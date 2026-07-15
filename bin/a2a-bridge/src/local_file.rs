@@ -20,21 +20,282 @@ pub(crate) struct LocalFileSnapshot {
     pub(crate) sha256: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DirectoryIdentity {
     pub(crate) device: u64,
     pub(crate) inode: u64,
+    pub(crate) object_sha256: String,
 }
 
 impl DirectoryIdentity {
     #[cfg(unix)]
-    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+    fn from_open_directory(
+        file: &File,
+        metadata: &std::fs::Metadata,
+        label: &str,
+    ) -> Result<Self, BoxError> {
         use std::os::unix::fs::MetadataExt as _;
-        Self {
+        let mut material = durable_directory_object_material(file, label)?;
+        material.extend_from_slice(&metadata.dev().to_be_bytes());
+        material.extend_from_slice(&metadata.ino().to_be_bytes());
+        Ok(Self {
             device: metadata.dev(),
             inode: metadata.ino(),
+            object_sha256: sha256_hex(&material),
+        })
+    }
+
+    #[cfg(unix)]
+    fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        self.device == metadata.dev() && self.inode == metadata.ino()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_attrlist(commonattr: libc::attrgroup_t, volattr: libc::attrgroup_t) -> libc::attrlist {
+    libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr,
+        volattr,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_descriptor_attribute(
+    file: &File,
+    list: &mut libc::attrlist,
+    buffer: &mut [u8],
+    label: &str,
+) -> Result<(), BoxError> {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: `list` and `buffer` are live writable objects for the duration of the call, the
+    // descriptor is owned by `file`, and the buffer size exactly describes `buffer`.
+    let result = unsafe {
+        libc::fgetattrlist(
+            file.as_raw_fd(),
+            (list as *mut libc::attrlist).cast(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(format!(
+            "{label}: durable directory identity is unavailable: {}",
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    let returned = u32::from_ne_bytes(
+        buffer[0..4]
+            .try_into()
+            .expect("attribute buffer always has a length field"),
+    ) as usize;
+    if returned != buffer.len() {
+        return Err(format!(
+            "{label}: durable directory identity returned an unexpected attribute size"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn durable_directory_object_material(file: &File, label: &str) -> Result<Vec<u8>, BoxError> {
+    // APFS and other modern Darwin filesystems use 64-bit file IDs, so the legacy stat/fsobj_id
+    // generation field may be zero. Only accept a descriptor's file ID when the volume explicitly
+    // advertises both persistent and 64-bit object IDs; otherwise the plan/action gap cannot safely
+    // distinguish object replacement and must fail closed.
+    let mut capabilities = [0_u8; 36];
+    let mut capability_list = macos_attrlist(0, libc::ATTR_VOL_CAPABILITIES);
+    macos_descriptor_attribute(file, &mut capability_list, &mut capabilities, label)?;
+    let format_capabilities = u32::from_ne_bytes(
+        capabilities[4..8]
+            .try_into()
+            .expect("capability field has a fixed width"),
+    );
+    let format_valid = u32::from_ne_bytes(
+        capabilities[20..24]
+            .try_into()
+            .expect("capability-valid field has a fixed width"),
+    );
+    if !macos_has_persistent_64_bit_file_ids(format_capabilities, format_valid) {
+        return Err(format!(
+            "{label}: filesystem does not provide persistent 64-bit directory object IDs"
+        )
+        .into());
+    }
+
+    let mut volume_uuid = [0_u8; 20];
+    let mut volume_uuid_list = macos_attrlist(0, libc::ATTR_VOL_UUID);
+    macos_descriptor_attribute(file, &mut volume_uuid_list, &mut volume_uuid, label)?;
+    let volume_uuid: [u8; 16] = volume_uuid[4..20]
+        .try_into()
+        .expect("volume UUID field has a fixed width");
+    if !macos_valid_volume_uuid(&volume_uuid) {
+        return Err(format!("{label}: filesystem returned an invalid volume UUID").into());
+    }
+
+    let mut file_id = [0_u8; 12];
+    let mut file_id_list = macos_attrlist(libc::ATTR_CMN_FILEID, 0);
+    macos_descriptor_attribute(file, &mut file_id_list, &mut file_id, label)?;
+    let file_id = u64::from_ne_bytes(
+        file_id[4..12]
+            .try_into()
+            .expect("file-id field has a fixed width"),
+    );
+    if file_id == 0 {
+        return Err(format!("{label}: filesystem returned an invalid persistent object ID").into());
+    }
+    let mut material = b"a2a-bridge:darwin-volume-file-id:v2\0".to_vec();
+    material.extend_from_slice(&volume_uuid);
+    material.extend_from_slice(&file_id.to_be_bytes());
+    Ok(material)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_has_persistent_64_bit_file_ids(format_capabilities: u32, format_valid: u32) -> bool {
+    let required = libc::VOL_CAP_FMT_PERSISTENTOBJECTIDS | libc::VOL_CAP_FMT_64BIT_OBJECT_IDS;
+    format_valid & required == required && format_capabilities & required == required
+}
+
+#[cfg(target_os = "macos")]
+fn macos_valid_volume_uuid(volume_uuid: &[u8; 16]) -> bool {
+    volume_uuid.iter().any(|byte| *byte != 0)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+#[repr(C)]
+struct LinuxFileHandleBuffer {
+    handle_bytes: libc::c_uint,
+    handle_type: libc::c_int,
+    bytes: [libc::c_uchar; libc::MAX_HANDLE_SZ as usize],
+}
+
+#[cfg(target_os = "linux")]
+const LINUX_AT_HANDLE_MNT_ID_UNIQUE: libc::c_int = 0x001;
+
+#[cfg(target_os = "linux")]
+fn acquire_linux_file_handle<F>(
+    mut acquire: F,
+    label: &str,
+) -> Result<(LinuxFileHandleBuffer, u64, libc::c_int), BoxError>
+where
+    F: FnMut(libc::c_int) -> std::io::Result<(LinuxFileHandleBuffer, u64)>,
+{
+    // Linux 6.5's identity-only FID mode works on filesystems such as overlayfs that intentionally do
+    // not provide an openable handle. Linux 6.12's unique mount ID is non-reused during the current
+    // boot. Both modes require it: an older kernel may reject the flag, but falling back to a reusable
+    // 32-bit mount ID would let a later remount collide with a previously authorized plan.
+    let base_flags = libc::AT_EMPTY_PATH | LINUX_AT_HANDLE_MNT_ID_UNIQUE;
+    let identity_flags = base_flags | libc::AT_HANDLE_FID;
+    match acquire(identity_flags) {
+        Ok((handle, mount_id)) => Ok((handle, mount_id, identity_flags)),
+        Err(identity_error) => match acquire(base_flags) {
+            Ok((handle, mount_id)) => Ok((handle, mount_id, base_flags)),
+            Err(openable_error) => Err(format!(
+                "{label}: filesystem cannot provide a durable directory object handle with a unique mount identity (identity-only: {identity_error}; compatible: {openable_error})"
+            )
+            .into()),
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_boot_id(raw: &[u8]) -> Option<[u8; 36]> {
+    let value = raw.strip_suffix(b"\n").unwrap_or(raw);
+    let value: [u8; 36] = value.try_into().ok()?;
+    let mut has_nonzero_hex_digit = false;
+    for (index, byte) in value.iter().enumerate() {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            if *byte != b'-' {
+                return None;
+            }
+        } else if !byte.is_ascii_digit() && !(b'a'..=b'f').contains(byte) {
+            return None;
+        } else if *byte != b'0' {
+            has_nonzero_hex_digit = true;
         }
     }
+    has_nonzero_hex_digit.then_some(value)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_boot_id(label: &str) -> Result<[u8; 36], BoxError> {
+    let path = "/proc/sys/kernel/random/boot_id";
+    let file = File::open(path)
+        .map_err(|error| format!("{label}: cannot read Linux boot identity: {error}"))?;
+    let mut bytes = Vec::with_capacity(37);
+    file.take(38)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{label}: cannot read Linux boot identity: {error}"))?;
+    parse_linux_boot_id(&bytes)
+        .ok_or_else(|| format!("{label}: Linux boot identity is malformed").into())
+}
+
+#[cfg(target_os = "linux")]
+fn durable_directory_object_material(file: &File, label: &str) -> Result<Vec<u8>, BoxError> {
+    use std::os::fd::AsRawFd as _;
+
+    let empty_path = b"\0";
+    let acquire = |flags: libc::c_int| {
+        let mut handle = LinuxFileHandleBuffer {
+            handle_bytes: libc::MAX_HANDLE_SZ as libc::c_uint,
+            handle_type: 0,
+            bytes: [0; libc::MAX_HANDLE_SZ as usize],
+        };
+        let mut mount_id = 0_u64;
+        // SAFETY: `file` owns a live descriptor; `empty_path` is a NUL-terminated empty C string;
+        // `LinuxFileHandleBuffer` has the C `file_handle` prefix followed immediately by MAX_HANDLE_SZ
+        // bytes; and `mount_id` is a live 64-bit output required by AT_HANDLE_MNT_ID_UNIQUE. The
+        // kernel is bounded by `handle_bytes`, and libc supplies the architecture-specific syscall ID.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_name_to_handle_at,
+                file.as_raw_fd(),
+                empty_path.as_ptr().cast::<libc::c_char>(),
+                (&mut handle as *mut LinuxFileHandleBuffer).cast::<libc::file_handle>(),
+                &mut mount_id as *mut u64,
+                flags,
+            )
+        };
+        if result == 0 {
+            Ok((handle, mount_id))
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    let (handle, mount_id, used_flags) = acquire_linux_file_handle(acquire, label)?;
+    let handle_bytes = handle.handle_bytes as usize;
+    if handle_bytes == 0 || handle_bytes > handle.bytes.len() {
+        return Err(
+            format!("{label}: filesystem returned an invalid directory object handle").into(),
+        );
+    }
+    let boot_id = linux_boot_id(label)?;
+    let mut material = b"a2a-bridge:linux-boot-mount-file-handle:v2\0".to_vec();
+    material.extend_from_slice(&boot_id);
+    material.extend_from_slice(&used_flags.to_be_bytes());
+    material.extend_from_slice(&mount_id.to_be_bytes());
+    material.extend_from_slice(&handle.handle_type.to_be_bytes());
+    material.extend_from_slice(&(handle_bytes as u32).to_be_bytes());
+    material.extend_from_slice(&handle.bytes[..handle_bytes]);
+    Ok(material)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn durable_directory_object_material(_file: &File, label: &str) -> Result<Vec<u8>, BoxError> {
+    Err(format!(
+        "{label}: durable host-fallback directory identity is unsupported on this operating system"
+    )
+    .into())
 }
 
 #[derive(Debug)]
@@ -119,7 +380,7 @@ fn open_directory_snapshot(
     }
     let canonical_cwd = SessionCwd::parse(&canonical_path.to_string_lossy())
         .map_err(|_| format!("{label}: resolved directory is not a valid session cwd"))?;
-    let identity = DirectoryIdentity::from_metadata(&descriptor_metadata);
+    let identity = DirectoryIdentity::from_open_directory(&file, &descriptor_metadata, label)?;
     Ok((
         file,
         DirectorySnapshot {
@@ -136,7 +397,7 @@ pub(crate) fn snapshot_directory(path: &Path, label: &str) -> Result<DirectorySn
 
 fn stable_directory_path(
     _file: &File,
-    identity: DirectoryIdentity,
+    identity: &DirectoryIdentity,
     label: &str,
 ) -> Result<(PathBuf, bool), BoxError> {
     #[cfg(target_os = "macos")]
@@ -166,7 +427,7 @@ fn stable_directory_path(
                 path.display()
             )
         })?;
-        if !metadata.is_dir() || DirectoryIdentity::from_metadata(&metadata) != identity {
+        if !metadata.is_dir() || !identity.matches_metadata(&metadata) {
             return Err(format!(
                 "{label}: stable directory handle {} does not identify the planned directory",
                 path.display()
@@ -181,15 +442,15 @@ impl PinnedDirectory {
     pub(crate) fn open(
         path: &Path,
         expected_cwd: &SessionCwd,
-        expected_identity: DirectoryIdentity,
+        expected_identity: &DirectoryIdentity,
         label: &str,
     ) -> Result<Self, BoxError> {
         let (file, snapshot) = open_directory_snapshot(path, label)?;
-        if &snapshot.canonical_cwd != expected_cwd || snapshot.identity != expected_identity {
+        if &snapshot.canonical_cwd != expected_cwd || &snapshot.identity != expected_identity {
             return Err(format!("{label}: directory identity changed after planning").into());
         }
         let (acp_session_cwd, retain_descriptor_after_exec) =
-            stable_directory_path(&file, snapshot.identity, label)?;
+            stable_directory_path(&file, &snapshot.identity, label)?;
         Ok(Self {
             file: Arc::new(file),
             canonical_cwd: snapshot.canonical_cwd,
@@ -212,11 +473,12 @@ impl PinnedDirectory {
     }
 
     pub(crate) fn current_path_matches(&self) -> bool {
-        std::fs::metadata(self.canonical_cwd.as_str())
-            .ok()
-            .is_some_and(|metadata| {
-                metadata.is_dir() && DirectoryIdentity::from_metadata(&metadata) == self.identity
-            })
+        open_directory_snapshot(
+            Path::new(self.canonical_cwd.as_str()),
+            "fallback smoke cwd recheck",
+        )
+        .ok()
+        .is_some_and(|(_file, snapshot)| snapshot.identity == self.identity)
     }
 }
 
@@ -385,7 +647,7 @@ mod tests {
         let pin = PinnedDirectory::open(
             &planned,
             &snapshot.canonical_cwd,
-            snapshot.identity,
+            &snapshot.identity,
             "test cwd",
         )
         .unwrap();
@@ -396,10 +658,7 @@ mod tests {
         fs::create_dir(&planned).unwrap();
 
         let stable_metadata = fs::metadata(&stable).unwrap();
-        assert_eq!(
-            DirectoryIdentity::from_metadata(&stable_metadata),
-            snapshot.identity
-        );
+        assert!(snapshot.identity.matches_metadata(&stable_metadata));
         assert_eq!(
             fs::read(stable.join("original-marker")).unwrap(),
             b"original"
@@ -409,5 +668,96 @@ mod tests {
         assert!(!pin.retain_descriptor_after_exec());
         #[cfg(target_os = "linux")]
         assert!(pin.retain_descriptor_after_exec());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn pinned_directory_rejects_a_wrong_object_fingerprint_with_matching_dev_and_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let planned = dir.path().join("planned");
+        fs::create_dir(&planned).unwrap();
+        let snapshot = snapshot_directory(&planned, "test cwd").unwrap();
+        let mut wrong_identity = snapshot.identity.clone();
+        wrong_identity.object_sha256 = "0".repeat(64);
+
+        let error = PinnedDirectory::open(
+            &planned,
+            &snapshot.canonical_cwd,
+            &wrong_identity,
+            "test cwd",
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("directory identity changed after planning"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_directory_identity_fails_closed_when_both_handle_modes_are_unavailable() {
+        let mut observed_flags = Vec::new();
+        let error = acquire_linux_file_handle(
+            |flags| {
+                observed_flags.push(flags);
+                Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+            },
+            "unsupported cwd",
+        )
+        .unwrap_err();
+        assert_eq!(
+            observed_flags,
+            [
+                libc::AT_EMPTY_PATH | libc::AT_HANDLE_FID | LINUX_AT_HANDLE_MNT_ID_UNIQUE,
+                libc::AT_EMPTY_PATH | LINUX_AT_HANDLE_MNT_ID_UNIQUE
+            ]
+        );
+        assert!(error
+            .to_string()
+            .contains("cannot provide a durable directory object handle"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_boot_identity_parser_is_strict_and_bounded() {
+        let valid = b"00112233-4455-6677-8899-aabbccddeeff\n";
+        assert_eq!(parse_linux_boot_id(valid).unwrap().as_slice(), &valid[..36]);
+        assert!(parse_linux_boot_id(b"00112233-4455-6677-8899-AABBCCDDEEFF\n").is_none());
+        assert!(parse_linux_boot_id(b"001122334455-6677-8899-aabbccddeeff\n").is_none());
+        assert!(parse_linux_boot_id(b"00112233-4455-6677-8899-aabbccddeeffxx").is_none());
+        assert!(parse_linux_boot_id(b"00000000-0000-0000-0000-000000000000\n").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_durable_identity_requires_both_persistent_64_bit_capabilities() {
+        let persistent = libc::VOL_CAP_FMT_PERSISTENTOBJECTIDS;
+        let wide = libc::VOL_CAP_FMT_64BIT_OBJECT_IDS;
+        assert!(macos_has_persistent_64_bit_file_ids(
+            persistent | wide,
+            persistent | wide
+        ));
+        assert!(!macos_has_persistent_64_bit_file_ids(
+            persistent,
+            persistent | wide
+        ));
+        assert!(!macos_has_persistent_64_bit_file_ids(
+            persistent | wide,
+            persistent
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_durable_identity_is_scoped_to_the_volume_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = open_directory(dir.path()).unwrap();
+        let material = durable_directory_object_material(&file, "test cwd").unwrap();
+        let prefix = b"a2a-bridge:darwin-volume-file-id:v2\0";
+
+        assert!(material.starts_with(prefix));
+        assert_eq!(material.len(), prefix.len() + 16 + 8);
+        assert!(!macos_valid_volume_uuid(&[0; 16]));
+        assert!(macos_valid_volume_uuid(&[1; 16]));
     }
 }

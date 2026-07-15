@@ -27,7 +27,9 @@ Validate one complete local failed R2c smoke-v2 artifact and emit a versioned re
 distinct host verification smoke. Hand-assembled task envelopes are not accepted because they are not
 bound to persisted lifecycle/config evidence.
 This command never resolves, spawns, prompts, retries, resumes, or performs network access. An eligible
-plan still requires a separately invoked, explicitly billable smoke command.";
+plan still requires a separately invoked, explicitly billable smoke command.
+Current slice/review status is owned by docs/reliability-execution-roadmap.md; this help defines behavior,
+not release state.";
 
 const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
@@ -317,7 +319,7 @@ struct SmokeDiagnostics {
     _stderr_text: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SmokeCleanup {
     grace_timeout_secs: u64,
@@ -537,7 +539,7 @@ fn validate_smoke_lifecycle(
     Ok(())
 }
 
-fn validate_cleanup(cleanup: &SmokeCleanup) -> Result<(), BoxError> {
+fn validate_cleanup(cleanup: &SmokeCleanup) -> Result<bool, BoxError> {
     let valid_step =
         |value: &str| matches!(value, "not_needed" | "completed" | "failed" | "timed_out");
     if cleanup.grace_timeout_secs == 0
@@ -552,7 +554,7 @@ fn validate_cleanup(cleanup: &SmokeCleanup) -> Result<(), BoxError> {
     {
         return Err("fallback-plan: invalid or incomplete smoke cleanup record".into());
     }
-    Ok(())
+    Ok(serde_json::to_value(cleanup)? == crate::smoke::ordinary_pre_spawn_cleanup_wire_value())
 }
 
 fn validate_target_evidence(target: &SmokeTarget, source_agent: &str) -> Result<(), BoxError> {
@@ -688,7 +690,7 @@ fn parse_smoke_source(bytes: &[u8]) -> Result<NormalizedSource, BoxError> {
             return Err("fallback-plan: invalid source config SHA-256".into());
         }
     }
-    validate_cleanup(&source.cleanup)?;
+    let cleanup_matches_production_pre_spawn = validate_cleanup(&source.cleanup)?;
     if source.attempt.timeout_secs == 0
         || source.attempt.timeout_secs > 900
         || source.attempt.started_at_ms < 0
@@ -702,6 +704,12 @@ fn parse_smoke_source(bytes: &[u8]) -> Result<NormalizedSource, BoxError> {
         return Err("fallback-plan: inconsistent smoke artifact lifecycle".into());
     }
     let mut reasons = Vec::new();
+    if !cleanup_matches_production_pre_spawn {
+        push_reason(
+            &mut reasons,
+            IneligibilityReason::SourceDiagnosticsIncomplete,
+        );
+    }
     if source.success {
         push_reason(&mut reasons, IneligibilityReason::SourceNotFailed);
     }
@@ -923,6 +931,7 @@ struct TrustRecord {
     trusted_session_cwd: String,
     trusted_session_cwd_device: u64,
     trusted_session_cwd_inode: u64,
+    trusted_session_cwd_object_sha256: String,
     authority: &'static str,
 }
 
@@ -1090,6 +1099,8 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
             trusted_session_cwd_identity.device.to_string(),
             "--expected-session-cwd-inode".to_owned(),
             trusted_session_cwd_identity.inode.to_string(),
+            "--expected-session-cwd-object-sha256".to_owned(),
+            trusted_session_cwd_identity.object_sha256.clone(),
             "--expected-config-sha256".to_owned(),
             config_file.sha256.clone(),
             "--expected-executable-sha256".to_owned(),
@@ -1124,7 +1135,8 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
             trusted_session_cwd: trusted_session_cwd_text,
             trusted_session_cwd_device: trusted_session_cwd_identity.device,
             trusted_session_cwd_inode: trusted_session_cwd_identity.inode,
-            authority: "local_cli_flag_and_explicit_directory_identity",
+            trusted_session_cwd_object_sha256: trusted_session_cwd_identity.object_sha256,
+            authority: "local_cli_flag_and_persistent_directory_object_identity",
         },
         rerun,
     })

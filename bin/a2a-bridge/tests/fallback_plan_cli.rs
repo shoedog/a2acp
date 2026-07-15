@@ -131,11 +131,11 @@ fn smoke_artifact(repo: &Path, config: &Path, class: &str, accepted: bool) -> se
             "stderr_text": "excluded"
         },
         "cleanup": {
-            "grace_timeout_secs": 5,
+            "grace_timeout_secs": 10,
             "cancel": "not_needed",
             "release": "not_needed",
             "retire": "not_needed",
-            "run_scoped_backstop": "not_needed"
+            "run_scoped_backstop": "invoked_best_effort"
         }
     })
 }
@@ -284,6 +284,17 @@ fn production_smoke_preflight_artifact_is_eligible_without_hand_built_lifecycle(
             .unwrap()
             .len(),
         4
+    );
+    assert_eq!(
+        artifact["cleanup"],
+        serde_json::json!({
+            "grace_timeout_secs": 10,
+            "cancel": "not_needed",
+            "release": "not_needed",
+            "retire": "not_needed",
+            "run_scoped_backstop": "invoked_best_effort"
+        }),
+        "the planner fixture must match the ordinary production pre-spawn failure serializer"
     );
 
     let planned = fallback_command(&config, &artifact_path)
@@ -561,6 +572,35 @@ fn failed_success_timeout_and_dropped_event_invariants_are_closed() {
 }
 
 #[test]
+fn serializer_impossible_cleanup_records_never_authorize_fallback() {
+    let (_dir, marker, config, source) = fixture();
+    let repo = source.parent().unwrap().join("owned repo");
+    let cases = [
+        ("timeout", "grace_timeout_secs", serde_json::json!(5)),
+        ("cancel", "cancel", serde_json::json!("completed")),
+        ("release", "release", serde_json::json!("completed")),
+        ("retire", "retire", serde_json::json!("failed")),
+        (
+            "backstop",
+            "run_scoped_backstop",
+            serde_json::json!("not_needed"),
+        ),
+    ];
+    for (case, field, value) in cases {
+        let mut artifact = smoke_artifact(&repo, &config, "container_runtime", false);
+        artifact["cleanup"][field] = value;
+        write_json(&source, &artifact);
+
+        let output = fallback_command(&config, &source)
+            .arg("--confirm-trusted-own-repo-read-only")
+            .output()
+            .unwrap();
+        assert_ineligible_without_command(&read_plan(&output), "source_diagnostics_incomplete");
+        assert!(!marker.exists(), "cleanup case {case} spawned the target");
+    }
+}
+
+#[test]
 fn hand_assembled_task_diagnostic_is_rejected_without_a_plan() {
     let (_dir, marker, config, source) = fixture();
     let repo = source.parent().unwrap().join("owned repo");
@@ -776,6 +816,14 @@ fn exact_argv_uses_current_binary_config_digest_and_explicit_trusted_cwd() {
     use std::os::unix::fs::MetadataExt as _;
     let canonical_repo_device = canonical_repo_metadata.dev().to_string();
     let canonical_repo_inode = canonical_repo_metadata.ino().to_string();
+    let canonical_repo_object_sha256 = plan["trust"]["trusted_session_cwd_object_sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(canonical_repo_object_sha256.len(), 64);
+    assert!(canonical_repo_object_sha256
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit()));
     let config_sha256 = sha256_hex(&fs::read(&config).unwrap());
     let executable = fs::canonicalize(env!("CARGO_BIN_EXE_a2a-bridge")).unwrap();
     let executable_sha256 = sha256_hex(&fs::read(&executable).unwrap());
@@ -796,6 +844,8 @@ fn exact_argv_uses_current_binary_config_digest_and_explicit_trusted_cwd() {
         canonical_repo_device,
         "--expected-session-cwd-inode",
         canonical_repo_inode,
+        "--expected-session-cwd-object-sha256",
+        canonical_repo_object_sha256,
         "--expected-config-sha256",
         config_sha256,
         "--expected-executable-sha256",
@@ -939,7 +989,13 @@ fn drifted_config_and_contradictory_lifecycle_fail_closed() {
 
 #[test]
 fn generated_smoke_refuses_config_executable_and_cwd_drift_before_spawn() {
-    for drift in ["config", "executable", "cwd", "target-marker"] {
+    for drift in [
+        "config",
+        "executable",
+        "cwd",
+        "object-fingerprint",
+        "target-marker",
+    ] {
         let (_dir, marker, config, source) = fixture();
         let plan_output = fallback_command(&config, &source)
             .arg("--confirm-trusted-own-repo-read-only")
@@ -972,6 +1028,13 @@ fn generated_smoke_refuses_config_executable_and_cwd_drift_before_spawn() {
                     .unwrap();
                 argv[index + 1] = "/etc".into();
             }
+            "object-fingerprint" => {
+                let index = argv
+                    .iter()
+                    .position(|value| value == "--expected-session-cwd-object-sha256")
+                    .unwrap();
+                argv[index + 1] = "0".repeat(64);
+            }
             "target-marker" => {
                 let changed = fs::read_to_string(&config).unwrap().replace(
                     "host_fallback_eligible = true",
@@ -992,7 +1055,7 @@ fn generated_smoke_refuses_config_executable_and_cwd_drift_before_spawn() {
         let expected_code = match drift {
             "config" => "smoke.fallback_config_drift",
             "executable" => "smoke.fallback_executable_drift",
-            "cwd" => "smoke.fallback_cwd_drift",
+            "cwd" | "object-fingerprint" => "smoke.fallback_cwd_drift",
             "target-marker" => "smoke.fallback_target_drift",
             _ => unreachable!(),
         };
@@ -1103,12 +1166,13 @@ fn guarded_host_smoke_never_invokes_the_degraded_container_runtime() {
             .output()
             .unwrap(),
     );
-    let argv: Vec<String> = plan["rerun"]["argv"]
+    let mut argv: Vec<String> = plan["rerun"]["argv"]
         .as_array()
         .unwrap()
         .iter()
         .map(|value| value.as_str().unwrap().to_owned())
         .collect();
+    argv.extend(["--timeout-secs".into(), "1".into()]);
     let smoke = Command::new(&argv[0]).args(&argv[1..]).output().unwrap();
     assert!(
         !smoke.status.success(),

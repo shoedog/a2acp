@@ -97,6 +97,7 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
     let mut expected_session_cwd = None;
     let mut expected_session_cwd_device = None;
     let mut expected_session_cwd_inode = None;
+    let mut expected_session_cwd_object_sha256 = None;
     let mut fallback_source_agent = None;
     let mut require_host_fallback_eligible = false;
     let mut acknowledged = false;
@@ -170,6 +171,15 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
             "--expected-session-cwd-inode" => {
                 expected_session_cwd_inode = Some(value(&mut it, "--expected-session-cwd-inode")?);
             }
+            "--expected-session-cwd-object-sha256"
+                if expected_session_cwd_object_sha256.is_some() =>
+            {
+                return Err("smoke: duplicate --expected-session-cwd-object-sha256".into());
+            }
+            "--expected-session-cwd-object-sha256" => {
+                expected_session_cwd_object_sha256 =
+                    Some(value(&mut it, "--expected-session-cwd-object-sha256")?);
+            }
             "--fallback-source-agent" if fallback_source_agent.is_some() => {
                 return Err("smoke: duplicate --fallback-source-agent".into());
             }
@@ -240,18 +250,23 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
         + usize::from(expected_session_cwd.is_some())
         + usize::from(expected_session_cwd_device.is_some())
         + usize::from(expected_session_cwd_inode.is_some())
+        + usize::from(expected_session_cwd_object_sha256.is_some())
         + usize::from(fallback_source_agent.is_some())
         + usize::from(require_host_fallback_eligible);
     let fallback_guard = match guard_count {
         0 => None,
-        7 if session_cwd.is_some() => {
+        8 if session_cwd.is_some() => {
             let expected_config_sha256 = expected_config_sha256.expect("counted above");
             let expected_executable_sha256 = expected_executable_sha256.expect("counted above");
+            let expected_session_cwd_object_sha256 =
+                expected_session_cwd_object_sha256.expect("counted above");
             if !crate::local_file::valid_sha256(&expected_config_sha256)
                 || !crate::local_file::valid_sha256(&expected_executable_sha256)
+                || !crate::local_file::valid_sha256(&expected_session_cwd_object_sha256)
             {
                 return Err(
-                    "smoke: fallback guard digests must be 64 hexadecimal characters".into(),
+                    "smoke: fallback guard digests and object fingerprint must be 64 hexadecimal characters"
+                        .into(),
                 );
             }
             let source = validate_raw_id(
@@ -276,12 +291,13 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
                 expected_session_cwd_identity: crate::local_file::DirectoryIdentity {
                     device: expected_session_cwd_device,
                     inode: expected_session_cwd_inode,
+                    object_sha256: expected_session_cwd_object_sha256.to_ascii_lowercase(),
                 },
                 source_agent: AgentId::parse(source)
                     .map_err(|_| "smoke: invalid --fallback-source-agent")?,
             })
         }
-        7 => return Err("smoke: fallback guard requires --session-cwd".into()),
+        8 => return Err("smoke: fallback guard requires --session-cwd".into()),
         _ => {
             return Err(
                 "smoke: fallback guard flags must be supplied together as a closed set".into(),
@@ -369,6 +385,7 @@ struct FallbackGuardRecord {
     expected_session_cwd: String,
     expected_session_cwd_device: u64,
     expected_session_cwd_inode: u64,
+    expected_session_cwd_object_sha256: String,
     source_agent: String,
     require_host_fallback_eligible: bool,
 }
@@ -498,6 +515,20 @@ impl Default for CleanupRecord {
     }
 }
 
+impl CleanupRecord {
+    fn ordinary_pre_spawn_failure() -> Self {
+        Self {
+            run_scoped_backstop: "invoked_best_effort",
+            ..Self::default()
+        }
+    }
+}
+
+pub(crate) fn ordinary_pre_spawn_cleanup_wire_value() -> Value {
+    serde_json::to_value(CleanupRecord::ordinary_pre_spawn_failure())
+        .expect("the fixed smoke cleanup record is serializable")
+}
+
 struct ArtifactState {
     artifact: SmokeArtifactV2,
     failure: Option<FailureDiagnostic>,
@@ -546,6 +577,10 @@ impl ArtifactState {
                             expected_session_cwd: guard.expected_session_cwd.as_str().to_owned(),
                             expected_session_cwd_device: guard.expected_session_cwd_identity.device,
                             expected_session_cwd_inode: guard.expected_session_cwd_identity.inode,
+                            expected_session_cwd_object_sha256: guard
+                                .expected_session_cwd_identity
+                                .object_sha256
+                                .clone(),
                             source_agent: guard.source_agent.as_str().to_owned(),
                             require_host_fallback_eligible: true,
                         }),
@@ -1466,7 +1501,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         let pin = match crate::local_file::PinnedDirectory::open(
             Path::new(guard.expected_session_cwd.as_str()),
             &guard.expected_session_cwd,
-            guard.expected_session_cwd_identity,
+            &guard.expected_session_cwd_identity,
             "fallback smoke cwd",
         ) {
             Ok(pin) => pin,
@@ -1581,7 +1616,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         Err(error) => {
             state.fail_error(&error, DiagnosticPhase::Resolve, false);
             if run_guard.is_some() {
-                state.artifact.cleanup.run_scoped_backstop = "invoked_best_effort";
+                state.artifact.cleanup = CleanupRecord::ordinary_pre_spawn_failure();
             }
             drop(run_guard);
             drop(lease);
@@ -1624,7 +1659,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             );
             registry.invalidate(&args.agent).await;
             if run_guard.is_some() {
-                state.artifact.cleanup.run_scoped_backstop = "invoked_best_effort";
+                state.artifact.cleanup = CleanupRecord::ordinary_pre_spawn_failure();
             }
             drop(registry);
             drop(run_guard);
@@ -1635,7 +1670,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             state.artifact.attempt.timed_out = is_timeout_failure(&error);
             state.fail_error(&error, DiagnosticPhase::Resolve, false);
             if run_guard.is_some() {
-                state.artifact.cleanup.run_scoped_backstop = "invoked_best_effort";
+                state.artifact.cleanup = CleanupRecord::ordinary_pre_spawn_failure();
             }
             drop(registry);
             drop(run_guard);
@@ -2142,6 +2177,8 @@ mod tests {
             "1",
             "--expected-session-cwd-inode",
             "2",
+            "--expected-session-cwd-object-sha256",
+            digest,
             "--fallback-source-agent",
             "source",
             "--require-host-fallback-eligible",
@@ -2160,6 +2197,8 @@ mod tests {
             "1",
             "--expected-session-cwd-inode",
             "2",
+            "--expected-session-cwd-object-sha256",
+            digest,
             "--fallback-source-agent",
             "source",
             "--require-host-fallback-eligible",
@@ -2179,6 +2218,28 @@ mod tests {
             "not-a-device",
             "--expected-session-cwd-inode",
             "2",
+            "--expected-session-cwd-object-sha256",
+            digest,
+            "--fallback-source-agent",
+            "source",
+            "--require-host-fallback-eligible",
+        ]))
+        .is_err());
+        assert!(parse_args(&cli_args(&[
+            "--session-cwd",
+            "/tmp",
+            "--expected-config-sha256",
+            digest,
+            "--expected-executable-sha256",
+            digest,
+            "--expected-session-cwd",
+            "/tmp",
+            "--expected-session-cwd-device",
+            "1",
+            "--expected-session-cwd-inode",
+            "2",
+            "--expected-session-cwd-object-sha256",
+            "not-a-digest",
             "--fallback-source-agent",
             "source",
             "--require-host-fallback-eligible",
@@ -2298,7 +2359,7 @@ mod tests {
         let pin = crate::local_file::PinnedDirectory::open(
             &planned,
             &snapshot.canonical_cwd,
-            snapshot.identity,
+            &snapshot.identity,
             "test cwd",
         )
         .unwrap();

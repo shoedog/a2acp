@@ -182,6 +182,7 @@ usage: a2a-bridge smoke --agent <id> --config <path> --acknowledge-billable
                          --expected-session-cwd <canonical-repo>
                          --expected-session-cwd-device <u64>
                          --expected-session-cwd-inode <u64>
+                         --expected-session-cwd-object-sha256 <hex>
                          --fallback-source-agent <id>
                          --require-host-fallback-eligible]
 
@@ -910,7 +911,8 @@ fn make_spawn_fn(
         let host_process_cwd = host_process_cwd.clone();
         Box::pin(async move {
             // Ordinary host children inherit the bridge cwd; AcpConfig.cwd is their ACP session cwd.
-            // Guarded fallback instead fchdirs the child to a pinned directory object and uses ".".
+            // Guarded fallback instead fchdirs the child to a pinned directory object and gives ACP
+            // an object-addressed absolute session cwd installed below.
             let resolved =
                 resolve_static_session_cwd(entry.session_cwd.as_deref(), entry.cwd.as_deref());
             let cwd = {

@@ -1,17 +1,18 @@
 # R2d — Local non-billable fallback-plan implementation plan
 
-- **Status:** IN REVIEW — the initial review and closure re-reviews 1–3 returned `REVISE`; the v18 fold
+- **Status:** IN REVIEW — the initial review and closure re-reviews 1–4 returned `REVISE`; the v20 fold
   is applied in the working tree; focused and full deterministic gates are green; final closure remains
 - **Prerequisites:** R2b and R2c merged (`be54bc51`, PR #28)
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md),
-  v18
+  v20
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Branch:** `agent/reliability-r2d-fallback-plan`
 - **Initial reviewed candidate:** `b6424d725e56d1f3fde0b7c29b6057155d69dacd`
 - **Closure re-review 1 candidate:** `0b05c409cbbf9441348b2719a537f8f4978216a3` — `REVISE`
 - **Closure re-review 2 candidate:** `c8d17b2acbe3b113ce8fcdbce243ea2e08561141` — `REVISE`
 - **Closure re-review 3 candidate:** `69152d7360a4900fe49390338b56efd94c784495` — `REVISE`
+- **Closure re-review 4 candidate:** `349755ed8f4534db0e04b8af006ca6072e01110b` — `REVISE`
 
 R2d answers one local operator question: given complete failed R2c smoke evidence from a read-only
 container attempt, may an explicitly named host agent be proposed for a new trusted-own-repo read-only
@@ -107,7 +108,35 @@ The full suite also caught one direct smoke-side `AgentFailure` construction in 
 The final fold carries that local static refusal separately from backend errors, preserving the audited
 lifecycle-constructor boundary without weakening its guard.
 
-No Fable, Claude model/Haiku, retry, fallback, live provider turn, or real container was used in the four
+Closure re-review 4 ran through the candidate bridge with `gpt-5.6-sol`/`xhigh` against exact
+`349755ed8f4534db0e04b8af006ca6072e01110b` and returned `REVISE`. It marked early artifact secrecy,
+tagged-redacted authentication, and adjacent secrecy `FIXED`, but kept directory-object identity
+`PARTIAL`: after planning, only device/inode survived descriptor close, so inode reuse could still admit a
+different object. It also found one new `WRONG/MAJOR` cleanup-evidence defect, one `SMELL/MAJOR` status
+surface gap, and one `SMELL/MINOR` stale comment. The v19 fold:
+
+1. carries a SHA-256 fingerprint of a descriptor-derived durable object ID in the plan/action guard;
+   macOS accepts only volumes advertising persistent 64-bit file IDs, Linux uses the opaque
+   `name_to_handle_at(..., AT_EMPTY_PATH)` handle, and unavailable support fails closed;
+2. authorizes fallback only for the exact ordinary production pre-spawn cleanup tuple (10-second grace,
+   cancel/release/retire `not_needed`, run-scoped backstop `invoked_best_effort`), with mutations for every
+   field and a production-serialization control; and
+3. designates the roadmap as the sole volatile status cursor, links stable help/onboarding/skill surfaces
+   to it, and corrects the pinned-child cwd comment.
+
+A post-v19 self-review found that file handles and persistent file IDs are scoped by their filesystem:
+an ordinary Linux mount ID can be reused after unmount, and a Darwin file ID is meaningful only on its
+volume. V20 closes that adjacent remount/reboot ambiguity without weakening the fail-closed boundary:
+
+1. Darwin fingerprints the descriptor's nonzero volume UUID together with its persistent 64-bit file ID;
+2. Linux fingerprints the current boot ID, Linux 6.12's non-reused 64-bit
+   `AT_HANDLE_MNT_ID_UNIQUE` value, and the opaque file handle. It tries Linux 6.5's identity-only
+   `AT_HANDLE_FID` form first and the compatible handle form second, but both require the unique mount
+   identity; and
+3. older kernels, unsupported filesystems, malformed/all-zero boot IDs, and invalid/all-zero volume UUIDs
+   fail closed. The volume-scope and unique-flag regressions failed on the pre-v20 implementation.
+
+No Fable, Claude model/Haiku, retry, fallback, live provider turn, or real container was used in the five
 reviews/folds. Separate adapter-only compatibility probes sent `initialize` + `session/new` (never
 `session/prompt`) through installed Codex ACP 1.1.2 and Claude Agent ACP 0.44.0; both accepted the macOS
 object-addressed absolute cwd.
@@ -147,8 +176,9 @@ object-addressed absolute cwd.
 - The artifact must contain exactly one timestamp-ordered nested
   `Resolve/Started → Spawn/Started → Spawn/Failed → Resolve/Failed` attempt inside the interval with its
   unique outer failure represented, no dropped events, the complete production container provenance
-  row/status set, authentication matching the pinned source entry, complete cleanup records, no turn
-  activity behind a false acceptance barrier, and one spawn-phase `container_fallback_candidate` class.
+  row/status set, authentication matching the pinned source entry, the exact production pre-spawn cleanup
+  tuple, no turn activity behind a false acceptance barrier, and one spawn-phase
+  `container_fallback_candidate` class.
 - The source canonical config path and exact-byte SHA-256 must match the current pinned config snapshot.
   The current source agent must still exist as `container_ro`. The local operator supplies the exact
   canonical trusted cwd; artifact cwd must agree as evidence, and the exact cwd must be under the current
@@ -186,6 +216,7 @@ The generated argv includes, as one closed set:
 --expected-session-cwd <canonical-repo>
 --expected-session-cwd-device <u64>
 --expected-session-cwd-inode <u64>
+--expected-session-cwd-object-sha256 <hex>
 --fallback-source-agent <container-agent-id>
 --require-host-fallback-eligible
 ```
@@ -200,7 +231,11 @@ artifact and no agent process is started. Once the guard opens the expected dire
 adapter child performs `fchdir` to that pinned descriptor and guarded ACP uses an object-addressed
 absolute cwd (`/.vol/<device>/<inode>` on macOS; inherited `/proc/self/fd/<n>` on Linux). The parent
 descriptor remains close-on-exec; only the already-forked Linux child retains its copy. Later pathname
-replacement therefore cannot redirect the spawned process or violate ACP's absolute-cwd contract.
+replacement therefore cannot redirect the spawned process or violate ACP's absolute-cwd contract. Across
+the plan/action process gap, the object fingerprint prevents device/inode reuse from satisfying the guard:
+Darwin requires a nonzero volume UUID plus a descriptor file ID on a volume advertising persistent 64-bit
+object IDs. Linux requires a valid boot ID, a non-reused 64-bit unique mount ID, and an opaque descriptor
+file handle. Unsupported filesystems, kernels, or operating systems refuse planning.
 
 ## Pre-change-failing and edge regressions
 
@@ -212,7 +247,10 @@ replacement therefore cannot redirect the spawned process or violate ACP's absol
   oversized source, controls, quotes, and schema mismatch;
 - config, executable, and source-mount drift between plan and action, all before target spawn;
 - same-mount trusted-cwd symlink/sibling replacement and same-path directory-object replacement between
-  planning and action, plus replacement during configure immediately before lazy prompt/session mint;
+  planning and action, a matching-device/inode but wrong durable-object fingerprint, plus replacement
+  during configure immediately before lazy prompt/session mint;
+- Darwin volume-scoped persistent identity plus all-zero UUID refusal; Linux unique-mount flags in both
+  handle modes plus malformed, oversized, uppercase, and all-zero boot-ID refusal;
 - complete lifecycle-failure equality, including summary/stderr/cause metadata rather than partial
   identity matching;
 - known-credential injection through provenance detail/remedy and structured model/mode fields;
@@ -224,12 +262,22 @@ replacement therefore cannot redirect the spawned process or violate ACP's absol
   credential file/directory/anonymous/named-volume types, and shared doctor/Claude-preflight parsing;
 - inner container-like text remains non-evidence, launch errors retain their original diagnosis, normal
   container cleanup still occurs, and guarded host smoke invokes no degraded runtime maintenance.
+- exact production pre-spawn cleanup serialization plus independent timeout/cancel/release/retire/backstop
+  mutations, each ineligible with no command.
 
-Current v18 focused evidence is planner CLI **22 / 0** and smoke units **22 / 0**.
+Current v20 focused evidence is planner CLI **23 / 0**, smoke units **22 / 0**, and local-file units
+**7 / 0** on macOS. A Linux `a2a-toolchain` container, reading the worktree through a read-only bind and
+writing only R2d-specific disposable cache volumes that were removed after verification, also passes
+local-file **7 / 0** and planner CLI **23 / 0**. Its real overlayfs path exercises
+`AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE`; the injected dual-mode-unavailable case proves fail-closed
+behavior. A default Linux debug artifact was 271,582,616 bytes and therefore correctly tripped the
+unchanged 256 MiB planner evidence cap (13 passed / 10 rejected); rebuilding the same test target with
+`CARGO_PROFILE_DEV_DEBUG=0` produced the stated **23 / 0**, separating debug-symbol inflation from product
+behavior without weakening the cap.
 
-The exact v18 working fold also passes:
+The exact v20 working fold also passes:
 
-- full serial workspace: **1,979 passed / 0 failed / 12 ignored** across 69 test/doc-test executables;
+- full serial workspace: **1,983 passed / 0 failed / 12 ignored** across 69 test/doc-test executables;
 - format check and `git diff --check`: clean;
 - workspace all-target check and warnings-denied all-target Clippy: clean;
 - release `a2a-bridge` binary build: clean;
@@ -241,9 +289,8 @@ The exact v18 working fold also passes:
 
 ## Completion boundary
 
-Freeze and commit the fully gated v18 fold, then run one Sol/xhigh closure re-review that
-adjudicates the three closure-re-review-3 findings, complete early-artifact secrecy, and guarded ACP's
-descriptor-pinned absolute-cwd compatibility. Do
+Freeze and commit the fully gated v20 fold, then run one Sol/xhigh closure re-review that adjudicates the
+partial durable-object finding and all three closure-re-review-4 findings. Do
 not use Fable or Claude for this closure under the current constrained usage windows. Do not run a
 live/billable smoke: R2d behavior is proven by deterministic pre-spawn fixtures, and the R2c live result
 remains historical evidence only.
