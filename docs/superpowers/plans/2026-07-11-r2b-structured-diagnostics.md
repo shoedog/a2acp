@@ -1,6 +1,6 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN REVIEW (merge pending; 2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 NOT STARTED
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 MERGED at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 NOT STARTED
 - **Current execution boundary:** no live/billable gate ran; no docs-link checker is present
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
@@ -645,8 +645,9 @@ R2b2d implementation handoff (review-approved branch commit based on
   `SMELL/MAJOR` `FIXED`. It confirmed resolve-only retry remains eligible, configured-session retry now
   requires successful observed cleanup, the original transient failure stays primary, all requested mutation
   controls are live, and the prior ready-result/terminal folds remain closed. It found no new findings and
-  returned `APPROVE` on published head `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`. Merge R2b2, then begin
-  R2b3.
+  returned `APPROVE` on published head `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`. A final docs-only
+  Sol/xhigh re-review returned `APPROVE` on `0627e911`; R2b2 was fast-forwarded to `origin/main` at
+  `0627e91144e79d9328ed9b5635033cf410c9e96e`. Begin R2b3.
 
 ### Observation plumbing
 

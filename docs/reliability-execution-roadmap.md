@@ -1,15 +1,15 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **R2b1 implementation baseline:** `main` at `7b788c1f` on 2026-07-12
-- **Completed through:** R2b2d `14402f8`; final folds `a459b31` and `e63d4d0`; closure re-review 2
-  `APPROVE` at `0c0e3fe`
+- **R2b2 merge head:** `main` at `0627e911` on 2026-07-12
+- **Completed through:** R2b2 **MERGED** at `0627e911` after final folds `a459b31` and `e63d4d0` and
+  closure re-review 2 `APPROVE` at `0c0e3fe`
 - **Current exact gate:** **1,100 / 0 / 0 ignored** across the six affected packages; format/diff,
   workspace/all-target check, warnings-denied Clippy, and release build clean
 - **Full workspace gate:** host serial **1,816 / 0 / 12 ignored**; repository hygiene **37** tracked
   artifacts / **7** validated example configs
 - **Current execution boundary:** no live/billable gate ran; no docs-link checker is present
-- **Next action:** merge R2b2 to `main`, then begin independently reviewed R2b3
+- **Next action:** begin independently reviewed R2b3
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -26,7 +26,7 @@ and completion evidence.
 R2a provenance (MERGED)
   -> R2b0 contract clarifications (MERGED)
   -> R2b1 diagnostic types + rollback-safe persistence surface (MERGED)
-  -> R2b2 ACP/Fable lifecycle evidence + no-replay/warm-session safety (IN REVIEW)
+  -> R2b2 ACP/Fable lifecycle evidence + no-replay/warm-session safety (MERGED)
   -> R2b3 API/provider mapping + remaining container/dispatch observation
   -> R2c explicit one-turn billable smoke
        -> R2d local non-billable fallback plan
@@ -49,7 +49,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2a — doctor provenance | **MERGED** at `24aff09c` | [R2 design](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md) | Additive non-billable provenance rows. |
 | R2b0 — contract clarifications | **MERGED** at `11ebc402` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Design v13 retains a claim-identified expiring tombstone through cleanup and makes worktree release/forced retirement join one per-session cell; Sol/xhigh APPROVED. |
 | R2b1 — diagnostic foundation | **MERGED** at `7b788c1f` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
-| R2b2 — ACP/Fable lifecycle diagnostics | **IN REVIEW** (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**; merge pending) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, concurrency-qualified warm cleanup, then aggregate cold-path closure; one final merge boundary. |
+| R2b2 — ACP/Fable lifecycle diagnostics | **MERGED** at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, concurrency-qualified warm cleanup, then aggregate cold-path closure; one final merge boundary. |
 | R2b3 — API/container diagnostics | **NOT STARTED** | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
 | R2c — live smoke | **NOT STARTED** | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | One explicit, bounded, billable turn; no retry. |
 | R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
@@ -198,12 +198,12 @@ Next action:
 
 ## Current handoff
 
-- `origin/main` contains R2b1 at `7b788c1f`; R2b2 is active on
-  `agent/reliability-r2b2-acp-lifecycle`. R2b2d is review-approved, committed, and pushed at
+- `origin/main` contains R2b2 at `0627e91144e79d9328ed9b5635033cf410c9e96e`. R2b2d was approved at
   `14402f895a5eda2852684a8fbd35f83452e2645f`; the final full-branch review fold is committed at
   `a459b31de5a4665138a7330868e38dfb8992438b`, and the re-review-1 fold at
   `e63d4d085e8dd51424cdedebda7aa64b9f1a8b01`. Fresh Sol/xhigh closure re-review 2 returned `APPROVE`
-  on published head `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`; merge is pending.
+  on published head `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`; a final docs-only Sol/xhigh re-review returned
+  `APPROVE` on `0627e911`. R2b3 is next.
 - R2b0's full local suite was 1,607 passed / 0 failed / 12 ignored live-agent tests.
 - A fresh bridge-mediated Fable/xhigh review returned `R2A: READY`, `V6 DESIGN: READY`, `MERGE`.
 - The Podman bare image-id normalization and non-vacuous descendant survivor-marker regression were
@@ -256,14 +256,15 @@ Next action:
   billable smoke was run in R2b1.
 - R2b1 was fast-forwarded to `origin/main` at `7b788c1fa6b62459e8a8473ca853f9414b28bfbc` after the
   final `APPROVE`; the post-merge cursor branch is `agent/reliability-r2b2-cursor`.
-- R2b2 implementation is active on `agent/reliability-r2b2-acp-lifecycle`; R2b2a is committed at
+- R2b2 was fast-forwarded to `origin/main` at `0627e91144e79d9328ed9b5635033cf410c9e96e`; R2b2a is at
   `4ed12f1035c16fa5dbd55169e59ca4c277373da4` and R2b2b at
   `f40096dfcfb43a37236ce5626fd362a16645f0fe`. R2b2c owner/workflow authority is committed and pushed at
   `407907202982d732c2395be0f6319f6029622f82` after final review 7 `APPROVE` and exact-tree full gates;
   R2b2d is approved/pushed at `14402f895a5eda2852684a8fbd35f83452e2645f`, and the aggregate final-review
   folds are committed at `a459b31de5a4665138a7330868e38dfb8992438b` and
   `e63d4d085e8dd51424cdedebda7aa64b9f1a8b01`. Fresh Sol/xhigh closure re-review 2 returned `APPROVE`
-  on published head `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`; merge is pending.
+  on published head `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`; the final docs-only Sol/xhigh re-review returned
+  `APPROVE` on the merge head. R2b3 is next.
 - R2b2a adds bounded/no-op/task-journal diagnostic observers and explicit factories, composite backend
   compatibility methods, `resolve_observed`, legacy/observed registry spawn constructors, initializer-only
   observer ownership, cache/waiter `backend.reused`, and live `new_observed` wiring. No ACP lifecycle
@@ -545,4 +546,5 @@ Next action:
   `WRONG/MAJOR` and branch-completeness `SMELL/MAJOR` `FIXED`, confirmed the earlier ready-result and terminal
   folds remain closed, found no new findings, and returned `APPROVE`. The retained Git-fixture and bounded-yield
   debts remain minor. Exact published head was `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`; no live/billable gate
-  ran, and no docs-link checker is present. Merge R2b2, then begin R2b3.
+  ran, and no docs-link checker is present. R2b2 was fast-forwarded to `origin/main` at
+  `0627e91144e79d9328ed9b5635033cf410c9e96e`; begin R2b3.
