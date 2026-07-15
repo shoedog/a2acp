@@ -1,6 +1,6 @@
 # Bridge reliability R2 — provenance and phase-specific diagnostics (design, v13)
 
-- **Status:** R2a, R2b0, and R2b1 merged; R2b2 in progress; v13 is the design of record for R2b2–R2b3
+- **Status:** R2a, R2b0, and R2b1 merged; R2b2 IN REVIEW; v13 is the design of record for R2b2–R2b3
 - **R2b2 review state:** R2b2d closure review 12 `APPROVE` at
   `14402f895a5eda2852684a8fbd35f83452e2645f`; final full-R2b2 review 1 `REVISE`; cold-path fold
   `a459b31de5a4665138a7330868e38dfb8992438b`; closure re-review 1 `REVISE`; retry-veto fold
@@ -8,6 +8,7 @@
   workspace suite **1,816 / 0 / 12 ignored**; repository hygiene **37** tracked artifacts / **7** validated
   example configs; fresh Sol/xhigh closure re-review 2 `APPROVE` at
   `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`; merge pending
+- **Current execution boundary:** no live/billable gate ran; no docs-link checker is present
 - **Date:** 2026-07-11
 - **Base:** `144b900d95da11cd852de12540d363a6c41a82d0` (`origin/main` after R2a and reliability plans)
 - **R2b0 commit:** `11ebc4020749dd8cef0bc605530cc00ba285add8`

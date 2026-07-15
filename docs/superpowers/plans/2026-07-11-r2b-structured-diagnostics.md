@@ -1,6 +1,7 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
 - **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 IN REVIEW (merge pending; 2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 NOT STARTED
+- **Current execution boundary:** no live/billable gate ran; no docs-link checker is present
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -639,7 +640,7 @@ R2b2d implementation handoff (review-approved branch commit based on
 - Workflow passes **86 / 0 / 0**; the exact six-package gate passes **1,100 / 0 / 0 ignored**; the host serial
   workspace passes **1,816 / 0 / 12 ignored**. Format/diff, workspace/all-target check, warnings-denied
   workspace/all-target Clippy, workspace release build, and hygiene **37/7** are clean. No live/billable gate
-  ran. Run closure re-review 2; do not merge before approval.
+  ran, and no docs-link checker is present. Run closure re-review 2; do not merge before approval.
 - Fresh Sol/xhigh closure re-review 2 adjudicated the transient-cleanup `WRONG/MAJOR` and coverage
   `SMELL/MAJOR` `FIXED`. It confirmed resolve-only retry remains eligible, configured-session retry now
   requires successful observed cleanup, the original transient failure stays primary, all requested mutation

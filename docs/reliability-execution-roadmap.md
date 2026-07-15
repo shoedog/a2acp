@@ -2,11 +2,13 @@
 
 - **Program status:** active P0
 - **R2b1 implementation baseline:** `main` at `7b788c1f` on 2026-07-12
-- **Completed through:** R2b2 implementation and closure re-review 2 `APPROVE` at `0c0e3fe`
+- **Completed through:** R2b2d `14402f8`; final folds `a459b31` and `e63d4d0`; closure re-review 2
+  `APPROVE` at `0c0e3fe`
 - **Current exact gate:** **1,100 / 0 / 0 ignored** across the six affected packages; format/diff,
   workspace/all-target check, warnings-denied Clippy, and release build clean
 - **Full workspace gate:** host serial **1,816 / 0 / 12 ignored**; repository hygiene **37** tracked
   artifacts / **7** validated example configs
+- **Current execution boundary:** no live/billable gate ran; no docs-link checker is present
 - **Next action:** merge R2b2 to `main`, then begin independently reviewed R2b3
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -24,7 +26,7 @@ and completion evidence.
 R2a provenance (MERGED)
   -> R2b0 contract clarifications (MERGED)
   -> R2b1 diagnostic types + rollback-safe persistence surface (MERGED)
-  -> R2b2 ACP/Fable lifecycle evidence + no-replay/warm-session safety (IN PROGRESS)
+  -> R2b2 ACP/Fable lifecycle evidence + no-replay/warm-session safety (IN REVIEW)
   -> R2b3 API/provider mapping + remaining container/dispatch observation
   -> R2c explicit one-turn billable smoke
        -> R2d local non-billable fallback plan
@@ -260,7 +262,8 @@ Next action:
   `407907202982d732c2395be0f6319f6029622f82` after final review 7 `APPROVE` and exact-tree full gates;
   R2b2d is approved/pushed at `14402f895a5eda2852684a8fbd35f83452e2645f`, and the aggregate final-review
   folds are committed at `a459b31de5a4665138a7330868e38dfb8992438b` and
-  `e63d4d085e8dd51424cdedebda7aa64b9f1a8b01`, with re-review 2 pending.
+  `e63d4d085e8dd51424cdedebda7aa64b9f1a8b01`. Fresh Sol/xhigh closure re-review 2 returned `APPROVE`
+  on published head `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`; merge is pending.
 - R2b2a adds bounded/no-op/task-journal diagnostic observers and explicit factories, composite backend
   compatibility methods, `resolve_observed`, legacy/observed registry spawn constructors, initializer-only
   observer ownership, cache/waiter `backend.reused`, and live `new_observed` wiring. No ACP lifecycle
@@ -542,4 +545,4 @@ Next action:
   `WRONG/MAJOR` and branch-completeness `SMELL/MAJOR` `FIXED`, confirmed the earlier ready-result and terminal
   folds remain closed, found no new findings, and returned `APPROVE`. The retained Git-fixture and bounded-yield
   debts remain minor. Exact published head was `0c0e3feefa8d66169d4ee18faa9911d5fb1a32d8`; no live/billable gate
-  ran. Merge R2b2, then begin R2b3.
+  ran, and no docs-link checker is present. Merge R2b2, then begin R2b3.
