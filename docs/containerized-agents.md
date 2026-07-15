@@ -231,6 +231,14 @@ root via a symlink.
 > shared `:rw` target (the clone/scratch on the host), not the container. (A warm-pool for writers is a
 > separate future slice.)
 
+> **Joinable cleanup diagnostics.** Release, warm retirement, and detached drop share one bounded
+> per-session reap flight. An observed release waits for that flight and returns its stable typed result to
+> every waiter; retirement starts cleanup before cancellable agent termination. Failures surface as
+> `container.reap.spawn_failed`, `container.reap.timeout`, `container.reap.nonzero_exit`, or
+> `container.reap.worker_panicked` and remain fatal accepted work. An observer failure cannot suppress the
+> reap, and a detached teardown does not write diagnostics after the task owner has gone away. Do not
+> interpret a cleanup failure as permission to replay the prompt or silently fall back to a host agent.
+
 Set the per-request `:rw` target via **`serve` + A2A** (`message.metadata` cwd) or, for **`run-workflow`**,
 the `--session-cwd <dir>` flag — without it, agents run in the LAUNCH cwd, not the target repo.
 

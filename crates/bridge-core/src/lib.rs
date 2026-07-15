@@ -12,6 +12,7 @@ pub mod permission;
 pub mod ports;
 pub mod process;
 pub mod profile;
+pub mod provider;
 pub mod reaper;
 pub mod run_identity;
 pub mod sandbox;

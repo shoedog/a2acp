@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,8 +16,10 @@ use bridge_core::domain::{Part, SandboxConfig, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
 use bridge_core::permission::TurnMeta;
-use bridge_core::ports::{AgentBackend, BackendStream};
-use bridge_core::reaper::{production_reap_fn, reap_once, spawn_detached, ReapFn};
+use bridge_core::ports::{
+    AgentBackend, BackendObservers, BackendStream, DiagnosticObserver, RichEventSink,
+};
+use bridge_core::reaper::{spawn_detached, ReapController, ReapFailure, ReapFn};
 use bridge_core::run_identity::RunHandle;
 use bridge_core::sandbox::{a2a_name, check_rw_target, compose_container_rw};
 use bridge_core::session_cwd::SessionCwd;
@@ -34,6 +36,121 @@ pub trait ContainerSpawn: Send + Sync {
         argv: &[String],
         cfg: AcpConfig,
     ) -> Result<Arc<dyn AgentBackend>, BridgeError>;
+
+    async fn spawn_observed(
+        &self,
+        program: &str,
+        argv: &[String],
+        cfg: AcpConfig,
+        _observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+        self.spawn(program, argv, cfg).await
+    }
+}
+
+async fn record_container_transition(
+    observer: &Arc<dyn DiagnosticObserver>,
+    phase: bridge_core::diagnostics::DiagnosticPhase,
+    status: bridge_core::diagnostics::PhaseStatus,
+    code: Option<&'static str>,
+) -> Result<(), BridgeError> {
+    use bridge_core::diagnostics::{
+        diagnostic_timestamp_ms, DiagnosticEvent, DiagnosticRedactor, PersistedPhaseTransition,
+        PersistedPhaseTransitionInput,
+    };
+    let redactor = DiagnosticRedactor::default();
+    let transition = PersistedPhaseTransition::build_static_code(
+        PersistedPhaseTransitionInput {
+            phase,
+            status,
+            at_ms: diagnostic_timestamp_ms(),
+            operation: None,
+            code: None,
+            auth: None,
+        },
+        code,
+        &redactor,
+    )
+    .map_err(|_| BridgeError::InvalidStateTransition)?;
+    let event =
+        DiagnosticEvent::new(transition, None).map_err(|_| BridgeError::InvalidStateTransition)?;
+    observer.record(event).await
+}
+
+fn build_reap_failure(
+    failure: ReapFailure,
+) -> Result<bridge_core::diagnostics::FailureDiagnostic, BridgeError> {
+    use bridge_core::diagnostics::{
+        DiagnosticFailureClass, DiagnosticPhase, DiagnosticRedactor, FailureDiagnostic,
+        FailureDiagnosticInput, FailureDisposition,
+    };
+    FailureDiagnostic::build_static_code(
+        FailureDiagnosticInput {
+            failed_phase: DiagnosticPhase::Teardown,
+            last_completed_phase: None,
+            class: DiagnosticFailureClass::ContainerRuntime,
+            disposition: FailureDisposition::Fatal,
+            code: String::new(),
+            summary: "Container removal failed".into(),
+            causes: vec![],
+            stderr_observed: false,
+            stderr_line_count: 0,
+            stderr_scope: None,
+            stderr_tail: None,
+            stderr_redaction: None,
+            retry_after_ms: None,
+            reset_at_ms: None,
+            // Cleanup follows an arbitrary warm turn; fail closed for replay and
+            // fallback even when this particular session never crossed a prompt.
+            prompt_may_have_been_accepted: true,
+        },
+        failure.code(),
+        &DiagnosticRedactor::default(),
+    )
+    .map_err(|_| BridgeError::InvalidStateTransition)
+}
+
+fn container_reap_failure_error(
+    diagnostic: bridge_core::diagnostics::FailureDiagnostic,
+) -> BridgeError {
+    BridgeError::agent_failure(diagnostic)
+}
+
+async fn record_reap_failure(
+    observer: &Arc<dyn DiagnosticObserver>,
+    failure: ReapFailure,
+) -> BridgeError {
+    use bridge_core::diagnostics::{
+        diagnostic_timestamp_ms, DiagnosticEvent, DiagnosticPhase, DiagnosticRedactor,
+        PersistedPhaseTransition, PersistedPhaseTransitionInput, PhaseStatus,
+    };
+    let diagnostic = match build_reap_failure(failure) {
+        Ok(diagnostic) => diagnostic,
+        Err(error) => return error,
+    };
+    let transition = match PersistedPhaseTransition::build_static_code(
+        PersistedPhaseTransitionInput {
+            phase: DiagnosticPhase::Teardown,
+            status: PhaseStatus::Failed,
+            at_ms: diagnostic_timestamp_ms(),
+            operation: None,
+            code: None,
+            auth: None,
+        },
+        Some(failure.code()),
+        &DiagnosticRedactor::default(),
+    ) {
+        Ok(transition) => transition,
+        Err(_) => return BridgeError::InvalidStateTransition,
+    };
+    let event = match DiagnosticEvent::new(transition, Some(diagnostic.clone())) {
+        Ok(event) => event,
+        Err(_) => return BridgeError::InvalidStateTransition,
+    };
+    match observer.record(event).await {
+        Ok(()) => container_reap_failure_error(diagnostic),
+        Err(error) => error,
+    }
 }
 
 /// Static config for a `ContainerRw` agent (cheap, no Docker at construction — crash-orphan recovery is
@@ -66,8 +183,7 @@ pub struct ContainerRwConfig {
 /// the stream-owned [`ContainerReaper`] so cancel + stream-drop can't double-reap.
 struct InflightTurn {
     inner: Arc<dyn AgentBackend>,
-    name: String,
-    reaped: Arc<AtomicBool>,
+    reap: ReapController,
 }
 
 /// A spawned, configured inner backend + its container identity. Shared shape for per-turn (promoted to
@@ -75,8 +191,7 @@ struct InflightTurn {
 /// session was configured with (re-applied on a warm reuse turn).
 struct WarmInner {
     inner: Arc<dyn AgentBackend>,
-    name: String,
-    reaped: Arc<AtomicBool>,
+    reap: ReapController,
     rw_canon: SessionCwd,
 }
 
@@ -88,6 +203,7 @@ enum InflightState {
 }
 
 type Inflight = Arc<Mutex<HashMap<SessionId, InflightState>>>;
+type ReapFactory = Arc<dyn Fn(String, String) -> ReapController + Send + Sync>;
 
 /// Per-turn (cold) vs warm (one container + session reused across turns, reaped only at `retire`).
 #[derive(Clone, Copy, PartialEq)]
@@ -99,7 +215,7 @@ enum Lifecycle {
 pub struct ContainerRwBackend {
     cfg: ContainerRwConfig,
     spawn: Arc<dyn ContainerSpawn>,
-    reap_fn: ReapFn,
+    reap_factory: ReapFactory,
     /// STABLE per-instance owner token (hash of config-path + mount + agent id), set by the caller.
     owner: String,
     session_cfg: Mutex<HashMap<SessionId, SessionSpec>>,
@@ -109,6 +225,11 @@ pub struct ContainerRwBackend {
     lifecycle: Lifecycle,
     /// Warm mode only: the authoritative cached container/session per `SessionId` (drained at `retire`).
     warm: Mutex<HashMap<SessionId, WarmInner>>,
+    /// Latest per-session join handle, installed as soon as a named container
+    /// is owned. This survives spawn/config/prompt failure and cache/inflight
+    /// removal so observed cleanup can join the exact detached attempt. A later
+    /// container generation for the same session replaces the settled entry.
+    session_reaps: Mutex<HashMap<SessionId, ReapController>>,
     /// Warm mode only: sessions with an in-flight turn → the turn's monotonic epoch (concurrency reject).
     /// The epoch lets a stale (early-drop) detached clear remove ONLY its own turn's marker, never a later
     /// turn's (review finding: a bare `HashSet` clear could erase the next turn's marker).
@@ -129,10 +250,22 @@ impl ContainerRwBackend {
         owner: String,
         reap_fn: ReapFn,
     ) -> Result<Self, BridgeError> {
+        let reap_factory: ReapFactory = Arc::new(move |runtime, name| {
+            ReapController::from_legacy(runtime, name, Arc::clone(&reap_fn))
+        });
+        Self::new_with_reap_factory(cfg, spawn, owner, reap_factory).await
+    }
+
+    async fn new_with_reap_factory(
+        cfg: ContainerRwConfig,
+        spawn: Arc<dyn ContainerSpawn>,
+        owner: String,
+        reap_factory: ReapFactory,
+    ) -> Result<Self, BridgeError> {
         Ok(Self {
             cfg,
             spawn,
-            reap_fn,
+            reap_factory,
             owner,
             session_cfg: Mutex::new(HashMap::new()),
             pending_turn_meta: Mutex::new(HashMap::new()),
@@ -140,6 +273,7 @@ impl ContainerRwBackend {
             turn_seq: AtomicU64::new(0),
             lifecycle: Lifecycle::PerTurn,
             warm: Mutex::new(HashMap::new()),
+            session_reaps: Mutex::new(HashMap::new()),
             turn_active: Arc::new(Mutex::new(HashMap::new())),
             turn_epoch: AtomicU64::new(0),
         })
@@ -164,7 +298,10 @@ impl ContainerRwBackend {
         spawn: Arc<dyn ContainerSpawn>,
         owner: String,
     ) -> Result<Self, BridgeError> {
-        Self::new_warm_with_hooks(cfg, spawn, owner, production_reap_fn()).await
+        let reap_factory: ReapFactory = Arc::new(ReapController::production);
+        let mut backend = Self::new_with_reap_factory(cfg, spawn, owner, reap_factory).await?;
+        backend.lifecycle = Lifecycle::Warm;
+        Ok(backend)
     }
 
     fn is_warm(&self) -> bool {
@@ -178,7 +315,8 @@ impl ContainerRwBackend {
         spawn: Arc<dyn ContainerSpawn>,
         owner: String,
     ) -> Result<Self, BridgeError> {
-        Self::new_with_hooks(cfg, spawn, owner, production_reap_fn()).await
+        let reap_factory: ReapFactory = Arc::new(ReapController::production);
+        Self::new_with_reap_factory(cfg, spawn, owner, reap_factory).await
     }
 
     /// Canonicalize BOTH the mount anchor and the rw target (resolving symlinks — the writable-mount
@@ -202,6 +340,7 @@ impl ContainerRwBackend {
         &self,
         session: &SessionId,
         spec: &SessionSpec,
+        diagnostic_observer: Option<Arc<dyn DiagnosticObserver>>,
     ) -> Result<WarmInner, BridgeError> {
         let runtime = self.cfg.sandbox.runtime().to_string();
         let cwd = spec.cwd.clone().ok_or(BridgeError::ConfigInvalid {
@@ -212,6 +351,11 @@ impl ContainerRwBackend {
         // Increment A: the run-id segment defeats same-owner concurrent name clashes; the label set is
         // built PER MINT so `kind` (warm|perturn) is never stale and `repo`/`cwd` reflect this :rw target.
         let name = a2a_name("rw", &self.owner, &self.cfg.run.instance_id, &n.to_string());
+        let reap = (self.reap_factory)(runtime.clone(), name.clone());
+        self.session_reaps
+            .lock()
+            .await
+            .insert(session.clone(), reap.clone());
         let kind = if self.is_warm() { "warm" } else { "perturn" };
         let repo = rw_canon.as_str();
         let labels = self
@@ -278,25 +422,31 @@ impl ContainerRwBackend {
                 Vec::new()
             },
         };
-        let inner = match self.spawn.spawn(&program, &argv, acp).await {
+        let spawned = match diagnostic_observer {
+            Some(observer) => {
+                self.spawn
+                    .spawn_observed(&program, &argv, acp, observer)
+                    .await
+            }
+            None => self.spawn.spawn(&program, &argv, acp).await,
+        };
+        let inner = match spawned {
             Ok(i) => i,
             Err(e) => {
-                (self.reap_fn)(runtime.clone(), name.clone()); // spawn-failure reap (never inserted)
+                reap.reap_detached(); // spawn-failure reap (never inserted)
                 return Err(e);
             }
         };
-        let reaped = Arc::new(AtomicBool::new(false));
         // The inner prefers the stashed SessionSpec.cwd over AcpConfig.cwd → configure with CANONICAL cwd.
         let mut spec_canon = spec.clone();
         spec_canon.cwd = Some(rw_canon.clone());
         if let Err(e) = inner.configure_session(session, &spec_canon).await {
-            reap_once(&self.reap_fn, &runtime, &name, &reaped);
+            reap.reap_detached();
             return Err(e);
         }
         Ok(WarmInner {
             inner,
-            name,
-            reaped,
+            reap,
             rw_canon,
         })
     }
@@ -312,6 +462,7 @@ impl ContainerRwBackend {
         &self,
         session: &SessionId,
         parts: Vec<Part>,
+        observers: Option<BackendObservers>,
     ) -> Result<BackendStream, BridgeError> {
         let meta = { self.pending_turn_meta.lock().await.remove(session) };
         let spec = self.session_cfg.lock().await.get(session).cloned().ok_or(
@@ -345,13 +496,45 @@ impl ContainerRwBackend {
         let cache_miss = !self.warm.lock().await.contains_key(session);
         if cache_miss {
             // `open_inner` already reaps on its own failure; nothing inserted yet.
-            let wi = match self.open_inner(session, &spec).await {
+            let wi = match self
+                .open_inner(
+                    session,
+                    &spec,
+                    observers
+                        .as_ref()
+                        .map(|observers| Arc::clone(&observers.diagnostic)),
+                )
+                .await
+            {
                 Ok(wi) => wi,
                 Err(e) => fail!(e),
             };
             self.warm.lock().await.insert(session.clone(), wi);
             // NO re-configure on cache-miss: open_inner already configured with the canonical cwd.
         } else {
+            if let Some(observers) = &observers {
+                use bridge_core::diagnostics::{DiagnosticPhase, PhaseStatus};
+                if let Err(error) = record_container_transition(
+                    &observers.diagnostic,
+                    DiagnosticPhase::Resolve,
+                    PhaseStatus::Started,
+                    None,
+                )
+                .await
+                {
+                    fail!(error);
+                }
+                if let Err(error) = record_container_transition(
+                    &observers.diagnostic,
+                    DiagnosticPhase::Resolve,
+                    PhaseStatus::Completed,
+                    Some("backend.reused"),
+                )
+                .await
+                {
+                    fail!(error);
+                }
+            }
             // Reuse: re-apply the cached canonical cwd. A concurrent `retire` can drain the entry after the
             // cache-hit check above → treat absence as "retired under me" (Err, NOT a panic on unwrap).
             let reuse = {
@@ -373,10 +556,9 @@ impl ContainerRwBackend {
         }
         let got = {
             let w = self.warm.lock().await;
-            w.get(session)
-                .map(|wi| (wi.inner.clone(), wi.name.clone(), wi.reaped.clone()))
+            w.get(session).map(|wi| (wi.inner.clone(), wi.reap.clone()))
         };
-        let (inner, name, reaped) = match got {
+        let (inner, reap) = match got {
             Some(t) => t,
             None => fail!(BridgeError::agent_crashed(
                 "warm session retired during prompt"
@@ -385,13 +567,17 @@ impl ContainerRwBackend {
         if let Some(meta) = meta {
             inner.configure_turn(session, meta).await;
         }
-        let inner_stream = match inner.prompt(session, parts).await {
+        let prompt_result = match observers {
+            Some(observers) => inner.prompt_with_observers(session, parts, observers).await,
+            None => inner.prompt(session, parts).await,
+        };
+        let inner_stream = match prompt_result {
             Ok(s) => s,
             Err(e) => {
                 if cache_miss {
                     // First-turn failure → reap + remove (no cumulative work to protect).
                     self.warm.lock().await.remove(session);
-                    reap_once(&self.reap_fn, self.cfg.sandbox.runtime(), &name, &reaped);
+                    reap.reap_detached();
                 }
                 fail!(e) // reuse: keep the warm entry, do NOT reap
             }
@@ -425,10 +611,11 @@ impl ContainerRwBackend {
     /// `turn_active` marker (a held/raced stream could leave one behind).
     async fn retire_warm(&self) -> Result<(), BridgeError> {
         let entries: Vec<(SessionId, WarmInner)> = { self.warm.lock().await.drain().collect() };
-        let runtime = self.cfg.sandbox.runtime().to_string();
+        for (_, wi) in &entries {
+            wi.reap.reap_detached();
+        }
         for (s, wi) in entries {
             let _ = wi.inner.cancel(&s).await;
-            reap_once(&self.reap_fn, &runtime, &wi.name, &wi.reaped);
             self.turn_active.lock().await.remove(&s);
         }
         Ok(())
@@ -437,28 +624,170 @@ impl ContainerRwBackend {
     /// Reap ONE warm session's container (per-session analogue of `retire_warm`).
     async fn release_warm(&self, session: &SessionId) {
         let wi = self.warm.lock().await.remove(session);
+        let reap = match &wi {
+            Some(wi) => Some(wi.reap.clone()),
+            None => self.session_reaps.lock().await.get(session).cloned(),
+        };
+        if let Some(reap) = &reap {
+            reap.reap_detached();
+        }
         if let Some(wi) = wi {
             let _ = wi.inner.cancel(session).await;
-            reap_once(
-                &self.reap_fn,
-                self.cfg.sandbox.runtime(),
-                &wi.name,
-                &wi.reaped,
-            );
         }
         self.turn_active.lock().await.remove(session);
     }
+
+    async fn release_warm_checked(&self, session: &SessionId) -> Result<(), ReapFailure> {
+        let wi = self.warm.lock().await.remove(session);
+        let reap = match &wi {
+            Some(wi) => Some(wi.reap.clone()),
+            None => self.session_reaps.lock().await.get(session).cloned(),
+        };
+        if let Some(reap) = &reap {
+            // Start before any cancellable await so dropping this waiter cannot
+            // suppress process-owned cleanup.
+            reap.reap_detached();
+        }
+        if let Some(wi) = wi {
+            let _ = wi.inner.cancel(session).await;
+        }
+        self.turn_active.lock().await.remove(session);
+        match reap {
+            Some(reap) => reap.reap_observed().await,
+            None => Ok(()),
+        }
+    }
+
+    async fn release_warm_observed(
+        &self,
+        session: &SessionId,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<(), BridgeError> {
+        use bridge_core::diagnostics::{DiagnosticPhase, PhaseStatus};
+
+        let wi = self.warm.lock().await.remove(session);
+        let reap = match &wi {
+            Some(wi) => Some(wi.reap.clone()),
+            None => self.session_reaps.lock().await.get(session).cloned(),
+        };
+        if let Some(reap) = &reap {
+            reap.reap_detached();
+        }
+        let start_result = record_container_transition(
+            &observer,
+            DiagnosticPhase::Teardown,
+            PhaseStatus::Started,
+            Some("container.teardown.reap"),
+        )
+        .await;
+
+        if let Some(wi) = wi {
+            let _ = wi.inner.cancel(session).await;
+        }
+        self.turn_active.lock().await.remove(session);
+        let reap_result = match reap {
+            Some(reap) => reap.reap_observed().await,
+            None => Ok(()),
+        };
+        start_result?;
+        match reap_result {
+            Ok(()) => {
+                record_container_transition(
+                    &observer,
+                    DiagnosticPhase::Teardown,
+                    PhaseStatus::Completed,
+                    Some("container.teardown.reaped"),
+                )
+                .await
+            }
+            Err(failure) => Err(record_reap_failure(&observer, failure).await),
+        }
+    }
+
+    async fn release_cold_checked(&self, session: &SessionId) -> Result<(), ReapFailure> {
+        let inflight_reap = {
+            let inflight = self.inflight.lock().await;
+            match inflight.get(session) {
+                Some(InflightState::Live(turn)) => Some((turn.inner.clone(), turn.reap.clone())),
+                Some(InflightState::Reserving) | None => None,
+            }
+        };
+        let reap = match &inflight_reap {
+            Some((_, reap)) => Some(reap.clone()),
+            None => self.session_reaps.lock().await.get(session).cloned(),
+        };
+        if let Some(reap) = &reap {
+            reap.reap_detached();
+        }
+        if let Some((inner, _)) = inflight_reap {
+            let _ = inner.cancel(session).await;
+        }
+        match reap {
+            Some(reap) => reap.reap_observed().await,
+            None => Ok(()),
+        }
+    }
+
+    async fn release_cold_observed(
+        &self,
+        session: &SessionId,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<(), BridgeError> {
+        use bridge_core::diagnostics::{DiagnosticPhase, PhaseStatus};
+
+        let inflight_reap = {
+            let inflight = self.inflight.lock().await;
+            match inflight.get(session) {
+                Some(InflightState::Live(turn)) => Some((turn.inner.clone(), turn.reap.clone())),
+                Some(InflightState::Reserving) | None => None,
+            }
+        };
+        let reap = match &inflight_reap {
+            Some((_, reap)) => Some(reap.clone()),
+            None => self.session_reaps.lock().await.get(session).cloned(),
+        };
+        if let Some(reap) = &reap {
+            reap.reap_detached();
+        }
+        let start_result = record_container_transition(
+            &observer,
+            DiagnosticPhase::Teardown,
+            PhaseStatus::Started,
+            Some("container.teardown.reap"),
+        )
+        .await;
+        if let Some((inner, _)) = inflight_reap {
+            let _ = inner.cancel(session).await;
+        }
+        let reap_result = match reap {
+            Some(reap) => reap.reap_observed().await,
+            None => Ok(()),
+        };
+        start_result?;
+        match reap_result {
+            Ok(()) => {
+                record_container_transition(
+                    &observer,
+                    DiagnosticPhase::Teardown,
+                    PhaseStatus::Completed,
+                    Some("container.teardown.reaped"),
+                )
+                .await
+            }
+            Err(failure) => Err(record_reap_failure(&observer, failure).await),
+        }
+    }
 }
 
-#[async_trait]
-impl AgentBackend for ContainerRwBackend {
-    async fn prompt(
+impl ContainerRwBackend {
+    async fn prompt_inner(
         &self,
         session: &SessionId,
         parts: Vec<Part>,
+        observers: Option<BackendObservers>,
     ) -> Result<BackendStream, BridgeError> {
         if self.is_warm() {
-            return self.prompt_warm(session, parts).await;
+            return self.prompt_warm(session, parts, observers).await;
         }
 
         let meta = { self.pending_turn_meta.lock().await.remove(session) };
@@ -487,8 +816,16 @@ impl AgentBackend for ContainerRwBackend {
             m.insert(session.clone(), InflightState::Reserving);
         }
         // From here every error path must remove the reservation (open_inner reaps on its own failure).
-        let runtime = self.cfg.sandbox.runtime().to_string();
-        let wi = match self.open_inner(session, &spec).await {
+        let wi = match self
+            .open_inner(
+                session,
+                &spec,
+                observers
+                    .as_ref()
+                    .map(|observers| Arc::clone(&observers.diagnostic)),
+            )
+            .await
+        {
             Ok(wi) => wi,
             Err(e) => {
                 self.inflight.lock().await.remove(session);
@@ -501,32 +838,73 @@ impl AgentBackend for ContainerRwBackend {
             session.clone(),
             InflightState::Live(InflightTurn {
                 inner: wi.inner.clone(),
-                name: wi.name.clone(),
-                reaped: wi.reaped.clone(),
+                reap: wi.reap.clone(),
             }),
         );
 
         if let Some(meta) = meta {
             wi.inner.configure_turn(session, meta).await;
         }
-        let inner_stream = match wi.inner.prompt(session, parts).await {
+        let prompt_result = match observers {
+            Some(observers) => {
+                wi.inner
+                    .prompt_with_observers(session, parts, observers)
+                    .await
+            }
+            None => wi.inner.prompt(session, parts).await,
+        };
+        let inner_stream = match prompt_result {
             Ok(s) => s,
             Err(e) => {
                 self.inflight.lock().await.remove(session);
-                reap_once(&self.reap_fn, &runtime, &wi.name, &wi.reaped);
+                wi.reap.reap_detached();
                 return Err(e);
             }
         };
 
         let reaper = ContainerReaper {
-            runtime,
-            name: wi.name,
-            reap_fn: self.reap_fn.clone(),
-            reaped: wi.reaped,
+            reap: wi.reap,
             inflight: self.inflight.clone(),
             session: session.clone(),
         };
         Ok(wrap_with_reaper(wi.inner, inner_stream, reaper))
+    }
+}
+
+#[async_trait]
+impl AgentBackend for ContainerRwBackend {
+    async fn prompt(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+    ) -> Result<BackendStream, BridgeError> {
+        self.prompt_inner(session, parts, None).await
+    }
+
+    async fn prompt_observed(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+        sink: Arc<dyn RichEventSink>,
+    ) -> Result<BackendStream, BridgeError> {
+        self.prompt_inner(
+            session,
+            parts,
+            Some(BackendObservers::new(
+                Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+                Some(sink),
+            )),
+        )
+        .await
+    }
+
+    async fn prompt_with_observers(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+        observers: BackendObservers,
+    ) -> Result<BackendStream, BridgeError> {
+        self.prompt_inner(session, parts, Some(observers)).await
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
@@ -541,13 +919,8 @@ impl AgentBackend for ContainerRwBackend {
             }
         };
         if let Some(t) = turn {
-            let _ = t.inner.cancel(session).await; // graceful session/cancel first
-            reap_once(
-                &self.reap_fn,
-                self.cfg.sandbox.runtime(),
-                &t.name,
-                &t.reaped,
-            );
+            t.reap.reap_detached();
+            let _ = t.inner.cancel(session).await;
         }
         Ok(())
     }
@@ -575,6 +948,9 @@ impl AgentBackend for ContainerRwBackend {
     async fn forget_session(&self, session: &SessionId) {
         self.session_cfg.lock().await.remove(session);
         self.pending_turn_meta.lock().await.remove(session);
+        if !self.is_warm() {
+            self.session_reaps.lock().await.remove(session);
+        }
     }
 
     async fn release_session(&self, session: &SessionId) {
@@ -583,6 +959,36 @@ impl AgentBackend for ContainerRwBackend {
         }
         self.session_cfg.lock().await.remove(session);
         self.pending_turn_meta.lock().await.remove(session);
+        self.session_reaps.lock().await.remove(session);
+    }
+
+    async fn release_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
+        let result = if self.is_warm() {
+            self.release_warm_checked(session).await
+        } else {
+            self.release_cold_checked(session).await
+        };
+        self.session_cfg.lock().await.remove(session);
+        self.pending_turn_meta.lock().await.remove(session);
+        result.map_err(|failure| match build_reap_failure(failure) {
+            Ok(diagnostic) => container_reap_failure_error(diagnostic),
+            Err(error) => error,
+        })
+    }
+
+    async fn release_session_observed(
+        &self,
+        session: &SessionId,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<(), BridgeError> {
+        let result = if self.is_warm() {
+            self.release_warm_observed(session, observer).await
+        } else {
+            self.release_cold_observed(session, observer).await
+        };
+        self.session_cfg.lock().await.remove(session);
+        self.pending_turn_meta.lock().await.remove(session);
+        result
     }
 
     async fn retire(&self) -> Result<(), BridgeError> {
@@ -598,14 +1004,11 @@ impl AgentBackend for ContainerRwBackend {
                 })
                 .collect()
         };
+        for (_, turn) in &turns {
+            turn.reap.reap_detached();
+        }
         for (s, t) in turns {
             let _ = t.inner.cancel(&s).await;
-            reap_once(
-                &self.reap_fn,
-                self.cfg.sandbox.runtime(),
-                &t.name,
-                &t.reaped,
-            );
         }
         Ok(())
     }
@@ -614,10 +1017,7 @@ impl AgentBackend for ContainerRwBackend {
 /// Owned by the returned stream: reaps the container + clears the inflight entry on EVERY exit path
 /// (Done / error / consumer-drop). Reap is idempotent + detached — `Drop` never blocks a worker.
 struct ContainerReaper {
-    runtime: String,
-    name: String,
-    reap_fn: ReapFn,
-    reaped: Arc<AtomicBool>,
+    reap: ReapController,
     inflight: Inflight,
     session: SessionId,
 }
@@ -634,7 +1034,7 @@ impl Drop for ContainerReaper {
         spawn_detached(async move {
             inflight.lock().await.remove(&session);
         });
-        reap_once(&self.reap_fn, &self.runtime, &self.name, &self.reaped);
+        self.reap.reap_detached();
     }
 }
 
@@ -747,11 +1147,18 @@ fn canonicalize_lenient(path: &str) -> Result<SessionCwd, BridgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bridge_core::diagnostics::{
+        diagnostic_timestamp_ms, DiagnosticEvent, DiagnosticPhase, DiagnosticRedactor,
+        InMemoryDiagnosticObserver, PersistedPhaseTransition, PersistedPhaseTransitionInput,
+        PhaseStatus,
+    };
     use bridge_core::domain::{EffectiveConfig, EgressPolicy, MountAccess};
     use bridge_core::ids::{ContextId, OperationId};
     use bridge_core::permission::TurnMeta;
+    use bridge_core::ports::{BackendObservers, DiagnosticObserver, RichEventSink};
+    use bridge_core::reaper::ReapAttemptFn;
     use std::collections::HashSet;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     // ---- stubs -------------------------------------------------------------
 
@@ -765,6 +1172,7 @@ mod tests {
         fail_prompt: AtomicBool,
         configured_turns: Mutex<Vec<(SessionId, TurnMeta)>>,
         call_order: Mutex<Vec<&'static str>>,
+        cancel_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
     #[async_trait]
     impl AgentBackend for StubInner {
@@ -783,6 +1191,10 @@ mod tests {
         }
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
             self.canceled.store(true, Ordering::SeqCst);
+            if let Some((entered, release)) = &self.cancel_gate {
+                entered.notify_one();
+                release.notified().await;
+            }
             Ok(())
         }
         async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
@@ -792,27 +1204,65 @@ mod tests {
                 .push((session.clone(), meta));
             self.call_order.lock().await.push("configure_turn");
         }
+
+        async fn prompt_with_observers(
+            &self,
+            session: &SessionId,
+            parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            if let Some(sink) = observers.rich {
+                sink.record(bridge_core::orch::OrchEventKind::ToolCall {
+                    tool_call_id: "tool-1".into(),
+                    title: "container test".into(),
+                    kind: "read".into(),
+                    status: "completed".into(),
+                    locations: vec![],
+                    content: None,
+                });
+            }
+            self.prompt(session, parts).await
+        }
     }
 
     struct CountingSpawn {
         count: AtomicUsize,
         fail: bool,
         fail_prompt: bool,
+        observed_count: AtomicUsize,
         last_argv: Mutex<Vec<String>>,
         last_acp_mcp: Mutex<Vec<bridge_core::mcp::McpServerSpec>>,
         last_diagnostic_redactor: Mutex<Option<bridge_core::diagnostics::DiagnosticRedactor>>,
         last_inner: Mutex<Option<Arc<StubInner>>>,
+        cancel_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
     impl CountingSpawn {
         fn new(fail: bool) -> Arc<Self> {
+            Self::with_optional_cancel_gate(fail, None)
+        }
+
+        fn with_cancel_gate(
+            fail: bool,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        ) -> Arc<Self> {
+            Self::with_optional_cancel_gate(fail, Some((entered, release)))
+        }
+
+        fn with_optional_cancel_gate(
+            fail: bool,
+            cancel_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 count: AtomicUsize::new(0),
                 fail,
                 fail_prompt: false,
+                observed_count: AtomicUsize::new(0),
                 last_argv: Mutex::new(vec![]),
                 last_acp_mcp: Mutex::new(vec![]),
                 last_diagnostic_redactor: Mutex::new(None),
                 last_inner: Mutex::new(None),
+                cancel_gate,
             })
         }
     }
@@ -838,9 +1288,72 @@ mod tests {
                 fail_prompt: AtomicBool::new(self.fail_prompt),
                 configured_turns: Mutex::new(Vec::new()),
                 call_order: Mutex::new(Vec::new()),
+                cancel_gate: self.cancel_gate.clone(),
             });
             *self.last_inner.lock().await = Some(inner.clone());
             Ok(inner)
+        }
+
+        async fn spawn_observed(
+            &self,
+            program: &str,
+            argv: &[String],
+            cfg: AcpConfig,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+            self.observed_count.fetch_add(1, Ordering::SeqCst);
+            observer
+                .record(test_transition(
+                    DiagnosticPhase::Spawn,
+                    PhaseStatus::Started,
+                    None,
+                ))
+                .await?;
+            let inner = self.spawn(program, argv, cfg).await?;
+            observer
+                .record(test_transition(
+                    DiagnosticPhase::Spawn,
+                    PhaseStatus::Completed,
+                    None,
+                ))
+                .await?;
+            Ok(inner)
+        }
+    }
+
+    fn test_transition(
+        phase: DiagnosticPhase,
+        status: PhaseStatus,
+        code: Option<&'static str>,
+    ) -> DiagnosticEvent {
+        let redactor = DiagnosticRedactor::default();
+        let transition = PersistedPhaseTransition::build_static_code(
+            PersistedPhaseTransitionInput {
+                phase,
+                status,
+                at_ms: diagnostic_timestamp_ms(),
+                operation: None,
+                code: None,
+                auth: None,
+            },
+            code,
+            &redactor,
+        )
+        .unwrap();
+        DiagnosticEvent::new(transition, None).unwrap()
+    }
+
+    #[derive(Default)]
+    struct CountingRichSink(AtomicUsize);
+
+    #[async_trait]
+    impl RichEventSink for CountingRichSink {
+        fn record(&self, _kind: bridge_core::orch::OrchEventKind) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn flush(&self) -> Result<(), BridgeError> {
+            Ok(())
         }
     }
 
@@ -851,6 +1364,16 @@ mod tests {
             n2.fetch_add(1, Ordering::SeqCst);
         });
         (f, n)
+    }
+
+    async fn wait_for_reaps(reaps: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while reaps.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached reap starts within the test bound");
     }
     fn cfg_with_mount(mount: &str) -> ContainerRwConfig {
         ContainerRwConfig {
@@ -900,6 +1423,42 @@ mod tests {
         ContainerRwBackend::new_warm_with_hooks(cfg_with_mount(mount), spawn, "inst".into(), reap)
             .await
             .unwrap()
+    }
+
+    async fn warm_backend_with_attempt(
+        mount: &str,
+        spawn: Arc<dyn ContainerSpawn>,
+        attempt: ReapAttemptFn,
+    ) -> ContainerRwBackend {
+        let factory: ReapFactory =
+            Arc::new(move |runtime, name| ReapController::new(runtime, name, Arc::clone(&attempt)));
+        let mut backend = ContainerRwBackend::new_with_reap_factory(
+            cfg_with_mount(mount),
+            spawn,
+            "inst".into(),
+            factory,
+        )
+        .await
+        .unwrap();
+        backend.lifecycle = Lifecycle::Warm;
+        backend
+    }
+
+    async fn backend_with_attempt(
+        mount: &str,
+        spawn: Arc<dyn ContainerSpawn>,
+        attempt: ReapAttemptFn,
+    ) -> ContainerRwBackend {
+        let factory: ReapFactory =
+            Arc::new(move |runtime, name| ReapController::new(runtime, name, Arc::clone(&attempt)));
+        ContainerRwBackend::new_with_reap_factory(
+            cfg_with_mount(mount),
+            spawn,
+            "inst".into(),
+            factory,
+        )
+        .await
+        .unwrap()
     }
     fn spec_cwd(p: &str) -> SessionSpec {
         SessionSpec {
@@ -1154,6 +1713,7 @@ mod tests {
             .await;
         let err = prompt_err(&be, &s).await;
         assert!(format!("{err:?}").contains("boom"), "got {err:?}");
+        wait_for_reaps(&reaps, 1).await;
         assert_eq!(reaps.load(Ordering::SeqCst), 1, "spawn failure MUST reap");
         assert!(be.inflight.lock().await.is_empty(), "reservation removed");
         assert!(
@@ -1246,6 +1806,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_prompt_threads_diagnostic_and_rich_observers_through_spawn_and_inner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(false);
+        let be = backend(root, spawn.clone(), counting_reap().0).await;
+        let session = SessionId::parse("observed-cold").unwrap();
+        be.configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+        let rich = Arc::new(CountingRichSink::default());
+        let mut stream = be
+            .prompt_with_observers(
+                &session,
+                vec![],
+                BackendObservers::new(observer.clone(), Some(rich.clone())),
+            )
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        assert_eq!(spawn.observed_count.load(Ordering::SeqCst), 1);
+        assert_eq!(rich.0.load(Ordering::SeqCst), 1);
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transition().phase(), DiagnosticPhase::Spawn);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().phase(), DiagnosticPhase::Spawn);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn warm_cache_miss_is_observed_and_reuse_emits_backend_reused_without_respawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(false);
+        let be = warm_backend(root, spawn.clone(), counting_reap().0).await;
+        let session = SessionId::parse("observed-warm").unwrap();
+        be.configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+
+        let first_observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+        let first_rich = Arc::new(CountingRichSink::default());
+        let mut first = be
+            .prompt_with_observers(
+                &session,
+                vec![],
+                BackendObservers::new(first_observer.clone(), Some(first_rich.clone())),
+            )
+            .await
+            .unwrap();
+        while first.next().await.is_some() {}
+        assert_eq!(spawn.observed_count.load(Ordering::SeqCst), 1);
+        assert_eq!(first_rich.0.load(Ordering::SeqCst), 1);
+        assert!(first_observer
+            .snapshot()
+            .await
+            .iter()
+            .any(|event| event.transition().phase() == DiagnosticPhase::Spawn));
+
+        let second_observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+        let second_rich = Arc::new(CountingRichSink::default());
+        let mut second = be
+            .prompt_with_observers(
+                &session,
+                vec![],
+                BackendObservers::new(second_observer.clone(), Some(second_rich.clone())),
+            )
+            .await
+            .unwrap();
+        while second.next().await.is_some() {}
+
+        assert_eq!(spawn.observed_count.load(Ordering::SeqCst), 1);
+        assert_eq!(second_rich.0.load(Ordering::SeqCst), 1);
+        let second_events = second_observer.snapshot().await;
+        assert_eq!(second_events.len(), 2);
+        assert!(second_events
+            .iter()
+            .all(|event| event.transition().phase() == DiagnosticPhase::Resolve));
+        assert_eq!(
+            second_events[1]
+                .transition()
+                .code()
+                .map(|code| code.as_str()),
+            Some("backend.reused")
+        );
+    }
+
+    #[tokio::test]
     async fn retire_cancels_and_reaps() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_str().unwrap();
@@ -1261,6 +1911,7 @@ mod tests {
             inner.canceled.load(Ordering::SeqCst),
             "retire cancels the inner"
         );
+        wait_for_reaps(&reaps, 1).await;
         assert!(reaps.load(Ordering::SeqCst) >= 1, "retire reaps");
     }
 
@@ -1270,14 +1921,17 @@ mod tests {
         let (reap, reaps) = counting_reap();
         let inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
         let reaper = ContainerReaper {
-            runtime: "docker".into(),
-            name: "a2a-rw-inst-0".into(),
-            reap_fn: reap,
-            reaped: Arc::new(AtomicBool::new(false)),
+            reap: ReapController::from_legacy("docker", "a2a-rw-inst-0", reap),
             inflight,
             session: SessionId::parse("s1").unwrap(),
         };
         drop(reaper); // no runtime in scope → spawn_detached uses the thread fallback
+        for _ in 0..100 {
+            if reaps.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(
             reaps.load(Ordering::SeqCst),
             1,
@@ -1416,6 +2070,7 @@ mod tests {
         }
         assert_eq!(reaps.load(Ordering::SeqCst), 0, "no reap across turns");
         be.retire().await.unwrap();
+        wait_for_reaps(&reaps, 1).await;
         let inner = spawn.last_inner.lock().await.clone().unwrap();
         assert!(
             inner.canceled.load(Ordering::SeqCst),
@@ -1427,6 +2082,58 @@ mod tests {
             "reaped exactly once at retire"
         );
         assert!(be.warm.lock().await.is_empty(), "warm cache drained");
+    }
+
+    #[tokio::test]
+    async fn warm_retirement_starts_reap_before_cancellable_agent_cancel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let cancel_entered = Arc::new(tokio::sync::Notify::new());
+        let cancel_release = Arc::new(tokio::sync::Notify::new());
+        let reap_entered = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempt: ReapAttemptFn = {
+            let calls = Arc::clone(&calls);
+            let reap_entered = Arc::clone(&reap_entered);
+            Arc::new(move |_runtime, _name| {
+                let calls = Arc::clone(&calls);
+                let reap_entered = Arc::clone(&reap_entered);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    reap_entered.notify_one();
+                    Ok(())
+                })
+            })
+        };
+        let spawn = CountingSpawn::with_cancel_gate(
+            false,
+            Arc::clone(&cancel_entered),
+            Arc::clone(&cancel_release),
+        );
+        let backend = Arc::new(warm_backend_with_attempt(root, spawn, attempt).await);
+        let session = SessionId::parse("retire-cancel-window").unwrap();
+        backend
+            .configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+        let mut stream = backend.prompt(&session, vec![]).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let retire = {
+            let backend = Arc::clone(&backend);
+            tokio::spawn(async move { backend.retire().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), cancel_entered.notified())
+            .await
+            .expect("retirement reaches the gated agent cancel");
+        tokio::time::timeout(Duration::from_secs(2), reap_entered.notified())
+            .await
+            .expect("reap starts even while agent cancel remains blocked");
+        assert!(!retire.is_finished());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        cancel_release.notify_one();
+        retire.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -1444,12 +2151,209 @@ mod tests {
         while stream.next().await.is_some() {}
 
         be.release_session(&s).await;
+        wait_for_reaps(&reaps, 1).await;
         assert!(be.warm.lock().await.get(&s).is_none(), "warm entry removed");
         assert_eq!(
             reaps.load(Ordering::SeqCst),
             1,
             "exactly one container reaped"
         );
+    }
+
+    #[tokio::test]
+    async fn observed_warm_release_awaits_success_and_records_teardown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempt: ReapAttemptFn = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_runtime, _name| {
+                let calls = Arc::clone(&calls);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        };
+        let be = warm_backend_with_attempt(root, CountingSpawn::new(false), attempt).await;
+        let session = SessionId::parse("observed-release-ok").unwrap();
+        be.configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+        let mut stream = be.prompt(&session, vec![]).await.unwrap();
+        while stream.next().await.is_some() {}
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+
+        be.release_session_observed(&session, observer.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transition().phase(), DiagnosticPhase::Teardown);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Completed);
+        assert_eq!(
+            events[1].transition().code().map(|code| code.as_str()),
+            Some("container.teardown.reaped")
+        );
+        assert!(!be.warm.lock().await.contains_key(&session));
+    }
+
+    #[tokio::test]
+    async fn observed_cold_release_joins_reap_after_agent_spawn_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_attempt = Arc::clone(&calls);
+        let attempt: ReapAttemptFn = Arc::new(move |_runtime, _name| {
+            let calls = Arc::clone(&calls_for_attempt);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(ReapFailure::Spawn)
+            })
+        });
+        let be = backend_with_attempt(root, CountingSpawn::new(true), attempt).await;
+        let session = SessionId::parse("observed-cold-spawn-failure").unwrap();
+        be.configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+
+        assert!(be.prompt(&session, vec![]).await.is_err());
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let error = be
+            .release_session_observed(&session, observer.clone())
+            .await
+            .expect_err("observed cleanup must join the failed detached reap");
+        let BridgeError::AgentFailure { diagnostic } = error else {
+            panic!("typed reap failure must be structured");
+        };
+        assert_eq!(
+            diagnostic.class(),
+            bridge_core::diagnostics::DiagnosticFailureClass::ContainerRuntime
+        );
+        assert_eq!(diagnostic.code().as_str(), ReapFailure::Spawn.code());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Failed);
+        assert!(be.release_session_checked(&session).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn observed_warm_release_maps_every_typed_reap_failure_without_retry() {
+        for failure in [
+            ReapFailure::Spawn,
+            ReapFailure::Timeout,
+            ReapFailure::NonZeroExit,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().to_str().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let attempt: ReapAttemptFn = {
+                let calls = Arc::clone(&calls);
+                Arc::new(move |_runtime, _name| {
+                    let calls = Arc::clone(&calls);
+                    Box::pin(async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Err(failure)
+                    })
+                })
+            };
+            let be = warm_backend_with_attempt(root, CountingSpawn::new(false), attempt).await;
+            let session = SessionId::parse(format!("observed-release-{failure:?}")).unwrap();
+            be.configure_session(&session, &spec_cwd(root))
+                .await
+                .unwrap();
+            let mut stream = be.prompt(&session, vec![]).await.unwrap();
+            while stream.next().await.is_some() {}
+            let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+
+            let error = be
+                .release_session_observed(&session, observer.clone())
+                .await
+                .unwrap_err();
+            let BridgeError::AgentFailure { diagnostic } = &error else {
+                panic!("typed reap failure must be structured: {error:?}");
+            };
+            assert_eq!(
+                diagnostic.class(),
+                bridge_core::diagnostics::DiagnosticFailureClass::ContainerRuntime
+            );
+            assert_eq!(diagnostic.code().as_str(), failure.code());
+            assert_eq!(
+                diagnostic.disposition(),
+                bridge_core::diagnostics::FailureDisposition::Fatal
+            );
+            assert!(diagnostic.prompt_may_have_been_accepted());
+            assert!(!error.is_transient());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let events = observer.snapshot().await;
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[1].transition().status(), PhaseStatus::Failed);
+
+            // The retained controller returns the same settled failure without
+            // starting a second removal attempt.
+            assert!(be.release_session_checked(&session).await.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn retirement_and_observed_release_join_without_retaining_observer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let attempt: ReapAttemptFn = {
+            let calls = Arc::clone(&calls);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move |_runtime, _name| {
+                let calls = Arc::clone(&calls);
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+            })
+        };
+        let be =
+            Arc::new(warm_backend_with_attempt(root, CountingSpawn::new(false), attempt).await);
+        let session = SessionId::parse("release-retire-join").unwrap();
+        be.configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+        let mut stream = be.prompt(&session, vec![]).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        be.retire().await.unwrap();
+        entered.notified().await;
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let observer_dyn: Arc<dyn DiagnosticObserver> = observer.clone();
+        let weak = Arc::downgrade(&observer_dyn);
+        let release_task = {
+            let be = Arc::clone(&be);
+            let session = session.clone();
+            tokio::spawn(async move { be.release_session_observed(&session, observer_dyn).await })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.notify_waiters();
+        release_task.await.unwrap().unwrap();
+        drop(observer);
+        assert!(
+            weak.upgrade().is_none(),
+            "settled controller must not retain the operation observer"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1468,6 +2372,7 @@ mod tests {
             "cancel cleared turn_active"
         );
         be.retire().await.unwrap(); // retire still reaps the cached container
+        wait_for_reaps(&reaps, 1).await;
         assert_eq!(reaps.load(Ordering::SeqCst), 1);
     }
 
@@ -1486,6 +2391,7 @@ mod tests {
         .await;
         let err = prompt_err(&be, &s).await;
         assert!(format!("{err:?}").contains("boom"), "got {err:?}");
+        wait_for_reaps(&reaps, 1).await;
         assert_eq!(
             reaps.load(Ordering::SeqCst),
             1,

@@ -1,12 +1,209 @@
 //! Shared container-reaping primitives (used by the :rw ContainerRwBackend and the :ro AcpBackend path).
 //! Detached + idempotent so a `Drop` (which may fire off-runtime at process shutdown) never blocks/panics.
+use futures::FutureExt;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 /// `(runtime, name) -> fire-and-forget reap`. Injectable so tests don't spawn Docker.
 pub type ReapFn = Arc<dyn Fn(String, String) + Send + Sync>;
+
+/// One bounded removal attempt. The result is metadata-only and safe to share
+/// with operation-owned teardown diagnostics.
+pub type ReapAttemptFn = Arc<
+    dyn Fn(String, String) -> Pin<Box<dyn Future<Output = Result<(), ReapFailure>> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReapFailure {
+    Spawn,
+    Timeout,
+    NonZeroExit,
+    WorkerPanicked,
+}
+
+impl ReapFailure {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Spawn => "container.reap.spawn_failed",
+            Self::Timeout => "container.reap.timeout",
+            Self::NonZeroExit => "container.reap.nonzero_exit",
+            Self::WorkerPanicked => "container.reap.worker_panicked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReapState {
+    NotStarted,
+    Running,
+    Settled(Result<(), ReapFailure>),
+}
+
+struct ReapShared {
+    state: StdMutex<ReapState>,
+    settled: tokio::sync::Notify,
+}
+
+/// Shared, cancellation-safe, joinable ownership for one named container reap.
+/// The worker never owns an operation observer; observed callers only await and
+/// locally report the shared metadata-only result.
+#[derive(Clone)]
+pub struct ReapController {
+    runtime: String,
+    name: String,
+    attempt: ReapAttemptFn,
+    shared: Arc<ReapShared>,
+}
+
+impl std::fmt::Debug for ReapController {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReapController")
+            .field("runtime", &self.runtime)
+            .field("name", &self.name)
+            .field("result", &self.result())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReapController {
+    pub fn new(
+        runtime: impl Into<String>,
+        name: impl Into<String>,
+        attempt: ReapAttemptFn,
+    ) -> Self {
+        Self {
+            runtime: runtime.into(),
+            name: name.into(),
+            attempt,
+            shared: Arc::new(ReapShared {
+                state: StdMutex::new(ReapState::NotStarted),
+                settled: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+
+    /// Source-compatible adapter for existing injectable fire-and-forget tests
+    /// and constructors. Invocation completion is the only result that legacy
+    /// closures can expose, so it settles successfully after the call returns.
+    pub fn from_legacy(
+        runtime: impl Into<String>,
+        name: impl Into<String>,
+        reap_fn: ReapFn,
+    ) -> Self {
+        let attempt: ReapAttemptFn = Arc::new(move |runtime, name| {
+            let reap_fn = Arc::clone(&reap_fn);
+            Box::pin(async move {
+                reap_fn(runtime, name);
+                Ok(())
+            })
+        });
+        Self::new(runtime, name, attempt)
+    }
+
+    pub fn production(runtime: impl Into<String>, name: impl Into<String>) -> Self {
+        let attempt: ReapAttemptFn = Arc::new(|runtime, name| {
+            Box::pin(async move {
+                let (program, argv) = crate::sandbox::reap_argv(&runtime, &name);
+                let mut command = tokio::process::Command::new(&program);
+                command.args(&argv).kill_on_drop(true);
+                let child = command.spawn().map_err(|_| ReapFailure::Spawn)?;
+                let output =
+                    tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+                        .await
+                        .map_err(|_| ReapFailure::Timeout)?
+                        .map_err(|_| ReapFailure::Spawn)?;
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(ReapFailure::NonZeroExit)
+                }
+            })
+        });
+        Self::new(runtime, name, attempt)
+    }
+
+    fn ensure_started(&self) {
+        let should_start = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *state == ReapState::NotStarted {
+                *state = ReapState::Running;
+                true
+            } else {
+                false
+            }
+        };
+        if !should_start {
+            return;
+        }
+
+        let runtime = self.runtime.clone();
+        let name = self.name.clone();
+        let attempt = Arc::clone(&self.attempt);
+        let shared = Arc::clone(&self.shared);
+        spawn_detached(async move {
+            let attempt_future =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| attempt(runtime, name)));
+            let result = match attempt_future {
+                Ok(future) => match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+                    Ok(result) => result,
+                    Err(_) => Err(ReapFailure::WorkerPanicked),
+                },
+                Err(_) => Err(ReapFailure::WorkerPanicked),
+            };
+            *shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = ReapState::Settled(result);
+            shared.settled.notify_waiters();
+        });
+    }
+
+    /// Start or join the single removal attempt and return its stable result.
+    pub async fn reap_observed(&self) -> Result<(), ReapFailure> {
+        self.ensure_started();
+        loop {
+            // Register before sampling state so settlement cannot be lost between
+            // the sample and the await.
+            let notified = self.shared.settled.notified();
+            let state = *self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match state {
+                ReapState::Settled(result) => return result,
+                ReapState::NotStarted => self.ensure_started(),
+                ReapState::Running => notified.await,
+            }
+        }
+    }
+
+    /// Start the same single attempt without retaining any operation observer.
+    pub fn reap_detached(&self) {
+        self.ensure_started();
+    }
+
+    pub fn result(&self) -> Option<Result<(), ReapFailure>> {
+        match *self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            ReapState::Settled(result) => Some(result),
+            ReapState::NotStarted | ReapState::Running => None,
+        }
+    }
+}
 
 /// Reap a named container exactly once (idempotent via the shared `reaped` flag).
 pub fn reap_once(reap_fn: &ReapFn, runtime: &str, name: &str, reaped: &Arc<AtomicBool>) {
@@ -177,6 +374,109 @@ mod tests {
         .join()
         .unwrap();
         // No panic = pass (the detached work runs on its own thread; we don't join it).
+    }
+
+    #[tokio::test]
+    async fn joinable_reaper_runs_once_for_concurrent_waiters() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let attempt: ReapAttemptFn = {
+            let calls = Arc::clone(&calls);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move |_runtime, _name| {
+                let calls = Arc::clone(&calls);
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+            })
+        };
+        let controller = ReapController::new("docker", "a2a-rw-x", attempt);
+        let first = {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.reap_observed().await })
+        };
+        entered.notified().await;
+        let second = {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.reap_observed().await })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.notify_waiters();
+        assert_eq!(first.await.unwrap(), Ok(()));
+        assert_eq!(second.await.unwrap(), Ok(()));
+        assert_eq!(controller.reap_observed().await, Ok(()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn joinable_reaper_returns_same_typed_failure_to_every_waiter() {
+        for failure in [
+            ReapFailure::Spawn,
+            ReapFailure::Timeout,
+            ReapFailure::NonZeroExit,
+        ] {
+            let attempt: ReapAttemptFn =
+                Arc::new(move |_runtime, _name| Box::pin(async move { Err(failure) }));
+            let controller = ReapController::new("docker", "a2a-rw-x", attempt);
+            assert_eq!(controller.reap_observed().await, Err(failure));
+            assert_eq!(controller.reap_observed().await, Err(failure));
+            assert_eq!(controller.result(), Some(Err(failure)));
+            assert_eq!(
+                failure.code(),
+                match failure {
+                    ReapFailure::Spawn => "container.reap.spawn_failed",
+                    ReapFailure::Timeout => "container.reap.timeout",
+                    ReapFailure::NonZeroExit => "container.reap.nonzero_exit",
+                    ReapFailure::WorkerPanicked => unreachable!(),
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_reap_starts_the_same_joinable_attempt() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempt: ReapAttemptFn = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_runtime, _name| {
+                let calls = Arc::clone(&calls);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        };
+        let controller = ReapController::new("docker", "a2a-rw-x", attempt);
+        controller.reap_detached();
+        tokio::time::timeout(Duration::from_secs(1), controller.reap_observed())
+            .await
+            .expect("detached attempt settles")
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_reap_fn_adapter_is_joinable_and_exactly_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reap_fn: ReapFn = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_runtime, _name| {
+                calls.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let controller = ReapController::from_legacy("docker", "a2a-rw-x", reap_fn);
+        controller.reap_observed().await.unwrap();
+        controller.reap_detached();
+        controller.reap_observed().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     // ---- plan_recovery (pure crash-recovery planner) ---------------------------------------------------

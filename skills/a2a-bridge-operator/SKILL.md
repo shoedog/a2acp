@@ -99,6 +99,25 @@ usage window as well as bridge preflight. For trusted own-repo reviews:
   generic `AgentCrashed`, record the operator-visible usage state as context but keep the bridge diagnosis
   `unknown` until the underlying cause is retained.
 
+### Interpret provider and container-cleanup diagnostics
+
+Provider classification is deliberately closed. HTTP 401/403 and ACP `auth_required` are authoritative.
+Otherwise, trust only an exact supported token in structured `code`/`type` fields and an HTTP status that
+is compatible with that class. Bare 429/503/529, incompatible status/token pairs, conflicting fields,
+fuzzy prose, stderr text, and oversized or malformed bodies remain `upstream.unknown`; do not use them to
+justify fallback or an automatic replay. `upstream.classification_conflict`,
+`upstream.retry_metadata_conflict`, and `upstream.retry_metadata_invalid` mean the bridge rejected
+ambiguous advisory evidence, not that it inferred a provider class from it. Retry/reset hints are bounded
+metadata and never change terminal disposition.
+
+Observed container release joins one bridge-owned bounded reap flight. A successful return means that
+flight completed; `container.reap.spawn_failed`, `container.reap.timeout`,
+`container.reap.nonzero_exit`, or `container.reap.worker_panicked` is a fatal accepted cleanup failure.
+All concurrent waiters receive the same result, and later observer failure cannot cancel or suppress
+cleanup. Detached drop/retirement may start the same flight but must not write late task diagnostics.
+Treat an observed reap failure as cleanup evidence for the current attempt, not permission to replay a
+possibly accepted prompt.
+
 ### Suspected verification stall and takeover
 
 Process existence, total elapsed time, and last file modification are not sufficient to call a run

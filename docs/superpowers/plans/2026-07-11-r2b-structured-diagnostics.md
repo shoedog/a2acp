@@ -1,7 +1,8 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 MERGED at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 NOT STARTED
-- **Current execution boundary:** no live/billable gate ran; no docs-link checker is present
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 MERGED at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 IN PROGRESS on `agent/reliability-r2b3-api-container` from `2e9ed640` (affected packages **566 / 0 / 1 ignored**; full host workspace **1,860 / 0 / 12 ignored**; hygiene **37/7**; review pending)
+- **Current execution boundary:** no R2c live/billable smoke ran; fresh full-branch review remains; no
+  docs-link checker is present
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -845,6 +846,36 @@ automatically.
 - cold, cache-miss, and reuse container observer sequences;
 - observed reap success, spawn failure, timeout, nonzero exit, concurrent joiners, and detached drop;
 - full task-journal, CLI/operator artifact, trace, and A2A wire secret regressions.
+
+### R2b3 implementation evidence before full review
+
+- `ApiBackend` installs the first-send future before crossing `PromptStart`/`PromptStream`, retains the
+  acceptance barrier through later tool rounds, forwards both observer channels, and maps all
+  post-barrier failures to fatal accepted work without replay.
+- HTTP error bodies are capped at 64 KiB before parsing. The parser accepts only the closed `error.code`
+  and `error.type` tokens, exact compatible statuses, bounded single retry/reset fields, and one canonical
+  `Retry-After`; malformed, duplicate, conflicting, fuzzy, status-only 429/503/529, and incompatible
+  evidence remains `unknown` or receives a bridge-owned conflict/invalid-metadata code.
+- ACP preserves the structured SDK error and applies the same token table only at the four normative flat
+  or nested `code`/`type` paths. Auth-required is authoritative; arbitrary message/stderr prose remains
+  `unknown`.
+- `ReapController` owns one cancellation-safe detached cleanup flight and one stable typed result for all
+  observed and detached joiners. Production reaping bounds `<runtime> rm -f` and distinguishes spawn,
+  timeout, nonzero-exit, and worker-panic failures.
+- `ContainerRwBackend` forwards operation-local observers through cold creation, warm cache miss, and
+  warm reuse without storing them in `WarmInner`. Reuse emits `backend.reused`; owned retirement starts
+  cleanup before cancellable agent termination; cold spawn failures retain a joinable cleanup result.
+- ACP observed `:ro` release and `container_rw` release await the same controller and surface cleanup
+  failures as fatal accepted `container_runtime` diagnostics. Observer rejection cannot suppress or
+  detach cleanup.
+- Pre-change-red regressions cover first-send installation order, closed provider mappings and their
+  negative/conflict edges, cold spawn-failure cleanup joining, retirement-before-cancel, typed cleanup
+  failures, concurrent joiners, detached cleanup, and centralized diagnostic-construction guards.
+- `cargo fmt --all -- --check` plus the exact affected-package command pass **566 / 0 / 1 ignored**:
+  ACP 204, API 56 plus one ignored local Ollama case, container 31, and core 275. The host serial full
+  workspace passes **1,860 / 0 / 12 ignored** across 65 harness groups. Workspace/all-target check,
+  warnings-denied Clippy, release binary, and hygiene **37/7** are clean. Fresh Sol/xhigh review remains.
+  No R2c live/billable smoke has run, and no docs-link checker is present.
 
 ## R2b completion gate
 

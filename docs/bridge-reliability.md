@@ -150,8 +150,8 @@ Exit: a release cannot claim an agent path that was not tested from its distribu
 
 ## Immediate queue
 
-1. Implement the reviewed R2b phase/diagnostic contract as R2b0–R2b3, including total detached
-   projection and post-acceptance no-replay mappings. Use the
+1. Finish, independently review, and merge R2b3's API/provider/container portion of the reviewed R2b
+   phase/diagnostic contract, including post-acceptance no-replay mappings and joinable cleanup. Use the
    [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md).
 2. Add the separate explicitly billable R2c live-smoke command from the
    [R2c plan](superpowers/plans/2026-07-11-r2c-live-smoke.md).

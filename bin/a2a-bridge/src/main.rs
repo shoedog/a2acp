@@ -378,14 +378,15 @@ fn acp_spawn_inputs(
         None => (None, Vec::new()),
     };
     let (program, argv) = acp_program_argv(entry, ro_name.as_deref(), &labels, &mcp_cwd)?;
-    let container = ro_name.map(|name| bridge_acp::acp_backend::ContainerReap {
-        runtime: entry
-            .sandbox
-            .as_ref()
-            .map(|sb| sb.runtime().to_string())
-            .unwrap_or_else(|| "docker".to_string()),
-        name,
-        reap_fn: bridge_core::reaper::production_reap_fn(),
+    let container = ro_name.map(|name| {
+        bridge_acp::acp_backend::ContainerReap::production(
+            entry
+                .sandbox
+                .as_ref()
+                .map(|sb| sb.runtime().to_string())
+                .unwrap_or_else(|| "docker".to_string()),
+            name,
+        )
     });
     // MCP environment values are already held by the bridge and can be echoed
     // by an adapter error. Treat them as credential-shaped diagnostic inputs;
@@ -437,6 +438,26 @@ impl bridge_container::ContainerSpawn for AcpContainerSpawn {
         let mut be = bridge_acp::acp_backend::AcpBackend::spawn(program, &argv_ref, cfg)
             .await?
             .with_policy(Arc::clone(&self.policy));
+        if let Some(reg) = &self.permission_registry {
+            be = be
+                .with_permission_registry(Arc::clone(reg))
+                .with_permission_timeout_ms(self.perm_timeout_ms);
+        }
+        Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
+    }
+
+    async fn spawn_observed(
+        &self,
+        program: &str,
+        argv: &[String],
+        cfg: bridge_acp::acp_backend::AcpConfig,
+        observer: Arc<dyn bridge_core::ports::DiagnosticObserver>,
+    ) -> Result<Arc<dyn bridge_core::ports::AgentBackend>, BridgeError> {
+        let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let mut be =
+            bridge_acp::acp_backend::AcpBackend::spawn_observed(program, &argv_ref, cfg, observer)
+                .await?
+                .with_policy(Arc::clone(&self.policy));
         if let Some(reg) = &self.permission_registry {
             be = be
                 .with_permission_registry(Arc::clone(reg))

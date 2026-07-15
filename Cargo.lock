@@ -493,6 +493,7 @@ dependencies = [
  "async-trait",
  "bridge-core",
  "futures",
+ "httpdate",
  "reqwest",
  "serde",
  "serde_json",

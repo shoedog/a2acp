@@ -29,7 +29,9 @@ use agent_client_protocol::schema::v1::{
     WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectTo, ConnectionTo, ErrorCode};
+use agent_client_protocol::{
+    Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Error as AcpError, ErrorCode,
+};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, OwnedMutexGuard};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -67,6 +69,8 @@ use bridge_core::ports::{
 use bridge_core::process::{
     ProcessStderrCursor, ProcessStderrRing, ProcessStderrSnapshot, Supervised,
 };
+use bridge_core::provider::{classify_acp_error_data, ProviderEvidence};
+use bridge_core::reaper::{ReapController, ReapFn};
 
 /// Default bound on the `initialize` handshake. A real agent that connects its
 /// stdio but never sends the initialize response would otherwise hang
@@ -155,6 +159,41 @@ impl AcpLifecycle {
         operation: Option<DiagnosticOperation>,
         auth: Option<AuthenticationEvidenceInput>,
     ) -> BridgeError {
+        self.failure_with_retry_metadata(
+            phase,
+            last_completed_phase,
+            class,
+            disposition,
+            code,
+            summary,
+            cause,
+            None,
+            None,
+            prompt_may_have_been_accepted,
+            stderr,
+            operation,
+            auth,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn failure_with_retry_metadata(
+        &self,
+        phase: DiagnosticPhase,
+        last_completed_phase: Option<DiagnosticPhase>,
+        class: DiagnosticFailureClass,
+        disposition: FailureDisposition,
+        code: &'static str,
+        summary: &'static str,
+        cause: Option<String>,
+        retry_after_ms: Option<u64>,
+        reset_at_ms: Option<i64>,
+        prompt_may_have_been_accepted: bool,
+        stderr: Option<ProcessStderrSnapshot>,
+        operation: Option<DiagnosticOperation>,
+        auth: Option<AuthenticationEvidenceInput>,
+    ) -> BridgeError {
         let stderr = stderr.or_else(|| self.stderr_snapshot());
         let stderr_line_count = stderr.as_ref().map_or(0, ProcessStderrSnapshot::line_count);
         let stderr_observed = stderr_line_count != 0;
@@ -172,8 +211,8 @@ impl AcpLifecycle {
                 stderr_scope: stderr_observed.then_some(StderrScope::Process),
                 stderr_tail: None,
                 stderr_redaction: None,
-                retry_after_ms: None,
-                reset_at_ms: None,
+                retry_after_ms,
+                reset_at_ms,
                 prompt_may_have_been_accepted,
             },
             code,
@@ -379,21 +418,43 @@ pub struct AcpConfig {
 }
 
 /// Reaper handle for a containerized (`:ro` sandbox) agent: the named `docker run` container is removed
-/// (`docker rm -f`) on every teardown path. Built by the bin's spawn factories; `reap_fn` is injected so
-/// the teardown logic is Docker-free unit-testable.
+/// (`docker rm -f`) on every teardown path. The shared controller lets an
+/// operation-owned release join the same bounded attempt that `Drop` or process
+/// retirement may already have started.
 #[derive(Clone)]
 pub struct ContainerReap {
-    pub runtime: String,
-    pub name: String,
-    pub reap_fn: bridge_core::reaper::ReapFn,
+    controller: ReapController,
+}
+
+impl ContainerReap {
+    /// Compatibility adapter for existing injected fire-and-forget reapers.
+    pub fn from_legacy(
+        runtime: impl Into<String>,
+        name: impl Into<String>,
+        reap_fn: ReapFn,
+    ) -> Self {
+        Self {
+            controller: ReapController::from_legacy(runtime, name, reap_fn),
+        }
+    }
+
+    /// Production `runtime rm -f name` controller with a bounded, typed result.
+    pub fn production(runtime: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            controller: ReapController::production(runtime, name),
+        }
+    }
+
+    /// Explicit controller injection for typed result/cancellation tests.
+    pub fn from_controller(controller: ReapController) -> Self {
+        Self { controller }
+    }
 }
 
 impl std::fmt::Debug for ContainerReap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContainerReap")
-            .field("runtime", &self.runtime)
-            .field("name", &self.name)
-            .field("reap_fn", &"<fn>")
+            .field("controller", &self.controller)
             .finish()
     }
 }
@@ -533,7 +594,7 @@ enum TurnEvent {
 }
 
 enum PromptDriverFailure {
-    Sdk(String),
+    Sdk(AcpError),
     KillSwitch,
     Watchdog(Option<String>),
     DroppedStreamTimeout,
@@ -3284,7 +3345,8 @@ impl AcpBackend {
     /// teardown site (spawn-failure, escalate_terminate, retire, Drop) — at most one `docker rm -f` total.
     fn reap_container(container: &Option<ContainerReap>, reaped: &Arc<AtomicBool>) {
         if let Some(c) = container {
-            bridge_core::reaper::reap_once(&c.reap_fn, &c.runtime, &c.name, reaped);
+            reaped.store(true, Ordering::SeqCst);
+            c.controller.reap_detached();
         }
     }
 
@@ -3905,7 +3967,7 @@ impl AcpBackend {
                 // poll as a fired watchdog ALWAYS wins (the natural completion is never relabeled
                 // AgentTimedOut). Without `biased`, tokio picks a ready arm at random.
                 biased;
-                outcome = &mut prompt_fut => outcome.map_err(|error| PromptDriverFailure::Sdk(error.to_string())),
+                outcome = &mut prompt_fut => outcome.map_err(PromptDriverFailure::Sdk),
                 _ = kill.notified() => Err(PromptDriverFailure::KillSwitch),
                 _ = async {
                     match &watchdog_fired {
@@ -3959,7 +4021,7 @@ impl AcpBackend {
                     .await
                     {
                         CancelSettle::Prompt(outcome) => outcome
-                            .map_err(|error| PromptDriverFailure::Sdk(error.to_string())),
+                            .map_err(PromptDriverFailure::Sdk),
                         CancelSettle::KillSwitch => Err(PromptDriverFailure::KillSwitch),
                         CancelSettle::GraceElapsed => {
                             AcpBackend::escalate_terminate(
@@ -4045,17 +4107,33 @@ impl AcpBackend {
                     let stderr = stderr_ring_for_driver
                         .as_ref()
                         .and_then(|ring| stderr_cursor.map(|cursor| ring.metadata_since(cursor)));
-                    let (class, code, summary, cause) = match failure {
-                        PromptDriverFailure::Sdk(cause) => (
-                            DiagnosticFailureClass::Transport,
-                            "acp.prompt.transport",
-                            "ACP prompt transport failed",
-                            Some(cause),
-                        ),
+                    let (class, code, summary, cause, retry_after_ms, reset_at_ms) = match failure {
+                        PromptDriverFailure::Sdk(error) => {
+                            let ProviderEvidence {
+                                class,
+                                code,
+                                retry_after_ms,
+                                reset_at_ms,
+                            } = classify_acp_error_data(
+                                error.code == ErrorCode::AuthRequired,
+                                error.data.as_ref(),
+                                diagnostic_timestamp_ms(),
+                            );
+                            (
+                                class,
+                                code,
+                                "ACP prompt failed",
+                                Some(error.message),
+                                retry_after_ms,
+                                reset_at_ms,
+                            )
+                        }
                         PromptDriverFailure::KillSwitch => (
                             DiagnosticFailureClass::AgentProcess,
                             "acp.prompt.kill_switch",
                             "ACP prompt was terminated after cancellation grace",
+                            None,
+                            None,
                             None,
                         ),
                         PromptDriverFailure::Watchdog(cause) => (
@@ -4063,17 +4141,21 @@ impl AcpBackend {
                             "acp.prompt.watchdog_timeout",
                             "ACP prompt exceeded its watchdog bound",
                             cause,
+                            None,
+                            None,
                         ),
                         PromptDriverFailure::DroppedStreamTimeout => (
                             DiagnosticFailureClass::Timeout,
                             "acp.prompt.dropped_stream_timeout",
                             "ACP prompt did not stop after its consumer disconnected",
                             None,
+                            None,
+                            None,
                         ),
                     };
                     TurnEvent::Failed(
                         lifecycle
-                            .failure(
+                            .failure_with_retry_metadata(
                                 DiagnosticPhase::PromptStream,
                                 Some(DiagnosticPhase::PromptStart),
                                 class,
@@ -4081,6 +4163,8 @@ impl AcpBackend {
                                 code,
                                 summary,
                                 cause,
+                                retry_after_ms,
+                                reset_at_ms,
                                 true,
                                 stderr,
                                 None,
@@ -4428,7 +4512,21 @@ impl AgentBackend for AcpBackend {
         observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<(), BridgeError> {
         let lifecycle = self.operation_lifecycle(session, observer).await;
-        lifecycle
+        let container = self
+            .config
+            .as_ref()
+            .and_then(|config| config.container.clone());
+
+        // A `:ro` release owns process cleanup, not just the ACP session map.
+        // Select/start the observer-free flight before the first cancellable
+        // diagnostic write. If that write is rejected, cleanup still runs and
+        // this waiter returns only after the shared reap has settled.
+        if let Some(container) = &container {
+            self.reaped.store(true, Ordering::SeqCst);
+            container.controller.reap_detached();
+        }
+
+        let start_result = lifecycle
             .record(
                 DiagnosticPhase::Teardown,
                 PhaseStatus::Started,
@@ -4436,11 +4534,25 @@ impl AgentBackend for AcpBackend {
                 Some("acp.teardown.release"),
                 None,
             )
-            .await?;
+            .await;
+        if container.is_none() {
+            if let Err(error) = &start_result {
+                // Preserve the existing persistence-first behavior for the
+                // shared, non-container ACP backend.
+                return Err(error.clone());
+            }
+        }
+        let release_result = self.release_session_result(session).await;
+        let reap_result = match &container {
+            Some(container) => container.controller.reap_observed().await,
+            None => Ok(()),
+        };
+
+        start_result?;
         if let Err(TeardownFailure {
             error,
             prompt_may_have_been_accepted,
-        }) = self.release_session_result(session).await
+        }) = release_result
         {
             return Err(lifecycle
                 .failure(
@@ -4458,12 +4570,33 @@ impl AgentBackend for AcpBackend {
                 )
                 .await);
         }
+        if let Err(failure) = reap_result {
+            return Err(lifecycle
+                .failure(
+                    DiagnosticPhase::Teardown,
+                    None,
+                    DiagnosticFailureClass::ContainerRuntime,
+                    FailureDisposition::Fatal,
+                    failure.code(),
+                    "Container removal failed",
+                    None,
+                    true,
+                    None,
+                    None,
+                    None,
+                )
+                .await);
+        }
         lifecycle
             .record(
                 DiagnosticPhase::Teardown,
                 PhaseStatus::Completed,
                 None,
-                Some("acp.teardown.released"),
+                Some(if container.is_some() {
+                    "acp.teardown.container_reaped"
+                } else {
+                    "acp.teardown.released"
+                }),
                 None,
             )
             .await
@@ -4478,21 +4611,22 @@ impl AgentBackend for AcpBackend {
     /// cannot install new work while retirement tears down the shared agent.
     async fn retire(&self) -> Result<(), BridgeError> {
         Self::close_connection_fence(&self.dispatch_gate, &self.unavailable);
+        // Registry retirement must select/start process-owned container cleanup
+        // before the cancellable graceful process termination await.
+        let container = self.config.as_ref().and_then(|c| c.container.clone());
+        AcpBackend::reap_container(&container, &self.reaped);
         let sup = self.supervised.lock().ok().and_then(|mut g| g.take());
         if let Some(sup) = sup {
             sup.terminate(self.cancel_grace()).await;
         }
-        // Site C: lease-drain teardown → reap the `:ro` container (idempotent; no-op if none).
-        let container = self.config.as_ref().and_then(|c| c.container.clone());
-        AcpBackend::reap_container(&container, &self.reaped);
         Ok(())
     }
 }
 
 impl Drop for AcpBackend {
     /// Site D: the plain-drop path (normal workflow completion → registry drop). Reaps the `:ro` container
-    /// if no earlier site already did. `reap_container` → `reap_once` → `production_reap_fn`'s
-    /// `spawn_detached` is off-runtime-safe, so a Drop at process shutdown never panics.
+    /// if no earlier site already did. The shared controller's detached start is
+    /// off-runtime-safe, so a Drop at process shutdown never panics.
     fn drop(&mut self) {
         let container = self.config.as_ref().and_then(|c| c.container.clone());
         AcpBackend::reap_container(&container, &self.reaped);
@@ -4512,6 +4646,7 @@ mod tests {
     use bridge_core::error::BridgeError;
     use bridge_core::ports::{AgentBackend, BackendObservers, RichEventSink, Update};
     use bridge_core::process::Supervised;
+    use bridge_core::reaper::{ReapAttemptFn, ReapFailure};
     use bridge_core::SessionCwd;
     use futures::StreamExt;
     use std::time::Duration;
@@ -5411,16 +5546,15 @@ mod tests {
         let reap_fn: bridge_core::reaper::ReapFn = Arc::new(move |_r, _n| {
             c.fetch_add(1, Ordering::SeqCst);
         });
-        let container = Some(ContainerReap {
-            runtime: "docker".into(),
-            name: "a2a-ro-owner-nonce".into(),
-            reap_fn,
-        });
+        let controller =
+            ReapController::from_legacy("docker", "a2a-ro-owner-nonce", Arc::clone(&reap_fn));
+        let container = Some(ContainerReap::from_controller(controller.clone()));
         let reaped = Arc::new(AtomicBool::new(false));
         // escalate_terminate + retire + Drop all firing → still one `docker rm -f`.
         AcpBackend::reap_container(&container, &reaped);
         AcpBackend::reap_container(&container, &reaped);
         AcpBackend::reap_container(&container, &reaped);
+        controller.reap_observed().await.unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -5446,21 +5580,23 @@ mod tests {
             cwd: std::env::temp_dir(),
             handshake_timeout: Duration::from_millis(200), // force the timeout fast
             cancel_grace: Duration::from_millis(200),
-            container: Some(ContainerReap {
-                runtime: "docker".into(),
-                name: "a2a-ro-owner-nonce".into(),
+            container: Some(ContainerReap::from_legacy(
+                "docker",
+                "a2a-ro-owner-nonce",
                 reap_fn,
-            }),
+            )),
             ..AcpConfig::default()
         };
         // /bin/cat starts (Supervised ok) but never answers `initialize` → handshake timeout → spawn Err.
         let res = AcpBackend::spawn("/bin/cat", &[], cfg).await;
         assert!(res.is_err(), "handshake must time out");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "the started container is reaped on the spawn-error path"
-        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while calls.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the started container is reaped on the spawn-error path");
     }
 
     #[tokio::test]
@@ -5957,6 +6093,9 @@ mod tests {
         /// error instead of a `PromptResponse`), so the client's `send_request`
         /// returns `Err` — driving the transport/agent-error path deterministically.
         fail_prompt: Arc<AtomicBool>,
+        /// Optional structured JSON-RPC error returned when `fail_prompt` is set.
+        /// `None` preserves the legacy internal-error fixture.
+        prompt_error: Arc<Mutex<Option<AcpError>>>,
         /// Scripted `session/update`s the prompt handler emits (in order) BEFORE
         /// it returns the `PromptResponse`. Empty by default.
         prompt_updates: Arc<Mutex<Vec<ScriptedUpdate>>>,
@@ -6075,6 +6214,7 @@ mod tests {
                 prompt_started: Arc::new(Notify::new()),
                 gate_prompt: Arc::new(AtomicBool::new(false)),
                 fail_prompt: Arc::new(AtomicBool::new(false)),
+                prompt_error: Arc::new(Mutex::new(None)),
                 prompt_updates: Arc::new(Mutex::new(Vec::new())),
                 stop_reason: Arc::new(Mutex::new(StopReason::EndTurn)),
                 terminal_usage: Arc::new(Mutex::new(None)),
@@ -6804,8 +6944,13 @@ mod tests {
                                 // "fail" (not "end") so a test can distinguish.
                                 if r2.fail_prompt.load(Ordering::SeqCst) {
                                     r2.prompt_log.lock().await.push("fail");
-                                    responder
-                                        .respond_with_internal_error("agent failed the turn")?;
+                                    if let Some(error) = r2.prompt_error.lock().await.clone() {
+                                        responder.respond_with_error(error)?;
+                                    } else {
+                                        responder.respond_with_internal_error(
+                                            "agent failed the turn",
+                                        )?;
+                                    }
                                     return Ok(());
                                 }
                                 r2.prompt_log.lock().await.push("end");
@@ -7735,13 +7880,18 @@ mod tests {
             panic!("prompt SDK failure must be structured, got {error:?}");
         };
         assert_eq!(diagnostic.failed_phase(), DiagnosticPhase::PromptStream);
-        assert_eq!(diagnostic.class(), DiagnosticFailureClass::Transport);
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::Unknown);
+        assert_eq!(diagnostic.code().as_str(), "upstream.unknown");
         assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
         assert!(diagnostic.prompt_may_have_been_accepted());
-        assert!(diagnostic
-            .causes()
-            .last()
-            .is_some_and(|cause| cause.contains("agent failed the turn")));
+        assert_eq!(diagnostic.causes(), &["Internal error"]);
+        assert!(
+            diagnostic
+                .causes()
+                .iter()
+                .all(|cause| !cause.contains("agent failed the turn")),
+            "arbitrary JSON-RPC data prose is not diagnostic evidence"
+        );
         assert!(
             !error.is_transient(),
             "E6 must not replay post-barrier work"
@@ -7758,6 +7908,67 @@ mod tests {
         assert!(events
             .iter()
             .all(|event| event.transition().phase() != DiagnosticPhase::PromptFinish));
+    }
+
+    #[tokio::test]
+    async fn observed_prompt_structured_provider_limit_preserves_bounded_hints() {
+        let rec = Recorder::new("agent-sess-PROMPT-LIMIT");
+        rec.fail_prompt.store(true, Ordering::SeqCst);
+        let reset_at_ms = diagnostic_timestamp_ms() + 60_000;
+        *rec.prompt_error.lock().await = Some(
+            AcpError::new(-32_099, "opaque provider rejection").data(serde_json::json!({
+                "code": "usage_limit_reached",
+                "error": {"type": "rate_limit_error"},
+                "retry_after_ms": 1234,
+                "reset_at_ms": reset_at_ms
+            })),
+        );
+        let backend = connect_recording(rec).await;
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(32).unwrap());
+        let mut stream = backend
+            .prompt_with_observers(
+                &bkey("bridge-PROMPT-LIMIT"),
+                vec![],
+                BackendObservers::diagnostic_only(observer),
+            )
+            .await
+            .unwrap();
+
+        let error = stream.next().await.unwrap().unwrap_err();
+        let BridgeError::AgentFailure { diagnostic } = &error else {
+            panic!("structured provider limit must remain an AgentFailure");
+        };
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::ProviderLimit);
+        assert_eq!(diagnostic.code().as_str(), "upstream.provider_limit");
+        assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+        assert!(diagnostic.prompt_may_have_been_accepted());
+        let serialized = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(serialized["retry_after_ms"], 1234);
+        assert_eq!(serialized["reset_at_ms"], reset_at_ms);
+        assert!(!error.is_transient());
+        assert!(!diagnostic.class().is_container_fallback_class());
+    }
+
+    #[tokio::test]
+    async fn observed_prompt_prose_only_usage_limit_remains_unknown() {
+        let rec = Recorder::new("agent-sess-PROMPT-PROSE");
+        rec.fail_prompt.store(true, Ordering::SeqCst);
+        *rec.prompt_error.lock().await = Some(AcpError::new(
+            -32_099,
+            "usage limit reached; retry after an hour",
+        ));
+        let backend = connect_recording(rec).await;
+        let mut stream = backend
+            .prompt(&bkey("bridge-PROMPT-PROSE"), vec![])
+            .await
+            .unwrap();
+
+        let error = stream.next().await.unwrap().unwrap_err();
+        let BridgeError::AgentFailure { diagnostic } = error else {
+            panic!("prose-only rejection must remain a structured AgentFailure");
+        };
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::Unknown);
+        assert_eq!(diagnostic.code().as_str(), "upstream.unknown");
     }
 
     #[tokio::test]
@@ -7825,7 +8036,7 @@ mod tests {
         let diagnostic = assert_agent_failure(
             &error,
             DiagnosticPhase::PromptStream,
-            DiagnosticFailureClass::Transport,
+            DiagnosticFailureClass::Unknown,
             true,
         );
         let json = serde_json::to_value(diagnostic).unwrap();
@@ -9131,9 +9342,10 @@ mod tests {
                 let diagnostic = assert_agent_failure(
                     &error,
                     DiagnosticPhase::PromptStream,
-                    DiagnosticFailureClass::Transport,
+                    DiagnosticFailureClass::Unknown,
                     true,
                 );
+                assert_eq!(diagnostic.code().as_str(), "upstream.unknown");
                 assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
             }
             other => panic!(
@@ -11508,6 +11720,149 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), rec.cancel_seen.notified())
             .await
             .expect("observed release must dispatch session/cancel");
+    }
+
+    #[tokio::test]
+    async fn observed_ro_release_joins_one_container_reap_and_records_completion() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_attempt = Arc::clone(&calls);
+        let attempt: ReapAttemptFn = Arc::new(move |_runtime, _name| {
+            let calls = Arc::clone(&calls_for_attempt);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let controller = ReapController::new("docker", "a2a-ro-release-success", attempt);
+        let mut config = test_config();
+        config.container = Some(ContainerReap::from_controller(controller.clone()));
+        let recorder = Recorder::new("agent-sess-RO-RELEASE-SUCCESS");
+        let backend = connect_recording_with(recorder.clone(), config).await;
+        let session = bkey("bridge-RO-RELEASE-SUCCESS");
+        backend.ensure_session(&session).await.unwrap();
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+
+        backend
+            .release_session_observed(&session, observer.clone())
+            .await
+            .unwrap();
+        // Retirement/drop may join the same controller later, but no path may
+        // install a second runtime removal attempt.
+        backend.retire().await.unwrap();
+        controller.reap_observed().await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Completed);
+        assert_eq!(
+            events[1].transition().code().map(|code| code.as_str()),
+            Some("acp.teardown.container_reaped")
+        );
+        tokio::time::timeout(Duration::from_secs(2), recorder.cancel_seen.notified())
+            .await
+            .expect("observed :ro release still clears the ACP session");
+    }
+
+    #[tokio::test]
+    async fn observed_ro_release_surfaces_each_typed_runtime_failure() {
+        for failure in [
+            ReapFailure::Spawn,
+            ReapFailure::Timeout,
+            ReapFailure::NonZeroExit,
+            ReapFailure::WorkerPanicked,
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls_for_attempt = Arc::clone(&calls);
+            let attempt: ReapAttemptFn = Arc::new(move |_runtime, _name| {
+                let calls = Arc::clone(&calls_for_attempt);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(failure)
+                })
+            });
+            let controller = ReapController::new("docker", "a2a-ro-release-failure", attempt);
+            let mut config = test_config();
+            config.container = Some(ContainerReap::from_controller(controller));
+            let backend =
+                connect_recording_with(Recorder::new("agent-sess-RO-RELEASE-FAILURE"), config)
+                    .await;
+            let session = bkey("bridge-RO-RELEASE-FAILURE");
+            backend.ensure_session(&session).await.unwrap();
+            let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+
+            let error = backend
+                .release_session_observed(&session, observer.clone())
+                .await
+                .expect_err("typed runtime failure must fail observed release");
+            let diagnostic = assert_agent_failure(
+                &error,
+                DiagnosticPhase::Teardown,
+                DiagnosticFailureClass::ContainerRuntime,
+                true,
+            );
+            assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+            assert_eq!(diagnostic.code().as_str(), failure.code());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let events = observer.snapshot().await;
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+            assert_eq!(events[1].transition().status(), PhaseStatus::Failed);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_ro_release_observation_cannot_suppress_or_detach_cleanup() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_attempt = Arc::clone(&calls);
+        let entered = Arc::new(Notify::new());
+        let entered_for_attempt = Arc::clone(&entered);
+        let release = Arc::new(Notify::new());
+        let release_for_attempt = Arc::clone(&release);
+        let attempt: ReapAttemptFn = Arc::new(move |_runtime, _name| {
+            let calls = Arc::clone(&calls_for_attempt);
+            let entered = Arc::clone(&entered_for_attempt);
+            let release = Arc::clone(&release_for_attempt);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                entered.notify_one();
+                release.notified().await;
+                Ok(())
+            })
+        });
+        let controller = ReapController::new("docker", "a2a-ro-release-rejected", attempt);
+        let mut config = test_config();
+        config.container = Some(ContainerReap::from_controller(controller.clone()));
+        let backend = Arc::new(
+            connect_recording_with(Recorder::new("agent-sess-RO-RELEASE-REJECTED"), config).await,
+        );
+        let session = bkey("bridge-RO-RELEASE-REJECTED");
+        backend.ensure_session(&session).await.unwrap();
+        let rejecting = Arc::new(RejectOnRecord {
+            count: AtomicU64::new(0),
+            reject_at: 1,
+        });
+        let backend_for_release = Arc::clone(&backend);
+        let session_for_release = session.clone();
+        let task = tokio::spawn(async move {
+            backend_for_release
+                .release_session_observed(&session_for_release, rejecting)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("reap must start before the rejected diagnostic write can return");
+        assert!(
+            !task.is_finished(),
+            "observer failure must wait for the already-owned cleanup result"
+        );
+        release.notify_one();
+        assert_eq!(task.await.unwrap(), Err(BridgeError::StoreFailure));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.result(), Some(Ok(())));
+        assert!(backend.sessions.lock().await.get(&session).is_none());
     }
 
     #[tokio::test]

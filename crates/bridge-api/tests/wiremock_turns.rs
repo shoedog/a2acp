@@ -224,7 +224,7 @@ async fn cancel_during_inflight_ends_with_cancelled_and_preempts() {
 }
 
 #[tokio::test]
-async fn http_500_is_agent_crashed() {
+async fn http_500_is_structured_unknown() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -245,14 +245,18 @@ async fn http_500_is_agent_crashed() {
             err = Some(e);
         }
     }
-    assert!(matches!(
-        err,
-        Some(bridge_core::error::BridgeError::AgentCrashed { .. })
-    ));
+    let Some(BridgeError::AgentFailure { diagnostic }) = err else {
+        panic!("HTTP 500 must be a structured AgentFailure");
+    };
+    assert_eq!(
+        diagnostic.class(),
+        bridge_core::diagnostics::DiagnosticFailureClass::Unknown
+    );
+    assert_eq!(diagnostic.code().as_str(), "upstream.unknown");
 }
 
 #[tokio::test]
-async fn http_429_is_agent_overloaded() {
+async fn bare_http_429_is_structured_unknown() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -273,14 +277,18 @@ async fn http_429_is_agent_overloaded() {
             err = Some(e);
         }
     }
-    assert!(matches!(
-        err,
-        Some(bridge_core::error::BridgeError::AgentOverloaded)
-    ));
+    let Some(BridgeError::AgentFailure { diagnostic }) = err else {
+        panic!("bare HTTP 429 must be a structured AgentFailure");
+    };
+    assert_eq!(
+        diagnostic.class(),
+        bridge_core::diagnostics::DiagnosticFailureClass::Unknown
+    );
+    assert_eq!(diagnostic.code().as_str(), "upstream.unknown");
 }
 
 #[tokio::test]
-async fn http_401_is_agent_not_authenticated() {
+async fn http_401_is_structured_authentication() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -301,14 +309,18 @@ async fn http_401_is_agent_not_authenticated() {
             err = Some(e);
         }
     }
-    assert!(matches!(
-        err,
-        Some(bridge_core::error::BridgeError::AgentNotAuthenticated)
-    ));
+    let Some(BridgeError::AgentFailure { diagnostic }) = err else {
+        panic!("HTTP 401 must be a structured AgentFailure");
+    };
+    assert_eq!(
+        diagnostic.class(),
+        bridge_core::diagnostics::DiagnosticFailureClass::Authentication
+    );
+    assert_eq!(diagnostic.code().as_str(), "upstream.authentication");
 }
 
 #[tokio::test]
-async fn malformed_sse_is_frame_error() {
+async fn malformed_sse_is_structured_protocol_failure() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -329,14 +341,18 @@ async fn malformed_sse_is_frame_error() {
             err = Some(e);
         }
     }
-    assert!(matches!(
-        err,
-        Some(bridge_core::error::BridgeError::FrameError)
-    ));
+    let Some(BridgeError::AgentFailure { diagnostic }) = err else {
+        panic!("malformed SSE must be a structured AgentFailure");
+    };
+    assert_eq!(
+        diagnostic.class(),
+        bridge_core::diagnostics::DiagnosticFailureClass::Protocol
+    );
+    assert_eq!(diagnostic.code().as_str(), "api.prompt.sse_frame");
 }
 
 #[tokio::test]
-async fn connection_refused_is_agent_crashed() {
+async fn connection_refused_is_structured_transport_failure() {
     let be = ApiBackend::new(ApiConfig::new("http://127.0.0.1:1/v1"));
     let mut st = be
         .prompt(
@@ -351,10 +367,14 @@ async fn connection_refused_is_agent_crashed() {
             err = Some(e);
         }
     }
-    assert!(matches!(
-        err,
-        Some(bridge_core::error::BridgeError::AgentCrashed { .. })
-    ));
+    let Some(BridgeError::AgentFailure { diagnostic }) = err else {
+        panic!("connection refusal must be a structured AgentFailure");
+    };
+    assert_eq!(
+        diagnostic.class(),
+        bridge_core::diagnostics::DiagnosticFailureClass::Transport
+    );
+    assert_eq!(diagnostic.code().as_str(), "api.prompt.send");
 }
 
 #[tokio::test]
