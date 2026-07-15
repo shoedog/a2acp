@@ -114,10 +114,13 @@ a2a-bridge serve --config ./a2a-bridge.toml
 
 ```bash
 a2a-bridge models --config ./a2a-bridge.toml            # table: each agent's advertised models/effort/modes
-a2a-bridge models --config … --agent codex --json       # one agent, JSON (card's agent-models shape)
+a2a-bridge models --config … --agent codex --json       # one agent, JSON (caps or explicit failure)
 ```
 
-Probes live, degrades per-agent. Pass any listed value to the per-request override
+Probes live and degrades per-agent. Successful JSON values use the Agent Card `agent-models` capability
+shape. A failed probe is retained as `{available:false,failure:{agent,strategy,phase,...}}`; an explicitly
+requested failed agent exits nonzero after printing that machine-readable record, while an all-agent probe
+keeps partial-success exit behavior. Pass any listed value to the per-request override
 (`message.metadata` `a2a-bridge.{model,effort,mode}`) or an agent's config default.
 
 ## 5. Inspect / clean up containers
