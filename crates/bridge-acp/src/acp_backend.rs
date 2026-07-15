@@ -70,7 +70,7 @@ use bridge_core::process::{
     ProcessStderrCursor, ProcessStderrRing, ProcessStderrSnapshot, Supervised,
 };
 use bridge_core::provider::{classify_acp_error_data, ProviderEvidence};
-use bridge_core::reaper::{ReapController, ReapFn};
+use bridge_core::reaper::{production_reap_fn, ReapController, ReapFn};
 
 /// Default bound on the `initialize` handshake. A real agent that connects its
 /// stdio but never sends the initialize response would otherwise hang
@@ -417,13 +417,14 @@ pub struct AcpConfig {
     pub diagnostic_redactor: DiagnosticRedactor,
 }
 
-/// Reaper handle for a containerized (`:ro` sandbox) agent: the named `docker run` container is removed
-/// (`docker rm -f`) on every teardown path. The shared controller lets an
-/// operation-owned release join the same bounded attempt that `Drop` or process
-/// retirement may already have started.
+/// Reaper configuration for a containerized (`:ro` sandbox) agent. The public
+/// fields intentionally retain the original source-compatible literal shape;
+/// [`AcpBackend`] converts legacy injections to a private shared controller.
 #[derive(Clone)]
 pub struct ContainerReap {
-    controller: ReapController,
+    pub runtime: String,
+    pub name: String,
+    pub reap_fn: ReapFn,
 }
 
 impl ContainerReap {
@@ -434,27 +435,45 @@ impl ContainerReap {
         reap_fn: ReapFn,
     ) -> Self {
         Self {
-            controller: ReapController::from_legacy(runtime, name, reap_fn),
+            runtime: runtime.into(),
+            name: name.into(),
+            reap_fn,
         }
     }
 
-    /// Production `runtime rm -f name` controller with a bounded, typed result.
+    /// Source-compatible production configuration. The bridge binary supplies
+    /// a typed [`ReapController`] alongside this value when it needs to report
+    /// the bounded runtime result; external legacy callers keep best-effort
+    /// behavior through `reap_fn`.
     pub fn production(runtime: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
-            controller: ReapController::production(runtime, name),
+            runtime: runtime.into(),
+            name: name.into(),
+            reap_fn: production_reap_fn(),
         }
     }
 
-    /// Explicit controller injection for typed result/cancellation tests.
-    pub fn from_controller(controller: ReapController) -> Self {
-        Self { controller }
+    /// Build the typed production flight for bridge-owned spawn paths.
+    #[doc(hidden)]
+    pub fn production_controller(&self) -> ReapController {
+        ReapController::production(self.runtime.clone(), self.name.clone())
+    }
+
+    fn legacy_controller(&self) -> ReapController {
+        ReapController::from_legacy(
+            self.runtime.clone(),
+            self.name.clone(),
+            Arc::clone(&self.reap_fn),
+        )
     }
 }
 
 impl std::fmt::Debug for ContainerReap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContainerReap")
-            .field("controller", &self.controller)
+            .field("runtime", &self.runtime)
+            .field("name", &self.name)
+            .field("reap_fn", &"<fn>")
             .finish()
     }
 }
@@ -867,6 +886,10 @@ pub struct AcpBackend {
     stderr_ring: Option<ProcessStderrRing>,
     /// Static config (cwd for `session/new`, model/mode for later tasks).
     config: Option<AcpConfig>,
+    /// One private, joinable container-removal flight. Public `AcpConfig`
+    /// retains its legacy literal shape; production may inject a typed
+    /// controller while legacy callers are adapted from `ContainerReap`.
+    container_reap: Option<ReapController>,
     /// Idempotency flag for the `:ro` container reaper (shared across the teardown sites: cancel-escalate,
     /// retire, Drop). Always present; reaping is a no-op when `config.container` is `None`.
     reaped: Arc<AtomicBool>,
@@ -1570,6 +1593,19 @@ impl AcpBackend {
         config: AcpConfig,
         observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<Self, BridgeError> {
+        Self::spawn_observed_with_container_controller(cmd, args, config, observer, None).await
+    }
+
+    /// Bridge-owned production seam for retaining the public legacy
+    /// `ContainerReap` shape while joining a typed runtime-removal attempt.
+    #[doc(hidden)]
+    pub async fn spawn_observed_with_container_controller(
+        cmd: &str,
+        args: &[&str],
+        config: AcpConfig,
+        observer: Arc<dyn DiagnosticObserver>,
+        container_controller: Option<ReapController>,
+    ) -> Result<Self, BridgeError> {
         let redactor = config.diagnostic_redactor.clone();
         let lifecycle = AcpLifecycle::new(observer.clone(), redactor.clone(), None);
         lifecycle
@@ -1584,7 +1620,13 @@ impl AcpBackend {
         // Reaper handle for the SPAWN-FAILURE path (Site A): once `Supervised::spawn` succeeds the
         // `docker run` container is up, but if pipe-take or the handshake then fails there is no backend
         // to reap from — so reap here. Cloned before `config` moves into `connect`.
-        let container_on_fail = config.container.clone();
+        let container_controller = container_controller.or_else(|| {
+            config
+                .container
+                .as_ref()
+                .map(ContainerReap::legacy_controller)
+        });
+        let container_on_fail = container_controller.clone();
         let mut supervised =
             match Supervised::spawn_with_stderr_redactor(cmd, args, None, redactor.clone()) {
                 Ok(supervised) => supervised,
@@ -1671,6 +1713,7 @@ impl AcpBackend {
             Self::connect_observed_after(
                 transport,
                 config,
+                container_controller,
                 observer,
                 Some(DiagnosticPhase::Spawn),
                 Some((stderr_ring.clone(), stderr_cursor)),
@@ -1718,12 +1761,13 @@ impl AcpBackend {
         config: AcpConfig,
         observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<Self, BridgeError> {
-        Self::connect_observed_after(transport, config, observer, None, None).await
+        Self::connect_observed_after(transport, config, None, observer, None, None).await
     }
 
     async fn connect_observed_after(
         transport: impl ConnectTo<Client> + 'static,
         config: AcpConfig,
+        container_controller: Option<ReapController>,
         observer: Arc<dyn DiagnosticObserver>,
         last_completed_before_initialize: Option<DiagnosticPhase>,
         stderr: Option<(ProcessStderrRing, ProcessStderrCursor)>,
@@ -2119,6 +2163,12 @@ impl AcpBackend {
                 .await?;
         }
 
+        let container_reap = container_controller.or_else(|| {
+            config
+                .container
+                .as_ref()
+                .map(ContainerReap::legacy_controller)
+        });
         Ok(Self {
             conn: Some(AcpConn {
                 cx,
@@ -2130,6 +2180,7 @@ impl AcpBackend {
             supervised: Arc::new(StdMutex::new(None)),
             stderr_ring: None,
             config: Some(config),
+            container_reap,
             reaped: Arc::new(AtomicBool::new(false)),
             unavailable: Arc::new(AtomicBool::new(false)),
             dispatch_gate: Arc::new(StdMutex::new(())),
@@ -3056,7 +3107,7 @@ impl AcpBackend {
 
         let turn_lock = Arc::clone(&entry.turn_lock);
         let supervised = Arc::clone(&self.supervised);
-        let container = self.config.as_ref().and_then(|c| c.container.clone());
+        let container = self.container_reap.clone();
         let reaped = Arc::clone(&self.reaped);
         let unavailable = Arc::clone(&self.unavailable);
         let dispatch_gate = Arc::clone(&self.dispatch_gate);
@@ -3114,6 +3165,7 @@ impl AcpBackend {
         let mut backend = Self::connect_observed_after(
             transport,
             config,
+            None,
             Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
             None,
             Some((stderr_ring.clone(), stderr_cursor)),
@@ -3325,7 +3377,7 @@ impl AcpBackend {
 
     fn escalate_terminate(
         supervised: &Arc<StdMutex<Option<Supervised>>>,
-        container: &Option<ContainerReap>,
+        container: &Option<ReapController>,
         reaped: &Arc<AtomicBool>,
         dispatch_gate: &Arc<StdMutex<()>>,
         unavailable: &Arc<AtomicBool>,
@@ -3343,10 +3395,10 @@ impl AcpBackend {
 
     /// Reap the agent's `:ro` container (idempotent; no-op when `container` is `None`). Called from every
     /// teardown site (spawn-failure, escalate_terminate, retire, Drop) — at most one `docker rm -f` total.
-    fn reap_container(container: &Option<ContainerReap>, reaped: &Arc<AtomicBool>) {
+    fn reap_container(container: &Option<ReapController>, reaped: &Arc<AtomicBool>) {
         if let Some(c) = container {
             reaped.store(true, Ordering::SeqCst);
-            c.controller.reap_detached();
+            c.reap_detached();
         }
     }
 
@@ -3829,7 +3881,7 @@ impl AcpBackend {
         let registry_for_driver = Arc::clone(&registry);
         let agent_id_for_driver = agent_id.clone();
         let supervised_for_driver = Arc::clone(&self.supervised);
-        let container_for_driver = self.config.as_ref().and_then(|c| c.container.clone());
+        let container_for_driver = self.container_reap.clone();
         let reaped_for_driver = Arc::clone(&self.reaped);
         let unavailable_for_driver = Arc::clone(&self.unavailable);
         let dispatch_gate_for_driver = Arc::clone(&self.dispatch_gate);
@@ -4497,13 +4549,64 @@ impl AgentBackend for AcpBackend {
     /// the config stash. Does NOT `retire()` the shared process (warm for serve's lifetime,
     /// shared across sessions). [Slice 0]
     async fn release_session(&self, session: &SessionId) {
-        let _ = self.release_session_result(session).await;
+        let _ = self.release_session_checked(session).await;
     }
 
     async fn release_session_checked(&self, session: &SessionId) -> Result<(), BridgeError> {
-        self.release_session_result(session)
-            .await
-            .map_err(|failure| failure.error)
+        let container = self.container_reap.clone();
+        let lifecycle = if container.is_some() {
+            Some(
+                self.operation_lifecycle(
+                    session,
+                    Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        if let Some(container) = &container {
+            self.reaped.store(true, Ordering::SeqCst);
+            container.reap_detached();
+        }
+        if let Some(lifecycle) = &lifecycle {
+            lifecycle
+                .record(
+                    DiagnosticPhase::Teardown,
+                    PhaseStatus::Started,
+                    None,
+                    Some("acp.teardown.release"),
+                    None,
+                )
+                .await?;
+        }
+        let release_result = self.release_session_result(session).await;
+        let reap_result = match &container {
+            Some(container) => container.reap_observed().await,
+            None => Ok(()),
+        };
+        if let Err(failure) = release_result {
+            return Err(failure.error);
+        }
+        if let Err(failure) = reap_result {
+            return Err(lifecycle
+                .expect("container cleanup lifecycle")
+                .failure(
+                    DiagnosticPhase::Teardown,
+                    None,
+                    DiagnosticFailureClass::ContainerRuntime,
+                    FailureDisposition::Fatal,
+                    failure.code(),
+                    "Container removal failed",
+                    None,
+                    true,
+                    None,
+                    None,
+                    None,
+                )
+                .await);
+        }
+        Ok(())
     }
 
     async fn release_session_observed(
@@ -4512,10 +4615,7 @@ impl AgentBackend for AcpBackend {
         observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<(), BridgeError> {
         let lifecycle = self.operation_lifecycle(session, observer).await;
-        let container = self
-            .config
-            .as_ref()
-            .and_then(|config| config.container.clone());
+        let container = self.container_reap.clone();
 
         // A `:ro` release owns process cleanup, not just the ACP session map.
         // Select/start the observer-free flight before the first cancellable
@@ -4523,7 +4623,7 @@ impl AgentBackend for AcpBackend {
         // this waiter returns only after the shared reap has settled.
         if let Some(container) = &container {
             self.reaped.store(true, Ordering::SeqCst);
-            container.controller.reap_detached();
+            container.reap_detached();
         }
 
         let start_result = lifecycle
@@ -4544,7 +4644,7 @@ impl AgentBackend for AcpBackend {
         }
         let release_result = self.release_session_result(session).await;
         let reap_result = match &container {
-            Some(container) => container.controller.reap_observed().await,
+            Some(container) => container.reap_observed().await,
             None => Ok(()),
         };
 
@@ -4613,7 +4713,7 @@ impl AgentBackend for AcpBackend {
         Self::close_connection_fence(&self.dispatch_gate, &self.unavailable);
         // Registry retirement must select/start process-owned container cleanup
         // before the cancellable graceful process termination await.
-        let container = self.config.as_ref().and_then(|c| c.container.clone());
+        let container = self.container_reap.clone();
         AcpBackend::reap_container(&container, &self.reaped);
         let sup = self.supervised.lock().ok().and_then(|mut g| g.take());
         if let Some(sup) = sup {
@@ -4628,7 +4728,7 @@ impl Drop for AcpBackend {
     /// if no earlier site already did. The shared controller's detached start is
     /// off-runtime-safe, so a Drop at process shutdown never panics.
     fn drop(&mut self) {
-        let container = self.config.as_ref().and_then(|c| c.container.clone());
+        let container = self.container_reap.clone();
         AcpBackend::reap_container(&container, &self.reaped);
     }
 }
@@ -5548,7 +5648,7 @@ mod tests {
         });
         let controller =
             ReapController::from_legacy("docker", "a2a-ro-owner-nonce", Arc::clone(&reap_fn));
-        let container = Some(ContainerReap::from_controller(controller.clone()));
+        let container = Some(controller.clone());
         let reaped = Arc::new(AtomicBool::new(false));
         // escalate_terminate + retire + Drop all firing → still one `docker rm -f`.
         AcpBackend::reap_container(&container, &reaped);
@@ -5562,7 +5662,7 @@ mod tests {
         );
 
         // No container → never reaps.
-        let none: Option<ContainerReap> = None;
+        let none: Option<ReapController> = None;
         let r2 = Arc::new(AtomicBool::new(false));
         AcpBackend::reap_container(&none, &r2);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -5949,6 +6049,7 @@ mod tests {
             supervised: Arc::new(StdMutex::new(Some(supervised))),
             stderr_ring: None,
             config: None,
+            container_reap: None,
             reaped: Arc::new(AtomicBool::new(false)),
             unavailable: Arc::new(AtomicBool::new(false)),
             dispatch_gate: Arc::new(StdMutex::new(())),
@@ -8218,6 +8319,7 @@ mod tests {
             supervised: Arc::new(StdMutex::new(None)),
             stderr_ring: None,
             config: Some(test_config()),
+            container_reap: None,
             reaped: Arc::new(AtomicBool::new(false)),
             unavailable: Arc::new(AtomicBool::new(false)),
             dispatch_gate: Arc::new(StdMutex::new(())),
@@ -8501,10 +8603,7 @@ mod tests {
             .await
             .expect("prompt must pass its early checks and pause before dispatch");
 
-        let container = backend
-            .config
-            .as_ref()
-            .and_then(|config| config.container.clone());
+        let container = backend.container_reap.clone();
         AcpBackend::escalate_terminate(
             &backend.supervised,
             &container,
@@ -10963,6 +11062,7 @@ mod tests {
             supervised: Arc::new(StdMutex::new(Some(supervised))),
             stderr_ring: None,
             config: None,
+            container_reap: None,
             reaped: Arc::new(AtomicBool::new(false)),
             unavailable: Arc::new(AtomicBool::new(false)),
             dispatch_gate: Arc::new(StdMutex::new(())),
@@ -11734,10 +11834,10 @@ mod tests {
             })
         });
         let controller = ReapController::new("docker", "a2a-ro-release-success", attempt);
-        let mut config = test_config();
-        config.container = Some(ContainerReap::from_controller(controller.clone()));
+        let config = test_config();
         let recorder = Recorder::new("agent-sess-RO-RELEASE-SUCCESS");
-        let backend = connect_recording_with(recorder.clone(), config).await;
+        let mut backend = connect_recording_with(recorder.clone(), config).await;
+        backend.container_reap = Some(controller.clone());
         let session = bkey("bridge-RO-RELEASE-SUCCESS");
         backend.ensure_session(&session).await.unwrap();
         let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
@@ -11783,11 +11883,11 @@ mod tests {
                 })
             });
             let controller = ReapController::new("docker", "a2a-ro-release-failure", attempt);
-            let mut config = test_config();
-            config.container = Some(ContainerReap::from_controller(controller));
-            let backend =
+            let config = test_config();
+            let mut backend =
                 connect_recording_with(Recorder::new("agent-sess-RO-RELEASE-FAILURE"), config)
                     .await;
+            backend.container_reap = Some(controller);
             let session = bkey("bridge-RO-RELEASE-FAILURE");
             backend.ensure_session(&session).await.unwrap();
             let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
@@ -11813,6 +11913,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checked_ro_release_surfaces_the_typed_runtime_failure() {
+        let attempt: ReapAttemptFn =
+            Arc::new(|_runtime, _name| Box::pin(async move { Err(ReapFailure::Timeout) }));
+        let controller = ReapController::new("docker", "a2a-ro-checked", attempt);
+        let mut backend =
+            connect_recording_with(Recorder::new("agent-sess-RO-CHECKED"), test_config()).await;
+        backend.container_reap = Some(controller.clone());
+        let session = bkey("bridge-RO-CHECKED");
+        backend.ensure_session(&session).await.unwrap();
+
+        let error = backend
+            .release_session_checked(&session)
+            .await
+            .expect_err("checked cleanup must join the container-removal flight");
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::Teardown,
+            DiagnosticFailureClass::ContainerRuntime,
+            true,
+        );
+        assert_eq!(diagnostic.code().as_str(), ReapFailure::Timeout.code());
+        assert_eq!(controller.result(), Some(Err(ReapFailure::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn checked_ro_release_waits_for_the_owned_successful_cleanup() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let attempt: ReapAttemptFn = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move |_runtime, _name| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+            })
+        };
+        let controller = ReapController::new("docker", "a2a-ro-checked-ok", attempt);
+        let mut backend =
+            connect_recording_with(Recorder::new("agent-sess-RO-CHECKED-OK"), test_config()).await;
+        backend.container_reap = Some(controller.clone());
+        let backend = Arc::new(backend);
+        let session = bkey("bridge-RO-CHECKED-OK");
+        backend.ensure_session(&session).await.unwrap();
+
+        let task = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move { backend.release_session_checked(&session).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("checked release starts the container cleanup");
+        assert!(!task.is_finished());
+        release.notify_one();
+        task.await.unwrap().unwrap();
+        assert_eq!(controller.result(), Some(Ok(())));
+    }
+
+    #[tokio::test]
     async fn rejected_ro_release_observation_cannot_suppress_or_detach_cleanup() {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_attempt = Arc::clone(&calls);
@@ -11832,11 +11996,11 @@ mod tests {
             })
         });
         let controller = ReapController::new("docker", "a2a-ro-release-rejected", attempt);
-        let mut config = test_config();
-        config.container = Some(ContainerReap::from_controller(controller.clone()));
-        let backend = Arc::new(
-            connect_recording_with(Recorder::new("agent-sess-RO-RELEASE-REJECTED"), config).await,
-        );
+        let config = test_config();
+        let mut backend =
+            connect_recording_with(Recorder::new("agent-sess-RO-RELEASE-REJECTED"), config).await;
+        backend.container_reap = Some(controller.clone());
+        let backend = Arc::new(backend);
         let session = bkey("bridge-RO-RELEASE-REJECTED");
         backend.ensure_session(&session).await.unwrap();
         let rejecting = Arc::new(RejectOnRecord {
@@ -11866,12 +12030,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_ro_cleanup_event_persistence_remains_the_public_error() {
+        let attempt: ReapAttemptFn =
+            Arc::new(|_runtime, _name| Box::pin(async move { Err(ReapFailure::Timeout) }));
+        let controller = ReapController::new("docker", "a2a-ro-persistence", attempt);
+        let mut backend =
+            connect_recording_with(Recorder::new("agent-sess-RO-PERSISTENCE"), test_config()).await;
+        backend.container_reap = Some(controller.clone());
+        let session = bkey("bridge-RO-PERSISTENCE");
+        backend.ensure_session(&session).await.unwrap();
+        let rejecting = Arc::new(RejectOnRecord {
+            count: AtomicU64::new(0),
+            reject_at: 2,
+        });
+
+        assert_eq!(
+            backend.release_session_observed(&session, rejecting).await,
+            Err(BridgeError::StoreFailure),
+            "the failed-event journal write is a real persistence boundary"
+        );
+        assert_eq!(
+            controller.result(),
+            Some(Err(ReapFailure::Timeout)),
+            "the process-owned controller still retains its typed result"
+        );
+    }
+
+    #[tokio::test]
     async fn observed_pre_dispatch_cancel_and_release_failures_are_not_accepted() {
         let backend = AcpBackend {
             conn: None,
             supervised: Arc::new(StdMutex::new(None)),
             stderr_ring: None,
             config: Some(test_config()),
+            container_reap: None,
             reaped: Arc::new(AtomicBool::new(false)),
             unavailable: Arc::new(AtomicBool::new(false)),
             dispatch_gate: Arc::new(StdMutex::new(())),

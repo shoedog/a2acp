@@ -435,9 +435,19 @@ impl bridge_container::ContainerSpawn for AcpContainerSpawn {
         cfg: bridge_acp::acp_backend::AcpConfig,
     ) -> Result<Arc<dyn bridge_core::ports::AgentBackend>, BridgeError> {
         let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let mut be = bridge_acp::acp_backend::AcpBackend::spawn(program, &argv_ref, cfg)
-            .await?
-            .with_policy(Arc::clone(&self.policy));
+        let controller = cfg
+            .container
+            .as_ref()
+            .map(bridge_acp::acp_backend::ContainerReap::production_controller);
+        let mut be = bridge_acp::acp_backend::AcpBackend::spawn_observed_with_container_controller(
+            program,
+            &argv_ref,
+            cfg,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+            controller,
+        )
+        .await?
+        .with_policy(Arc::clone(&self.policy));
         if let Some(reg) = &self.permission_registry {
             be = be
                 .with_permission_registry(Arc::clone(reg))
@@ -454,10 +464,15 @@ impl bridge_container::ContainerSpawn for AcpContainerSpawn {
         observer: Arc<dyn bridge_core::ports::DiagnosticObserver>,
     ) -> Result<Arc<dyn bridge_core::ports::AgentBackend>, BridgeError> {
         let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let mut be =
-            bridge_acp::acp_backend::AcpBackend::spawn_observed(program, &argv_ref, cfg, observer)
-                .await?
-                .with_policy(Arc::clone(&self.policy));
+        let controller = cfg
+            .container
+            .as_ref()
+            .map(bridge_acp::acp_backend::ContainerReap::production_controller);
+        let mut be = bridge_acp::acp_backend::AcpBackend::spawn_observed_with_container_controller(
+            program, &argv_ref, cfg, observer, controller,
+        )
+        .await?
+        .with_policy(Arc::clone(&self.policy));
         if let Some(reg) = &self.permission_registry {
             be = be
                 .with_permission_registry(Arc::clone(reg))
@@ -817,8 +832,16 @@ fn make_spawn_fn(
                     let (program, argv, acp) =
                         acp_spawn_inputs(&entry, cwd, &owner_config_path, &run)?;
                     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
-                    let mut be = bridge_acp::acp_backend::AcpBackend::spawn_observed(
-                        &program, &argv_ref, acp, observer,
+                    let controller = acp
+                        .container
+                        .as_ref()
+                        .map(bridge_acp::acp_backend::ContainerReap::production_controller);
+                    let mut be = bridge_acp::acp_backend::AcpBackend::spawn_observed_with_container_controller(
+                        &program,
+                        &argv_ref,
+                        acp,
+                        observer,
+                        controller,
                     )
                     .await?
                     .with_policy(policy);

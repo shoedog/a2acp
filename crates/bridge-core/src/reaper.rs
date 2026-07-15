@@ -106,17 +106,25 @@ impl ReapController {
     }
 
     pub fn production(runtime: impl Into<String>, name: impl Into<String>) -> Self {
-        let attempt: ReapAttemptFn = Arc::new(|runtime, name| {
+        Self::production_with_timeout(runtime, name, Duration::from_secs(10))
+    }
+
+    fn production_with_timeout(
+        runtime: impl Into<String>,
+        name: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
+        let attempt: ReapAttemptFn = Arc::new(move |runtime, name| {
+            let timeout = timeout;
             Box::pin(async move {
                 let (program, argv) = crate::sandbox::reap_argv(&runtime, &name);
                 let mut command = tokio::process::Command::new(&program);
                 command.args(&argv).kill_on_drop(true);
                 let child = command.spawn().map_err(|_| ReapFailure::Spawn)?;
-                let output =
-                    tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
-                        .await
-                        .map_err(|_| ReapFailure::Timeout)?
-                        .map_err(|_| ReapFailure::Spawn)?;
+                let output = tokio::time::timeout(timeout, child.wait_with_output())
+                    .await
+                    .map_err(|_| ReapFailure::Timeout)?
+                    .map_err(|_| ReapFailure::Spawn)?;
                 if output.status.success() {
                     Ok(())
                 } else {
@@ -439,6 +447,81 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn synchronous_attempt_panic_settles_once_as_worker_panicked() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempt: ReapAttemptFn = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_runtime, _name| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                panic!("synchronous reaper panic")
+            })
+        };
+        let controller = ReapController::new("docker", "a2a-rw-sync-panic", attempt);
+
+        assert_eq!(
+            controller.reap_observed().await,
+            Err(ReapFailure::WorkerPanicked)
+        );
+        assert_eq!(
+            controller.reap_observed().await,
+            Err(ReapFailure::WorkerPanicked)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn asynchronous_attempt_panic_settles_once_as_worker_panicked() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempt: ReapAttemptFn = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_runtime, _name| {
+                let calls = Arc::clone(&calls);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    panic!("asynchronous reaper panic")
+                })
+            })
+        };
+        let controller = ReapController::new("docker", "a2a-rw-async-panic", attempt);
+
+        assert_eq!(
+            controller.reap_observed().await,
+            Err(ReapFailure::WorkerPanicked)
+        );
+        assert_eq!(
+            controller.reap_observed().await,
+            Err(ReapFailure::WorkerPanicked)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_timeout_kills_child_before_delayed_side_effect() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("hung-runtime");
+        let marker = temp.path().join("late-side-effect");
+        std::fs::write(&runtime, "#!/bin/sh\nsleep 0.25\nprintf reached > \"$3\"\n").unwrap();
+        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&runtime, permissions).unwrap();
+
+        let controller = ReapController::production_with_timeout(
+            runtime.to_string_lossy(),
+            marker.to_string_lossy(),
+            Duration::from_millis(20),
+        );
+        assert_eq!(controller.reap_observed().await, Err(ReapFailure::Timeout));
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(
+            !marker.exists(),
+            "kill_on_drop must stop the timed-out runtime before its delayed side effect"
+        );
     }
 
     #[tokio::test]

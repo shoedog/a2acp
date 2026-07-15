@@ -1,8 +1,8 @@
 # R2b — Structured lifecycle diagnostics implementation plan
 
-- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 MERGED at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 IN PROGRESS on `agent/reliability-r2b3-api-container` from `2e9ed640` (affected packages **566 / 0 / 1 ignored**; full host workspace **1,860 / 0 / 12 ignored**; hygiene **37/7**; review pending)
-- **Current execution boundary:** no R2c live/billable smoke ran; fresh full-branch review remains; no
-  docs-link checker is present
+- **Status:** R2b0 MERGED at `11ebc402`; R2b1 MERGED at `7b788c1f`; R2b2 MERGED at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**); R2b3 IN PROGRESS on `agent/reliability-r2b3-api-container` from `2e9ed640` (review 1 `REVISE`; fold on branch head; affected packages **584 / 0 / 1 ignored**; full host workspace **1,878 / 0 / 12 ignored**; hygiene **37/7**; closure re-review pending)
+- **Current execution boundary:** no R2c live/billable smoke ran; run a fresh full-branch closure
+  re-review; no docs-link checker is present
 - **Prerequisite:** R2a merged at `24aff09c`
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -872,11 +872,28 @@ automatically.
 - Pre-change-red regressions cover first-send installation order, closed provider mappings and their
   negative/conflict edges, cold spawn-failure cleanup joining, retirement-before-cancel, typed cleanup
   failures, concurrent joiners, detached cleanup, and centralized diagnostic-construction guards.
-- `cargo fmt --all -- --check` plus the exact affected-package command pass **566 / 0 / 1 ignored**:
-  ACP 204, API 56 plus one ignored local Ollama case, container 31, and core 275. The host serial full
-  workspace passes **1,860 / 0 / 12 ignored** across 65 harness groups. Workspace/all-target check,
-  warnings-denied Clippy, release binary, and hygiene **37/7** are clean. Fresh Sol/xhigh review remains.
-  No R2c live/billable smoke has run, and no docs-link checker is present.
+- Fresh Sol/xhigh review 1 returned `REVISE`. Confirmed findings were: cold and warm cancel/retire could
+  lose a creation reservation and permit late dispatch; a session-only reap map could replace the old
+  generation before its cleanup owner joined; warm backend `Drop` did not start cleanup; the new private
+  `ContainerReap` representation broke its long-public literal; and real panic/production timeout-kill
+  regressions were absent. The review's separate claim that a typed reap failure must replace a failed
+  diagnostic write is rejected by the design-of-record rule that a real journal boundary remains a
+  persistence failure. ACP and container tests now make that precedence explicit and prove the controller
+  still retains the typed cleanup result.
+- The review fold publishes a generation-bound controller in every cold/warm reservation before spawn,
+  seals retirement under the same admission lock, starts cleanup when cancel/retire takes the reservation,
+  and permits only the exact generation to promote or dispatch. A later cold generation is fenced until
+  checked/observed cleanup acknowledges the retained owner. Cold Forget, warm `Drop`, and ACP checked `:ro`
+  release now join/start the same process-owned flight. The exact public
+  `ContainerReap { runtime, name, reap_fn }` shape is restored; bridge production spawn supplies a private
+  typed controller. Self-audit also closes cancel-during-turn-configuration for cold and first warm turns.
+- Pre-change-red regressions cover all of those schedules, successful and failed checked cleanup, stale
+  dispatch suppression, synchronous and asynchronous worker panic, and production timeout child killing.
+  `cargo fmt --all` plus the exact affected-package command pass **584 / 0 / 1 ignored**: ACP 208, API 56
+  plus one ignored local Ollama case, container 42, and core 278. The exact review-fold tree passes host
+  serial workspace **1,878 / 0 / 12 ignored**, workspace/all-target check, warnings-denied all-target
+  Clippy, release binary build, and repository hygiene **37/7**. Request closure re-review. No R2c
+  live/billable smoke has run, and no docs-link checker is present.
 
 ## R2b completion gate
 
