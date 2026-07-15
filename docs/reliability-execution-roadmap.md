@@ -286,8 +286,8 @@ Next action:
   The amended `afcc856c` fold made the roadmap top, table, vocabulary, plan, and design agree on
   `APPROVED / PENDING MERGE`; it reran the same full/hygiene gates, and targeted Sol/xhigh re-review
   adjudicated the mismatch `FIXED`, found no new findings, and returned `APPROVE`. The branch was then
-  fast-forwarded and pushed to `origin/main` at `afcc856c3276fe682fb78dc657591021f5e604fc`. R2c remains
-  unrun and requires separate operator authorization.
+  fast-forwarded and pushed to `origin/main` at `afcc856c3276fe682fb78dc657591021f5e604fc`. At that R2b3
+  merge checkpoint, R2c was unrun and required separate operator authorization.
 - `origin/main` contains R2b3 at `afcc856c3276fe682fb78dc657591021f5e604fc`. R2b2d was approved at
   `14402f895a5eda2852684a8fbd35f83452e2645f`; the final full-branch review fold is committed at
   `a459b31de5a4665138a7330868e38dfb8992438b`, and the re-review-1 fold at
@@ -595,8 +595,8 @@ Next action:
   (`PermissionDenied`) and two file-watch cases timed out. The identical host-level serial command then passed
   **1,806 / 0 / 12 ignored** across 64 terminal result groups, falsifying a branch regression. Repository
   hygiene passes with **37** tracked artifacts and **7** validated example configs. The Git command-fixture
-  limitation and bounded yield polling remain minor test-coverage follow-ups. No docs-link checker is present
-  and no live/billable gate has run.
+  limitation and bounded yield polling remain minor test-coverage follow-ups. At that R2b2 checkpoint, no
+  docs-link checker was present and no live/billable gate had run.
 - The first final full-R2b2 Max review inspected all 36 changed paths at published head `5917f175` and
   returned `REVISE` with two `WRONG/MAJOR` cold-workflow asymmetries. A successful cold turn could discard a
   result-bearing Worktree teardown failure and report `Completed`; separately, cancellation-first cold

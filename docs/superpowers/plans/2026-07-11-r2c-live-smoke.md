@@ -12,7 +12,7 @@ artifact/redaction, and API tool-observation regressions are green. The first au
 exposed an artifact-permission defect and was not accepted; after reviewed hardening, a separately
 authorized fixed-candidate turn passed artifact-exact with no retry or fallback.
 
-## In-progress checkpoint — 2026-07-15
+## Approval checkpoint — 2026-07-15
 
 - Implemented the strict one-turn `smoke` command, pre-attempt output validation, absolute attempt and
   cleanup bounds, private versioned artifact, default recursive stderr-text removal, exact terminal/PONG
