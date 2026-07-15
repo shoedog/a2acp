@@ -1,0 +1,79 @@
+name: Compatibility regression
+description: Report a provider, agent, model, protocol, or dependency update that broke a previously working path.
+title: "[Compatibility]: "
+labels:
+  - "kind:compatibility"
+  - "status:triage"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Compatibility reports need both the last-known-good and first-known-bad boundary. Remove secrets, credentials, private prompts, and sensitive log content before submitting.
+  - type: input
+    id: component
+    attributes:
+      label: Agent, provider, or dependency
+      placeholder: codex-acp, Claude Code, Podman, ACP SDK, etc.
+    validations:
+      required: true
+  - type: input
+    id: last_good
+    attributes:
+      label: Last-known-good versions
+      description: Include a2a-bridge plus the agent/provider/dependency version.
+    validations:
+      required: true
+  - type: input
+    id: first_bad
+    attributes:
+      label: First-known-bad versions
+      description: Include a2a-bridge plus the agent/provider/dependency version.
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model and effort, if applicable
+      placeholder: gpt-5.6-sol[high]
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Execution environment
+      options:
+        - Host / non-container
+        - Managed container
+        - CI
+        - More than one environment
+        - Other or unknown
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction and version boundary
+      description: Show the same safe operation on the good and bad versions, without triggering unnecessary billable turns.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed compatibility failure
+      description: State the incorrect result and whether the host and container paths differ.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Include protocol errors, exit status, and artifact metadata; omit sensitive payloads.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks completed
+      options:
+        - label: I verified the version boundary or clearly marked it as suspected.
+          required: true
+        - label: I removed secrets, credentials, private prompts, and sensitive log content.
+          required: true

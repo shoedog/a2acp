@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/shoedog/a2acp/security/advisories/new
+    about: Do not disclose vulnerabilities, credentials, private prompts, or sensitive logs in a public issue.

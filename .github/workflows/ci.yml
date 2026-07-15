@@ -10,6 +10,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+permissions:
+  contents: read
+  issues: read
+
 jobs:
   ci:
     name: Build, Lint, Coverage
@@ -44,6 +48,15 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Validate issue intake
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          live_labels="$(mktemp)"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/labels?per_page=100" --jq '.[].name' > "$live_labels"
+          ruby tools/validate_issue_intake.rb --live-labels "$live_labels"
+          ruby tools/validate_issue_intake_test.rb
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings

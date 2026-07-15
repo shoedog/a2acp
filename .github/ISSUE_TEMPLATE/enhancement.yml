@@ -1,0 +1,65 @@
+name: Enhancement or feature
+description: Propose a new capability or a material improvement to an existing one.
+title: "[Enhancement]: "
+labels:
+  - "kind:enhancement"
+  - "status:triage"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start with the operator problem and desired outcome. Remove secrets, credentials, private prompts, and sensitive log content before submitting examples.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What operator or contributor problem is not adequately solved today?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior and how we would know the change works.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - ACP adapter or provider
+        - Workflow execution
+        - Container runtime
+        - CLI
+        - Model compatibility
+        - Documentation
+        - Release or packaging
+        - Repository automation
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Proposed scope
+      description: Identify the smallest useful increment, constraints, and important non-goals.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing commands, configuration, or external tools that partly address the problem.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Additional evidence
+      description: Link public examples or paste scrubbed diagnostics only.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed secrets, credentials, private prompts, and sensitive log content.
+          required: true
