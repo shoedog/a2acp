@@ -56,6 +56,8 @@ struct FallbackSmokeGuard {
     expected_executable_sha256: String,
     expected_session_cwd: SessionCwd,
     expected_session_cwd_identity: crate::local_file::DirectoryIdentity,
+    expected_source_mount: SessionCwd,
+    expected_source_mount_identity: crate::local_file::DirectoryIdentity,
     source_agent: AgentId,
 }
 
@@ -98,6 +100,10 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
     let mut expected_session_cwd_device = None;
     let mut expected_session_cwd_inode = None;
     let mut expected_session_cwd_object_sha256 = None;
+    let mut expected_source_mount = None;
+    let mut expected_source_mount_device = None;
+    let mut expected_source_mount_inode = None;
+    let mut expected_source_mount_object_sha256 = None;
     let mut fallback_source_agent = None;
     let mut require_host_fallback_eligible = false;
     let mut acknowledged = false;
@@ -180,6 +186,35 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
                 expected_session_cwd_object_sha256 =
                     Some(value(&mut it, "--expected-session-cwd-object-sha256")?);
             }
+            "--expected-source-mount" if expected_source_mount.is_some() => {
+                return Err("smoke: duplicate --expected-source-mount".into());
+            }
+            "--expected-source-mount" => {
+                expected_source_mount = Some(value(&mut it, "--expected-source-mount")?);
+            }
+            "--expected-source-mount-device" if expected_source_mount_device.is_some() => {
+                return Err("smoke: duplicate --expected-source-mount-device".into());
+            }
+            "--expected-source-mount-device" => {
+                expected_source_mount_device =
+                    Some(value(&mut it, "--expected-source-mount-device")?);
+            }
+            "--expected-source-mount-inode" if expected_source_mount_inode.is_some() => {
+                return Err("smoke: duplicate --expected-source-mount-inode".into());
+            }
+            "--expected-source-mount-inode" => {
+                expected_source_mount_inode =
+                    Some(value(&mut it, "--expected-source-mount-inode")?);
+            }
+            "--expected-source-mount-object-sha256"
+                if expected_source_mount_object_sha256.is_some() =>
+            {
+                return Err("smoke: duplicate --expected-source-mount-object-sha256".into());
+            }
+            "--expected-source-mount-object-sha256" => {
+                expected_source_mount_object_sha256 =
+                    Some(value(&mut it, "--expected-source-mount-object-sha256")?);
+            }
             "--fallback-source-agent" if fallback_source_agent.is_some() => {
                 return Err("smoke: duplicate --fallback-source-agent".into());
             }
@@ -251,21 +286,28 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
         + usize::from(expected_session_cwd_device.is_some())
         + usize::from(expected_session_cwd_inode.is_some())
         + usize::from(expected_session_cwd_object_sha256.is_some())
+        + usize::from(expected_source_mount.is_some())
+        + usize::from(expected_source_mount_device.is_some())
+        + usize::from(expected_source_mount_inode.is_some())
+        + usize::from(expected_source_mount_object_sha256.is_some())
         + usize::from(fallback_source_agent.is_some())
         + usize::from(require_host_fallback_eligible);
     let fallback_guard = match guard_count {
         0 => None,
-        8 if session_cwd.is_some() => {
+        12 if session_cwd.is_some() => {
             let expected_config_sha256 = expected_config_sha256.expect("counted above");
             let expected_executable_sha256 = expected_executable_sha256.expect("counted above");
             let expected_session_cwd_object_sha256 =
                 expected_session_cwd_object_sha256.expect("counted above");
+            let expected_source_mount_object_sha256 =
+                expected_source_mount_object_sha256.expect("counted above");
             if !crate::local_file::valid_sha256(&expected_config_sha256)
                 || !crate::local_file::valid_sha256(&expected_executable_sha256)
                 || !crate::local_file::valid_sha256(&expected_session_cwd_object_sha256)
+                || !crate::local_file::valid_sha256(&expected_source_mount_object_sha256)
             {
                 return Err(
-                    "smoke: fallback guard digests and object fingerprint must be 64 hexadecimal characters"
+                    "smoke: fallback guard digests and object fingerprints must be 64 hexadecimal characters"
                         .into(),
                 );
             }
@@ -284,6 +326,17 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
                 .expect("counted above")
                 .parse::<u64>()
                 .map_err(|_| "smoke: invalid --expected-session-cwd-inode")?;
+            let expected_source_mount =
+                SessionCwd::parse(&expected_source_mount.expect("counted above"))
+                    .map_err(|_| "smoke: invalid --expected-source-mount")?;
+            let expected_source_mount_device = expected_source_mount_device
+                .expect("counted above")
+                .parse::<u64>()
+                .map_err(|_| "smoke: invalid --expected-source-mount-device")?;
+            let expected_source_mount_inode = expected_source_mount_inode
+                .expect("counted above")
+                .parse::<u64>()
+                .map_err(|_| "smoke: invalid --expected-source-mount-inode")?;
             Some(FallbackSmokeGuard {
                 expected_config_sha256: expected_config_sha256.to_ascii_lowercase(),
                 expected_executable_sha256: expected_executable_sha256.to_ascii_lowercase(),
@@ -293,11 +346,17 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
                     inode: expected_session_cwd_inode,
                     object_sha256: expected_session_cwd_object_sha256.to_ascii_lowercase(),
                 },
+                expected_source_mount,
+                expected_source_mount_identity: crate::local_file::DirectoryIdentity {
+                    device: expected_source_mount_device,
+                    inode: expected_source_mount_inode,
+                    object_sha256: expected_source_mount_object_sha256.to_ascii_lowercase(),
+                },
                 source_agent: AgentId::parse(source)
                     .map_err(|_| "smoke: invalid --fallback-source-agent")?,
             })
         }
-        8 => return Err("smoke: fallback guard requires --session-cwd".into()),
+        12 => return Err("smoke: fallback guard requires --session-cwd".into()),
         _ => {
             return Err(
                 "smoke: fallback guard flags must be supplied together as a closed set".into(),
@@ -386,6 +445,10 @@ struct FallbackGuardRecord {
     expected_session_cwd_device: u64,
     expected_session_cwd_inode: u64,
     expected_session_cwd_object_sha256: String,
+    expected_source_mount: String,
+    expected_source_mount_device: u64,
+    expected_source_mount_inode: u64,
+    expected_source_mount_object_sha256: String,
     source_agent: String,
     require_host_fallback_eligible: bool,
 }
@@ -579,6 +642,15 @@ impl ArtifactState {
                             expected_session_cwd_inode: guard.expected_session_cwd_identity.inode,
                             expected_session_cwd_object_sha256: guard
                                 .expected_session_cwd_identity
+                                .object_sha256
+                                .clone(),
+                            expected_source_mount: guard.expected_source_mount.as_str().to_owned(),
+                            expected_source_mount_device: guard
+                                .expected_source_mount_identity
+                                .device,
+                            expected_source_mount_inode: guard.expected_source_mount_identity.inode,
+                            expected_source_mount_object_sha256: guard
+                                .expected_source_mount_identity
                                 .object_sha256
                                 .clone(),
                             source_agent: guard.source_agent.as_str().to_owned(),
@@ -1517,24 +1589,34 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             }
         };
         pinned_session_cwd = Some(pin);
-        let source = snapshot
+        // The source mount is authorization evidence only. After exact identity and containment pass,
+        // host execution uses the separately pinned trusted cwd and never reads this mount path again,
+        // so the source descriptor need not survive through target spawn.
+        let source_mount = snapshot
             .entries
             .iter()
-            .find(|entry| entry.id == guard.source_agent);
-        let source_cwd = source
+            .find(|entry| entry.id == guard.source_agent)
             .filter(|entry| execution_mode(entry) == "container_ro")
             .and_then(|entry| entry.sandbox.as_ref())
-            .and_then(|sandbox| canonical_session_cwd(Path::new(&sandbox.mount)).ok());
-        if !session_cwd
-            .as_ref()
-            .zip(source_cwd.as_ref())
-            .is_some_and(|(cwd, root)| cwd.is_under(root))
-        {
+            .and_then(|sandbox| {
+                crate::local_file::snapshot_directory(
+                    Path::new(&sandbox.mount),
+                    "fallback smoke source mount",
+                )
+                .ok()
+            });
+        if !source_mount.as_ref().is_some_and(|mount| {
+            mount.canonical_cwd == guard.expected_source_mount
+                && mount.identity == guard.expected_source_mount_identity
+                && session_cwd
+                    .as_ref()
+                    .is_some_and(|cwd| cwd.is_under(&mount.canonical_cwd))
+        }) {
             state.fail_static(
                 DiagnosticPhase::ConfigApply,
                 DiagnosticFailureClass::Config,
                 "smoke.fallback_source_drift",
-                "Fallback smoke cwd is not within the current source container mount",
+                "Fallback smoke source mount identity or containment changed after planning",
                 false,
             );
             return state.finalize(args.include_redacted_stderr).await;
@@ -2179,6 +2261,14 @@ mod tests {
             "2",
             "--expected-session-cwd-object-sha256",
             digest,
+            "--expected-source-mount",
+            "/tmp",
+            "--expected-source-mount-device",
+            "3",
+            "--expected-source-mount-inode",
+            "4",
+            "--expected-source-mount-object-sha256",
+            digest,
             "--fallback-source-agent",
             "source",
             "--require-host-fallback-eligible",
@@ -2198,6 +2288,14 @@ mod tests {
             "--expected-session-cwd-inode",
             "2",
             "--expected-session-cwd-object-sha256",
+            digest,
+            "--expected-source-mount",
+            "/tmp",
+            "--expected-source-mount-device",
+            "3",
+            "--expected-source-mount-inode",
+            "4",
+            "--expected-source-mount-object-sha256",
             digest,
             "--fallback-source-agent",
             "source",
@@ -2220,6 +2318,14 @@ mod tests {
             "2",
             "--expected-session-cwd-object-sha256",
             digest,
+            "--expected-source-mount",
+            "/tmp",
+            "--expected-source-mount-device",
+            "3",
+            "--expected-source-mount-inode",
+            "4",
+            "--expected-source-mount-object-sha256",
+            digest,
             "--fallback-source-agent",
             "source",
             "--require-host-fallback-eligible",
@@ -2239,6 +2345,42 @@ mod tests {
             "--expected-session-cwd-inode",
             "2",
             "--expected-session-cwd-object-sha256",
+            "not-a-digest",
+            "--expected-source-mount",
+            "/tmp",
+            "--expected-source-mount-device",
+            "3",
+            "--expected-source-mount-inode",
+            "4",
+            "--expected-source-mount-object-sha256",
+            digest,
+            "--fallback-source-agent",
+            "source",
+            "--require-host-fallback-eligible",
+        ]))
+        .is_err());
+        assert!(parse_args(&cli_args(&[
+            "--session-cwd",
+            "/tmp",
+            "--expected-config-sha256",
+            digest,
+            "--expected-executable-sha256",
+            digest,
+            "--expected-session-cwd",
+            "/tmp",
+            "--expected-session-cwd-device",
+            "1",
+            "--expected-session-cwd-inode",
+            "2",
+            "--expected-session-cwd-object-sha256",
+            digest,
+            "--expected-source-mount",
+            "/tmp",
+            "--expected-source-mount-device",
+            "3",
+            "--expected-source-mount-inode",
+            "4",
+            "--expected-source-mount-object-sha256",
             "not-a-digest",
             "--fallback-source-agent",
             "source",

@@ -906,12 +906,22 @@ struct SourceRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     config_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    current_mount: Option<DirectoryObjectRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     failure_class: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_disposition: Option<&'static str>,
     prompt_may_have_been_accepted: bool,
+}
+
+#[derive(Serialize)]
+struct DirectoryObjectRecord {
+    canonical_path: String,
+    device: u64,
+    inode: u64,
+    object_sha256: String,
 }
 
 #[derive(Serialize)]
@@ -994,7 +1004,11 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
         ),
         Some(entry) => {
             source_execution_root = entry.sandbox.as_ref().and_then(|sandbox| {
-                canonical_existing_directory(Path::new(&sandbox.mount), "source sandbox mount").ok()
+                crate::local_file::snapshot_directory(
+                    Path::new(&sandbox.mount),
+                    "source sandbox mount",
+                )
+                .ok()
             });
             if let Some(target) = source.target.as_ref() {
                 validate_current_source_evidence(
@@ -1015,7 +1029,7 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
                     &mut reasons,
                     IneligibilityReason::SourceAgentConfigurationMismatch,
                 ),
-                Some(root) if !trusted_session_cwd.is_under(root) => push_reason(
+                Some(root) if !trusted_session_cwd.is_under(&root.canonical_cwd) => push_reason(
                     &mut reasons,
                     IneligibilityReason::TrustedSessionCwdOutsideSourceMount,
                 ),
@@ -1047,6 +1061,14 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
         push_reason(&mut reasons, IneligibilityReason::TargetAgentNotEligible);
     }
 
+    let current_mount = source_execution_root
+        .as_ref()
+        .map(|mount| DirectoryObjectRecord {
+            canonical_path: mount.canonical_cwd.as_str().to_owned(),
+            device: mount.identity.device,
+            inode: mount.identity.inode,
+            object_sha256: mount.identity.object_sha256.clone(),
+        });
     let source_record = SourceRecord {
         artifact_schema: source.schema,
         artifact_path: source_path_text,
@@ -1056,6 +1078,7 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
         execution_mode: source.execution_mode,
         config_canonical_path: source.config_canonical_path,
         config_sha256: source.config_sha256,
+        current_mount,
         failure_class: source
             .failure
             .as_ref()
@@ -1081,7 +1104,8 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
         )?;
         let executable_path_text =
             validated_path_text(&executable.canonical_path, "current executable path")?;
-        let _source_root = source_execution_root
+        let source_root = source_execution_root
+            .as_ref()
             .ok_or("fallback-plan: eligible source has no current config-owned mount")?;
         let argv = vec![
             executable_path_text,
@@ -1101,6 +1125,14 @@ fn build_plan(args: FallbackArgs) -> Result<FallbackPlanV2, BoxError> {
             trusted_session_cwd_identity.inode.to_string(),
             "--expected-session-cwd-object-sha256".to_owned(),
             trusted_session_cwd_identity.object_sha256.clone(),
+            "--expected-source-mount".to_owned(),
+            source_root.canonical_cwd.as_str().to_owned(),
+            "--expected-source-mount-device".to_owned(),
+            source_root.identity.device.to_string(),
+            "--expected-source-mount-inode".to_owned(),
+            source_root.identity.inode.to_string(),
+            "--expected-source-mount-object-sha256".to_owned(),
+            source_root.identity.object_sha256.clone(),
             "--expected-config-sha256".to_owned(),
             config_file.sha256.clone(),
             "--expected-executable-sha256".to_owned(),

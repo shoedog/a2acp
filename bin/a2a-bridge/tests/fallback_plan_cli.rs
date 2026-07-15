@@ -824,6 +824,11 @@ fn exact_argv_uses_current_binary_config_digest_and_explicit_trusted_cwd() {
     assert!(canonical_repo_object_sha256
         .bytes()
         .all(|byte| byte.is_ascii_hexdigit()));
+    let source_mount = &plan["source"]["current_mount"];
+    let source_mount_path = source_mount["canonical_path"].as_str().unwrap().to_owned();
+    let source_mount_device = source_mount["device"].as_u64().unwrap().to_string();
+    let source_mount_inode = source_mount["inode"].as_u64().unwrap().to_string();
+    let source_mount_object_sha256 = source_mount["object_sha256"].as_str().unwrap().to_owned();
     let config_sha256 = sha256_hex(&fs::read(&config).unwrap());
     let executable = fs::canonicalize(env!("CARGO_BIN_EXE_a2a-bridge")).unwrap();
     let executable_sha256 = sha256_hex(&fs::read(&executable).unwrap());
@@ -846,6 +851,14 @@ fn exact_argv_uses_current_binary_config_digest_and_explicit_trusted_cwd() {
         canonical_repo_inode,
         "--expected-session-cwd-object-sha256",
         canonical_repo_object_sha256,
+        "--expected-source-mount",
+        source_mount_path,
+        "--expected-source-mount-device",
+        source_mount_device,
+        "--expected-source-mount-inode",
+        source_mount_inode,
+        "--expected-source-mount-object-sha256",
+        source_mount_object_sha256,
         "--expected-config-sha256",
         config_sha256,
         "--expected-executable-sha256",
@@ -872,6 +885,13 @@ fn exact_argv_uses_current_binary_config_digest_and_explicit_trusted_cwd() {
     assert_eq!(
         plan["trust"]["trusted_session_cwd_inode"],
         canonical_repo_metadata.ino()
+    );
+    assert_eq!(source_mount["canonical_path"], canonical_repo_text);
+    assert_eq!(source_mount["device"], canonical_repo_metadata.dev());
+    assert_eq!(source_mount["inode"], canonical_repo_metadata.ino());
+    assert_eq!(
+        source_mount["object_sha256"],
+        plan["trust"]["trusted_session_cwd_object_sha256"]
     );
     assert_eq!(plan["target"]["config_sha256"], config_sha256);
     assert!(
@@ -994,6 +1014,7 @@ fn generated_smoke_refuses_config_executable_and_cwd_drift_before_spawn() {
         "executable",
         "cwd",
         "object-fingerprint",
+        "source-mount-object-fingerprint",
         "target-marker",
     ] {
         let (_dir, marker, config, source) = fixture();
@@ -1035,6 +1056,13 @@ fn generated_smoke_refuses_config_executable_and_cwd_drift_before_spawn() {
                     .unwrap();
                 argv[index + 1] = "0".repeat(64);
             }
+            "source-mount-object-fingerprint" => {
+                let index = argv
+                    .iter()
+                    .position(|value| value == "--expected-source-mount-object-sha256")
+                    .unwrap();
+                argv[index + 1] = "0".repeat(64);
+            }
             "target-marker" => {
                 let changed = fs::read_to_string(&config).unwrap().replace(
                     "host_fallback_eligible = true",
@@ -1056,6 +1084,7 @@ fn generated_smoke_refuses_config_executable_and_cwd_drift_before_spawn() {
             "config" => "smoke.fallback_config_drift",
             "executable" => "smoke.fallback_executable_drift",
             "cwd" | "object-fingerprint" => "smoke.fallback_cwd_drift",
+            "source-mount-object-fingerprint" => "smoke.fallback_source_drift",
             "target-marker" => "smoke.fallback_target_drift",
             _ => unreachable!(),
         };
@@ -1125,6 +1154,49 @@ fn generated_smoke_refuses_same_path_directory_replacement_before_spawn() {
     assert_eq!(
         artifact["diagnostics"]["failure"]["code"],
         "smoke.fallback_cwd_drift"
+    );
+}
+
+#[test]
+fn generated_smoke_refuses_source_mount_symlink_retarget_before_spawn() {
+    let (dir, marker, config, source) = fixture();
+    let repo = dir.path().join("owned repo");
+    let source_link = dir.path().join("source-link");
+    std::os::unix::fs::symlink(&repo, &source_link).unwrap();
+    let configured = fs::read_to_string(&config)
+        .unwrap()
+        .replace(&format!("{repo:?}"), &format!("{source_link:?}"));
+    fs::write(&config, configured).unwrap();
+    let mut artifact: serde_json::Value =
+        serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+    artifact["request"]["config_sha256"] =
+        serde_json::json!(sha256_hex(&fs::read(&config).unwrap()));
+    write_json(&source, &artifact);
+
+    let plan = read_plan(
+        &fallback_command(&config, &source)
+            .arg("--confirm-trusted-own-repo-read-only")
+            .output()
+            .unwrap(),
+    );
+    let mut argv: Vec<String> = plan["rerun"]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect();
+    argv.extend(["--timeout-secs".into(), "1".into()]);
+
+    fs::remove_file(&source_link).unwrap();
+    std::os::unix::fs::symlink(dir.path(), &source_link).unwrap();
+
+    let output = Command::new(&argv[0]).args(&argv[1..]).output().unwrap();
+    assert!(!output.status.success());
+    let artifact: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!marker.exists(), "source mount drift spawned the target");
+    assert_eq!(
+        artifact["diagnostics"]["failure"]["code"],
+        "smoke.fallback_source_drift"
     );
 }
 

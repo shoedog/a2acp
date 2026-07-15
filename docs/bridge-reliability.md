@@ -51,9 +51,10 @@ host and container entries but no automatic fallback policy. R2's first fallback
 non-billable operator plan/recommendation only; caller-supplied A2A metadata cannot assert trust or start
 a host attempt. In-process fallback is deferred until policy can bind a non-forgeable trust attestation
 to authenticated caller context. The local planner accepts only complete smoke-v2 evidence bound to the
-current config bytes, derives host scope from the current read-only source mount rather than artifact cwd,
-and emits a guarded distinct fixed-PONG smoke that the operator must invoke separately. It performs no
-external post-failure runtime probe and never executes the emitted plan.
+current config bytes, derives host scope from a plan-time identity snapshot of the read-only source mount
+rather than artifact cwd, and emits a guarded distinct fixed-PONG smoke that the operator must invoke
+separately. The later smoke refuses if that source-mount object changed. The planner performs no external
+post-failure runtime probe and never executes the emitted plan.
 
 Provider capacity is a separate axis. For trusted own-repo full-branch reviews, use Fable xhigh only when
 its usage window has headroom; when Claude is known to be near its usage limit, select the explicit
@@ -155,21 +156,12 @@ Exit: upstream drift is found by the canary rather than an unrelated feature bra
 
 Exit: a release cannot claim an agent path that was not tested from its distributable artifact.
 
-## Immediate queue
+## Current execution queue
 
-1. Freeze the fully gated R2d design-v18 fold, then run one Sol/xhigh closure re-review for the local
-   non-billable fallback-plan from the
-   [R2d plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md). Its initial review and closure
-   re-reviews 1–3 returned `REVISE`; v18 folds the latest three findings, planner/smoke-unit gates are
-   green at **22 / 0** each, and the full workspace is **1,979 / 0 / 12 ignored**. Keep
-   authenticated in-process
-   [R2e](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) deferred.
-2. Establish the pinned/floating compatibility lanes in the
-   [R3 plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md).
-3. Make the reader image reproducible and the compatibility matrix a release gate through the
-   [R4 plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md).
-4. Keep provider/model fallback operator-selected and separately recorded; it never enters the
-   container-degradation eligibility gate.
+Volatile slice status, review evidence, sequencing, and the next action live only in the
+[reliability execution roadmap](reliability-execution-roadmap.md). This behavior overview does not copy
+changing candidate hashes or gate totals. Keep provider/model fallback operator-selected and separately
+recorded; it never enters the container-degradation eligibility gate.
 
 ## Guardrails
 

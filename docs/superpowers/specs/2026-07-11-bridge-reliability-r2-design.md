@@ -1,7 +1,7 @@
-# Bridge reliability R2 — provenance and phase-specific diagnostics (design, v20)
+# Bridge reliability R2 — provenance and phase-specific diagnostics (design, v21)
 
 - **Status:** R2a, R2b0–R2b3, and R2c merged; R2d is **IN REVIEW** on
-  `agent/reliability-r2d-fallback-plan`; v20 is the design of record for R2b–R2e
+  `agent/reliability-r2d-fallback-plan`; v21 is the design of record for R2b–R2e
 - **R2d review state:** the initial bridge-mediated `gpt-5.6-sol`/`xhigh` security review of exact
   candidate `b6424d725e56d1f3fde0b7c29b6057155d69dacd` returned `REVISE`; its nine findings were folded at
   `0b05c409cbbf9441348b2719a537f8f4978216a3`. Closure re-review 1 of that exact fold also returned
@@ -26,9 +26,14 @@
   production pre-spawn cleanup tuple, names the roadmap as the sole volatile status cursor, and corrects
   the comment. V20 scopes Darwin identity with the descriptor's volume UUID and scopes Linux identity with
   the boot ID plus Linux 6.12's non-reused 64-bit unique mount ID; no reusable mount-ID downgrade exists.
-  Current focused gates are planner **23 / 0**, smoke **22 / 0**, and local-file **7 / 0**; a Linux
-  container also passes planner **23 / 0** and local-file **7 / 0**. The changed-tree full serial
-  workspace passes **1,983 / 0 / 12 ignored** across 69 executables; format/diff, all-target check,
+  Closure re-review 5 of exact `49716473cf405b272dd8ecff554630b90faed0e0` adjudicated all four prior
+  findings `FIXED`, then returned `REVISE`: the guard did not bind semantic source-mount identity, the
+  behavior overview copied a stale v18 queue, and `AGENTS.md` did not link the roadmap authority. V21
+  persists the source mount's canonical path and durable object fingerprint through the plan/action
+  guard, replaces the copied queue with a roadmap pointer, and aligns `AGENTS.md`. Current focused gates
+  are planner **24 / 0**, smoke **22 / 0**, and local-file **7 / 0**; a Linux container also passes
+  planner **24 / 0** and local-file **7 / 0**. The changed-tree full serial workspace passes
+  **1,984 / 0 / 12 ignored** across 69 executables; format/diff, all-target check,
   warnings-denied Clippy, release, and hygiene **37/7** are clean. Final closure remains pending.
 - **R2b3 review state:** implementation plus four committed review folds; fresh Sol/xhigh closure
   re-review 3 returned `REVISE` with one shared-process ownership blocker, one raw-JSON correctness item,
@@ -440,6 +445,18 @@ handle modes. Older kernels, unsupported filesystems, and malformed/all-zero sco
 closed. Direct pre-v20 regressions failed for the missing Darwin volume scope and missing Linux unique
 flag before the implementation was changed.
 
+Closure re-review 5 found that config-byte equality plus a current-only containment check did not preserve
+the configured source mount's plan-time semantics: an unchanged symlink mount could be retargeted to a
+broader ancestor while the trusted repo object remained unchanged. V21 records the source mount's
+plan-time canonical path and descriptor-derived device/inode/object fingerprint in the plan and 12-field
+guard. Action recomputes and compares the complete mount identity before registry resolution, then checks
+the exact trusted repo is beneath that unchanged mount. The end-to-end regression first proved the old
+guard spawned the adapter after retargeting and now proves `smoke.fallback_source_drift` with zero spawn;
+a forged mount fingerprint is independently refused. The same fold removes the overview's volatile queue
+and makes `AGENTS.md` point directly to the roadmap status authority. The mount is only authorization
+evidence: after that check, host execution never reads the source path and instead retains the separately
+guarded trusted-repo descriptor through target execution.
+
 The first v18 full-suite run caught a direct smoke-side `BridgeError::agent_failure` introduced while
 transporting the local cwd-drift refusal. The final v18 fold carries an optional static diagnostic in the
 smoke drain result instead, while backend errors continue through their audited lifecycle builders. The
@@ -714,7 +731,8 @@ additionally requires all of:
 1. the local operator passes the explicit trusted-own-repo-read-only confirmation flag and independently
    supplies the exact canonical trusted repo cwd;
 2. the complete source is smoke schema v2, its canonical config path/exact-byte digest match the current
-   pinned config, and its current source entry is still `container_ro` with a canonical mount;
+   pinned config, and its current source entry is still `container_ro` with a canonical mount whose
+   descriptor-derived identity can be snapshotted;
 3. a named host target is explicitly configured/selected, marked eligible, and is not sandboxed or
    write-capable;
 4. `prompt_may_have_been_accepted == false`, lifecycle evidence is closed, and no events were dropped;
@@ -1183,13 +1201,15 @@ Requirements:
 - Require `--trusted-session-cwd` as a separate existing canonical directory selected by the local
   operator. The artifact cwd is evidence only: it must canonicalize to the same directory. The exact
   trusted cwd must be equal to or below the current source entry's canonical read-only mount; a broad
-  source mount never becomes the generated host cwd. The emitted closed guard also carries that
-  plan-time canonical value as `--expected-session-cwd` plus the descriptor-derived durable-object
-  fingerprint; action-time canonicalization and complete object identity must match, so a same-mount
-  symlink, sibling replacement, or inode-reuse replacement fails before spawn. Darwin requires persistent
-  64-bit volume object IDs bound to a nonzero volume UUID. Linux requires a valid boot ID, a non-reused
-  64-bit unique mount ID, and an opaque file handle; unavailable support fails closed rather than using a
-  reusable ordinary mount ID.
+  source mount never becomes the generated host cwd. Planning records that mount's canonical path and
+  complete descriptor-derived identity; action requires exact equality before registry resolution. The
+  emitted closed guard carries the repo object under `--expected-session-cwd` and its identity flags, and
+  independently carries the mount object under `--expected-source-mount` and its identity flags.
+  Action-time canonicalization and complete object identity must match for both objects, so a same-mount
+  symlink, sibling replacement, mount retarget, or inode-reuse replacement fails before spawn. Darwin
+  requires persistent 64-bit volume object IDs bound to a nonzero volume UUID. Linux requires a valid boot
+  ID, a non-reused 64-bit unique mount ID, and an opaque file handle; unavailable support fails closed
+  rather than using a reusable ordinary mount ID.
 - Source, config, and current executable inputs are descriptor-first bounded regular-file snapshots. On
   Unix, final symlinks/special files fail closed, FIFO opens are nonblocking, and descriptor/path identity
   rejects replacement between open and canonicalization.
@@ -1200,17 +1220,18 @@ Requirements:
   the five typed spawn-phase container classes. Legacy `AgentCrashed`, missing/incomplete evidence,
   contradictory phase records, success, or timeout is ineligible or rejected.
 - Require the source's canonical config path and exact-byte SHA-256 to match the current pinned config.
-  Resolve the source agent in that same snapshot, require the explicit trusted cwd to remain within its
-  current canonical read-only sandbox mount, and use only that exact operator path for the rerun.
+  Resolve the source agent in that same snapshot, record its canonical read-only sandbox mount's
+  descriptor-derived identity, require the explicit trusted cwd to remain within it, and use only that
+  exact operator path for the rerun.
 - Include source attempt id, original agent, failure code/class, selected host target, local trust
   assertion, config path/digest, and generated rerun command in the plan. The eventual fixed-PONG smoke
   creates a distinct attempt/cost record and is only a compatibility verification; it never resumes,
   mutates, or proves the original arbitrary task.
 - Bind the generated absolute candidate-binary argv to current executable/config SHA-256, the exact
-  plan-time canonical session cwd and durable-object fingerprint, the source agent, and the required host
-  marker. The smoke accepts the complete guard only as a closed set and rechecks config bytes, executable
-  bytes, exact cwd identity,
-  source mode/mount containment, and target marker before spawn.
+  plan-time canonical session cwd and durable-object fingerprint, the exact plan-time canonical source
+  mount and durable-object fingerprint, the source agent, and the required host marker. The smoke accepts
+  the complete guard only as a closed set and rechecks config bytes, executable bytes, exact cwd identity,
+  exact source-mount identity and containment, and target marker before spawn.
   Because the guarded target is necessarily unsandboxed ACP, this smoke skips container orphan recovery
   and run-end sweeping, records the backstop as `not_needed`, and therefore does not consult the degraded
   runtime. Drift fails closed.
@@ -1423,11 +1444,14 @@ For trusted own-repo full-branch reviews, the operating policy is:
   eligible complete smoke-v2 artifact emits a versioned plan and separate rerun command; it never
   executes it. Historical smoke-v1 and hand-assembled task envelopes reject.
 - Artifact cwd cannot control host scope. It must agree with the independently supplied exact trusted cwd,
-  which must remain within the current canonical source mount. Current config path/digest/source/mount
-  drift makes the plan ineligible, and config/executable/exact-cwd/source-marker/target-marker drift before
-  the later smoke refuses before spawn, including a same-mount symlink/sibling swap or a mismatched
+  which must remain within the canonical source mount whose descriptor-derived identity was snapshotted.
+  Current config
+  path/digest/source/mount drift makes the plan ineligible, and config/executable/exact-cwd/source-mount/
+  source-marker/target-marker drift before the later smoke refuses before spawn, including a same-mount
+  symlink/sibling swap or a mismatched
   durable-object fingerprint with matching device/inode, Darwin all-zero/volume-scope failures, and Linux
-  malformed boot identity or unavailable unique-mount identity.
+  malformed boot identity or unavailable unique-mount identity. Retargeting an unchanged configured
+  source-mount symlink or forging its object fingerprint also refuses before spawn.
 - A genuine static container preflight failure serializes the unique nested resolve/spawn lifecycle that
   the planner accepts; its event and outer diagnostics must match in full. Retry-shaped or
   config-contradictory provenance/auth evidence rejects. Known credentials are absent from provenance and

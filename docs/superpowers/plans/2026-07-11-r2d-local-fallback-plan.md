@@ -1,11 +1,11 @@
 # R2d — Local non-billable fallback-plan implementation plan
 
-- **Status:** IN REVIEW — the initial review and closure re-reviews 1–4 returned `REVISE`; the v20 fold
+- **Status:** IN REVIEW — the initial review and closure re-reviews 1–5 returned `REVISE`; the v21 fold
   is applied in the working tree; focused and full deterministic gates are green; final closure remains
 - **Prerequisites:** R2b and R2c merged (`be54bc51`, PR #28)
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md),
-  v20
+  v21
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Branch:** `agent/reliability-r2d-fallback-plan`
 - **Initial reviewed candidate:** `b6424d725e56d1f3fde0b7c29b6057155d69dacd`
@@ -13,6 +13,7 @@
 - **Closure re-review 2 candidate:** `c8d17b2acbe3b113ce8fcdbce243ea2e08561141` — `REVISE`
 - **Closure re-review 3 candidate:** `69152d7360a4900fe49390338b56efd94c784495` — `REVISE`
 - **Closure re-review 4 candidate:** `349755ed8f4534db0e04b8af006ca6072e01110b` — `REVISE`
+- **Closure re-review 5 candidate:** `49716473cf405b272dd8ecff554630b90faed0e0` — `REVISE`
 
 R2d answers one local operator question: given complete failed R2c smoke evidence from a read-only
 container attempt, may an explicitly named host agent be proposed for a new trusted-own-repo read-only
@@ -136,8 +137,23 @@ volume. V20 closes that adjacent remount/reboot ambiguity without weakening the 
 3. older kernels, unsupported filesystems, malformed/all-zero boot IDs, and invalid/all-zero volume UUIDs
    fail closed. The volume-scope and unique-flag regressions failed on the pre-v20 implementation.
 
-No Fable, Claude model/Haiku, retry, fallback, live provider turn, or real container was used in the five
-reviews/folds. Separate adapter-only compatibility probes sent `initialize` + `session/new` (never
+Closure re-review 5 ran through the candidate bridge with `gpt-5.6-sol`/`xhigh` against exact
+`49716473cf405b272dd8ecff554630b90faed0e0`. It adjudicated all four closure-re-review-4 findings `FIXED`,
+then returned `REVISE` for one `WRONG/MAJOR` source-mount drift gap, one `WRONG/MINOR` stale overview
+queue, and one `SMELL/MINOR` missing `AGENTS.md` authority link. V21 closes all three:
+
+1. planning records the configured read-only source mount's canonical path plus descriptor-derived
+   device/inode/object fingerprint in the plan and generated closed guard; action recomputes all four
+   values before registry resolution and rejects any mismatch;
+2. a pre-change-red end-to-end regression retargets an unchanged configured mount symlink from the owned
+   repo to its broader parent, proves the old guard spawned the adapter, and now proves
+   `smoke.fallback_source_drift` with zero spawn. A forged source-mount object fingerprint is also refused;
+   and
+3. the behavior overview now points to the roadmap instead of copying a volatile queue, while `AGENTS.md`
+   and the roadmap explicitly agree that the roadmap alone owns status, sequencing, and handoff.
+
+No Fable, Claude model/Haiku, retry, fallback, or live smoke was used in the review chain or folds.
+Separate adapter-only compatibility probes sent `initialize` + `session/new` (never
 `session/prompt`) through installed Codex ACP 1.1.2 and Claude Agent ACP 0.44.0; both accepted the macOS
 object-addressed absolute cwd.
 
@@ -181,8 +197,8 @@ object-addressed absolute cwd.
   `container_fallback_candidate` class.
 - The source canonical config path and exact-byte SHA-256 must match the current pinned config snapshot.
   The current source agent must still exist as `container_ro`. The local operator supplies the exact
-  canonical trusted cwd; artifact cwd must agree as evidence, and the exact cwd must be under the current
-  canonical configured mount.
+  canonical trusted cwd; artifact cwd must agree as evidence, and the exact cwd must be under the
+  canonical configured mount whose descriptor-derived identity snapshot is recorded in the plan.
 
 ### D4 — closed eligibility matrix
 
@@ -217,22 +233,30 @@ The generated argv includes, as one closed set:
 --expected-session-cwd-device <u64>
 --expected-session-cwd-inode <u64>
 --expected-session-cwd-object-sha256 <hex>
+--expected-source-mount <canonical-root>
+--expected-source-mount-device <u64>
+--expected-source-mount-inode <u64>
+--expected-source-mount-object-sha256 <hex>
 --fallback-source-agent <container-agent-id>
 --require-host-fallback-eligible
 ```
 
 It also contains the current absolute candidate executable, canonical config path, exact operator-supplied
 trusted repo as `--session-cwd`, and `--acknowledge-billable`. The planner never invokes it. When an
-operator later does, smoke re-reads the bounded regular config/executable and revalidates source
-mode/mount containment, exact planned cwd identity, and the target marker before registry
-resolution/spawn. A guarded target cannot spawn containers, so smoke skips container orphan recovery and
-the run-end sweep and truthfully records that backstop as `not_needed`. Any drift emits a failed smoke-v2
-artifact and no agent process is started. Once the guard opens the expected directory object, the host
-adapter child performs `fchdir` to that pinned descriptor and guarded ACP uses an object-addressed
-absolute cwd (`/.vol/<device>/<inode>` on macOS; inherited `/proc/self/fd/<n>` on Linux). The parent
+operator later does, smoke re-reads the bounded regular config/executable and revalidates source mode,
+exact planned source-mount object identity and containment, exact planned cwd identity, and the target
+marker before registry resolution/spawn. A guarded target cannot spawn containers, so smoke skips
+container orphan recovery and the run-end sweep and truthfully records that backstop as `not_needed`.
+Any drift emits a failed smoke-v2 artifact and no agent process is started. Once the guard opens the
+expected directory object, the host adapter child performs `fchdir` to that pinned descriptor and
+guarded ACP uses an object-addressed absolute cwd (`/.vol/<device>/<inode>` on macOS; inherited
+`/proc/self/fd/<n>` on Linux). The parent
 descriptor remains close-on-exec; only the already-forked Linux child retains its copy. Later pathname
 replacement therefore cannot redirect the spawned process or violate ACP's absolute-cwd contract. Across
-the plan/action process gap, the object fingerprint prevents device/inode reuse from satisfying the guard:
+the plan/action process gap, each object's fingerprint prevents device/inode reuse from satisfying the
+guard. The source mount is only an authorization input and is not used after its exact identity and
+containment check, while the separately guarded trusted cwd descriptor remains pinned through target
+execution.
 Darwin requires a nonzero volume UUID plus a descriptor file ID on a volume advertising persistent 64-bit
 object IDs. Linux requires a valid boot ID, a non-reused 64-bit unique mount ID, and an opaque descriptor
 file handle. Unsupported filesystems, kernels, or operating systems refuse planning.
@@ -251,6 +275,8 @@ file handle. Unsupported filesystems, kernels, or operating systems refuse plann
   during configure immediately before lazy prompt/session mint;
 - Darwin volume-scoped persistent identity plus all-zero UUID refusal; Linux unique-mount flags in both
   handle modes plus malformed, oversized, uppercase, and all-zero boot-ID refusal;
+- configured source-mount symlink retargeting to a broader ancestor and a forged mount-object fingerprint,
+  both refused before target spawn while config bytes and trusted-repo identity remain unchanged;
 - complete lifecycle-failure equality, including summary/stderr/cause metadata rather than partial
   identity matching;
 - known-credential injection through provenance detail/remedy and structured model/mode fields;
@@ -265,32 +291,32 @@ file handle. Unsupported filesystems, kernels, or operating systems refuse plann
 - exact production pre-spawn cleanup serialization plus independent timeout/cancel/release/retire/backstop
   mutations, each ineligible with no command.
 
-Current v20 focused evidence is planner CLI **23 / 0**, smoke units **22 / 0**, and local-file units
+Current v21 focused evidence is planner CLI **24 / 0**, smoke units **22 / 0**, and local-file units
 **7 / 0** on macOS. A Linux `a2a-toolchain` container, reading the worktree through a read-only bind and
-writing only R2d-specific disposable cache volumes that were removed after verification, also passes
-local-file **7 / 0** and planner CLI **23 / 0**. Its real overlayfs path exercises
+writing its build output only inside the disposable container, also passes local-file **7 / 0** and
+planner CLI **24 / 0**. Its real overlayfs path exercises
 `AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE`; the injected dual-mode-unavailable case proves fail-closed
 behavior. A default Linux debug artifact was 271,582,616 bytes and therefore correctly tripped the
-unchanged 256 MiB planner evidence cap (13 passed / 10 rejected); rebuilding the same test target with
-`CARGO_PROFILE_DEV_DEBUG=0` produced the stated **23 / 0**, separating debug-symbol inflation from product
+unchanged 256 MiB planner evidence cap (13 passed / 10 rejected); rebuilding the current test target with
+`CARGO_PROFILE_DEV_DEBUG=0` produced the stated **24 / 0**, separating debug-symbol inflation from product
 behavior without weakening the cap.
 
-The exact v20 working fold also passes:
+The exact v21 working fold also passes:
 
-- full serial workspace: **1,983 passed / 0 failed / 12 ignored** across 69 test/doc-test executables;
+- full serial workspace: **1,984 passed / 0 failed / 12 ignored** across 69 test/doc-test executables;
 - format check and `git diff --check`: clean;
 - workspace all-target check and warnings-denied all-target Clippy: clean;
 - release `a2a-bridge` binary build: clean;
 - repository hygiene: **37** tracked artifacts / **7** validated example configs;
 - non-prompt adapter compatibility: Codex ACP 1.1.2 and Claude Agent ACP 0.44.0 each accepted
   `initialize` + `session/new` with the macOS object-addressed absolute cwd; no model prompt was sent;
-- live/billable gates: not run; no provider, container, or agent turn is required for this deterministic
-  plan/pre-spawn surface.
+- live/billable gates: not run; no live provider or agent turn is required for this deterministic
+  plan/pre-spawn surface. The disposable Linux test container above ran only deterministic tests.
 
 ## Completion boundary
 
-Freeze and commit the fully gated v20 fold, then run one Sol/xhigh closure re-review that adjudicates the
-partial durable-object finding and all three closure-re-review-4 findings. Do
+Freeze and commit the fully gated v21 fold, then run one Sol/xhigh closure re-review that adjudicates all
+three closure-re-review-5 findings and confirms the earlier inherited findings remain fixed. Do
 not use Fable or Claude for this closure under the current constrained usage windows. Do not run a
 live/billable smoke: R2d behavior is proven by deterministic pre-spawn fixtures, and the R2c live result
 remains historical evidence only.

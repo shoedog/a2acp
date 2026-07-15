@@ -75,12 +75,12 @@ does not infer trust, and does not execute or authorize an in-process fallback. 
 Planning that distinct verification requires `--trusted-session-cwd <exact-owned-repo>`. The path must be
 an existing canonical directory, must exactly match the failed smoke's reported cwd as evidence, and must
 remain under the current source agent's canonical read-only mount. Only that exact path enters the emitted
-argv, and its plan-time canonical value plus a descriptor-derived persistent-object fingerprint are carried
-separately in the closed action guard. A guarded host smoke revalidates exact cwd object identity plus the
-source/target/config/executable guard before spawn; a same-mount symlink/sibling or inode-reuse replacement
-fails closed. Filesystems without a durable object ID/handle cannot emit an eligible plan. It does not
-invoke the degraded container runtime for recovery or run-end cleanup and records that backstop as
-`not_needed`.
+argv. The exact repo and source-mount objects each carry a plan-time canonical path plus a
+descriptor-derived persistent-object fingerprint in the closed action guard. A guarded host smoke
+revalidates both exact directory objects plus the source/target/config/executable guard before spawn; a
+same-mount symlink/sibling, source-mount symlink retarget, or inode-reuse replacement fails closed.
+Filesystems without a durable object ID/handle cannot emit an eligible plan. It does not invoke the
+degraded container runtime for recovery or run-end cleanup and records that backstop as `not_needed`.
 
 This onboarding page is a stable behavior/setup surface, not the current release-status cursor. Current
 slice, review, and gate state is owned by

@@ -183,6 +183,10 @@ usage: a2a-bridge smoke --agent <id> --config <path> --acknowledge-billable
                          --expected-session-cwd-device <u64>
                          --expected-session-cwd-inode <u64>
                          --expected-session-cwd-object-sha256 <hex>
+                         --expected-source-mount <canonical-root>
+                         --expected-source-mount-device <u64>
+                         --expected-source-mount-inode <u64>
+                         --expected-source-mount-object-sha256 <hex>
                          --fallback-source-agent <id>
                          --require-host-fallback-eligible]
 
