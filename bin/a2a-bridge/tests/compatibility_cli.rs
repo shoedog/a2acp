@@ -425,6 +425,13 @@ fn compare_is_non_billable_and_reports_manifest_drift_as_json() {
           "schema_version": 1,
           "manifest_schema_version": 1,
           "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "aggregate": {
+            "success": true,
+            "cancelled": false,
+            "budget_exhausted": false,
+            "token_observation_missing_cases": 0,
+            "cost_observation_missing_cases": 0
+          },
           "cases": []
         }"#,
     )

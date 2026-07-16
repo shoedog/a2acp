@@ -178,17 +178,28 @@ a2a-bridge compatibility run \
 
 The runner canonicalizes and descriptor-pins the aggregate parent, creates aggregate and scratch entries
 relative to that retained descriptor, rechecks its identity during creation, and refuses normal or bare
-Git repository ancestors; keep compatibility evidence in disposable operator-owned storage. Manifest prerequisites use
+Git repository ancestors. The new mode-`0600` output immediately contains a blocking setup-incomplete
+aggregate, so later scratch/staging failure remains valid evidence instead of an empty file; keep
+compatibility evidence in disposable operator-owned storage. Manifest prerequisites use
 structured entries: `{ name = "PATH" }` means presence-only, while
 `{ name = "A2A_BRIDGE_ALLOW_FABLE", one_of = ["1", "true"] }` binds accepted non-secret values.
+Pinned adapter/CLI values require one complete semantic `<package>=<version>`. Remote API rows require
+dedicated `provider`, `api`, and `api_version` component identities; a generic execution row is not a pin.
+An alias-shaped model ID may be an exact advertised raw ID, so the runner also requires the successful
+effective model to equal the requested pin and blocks a fallback alias resolution as drift.
 
 Each eligible case invokes one bounded, privately staged snapshot of the exact candidate binary's
 fixed-PONG `smoke` once. The aggregate records its SHA-256 and byte length; the runner refuses digest
 drift, publishes the staged inode owner-executable but non-writable as mode `0500`, executes the
 verified file object instead of reopening its name, and accesses child smoke
-artifacts relative to the retained scratch descriptor. There is no retry, provider fallback, implicit all-case selection, baseline update,
+artifacts relative to the retained scratch descriptor. After hashing it rechecks cancellation and the
+full declared timeout headroom immediately before spawn. On Linux, the staged child closes its inherited
+candidate descriptor after exec and its scratch descriptor after opening the artifact, before ACP
+descendants. There is no retry, provider fallback, implicit all-case selection, baseline update,
 or production-config mutation. A case does not start unless its declared token and observable-cost caps
-fit the remaining total headroom. The checked-in R3a manifest intentionally has no cases; R3b adds reviewed pins. Read
+fit the remaining total headroom. Comparison retains per-case execution/error/not-run/budget state and
+aggregate success/cancellation/budget state while excluding variable usage quantities. The checked-in
+R3a manifest intentionally has no cases; R3b adds reviewed pins. Read
 [`docs/compatibility.md`](docs/compatibility.md) and the current
 [`reliability roadmap`](docs/reliability-execution-roadmap.md) before spending a live turn.
 

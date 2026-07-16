@@ -60,6 +60,12 @@ baseline entry, or PASS row merely to exercise the runner: deterministic missing
 the orchestration without spending a provider turn, while support evidence still requires the exact
 candidate binary and environment named below.
 
+Pinned adapter and CLI identities use one complete semantic version. Remote API support rows must pin
+provider, API, and API-version identities rather than a generic execution row. A raw advertised model ID
+may share an alias spelling, but a fallback resolution is blocking effective-model drift. Baseline
+comparison retains per-case runner/not-run/budget outcomes and aggregate success/cancellation/budget
+state; it intentionally omits variable token and cost quantities while retaining cap violations.
+
 Use the release-mode candidate's `smoke` command for the minimal live turn. Do not add or refresh a PASS
 row from unit tests, an unacknowledged refusal, a source-tree helper, or a stale installed binary. Retain the
 versioned smoke artifact under disposable/operator evidence storage (not this repository), and record every

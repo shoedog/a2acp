@@ -581,12 +581,12 @@ impl PinnedDirectory {
             }
             // SAFETY: `fd` was returned uniquely by openat above.
             let file = unsafe { File::from_raw_fd(fd) };
-            if !file
+            let metadata = file
                 .metadata()
-                .map_err(|error| format!("{label}: cannot inspect opened file: {error}"))?
-                .is_file()
-            {
-                return Err(format!("{label}: child must be a regular file").into());
+                .map_err(|error| format!("{label}: cannot inspect opened file: {error}"))?;
+            use std::os::unix::fs::MetadataExt as _;
+            if !metadata.is_file() || metadata.nlink() != 1 {
+                return Err(format!("{label}: child must be a single-link regular file").into());
             }
             Ok(file)
         }
@@ -597,7 +597,7 @@ impl PinnedDirectory {
         }
     }
 
-    /// Atomically create and retain one child directory beneath this directory object.
+    /// Create one child directory, then retain the opened object beneath this directory descriptor.
     pub(crate) fn create_child_directory(
         &self,
         name: &OsStr,
@@ -1043,6 +1043,16 @@ mod tests {
             .create_new_file(OsStr::new("../escape"), 0o600, "escape")
             .is_err());
         assert!(!dir.path().join("escape").exists());
+
+        fs::hard_link(moved.join("evidence.json"), moved.join("evidence-link")).unwrap();
+        assert!(pin
+            .open_regular_file(OsStr::new("evidence.json"), "hard-linked evidence")
+            .unwrap_err()
+            .to_string()
+            .contains("single-link"));
+        fs::remove_file(moved.join("evidence-link")).unwrap();
+        pin.open_regular_file(OsStr::new("evidence.json"), "single-link evidence")
+            .unwrap();
 
         scratch
             .remove_child(OsStr::new("marker"), false, "test marker cleanup")

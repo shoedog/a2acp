@@ -1933,6 +1933,7 @@ pub(crate) async fn smoke_cmd(args: &[String]) -> Result<(), BoxError> {
         return Ok(());
     }
     let args = parse_args(args)?;
+    crate::compatibility::close_inherited_compatibility_executable()?;
     if args
         .out
         .as_deref()
@@ -1942,6 +1943,7 @@ pub(crate) async fn smoke_cmd(args: &[String]) -> Result<(), BoxError> {
     }
     // Prove the selected evidence destination is writable before a provider process/request can exist.
     let mut artifact_file = prepare_artifact_file(args.out.as_deref(), &args.config)?;
+    crate::compatibility::close_inherited_compatibility_scratch()?;
     bridge_observ::init_stderr();
     let artifact = run_attempt(&args).await;
     let success = artifact.success;
