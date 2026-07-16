@@ -176,13 +176,16 @@ a2a-bridge compatibility run \
   --out /private/tmp/compatibility-aggregate.json
 ```
 
-The runner refuses an aggregate path inside any detected repository; keep compatibility evidence in
-disposable operator-owned storage.
+The runner canonicalizes and descriptor-pins the aggregate parent, rechecks its identity during creation,
+and refuses normal or bare Git repository ancestors; keep compatibility evidence in disposable operator-owned storage. Manifest prerequisites use
+structured entries: `{ name = "PATH" }` means presence-only, while
+`{ name = "A2A_BRIDGE_ALLOW_FABLE", one_of = ["1", "true"] }` binds accepted non-secret values.
 
 Each eligible case invokes one bounded, privately staged snapshot of the exact candidate binary's
 fixed-PONG `smoke` once. The aggregate records its SHA-256 and byte length, and the runner refuses digest
 drift before spawn. There is no retry, provider fallback, implicit all-case selection, baseline update,
-or production-config mutation. The checked-in R3a manifest intentionally has no cases; R3b adds reviewed pins. Read
+or production-config mutation. A case does not start unless its declared token and observable-cost caps
+fit the remaining total headroom. The checked-in R3a manifest intentionally has no cases; R3b adds reviewed pins. Read
 [`docs/compatibility.md`](docs/compatibility.md) and the current
 [`reliability roadmap`](docs/reliability-execution-roadmap.md) before spending a live turn.
 

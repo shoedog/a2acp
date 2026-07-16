@@ -184,6 +184,14 @@ struct PinSet {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RequiredEnvironment {
+    name: String,
+    #[serde(default)]
+    one_of: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CompatibilityCase {
     id: String,
     lane: Lane,
@@ -207,7 +215,7 @@ struct CompatibilityCase {
     #[serde(default)]
     credential_env: Option<String>,
     #[serde(default)]
-    required_env: Vec<String>,
+    required_env: Vec<RequiredEnvironment>,
     probe: ProbeType,
     billable: bool,
     timeout_secs: u64,
@@ -254,6 +262,7 @@ fn bounded_text(label: &str, value: &str, max: usize) -> Result<(), BoxError> {
 
 fn stable_id(label: &str, value: &str) -> Result<(), BoxError> {
     bounded_text(label, value, MAX_ID_BYTES)?;
+    reject_secret_text(label, value)?;
     let mut bytes = value.bytes();
     let Some(first) = bytes.next() else {
         return Err(format!("compatibility manifest: {label} is empty").into());
@@ -452,7 +461,8 @@ fn validate_case(case: &CompatibilityCase, budget: &ManifestBudget) -> Result<()
         }
         (_, None) => {}
     }
-    for name in &case.required_env {
+    for requirement in &case.required_env {
+        let name = &requirement.name;
         if !env_name(name) {
             return Err(format!(
                 "compatibility manifest: case {:?} has invalid required_env name {:?}",
@@ -480,6 +490,18 @@ fn validate_case(case: &CompatibilityCase, budget: &ManifestBudget) -> Result<()
                 case.id
             )
             .into());
+        }
+        let mut values = BTreeSet::new();
+        for expected in &requirement.one_of {
+            bounded_text("required_env expected value", expected, MAX_ID_BYTES)?;
+            reject_secret_text("required_env expected value", expected)?;
+            if !values.insert(expected) {
+                return Err(format!(
+                    "compatibility manifest: case {:?} repeats a required_env expected value",
+                    case.id
+                )
+                .into());
+            }
         }
     }
     match (case.execution_mode.is_container(), &case.expected_image_digest) {
@@ -593,6 +615,7 @@ fn validate_case(case: &CompatibilityCase, budget: &ManifestBudget) -> Result<()
                 )
                 .into());
             }
+            exact_component("pinned model", &pins.model)?;
             if let Some(adapter) = &pins.adapter {
                 exact_package_pin("adapter pin", adapter)?;
             }
@@ -611,6 +634,61 @@ fn validate_case(case: &CompatibilityCase, budget: &ManifestBudget) -> Result<()
                     .into());
                 }
                 exact_component("component pin", value)?;
+            }
+            match (case.execution_mode, case.evidence_path) {
+                (ExecutionMode::RemoteApi, _) => {
+                    if pins.adapter.is_some() || pins.agent_cli.is_some() {
+                        return Err(format!(
+                            "compatibility manifest: pinned remote-API case {:?} must express provider dependencies through component pins, not adapter or agent CLI pins",
+                            case.id
+                        )
+                        .into());
+                    }
+                    if pins.components.is_empty() {
+                        return Err(format!(
+                            "compatibility manifest: pinned remote-API case {:?} requires at least one exact component pin",
+                            case.id
+                        )
+                        .into());
+                    }
+                }
+                (_, EvidencePath::DirectCli) => {
+                    if pins.adapter.is_some() {
+                        return Err(format!(
+                            "compatibility manifest: pinned direct-CLI case {:?} must not declare an adapter pin",
+                            case.id
+                        )
+                        .into());
+                    }
+                    if pins.agent_cli.is_none() {
+                        return Err(format!(
+                            "compatibility manifest: pinned direct-CLI case {:?} requires an exact agent CLI pin",
+                            case.id
+                        )
+                        .into());
+                    }
+                }
+                (
+                    _,
+                    EvidencePath::DirectAcp
+                    | EvidencePath::BridgeSmoke
+                    | EvidencePath::BridgeWorkflow,
+                ) => {
+                    if pins.adapter.is_none() {
+                        return Err(format!(
+                            "compatibility manifest: pinned ACP/bridge case {:?} requires an exact adapter pin",
+                            case.id
+                        )
+                        .into());
+                    }
+                    if pins.agent_cli.is_none() {
+                        return Err(format!(
+                            "compatibility manifest: pinned ACP/bridge case {:?} requires an exact agent CLI pin",
+                            case.id
+                        )
+                        .into());
+                    }
+                }
             }
             match (case.execution_mode.is_container(), &pins.image_digest) {
                 (true, Some(digest))
@@ -684,15 +762,23 @@ fn load_manifest(path: &Path) -> Result<LoadedManifest, BoxError> {
         artifact_safe_path("compatibility manifest", &snapshot.canonical_path)?;
     let raw = std::str::from_utf8(&snapshot.bytes)
         .map_err(|_| "compatibility manifest: file must be UTF-8")?;
-    let manifest: CompatibilityManifest = toml::from_str(raw)
-        .map_err(|error| format!("compatibility manifest: invalid TOML: {error}"))?;
-    validate_manifest(&manifest)?;
+    let manifest = parse_manifest_text(raw)?;
     Ok(LoadedManifest {
         manifest,
         canonical_path: snapshot.canonical_path,
         canonical_path_text,
         sha256: snapshot.sha256,
     })
+}
+
+fn parse_manifest_text(raw: &str) -> Result<CompatibilityManifest, BoxError> {
+    // Scan before TOML parsing so comments and parse-error source snippets cannot carry a credential
+    // into a checked-in manifest or diagnostic.
+    reject_secret_text("manifest text", raw)?;
+    let manifest: CompatibilityManifest = toml::from_str(raw)
+        .map_err(|error| format!("compatibility manifest: invalid TOML: {error}"))?;
+    validate_manifest(&manifest)?;
+    Ok(manifest)
 }
 
 #[derive(Debug)]
@@ -1193,22 +1279,84 @@ fn repository_root(path: &Path) -> Option<PathBuf> {
     let start = if path.is_dir() { path } else { path.parent()? };
     start
         .ancestors()
-        .find(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok())
+        .find(|ancestor| {
+            std::fs::symlink_metadata(ancestor.join(".git")).is_ok()
+                || looks_like_bare_git_repository(ancestor)
+        })
         .map(Path::to_path_buf)
 }
 
-fn ensure_output_outside_repositories(output: &Path) -> Result<(), BoxError> {
+fn looks_like_bare_git_repository(path: &Path) -> bool {
+    std::fs::metadata(path.join("HEAD")).is_ok_and(|metadata| metadata.is_file())
+        && std::fs::metadata(path.join("objects")).is_ok_and(|metadata| metadata.is_dir())
+        && (std::fs::metadata(path.join("refs")).is_ok_and(|metadata| metadata.is_dir())
+            || std::fs::metadata(path.join("packed-refs")).is_ok_and(|metadata| metadata.is_file()))
+}
+
+struct PinnedOutputDirectory {
+    pin: local_file::PinnedDirectory,
+    canonical_parent: PathBuf,
+    output_path: PathBuf,
+}
+
+impl PinnedOutputDirectory {
+    fn prepare_output(&self) -> Result<File, BoxError> {
+        if !self.pin.current_path_matches() {
+            return Err(
+                "compatibility run: aggregate parent identity changed before output creation"
+                    .into(),
+            );
+        }
+        let file = prepare_output(&self.output_path)?;
+        if !self.pin.current_path_matches() {
+            return Err(
+                "compatibility run: aggregate parent identity changed during output creation"
+                    .into(),
+            );
+        }
+        Ok(file)
+    }
+
+    fn create_scratch(&self) -> Result<ScratchDir, BoxError> {
+        if !self.pin.current_path_matches() {
+            return Err(
+                "compatibility run: aggregate parent identity changed before scratch creation"
+                    .into(),
+            );
+        }
+        let scratch = create_scratch_dir(&self.canonical_parent)?;
+        if !self.pin.current_path_matches() {
+            return Err(
+                "compatibility run: aggregate parent identity changed during scratch creation"
+                    .into(),
+            );
+        }
+        Ok(scratch)
+    }
+}
+
+fn ensure_output_outside_repositories(output: &Path) -> Result<PinnedOutputDirectory, BoxError> {
+    let file_name = output
+        .file_name()
+        .ok_or("compatibility run: --out must name a file")?;
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
-    let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
-        format!(
-            "compatibility run: cannot resolve aggregate parent {}: {error}",
-            parent.display()
-        )
-    })?;
+    let snapshot = local_file::snapshot_directory(parent, "compatibility aggregate parent")?;
+    let canonical_parent = PathBuf::from(snapshot.canonical_cwd.as_str());
     if repository_root(&canonical_parent).is_some() {
         return Err("compatibility run: --out must be outside any repository".into());
     }
-    Ok(())
+    let pin = local_file::PinnedDirectory::open(
+        parent,
+        &snapshot.canonical_cwd,
+        &snapshot.identity,
+        "compatibility aggregate parent",
+    )?;
+    let output_path = canonical_parent.join(file_name);
+    Ok(PinnedOutputDirectory {
+        pin,
+        canonical_parent,
+        output_path,
+    })
 }
 
 fn write_aggregate(file: &mut File, aggregate: &AggregateArtifact) -> Result<(), BoxError> {
@@ -1375,6 +1523,28 @@ fn optional_request_field_matches(smoke: &Value, field: &str, expected: Option<&
     }
 }
 
+fn effective_field_matches(smoke: &Value, field: &str, expected: &str) -> bool {
+    smoke
+        .pointer(&format!("/session/effective_request/{field}"))
+        .and_then(Value::as_str)
+        == Some(expected)
+}
+
+fn api_key_authentication_matches(smoke: &Value, expected_env: &str) -> bool {
+    smoke
+        .pointer("/target/authentication/name/state")
+        .and_then(Value::as_str)
+        == Some("value")
+        && smoke
+            .pointer("/target/authentication/name/value")
+            .and_then(Value::as_str)
+            == Some(expected_env)
+        && smoke
+            .pointer("/target/authentication/present")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
 fn drift_for(case: &CompatibilityCase, smoke: &Value) -> Vec<String> {
     let mut drift = Vec::new();
     let success = smoke
@@ -1390,6 +1560,25 @@ fn drift_for(case: &CompatibilityCase, smoke: &Value) -> Vec<String> {
     if !optional_request_field_matches(smoke, "mode", case.mode.as_deref()) {
         drift.push("capability.mode".into());
     }
+    if success {
+        if !effective_field_matches(smoke, "model", &case.model) {
+            drift.push("capability.effective_model".into());
+        }
+        if case
+            .effort
+            .as_deref()
+            .is_some_and(|expected| !effective_field_matches(smoke, "effort", expected))
+        {
+            drift.push("capability.effective_effort".into());
+        }
+        if case
+            .mode
+            .as_deref()
+            .is_some_and(|expected| !effective_field_matches(smoke, "mode", expected))
+        {
+            drift.push("capability.effective_mode".into());
+        }
+    }
     if success || smoke.get("target").is_some_and(|value| !value.is_null()) {
         if smoke
             .pointer("/target/execution_mode")
@@ -1404,6 +1593,13 @@ fn drift_for(case: &CompatibilityCase, smoke: &Value) -> Vec<String> {
             != Some(case.auth_path.wire())
         {
             drift.push("authentication.path".into());
+        } else if case.auth_path == AuthPath::ApiKeyEnv
+            && case
+                .credential_env
+                .as_deref()
+                .is_none_or(|expected| !api_key_authentication_matches(smoke, expected))
+        {
+            drift.push("authentication.credential_env".into());
         }
         if let Some(image) = &case.expected_image_digest {
             if !provenance_field_matches(smoke, &case.agent, "image", "immutable_id", image) {
@@ -1514,12 +1710,17 @@ fn case_environment_ready(case: &CompatibilityCase, owner: &str) -> Option<&'sta
     if case.environment_owner != owner {
         return Some("environment_owner_mismatch");
     }
-    if case
-        .required_env
-        .iter()
-        .any(|name| std::env::var_os(name).is_none())
-    {
-        return Some("required_environment_missing");
+    for requirement in &case.required_env {
+        let Some(value) = std::env::var_os(&requirement.name) else {
+            return Some("required_environment_missing");
+        };
+        if !requirement.one_of.is_empty()
+            && value
+                .to_str()
+                .is_none_or(|value| !requirement.one_of.iter().any(|expected| expected == value))
+        {
+            return Some("required_environment_value_mismatch");
+        }
     }
     if let Some(name) = &case.credential_env {
         match std::env::var(name) {
@@ -1602,10 +1803,25 @@ async fn build_aggregate<I: SmokeInvoker>(
         if budget.exhausted
             || budget.observed_tokens >= budget_config.max_tokens
             || total_cost_exhausted
-            || remaining.is_none_or(|remaining| remaining < Duration::from_secs(case.timeout_secs))
         {
             budget.exhausted = true;
             results.push(not_run_result(case, "total_budget_exhausted"));
+            continue;
+        }
+        let token_headroom_insufficient = budget_config
+            .max_tokens
+            .saturating_sub(budget.observed_tokens)
+            < case.max_tokens;
+        let cost_headroom_insufficient = match (budget_config.max_cost_usd, case.max_cost_usd) {
+            (Some(total), Some(case_cap)) => total - budget.observed_cost_usd < case_cap,
+            _ => false,
+        };
+        if token_headroom_insufficient
+            || cost_headroom_insufficient
+            || remaining.is_none_or(|remaining| remaining < Duration::from_secs(case.timeout_secs))
+        {
+            budget.exhausted = true;
+            results.push(not_run_result(case, "total_budget_insufficient_for_case"));
             continue;
         }
         if let Some(reason) = case_environment_ready(case, environment_owner) {
@@ -1729,6 +1945,10 @@ async fn build_aggregate<I: SmokeInvoker>(
             }
             _ => budget.cost_observation_missing_cases += 1,
         }
+        if started.elapsed() > Duration::from_secs(budget_config.timeout_secs) {
+            budget_violations.push("total_timeout_exceeded".into());
+            budget.exhausted = true;
+        }
         if budget.observed_tokens > budget.max_tokens
             || budget
                 .max_cost_usd
@@ -1763,12 +1983,18 @@ async fn build_aggregate<I: SmokeInvoker>(
         });
     }
 
+    if started.elapsed() > Duration::from_secs(budget_config.timeout_secs) {
+        budget.exhausted = true;
+    }
+
     let runner_failed = results
         .iter()
         .any(|result| result.execution == ExecutionState::RunnerFailure);
-    let pinned_failed = results
-        .iter()
-        .any(|result| result.lane == Lane::Pinned && !result.expectation_met);
+    let pinned_failed = results.iter().any(|result| {
+        result.lane == Lane::Pinned
+            && result.classification == Classification::Support
+            && !result.expectation_met
+    });
     AggregateArtifact {
         schema_version: 1,
         candidate: candidate.clone(),
@@ -1840,15 +2066,32 @@ fn object_subset(value: &Value, fields: &[&str]) -> Value {
     Value::Object(out)
 }
 
+fn diagnostic_projection(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(diagnostic_projection).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "at_ms" | "failed_phase"))
+                .map(|(key, value)| (key.clone(), diagnostic_projection(value)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
 fn baseline_from_result(result: &CaseResult) -> CaseBaseline {
     let smoke = result.smoke.as_ref().unwrap_or(&Value::Null);
     let request = smoke.get("request").unwrap_or(&Value::Null);
     let session = smoke.get("session").unwrap_or(&Value::Null);
     let target = smoke.get("target").unwrap_or(&Value::Null);
+    let attempt = smoke.get("attempt").unwrap_or(&Value::Null);
+    let diagnostics = smoke.get("diagnostics").unwrap_or(&Value::Null);
     let failure = smoke
         .pointer("/diagnostics/failure")
         .unwrap_or(&Value::Null);
     let turn = smoke.get("turn").unwrap_or(&Value::Null);
+    let cleanup = smoke.get("cleanup").unwrap_or(&Value::Null);
     CaseBaseline {
         case_id: result.case_id.clone(),
         status: result.actual_status,
@@ -1860,16 +2103,40 @@ fn baseline_from_result(result: &CaseResult) -> CaseBaseline {
         }),
         authentication: target.get("authentication").cloned().unwrap_or(Value::Null),
         phase: failure.get("failed_phase").cloned().unwrap_or(Value::Null),
-        terminal: object_subset(turn, &["terminal_state", "stop_reason", "exact_pong"]),
-        diagnostic: object_subset(
-            failure,
-            &[
-                "class",
-                "disposition",
-                "code",
-                "prompt_may_have_been_accepted",
-            ],
-        ),
+        terminal: json!({
+            "attempt": object_subset(
+                attempt,
+                &["timeout_secs", "timed_out", "prompt_may_have_been_accepted"],
+            ),
+            "turn": object_subset(
+                turn,
+                &[
+                    "prompt",
+                    "prompt_calls",
+                    "terminal_state",
+                    "stop_reason",
+                    "exact_pong",
+                    "text_bytes",
+                    "tool_event_count",
+                    "permission_update_count",
+                ],
+            ),
+            "cleanup": cleanup,
+        }),
+        diagnostic: json!({
+            "lifecycle": diagnostic_projection(
+                diagnostics.get("lifecycle").unwrap_or(&Value::Null),
+            ),
+            "dropped_events": diagnostics
+                .get("dropped_events")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "failure": diagnostic_projection(failure),
+            "stderr_text": diagnostics
+                .get("stderr_text")
+                .cloned()
+                .unwrap_or(Value::Null),
+        }),
     }
 }
 
@@ -2005,7 +2272,7 @@ fn compare_artifacts(
 async fn run_command(args: RunArgs) -> Result<(), BoxError> {
     let loaded = load_manifest(&args.manifest)?;
     let selected = select_case_indices(&loaded.manifest, &args.selection)?;
-    ensure_output_outside_repositories(&args.out)?;
+    let output_directory = ensure_output_outside_repositories(&args.out)?;
     let executable = std::env::current_exe()
         .map_err(|error| format!("compatibility run: cannot resolve candidate binary: {error}"))?;
     let executable = local_file::read_regular_file_bounded(
@@ -2022,9 +2289,8 @@ async fn run_command(args: RunArgs) -> Result<(), BoxError> {
         byte_length: u64::try_from(executable.bytes.len())
             .map_err(|_| "compatibility run: candidate binary length does not fit u64")?,
     };
-    let mut output = prepare_output(&args.out)?;
-    let parent = args.out.parent().unwrap_or_else(|| Path::new("."));
-    let scratch = create_scratch_dir(parent)?;
+    let mut output = output_directory.prepare_output()?;
+    let scratch = output_directory.create_scratch()?;
     let staged_executable = stage_candidate(&executable, &scratch.path)?;
     drop(executable);
     let invoker = ProcessSmokeInvoker {
@@ -2232,6 +2498,21 @@ mod tests {
         }
     }
 
+    struct DelayedInvoker {
+        delay: Duration,
+        calls: Mutex<Vec<String>>,
+        result: Mutex<Option<InvocationResult>>,
+    }
+
+    #[async_trait]
+    impl SmokeInvoker for DelayedInvoker {
+        async fn invoke(&self, request: &SmokeRequest) -> InvocationResult {
+            self.calls.lock().unwrap().push(request.agent.clone());
+            tokio::time::sleep(self.delay).await;
+            self.result.lock().unwrap().take().unwrap()
+        }
+    }
+
     #[async_trait]
     impl SmokeInvoker for FakeInvoker {
         async fn invoke(&self, request: &SmokeRequest) -> InvocationResult {
@@ -2331,9 +2612,9 @@ agent_cli = "@openai/codex=0.144.1"
     }
 
     fn parse_and_validate(raw: &str) -> Result<(), String> {
-        let manifest: CompatibilityManifest =
-            toml::from_str(raw).map_err(|error| error.to_string())?;
-        validate_manifest(&manifest).map_err(|error| error.to_string())
+        parse_manifest_text(raw)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     #[test]
@@ -2384,6 +2665,30 @@ agent_cli = "@openai/codex=0.144.1"
             .unwrap_err()
             .contains("secret-shaped"));
 
+        let secret_id = valid_pinned_toml().replace("id = \"host-case\"", "id = \"sk-ant-secret\"");
+        assert!(parse_and_validate(&secret_id)
+            .unwrap_err()
+            .contains("secret-shaped"));
+
+        let secret_comment = format!("{}\n# token=opaque-comment-secret\n", valid_pinned_toml());
+        assert!(parse_and_validate(&secret_comment)
+            .unwrap_err()
+            .contains("secret-shaped"));
+
+        let floating_model = valid_pinned_toml().replace("gpt-5.6-sol", "latest");
+        assert!(parse_and_validate(&floating_model)
+            .unwrap_err()
+            .contains("exact identity"));
+
+        let missing_adapter = valid_pinned_toml()
+            .lines()
+            .filter(|line| !line.starts_with("adapter = "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(parse_and_validate(&missing_adapter)
+            .unwrap_err()
+            .contains("adapter pin"));
+
         for (from, to, expected) in [
             ("retry_cap = 0", "retry_cap = 1", "exactly zero"),
             ("timeout_secs = 10", "timeout_secs = 0", "timeout_secs"),
@@ -2431,6 +2736,38 @@ agent_cli = "@openai/codex=0.144.1"
     }
 
     #[test]
+    fn pinned_dependencies_are_explicit_for_cli_acp_and_remote_api_paths() {
+        let direct_with_adapter = valid_pinned_toml().replace(
+            "evidence_path = \"bridge_smoke\"",
+            "evidence_path = \"direct_cli\"",
+        );
+        assert!(parse_and_validate(&direct_with_adapter)
+            .unwrap_err()
+            .contains("must not declare an adapter pin"));
+        let direct = direct_with_adapter
+            .lines()
+            .filter(|line| !line.starts_with("adapter = "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        parse_and_validate(&direct).unwrap();
+
+        let remote = valid_pinned_toml()
+            .replace(
+                "execution_mode = \"host\"",
+                "execution_mode = \"remote_api\"",
+            )
+            .lines()
+            .filter(|line| !line.starts_with("adapter = ") && !line.starts_with("agent_cli = "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(parse_and_validate(&remote)
+            .unwrap_err()
+            .contains("component pin"));
+        let remote = format!("{remote}\ncomponents = {{ provider_api = \"v1\" }}\n");
+        parse_and_validate(&remote).unwrap();
+    }
+
+    #[test]
     fn api_key_auth_records_only_a_valid_credential_environment_name() {
         let api = valid_pinned_toml().replace(
             "auth_path = \"pre_authenticated\"",
@@ -2462,17 +2799,42 @@ agent_cli = "@openai/codex=0.144.1"
             .unwrap_err()
             .contains("must not declare credential_env"));
 
-        let misclassified =
-            valid_pinned_toml().replace("required_env = []", "required_env = [\"OPENAI_API_KEY\"]");
+        let misclassified = valid_pinned_toml().replace(
+            "required_env = []",
+            "required_env = [{ name = \"OPENAI_API_KEY\" }]",
+        );
         assert!(parse_and_validate(&misclassified)
             .unwrap_err()
             .contains("credential_env, not required_env"));
 
         let non_secret_prerequisite = valid_pinned_toml().replace(
             "required_env = []",
-            "required_env = [\"AWS_PROFILE\", \"PATH\"]",
+            "required_env = [{ name = \"AWS_PROFILE\" }, { name = \"PATH\" }]",
         );
         parse_and_validate(&non_secret_prerequisite).unwrap();
+
+        let value_bound_prerequisite = valid_pinned_toml().replace(
+            "required_env = []",
+            "required_env = [{ name = \"A2A_BRIDGE_ALLOW_FABLE\", one_of = [\"1\", \"true\"] }]",
+        );
+        parse_and_validate(&value_bound_prerequisite).unwrap();
+    }
+
+    #[test]
+    fn environment_prerequisites_can_require_an_exact_non_secret_value() {
+        let path = std::env::var("PATH").expect("test process has PATH");
+        let mut case = case("env", EvidenceStatus::Pass);
+        case.required_env = vec![RequiredEnvironment {
+            name: "PATH".into(),
+            one_of: vec![path],
+        }];
+        assert_eq!(case_environment_ready(&case, "test-runner"), None);
+
+        case.required_env[0].one_of = vec!["definitely-not-the-process-path".into()];
+        assert_eq!(
+            case_environment_ready(&case, "test-runner"),
+            Some("required_environment_value_mismatch")
+        );
     }
 
     #[tokio::test]
@@ -2517,6 +2879,60 @@ agent_cli = "@openai/codex=0.144.1"
         assert!(aggregate.success);
     }
 
+    #[test]
+    fn lane_case_and_all_selection_never_collapse_to_an_implicit_all() {
+        let mut pinned = case("pinned", EvidenceStatus::Pass);
+        pinned.lane = Lane::Pinned;
+        let floating = case("floating", EvidenceStatus::Pass);
+        let manifest = manifest(vec![pinned, floating]);
+
+        assert_eq!(
+            select_case_indices(
+                &manifest,
+                &SelectionRecord {
+                    lane: Some(Lane::Pinned),
+                    cases: Vec::new(),
+                    all: false,
+                },
+            )
+            .unwrap(),
+            [0]
+        );
+        assert_eq!(
+            select_case_indices(
+                &manifest,
+                &SelectionRecord {
+                    lane: None,
+                    cases: vec!["floating".into()],
+                    all: false,
+                },
+            )
+            .unwrap(),
+            [1]
+        );
+        assert_eq!(
+            select_case_indices(
+                &manifest,
+                &SelectionRecord {
+                    lane: None,
+                    cases: Vec::new(),
+                    all: true,
+                },
+            )
+            .unwrap(),
+            [0, 1]
+        );
+        assert!(select_case_indices(
+            &manifest,
+            &SelectionRecord {
+                lane: None,
+                cases: vec!["missing".into()],
+                all: false,
+            },
+        )
+        .is_err());
+    }
+
     #[tokio::test]
     async fn runner_failure_stops_before_any_later_billable_case() {
         let dir = tempfile::tempdir().unwrap();
@@ -2558,6 +2974,64 @@ agent_cli = "@openai/codex=0.144.1"
             Some("prior_runner_failure")
         );
         assert!(!aggregate.success);
+    }
+
+    #[tokio::test]
+    async fn schema_and_exit_inconsistency_are_unaccounted_runner_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let case = case("first", EvidenceStatus::Pass);
+        let candidate = candidate_identity();
+        let selection = selection();
+        let selected_indices = [0];
+
+        let mut wrong_schema = smoke(&case, true, Some(1));
+        wrong_schema["request"]["agent"] = Value::String("different-agent".into());
+        let schema_invoker = FakeInvoker::new(vec![invocation(wrong_schema)]);
+        let schema_loaded = loaded(dir.path(), vec![case.clone()]);
+        let cancelled = AtomicBool::new(false);
+        let schema = build_aggregate(
+            AggregateInputs {
+                loaded: &schema_loaded,
+                candidate: &candidate,
+                selection: &selection,
+                selected_indices: &selected_indices,
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &schema_invoker,
+        )
+        .await;
+        assert_eq!(
+            schema.results[0].runner_error_code.as_deref(),
+            Some("smoke_artifact_schema_mismatch")
+        );
+        assert!(!schema.success);
+
+        let exit_invoker = FakeInvoker::new(vec![InvocationResult {
+            artifact: Some(smoke(&case, true, Some(1))),
+            process_success: false,
+            runner_error_code: None,
+        }]);
+        let exit_loaded = loaded(dir.path(), vec![case]);
+        let exit = build_aggregate(
+            AggregateInputs {
+                loaded: &exit_loaded,
+                candidate: &candidate,
+                selection: &selection,
+                selected_indices: &selected_indices,
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &exit_invoker,
+        )
+        .await;
+        assert_eq!(
+            exit.results[0].runner_error_code.as_deref(),
+            Some("smoke_exit_artifact_mismatch")
+        );
+        assert!(!exit.success);
     }
 
     #[tokio::test]
@@ -2648,6 +3122,129 @@ agent_cli = "@openai/codex=0.144.1"
     }
 
     #[tokio::test]
+    async fn insufficient_token_headroom_stops_before_the_next_billable_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = case("first", EvidenceStatus::Pass);
+        first.max_tokens = 5;
+        let mut second = case("second", EvidenceStatus::Pass);
+        second.max_tokens = 7;
+        let invoker = FakeInvoker::new(vec![
+            invocation(smoke(&first, true, Some(4))),
+            invocation(smoke(&second, true, Some(1))),
+        ]);
+        let mut loaded = loaded(dir.path(), vec![first, second]);
+        loaded.manifest.budget.max_tokens = 10;
+        let cancelled = AtomicBool::new(false);
+        let candidate = candidate_identity();
+        let selection = selection();
+        let selected_indices = [0, 1];
+
+        let aggregate = build_aggregate(
+            AggregateInputs {
+                loaded: &loaded,
+                candidate: &candidate,
+                selection: &selection,
+                selected_indices: &selected_indices,
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &invoker,
+        )
+        .await;
+
+        assert_eq!(&*invoker.calls.lock().unwrap(), &["first"]);
+        assert_eq!(
+            aggregate.results[1].not_run_reason.as_deref(),
+            Some("total_budget_insufficient_for_case")
+        );
+        assert!(aggregate.budget.exhausted);
+        assert!(!aggregate.success);
+    }
+
+    #[tokio::test]
+    async fn insufficient_observable_cost_headroom_stops_before_the_next_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = case("first", EvidenceStatus::Pass);
+        first.max_cost_usd = Some(0.6);
+        let mut second = case("second", EvidenceStatus::Pass);
+        second.max_cost_usd = Some(0.6);
+        let mut first_smoke = smoke(&first, true, Some(1));
+        first_smoke["turn"]["usage"]["cost"] = json!({"amount": 0.5, "currency": "USD"});
+        let invoker = FakeInvoker::new(vec![
+            invocation(first_smoke),
+            invocation(smoke(&second, true, Some(1))),
+        ]);
+        let mut loaded = loaded(dir.path(), vec![first, second]);
+        loaded.manifest.budget.max_cost_usd = Some(1.0);
+        let cancelled = AtomicBool::new(false);
+        let candidate = candidate_identity();
+        let selection = selection();
+        let selected_indices = [0, 1];
+
+        let aggregate = build_aggregate(
+            AggregateInputs {
+                loaded: &loaded,
+                candidate: &candidate,
+                selection: &selection,
+                selected_indices: &selected_indices,
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &invoker,
+        )
+        .await;
+
+        assert_eq!(&*invoker.calls.lock().unwrap(), &["first"]);
+        assert_eq!(
+            aggregate.results[1].not_run_reason.as_deref(),
+            Some("total_budget_insufficient_for_case")
+        );
+        assert!(aggregate.budget.exhausted);
+        assert!(!aggregate.success);
+    }
+
+    #[tokio::test]
+    async fn final_case_elapsed_time_exhaustion_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let only = case("only", EvidenceStatus::Pass);
+        let invoker = DelayedInvoker {
+            delay: Duration::from_millis(2_100),
+            calls: Mutex::new(Vec::new()),
+            result: Mutex::new(Some(invocation(smoke(&only, true, Some(1))))),
+        };
+        let mut loaded = loaded(dir.path(), vec![only]);
+        loaded.manifest.budget.timeout_secs = 2;
+        let cancelled = AtomicBool::new(false);
+        let candidate = candidate_identity();
+        let selection = selection();
+        let selected_indices = [0];
+
+        let aggregate = build_aggregate(
+            AggregateInputs {
+                loaded: &loaded,
+                candidate: &candidate,
+                selection: &selection,
+                selected_indices: &selected_indices,
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &invoker,
+        )
+        .await;
+
+        assert_eq!(&*invoker.calls.lock().unwrap(), &["only"]);
+        assert!(aggregate.budget.exhausted);
+        assert_eq!(
+            aggregate.results[0].budget_violations,
+            ["total_timeout_exceeded"]
+        );
+        assert!(!aggregate.success);
+    }
+
+    #[tokio::test]
     async fn ineligible_and_representative_cases_are_explicit_and_never_invoked() {
         let dir = tempfile::tempdir().unwrap();
         let mut wrong_platform = case("wrong-platform", EvidenceStatus::Unknown);
@@ -2691,6 +3288,55 @@ agent_cli = "@openai/codex=0.144.1"
             aggregate.results[2].not_run_reason.as_deref(),
             Some("evidence_path_not_implemented_in_r3a")
         );
+    }
+
+    #[tokio::test]
+    async fn pinned_non_goal_is_advisory_but_pinned_support_remains_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut non_goal = case("historic-control", EvidenceStatus::Pass);
+        non_goal.lane = Lane::Pinned;
+        non_goal.classification = Classification::NonGoal;
+        non_goal.evidence_path = EvidencePath::DirectCli;
+        let invoker = FakeInvoker::new(Vec::new());
+        let cancelled = AtomicBool::new(false);
+        let candidate = candidate_identity();
+        let selection = selection();
+        let selected_indices = [0];
+
+        let non_goal_loaded = loaded(dir.path(), vec![non_goal.clone()]);
+        let advisory = build_aggregate(
+            AggregateInputs {
+                loaded: &non_goal_loaded,
+                candidate: &candidate,
+                selection: &selection,
+                selected_indices: &selected_indices,
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &invoker,
+        )
+        .await;
+        assert!(!advisory.results[0].expectation_met);
+        assert!(advisory.success);
+
+        let mut support = non_goal;
+        support.classification = Classification::Support;
+        let support_loaded = loaded(dir.path(), vec![support]);
+        let blocking = build_aggregate(
+            AggregateInputs {
+                loaded: &support_loaded,
+                candidate: &candidate,
+                selection: &selection,
+                selected_indices: &selected_indices,
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &invoker,
+        )
+        .await;
+        assert!(!blocking.success);
     }
 
     #[tokio::test]
@@ -2825,6 +3471,47 @@ agent_cli = "@openai/codex=0.144.1"
         assert!(!aggregate.success);
     }
 
+    #[tokio::test]
+    async fn cumulative_smoke_evidence_limit_rejects_individually_bounded_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = case("first", EvidenceStatus::Pass);
+        let second = case("second", EvidenceStatus::Pass);
+        let mut first_smoke = smoke(&first, true, Some(1));
+        let mut second_smoke = smoke(&second, true, Some(1));
+        let padding = "x".repeat(MAX_EMBEDDED_SMOKE_BYTES / 2);
+        first_smoke["padding"] = Value::String(padding.clone());
+        second_smoke["padding"] = Value::String(padding);
+        let invoker = FakeInvoker::new(vec![invocation(first_smoke), invocation(second_smoke)]);
+        let loaded = loaded(dir.path(), vec![first, second]);
+        let cancelled = AtomicBool::new(false);
+        let candidate = candidate_identity();
+        let selection = selection();
+        let selected_indices = [0, 1];
+
+        let aggregate = build_aggregate(
+            AggregateInputs {
+                loaded: &loaded,
+                candidate: &candidate,
+                selection: &selection,
+                selected_indices: &selected_indices,
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &invoker,
+        )
+        .await;
+
+        assert_eq!(&*invoker.calls.lock().unwrap(), &["first", "second"]);
+        assert_eq!(aggregate.results[0].execution, ExecutionState::Completed);
+        assert_eq!(
+            aggregate.results[1].runner_error_code.as_deref(),
+            Some("aggregate_smoke_evidence_limit_exceeded")
+        );
+        assert!(aggregate.results[1].smoke.is_none());
+        assert!(!aggregate.success);
+    }
+
     #[test]
     fn pinned_drift_requires_exact_agent_rows_and_all_requested_capabilities() {
         let mut case = case("codex", EvidenceStatus::Pass);
@@ -2842,6 +3529,8 @@ agent_cli = "@openai/codex=0.144.1"
         artifact["request"]["config_sha256"] = Value::String("a".repeat(64));
         artifact["request"]["effort"] = Value::String("xhigh".into());
         artifact["request"]["mode"] = Value::String("read-only".into());
+        artifact["session"]["effective_request"]["effort"] = Value::String("xhigh".into());
+        artifact["session"]["effective_request"]["mode"] = Value::String("read-only".into());
         artifact["target"]["provenance"] = json!([
             {
                 "check": "provenance:codex:adapter",
@@ -2872,6 +3561,74 @@ agent_cli = "@openai/codex=0.144.1"
     }
 
     #[test]
+    fn successful_api_case_binds_exact_credential_and_effective_capabilities() {
+        let mut case = case("api", EvidenceStatus::Pass);
+        case.execution_mode = ExecutionMode::RemoteApi;
+        case.auth_path = AuthPath::ApiKeyEnv;
+        case.credential_env = Some("EXPECTED_API_KEY".into());
+        case.effort = Some("xhigh".into());
+        case.mode = Some("read-only".into());
+        let mut artifact = smoke(&case, true, Some(1));
+        artifact["target"]["execution_mode"] = Value::String("remote_api".into());
+        artifact["target"]["authentication"] = json!({
+            "path": "api_key_env",
+            "name": {"state": "value", "value": "EXPECTED_API_KEY"},
+            "present": true
+        });
+        artifact["request"]["effort"] = Value::String("xhigh".into());
+        artifact["request"]["mode"] = Value::String("read-only".into());
+        artifact["session"]["effective_request"] = json!({
+            "model": case.model,
+            "effort": "xhigh",
+            "mode": "read-only"
+        });
+        assert!(drift_for(&case, &artifact).is_empty());
+
+        let mut wrong_credential = artifact.clone();
+        wrong_credential["target"]["authentication"]["name"]["value"] =
+            Value::String("OTHER_API_KEY".into());
+        assert!(
+            drift_for(&case, &wrong_credential).contains(&"authentication.credential_env".into())
+        );
+
+        let mut absent_credential = artifact.clone();
+        absent_credential["target"]["authentication"]["present"] = Value::Bool(false);
+        assert!(
+            drift_for(&case, &absent_credential).contains(&"authentication.credential_env".into())
+        );
+
+        let mut wrong_effective = artifact;
+        wrong_effective["session"]["effective_request"]["model"] =
+            Value::String("different-model".into());
+        wrong_effective["session"]["effective_request"]["effort"] = Value::String("high".into());
+        let drift = drift_for(&case, &wrong_effective);
+        assert!(drift.contains(&"capability.effective_model".into()));
+        assert!(drift.contains(&"capability.effective_effort".into()));
+    }
+
+    #[test]
+    fn container_drift_requires_the_exact_immutable_image_identity() {
+        let mut case = case("reader", EvidenceStatus::Pass);
+        case.execution_mode = ExecutionMode::ContainerRo;
+        case.expected_image_digest = Some(format!("sha256:{}", "b".repeat(64)));
+        let mut artifact = smoke(&case, true, Some(1));
+        artifact["target"]["execution_mode"] = Value::String("container_ro".into());
+        artifact["target"]["provenance"] = json!([{
+            "check": "provenance:reader:image",
+            "status": "ok",
+            "detail": format!("runtime=podman immutable_id=sha256:{}", "b".repeat(64)),
+            "remedy": ""
+        }]);
+        assert!(drift_for(&case, &artifact).is_empty());
+
+        artifact["target"]["provenance"][0]["detail"] = Value::String(format!(
+            "runtime=podman immutable_id=sha256:{}",
+            "c".repeat(64)
+        ));
+        assert!(drift_for(&case, &artifact).contains(&"provenance.image".into()));
+    }
+
+    #[test]
     fn pinned_compare_reports_each_drift_dimension_independently() {
         let case = case("pinned", EvidenceStatus::Pass);
         let smoke = smoke(&case, true, Some(1));
@@ -2895,8 +3652,14 @@ agent_cli = "@openai/codex=0.144.1"
             smoke: Some(smoke),
         };
         let mut before = baseline_from_result(&result);
+        before.status = EvidenceStatus::Fail;
+        before.execution_mode = json!({"changed": true});
+        before.provenance = json!({"changed": true});
         before.capability = json!({"changed": true});
+        before.authentication = json!({"changed": true});
+        before.phase = json!({"changed": true});
         before.terminal = json!({"changed": true});
+        before.diagnostic = json!({"changed": true});
         let current = AggregateArtifact {
             schema_version: 1,
             candidate: candidate_identity(),
@@ -2934,7 +3697,19 @@ agent_cli = "@openai/codex=0.144.1"
         assert!(!report.equal);
         assert_eq!(report.changes.len(), 1);
         assert_eq!(report.changes[0].case_id, "pinned");
-        assert_eq!(report.changes[0].dimensions, ["capability", "terminal"]);
+        assert_eq!(
+            report.changes[0].dimensions,
+            [
+                "status",
+                "execution_mode",
+                "provenance",
+                "capability",
+                "authentication",
+                "phase",
+                "terminal",
+                "diagnostic",
+            ]
+        );
 
         let mut invalid_baseline = baseline;
         invalid_baseline.manifest_sha256 = "not-a-digest".into();
@@ -2942,6 +3717,80 @@ agent_cli = "@openai/codex=0.144.1"
             .unwrap_err()
             .to_string()
             .contains("invalid manifest identity"));
+    }
+
+    #[test]
+    fn comparison_keeps_prompt_count_lifecycle_drops_and_retry_metadata() {
+        let mut case = case("pinned", EvidenceStatus::Fail);
+        case.lane = Lane::Pinned;
+        let mut smoke = smoke(&case, false, Some(1));
+        smoke["turn"]["prompt_calls"] = json!(0);
+        smoke["diagnostics"]["dropped_events"] = json!(0);
+        smoke["diagnostics"]["lifecycle"] = json!([{
+            "transition": {"phase": "resolve", "status": "failed", "at_ms": 10},
+            "failure": smoke["diagnostics"]["failure"].clone()
+        }]);
+        let result = CaseResult {
+            case_id: case.id.clone(),
+            lane: Lane::Pinned,
+            evidence_path: EvidencePath::BridgeSmoke,
+            probe: ProbeType::Minimal,
+            billable: true,
+            execution: ExecutionState::Completed,
+            expected_status: EvidenceStatus::Fail,
+            actual_status: EvidenceStatus::Fail,
+            expectation_met: true,
+            classification: Classification::Support,
+            artifact_policy: case.artifact,
+            duration_ms: 1,
+            not_run_reason: None,
+            runner_error_code: None,
+            drift: Vec::new(),
+            budget_violations: Vec::new(),
+            smoke: Some(smoke),
+        };
+        let baseline = BaselineArtifact {
+            schema_version: 1,
+            manifest_schema_version: 1,
+            manifest_sha256: "a".repeat(64),
+            cases: vec![baseline_from_result(&result)],
+        };
+        let mut changed = result;
+        let changed_smoke = changed.smoke.as_mut().unwrap();
+        changed_smoke["turn"]["prompt_calls"] = json!(2);
+        changed_smoke["diagnostics"]["dropped_events"] = json!(1);
+        changed_smoke["diagnostics"]["lifecycle"][0]["failure"]["retry_after_ms"] = json!(1234);
+        changed_smoke["diagnostics"]["lifecycle"][0]["transition"]["at_ms"] = json!(999);
+        let current = AggregateArtifact {
+            schema_version: 1,
+            candidate: candidate_identity(),
+            manifest: ManifestIdentity {
+                schema_version: 1,
+                canonical_path: "/tmp/manifest.toml".into(),
+                sha256: "a".repeat(64),
+            },
+            selection: selection(),
+            environment_owner: "test-runner".into(),
+            started_at_ms: 1,
+            ended_at_ms: 2,
+            cancelled: false,
+            success: false,
+            budget: BudgetOutcome {
+                timeout_secs: 1,
+                max_tokens: 10,
+                max_cost_usd: None,
+                observed_tokens: 1,
+                observed_cost_usd: 0.0,
+                token_observation_missing_cases: 0,
+                cost_observation_missing_cases: 1,
+                exhausted: false,
+            },
+            results: vec![changed],
+        };
+
+        let report = compare_artifacts(&current, &baseline).unwrap();
+        assert!(!report.equal);
+        assert_eq!(report.changes[0].dimensions, ["terminal", "diagnostic"]);
     }
 
     #[test]
@@ -2997,5 +3846,45 @@ agent_cli = "@openai/codex=0.144.1"
         assert_eq!(result.runner_error_code, Some("candidate_binary_changed"));
         assert!(result.artifact.is_none());
         assert!(!request.artifact_path.exists());
+    }
+
+    #[test]
+    fn output_guard_rejects_bare_git_repository_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir(dir.path().join("objects")).unwrap();
+        std::fs::create_dir_all(dir.path().join("refs/heads")).unwrap();
+        let nested = dir.path().join("evidence");
+        std::fs::create_dir(&nested).unwrap();
+
+        assert!(ensure_output_outside_repositories(&nested.join("aggregate.json")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_output_parent_refuses_after_symlink_or_object_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let safe = dir.path().join("safe");
+        let repository = dir.path().join("repository");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::create_dir(&repository).unwrap();
+        std::fs::create_dir(repository.join(".git")).unwrap();
+        let alias = dir.path().join("output-parent");
+        symlink(&safe, &alias).unwrap();
+        let requested = alias.join("aggregate.json");
+
+        let resolved = ensure_output_outside_repositories(&requested).unwrap();
+        let moved = dir.path().join("moved-safe");
+        std::fs::rename(&safe, &moved).unwrap();
+        symlink(&repository, &safe).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&repository, &alias).unwrap();
+        let error = resolved.prepare_output().unwrap_err();
+
+        assert!(error.to_string().contains("parent identity changed"));
+        assert!(!moved.join("aggregate.json").exists());
+        assert!(!repository.join("aggregate.json").exists());
     }
 }

@@ -94,7 +94,8 @@ a2a-bridge compatibility validate --manifest compatibility/manifest.toml
 fail before the prompt. It refuses before manifest access unless `--acknowledge-billable` is present and
 requires `--lane`, repeated `--case`, or explicit `--all`; never use `--all` as a convenience default.
 Pass the exact `environment_owner` recorded by the selected cases and write the aggregate outside any
-repository. The runner enforces this against the aggregate parent:
+normal or bare Git repository. The runner canonicalizes and descriptor-pins that parent, then rechecks
+its identity before and during scratch/output creation so a retarget fails closed:
 
 ```bash
 a2a-bridge compatibility run \
@@ -109,7 +110,11 @@ The runner takes one bounded snapshot of this candidate binary, stages the exact
 the SHA-256 and byte length in the aggregate, and invokes that snapshot's existing `smoke` command once
 per eligible minimal bridge case. It refuses staged digest drift before spawn. Direct CLI/ACP,
 representative, wrong-owner/platform, and missing-prerequisite cases are retained as explicit unrun rows.
-Ctrl-C allows an already-running smoke to finish its bounded cleanup and starts no next case. Never treat
+Use structured non-secret prerequisites: `{ name = "PATH" }` requires presence, while
+`{ name = "A2A_BRIDGE_ALLOW_FABLE", one_of = ["1", "true"] }` requires an accepted exact value.
+API-key cases also bind the smoke's exact credential environment name and presence. A case does not start
+unless its token cap and any observable cost cap fit the remaining aggregate budget; final-case elapsed
+overflow is blocking. Ctrl-C allows an already-running smoke to finish its bounded cleanup and starts no next case. Never treat
 a floating pass as promotion, rewrite a baseline from a run, or route a failed case to another provider.
 Use `compatibility compare --current <aggregate>` against the checked-in pinned baseline; any changed
 provenance, capability, auth, phase, terminal, or diagnostic dimension requires review. The candidate

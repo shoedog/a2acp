@@ -49,6 +49,21 @@ redaction = "strict"
     manifest
 }
 
+fn write_two_case_manifest(dir: &Path) -> PathBuf {
+    let manifest = write_manifest(dir);
+    let first = fs::read_to_string(&manifest).unwrap();
+    let second = first
+        .split("[[cases]]")
+        .nth(1)
+        .expect("fixture contains one case")
+        .replace(
+            "id = \"missing-config-control\"",
+            "id = \"second-missing-config-control\"",
+        );
+    fs::write(&manifest, format!("{first}\n[[cases]]{second}")).unwrap();
+    manifest
+}
+
 fn compatibility_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"));
     command.arg("compatibility");
@@ -302,6 +317,65 @@ fn acknowledged_run_calls_the_smoke_contract_once_and_keeps_failure_evidence() {
     assert_eq!(
         fs::metadata(&out).unwrap().permissions().mode() & 0o777,
         0o600
+    );
+}
+
+#[test]
+fn case_selection_is_not_all_and_explicit_all_keeps_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_two_case_manifest(dir.path());
+    let selected_out = dir.path().join("selected.json");
+    let all_out = dir.path().join("all.json");
+
+    let selected = compatibility_command()
+        .arg("run")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--case")
+        .arg("second-missing-config-control")
+        .arg("--environment-owner")
+        .arg("test-runner")
+        .arg("--acknowledge-billable")
+        .arg("--out")
+        .arg(&selected_out)
+        .output()
+        .unwrap();
+    assert!(
+        selected.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let selected: serde_json::Value =
+        serde_json::from_slice(&fs::read(&selected_out).unwrap()).unwrap();
+    assert_eq!(selected["results"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        selected["results"][0]["case_id"],
+        "second-missing-config-control"
+    );
+
+    let all = compatibility_command()
+        .arg("run")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--all")
+        .arg("--environment-owner")
+        .arg("test-runner")
+        .arg("--acknowledge-billable")
+        .arg("--out")
+        .arg(&all_out)
+        .output()
+        .unwrap();
+    assert!(
+        all.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&all.stderr)
+    );
+    let all: serde_json::Value = serde_json::from_slice(&fs::read(&all_out).unwrap()).unwrap();
+    assert_eq!(all["results"].as_array().unwrap().len(), 2);
+    assert_eq!(all["results"][0]["case_id"], "missing-config-control");
+    assert_eq!(
+        all["results"][1]["case_id"],
+        "second-missing-config-control"
     );
 }
 
