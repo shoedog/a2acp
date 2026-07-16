@@ -10,7 +10,8 @@
   local-file **7 / 0**, and the guarded-composition regression **1 / 0**. The full serial workspace passes
   **1,985 / 0 / 12 ignored** across 69
   test/doc-test executables. Format/diff, all-target check, warnings-denied Clippy, release build, and
-  repository hygiene **37/7** are clean
+  repository hygiene **37/7** are clean. PR #29's replacement GitHub Build/Lint/Coverage run and CLA
+  check are green after the post-approval CI-only fold `15174d0`
 - **Review state:** the initial bridge-mediated `gpt-5.6-sol`/`xhigh` review of `b6424d7`, closure
   re-review 1 of `0b05c409`, closure re-review 2 of `c8d17b2`, closure re-review 3 of `69152d73`,
   closure re-review 4 of `349755ed`, closure re-review 5 of `4971647`, closure re-review 6 of
@@ -29,15 +30,20 @@
   cwd-derived input from the pinned object path before spawn and aligns the cursor. Re-review 7 marked
   both inherited findings `FIXED` and found only that the current Linux gate ledger omitted the explicit
   guarded-composition **1/0** total. V23 aligns that total across every current review-boundary surface.
-  Fable and Claude are not planned under the constrained usage windows
+  The post-approval CI-only fold `15174d0` sets workspace coverage builds to `CARGO_PROFILE_DEV_DEBUG=0`
+  so LLVM instrumentation does not inflate the bridge past the unchanged 256 MiB planner evidence cap;
+  it changes no product code, test, cap, or coverage threshold. The pre-fold GitHub run failed 11 of 24
+  planner tests only at that cap, the instrumented focused control passes **24/0**, and the replacement
+  Build/Lint/Coverage run passes. Fable and Claude are not planned under the constrained usage windows
 - **Last merged full workspace gate:** R2c host serial **1,933 / 0 / 12 ignored** across 68 executables;
   workspace/all-target check, warnings-denied Clippy, release build, and repository hygiene **37/7** clean
 - **Current execution boundary:** attempt 1 on `ce605eaf` passed provider/lifecycle but was rejected for an
   initial `0644` artifact; after reviewed create-new hardening, separately authorized attempt 2 on
   `1c9e4a43` passed in 8.770 seconds with a `0600` artifact, exact terminal `PONG`, no tools/retry/fallback,
   and completed teardown
-- **Next action:** push `agent/reliability-r2d-fallback-plan` and open one non-draft R2d PR. After merge,
-  advance the roadmap to R3; R2e remains deferred and must not start from this branch
+- **Next action:** PR #29 is open and non-draft. Merge only after one exact-head Sol/xhigh review of the
+  post-approval CI-only fold and all required GitHub checks are green; after merge, advance the roadmap
+  to R3. R2e remains deferred and must not start from this branch
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -82,7 +88,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2b2 — ACP/Fable lifecycle diagnostics | **MERGED** at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, concurrency-qualified warm cleanup, then aggregate cold-path closure; one final merge boundary. |
 | R2b3 — API/container diagnostics | **MERGED** at `afcc856c` (affected packages **602 / 0 / 1 ignored**; full host workspace **1,896 / 0 / 12 ignored**; hygiene **37/7**; initial review and closure re-reviews 1–3 `REVISE`; four review folds; closure re-review 4 `APPROVE` at `492946c`; final status re-review `APPROVE` at `afcc856c`) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
 | R2c — live smoke | **MERGED** at `be54bc51` by PR #28 (initial Fable/xhigh review `REVISE`; closure re-review `APPROVE` at `0e3b8ce`; attempt 1 rejected for initial `0644`; permission-fold review `APPROVE` at `23384622`; create-new closure review `APPROVE` at `ffb7e891`; full host workspace **1,933 / 0 / 12 ignored**; separately authorized attempt 2 on `1c9e4a43` passed artifact-exact in 8.770 s with mode `0600`, exact terminal `PONG`, no retry/fallback, and clean teardown) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
-| R2d — fallback plan | **APPROVED / PENDING MERGE** on `agent/reliability-r2d-fallback-plan` (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
+| R2d — fallback plan | **APPROVED / PENDING MERGE** in non-draft PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
 | R3 — compatibility canaries | **NOT STARTED** | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | Local manifest/runner first; scheduling requires runner/credential owner. |
@@ -293,7 +299,12 @@ Next action:
   `1586f24b17f5d7a7561642900fdccc9bba5fcb53` adjudicated the sole review-7 ledger finding `FIXED`,
   found no new `WRONG` or `SMELL`, and returned `APPROVE`; R2d is `APPROVED / PENDING MERGE`. No Fable,
   Claude model/Haiku, or live smoke ran; the recorded Sol/xhigh reviews are the only provider turns in
-  this closure chain.
+  this closure chain. Non-draft PR #29 then exposed a CI-only incompatibility: LLVM coverage debuginfo
+  inflated the instrumented bridge above the unchanged 256 MiB executable-evidence cap, so 11 planner
+  tests correctly refused before their intended assertions. Fold `15174d0` scopes
+  `CARGO_PROFILE_DEV_DEBUG=0` to workspace coverage only. The instrumented planner control passes
+  **24/0**, the replacement GitHub Build/Lint/Coverage run passes in 7m40s, CLA passes, and product code,
+  tests, the cap, and every coverage threshold remain unchanged.
 
 - R2b3 is implemented at `ed172ee726c06c3ee2e3f363c80178d367f8834a` with four review folds on
   `agent/reliability-r2b3-api-container`, based on `origin/main` at

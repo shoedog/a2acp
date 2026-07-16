@@ -45,7 +45,11 @@
   defect or `SMELL`, and returned `REVISE` only because the current numerical ledgers omitted the
   Linux regression's explicit **1/0** total. V23 aligns that evidence. Closure re-review 8 of exact
   `1586f24b17f5d7a7561642900fdccc9bba5fcb53` adjudicated that finding `FIXED`, found no new `WRONG`
-  or `SMELL`, and returned `APPROVE`.
+  or `SMELL`, and returned `APPROVE`. Post-approval CI-only fold `15174d0` scopes
+  `CARGO_PROFILE_DEV_DEBUG=0` to the workspace LLVM coverage step after full dev debuginfo inflated the
+  instrumented bridge beyond the unchanged 256 MiB planner evidence cap. It changes no product code,
+  test, cap, or coverage threshold; the instrumented planner control passes **24/0**, and PR #29's
+  replacement Build/Lint/Coverage run plus CLA check pass.
 - **R2b3 review state:** implementation plus four committed review folds; fresh Sol/xhigh closure
   re-review 3 returned `REVISE` with one shared-process ownership blocker, one raw-JSON correctness item,
   and one release-race coverage gap. The fourth fold passes affected packages **602 / 0 / 1 ignored**,

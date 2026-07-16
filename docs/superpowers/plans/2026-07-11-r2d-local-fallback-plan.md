@@ -18,6 +18,8 @@
 - **Closure re-review 6 candidate:** `379c3acc199fb58e6d6e1a8a8318470737ce6e8c` — `REVISE`
 - **Closure re-review 7 candidate:** `7fec898b5157603ae2eccd121e8367ff1914949b` — `REVISE`
 - **Closure re-review 8 candidate:** `1586f24b17f5d7a7561642900fdccc9bba5fcb53` — `APPROVE`
+- **Post-approval CI-only fold:** `15174d07` — workspace LLVM coverage uses stripped dev debuginfo;
+  replacement Build/Lint/Coverage and CLA checks pass in PR #29
 
 R2d answers one local operator question: given complete failed R2c smoke evidence from a read-only
 container attempt, may an explicitly named host agent be proposed for a new trusted-own-repo read-only
@@ -346,5 +348,13 @@ sole review-7 ledger finding `FIXED`, found no new `WRONG` or `SMELL`, and retur
 Claude, or live/billable smoke ran for this closure; R2d behavior remains proven by deterministic
 pre-spawn fixtures, and the R2c live result remains historical evidence only.
 
-R2d is `APPROVED / PENDING MERGE`; push the branch and open one non-draft PR. R2e remains
+R2d is `APPROVED / PENDING MERGE`; non-draft PR #29 is open. R2e remains
 `DEFERRED / BLOCKED BY POLICY`; after merge the active reliability slice becomes R3.
+
+Non-draft PR #29 exposed one CI-only boundary after approval: LLVM coverage's full dev debuginfo made
+the instrumented bridge exceed the unchanged 256 MiB planner evidence cap, so 11 of the 24 planner tests
+failed closed before their intended assertions. Fold `15174d0` scopes `CARGO_PROFILE_DEV_DEBUG=0` only
+to the workspace coverage step, leaving product code, tests, the cap, and all coverage thresholds
+unchanged. The instrumented planner control passes **24/0** and the replacement GitHub Build/Lint/Coverage
+run plus CLA check pass. Merge only after one exact-head Sol/xhigh review confirms this CI-only fold;
+then advance the active reliability slice to R3.
