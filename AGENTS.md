@@ -184,7 +184,8 @@ structured entries: `{ name = "PATH" }` means presence-only, while
 
 Each eligible case invokes one bounded, privately staged snapshot of the exact candidate binary's
 fixed-PONG `smoke` once. The aggregate records its SHA-256 and byte length; the runner refuses digest
-drift, executes the verified file object instead of reopening its name, and accesses child smoke
+drift, publishes the staged inode owner-executable but non-writable as mode `0500`, executes the
+verified file object instead of reopening its name, and accesses child smoke
 artifacts relative to the retained scratch descriptor. There is no retry, provider fallback, implicit all-case selection, baseline update,
 or production-config mutation. A case does not start unless its declared token and observable-cost caps
 fit the remaining total headroom. The checked-in R3a manifest intentionally has no cases; R3b adds reviewed pins. Read

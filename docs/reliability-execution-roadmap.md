@@ -11,15 +11,18 @@
   stop-after-unaccounted-runner-failure, exact agent-specific package/version and capability matching,
   explicit unrun rows, cumulative evidence/final aggregate size bounds, independent baseline drift
   dimensions, exact auth/effective-capability binding, value-aware prerequisites, prospective budget
-  headroom, final-case elapsed exhaustion, descriptor-relative output/scratch effects, and owner-only
-  same-digest candidate staging with stable-file-object execution after name retarget. The exact fold
-  passes **2,032 / 0 / 12 ignored** across **70** test/doc-test executables;
+  headroom, final-case elapsed exhaustion, descriptor-relative output/scratch effects, alias/range-free
+  applicable pin matrices, and owner-executable/non-writable same-digest candidate staging with
+  stable-file-object execution after name retarget. The last full exact fold passes
+  **2,032 / 0 / 12 ignored** across **70** test/doc-test executables;
   format/diff, workspace all-target check, warnings-denied Clippy, release build, hygiene **37/7**, and
   release-mode manifest validation are green.
 - **Review state:** initial bridge-mediated Sol/xhigh review of exact `884bc5f` returned `REVISE` with
   seven `WRONG` findings and one test-coverage `SMELL`; first closure re-review of exact `b37147c`
   returned `REVISE` with one inherited `PARTIAL` and five new `WRONG` findings. Both complete sets are
-  folded locally; fresh closure re-review of the new exact head is pending
+  folded locally. A fresh exact-`bc9f64c` attempt reached final synthesis but ended on provider capacity
+  without a verdict; its concrete partial leads are folded and do not count as a review gate. A fresh
+  closure re-review of the next exact green head is pending
 - **Last merged full workspace gate:** R2d host serial **1,985 / 0 / 12 ignored** across 69 executables;
   format/diff, all-target check, warnings-denied Clippy, release build, repository hygiene **37/7**, and
   PR #29 Build/Lint/Coverage plus CLA were green
@@ -54,8 +57,8 @@ R2a provenance (MERGED)
   -> R2b3 API/provider mapping + remaining container/dispatch observation (MERGED)
   -> R2c explicit one-turn billable smoke (MERGED)
        -> R2d local non-billable fallback plan (MERGED)
-  -> R3 compatibility manifest + pinned/floating canaries + OpenRouter/OpenCode (IN REVIEW: R3a)
-            -> R4 reproducible dependency/image pins + release promotion gate
+            -> R3 compatibility manifest + pinned/floating canaries + OpenRouter/OpenCode (IN REVIEW: R3a)
+                 -> R4 reproducible dependency/image pins + release promotion gate
 
 R2e authenticated in-process fallback is DEFERRED and off the critical path.
 It requires R2d plus a separately approved authenticated-policy/attestation design.
@@ -79,7 +82,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a initial and first closure Sol/xhigh `REVISE`; latest fold **35/0** units + **10/0** CLI | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner first; R3b pinned, R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a initial and first closure Sol/xhigh `REVISE`; capacity-ended attempt had no verdict; latest fold **36/0** units + last exact CLI **10/0** | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner first; R3b pinned, R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -231,8 +234,10 @@ Next action:
   smoke artifacts relative to retained descriptors, writes one owner-only aggregate with candidate identity,
   and never retries, falls back, promotes, or mutates production inputs. Initial Sol/xhigh review of exact
   `884bc5f` and first closure re-review of exact `b37147c` returned `REVISE`; all inherited and new
-  findings are folded locally. Focused gates pass compatibility units **35/0**, the full binary target
-  **359/0**, and CLI regressions **10/0**. The exact-fold full serial workspace passes
+  findings are folded locally. The later exact-`bc9f64c` Sol/xhigh attempt ended on provider capacity
+  before a verdict; its concrete partial leads are folded and the attempt is not a gate. Focused gates
+  pass compatibility units **36/0**; the last exact full binary target passes **359/0**, and CLI
+  regressions pass **10/0**. The last exact-fold full serial workspace passes
   **2,032/0/12 ignored** across **70** test/doc-test executables; format/diff, all-target
   check, warnings-denied Clippy, release build, hygiene **37/7**, and release-mode manifest validation are
   green. Closure re-review remains pending.

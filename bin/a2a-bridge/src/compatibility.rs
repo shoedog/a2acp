@@ -363,7 +363,14 @@ fn exact_component(label: &str, value: &str) -> Result<(), BoxError> {
     let lower = value.to_ascii_lowercase();
     if lower == "latest"
         || lower == "unknown"
+        || matches!(
+            lower.as_str(),
+            "auto" | "default" | "current" | "next" | "stable" | "nightly" | "canary"
+        )
         || lower.contains(":latest")
+        || lower
+            .split(['.', '-', '_'])
+            .any(|part| part.eq_ignore_ascii_case("x"))
         || value.contains('*')
         || value.contains('^')
         || value.contains('~')
@@ -380,9 +387,12 @@ fn exact_component(label: &str, value: &str) -> Result<(), BoxError> {
 
 fn exact_model(label: &str, value: &str) -> Result<(), BoxError> {
     exact_component(label, value)?;
-    if value.eq_ignore_ascii_case("auto") {
+    if bridge_acp::MODEL_ALIASES
+        .iter()
+        .any(|(alias, _)| value.eq_ignore_ascii_case(alias))
+    {
         return Err(format!(
-            "compatibility manifest: {label} must be an exact identity, not automatic or floating model selection"
+            "compatibility manifest: {label} must be an exact identity, not a bridge model alias"
         )
         .into());
     }
@@ -443,6 +453,18 @@ fn validate_case(case: &CompatibilityCase, budget: &ManifestBudget) -> Result<()
     if let Some(mode) = &case.mode {
         bounded_text("mode", mode, MAX_ID_BYTES)?;
         reject_secret_text("mode", mode)?;
+    }
+    if case.execution_mode == ExecutionMode::RemoteApi
+        && matches!(
+            case.evidence_path,
+            EvidencePath::DirectCli | EvidencePath::DirectAcp
+        )
+    {
+        return Err(format!(
+            "compatibility manifest: case {:?} remote API execution mode requires bridge smoke/workflow evidence, not a direct CLI or ACP control",
+            case.id
+        )
+        .into());
     }
     for (label, path) in [
         ("config path", Some(&case.config)),
@@ -1331,9 +1353,12 @@ fn stage_candidate(
     let name = OsStr::new("a2a-bridge-candidate");
     #[cfg(test)]
     let staged_path = scratch.path.join(name);
+    // The creating descriptor is writable even though the directory entry is mode 0500. Publishing
+    // the inode without owner-write permission prevents another ordinary same-owner opener from
+    // retaining a writable handle across the digest-to-exec boundary.
     let mut file = scratch
         .pin
-        .create_new_file(name, 0o700, "compatibility staged candidate")?;
+        .create_new_file(name, 0o500, "compatibility staged candidate")?;
     file.write_all(&snapshot.bytes)?;
     file.flush()?;
     file.sync_all()?;
@@ -2486,6 +2511,12 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        // SAFETY: geteuid has no preconditions and only reads the process credential.
+        unsafe { libc::geteuid() == 0 }
+    }
+
     fn scratch_in(parent: &Path) -> ScratchDir {
         let snapshot = local_file::snapshot_directory(parent, "test scratch parent").unwrap();
         let pin = local_file::PinnedDirectory::open(
@@ -2792,6 +2823,26 @@ agent_cli = "@openai/codex=0.144.1"
             .unwrap_err()
             .contains("exact identity"));
 
+        for selector in ["default", "opus", "gpt-5-6-sol"] {
+            let aliased_model = valid_pinned_toml().replace("gpt-5.6-sol", selector);
+            assert!(
+                parse_and_validate(&aliased_model)
+                    .unwrap_err()
+                    .contains("exact identity"),
+                "pinned model selector {selector:?} must not resolve through a default or alias"
+            );
+        }
+
+        for floating_version in ["next", "1.x"] {
+            let floating_adapter = valid_pinned_toml().replace("1.1.2", floating_version);
+            assert!(
+                parse_and_validate(&floating_adapter)
+                    .unwrap_err()
+                    .contains("exact identity"),
+                "pinned package version {floating_version:?} must be immutable"
+            );
+        }
+
         let missing_adapter = valid_pinned_toml()
             .lines()
             .filter(|line| !line.starts_with("adapter = "))
@@ -2877,6 +2928,16 @@ agent_cli = "@openai/codex=0.144.1"
             .contains("component pin"));
         let remote = format!("{remote}\ncomponents = {{ provider_api = \"v1\" }}\n");
         parse_and_validate(&remote).unwrap();
+
+        for evidence_path in ["direct_cli", "direct_acp"] {
+            let contradictory = remote.replace("bridge_smoke", evidence_path);
+            assert!(
+                parse_and_validate(&contradictory)
+                    .unwrap_err()
+                    .contains("remote API execution mode"),
+                "remote API mode must not bypass {evidence_path:?} dependency requirements"
+            );
+        }
     }
 
     #[test]
@@ -4056,7 +4117,8 @@ agent_cli = "@openai/codex=0.144.1"
     }
 
     #[tokio::test]
-    async fn staged_candidate_is_owner_only_and_digest_drift_refuses_before_spawn() {
+    async fn staged_candidate_is_owner_executable_nonwritable_and_digest_drift_refuses_before_spawn(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let bytes = b"#!/bin/sh\nexit 0\n".to_vec();
         let snapshot = local_file::LocalFileSnapshot {
@@ -4074,9 +4136,29 @@ agent_cli = "@openai/codex=0.144.1"
                 .permissions()
                 .mode()
                 & 0o777,
-            0o700
+            0o500
         );
 
+        #[cfg(unix)]
+        if !running_as_root() {
+            assert!(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&staged.staged_path)
+                    .is_err(),
+                "the staged inode must never be exposed with owner write permission"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let mut permissions = std::fs::metadata(&staged.staged_path)
+                .unwrap()
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&staged.staged_path, permissions).unwrap();
+        }
         std::fs::write(&staged.staged_path, b"changed").unwrap();
         let invoker = ProcessSmokeInvoker {
             executable: staged,
@@ -4142,6 +4224,54 @@ agent_cli = "@openai/codex=0.144.1"
                 let mut permissions = std::fs::metadata(&staged_path).unwrap().permissions();
                 permissions.set_mode(0o700);
                 std::fs::set_permissions(&staged_path, permissions).unwrap();
+            })
+            .await;
+
+        assert!(result.process_success);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_candidate_cannot_be_overwritten_in_place_after_digest_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = local_file::read_regular_file_bounded(
+            Path::new("/usr/bin/true"),
+            "test true executable",
+            MAX_EXECUTABLE_BYTES,
+        )
+        .unwrap();
+        let scratch = scratch_in(dir.path());
+        let staged = stage_candidate(&snapshot, &scratch).unwrap();
+        let staged_path = staged.staged_path.clone();
+        let invoker = ProcessSmokeInvoker {
+            executable: staged,
+            artifact_directory: &scratch.pin,
+            expected_sha256: snapshot.sha256,
+        };
+        let request = SmokeRequest {
+            agent: "test-agent".into(),
+            config: dir.path().join("missing.toml"),
+            model: "test-model".into(),
+            effort: None,
+            mode: None,
+            session_cwd: None,
+            timeout_secs: 1,
+            artifact_path: dir.path().join("artifact.json"),
+        };
+
+        let result = invoker
+            .invoke_after_candidate_check(&request, || {
+                if !running_as_root() {
+                    let overwrite = std::fs::OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .open(&staged_path);
+                    assert!(
+                        overwrite.is_err(),
+                        "an ordinary same-owner writer must not reopen the staged inode"
+                    );
+                }
+                assert_eq!(std::fs::read(&staged_path).unwrap(), snapshot.bytes);
             })
             .await;
 

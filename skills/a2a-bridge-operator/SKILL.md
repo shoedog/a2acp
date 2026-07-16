@@ -109,8 +109,9 @@ a2a-bridge compatibility run \
 
 The runner takes one bounded snapshot of this candidate binary, stages the exact bytes privately, records
 the SHA-256 and byte length in the aggregate, and invokes that snapshot's existing `smoke` command once
-per eligible minimal bridge case. It refuses staged digest drift, executes the verified file object
-instead of reopening its name, and reads/removes smoke artifacts relative to the retained scratch
+per eligible minimal bridge case. It refuses staged digest drift, publishes the candidate inode as
+owner-executable but non-writable mode `0500`, executes the verified file object instead of reopening
+its name, and reads/removes smoke artifacts relative to the retained scratch
 descriptor. Direct CLI/ACP,
 representative, wrong-owner/platform, and missing-prerequisite cases are retained as explicit unrun rows.
 Use structured non-secret prerequisites: `{ name = "PATH" }` requires presence, while

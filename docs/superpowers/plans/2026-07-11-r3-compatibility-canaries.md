@@ -2,7 +2,9 @@
 
 - **Status:** IN REVIEW — initial Sol/xhigh review of `884bc5f` and first closure re-review of
   `b37147c` returned `REVISE`; both finding sets are folded on
-  `agent/reliability-r3a-manifest-runner`, with one fresh exact-head closure re-review pending
+  `agent/reliability-r3a-manifest-runner`. A later exact-`bc9f64c` attempt ended on provider capacity
+  before a verdict; its concrete partial leads are folded, and one fresh exact-head closure re-review
+  remains pending
 - **Prerequisite:** R2c and R2d merged (`a6fec94c`, PR #29)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -53,7 +55,9 @@ eligible `evidence_path = "bridge_smoke"`, `probe = "minimal"` case shells back 
 binary's existing R2c `smoke` command once. Before opening the aggregate, the runner takes one bounded
 snapshot of the candidate executable and records its SHA-256 and byte length. After allocating the
 owner-only aggregate, but before any provider process, it stages those exact bytes as a private
-mode-`0700` executable inside the run's mode-`0700` scratch directory. It rechecks the staged digest
+owner-executable/non-writable mode-`0500` file inside the run's mode-`0700` scratch directory. The
+creating descriptor remains writable only while the bytes are installed, so the directory entry is
+never published with owner-write permission. It rechecks the staged digest
 before every spawn and executes the verified file object rather than reopening its mutable name. Smoke
 artifacts are opened and removed relative to the retained scratch descriptor, so one aggregate cannot
 silently combine different candidate bytes or read evidence from a retargeted scratch pathname.
@@ -86,15 +90,21 @@ report the corresponding metric.
 Pre-change evidence: the focused CLI regression failed because `compatibility` was an unknown
 subcommand. Initial-review regressions then failed **9** concrete unsafe states on `884bc5f`; that fold
 passed compatibility units **30/0**. First-closure mutation locks then failed exactly **5** reviewed
-states (**30 passed / 5 failed / 0 ignored**) on `b37147c`; the complete fold now passes compatibility
-units **35/0**, the full `a2a-bridge` binary target **359/0**, and CLI regressions **10/0**. The CLI
+states (**30 passed / 5 failed / 0 ignored**) on `b37147c`; that fold passed compatibility units
+**35/0**. Capacity-attempt mutation locks then failed exactly **4** states on `bc9f64c`
+(**32 passed / 4 failed / 0 ignored**): default/alias and floating-range pins, contradictory remote-API
+direct-control rows, writable candidate publication, and an in-place overwrite after the digest check.
+The current focused fold passes compatibility units **36/0**; the last exact full `a2a-bridge` binary
+target passes **359/0**, and CLI regressions pass **10/0**. The CLI
 suite includes a deterministic missing-config control that invokes the nested smoke exactly once, fails
 before provider spawn, and preserves the smoke-v2 failure inside an aggregate created mode `0600`; no
-live or billable provider turn ran. The unit suite also proves that the staged candidate is owner-only
-and digest drift refuses before process spawn. Exact adapter/CLI pins use canonical
+live or billable provider turn ran. The unit suite also proves that the staged candidate is owner-only,
+non-writable after publication, and that digest drift refuses before process spawn. Pinned models reject
+automatic/default selectors and bridge aliases. Exact adapter/CLI pins use canonical, alias/range-free
 `<package>=<version>` values and must match one OK agent-specific provenance row; direct CLI requires
 an agent-CLI pin, ACP/bridge paths require adapter plus agent-CLI pins, and remote API paths require
-explicit component pins. Prefix collisions, warning rows, requested/effective model/effort/mode drift,
+explicit component pins; remote-API mode cannot be mislabeled as a direct CLI/ACP control. Prefix
+collisions, warning rows, requested/effective model/effort/mode drift,
 and exact API-key environment identity/presence fail visibly.
 
 The exact review-fold deterministic gates pass: `cargo fmt --all -- --check`, `git diff --check`,
@@ -150,6 +160,18 @@ before prospective budget admission; and one literal `IN REVIEW` token across th
 dependency graph, and status table. The macOS fold also mutation-locks the platform seam: APFS permits
 child output through a stable directory-object path but `canonicalize` rejects that path, so the child
 uses the stable path while the parent reads and removes evidence relative to its retained descriptor.
+
+### R3a capacity-ended closure attempt
+
+The fresh bridge-mediated Sol/xhigh attempt on exact `bc9f64c` read the complete branch and reached final
+synthesis, but the provider returned capacity before any verdict or gate line. It is therefore not
+counted as a completed review. Its concrete partial analysis independently confirmed the inherited
+descriptor, diagnostic, budget-ordering, and status-token fixes, then identified three leads that are
+folded here: pinned model aliases/defaults and floating package ranges are rejected; remote-API mode
+cannot contradict a direct-CLI/direct-ACP evidence row and bypass its applicable pin requirements; and
+the staged candidate entry is mode `0500`, preventing an ordinary same-owner writer from reopening the
+verified inode across the digest-to-exec boundary. The roadmap dependency graph is also indented as the
+literal R2d -> R3 -> R4 prerequisite chain.
 
 ## R3b — pinned lane and promotion baseline
 
