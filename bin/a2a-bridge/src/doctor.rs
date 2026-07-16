@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bridge_core::domain::{AgentKind, EgressPolicy, RegistrySnapshot};
 
@@ -110,6 +110,23 @@ impl PathStat {
 }
 
 const MAX_PROVENANCE_METADATA_BYTES: usize = 1024 * 1024;
+const MAX_CLAUDE_CREDENTIAL_BYTES: u64 = 64 * 1024;
+const MAX_SMOKE_TIMEOUT_MS: u64 = 15 * 60 * 1000;
+const CREDENTIAL_PREFLIGHT_MARGIN_MS: u64 = 60 * 1000;
+const MIN_CLAUDE_ACCESS_RUNWAY_MS: u64 = MAX_SMOKE_TIMEOUT_MS + CREDENTIAL_PREFLIGHT_MARGIN_MS;
+const CLAUDE_EXPLICIT_AUTH_ENVS: [&str; 3] = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaudeOauthMetadata {
+    access_token_present: bool,
+    access_expires_at_ms: u64,
+    refresh_token_present: bool,
+    refresh_expires_at_ms: Option<u64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledPackage {
@@ -187,6 +204,20 @@ pub trait RuntimeProbes {
     /// non-secret compatibility prerequisite; callers must never hash credential destinations.
     fn file_sha256(&self, _path: &Path) -> Result<String, String> {
         Err("file digest unavailable".into())
+    }
+    /// Non-secret shape and expiry metadata from one bounded Claude OAuth credential file. Token
+    /// values are never returned, rendered, hashed, or persisted.
+    fn claude_oauth_metadata(&self, _path: &Path) -> Result<ClaudeOauthMetadata, String> {
+        Err("Claude OAuth metadata unavailable".into())
+    }
+    /// Host home used only to locate Claude's standard credential file for an unsandboxed automatic
+    /// auth entry. The path is never accepted from bridge config.
+    fn host_home_dir(&self) -> Option<PathBuf> {
+        None
+    }
+    /// Wall clock for credential expiry checks. Injectable for deterministic boundary tests.
+    fn now_unix_ms(&self) -> Result<u64, String> {
+        Err("current time unavailable".into())
     }
     /// Stat a host path. Never creates, never follows into a write probe (TOCTOU/mutating — cut per
     /// the spec's adversarial review).
@@ -835,6 +866,42 @@ fn immutable_image_labels(runtime: &str, image: &str) -> Result<BTreeMap<String,
     parse_image_labels(&output)
 }
 
+fn read_claude_oauth_metadata(path: &Path) -> Result<ClaudeOauthMetadata, String> {
+    let snapshot = crate::local_file::read_regular_file_bounded(
+        path,
+        "Claude OAuth credential",
+        MAX_CLAUDE_CREDENTIAL_BYTES,
+    )
+    .map_err(|_| "credential is unavailable or is not one bounded regular file".to_string())?;
+    let value: serde_json::Value = serde_json::from_slice(&snapshot.bytes)
+        .map_err(|_| "credential JSON is malformed".to_string())?;
+    let oauth = value
+        .get("claudeAiOauth")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "credential is missing claudeAiOauth metadata".to_string())?;
+    let access_token_present = oauth
+        .get("accessToken")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|token| !token.is_empty());
+    let access_expires_at_ms = oauth
+        .get("expiresAt")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "credential is missing a valid access-token expiry".to_string())?;
+    let refresh_token_present = oauth
+        .get("refreshToken")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|token| !token.is_empty());
+    let refresh_expires_at_ms = oauth
+        .get("refreshTokenExpiresAt")
+        .and_then(serde_json::Value::as_u64);
+    Ok(ClaudeOauthMetadata {
+        access_token_present,
+        access_expires_at_ms,
+        refresh_token_present,
+        refresh_expires_at_ms,
+    })
+}
+
 /// The production `RuntimeProbes` — every method is bounded (nothing here can hang `doctor`).
 pub struct RealProbes;
 
@@ -872,6 +939,20 @@ impl RuntimeProbes for RealProbes {
         )
         .map(|snapshot| snapshot.sha256)
         .map_err(|_| "file digest unavailable".into())
+    }
+    fn claude_oauth_metadata(&self, path: &Path) -> Result<ClaudeOauthMetadata, String> {
+        read_claude_oauth_metadata(path)
+    }
+    fn host_home_dir(&self) -> Option<PathBuf> {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+    fn now_unix_ms(&self) -> Result<u64, String> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system clock is before the Unix epoch".to_string())?
+            .as_millis()
+            .try_into()
+            .map_err(|_| "current time exceeds supported range".to_string())
     }
     fn path_stat(&self, path: &Path) -> PathStat {
         path_stat_impl(path)
@@ -1200,6 +1281,131 @@ fn host_mount_source(volumes: &[String], destination: &str) -> Option<PathBuf> {
     }
 }
 
+const CLAUDE_CREDENTIAL_DESTINATION: &str = "/root/.claude/.credentials.json";
+
+fn claude_credential_source(
+    entry: &bridge_core::domain::AgentEntry,
+    probes: &dyn RuntimeProbes,
+) -> Result<Option<PathBuf>, String> {
+    if !is_claude_acp_cmd(entry.cmd.as_deref()) {
+        return Ok(None);
+    }
+    if let Some(sandbox) = &entry.sandbox {
+        if let Some(path) = host_mount_source(&sandbox.volumes, CLAUDE_CREDENTIAL_DESTINATION) {
+            return Ok(Some(path));
+        }
+        return if entry.pre_authenticated {
+            Err("pre-authenticated Claude container requires exactly one regular-file credential bind"
+                .into())
+        } else {
+            Ok(None)
+        };
+    }
+    if entry.auth_method.is_some() {
+        return Ok(None);
+    }
+    if CLAUDE_EXPLICIT_AUTH_ENVS.iter().any(|name| {
+        probes
+            .env_var_value(name)
+            .is_some_and(|value| !value.is_empty())
+    }) {
+        return Ok(None);
+    }
+    probes
+        .host_home_dir()
+        .map(|home| Some(home.join(".claude/.credentials.json")))
+        .ok_or_else(|| "host HOME is unavailable for automatic Claude authentication".into())
+}
+
+fn refresh_credential_detail(metadata: ClaudeOauthMetadata, now_ms: u64) -> &'static str {
+    if !metadata.refresh_token_present {
+        "refresh_token=absent"
+    } else if metadata
+        .refresh_expires_at_ms
+        .is_some_and(|expires| expires <= now_ms)
+    {
+        "refresh_token=expired"
+    } else {
+        "refresh_token=present"
+    }
+}
+
+fn claude_oauth_provenance_row(
+    id: &str,
+    entry: &bridge_core::domain::AgentEntry,
+    probes: &dyn RuntimeProbes,
+) -> Option<CheckResult> {
+    let check = format!("provenance:{id}:oauth-credential");
+    let path = match claude_credential_source(entry, probes) {
+        Ok(Some(path)) => path,
+        Ok(None) => return None,
+        Err(reason) => {
+            return Some(CheckResult::fail(
+                check,
+                reason,
+                "establish a fresh host Claude login, sync the isolated copy when applicable, then rerun doctor",
+            ));
+        }
+    };
+    let metadata = match probes.claude_oauth_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(reason) => {
+            return Some(CheckResult::fail(
+                check,
+                format!("Claude OAuth credential freshness unavailable: {reason}"),
+                "refresh the host Claude login, run deploy/containers/sync-creds.sh claude when applicable, then rerun doctor",
+            ));
+        }
+    };
+    if !metadata.access_token_present {
+        return Some(CheckResult::fail(
+            check,
+            "Claude OAuth access token is absent",
+            "refresh the host Claude login, run deploy/containers/sync-creds.sh claude when applicable, then rerun doctor",
+        ));
+    }
+    let now_ms = match probes.now_unix_ms() {
+        Ok(now_ms) => now_ms,
+        Err(reason) => {
+            return Some(CheckResult::fail(
+                check,
+                format!("Claude OAuth credential freshness unavailable: {reason}"),
+                "fix the local clock before starting a billable Claude smoke",
+            ));
+        }
+    };
+    let refresh = refresh_credential_detail(metadata, now_ms);
+    if metadata.access_expires_at_ms <= now_ms {
+        let expired_secs = now_ms.saturating_sub(metadata.access_expires_at_ms) / 1000;
+        return Some(CheckResult::fail(
+            check,
+            format!("Claude OAuth access token expired {expired_secs}s ago; {refresh}"),
+            "refresh the host Claude login, run deploy/containers/sync-creds.sh claude when applicable, then request a separately authorized smoke",
+        ));
+    }
+    let remaining_ms = metadata.access_expires_at_ms - now_ms;
+    let remaining_secs = remaining_ms / 1000;
+    if remaining_ms < MIN_CLAUDE_ACCESS_RUNWAY_MS {
+        return Some(CheckResult::warn(
+            check,
+            format!("Claude OAuth access token has only {remaining_secs}s remaining; {refresh}"),
+            "refresh the host Claude login and isolated copy before a billable smoke",
+        ));
+    }
+    Some(CheckResult::ok(
+        check,
+        format!("Claude OAuth access token has {remaining_secs}s remaining; {refresh}"),
+    ))
+}
+
+pub(crate) fn provenance_blocks_smoke_spawn(rows: &[CheckResult]) -> bool {
+    rows.iter().any(|row| {
+        row.check.starts_with("provenance:")
+            && row.check.ends_with(":oauth-credential")
+            && row.status != CheckStatus::Ok
+    })
+}
+
 fn check_provenance(
     snapshot: &RegistrySnapshot,
     probes: &dyn RuntimeProbes,
@@ -1479,6 +1685,9 @@ fn check_provenance(
             format!("provenance:{id}:auth"),
             auth_detail,
         ));
+        if let Some(row) = claude_oauth_provenance_row(id, entry, probes) {
+            out.push(row);
+        }
 
         out.push(CheckResult::ok(
             format!("provenance:{id}:model"),
@@ -1928,7 +2137,8 @@ fn check_review_slice_cmd(
 /// Check 9 — configured bind-mount sources (the sandbox's `volumes`, e.g. mounted credentials or an
 /// isolated settings file) exist as host files; named volumes are skipped (informational — not a host
 /// path). The `creds:*` check-name prefix is retained for output compatibility with the original check.
-/// STATIC only (no freshness/expiry check — cut per review as TOCTOU/mutating-adjacent).
+/// Static source/type checks live here. Claude OAuth freshness is an additive provenance row because
+/// smoke also consumes that exact row as a read-only pre-spawn billing guard.
 /// NOTE: item 9's "env vars named by config are set" clause is the SAME fact as check 3's
 /// `api_key_env` check (the only config surface naming an env var) — folded there, not duplicated here.
 fn check_creds(
@@ -2318,6 +2528,9 @@ mod tests {
         image_ids: HashMap<(String, String), Result<String, String>>,
         image_labels: HashMap<(String, String), std::collections::BTreeMap<String, String>>,
         file_sha256s: HashMap<PathBuf, Result<String, String>>,
+        claude_oauth: HashMap<PathBuf, Result<ClaudeOauthMetadata, String>>,
+        host_home: Option<PathBuf>,
+        now_ms: u64,
         process_provenance: HashMap<String, ProcessProvenance>,
         env_vars: HashMap<String, String>,
         paths: HashMap<PathBuf, PathStat>,
@@ -2411,6 +2624,37 @@ mod tests {
                 .insert(PathBuf::from(path), Ok(sha256.to_string()));
             self.with_file(path)
         }
+        fn with_claude_oauth(
+            mut self,
+            path: &str,
+            access_expires_at_ms: u64,
+            refresh_token_present: bool,
+            refresh_expires_at_ms: Option<u64>,
+        ) -> Self {
+            self.claude_oauth.insert(
+                PathBuf::from(path),
+                Ok(ClaudeOauthMetadata {
+                    access_token_present: true,
+                    access_expires_at_ms,
+                    refresh_token_present,
+                    refresh_expires_at_ms,
+                }),
+            );
+            self.with_file(path)
+        }
+        fn with_claude_oauth_error(mut self, path: &str, reason: &str) -> Self {
+            self.claude_oauth
+                .insert(PathBuf::from(path), Err(reason.to_string()));
+            self.with_file(path)
+        }
+        fn with_host_home(mut self, path: &str) -> Self {
+            self.host_home = Some(PathBuf::from(path));
+            self
+        }
+        fn at_time(mut self, now_ms: u64) -> Self {
+            self.now_ms = now_ms;
+            self
+        }
         fn runtime_probe_calls(&self) -> Vec<String> {
             self.runtime_probe_calls.borrow().clone()
         }
@@ -2491,6 +2735,18 @@ mod tests {
                 .get(path)
                 .cloned()
                 .unwrap_or_else(|| Err("file digest unavailable".into()))
+        }
+        fn claude_oauth_metadata(&self, path: &Path) -> Result<ClaudeOauthMetadata, String> {
+            self.claude_oauth
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| Err("Claude OAuth metadata unavailable".into()))
+        }
+        fn host_home_dir(&self) -> Option<PathBuf> {
+            self.host_home.clone()
+        }
+        fn now_unix_ms(&self) -> Result<u64, String> {
+            Ok(self.now_ms)
         }
         fn path_stat(&self, path: &Path) -> PathStat {
             self.paths.get(path).copied().unwrap_or(PathStat::ABSENT)
@@ -3169,6 +3425,151 @@ mod tests {
         let results = run_checks(&cfg, &probes);
         assert_eq!(find(&results, "creds:reader:0").status, CheckStatus::Fail);
         assert_eq!(find(&results, "creds:reader:1").status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn expired_claude_oauth_fails_for_host_and_pre_authenticated_reader() {
+        const NOW: u64 = 2_000_000;
+        let host = acp_entry("claude-host", "claude-agent-acp");
+        let mut reader = acp_entry("claude-reader", "claude-agent-acp");
+        reader.pre_authenticated = true;
+        reader.sandbox = Some(locked_sandbox(
+            "reader:fixed",
+            "a2a-net",
+            vec!["/creds/.credentials.json:/root/.claude/.credentials.json".to_string()],
+        ));
+        let snapshot = snapshot(
+            "claude-host",
+            vec![host, reader],
+            vec!["claude-agent-acp", "docker"],
+        );
+        let probes = FakeProbes::new()
+            .with_host_home("/home/test")
+            .at_time(NOW)
+            .with_claude_oauth(
+                "/home/test/.claude/.credentials.json",
+                NOW - 1,
+                false,
+                Some(NOW + 10_000),
+            )
+            .with_claude_oauth(
+                "/creds/.credentials.json",
+                NOW - 1,
+                true,
+                Some(NOW + 10_000),
+            );
+        let mut rows = Vec::new();
+        check_provenance(&snapshot, &probes, &mut rows);
+
+        for id in ["claude-host", "claude-reader"] {
+            let row = find(&rows, &format!("provenance:{id}:oauth-credential"));
+            assert_eq!(row.status, CheckStatus::Fail);
+            assert!(row.detail.contains("expired"), "{}", row.detail);
+            assert!(!row.detail.contains("/home/test"));
+            assert!(!row.detail.contains("/creds"));
+        }
+        assert!(provenance_blocks_smoke_spawn(&rows));
+    }
+
+    #[test]
+    fn claude_oauth_runway_boundary_warns_below_minimum_and_accepts_exact_minimum() {
+        const NOW: u64 = 5_000_000;
+        let host = acp_entry("claude", "claude-agent-acp");
+        let snapshot = snapshot("claude", vec![host], vec!["claude-agent-acp"]);
+
+        let below = FakeProbes::new()
+            .with_host_home("/home/test")
+            .at_time(NOW)
+            .with_claude_oauth(
+                "/home/test/.claude/.credentials.json",
+                NOW + MIN_CLAUDE_ACCESS_RUNWAY_MS - 1,
+                true,
+                None,
+            );
+        let mut below_rows = Vec::new();
+        check_provenance(&snapshot, &below, &mut below_rows);
+        assert_eq!(
+            find(&below_rows, "provenance:claude:oauth-credential").status,
+            CheckStatus::Warn
+        );
+        assert!(provenance_blocks_smoke_spawn(&below_rows));
+
+        let exact = FakeProbes::new()
+            .with_host_home("/home/test")
+            .at_time(NOW)
+            .with_claude_oauth(
+                "/home/test/.claude/.credentials.json",
+                NOW + MIN_CLAUDE_ACCESS_RUNWAY_MS,
+                false,
+                None,
+            );
+        let mut exact_rows = Vec::new();
+        check_provenance(&snapshot, &exact, &mut exact_rows);
+        assert_eq!(
+            find(&exact_rows, "provenance:claude:oauth-credential").status,
+            CheckStatus::Ok
+        );
+        assert!(!provenance_blocks_smoke_spawn(&exact_rows));
+    }
+
+    #[test]
+    fn explicit_host_claude_auth_environment_bypasses_file_oauth_gate() {
+        let host = acp_entry("claude", "claude-agent-acp");
+        let snapshot = snapshot("claude", vec![host], vec!["claude-agent-acp"]);
+
+        for name in CLAUDE_EXPLICIT_AUTH_ENVS {
+            let probes = FakeProbes::new()
+                .with_host_home("/home/test")
+                .at_time(10)
+                .with_claude_oauth("/home/test/.claude/.credentials.json", 1, false, None)
+                .with_env(name, "synthetic-secret");
+            let mut rows = Vec::new();
+            check_provenance(&snapshot, &probes, &mut rows);
+            assert!(
+                rows.iter()
+                    .all(|row| row.check != "provenance:claude:oauth-credential"),
+                "explicit auth env {name} must not be overridden by file OAuth preflight"
+            );
+            assert!(!provenance_blocks_smoke_spawn(&rows));
+        }
+
+        let empty = FakeProbes::new()
+            .with_host_home("/home/test")
+            .at_time(10)
+            .with_claude_oauth("/home/test/.claude/.credentials.json", 1, false, None)
+            .with_env("ANTHROPIC_API_KEY", "");
+        let mut empty_rows = Vec::new();
+        check_provenance(&snapshot, &empty, &mut empty_rows);
+        assert_eq!(
+            find(&empty_rows, "provenance:claude:oauth-credential").status,
+            CheckStatus::Fail
+        );
+        assert!(provenance_blocks_smoke_spawn(&empty_rows));
+    }
+
+    #[test]
+    fn malformed_claude_oauth_metadata_fails_without_blocking_on_unrelated_warnings() {
+        let host = acp_entry("claude", "claude-agent-acp");
+        let snapshot = snapshot("claude", vec![host], vec!["claude-agent-acp"]);
+        let probes = FakeProbes::new()
+            .with_host_home("/home/test")
+            .at_time(1)
+            .with_claude_oauth_error(
+                "/home/test/.claude/.credentials.json",
+                "synthetic malformed credential",
+            );
+        let mut rows = Vec::new();
+        check_provenance(&snapshot, &probes, &mut rows);
+        let row = find(&rows, "provenance:claude:oauth-credential");
+        assert_eq!(row.status, CheckStatus::Fail);
+        assert!(row.detail.contains("freshness unavailable"));
+        assert!(provenance_blocks_smoke_spawn(&rows));
+
+        assert!(!provenance_blocks_smoke_spawn(&[CheckResult::warn(
+            "provenance:claude:adapter",
+            "unrelated warning",
+            "fix provenance",
+        )]));
     }
 
     // ---- check 10: explicit Fable prerequisites ----

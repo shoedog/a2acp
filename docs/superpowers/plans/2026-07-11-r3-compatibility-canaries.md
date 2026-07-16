@@ -1,9 +1,9 @@
 # R3 — Compatibility manifest and canary implementation plan
 
 - **Status:** overall R3 **IN REVIEW**; R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE** on
-  `agent/reliability-r3b-pinned-lane`. Nine pinned rows and four support configs are deterministically
-  green; Sol/xhigh deterministic closure review is `APPROVE`; no R3b live/billable canary or baseline
-  promotion has run.
+  `agent/reliability-r3b-pinned-lane`. Nine pinned rows are implemented; Sol/xhigh approved the pre-live
+  deterministic tree. Authorized attempt 1 passed both Codex cases and failed both Fable cases on expired
+  OAuth after prompt start. No baseline promotion ran; OAuth preflight hardening is in deterministic closure.
 - **Prerequisite:** R2c/R2d merged (`a6fec94c`, PR #29); R3a merged (`3927df3f`, PR #31)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -297,13 +297,14 @@ is unchanged.
 
 - **Branch:** `agent/reliability-r3b-pinned-lane`
 - **Implementation state (2026-07-16):** nine pinned rows validate at manifest SHA-256
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. Four support configs pass
-  non-billable doctor preflight (**53 ok / 0 warn / 0 fail** total), binary units pass **387/0**, and
-  the full serial workspace passes **2,060/0/12 ignored** across **70** groups. Linux/Rust 1.94 passes
-  binary units **388/0**, smoke CLI **12/0**, and compatibility CLI **11/0**. Format/diff, workspace
-  all-target check, warnings-denied Clippy, release build, hygiene **37/7**, and release-manifest
-  validation are green. The pinned baseline has the new manifest identity but no promoted cases pending
-  separately authorized exact-candidate live artifacts and review. Fresh Sol/xhigh closure review of
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. Attempt-1 OAuth hardening
+  passes binary **391/0**, full workspace **2,066/0/12 ignored** across **70** groups, Linux/Rust 1.94
+  binary **392/0**, Linux smoke CLI **14/0**, focused doctor **4/0**, spawned smoke CLI **2/0**, and all
+  format/check/Clippy/release/hygiene/manifest/dependency-policy gates.
+  The hardened release binary is 22,899,664 bytes at SHA-256
+  `638d44c00b81a5d03ee92ac3f6c6761a7ce067fa1958ff2eb659fe3b7ab7baa0` and has not run a provider turn.
+  The pinned baseline remains empty pending a future all-green, separately authorized aggregate. Fresh
+  Sol/xhigh closure review of
   exact `c38978a` returned `APPROVE` with no `WRONG`; its sole nonblocking test-coverage `SMELL` is
   closed on the current tree.
 
@@ -321,6 +322,24 @@ passed **388/0**. A reconstructed Linux harness first produced three unrelated e
 its `/tmp` tmpfs was `noexec`; a direct execute probe exited **126** there and **0** with explicit `exec`,
 after which the unchanged product tests were green. The separate shared operator pre-prompt crash
 is recorded in the central roadmap and did not trigger a replay or process restart.
+
+Authorized live attempt 1 ran exact candidate SHA-256 `d852cc28...4e50` and manifest
+`5d18cefe...c235d828` once, with zero retry/fallback. Codex host/reader returned terminal exact `PONG`
+in 8.649 s / 4.751 s. Claude 0.44 host and 0.55 reader both initialized, created sessions, applied exact
+Fable/xhigh, and reached prompt start, then failed HTTP 401 in 3.117 s / 2.992 s; both cleanup paths
+completed. The aggregate ended non-cancelled after 19.512 s, observed 38,053 tokens and zero cost, exhausted
+no budget, left all five controls unrun, and is non-promotable. Its mode-`0600` artifact is
+`/private/tmp/a2a-bridge-r3b-live.EeBAyf/pinned-aggregate.json`, SHA-256 `7f718f32...1571c1`.
+
+The failure falsified model selection and container-only degradation: model/effort application completed
+on both paths and host/reader failed symmetrically. Both access tokens had expired about five hours before
+the run. The five-minute launchd sync had succeeded, proving that byte synchronization alone propagated
+the stale host state. R3b therefore adds bounded token-blind OAuth metadata parsing, a 16-minute access
+runway row for host and exact mounted reader credentials, and a smoke guard that refuses a non-OK row
+before adapter resolution. The spawned regression failed pre-change **1 passed / 1 failed** because the
+expired case reached the fake adapter; current focused doctor **4/0** and CLI **2/0** are green. Finish full
+gates and Sol review, then require a fresh host login, post-login sync, two green Claude doctors, and new
+explicit billable authorization. Attempt 1 must never be replayed or promoted.
 
 Seed rows for every currently claimed path or control in `docs/compatibility.md`:
 

@@ -151,7 +151,9 @@ Without `--out`, stdout is JSON only; human direction goes to stderr. Do not pas
 An explicit output path must not already exist. On Unix, it is created owner-only as `0600` before agent
 resolution or spawn; an existing file/link or failure to apply that restriction is a pre-attempt refusal.
 
-Run `validate`, `doctor --json`, and `models --agent <id> --json` first. Never use a stale installed binary
+Run `validate`, `doctor --json`, and `models --agent <id> --json` first. Claude smoke refuses before adapter
+spawn when bounded OAuth metadata is expired or has less than 16 minutes of runway; syncing an isolated
+credential copy does not refresh an expired host login. Never use a stale installed binary
 for compatibility evidence, and never automatically rerun a failed or timed-out smoke: the first prompt may
 have been accepted. Do not update `docs/compatibility.md` until the release-mode artifact records the exact
 lane that actually ran.

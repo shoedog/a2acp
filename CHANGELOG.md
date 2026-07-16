@@ -25,6 +25,9 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   negative/non-finite reported costs as sticky blocking observations across later usage snapshots, and
   directly cover final-sibling same-name replacement before aggregate publication. Ambiguous duplicate
   Fable-settings destinations no longer report exact provenance.
+- Claude smoke/doctor preflight now reads only bounded, non-secret OAuth shape/expiry metadata and blocks
+  expired or short-runway credentials before adapter spawn. This prevents an automated isolated-credential
+  sync from turning an already expired host token into a billable host/reader failure.
 
 ## [0.2.1] - 2026-07-10
 

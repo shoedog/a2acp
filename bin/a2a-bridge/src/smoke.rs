@@ -1699,11 +1699,23 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     let artifact_redactor = artifact_redactor(&entry, session_cwd.as_ref());
     sanitize_optional_artifact_text(&mut state.artifact.request.model, &artifact_redactor);
     sanitize_optional_artifact_text(&mut state.artifact.request.mode, &artifact_redactor);
+    let provenance = artifact_provenance(&snapshot, &args.agent, &artifact_redactor);
+    let stale_oauth = doctor::provenance_blocks_smoke_spawn(&provenance);
     state.artifact.target = Some(TargetRecord {
         execution_mode: execution_mode(&entry),
-        provenance: artifact_provenance(&snapshot, &args.agent, &artifact_redactor),
+        provenance,
         authentication: authentication(&entry, &artifact_redactor),
     });
+    if stale_oauth {
+        state.fail_static(
+            DiagnosticPhase::Authenticate,
+            DiagnosticFailureClass::Authentication,
+            "smoke.auth_credential_stale",
+            "Claude OAuth credential is stale or lacks safe preflight runway",
+            false,
+        );
+        return state.finalize(args.include_redacted_stderr).await;
+    }
 
     let overrides = AgentOverride {
         model: args.model.clone(),

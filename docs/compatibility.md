@@ -32,8 +32,11 @@ Containerfile.
 
 ## R3b pinned candidate — 2026-07-16
 
-The checked-in manifest now preserves each claimed path as a distinct pinned case. This is a candidate
-contract, not new compatibility evidence: no R3b provider turn or baseline promotion has run.
+The checked-in manifest preserves each claimed path as a distinct pinned case. One separately authorized
+R3b run occurred on 2026-07-16; it is blocking failure evidence, not a promoted baseline. The exact
+candidate/manifest aggregate ran once with zero retry/fallback: both Codex paths passed, while both Fable
+paths reached prompt start and failed on HTTP 401 because the shared access token had expired. The five
+historical/non-goal rows remained unrun.
 
 | Case | R3b execution disposition | Release classification |
 |---|---|---|
@@ -56,6 +59,29 @@ settings destination and binds that minimal settings file at SHA-256
 a unique tag and did not replace the running operator's `latest` tag or process. Its floating Kiro
 download resolved 2.12.3, so the Kiro rows deliberately remain `STALE` pending R4's reproducible
 resolution work and a separately authorized re-baseline.
+
+### R3b live attempt 1 — auth freshness failure
+
+The owner-only aggregate at `/private/tmp/a2a-bridge-r3b-live.EeBAyf/pinned-aggregate.json` is mode
+`0600`, 25,128 bytes, and SHA-256
+`7f718f32743170fd7ae73a3027c870f052a8fabbd282762554922abf5e1571c1`. It binds candidate SHA-256
+`d852cc28a09d0a2705d5084119813e27b7a7e7d99087d7d76063b6aa74894e50` and manifest SHA-256
+`5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`.
+
+- Codex host passed exact `PONG` in 8.649 s; Codex reader passed in 4.751 s. Each made one prompt call,
+  recorded no drift/budget violation, and completed release/retirement.
+- Claude 0.44 host and Claude 0.55 reader each initialized, created a session, applied exact Fable/xhigh,
+  and reached `prompt_start`, then failed in 3.117 s / 2.992 s with a retained HTTP 401 authentication
+  cause. Both reported prompt-may-have-been-accepted, zero cost/tokens, and complete cancel/release/retire.
+- The aggregate ended non-cancelled after 19.512 s, observed 38,053 Codex tokens, exhausted no budget,
+  and did not run the five non-goal controls. It must not be replayed or promoted.
+
+The settled cause is stale credential preflight, not model selection or container health. The five-minute
+launchd sync ran successfully but copied a host Claude access token that had expired about five hours
+earlier; post-attempt host and isolated files shared that expired access token, while the host refresh token
+was absent. R3b now adds token-blind bounded expiry/runway checks to doctor and smoke so this state refuses
+before adapter spawn. A fresh host login, subsequent isolated-copy sync, green doctor, and new explicit
+billable authorization are required before another run.
 
 ## Resolved incident: Fable over Claude ACP
 

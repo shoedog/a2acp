@@ -5,18 +5,26 @@
 - **Completed through:** R3a **MERGED** at `3927df3f`; R2e remains deferred and off the critical path
 - **Active slice:** R3b pinned lane on `agent/reliability-r3b-pinned-lane`
 - **Current R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`; four executable support
-  configs pass non-billable doctor preflight with **53 ok / 0 warn / 0 fail** total. The binary unit
-  target passes **387 / 0 / 0**, and the full serial workspace passes **2,060 / 0 / 12 ignored**
-  across **70** test/doc-test groups. Linux/Rust 1.94 passes binary units **388 / 0 / 0**, smoke CLI
-  **12 / 0**, and compatibility CLI **11 / 0**. Format/diff, workspace all-target check,
-  warnings-denied Clippy, workspace release build, hygiene **37/7**, and release-manifest validation
-  are green. The uniquely tagged, non-operator reader candidate is
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. Post-attempt OAuth hardening
+  passes binary units **391 / 0 / 0**, full serial workspace **2,066 / 0 / 12 ignored** across **70**
+  groups, Linux/Rust 1.94 binary **392 / 0 / 0**, and Linux smoke CLI **14 / 0**. Focused doctor
+  **4 / 0** and spawned smoke CLI **2 / 0** include a pre-change **1 passed / 1 failed** red. Format/diff,
+  workspace check, all-feature warnings-denied Clippy, locked release build, hygiene **37/7**, manifest
+  validation, and dependency policy are green.
+  The uniquely tagged, non-operator reader candidate is
   `sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1`; it binds exact Codex and
-  Claude package labels while leaving Kiro explicitly `STALE`. Fresh Sol/xhigh closure review of exact
+  Claude package labels while leaving Kiro explicitly `STALE`. The post-hardening release binary is
+  22,899,664 bytes at SHA-256
+  `638d44c00b81a5d03ee92ac3f6c6761a7ce067fa1958ff2eb659fe3b7ab7baa0`; it has not run a provider
+  turn. Fresh Sol/xhigh closure review of exact
   `c38978a` returned `APPROVE` with no `WRONG`; its sole nonblocking backend-error test-coverage `SMELL`
-  is closed by a mutation-proven regression on the current tree. No R3b live/billable canary or baseline
-  promotion has run.
+  is closed by a mutation-proven regression. No baseline promotion has run.
+- **Current R3b live gate:** authorized pinned attempt 1 ran once with zero retry/fallback against candidate
+  SHA-256 `d852cc28...4e50`. Codex host/reader passed; Fable host/reader reached prompt start and failed
+  HTTP 401 because the copied Claude access token had expired. The five non-goal rows stayed unrun, cleanup
+  completed, no budget exhausted, and the owner-only aggregate is retained at
+  `/private/tmp/a2a-bridge-r3b-live.EeBAyf/pinned-aggregate.json` (SHA-256 `7f718f32...1571c1`). This run is
+  blocking failure evidence and must not be retried or promoted.
 - **R3a merge evidence:** the pre-change CLI regression failed because
   `compatibility` did not exist. The latest local review fold passes macOS compatibility units
   **44 / 0**, the full binary **370 / 0**, CLI **10 / 0**, and the serial workspace suite
@@ -74,17 +82,20 @@
 - **Last merged full workspace gate:** R2d host serial **1,985 / 0 / 12 ignored** across 69 executables;
   format/diff, all-target check, warnings-denied Clippy, release build, repository hygiene **37/7**, and
   PR #29 Build/Lint/Coverage plus CLA were green
-- **Current execution boundary:** R3b has four eligible minimal bridge-smoke support cases (Codex host,
+- **Current execution boundary:** R3b has four minimal bridge-smoke support cases (Codex host,
   Codex reader, Claude 0.44 host, Claude 0.55 Fable reader) and five explicit non-goal/unrun historical
-  rows (Claude direct CLI, Claude 0.55 host ACP, managed-no-egress negative, Kiro host, Kiro reader).
-  Selection and billing acknowledgement remain mandatory. The checked-in baseline has the new manifest
+  rows (Claude direct CLI, Claude 0.55 host ACP, managed-no-egress negative, Kiro host, Kiro reader). The
+  two Claude cases are currently ineligible because doctor reports expired OAuth; the two Codex attempt-1
+  passes do not authorize partial baseline promotion. Selection and billing acknowledgement remain
+  mandatory. The checked-in baseline has the new manifest
   identity but intentionally has no promoted case summaries until separately authorized exact-candidate
   live artifacts are reviewed. Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** request separate billable authorization for the four eligible canaries, run the exact
-  bounded no-retry lane, inspect its artifacts, and deliberately promote the baseline only if the evidence
-  is green. Then use one clean-room Fable/xhigh adversarial implementation plus release/compatibility lens
-  over the implementation and live release evidence. Do not rebuild or swap the running operator;
-  OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
+- **Next action:** finish full deterministic and Sol review closure of the OAuth preflight hardening. The
+  operator must then refresh the host Claude login and allow the isolated sync to copy a fresh token; require
+  both Claude doctors green before requesting new explicit authorization for one new four-case aggregate.
+  Promote only an all-green aggregate, then use one clean-room Fable/xhigh adversarial implementation plus
+  release/compatibility lens. Do not rebuild or swap the running operator; OpenRouter/OpenCode remain
+  R3e/R3f after the R3 core and before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**
@@ -135,7 +146,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE**, Sol/xhigh deterministic closure `APPROVE`, nine pinned rows, four deterministic-green support preflights, five explicit historical/unrun rows, full workspace **2,060/0/12 ignored** across 70 groups, and no live artifact or baseline promotion yet | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane and deliberate promotion active; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE**. Sol/xhigh deterministic closure approved the pre-live tree. Authorized attempt 1: Codex host/reader `PASS`, Fable host/reader `FAIL` on expired OAuth after prompt start, five controls unrun, no promotion. OAuth preflight hardening is full-suite green and pending fresh Sol review. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane and deliberate promotion active; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -174,6 +185,35 @@ serve-only session/configuration defect. Source inspection confirms `session/new
 model/effort `session/set_config_option` rejection can both map to `AgentCrashed` before a turn-log row.
 Carry the missing structured failure projection and stale-shared-state recovery question into R2f/R3d;
 do not replay automatically or use this review as compatibility evidence.
+
+### Active incident: synchronized but expired Claude OAuth reached billable prompt
+
+`INC-R3B-CLAUDE-OAUTH-EXPIRY-2026-07-16` records authorized pinned attempt 1. The exact candidate
+(`d852cc28...4e50`) and manifest (`5d18cefe...c235d828`) ran one aggregate with zero retry/fallback.
+Codex host/reader returned terminal exact `PONG` in 8.649 s / 4.751 s. Claude 0.44 host and Claude 0.55
+reader both initialized, created sessions, applied exact `claude-fable-5[1m]`/`xhigh`, and crossed
+`prompt_start`; each then failed with a retained HTTP 401 cause in 3.117 s / 2.992 s. Both failure paths
+completed cancel/release/retire. The other five rows stayed unrun; the aggregate ended non-cancelled in
+19.512 s with 38,053 observed Codex tokens, zero observed cost, no exhausted budget, and no promotion.
+
+Hypothesis/probe/result log:
+
+1. A model-selection or container defect predicted config/session failure or reader-only failure. Both
+   model/effort applications completed and host/reader failed symmetrically during prompt stream: falsified.
+2. One identical stale credential file predicted matching file digests. Host/reader files differed: falsified.
+3. Expired access plus unusable refresh state predicted current-time expiry behind the 401s. Both access
+   tokens had expired at 06:24 local, the post-attempt host refresh token was absent, and the isolated copy's
+   earlier refresh lineage did not recover the turn: supported.
+4. A missed sync predicted no recent service run. launchd had run successfully every five minutes and copied
+   Claude at 11:22:11: falsified. The sync propagated stale bytes because it performs no authentication.
+
+Settled root cause: the bridge checked credential source type but not freshness, so a successful sync of an
+already expired host access token passed doctor and crossed the billable boundary. R3b now parses only
+bounded OAuth shape/expiry metadata, never renders token values, requires 16 minutes of access runway, and
+blocks smoke before adapter spawn on a non-OK OAuth row. The mutation-backed spawned-CLI regression failed
+pre-change because the fake adapter was reached, while a fresh-token edge still reaches it. Do not rerun the
+live lane until full deterministic/review closure, a fresh host Claude login, post-login sync, green host and
+reader doctors, and new explicit authorization.
 
 Allowed status values are `NOT STARTED`, `IN PROGRESS`, `IN REVIEW`, `APPROVED / PENDING MERGE`,
 `MERGED`, `BLOCKED`, and `DEFERRED`. Update this table in the same PR that changes a slice status. Never
@@ -313,17 +353,20 @@ Next action:
   that remains sticky across later usage snapshots.
   It also rejects a changed pinned config before provider spawn and records exact Fable-settings
   provenance only for one unambiguous host-file settings destination; duplicates remain `WARN`. The
-  nine-case manifest validates at `5d18cefe...c235d828`; binary units pass **387/0**,
-  the full serial workspace passes **2,060/0/12 ignored** across **70** groups, and the four support
-  configs pass non-billable doctor preflight with **53 ok / 0 warn / 0 fail** total. Linux/Rust 1.94
-  passes binary units **388/0**, smoke CLI **12/0**, and compatibility CLI **11/0**. Format/diff,
-  workspace all-target check, warnings-denied Clippy, release build, hygiene **37/7**, and release
-  manifest validation are green. Sol/xhigh closure review of exact `c38978a` returned `APPROVE` with no
+  nine-case manifest validates at `5d18cefe...c235d828`. Post-live OAuth hardening passes binary
+  **391/0**, full workspace **2,066/0/12 ignored** across **70** groups, Linux binary **392/0**, Linux
+  smoke CLI **14/0**, focused doctor **4/0**, spawned CLI **2/0**, and all merge/policy gates. The current
+  expired real credentials now correctly produce Claude host **11 ok / 0 warn / 1 fail** and reader
+  **18 ok / 0 warn / 1 fail**; Codex remains **10/0/0** host and **14/0/0** reader. Sol/xhigh closure
+  review of exact `c38978a` returned `APPROVE` with no
   `WRONG`; its one test-coverage `SMELL` is closed by a mutation-proven backend-error regression for both
   invalid/valid usage orders. The Docker label path was exercised
   against the candidate image. A real Podman label inspection remains unverified because no local Podman
-  image was available; bounded parser/runtime fakes cover Podman-shaped image IDs. No R3b provider turn,
-  retry, fallback, baseline promotion, operator rebuild, or operator swap has run.
+  image was available; bounded parser/runtime fakes cover Podman-shaped image IDs. Authorized attempt 1
+  produced two Codex passes and two Fable HTTP 401 failures with no retry/fallback; no baseline promotion,
+  operator rebuild, or operator swap has run. The hardened release binary is SHA-256
+  `638d44c00b81a5d03ee92ac3f6c6761a7ce067fa1958ff2eb659fe3b7ab7baa0` (22,899,664 bytes) and remains
+  live-unexercised.
 - OpenRouter and OpenCode are recorded as R3e/R3f after the pinned/floating/scheduling core and before
   R4. Credentials remain environment-only; neither provider is eligible for automatic fallback. The
   running operator service is unchanged until a merged candidate is rebuilt and swapped during a

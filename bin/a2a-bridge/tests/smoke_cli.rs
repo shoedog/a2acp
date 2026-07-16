@@ -2,6 +2,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn marker_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
@@ -39,6 +40,60 @@ fn smoke_command(config: &PathBuf) -> Command {
         .arg("--config")
         .arg(config);
     command
+}
+
+fn claude_oauth_fixture(
+    access_expires_at_ms: u64,
+) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("spawned");
+    let adapter = dir.path().join("claude-agent-acp");
+    fs::write(
+        &adapter,
+        format!("#!/bin/sh\ntouch {:?}\nexec /bin/cat\n", marker),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&adapter).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&adapter, permissions).unwrap();
+
+    let home = dir.path().join("home");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::write(
+        home.join(".claude/.credentials.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "synthetic-secret-access-token",
+                "refreshToken": "synthetic-secret-refresh-token",
+                "expiresAt": access_expires_at_ms,
+                "refreshTokenExpiresAt": access_expires_at_ms.saturating_add(86_400_000_u64)
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let config = dir.path().join("a2a-bridge.toml");
+    fs::write(
+        &config,
+        format!(
+            "default = \"marker\"\n\n\
+             [registry]\nallowed_cmds = [{adapter:?}]\n\n\
+             [[agents]]\nid = \"marker\"\ncmd = {adapter:?}\n\n\
+             [server]\n"
+        ),
+    )
+    .unwrap();
+    (dir, marker, config, home)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap()
 }
 
 #[test]
@@ -106,6 +161,54 @@ fn blocked_model_refuses_before_agent_spawn() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("blocked model"));
     assert!(!marker.exists());
+}
+
+#[test]
+fn expired_claude_oauth_refuses_before_agent_spawn_without_leaking_tokens() {
+    let (_dir, marker, config, home) = claude_oauth_fixture(now_ms().saturating_sub(60_000));
+    let output = smoke_command(&config)
+        .arg("--acknowledge-billable")
+        .env("HOME", home)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let artifact: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        artifact["diagnostics"]["failure"]["code"],
+        "smoke.auth_credential_stale"
+    );
+    assert_eq!(artifact["attempt"]["prompt_may_have_been_accepted"], false);
+    assert_eq!(artifact["turn"]["prompt_calls"], 0);
+    assert!(
+        !marker.exists(),
+        "expired auth must block before adapter spawn"
+    );
+    let artifact_text = String::from_utf8(output.stdout).unwrap();
+    assert!(!artifact_text.contains("synthetic-secret"));
+}
+
+#[test]
+fn fresh_claude_oauth_does_not_block_adapter_spawn() {
+    let (_dir, marker, config, home) = claude_oauth_fixture(now_ms() + 3_600_000);
+    let output = smoke_command(&config)
+        .arg("--acknowledge-billable")
+        .arg("--timeout-secs")
+        .arg("1")
+        .env("HOME", home)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "the fake adapter cannot complete ACP"
+    );
+    assert!(marker.exists(), "fresh auth must not block adapter spawn");
+    let artifact: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_ne!(
+        artifact["diagnostics"]["failure"]["code"],
+        "smoke.auth_credential_stale"
+    );
 }
 
 #[test]
