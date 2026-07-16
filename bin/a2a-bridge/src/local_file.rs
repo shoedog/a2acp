@@ -702,6 +702,75 @@ impl PinnedDirectory {
             Err(format!("{label}: descriptor-relative removal is unsupported").into())
         }
     }
+
+    /// Atomically publish one already-synced regular child over another, but only while both names
+    /// still identify the caller's retained file objects beneath this exact directory descriptor.
+    pub(crate) fn replace_regular_child(
+        &self,
+        target_name: &OsStr,
+        expected_target: &File,
+        replacement_name: &OsStr,
+        expected_replacement: &File,
+        label: &str,
+    ) -> Result<(), BoxError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+
+            let opened_target = self.open_regular_file(target_name, label)?;
+            let opened_replacement = self.open_regular_file(replacement_name, label)?;
+            let target_metadata = expected_target
+                .metadata()
+                .map_err(|error| format!("{label}: cannot inspect retained target: {error}"))?;
+            let replacement_metadata = expected_replacement.metadata().map_err(|error| {
+                format!("{label}: cannot inspect retained replacement: {error}")
+            })?;
+            if !same_file(&opened_target.metadata()?, &target_metadata) {
+                return Err(format!("{label}: target identity changed before replacement").into());
+            }
+            if !same_file(&opened_replacement.metadata()?, &replacement_metadata) {
+                return Err(
+                    format!("{label}: replacement identity changed before publication").into(),
+                );
+            }
+
+            let target_name = child_name_cstring(target_name, label)?;
+            let replacement_name = child_name_cstring(replacement_name, label)?;
+            // SAFETY: both names are validated single components, the retained directory descriptor
+            // is live, and the identity checks above bind both names to the caller's open files.
+            // POSIX rename is atomic: failure leaves the target untouched; success publishes the
+            // fully-written replacement in one namespace operation.
+            if unsafe {
+                libc::renameat(
+                    self.file.as_raw_fd(),
+                    replacement_name.as_ptr(),
+                    self.file.as_raw_fd(),
+                    target_name.as_ptr(),
+                )
+            } == -1
+            {
+                return Err(format!(
+                    "{label}: cannot atomically publish descriptor-relative replacement: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            self.file
+                .sync_all()
+                .map_err(|error| format!("{label}: cannot sync replacement directory: {error}"))?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (
+                target_name,
+                expected_target,
+                replacement_name,
+                expected_replacement,
+            );
+            Err(format!("{label}: atomic descriptor-relative replacement is unsupported").into())
+        }
+    }
 }
 
 #[cfg(unix)]

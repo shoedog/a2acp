@@ -1,12 +1,11 @@
 # R3 — Compatibility manifest and canary implementation plan
 
-- **Status:** IN REVIEW — initial Sol/xhigh review of `884bc5f` and first closure re-review of
-  `b37147c` returned `REVISE`; both finding sets are folded on
-  `agent/reliability-r3a-manifest-runner`. A later exact-`bc9f64c` attempt ended on provider capacity
-  before a verdict. Fresh closure re-review of exact `c8c9452` returned `REVISE` with five `WRONG`
-  findings and two `SMELL`s; all concrete blockers and the two narrow hardening items are folded
-  locally with every deterministic gate green, and one fresh exact-head closure re-review remains
-  pending
+- **Status:** IN REVIEW — initial review and closure re-reviews 1–3 on `884bc5f`, `b37147c`,
+  `c8c9452`, and `a8602bb` returned `REVISE`; the intervening exact-`bc9f64c` attempt ended on
+  provider capacity without a verdict. Every completed finding set is folded locally on
+  `agent/reliability-r3a-manifest-runner` with deterministic gates green. One fresh Sol/xhigh review of
+  the corrected exact head remains pending; after Sol approves, one independent Fable/xhigh pass owns
+  the adversarial implementation and release/compatibility lenses
 - **Prerequisite:** R2c and R2d merged (`a6fec94c`, PR #29)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -51,8 +50,11 @@ a2a-bridge compatibility compare --current <aggregate.json>
 the manifest, requires an explicit selection (there is no implicit all-case billing), and pre-creates the
 aggregate output as a single-link regular file with mode `0600` before any provider process. The output
 immediately contains a valid blocking setup-incomplete aggregate with explicit selected-case rows, so a
-later scratch or candidate-staging failure cannot leave a zero-byte artifact. The final aggregate
-replaces that provisional evidence only after execution finishes. The output
+later scratch or candidate-staging failure cannot leave a zero-byte artifact. After execution finishes,
+the runner writes and syncs the final aggregate to a new owner-only sibling, verifies that both names
+still identify the retained files, and atomically replaces the provisional inode relative to the pinned
+directory. A serialization, write, sync, identity, or rename failure therefore leaves the valid setup
+artifact at the output path rather than partially overwriting it. The output
 parent is canonicalized and descriptor-pinned; output and private-scratch entries are created relative to
 the retained descriptor, and its identity is rechecked before and during creation, so a name or symlink
 retarget cannot redirect an effect into its replacement. Normal worktrees and bare Git repositories are both excluded. Each
@@ -67,8 +69,11 @@ before every spawn, then rechecks cancellation and full declared timeout headroo
 post-hash spawn boundary. It executes the verified file object rather than reopening its mutable name. Smoke
 artifacts are opened and removed relative to the retained scratch descriptor, so one aggregate cannot
 silently combine different candidate bytes or read evidence from a retargeted scratch pathname.
-On Linux, the staged smoke child closes the executable descriptor after its own exec and the scratch
-descriptor after opening its artifact, before any ACP/provider descendant can inherit either capability.
+On Linux, explicit internal argv fields carry the two descriptor numbers only from the compatibility
+parent. The staged smoke child proves that the executable descriptor identifies `/proc/self/exe` before
+closing it, then proves that the scratch descriptor identifies the opened `--out` parent before closing
+that capability. Legacy ambient descriptor environment variables are ignored, and neither internal argv
+field is forwarded to an ACP/provider descendant.
 Child stdout/stderr is discarded; the runner embeds only the bounded smoke-v2 artifact. Direct-CLI,
 direct-ACP, representative-workflow, wrong-platform, wrong-owner, and missing-prerequisite cases remain
 explicit `not_run` rows rather than being omitted or routed to a different path.
@@ -109,11 +114,18 @@ The last exact `c8c9452` fold passed compatibility units **36/0**, the full `a2a
 1.94 passed the same **36/0** units and **10/0** CLI there. Closure re-review of that exact commit
 returned `REVISE`. Its new regression set failed pre-fold for raw alias IDs/floating identities,
 meaningless remote components, post-hash cancellation and time admission, blocking comparison state,
-and zero-byte setup evidence. The current local review fold passes **41/0** macOS compatibility units,
-the full `a2a-bridge` binary target **365/0**, CLI regressions **10/0**, and the serial workspace suite
-**2,038/0/12 ignored** across **70** test/doc-test executables. Linux/Rust 1.94 with
-`CARGO_PROFILE_DEV_DEBUG=0` passes compatibility units **42/0** (including the Linux-only inherited-fd
-regression), CLI **10/0**, and the candidate-overwrite control as uid 65534 **1/0**. The CLI
+and zero-byte setup evidence. Exact `a8602bb` then passed **41/0** macOS compatibility units, binary
+**365/0**, CLI **10/0**, workspace **2,038/0/12 ignored**, and Linux units **42/0** plus CLI **10/0**;
+closure re-review 3 nevertheless returned `REVISE`. Its exactness-range regression and the independently
+reproduced pinned-support and atomic-publication regressions failed before their fixes. The Linux ambient
+fd and provider-descendant controls cover the remaining descriptor findings. The current local fold passes
+**44/0** macOS compatibility units, the full `a2a-bridge` binary target **368/0**, CLI regressions
+**10/0**, and the serial workspace suite **2,041/0/12 ignored** across **70** test/doc-test executables.
+Linux/Rust 1.94 passes compatibility units **45/0**, smoke CLI **12/0**, and compatibility CLI **11/0**
+with `CARGO_PROFILE_TEST_DEBUG=0`; an initial normal-debug compatibility CLI run stopped **8/3** because
+the instrumented candidate exceeded the unchanged 256 MiB evidence cap, and the debug-free rerun
+separated that fixture artifact from product behavior. The earlier candidate-overwrite control as uid
+65534 remains **1/0**. The CLI
 suite includes a deterministic missing-config control that invokes the nested smoke exactly once, fails
 before provider spawn, and preserves the smoke-v2 failure inside an aggregate created mode `0600`; no
 live or billable provider turn ran. The unit suite also proves that the staged candidate is owner-only,
@@ -131,7 +143,8 @@ and exact API-key environment identity/presence fail visibly.
 The current review fold also passes format/diff, workspace all-target check, warnings-denied Clippy,
 workspace release build, hygiene **37/7**, and release-candidate manifest validation at SHA-256
 `f6481b2e88d55ebbdbed33d73bac40b871627ed1ef6779f582c3943858249007`. One fresh Sol/xhigh closure
-re-review remains pending. No ignored or live test was run or re-baselined.
+re-review remains pending; after it approves, one independent Fable/xhigh adversarial implementation and
+release/compatibility review remains. No ignored or live test was run or re-baselined.
 
 Each manifest case records:
 
@@ -208,6 +221,26 @@ reopened files require one link and the directory helper no longer claims atomic
 compatibility-only executable/scratch descriptors close inside the staged child before ACP descendants.
 Mode `0500` remains an ordinary-writer safeguard, not a claim against root or an actively hostile same-UID
 actor that can change permissions.
+
+### R3a third closure re-review ledger
+
+Fresh bridge-mediated Sol/xhigh closure re-review of exact `a8602bb` returned `REVISE`. It marked seven
+of the eight inherited second-closure items `FIXED`, kept exact remote pins `PARTIAL` because `|` ranges
+still validated, and found three new `WRONG` states: expected `UNKNOWN`/`STALE` let an unexecuted pinned
+support case green the release aggregate; ambient Linux fd variables could close an unrelated descriptor;
+and an in-place final write could corrupt the already-synced setup artifact. Its one new `SMELL` noted
+that the Linux descriptor unit did not exercise the staged-child/provider boundary.
+
+The current fold closes all five items. Exact component pins reject alternation, lists, and spaced ranges.
+A pinned support result blocks unless execution completed and its expectation matched, while pinned
+non-goals remain advisory. Linux carries descriptor numbers in explicit internal argv fields, validates
+the executable against `/proc/self/exe` and scratch against the opened `--out` parent before closing, and
+ignores the retired ambient variables; a Linux integration control starts a fake provider and proves it
+inherits neither capability. Final publication uses a synced owner-only sibling plus descriptor-relative
+atomic rename after both entry identities are revalidated; an open reader retains the blocking setup
+inode, and a target-rebinding negative control refuses without mutation or staging residue. A fresh exact
+head Sol/xhigh review is still required before the one clean-room Fable/xhigh adversarial and
+release/compatibility pass.
 
 ## R3b — pinned lane and promotion baseline
 
@@ -303,7 +336,9 @@ service promotion boundary as R3e.
 - manifest schema boundaries, duplicates, missing pins, secret-shaped fields, invalid budgets/timeouts;
 - selection by lane/case without accidental all-case billing;
 - one R2c call per case and zero automatic retries;
-- aggregate artifact remains valid when a case fails or times out;
+- aggregate artifact remains valid when setup, a case, final publication, or target identity fails;
+- pinned support cannot green unless it actually completed and matched its expected status;
+- Linux staged descriptors are object-validated and absent from the first provider descendant;
 - pinned comparison reports provenance/capability/auth/phase/terminal drift independently;
 - floating lane cannot update production state;
 - cancellation/budget exhaustion stops before starting the next case;

@@ -321,6 +321,73 @@ fn acknowledged_run_calls_the_smoke_contract_once_and_keeps_failure_evidence() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn compatibility_child_closes_staged_capabilities_before_provider_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("provider-fds.txt");
+    let adapter = dir.path().join("fd-reporting-agent");
+    fs::write(
+        &adapter,
+        format!(
+            "#!/bin/sh\nfor fd in /proc/self/fd/*; do readlink \"$fd\" || true; done > {:?}\nexit 1\n",
+            report
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&adapter).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&adapter, permissions).unwrap();
+
+    let config = dir.path().join("a2a-bridge.toml");
+    fs::write(
+        &config,
+        format!(
+            "default = \"marker\"\n\n\
+             [registry]\nallowed_cmds = [{adapter:?}]\n\n\
+             [[agents]]\nid = \"marker\"\ncmd = {adapter:?}\n\n\
+             [server]\n"
+        ),
+    )
+    .unwrap();
+    let manifest = write_manifest(dir.path());
+    let manifest_text = fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("config = \"missing.toml\"", "config = \"a2a-bridge.toml\"")
+        .replace("agent = \"missing-agent\"", "agent = \"marker\"");
+    fs::write(&manifest, manifest_text).unwrap();
+    let out = dir.path().join("aggregate.json");
+
+    let output = compatibility_command()
+        .arg("run")
+        .arg("--manifest")
+        .arg(&manifest)
+        .arg("--all")
+        .arg("--environment-owner")
+        .arg("test-runner")
+        .arg("--acknowledge-billable")
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}\naggregate: {}",
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&out).unwrap_or_else(|error| format!("<unreadable: {error}>"))
+    );
+    let inherited = fs::read_to_string(&report).expect("provider process must record its fds");
+    assert!(
+        !inherited.contains("a2a-bridge-candidate"),
+        "provider inherited staged executable capability: {inherited}"
+    );
+    assert!(
+        !inherited.contains("/.a2a-compat-"),
+        "provider inherited compatibility scratch capability: {inherited}"
+    );
+}
+
 #[test]
 fn case_selection_is_not_all_and_explicit_all_keeps_every_row() {
     let dir = tempfile::tempdir().unwrap();

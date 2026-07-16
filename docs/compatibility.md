@@ -64,7 +64,11 @@ Pinned adapter and CLI identities use one complete semantic version. Remote API 
 provider, API, and API-version identities rather than a generic execution row. A raw advertised model ID
 may share an alias spelling, but a fallback resolution is blocking effective-model drift. Baseline
 comparison retains per-case runner/not-run/budget outcomes and aggregate success/cancellation/budget
-state; it intentionally omits variable token and cost quantities while retaining cap violations.
+state; it intentionally omits variable token and cost quantities while retaining cap violations. A
+pinned `support` row is release-blocking unless it actually completed and matched its expectation;
+`UNKNOWN` or `STALE` never turns an unrun support row green. The runner syncs blocking setup evidence
+first and atomically replaces it with the final aggregate, so finalization failure does not publish
+partially overwritten JSON.
 
 Use the release-mode candidate's `smoke` command for the minimal live turn. Do not add or refresh a PASS
 row from unit tests, an unacknowledged refusal, a source-tree helper, or a stale installed binary. Retain the

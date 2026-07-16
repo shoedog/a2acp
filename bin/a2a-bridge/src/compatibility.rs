@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::str::FromStr;
@@ -386,6 +386,9 @@ fn exact_component(label: &str, value: &str) -> Result<(), BoxError> {
         || value.contains('~')
         || value.contains('>')
         || value.contains('<')
+        || value.contains('|')
+        || value.contains(',')
+        || value.contains(" - ")
     {
         return Err(format!(
             "compatibility manifest: {label} must be an exact identity, not a floating tag or range"
@@ -1237,16 +1240,21 @@ impl ProcessSmokeInvoker<'_> {
             let retain_executable = self.executable.retain_executable_after_exec;
             let retain_directory = self.artifact_directory.retain_descriptor_after_exec();
             let mut command = tokio::process::Command::new(executable_path);
+            command.arg("smoke");
             #[cfg(target_os = "linux")]
             {
                 command
                     .env_remove(INHERITED_EXECUTABLE_FD_ENV)
                     .env_remove(INHERITED_SCRATCH_FD_ENV);
                 if retain_executable {
-                    command.env(INHERITED_EXECUTABLE_FD_ENV, executable_fd.to_string());
+                    command
+                        .arg("--internal-compat-executable-fd")
+                        .arg(executable_fd.to_string());
                 }
                 if retain_directory {
-                    command.env(INHERITED_SCRATCH_FD_ENV, retained_directory_fd.to_string());
+                    command
+                        .arg("--internal-compat-scratch-fd")
+                        .arg(retained_directory_fd.to_string());
                 }
             }
             // SAFETY: this callback runs after fork and before exec. It performs only async-signal-
@@ -1278,7 +1286,6 @@ impl ProcessSmokeInvoker<'_> {
         }
         #[cfg(unix)]
         command
-            .arg("smoke")
             .arg("--agent")
             .arg(&request.agent)
             .arg("--config")
@@ -1399,34 +1406,70 @@ fn close_raw_descriptor(fd: std::os::fd::RawFd, label: &str) -> Result<(), BoxEr
 }
 
 #[cfg(target_os = "linux")]
-fn close_inherited_descriptor_from_env(name: &str, label: &str) -> Result<(), BoxError> {
-    let Some(raw) = std::env::var_os(name) else {
-        return Ok(());
-    };
-    let raw = raw
-        .to_str()
-        .ok_or_else(|| format!("{label}: inherited descriptor is not Unicode"))?;
-    let fd = raw
-        .parse::<std::os::fd::RawFd>()
-        .map_err(|_| format!("{label}: inherited descriptor is not an integer"))?;
-    close_raw_descriptor(fd, label)
+fn descriptor_metadata(fd: i32, label: &str) -> Result<std::fs::Metadata, BoxError> {
+    if fd <= libc::STDERR_FILENO {
+        return Err(format!("{label}: inherited descriptor must be greater than stderr").into());
+    }
+    std::fs::metadata(format!("/proc/self/fd/{fd}"))
+        .map_err(|error| format!("{label}: cannot inspect inherited descriptor: {error}").into())
 }
 
-pub(crate) fn close_inherited_compatibility_executable() -> Result<(), BoxError> {
+#[cfg(target_os = "linux")]
+fn same_linux_object(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+pub(crate) fn close_inherited_compatibility_executable(fd: Option<i32>) -> Result<(), BoxError> {
     #[cfg(target_os = "linux")]
-    close_inherited_descriptor_from_env(
-        INHERITED_EXECUTABLE_FD_ENV,
-        "compatibility staged executable",
-    )?;
+    if let Some(fd) = fd {
+        let descriptor = descriptor_metadata(fd, "compatibility staged executable")?;
+        let running = std::fs::metadata("/proc/self/exe").map_err(|error| {
+            format!("compatibility staged executable: cannot inspect running executable: {error}")
+        })?;
+        if !descriptor.is_file() || !same_linux_object(&descriptor, &running) {
+            return Err(
+                "compatibility staged executable: inherited descriptor does not identify the running executable"
+                    .into(),
+            );
+        }
+        close_raw_descriptor(fd, "compatibility staged executable")?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if fd.is_some() {
+        return Err("compatibility staged executable: inherited descriptor is Linux-only".into());
+    }
     Ok(())
 }
 
-pub(crate) fn close_inherited_compatibility_scratch() -> Result<(), BoxError> {
+pub(crate) fn close_inherited_compatibility_scratch(
+    fd: Option<i32>,
+    artifact_path: Option<&Path>,
+) -> Result<(), BoxError> {
     #[cfg(target_os = "linux")]
-    close_inherited_descriptor_from_env(
-        INHERITED_SCRATCH_FD_ENV,
-        "compatibility staged scratch directory",
-    )?;
+    if let Some(fd) = fd {
+        let artifact_path = artifact_path
+            .ok_or("compatibility staged scratch directory: inherited descriptor requires --out")?;
+        let parent = artifact_path.parent().unwrap_or_else(|| Path::new("."));
+        let descriptor = descriptor_metadata(fd, "compatibility staged scratch directory")?;
+        let output_parent = std::fs::metadata(parent).map_err(|error| {
+            format!("compatibility staged scratch directory: cannot inspect --out parent: {error}")
+        })?;
+        if !descriptor.is_dir() || !same_linux_object(&descriptor, &output_parent) {
+            return Err(
+                "compatibility staged scratch directory: inherited descriptor does not identify the --out parent"
+                    .into(),
+            );
+        }
+        close_raw_descriptor(fd, "compatibility staged scratch directory")?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if fd.is_some() {
+        let _ = artifact_path;
+        return Err(
+            "compatibility staged scratch directory: inherited descriptor is Linux-only".into(),
+        );
+    }
     Ok(())
 }
 
@@ -1595,6 +1638,40 @@ impl PinnedOutputDirectory {
         Ok(file)
     }
 
+    fn replace_setup_with_final(
+        &self,
+        setup_file: &File,
+        aggregate: &AggregateArtifact,
+    ) -> Result<(), BoxError> {
+        let replacement_name = OsString::from(format!(
+            ".a2a-compat-final-{}-{}",
+            std::process::id(),
+            crate::implement::nonce(20)
+        ));
+        let mut replacement =
+            self.pin
+                .create_new_file(&replacement_name, 0o600, "compatibility final aggregate")?;
+        let published = write_aggregate(&mut replacement, aggregate).and_then(|()| {
+            self.pin.replace_regular_child(
+                &self.output_name,
+                setup_file,
+                &replacement_name,
+                &replacement,
+                "compatibility final aggregate",
+            )
+        });
+        if let Err(error) = published {
+            drop(replacement);
+            let _ = self.pin.remove_child(
+                &replacement_name,
+                false,
+                "compatibility final aggregate cleanup",
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn create_scratch(&self) -> Result<ScratchDir, BoxError> {
         if !self.pin.current_path_matches() {
             return Err(
@@ -1649,16 +1726,6 @@ fn aggregate_bytes(aggregate: &AggregateArtifact) -> Result<Vec<u8>, BoxError> {
 fn write_aggregate(file: &mut File, aggregate: &AggregateArtifact) -> Result<(), BoxError> {
     let bytes = aggregate_bytes(aggregate)?;
     file.write_all(&bytes)?;
-    file.flush()?;
-    file.sync_all()?;
-    Ok(())
-}
-
-fn replace_aggregate(file: &mut File, aggregate: &AggregateArtifact) -> Result<(), BoxError> {
-    let bytes = aggregate_bytes(aggregate)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&bytes)?;
-    file.set_len(u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
     file.flush()?;
     file.sync_all()?;
     Ok(())
@@ -2340,7 +2407,7 @@ async fn build_aggregate<I: SmokeInvoker>(
     let pinned_failed = results.iter().any(|result| {
         result.lane == Lane::Pinned
             && result.classification == Classification::Support
-            && !result.expectation_met
+            && (result.execution != ExecutionState::Completed || !result.expectation_met)
     });
     AggregateArtifact {
         schema_version: 1,
@@ -2698,7 +2765,7 @@ async fn run_command(args: RunArgs) -> Result<(), BoxError> {
         &selected,
         &args.environment_owner,
     );
-    let mut output = output_directory.prepare_output_with_setup_evidence(&setup_evidence)?;
+    let output = output_directory.prepare_output_with_setup_evidence(&setup_evidence)?;
     let scratch = output_directory.create_scratch()?;
     let staged_executable = stage_candidate(&executable, &scratch)?;
     drop(executable);
@@ -2731,7 +2798,7 @@ async fn run_command(args: RunArgs) -> Result<(), BoxError> {
     .await;
     signal_task.abort();
     let success = aggregate.success;
-    replace_aggregate(&mut output, &aggregate)?;
+    output_directory.replace_setup_with_final(&output, &aggregate)?;
     if success {
         Ok(())
     } else {
@@ -2793,6 +2860,7 @@ pub(crate) async fn compatibility_cmd(args: &[String]) -> Result<(), BoxError> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::io::{Seek, SeekFrom};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::AtomicBool;
@@ -2806,16 +2874,34 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn closed_compatibility_descriptor_cannot_reach_provider_descendants() {
-        use std::os::fd::AsRawFd as _;
+    fn compatibility_descriptor_handoff_validates_objects_before_close() {
+        use std::os::fd::{AsRawFd as _, IntoRawFd as _};
 
-        let source = File::open("/dev/null").unwrap();
-        // SAFETY: source is live; F_DUPFD_CLOEXEC creates a distinct owned descriptor for this test.
-        let inherited = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-        assert!(inherited > libc::STDERR_FILENO);
-        close_raw_descriptor(inherited, "test inherited compatibility descriptor").unwrap();
-        // SAFETY: querying a now-closed integer descriptor is defined and must fail with EBADF.
-        assert_eq!(unsafe { libc::fcntl(inherited, libc::F_GETFD) }, -1);
+        let unrelated = File::open("/dev/null").unwrap();
+        let error =
+            close_inherited_compatibility_executable(Some(unrelated.as_raw_fd())).unwrap_err();
+        assert!(error.to_string().contains("does not identify"));
+        // SAFETY: the rejected descriptor remains owned by `unrelated` and must still be live.
+        assert_ne!(
+            unsafe { libc::fcntl(unrelated.as_raw_fd(), libc::F_GETFD) },
+            -1
+        );
+
+        let executable = File::open("/proc/self/exe").unwrap().into_raw_fd();
+        close_inherited_compatibility_executable(Some(executable)).unwrap();
+        // SAFETY: querying a descriptor transferred to and closed by the helper is defined.
+        assert_eq!(unsafe { libc::fcntl(executable, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = File::open(dir.path()).unwrap().into_raw_fd();
+        let artifact = dir.path().join("artifact.json");
+        close_inherited_compatibility_scratch(Some(scratch), Some(&artifact)).unwrap();
+        // SAFETY: querying a descriptor transferred to and closed by the helper is defined.
+        assert_eq!(unsafe { libc::fcntl(scratch, libc::F_GETFD) }, -1);
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::EBADF)
@@ -3367,6 +3453,19 @@ agent_cli = "@openai/codex=0.144.1"
             "{remote}\ncomponents = {{ provider = \"openai\", api = \"responses\", api_version = \"v1\" }}\n"
         );
         parse_and_validate(&remote).unwrap();
+
+        for ranged_version in ["v1 || v2", "v1 - v2"] {
+            let ranged = remote.replace(
+                "api_version = \"v1\"",
+                &format!("api_version = {ranged_version:?}"),
+            );
+            assert!(
+                parse_and_validate(&ranged)
+                    .unwrap_err()
+                    .contains("exact identity"),
+                "remote API version range {ranged_version:?} must not satisfy an exact pin"
+            );
+        }
 
         for evidence_path in ["direct_cli", "direct_acp"] {
             let contradictory = remote.replace("bridge_smoke", evidence_path);
@@ -4974,5 +5073,145 @@ agent_cli = "@openai/codex=0.144.1"
             std::fs::metadata(output_path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn final_aggregate_atomically_replaces_setup_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("aggregate.json");
+        let output_directory = ensure_output_outside_repositories(&output_path).unwrap();
+        let loaded = loaded(dir.path(), vec![case("first", EvidenceStatus::Pass)]);
+        let setup = setup_incomplete_aggregate(
+            &loaded,
+            &candidate_identity(),
+            &selection(),
+            &[0],
+            "test-runner",
+        );
+        let output = output_directory
+            .prepare_output_with_setup_evidence(&setup)
+            .unwrap();
+        let mut provisional_reader = File::open(&output_path).unwrap();
+        let mut final_aggregate = setup.clone();
+        final_aggregate.success = true;
+        final_aggregate.ended_at_ms += 1;
+
+        output_directory
+            .replace_setup_with_final(&output, &final_aggregate)
+            .unwrap();
+
+        let published: AggregateArtifact = load_json(&output_path, "published aggregate").unwrap();
+        assert!(published.success);
+        provisional_reader.seek(SeekFrom::Start(0)).unwrap();
+        let preserved: AggregateArtifact = serde_json::from_reader(provisional_reader).unwrap();
+        assert!(
+            !preserved.success,
+            "a reader of the provisional inode must retain valid blocking setup evidence"
+        );
+        assert_eq!(
+            preserved.results[0].runner_error_code.as_deref(),
+            Some("compatibility_setup_incomplete")
+        );
+    }
+
+    #[test]
+    fn final_aggregate_replacement_refuses_target_rebinding() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("aggregate.json");
+        let moved_setup = dir.path().join("moved-setup.json");
+        let output_directory = ensure_output_outside_repositories(&output_path).unwrap();
+        let loaded = loaded(dir.path(), vec![case("first", EvidenceStatus::Pass)]);
+        let setup = setup_incomplete_aggregate(
+            &loaded,
+            &candidate_identity(),
+            &selection(),
+            &[0],
+            "test-runner",
+        );
+        let output = output_directory
+            .prepare_output_with_setup_evidence(&setup)
+            .unwrap();
+        std::fs::rename(&output_path, &moved_setup).unwrap();
+        std::fs::write(&output_path, b"replacement must remain untouched").unwrap();
+        let mut final_aggregate = setup.clone();
+        final_aggregate.success = true;
+
+        let error = output_directory
+            .replace_setup_with_final(&output, &final_aggregate)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("target identity changed"));
+        assert_eq!(
+            std::fs::read(&output_path).unwrap(),
+            b"replacement must remain untouched"
+        );
+        let preserved: AggregateArtifact =
+            load_json(&moved_setup, "moved setup aggregate").unwrap();
+        assert!(!preserved.success);
+        assert_eq!(
+            preserved.results[0].runner_error_code.as_deref(),
+            Some("compatibility_setup_incomplete")
+        );
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".a2a-compat-final-")
+        }));
+    }
+
+    #[tokio::test]
+    async fn pinned_support_not_run_unknown_cannot_green_release_aggregate() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = candidate_identity();
+        let selection = selection();
+        let selected_indices = [0];
+        let cancelled = AtomicBool::new(false);
+        let invoker = FakeInvoker::new(Vec::new());
+
+        let mut non_goal = case("unknown-non-goal", EvidenceStatus::Unknown);
+        non_goal.lane = Lane::Pinned;
+        non_goal.classification = Classification::NonGoal;
+        non_goal.os = "other-os".into();
+        let advisory = build_aggregate(
+            AggregateInputs {
+                loaded: &loaded(dir.path(), vec![non_goal]),
+                candidate: &candidate,
+                selection: &selection,
+                selected_indices: &selected_indices,
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &invoker,
+        )
+        .await;
+        assert!(advisory.success, "a pinned non-goal may remain advisory");
+
+        for expected in [EvidenceStatus::Unknown, EvidenceStatus::Stale] {
+            let mut support = case("unrun-support", expected);
+            support.lane = Lane::Pinned;
+            support.classification = Classification::Support;
+            support.os = "other-os".into();
+            let blocking = build_aggregate(
+                AggregateInputs {
+                    loaded: &loaded(dir.path(), vec![support]),
+                    candidate: &candidate,
+                    selection: &selection,
+                    selected_indices: &selected_indices,
+                    environment_owner: "test-runner",
+                    scratch: dir.path(),
+                    cancellation_requested: &cancelled,
+                },
+                &invoker,
+            )
+            .await;
+            assert_eq!(blocking.results[0].execution, ExecutionState::NotRun);
+            assert!(
+                !blocking.success,
+                "a release-blocking pinned support case must execute before the aggregate can green"
+            );
+        }
     }
 }
