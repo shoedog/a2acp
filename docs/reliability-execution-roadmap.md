@@ -112,9 +112,11 @@
   fold counts a stage only after its future receives a poll, preserves exact timeout phase/last-completed
   evidence, and repeats the full candidate binding on every active inventory surface. The accounting
   assertion fails **0 / 1** on exact `9d10e6f` with actual prompt calls `1` versus expected `0` and passes
-  **1 / 0** on the current fold. Full gates and
-  merge-policy checks are green; fresh exact-head re-review is pending. Reviews did not rerun supplied
-  build/test gates and are not compatibility evidence.
+  **1 / 0** on the current fold. Full gates and merge-policy checks are green. Fresh Sol/xhigh closure
+  review of exact `c458045cf3d0923457519e253d22dd545363f98d` adjudicated both inherited `WRONG` findings
+  `FIXED`, retained the resolver fixture as `ACCEPTED-NONBLOCKING`, found no new `WRONG` or `SMELL`, and
+  returned `APPROVE`. It independently inspected the complete final fold and active documentation while
+  accepting the supplied build/test gates without rerunning them. Reviews are not compatibility evidence.
 - **Last merged full workspace gate:** R2d host serial **1,985 / 0 / 12 ignored** across 69 executables;
   format/diff, all-target check, warnings-denied Clippy, release build, repository hygiene **37/7**, and
   PR #29 Build/Lint/Coverage plus CLA were green
@@ -126,9 +128,8 @@
   mandatory. The checked-in baseline has the new manifest
   identity but intentionally has no promoted case summaries until separately authorized exact-candidate
   live artifacts are reviewed. Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** run fresh Sol/xhigh closure re-review of the exact current call-accounting and
-  candidate-binding fold. After a fresh host login and post-login sync, require both Claude
-  host and reader doctors green before requesting new explicit authorization for one new four-case aggregate.
+- **Next action:** after a fresh host login and post-login sync, require both Claude host and reader doctors
+  green before requesting new explicit authorization for one new four-case aggregate.
   Promote only an all-green aggregate, then use one clean-room Fable/xhigh adversarial implementation plus
   release/compatibility lens. Do not rebuild or swap the running operator; OpenRouter/OpenCode remain
   R3e/R3f after the R3 core and before R4.
@@ -182,7 +183,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE**. Authorized attempt 1: Codex host/reader `PASS`, Fable host/reader `FAIL` on expired OAuth after prompt start, five controls unrun, no promotion. Exact `9d10e6f` review returned `REVISE`; the call-accounting and full candidate-binding fold is full-suite green pending fresh exact-head Sol/xhigh re-review. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane and deliberate promotion active; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE**. Authorized attempt 1: Codex host/reader `PASS`, Fable host/reader `FAIL` on expired OAuth after prompt start, five controls unrun, no promotion. Exact `9d10e6f` review returned `REVISE`; exact `c458045` closure review returned `APPROVE` with both inherited `WRONG` findings fixed, accepted resolver-fixture debt, and no new findings. Deterministic closure is ready; the live lane awaits fresh Claude auth, sync, both green doctors, and new authorization. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane and deliberate promotion active; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -422,7 +423,8 @@ Next action:
   found unpolled call/acceptance accounting and incomplete candidate bindings. The current full-gate-green
   fold closes both; its prompt-call assertion fails **0 / 1** on exact `9d10e6f` and passes **1 / 0** here.
   Its partially-progressed-resolver cleanup fixture remains an accepted nonblocking test
-  debt. Fresh exact-head re-review remains pending.
+  debt. Fresh Sol/xhigh closure review of exact `c458045cf3d0923457519e253d22dd545363f98d` returned
+  `APPROVE` with both inherited `WRONG` findings fixed and no new `WRONG` or `SMELL`.
 - OpenRouter and OpenCode are recorded as R3e/R3f after the pinned/floating/scheduling core and before
   R4. Credentials remain environment-only; neither provider is eligible for automatic fallback. The
   running operator service is unchanged until a merged candidate is rebuilt and swapped during a

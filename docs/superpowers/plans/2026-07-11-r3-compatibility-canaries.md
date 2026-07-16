@@ -5,7 +5,9 @@
   deterministic tree. Authorized attempt 1 passed both Codex cases and failed both Fable cases on expired
   OAuth after prompt start. No baseline promotion ran; the post-attempt hardening is in deterministic and
   Sol-review closure after a deadline/config-directory fold. Exact `9d10e6f` review returned `REVISE` on
-  call accounting and complete candidate binding; both are folded pending exact-head re-review. The current post-`9d10e6f`
+  call accounting and complete candidate binding; exact `c458045cf3d0923457519e253d22dd545363f98d`
+  closure review adjudicated both fixed, retained the resolver fixture as accepted/nonblocking, found no new
+  `WRONG` or `SMELL`, and returned `APPROVE`. The current post-`9d10e6f`
   closure fold passes binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
   groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates pass OAuth
   doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
@@ -336,7 +338,10 @@ is unchanged.
   expired stages still serialized configure/prompt calls plus false acceptance and because active
   inventories omitted full binary/manifest bindings. The current fold tracks first poll before counting a
   stage, preserves exact timeout phase/last-completed evidence, repeats the full candidate binding on every
-  active inventory surface, and is full-gate green pending fresh exact-head re-review. The prompt-call
+  active inventory surface, and is full-gate green. Fresh Sol/xhigh closure review of exact
+  `c458045cf3d0923457519e253d22dd545363f98d` adjudicated both inherited `WRONG` findings fixed, retained
+  the resolver fixture as accepted/nonblocking, found no new `WRONG` or `SMELL`, and returned `APPROVE`.
+  The prompt-call
   assertion fails **0 / 1** on exact `9d10e6f` with actual `1` versus expected `0` and passes **1 / 0** on
   the current fold. The
   partially-progressed-resolver cleanup mutation `SMELL` remains accepted and nonblocking because the
@@ -385,8 +390,8 @@ doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, 
 **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. The provider-unexercised
 release binary is 22,966,384 bytes at SHA-256
 `323b4e219130480c9f0cafe90fe7c36d0a64ec17467707876698a82ef574a079`; the bound manifest SHA-256 is
-`5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. Finish fresh Sol
-re-review. After a fresh host login and post-login sync, require both Claude host and reader doctors green
+`5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. After a fresh host login and
+post-login sync, require both Claude host and reader doctors green
 before requesting new explicit authorization for one new four-case aggregate. Attempt 1 must never be
 replayed or promoted.
 
