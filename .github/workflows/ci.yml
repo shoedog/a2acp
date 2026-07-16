@@ -68,6 +68,10 @@ jobs:
         run: cargo run -p a2a-bridge -- validate --repo-hygiene
 
       - name: Coverage — workspace (≥85% line coverage)
+        # LLVM coverage already supplies its own coverage mapping. Full dev debuginfo can
+        # inflate the bridge executable beyond fallback-plan's intentional 256 MiB input cap.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
         run: cargo llvm-cov --workspace --fail-under-lines 85
 
       - name: Coverage — bridge-core (≥90% line coverage)
