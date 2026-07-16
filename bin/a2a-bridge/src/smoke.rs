@@ -742,6 +742,18 @@ impl ArtifactState {
         self.artifact.attempt.prompt_may_have_been_accepted = accepted;
     }
 
+    fn fail_deadline_timeout(&mut self, context: DeadlineTimeoutContext) {
+        self.failure = Some(static_failure_with_context(
+            context.failed_phase,
+            context.last_completed_phase,
+            DiagnosticFailureClass::Timeout,
+            "smoke.timeout",
+            "Agent turn timed out",
+            context.prompt_may_have_been_accepted,
+        ));
+        self.artifact.attempt.prompt_may_have_been_accepted = context.prompt_may_have_been_accepted;
+    }
+
     fn fail_error(&mut self, error: &BridgeError, fallback_phase: DiagnosticPhase, accepted: bool) {
         if let BridgeError::AgentFailure { diagnostic } = error {
             self.artifact.attempt.prompt_may_have_been_accepted |=
@@ -856,6 +868,17 @@ fn static_failure(
     } else {
         None
     };
+    static_failure_with_context(phase, last_completed_phase, class, code, summary, accepted)
+}
+
+fn static_failure_with_context(
+    phase: DiagnosticPhase,
+    last_completed_phase: Option<DiagnosticPhase>,
+    class: DiagnosticFailureClass,
+    code: &'static str,
+    summary: &'static str,
+    accepted: bool,
+) -> FailureDiagnostic {
     FailureDiagnostic::build_static_code(
         FailureDiagnosticInput {
             failed_phase: phase,
@@ -992,8 +1015,22 @@ impl PolicyEngine for DenyAllPolicy {
 
 struct DrainResult {
     turn: TurnRecord,
+    configure_calls: u8,
     error: Option<BridgeError>,
     static_failure: Option<FailureDiagnostic>,
+    deadline_timeout: Option<DeadlineTimeoutContext>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeadlineTimeoutContext {
+    failed_phase: DiagnosticPhase,
+    last_completed_phase: Option<DiagnosticPhase>,
+    prompt_may_have_been_accepted: bool,
+}
+
+enum DeadlineFirst<T> {
+    Completed(T),
+    TimedOut { future_polled: bool },
 }
 
 enum ResolveOnce {
@@ -1024,28 +1061,37 @@ async fn resolve_once(
     deadline: tokio::time::Instant,
 ) -> ResolveOnce {
     match deadline_first(deadline, registry.resolve_observed(agent, observer)).await {
-        None => ResolveOnce::TimedOut,
-        Some(Err(error)) => ResolveOnce::Failed(error),
-        Some(Ok(resolved)) => ResolveOnce::Resolved(resolved),
+        DeadlineFirst::TimedOut { .. } => ResolveOnce::TimedOut,
+        DeadlineFirst::Completed(Err(error)) => ResolveOnce::Failed(error),
+        DeadlineFirst::Completed(Ok(resolved)) => ResolveOnce::Resolved(resolved),
     }
 }
 
-async fn deadline_first<F>(deadline: tokio::time::Instant, future: F) -> Option<F::Output>
+async fn deadline_first<F>(deadline: tokio::time::Instant, future: F) -> DeadlineFirst<F::Output>
 where
     F: std::future::Future,
 {
     // A newly constructed `Sleep` can require a timer-driver turn even when synchronous work has just
     // crossed its deadline. Refuse from the monotonic clock before constructing or polling either branch.
     if tokio::time::Instant::now() >= deadline {
-        return None;
+        return DeadlineFirst::TimedOut {
+            future_polled: false,
+        };
     }
     // `tokio::time::timeout_at` polls its inner future before its delay. Use one biased deadline-first
     // primitive for every billable stage so an already-expired (or simultaneously-ready) deadline
     // cannot give resolver/configure/prompt/drain one last poll.
+    let future_polled = std::sync::atomic::AtomicBool::new(false);
+    let tracked = async {
+        future_polled.store(true, Ordering::Relaxed);
+        future.await
+    };
     tokio::select! {
         biased;
-        _ = tokio::time::sleep_until(deadline) => None,
-        output = future => Some(output),
+        _ = tokio::time::sleep_until(deadline) => DeadlineFirst::TimedOut {
+            future_polled: future_polled.load(Ordering::Relaxed),
+        },
+        output = tracked => DeadlineFirst::Completed(output),
     }
 }
 
@@ -1060,11 +1106,12 @@ async fn execute_one(
 ) -> DrainResult {
     let mut turn = TurnRecord::default();
 
-    let cwd_drift = || DrainResult {
+    let cwd_drift = |configure_calls| DrainResult {
         turn: TurnRecord {
             terminal_state: "config_failed",
             ..TurnRecord::default()
         },
+        configure_calls,
         error: None,
         static_failure: Some(static_failure(
             DiagnosticPhase::ConfigApply,
@@ -1073,39 +1120,48 @@ async fn execute_one(
             "Fallback smoke cwd identity changed before host execution",
             false,
         )),
+        deadline_timeout: None,
     };
     if fallback_cwd.is_some_and(|cwd| !cwd.current_path_matches()) {
-        return cwd_drift();
+        return cwd_drift(0);
     }
 
-    match deadline_first(deadline, backend.configure_session(session, spec)).await {
-        None => {
-            turn.terminal_state = "timeout";
-            return DrainResult {
-                turn,
-                error: Some(BridgeError::AgentTimedOut),
-                static_failure: None,
-            };
-        }
-        Some(Err(error)) => {
-            turn.terminal_state = "config_failed";
-            return DrainResult {
-                turn,
-                error: Some(error),
-                static_failure: None,
-            };
-        }
-        Some(Ok(())) => turn.prompt_calls = 0,
-    }
+    let configure_calls =
+        match deadline_first(deadline, backend.configure_session(session, spec)).await {
+            DeadlineFirst::TimedOut { future_polled } => {
+                turn.terminal_state = "timeout";
+                return DrainResult {
+                    turn,
+                    configure_calls: u8::from(future_polled),
+                    error: Some(BridgeError::AgentTimedOut),
+                    static_failure: None,
+                    deadline_timeout: Some(DeadlineTimeoutContext {
+                        failed_phase: DiagnosticPhase::ConfigApply,
+                        last_completed_phase: Some(DiagnosticPhase::Resolve),
+                        prompt_may_have_been_accepted: false,
+                    }),
+                };
+            }
+            DeadlineFirst::Completed(Err(error)) => {
+                turn.terminal_state = "config_failed";
+                return DrainResult {
+                    turn,
+                    configure_calls: 1,
+                    error: Some(error),
+                    static_failure: None,
+                    deadline_timeout: None,
+                };
+            }
+            DeadlineFirst::Completed(Ok(())) => 1,
+        };
 
     // ACP configure only stashes SessionSpec; lazy session mint happens at prompt. Revalidate after
     // configure so a replacement in that exact window cannot reach the billable handoff. A later
     // replacement is still pinned by the host process spawn context and object-addressed ACP cwd.
     if fallback_cwd.is_some_and(|cwd| !cwd.current_path_matches()) {
-        return cwd_drift();
+        return cwd_drift(configure_calls);
     }
 
-    turn.prompt_calls = 1;
     let rich_dyn: Arc<dyn RichEventSink> = rich.clone();
     let diagnostic_dyn: Arc<dyn bridge_core::ports::DiagnosticObserver> = observer;
     let stream = match deadline_first(
@@ -1120,37 +1176,94 @@ async fn execute_one(
     )
     .await
     {
-        None => {
+        DeadlineFirst::TimedOut { future_polled } => {
+            turn.prompt_calls = u8::from(future_polled);
             turn.terminal_state = "timeout";
             return DrainResult {
                 turn,
+                configure_calls,
                 error: Some(BridgeError::AgentTimedOut),
                 static_failure: None,
+                deadline_timeout: Some(DeadlineTimeoutContext {
+                    failed_phase: DiagnosticPhase::PromptStart,
+                    last_completed_phase: Some(DiagnosticPhase::ConfigApply),
+                    prompt_may_have_been_accepted: future_polled,
+                }),
             };
         }
-        Some(Err(error)) => {
+        DeadlineFirst::Completed(Err(error)) => {
+            turn.prompt_calls = 1;
             turn.terminal_state = "prompt_failed";
             return DrainResult {
                 turn,
+                configure_calls,
                 error: Some(error),
                 static_failure: None,
+                deadline_timeout: None,
             };
         }
-        Some(Ok(stream)) => stream,
+        DeadlineFirst::Completed(Ok(stream)) => {
+            turn.prompt_calls = 1;
+            stream
+        }
     };
 
     match deadline_first(deadline, drain_stream(stream, Arc::clone(&rich))).await {
-        None => {
+        DeadlineFirst::TimedOut { .. } => {
             turn.terminal_state = "timeout";
             turn.tool_event_count = rich.tool_event_count();
             DrainResult {
                 turn,
+                configure_calls,
                 error: Some(BridgeError::AgentTimedOut),
                 static_failure: None,
+                deadline_timeout: Some(DeadlineTimeoutContext {
+                    failed_phase: DiagnosticPhase::PromptStream,
+                    last_completed_phase: Some(DiagnosticPhase::PromptStart),
+                    prompt_may_have_been_accepted: true,
+                }),
             }
         }
-        Some(result) => result,
+        DeadlineFirst::Completed(mut result) => {
+            result.configure_calls = configure_calls;
+            result
+        }
     }
+}
+
+fn apply_execute_result(state: &mut ArtifactState, result: DrainResult) -> bool {
+    let DrainResult {
+        turn,
+        configure_calls,
+        error,
+        static_failure,
+        deadline_timeout,
+    } = result;
+    state.artifact.session.configure_calls = configure_calls;
+    state.artifact.turn = turn;
+    let failed = error.is_some() || static_failure.is_some();
+
+    if let Some(failure) = static_failure {
+        state.artifact.attempt.prompt_may_have_been_accepted |=
+            failure.prompt_may_have_been_accepted();
+        state.failure = Some(failure);
+    } else if let Some(error) = &error {
+        state.artifact.attempt.timed_out = is_timeout_failure(error);
+        if let Some(context) = deadline_timeout {
+            debug_assert!(matches!(error, BridgeError::AgentTimedOut));
+            state.fail_deadline_timeout(context);
+        } else {
+            let accepted = state.artifact.turn.prompt_calls == 1;
+            let phase = turn_failure_phase(&state.artifact.turn);
+            state.fail_turn_error(error, phase, accepted);
+        }
+    } else {
+        debug_assert!(deadline_timeout.is_none());
+        state.artifact.success = true;
+        state.artifact.attempt.prompt_may_have_been_accepted = true;
+    }
+
+    failed
 }
 
 async fn drain_stream(
@@ -1175,8 +1288,10 @@ async fn drain_stream(
                     usage.map(|value| smoke_usage_with_history(value, invalid_cost_observed));
                 return DrainResult {
                     turn,
+                    configure_calls: 0,
                     error: Some(error),
                     static_failure: None,
+                    deadline_timeout: None,
                 };
             }
             Ok(Update::Text(text)) => {
@@ -1233,8 +1348,10 @@ async fn drain_stream(
     let error = (!successful).then_some(BridgeError::FrameError);
     DrainResult {
         turn,
+        configure_calls: 0,
         error,
         static_failure: None,
+        deadline_timeout: None,
     }
 }
 
@@ -1873,7 +1990,6 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     let backend = Arc::clone(&resolved.backend);
     let session = SessionId::parse(state.artifact.session.id.clone())
         .expect("generated non-empty smoke session id");
-    state.artifact.session.configure_calls = 1;
     let rich = Arc::new(SmokeRichSink::default());
     let result = execute_one(
         Arc::clone(&backend),
@@ -1885,27 +2001,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         pinned_session_cwd.as_ref(),
     )
     .await;
-    let DrainResult {
-        turn,
-        error,
-        static_failure,
-    } = result;
-    state.artifact.turn = turn;
-    let failed = error.is_some() || static_failure.is_some();
-
-    if let Some(failure) = static_failure {
-        state.artifact.attempt.prompt_may_have_been_accepted |=
-            failure.prompt_may_have_been_accepted();
-        state.failure = Some(failure);
-    } else if let Some(error) = &error {
-        state.artifact.attempt.timed_out = is_timeout_failure(error);
-        let accepted = state.artifact.turn.prompt_calls == 1;
-        let phase = turn_failure_phase(&state.artifact.turn);
-        state.fail_turn_error(error, phase, accepted);
-    } else {
-        state.artifact.success = true;
-        state.artifact.attempt.prompt_may_have_been_accepted = true;
-    }
+    let failed = apply_execute_result(&mut state, result);
 
     let cleanup = cleanup_backend(
         backend,
@@ -2864,8 +2960,28 @@ mod tests {
             expired.prompt_calls.load(Ordering::SeqCst)
         );
         assert_eq!(expired_result.turn.terminal_state, "timeout");
+        assert_eq!(expired_result.configure_calls, 0);
+        assert_eq!(
+            expired_result.deadline_timeout,
+            Some(DeadlineTimeoutContext {
+                failed_phase: DiagnosticPhase::ConfigApply,
+                last_completed_phase: Some(DiagnosticPhase::Resolve),
+                prompt_may_have_been_accepted: false,
+            })
+        );
         assert_eq!(expired.configure_calls.load(Ordering::SeqCst), 0);
         assert_eq!(expired.prompt_calls.load(Ordering::SeqCst), 0);
+        let mut expired_state = ArtifactState::new(&args());
+        assert!(apply_execute_result(&mut expired_state, expired_result));
+        assert_eq!(expired_state.artifact.session.configure_calls, 0);
+        assert_eq!(expired_state.artifact.turn.prompt_calls, 0);
+        assert!(!expired_state.artifact.attempt.prompt_may_have_been_accepted);
+        let expired_failure = expired_state.failure.as_ref().unwrap();
+        assert_eq!(expired_failure.failed_phase(), DiagnosticPhase::ConfigApply);
+        assert_eq!(
+            expired_failure.last_completed_phase(),
+            Some(DiagnosticPhase::Resolve)
+        );
 
         let configure_crosses = Arc::new(
             FakeBackend::new(Behavior::Exact).with_blocking_configure(Duration::from_millis(250)),
@@ -2885,8 +3001,37 @@ mod tests {
             Some(BridgeError::AgentTimedOut)
         ));
         assert_eq!(configure_result.turn.terminal_state, "timeout");
+        assert_eq!(configure_result.configure_calls, 1);
+        assert_eq!(configure_result.turn.prompt_calls, 0);
+        assert_eq!(
+            configure_result.deadline_timeout,
+            Some(DeadlineTimeoutContext {
+                failed_phase: DiagnosticPhase::PromptStart,
+                last_completed_phase: Some(DiagnosticPhase::ConfigApply),
+                prompt_may_have_been_accepted: false,
+            })
+        );
         assert_eq!(configure_crosses.configure_calls.load(Ordering::SeqCst), 1);
         assert_eq!(configure_crosses.prompt_calls.load(Ordering::SeqCst), 0);
+        let mut configure_state = ArtifactState::new(&args());
+        assert!(apply_execute_result(&mut configure_state, configure_result));
+        assert_eq!(configure_state.artifact.session.configure_calls, 1);
+        assert_eq!(configure_state.artifact.turn.prompt_calls, 0);
+        assert!(
+            !configure_state
+                .artifact
+                .attempt
+                .prompt_may_have_been_accepted
+        );
+        let configure_failure = configure_state.failure.as_ref().unwrap();
+        assert_eq!(
+            configure_failure.failed_phase(),
+            DiagnosticPhase::PromptStart
+        );
+        assert_eq!(
+            configure_failure.last_completed_phase(),
+            Some(DiagnosticPhase::ConfigApply)
+        );
 
         let prompt_crosses = Arc::new(
             FakeBackend::new(Behavior::Exact).with_blocking_prompt(Duration::from_millis(250)),
@@ -2906,8 +3051,29 @@ mod tests {
             Some(BridgeError::AgentTimedOut)
         ));
         assert_eq!(prompt_result.turn.terminal_state, "timeout");
+        assert_eq!(prompt_result.configure_calls, 1);
+        assert_eq!(prompt_result.turn.prompt_calls, 1);
+        assert_eq!(
+            prompt_result.deadline_timeout,
+            Some(DeadlineTimeoutContext {
+                failed_phase: DiagnosticPhase::PromptStream,
+                last_completed_phase: Some(DiagnosticPhase::PromptStart),
+                prompt_may_have_been_accepted: true,
+            })
+        );
         assert_eq!(prompt_crosses.configure_calls.load(Ordering::SeqCst), 1);
         assert_eq!(prompt_crosses.prompt_calls.load(Ordering::SeqCst), 1);
+        let mut prompt_state = ArtifactState::new(&args());
+        assert!(apply_execute_result(&mut prompt_state, prompt_result));
+        assert_eq!(prompt_state.artifact.session.configure_calls, 1);
+        assert_eq!(prompt_state.artifact.turn.prompt_calls, 1);
+        assert!(prompt_state.artifact.attempt.prompt_may_have_been_accepted);
+        let prompt_failure = prompt_state.failure.as_ref().unwrap();
+        assert_eq!(prompt_failure.failed_phase(), DiagnosticPhase::PromptStream);
+        assert_eq!(
+            prompt_failure.last_completed_phase(),
+            Some(DiagnosticPhase::PromptStart)
+        );
     }
 
     #[tokio::test]

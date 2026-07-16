@@ -5,11 +5,14 @@
 - **Completed through:** R3a **MERGED** at `3927df3f`; R2e remains deferred and off the critical path
 - **Active slice:** R3b pinned lane on `agent/reliability-r3b-pinned-lane`
 - **Current R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-`4574cbb`
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-`9d10e6f`
   closure fold passes binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
   groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates pass OAuth
   doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
-  **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. These include mutation-proven
+  **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. The provider-unexercised
+  release binary is 22,966,384 bytes at SHA-256
+  `323b4e219130480c9f0cafe90fe7c36d0a64ec17467707876698a82ef574a079`; the bound manifest SHA-256 is
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. These include mutation-proven
   pre-change failures for the runway, `CLAUDE_CONFIG_DIR`, immediate-expiry polling, and external-provider
   defects at every billable stage plus direct production-parser coverage. Format/diff, workspace check,
   all-target/all-feature
@@ -20,10 +23,7 @@
   unchanged test passed in the then-reported **394 / 0** rerun.
   The uniquely tagged, non-operator reader candidate is
   `sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1`; it binds exact Codex and
-  Claude package labels while leaving Kiro explicitly `STALE`. The folded release binary is
-  22,965,312 bytes at SHA-256
-  `b60315b23fb4a54876254ff94cff6d4dfca31d66f9c8c6cbab105115d030c202`; it has not run a provider
-  turn. Fresh Sol/xhigh closure review of exact
+  Claude package labels while leaving Kiro explicitly `STALE`. Fresh Sol/xhigh closure review of exact
   `c38978a` returned `APPROVE` with no `WRONG`; its sole nonblocking backend-error test-coverage `SMELL`
   is closed by a mutation-proven regression. No baseline promotion has run.
 - **Current R3b live gate:** authorized pinned attempt 1 ran once with zero retry/fallback against candidate
@@ -100,13 +100,21 @@
   review of exact `4574cbb` adjudicated both `FIXED`, then returned `REVISE` with three new `WRONG` findings:
   configure/prompt/drain retained inner-first deadline polling, current gate inventories differed across
   active cursors, and two operator surfaces required only one green Claude doctor. Its provider-selector
-  oracle `SMELL` is closed by an independent exact five-name assertion. The current fold uses one
+  oracle `SMELL` is closed by an independent exact five-name assertion. The `9d10e6f` fold uses one
   deadline-first primitive for resolution/configure/prompt/drain and aligns the exact gate and two-doctor /
   one-new-four-case-aggregate contracts. The remaining partially-progressed-resolver cleanup mutation
   `SMELL` is accepted and nonblocking: production ownership/drop, invalidation, and the run-scoped cleanup
-  backstop remain inspected but are not claimed as a direct acquisition fixture. Full gates and merge-policy
-  checks are green; fresh exact-head re-review is pending. Reviews did not rerun supplied build/test gates
-  and are not compatibility evidence.
+  backstop remain inspected but are not claimed as a direct acquisition fixture. Fresh Sol/xhigh review of
+  exact `9d10e6f` adjudicated deadline ordering, two-doctor wording, and the provider-list oracle `FIXED`,
+  kept the release inventory `PARTIAL` and resolver fixture `ACCEPTED-NONBLOCKING`, then returned `REVISE`
+  with two `WRONG` findings: an unpolled expired stage still serialized configure/prompt calls and false
+  prompt acceptance, while active candidate inventories omitted full binary/manifest bindings. The current
+  fold counts a stage only after its future receives a poll, preserves exact timeout phase/last-completed
+  evidence, and repeats the full candidate binding on every active inventory surface. The accounting
+  assertion fails **0 / 1** on exact `9d10e6f` with actual prompt calls `1` versus expected `0` and passes
+  **1 / 0** on the current fold. Full gates and
+  merge-policy checks are green; fresh exact-head re-review is pending. Reviews did not rerun supplied
+  build/test gates and are not compatibility evidence.
 - **Last merged full workspace gate:** R2d host serial **1,985 / 0 / 12 ignored** across 69 executables;
   format/diff, all-target check, warnings-denied Clippy, release build, repository hygiene **37/7**, and
   PR #29 Build/Lint/Coverage plus CLA were green
@@ -118,8 +126,8 @@
   mandatory. The checked-in baseline has the new manifest
   identity but intentionally has no promoted case summaries until separately authorized exact-candidate
   live artifacts are reviewed. Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** commit the full-gate-green post-`4574cbb` all-stage deadline/cursor fold and run fresh
-  Sol/xhigh re-review on that exact head. After a fresh host login and post-login sync, require both Claude
+- **Next action:** run fresh Sol/xhigh closure re-review of the exact current call-accounting and
+  candidate-binding fold. After a fresh host login and post-login sync, require both Claude
   host and reader doctors green before requesting new explicit authorization for one new four-case aggregate.
   Promote only an all-green aggregate, then use one clean-room Fable/xhigh adversarial implementation plus
   release/compatibility lens. Do not rebuild or swap the running operator; OpenRouter/OpenCode remain
@@ -174,7 +182,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE**. Authorized attempt 1: Codex host/reader `PASS`, Fable host/reader `FAIL` on expired OAuth after prompt start, five controls unrun, no promotion. The all-stage deadline, literal-cursor, and two-doctor closure fold is full-suite green and pending fresh exact-head Sol/xhigh re-review. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane and deliberate promotion active; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE**. Authorized attempt 1: Codex host/reader `PASS`, Fable host/reader `FAIL` on expired OAuth after prompt start, five controls unrun, no promotion. Exact `9d10e6f` review returned `REVISE`; the call-accounting and full candidate-binding fold is full-suite green pending fresh exact-head Sol/xhigh re-review. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane and deliberate promotion active; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -388,13 +396,16 @@ Next action:
   that remains sticky across later usage snapshots.
   It also rejects a changed pinned config before provider spawn and records exact Fable-settings
   provenance only for one unambiguous host-file settings destination; duplicates remain `WARN`. The
-  nine-case manifest validates at `5d18cefe...c235d828`. The current post-`4574cbb`
+  nine-case manifest validates at
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-`9d10e6f`
   closure fold passes binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
   groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates pass OAuth
   doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
-  **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. All merge/policy gates
-  are green. The current
-  expired real credentials now correctly produce Claude host **11 ok / 0 warn / 1 fail** and reader
+  **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. The provider-unexercised
+  release binary is 22,966,384 bytes at SHA-256
+  `323b4e219130480c9f0cafe90fe7c36d0a64ec17467707876698a82ef574a079`; the bound manifest SHA-256 is
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. All merge/policy gates are green.
+  The current expired real credentials now correctly produce Claude host **11 ok / 0 warn / 1 fail** and reader
   **18 ok / 0 warn / 1 fail**; Codex remains **10/0/0** host and **14/0/0** reader. Sol/xhigh closure
   review of exact `c38978a` returned `APPROVE` with no
   `WRONG`; its one test-coverage `SMELL` is closed by a mutation-proven backend-error regression for both
@@ -402,16 +413,16 @@ Next action:
   against the candidate image. A real Podman label inspection remains unverified because no local Podman
   image was available; bounded parser/runtime fakes cover Podman-shaped image IDs. Authorized attempt 1
   produced two Codex passes and two Fable HTTP 401 failures with no retry/fallback; no baseline promotion,
-  operator rebuild, or operator swap has run. The folded release binary is SHA-256
-  `b60315b23fb4a54876254ff94cff6d4dfca31d66f9c8c6cbab105115d030c202` (22,965,312 bytes) and remains
-  live-unexercised. A later exact-`f9f3e68` Sol review returned `REVISE` on the pre-recovery deadline gap
-  plus parser/comment smells; local mutation-backed deadline/config-directory and parser folds have full
+  operator rebuild, or operator swap has run. A later exact-`f9f3e68` Sol review returned `REVISE` on the
+  pre-recovery deadline gap plus parser/comment smells; local mutation-backed deadline/config-directory and parser folds have full
   host/Linux/merge-policy gates green. Sol approved that exact tree with no findings. A subsequent local
   audit demonstrated and folded immediate-expiry resolver polling plus pinned external-provider false-blocks.
   Review of exact `4574cbb` closed those findings but found all-stage deadline polling, cursor agreement,
-  two-doctor wording, and an independent provider-list oracle; the current full-gate-green fold closes all
-  four. Its partially-progressed-resolver cleanup fixture remains an accepted nonblocking test debt. Fresh
-  exact-head re-review remains pending.
+  two-doctor wording, and an independent provider-list oracle; `9d10e6f` closed those four, while its review
+  found unpolled call/acceptance accounting and incomplete candidate bindings. The current full-gate-green
+  fold closes both; its prompt-call assertion fails **0 / 1** on exact `9d10e6f` and passes **1 / 0** here.
+  Its partially-progressed-resolver cleanup fixture remains an accepted nonblocking test
+  debt. Fresh exact-head re-review remains pending.
 - OpenRouter and OpenCode are recorded as R3e/R3f after the pinned/floating/scheduling core and before
   R4. Credentials remain environment-only; neither provider is eligible for automatic fallback. The
   running operator service is unchanged until a merged candidate is rebuilt and swapped during a

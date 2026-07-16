@@ -86,7 +86,9 @@ an accepted runway cannot age behind a fresh timeout, and one deadline-first pri
 configure, prompt, or drain after expiry. Truthy pinned Claude selectors for Bedrock, Vertex, Foundry,
 Anthropic AWS, or Mantle use their
 external provider authentication instead of first-party file OAuth; false-like/unknown values and mounted
-reader credentials remain fail-closed. After a fresh host login and post-login sync, require both Claude host
+reader credentials remain fail-closed. An expired stage is counted only after its future receives a poll;
+an unpolled prompt refusal records zero prompt calls and false prompt-acceptance evidence. After a fresh host
+login and post-login sync, require both Claude host
 and reader doctors green before requesting new explicit authorization for one new four-case aggregate.
 
 ## Resolved incident: Fable over Claude ACP

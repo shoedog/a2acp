@@ -62,7 +62,8 @@ cwd. Truthy `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_US
 first-party file OAuth; false-like/unknown values do not, and host flags never bypass a reader mount. The
 absolute smoke deadline starts before provenance and orphan recovery, and one deadline-first primitive does
 not poll resolution, configure, prompt, or drain after expiry. A non-OK OAuth row blocks `smoke` before
-adapter spawn.
+adapter spawn. A stage is counted only after its future receives a poll; an unpolled prompt refusal records
+zero prompt calls and false prompt-acceptance evidence.
 `deploy/containers/sync-creds.sh claude` only copies the host file—it cannot
 refresh an expired host login. After a fresh host login and post-login sync, require both Claude host and
 reader doctors green before requesting new explicit authorization for one new four-case aggregate. Never

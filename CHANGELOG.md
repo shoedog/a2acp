@@ -32,7 +32,9 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   deadline before provenance and orphan recovery so an accepted runway cannot age behind a fresh timeout.
   One deadline-first primitive prevents resolution, configure, prompt, or drain from receiving an inner-first
   poll after expiry, while truthy pinned Claude third-party provider selectors bypass first-party file OAuth
-  without weakening mounted-reader checks.
+  without weakening mounted-reader checks. Deadline refusal now counts configure/prompt calls only after the
+  corresponding future is polled and preserves the exact failed and last-completed phases without falsely
+  claiming prompt acceptance.
 
 ## [0.2.1] - 2026-07-10
 

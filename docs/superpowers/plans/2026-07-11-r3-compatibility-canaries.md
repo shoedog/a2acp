@@ -4,11 +4,15 @@
   `agent/reliability-r3b-pinned-lane`. Nine pinned rows are implemented; Sol/xhigh approved the pre-live
   deterministic tree. Authorized attempt 1 passed both Codex cases and failed both Fable cases on expired
   OAuth after prompt start. No baseline promotion ran; the post-attempt hardening is in deterministic and
-  Sol-review closure after a deadline/config-directory fold. The current post-`4574cbb`
+  Sol-review closure after a deadline/config-directory fold. Exact `9d10e6f` review returned `REVISE` on
+  call accounting and complete candidate binding; both are folded pending exact-head re-review. The current post-`9d10e6f`
   closure fold passes binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
   groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates pass OAuth
   doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
-  **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**.
+  **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. The provider-unexercised
+  release binary is 22,966,384 bytes at SHA-256
+  `323b4e219130480c9f0cafe90fe7c36d0a64ec17467707876698a82ef574a079`; the bound manifest SHA-256 is
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`.
 - **Prerequisite:** R2c/R2d merged (`a6fec94c`, PR #29); R3a merged (`3927df3f`, PR #31)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -302,17 +306,18 @@ is unchanged.
 
 - **Branch:** `agent/reliability-r3b-pinned-lane`
 - **Implementation state (2026-07-16):** nine pinned rows validate at manifest SHA-256
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-`4574cbb`
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-`9d10e6f`
   closure fold passes binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
   groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates pass OAuth
   doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
-  **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. All
+  **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. The provider-unexercised
+  release binary is 22,966,384 bytes at SHA-256
+  `323b4e219130480c9f0cafe90fe7c36d0a64ec17467707876698a82ef574a079`; the bound manifest SHA-256 is
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. All
   format/check/Clippy/release/hygiene/manifest/dependency-policy gates are green.
   An intermediate Linux run was **393/1** only because the container could not resolve this worktree's
   host-absolute `.git` pointer; the exact Git pointer/common-directory mounts restored repo identity and
   the unchanged test passed in the **394/0** rerun.
-  The folded release binary is 22,965,312 bytes at SHA-256
-  `b60315b23fb4a54876254ff94cff6d4dfca31d66f9c8c6cbab105115d030c202` and has not run a provider turn.
   The pinned baseline remains empty pending a future all-green, separately authorized aggregate. Fresh
   Sol/xhigh closure review of
   exact `c38978a` returned `APPROVE` with no `WRONG`; its sole nonblocking test-coverage `SMELL` is
@@ -323,9 +328,17 @@ is unchanged.
   provider false-blocks. Review of exact `4574cbb` adjudicated both fixed, then returned `REVISE` because
   configure/prompt/drain retained inner-first deadline polling, the active gate inventories differed, and
   two operator surfaces allowed a rerun after only one green Claude doctor. Its provider-selector oracle
-  `SMELL` is closed by an independent exact five-name assertion. The current fold uses one deadline-first
+  `SMELL` is closed by an independent exact five-name assertion. The `9d10e6f` fold uses one deadline-first
   primitive through resolution/configure/prompt/drain, aligns the literal gate and two-doctor /
-  one-new-four-case-aggregate contracts, and is full-gate green pending fresh exact-head re-review. The
+  one-new-four-case-aggregate contracts, and is full-gate green. Fresh Sol/xhigh review of exact `9d10e6f`
+  adjudicated deadline ordering, two-doctor wording, and the provider-list oracle fixed; kept the release
+  inventory partial and resolver fixture accepted/nonblocking; and returned `REVISE` because unpolled
+  expired stages still serialized configure/prompt calls plus false acceptance and because active
+  inventories omitted full binary/manifest bindings. The current fold tracks first poll before counting a
+  stage, preserves exact timeout phase/last-completed evidence, repeats the full candidate binding on every
+  active inventory surface, and is full-gate green pending fresh exact-head re-review. The prompt-call
+  assertion fails **0 / 1** on exact `9d10e6f` with actual `1` versus expected `0` and passes **1 / 0** on
+  the current fold. The
   partially-progressed-resolver cleanup mutation `SMELL` remains accepted and nonblocking because the
   inspected ownership/drop, invalidation, and run-scoped backstop are not a direct acquisition fixture.
 
@@ -365,11 +378,14 @@ Bedrock/Vertex/Foundry/Anthropic-AWS/Mantle selectors use
 external host authentication and bypass first-party file OAuth, while false-like/unknown values and mounted
 reader credentials do not. The original spawned regression
 failed pre-change **1 passed / 1 failed** because the expired case reached the fake adapter. The newer
-config-directory and delayed-recovery regressions also fail pre-change. The current post-`4574cbb`
+config-directory and delayed-recovery regressions also fail pre-change. The current post-`9d10e6f`
 closure fold passes binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
 groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates pass OAuth
 doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
-**1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. Finish fresh Sol
+**1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. The provider-unexercised
+release binary is 22,966,384 bytes at SHA-256
+`323b4e219130480c9f0cafe90fe7c36d0a64ec17467707876698a82ef574a079`; the bound manifest SHA-256 is
+`5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. Finish fresh Sol
 re-review. After a fresh host login and post-login sync, require both Claude host and reader doctors green
 before requesting new explicit authorization for one new four-case aggregate. Attempt 1 must never be
 replayed or promoted.
