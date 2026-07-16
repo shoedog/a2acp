@@ -94,8 +94,9 @@ states (**30 passed / 5 failed / 0 ignored**) on `b37147c`; that fold passed com
 **35/0**. Capacity-attempt mutation locks then failed exactly **4** states on `bc9f64c`
 (**32 passed / 4 failed / 0 ignored**): default/alias and floating-range pins, contradictory remote-API
 direct-control rows, writable candidate publication, and an in-place overwrite after the digest check.
-The current focused fold passes compatibility units **36/0**; the last exact full `a2a-bridge` binary
-target passes **359/0**, and CLI regressions pass **10/0**. The CLI
+The current focused fold passes compatibility units **36/0**, the full `a2a-bridge` binary target
+**360/0**, and CLI regressions **10/0**. Supplemental Linux/Rust 1.94 passes the same **36/0** units and
+**10/0** CLI with CI's debug-disabled profile. The CLI
 suite includes a deterministic missing-config control that invokes the nested smoke exactly once, fails
 before provider spawn, and preserves the smoke-v2 failure inside an aggregate created mode `0600`; no
 live or billable provider turn ran. The unit suite also proves that the staged candidate is owner-only,
@@ -109,7 +110,7 @@ and exact API-key environment identity/presence fail visibly.
 
 The exact review-fold deterministic gates pass: `cargo fmt --all -- --check`, `git diff --check`,
 workspace all-target check, warnings-denied workspace/all-target Clippy, serial workspace tests
-**2,032 passed / 0 failed / 12 ignored** across **70** test/doc-test executables, release binary build,
+**2,033 passed / 0 failed / 12 ignored** across **70** test/doc-test executables, release workspace build,
 repository hygiene **37/7**, and release-candidate manifest validation at SHA-256
 `f6481b2e88d55ebbdbed33d73bac40b871627ed1ef6779f582c3943858249007`. One fresh Sol/xhigh closure
 re-review remains pending. The 12 ignored tests are the unchanged explicitly live/authenticated provider

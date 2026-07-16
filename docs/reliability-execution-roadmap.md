@@ -13,10 +13,11 @@
   dimensions, exact auth/effective-capability binding, value-aware prerequisites, prospective budget
   headroom, final-case elapsed exhaustion, descriptor-relative output/scratch effects, alias/range-free
   applicable pin matrices, and owner-executable/non-writable same-digest candidate staging with
-  stable-file-object execution after name retarget. The last full exact fold passes
-  **2,032 / 0 / 12 ignored** across **70** test/doc-test executables;
+  stable-file-object execution after name retarget. The current exact fold passes
+  **2,033 / 0 / 12 ignored** across **70** test/doc-test executables;
   format/diff, workspace all-target check, warnings-denied Clippy, release build, hygiene **37/7**, and
-  release-mode manifest validation are green.
+  release-mode manifest validation are green. Supplemental Linux/Rust 1.94 compatibility units
+  **36/0** and CLI **10/0** are green with CI's debug-disabled profile.
 - **Review state:** initial bridge-mediated Sol/xhigh review of exact `884bc5f` returned `REVISE` with
   seven `WRONG` findings and one test-coverage `SMELL`; first closure re-review of exact `b37147c`
   returned `REVISE` with one inherited `PARTIAL` and five new `WRONG` findings. Both complete sets are
@@ -236,9 +237,10 @@ Next action:
   `884bc5f` and first closure re-review of exact `b37147c` returned `REVISE`; all inherited and new
   findings are folded locally. The later exact-`bc9f64c` Sol/xhigh attempt ended on provider capacity
   before a verdict; its concrete partial leads are folded and the attempt is not a gate. Focused gates
-  pass compatibility units **36/0**; the last exact full binary target passes **359/0**, and CLI
-  regressions pass **10/0**. The last exact-fold full serial workspace passes
-  **2,032/0/12 ignored** across **70** test/doc-test executables; format/diff, all-target
+  pass compatibility units **36/0**, the full binary target **360/0**, and CLI regressions **10/0**
+  on macOS; supplemental Linux/Rust 1.94 passes the same **36/0** units and **10/0** CLI with CI's
+  debug-disabled profile. The exact-fold full serial workspace passes
+  **2,033/0/12 ignored** across **70** test/doc-test executables; format/diff, all-target
   check, warnings-denied Clippy, release build, hygiene **37/7**, and release-mode manifest validation are
   green. Closure re-review remains pending.
 - OpenRouter and OpenCode are recorded as R3e/R3f after the pinned/floating/scheduling core and before
