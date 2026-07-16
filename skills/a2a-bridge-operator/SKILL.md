@@ -82,6 +82,56 @@ for the JSON artifact. An explicit output path must not already exist. On Unix, 
 `0600` before agent resolution or spawn; an existing file/link or failure to apply that restriction is a
 pre-attempt refusal.
 
+### Run the versioned compatibility manifest
+
+Validate locally before selecting any case:
+
+```bash
+a2a-bridge compatibility validate --manifest compatibility/manifest.toml
+```
+
+`compatibility run` is a billable orchestration boundary even when a negative control is expected to
+fail before the prompt. It refuses before manifest access unless `--acknowledge-billable` is present and
+requires `--lane`, repeated `--case`, or explicit `--all`; never use `--all` as a convenience default.
+Pass the exact `environment_owner` recorded by the selected cases and write the aggregate outside any
+normal or bare Git repository. The runner canonicalizes and descriptor-pins that parent, then rechecks
+its identity before and during descriptor-relative scratch/output creation so a retarget cannot redirect
+an effect into the replacement object. It writes a valid blocking setup-incomplete aggregate immediately;
+if scratch or candidate staging then fails, inspect that artifact rather than treating an empty file as
+run evidence:
+
+```bash
+a2a-bridge compatibility run \
+  --manifest compatibility/manifest.toml \
+  --case <exact-case-id> \
+  --environment-owner <exact-owner-id> \
+  --acknowledge-billable \
+  --out /private/tmp/<new-aggregate>.json
+```
+
+The runner takes one bounded snapshot of this candidate binary, stages the exact bytes privately, records
+the SHA-256 and byte length in the aggregate, and invokes that snapshot's existing `smoke` command once
+per eligible minimal bridge case. It refuses staged digest drift, publishes the candidate inode as
+owner-executable but non-writable mode `0500`, executes the verified file object instead of reopening
+its name, and reads/removes smoke artifacts relative to the retained scratch
+descriptor. It rechecks cancellation and full timeout headroom after hashing at the actual spawn boundary;
+on Linux, the staged child closes compatibility-only executable/scratch descriptors before ACP descendants.
+Direct CLI/ACP,
+representative, wrong-owner/platform, and missing-prerequisite cases are retained as explicit unrun rows.
+Use structured non-secret prerequisites: `{ name = "PATH" }` requires presence, while
+`{ name = "A2A_BRIDGE_ALLOW_FABLE", one_of = ["1", "true"] }` requires an accepted exact value.
+API-key cases also bind the smoke's exact credential environment name and presence. A case does not start
+unless its token cap and any observable cost cap fit the remaining aggregate budget; final-case elapsed
+overflow is blocking. Ctrl-C allows an already-running smoke to finish its bounded cleanup and starts no next case. Never treat
+a floating pass as promotion, rewrite a baseline from a run, or route a failed case to another provider.
+Use `compatibility compare --current <aggregate>` against the checked-in pinned baseline; any changed
+case/aggregate outcome, provenance, capability, auth, phase, terminal, or diagnostic dimension requires
+review. Pinned adapter/CLI versions are complete semantic versions; remote API pins must name
+`provider`, `api`, and `api_version`. Alias-shaped raw model IDs remain valid only when the successful
+effective identity is exactly the requested pin. The candidate
+path, digest, and byte length are recorded in each aggregate for release review; they are not normalized
+away or treated as a baseline-owned provider pin.
+
 ### Plan, then explicitly run, a trusted host verification
 
 After a failed read-only container smoke, use the local planner only when its artifact is complete schema

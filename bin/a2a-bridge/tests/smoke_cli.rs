@@ -151,6 +151,32 @@ fn acknowledged_pre_spawn_failure_emits_artifact_before_nonzero_exit() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn direct_smoke_ignores_legacy_ambient_compatibility_descriptors() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.toml");
+    let output = smoke_command(&missing)
+        .arg("--acknowledge-billable")
+        .env("_A2A_BRIDGE_INTERNAL_COMPAT_EXECUTABLE_FD", "999999")
+        .env("_A2A_BRIDGE_INTERNAL_COMPAT_SCRATCH_FD", "999998")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let artifact: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("ambient compatibility state must not suppress the normal failure artifact");
+    assert_eq!(
+        artifact["diagnostics"]["failure"]["code"],
+        "smoke.config_path"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("inherited descriptor"),
+        "ambient internal names must not alter a direct smoke: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn explicit_out_gets_failure_artifact_and_stdout_stays_empty() {
     let dir = tempfile::tempdir().unwrap();

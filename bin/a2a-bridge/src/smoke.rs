@@ -73,6 +73,8 @@ struct SmokeArgs {
     include_redacted_stderr: bool,
     out: Option<PathBuf>,
     fallback_guard: Option<FallbackSmokeGuard>,
+    internal_compat_executable_fd: Option<i32>,
+    internal_compat_scratch_fd: Option<i32>,
 }
 
 fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
@@ -106,6 +108,8 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
     let mut expected_source_mount_object_sha256 = None;
     let mut fallback_source_agent = None;
     let mut require_host_fallback_eligible = false;
+    let mut internal_compat_executable_fd = None;
+    let mut internal_compat_scratch_fd = None;
     let mut acknowledged = false;
 
     let mut it = args.iter();
@@ -225,6 +229,19 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
                 return Err("smoke: duplicate --require-host-fallback-eligible".into());
             }
             "--require-host-fallback-eligible" => require_host_fallback_eligible = true,
+            "--internal-compat-executable-fd" if internal_compat_executable_fd.is_some() => {
+                return Err("smoke: duplicate --internal-compat-executable-fd".into());
+            }
+            "--internal-compat-executable-fd" => {
+                internal_compat_executable_fd =
+                    Some(value(&mut it, "--internal-compat-executable-fd")?);
+            }
+            "--internal-compat-scratch-fd" if internal_compat_scratch_fd.is_some() => {
+                return Err("smoke: duplicate --internal-compat-scratch-fd".into());
+            }
+            "--internal-compat-scratch-fd" => {
+                internal_compat_scratch_fd = Some(value(&mut it, "--internal-compat-scratch-fd")?);
+            }
             other => {
                 return Err(format!("smoke: unknown argument {other:?}\n{SMOKE_USAGE}").into());
             }
@@ -278,6 +295,30 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
         .is_some_and(|path| path.as_os_str().is_empty())
     {
         return Err("smoke: --session-cwd requires a non-empty directory path".into());
+    }
+
+    let parse_internal_fd = |raw: Option<String>, flag: &str| -> Result<Option<i32>, BoxError> {
+        raw.map(|raw| {
+            raw.parse::<i32>().ok().filter(|fd| *fd > 2).ok_or_else(|| {
+                format!("smoke: {flag} must be an integer greater than stderr").into()
+            })
+        })
+        .transpose()
+    };
+    let internal_compat_executable_fd = parse_internal_fd(
+        internal_compat_executable_fd,
+        "--internal-compat-executable-fd",
+    )?;
+    let internal_compat_scratch_fd =
+        parse_internal_fd(internal_compat_scratch_fd, "--internal-compat-scratch-fd")?;
+    if internal_compat_executable_fd.is_some() != internal_compat_scratch_fd.is_some() {
+        return Err(
+            "smoke: internal compatibility descriptor flags must be supplied together".into(),
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    if internal_compat_executable_fd.is_some() {
+        return Err("smoke: internal compatibility descriptors are supported only on Linux".into());
     }
 
     let guard_count = usize::from(expected_config_sha256.is_some())
@@ -375,6 +416,8 @@ fn parse_args(args: &[String]) -> Result<SmokeArgs, BoxError> {
         include_redacted_stderr,
         out,
         fallback_guard,
+        internal_compat_executable_fd,
+        internal_compat_scratch_fd,
     })
 }
 
@@ -1933,6 +1976,9 @@ pub(crate) async fn smoke_cmd(args: &[String]) -> Result<(), BoxError> {
         return Ok(());
     }
     let args = parse_args(args)?;
+    crate::compatibility::close_inherited_compatibility_executable(
+        args.internal_compat_executable_fd,
+    )?;
     if args
         .out
         .as_deref()
@@ -1942,6 +1988,10 @@ pub(crate) async fn smoke_cmd(args: &[String]) -> Result<(), BoxError> {
     }
     // Prove the selected evidence destination is writable before a provider process/request can exist.
     let mut artifact_file = prepare_artifact_file(args.out.as_deref(), &args.config)?;
+    crate::compatibility::close_inherited_compatibility_scratch(
+        args.internal_compat_scratch_fd,
+        args.out.as_deref(),
+    )?;
     bridge_observ::init_stderr();
     let artifact = run_attempt(&args).await;
     let success = artifact.success;
@@ -2181,6 +2231,8 @@ mod tests {
             include_redacted_stderr: false,
             out: None,
             fallback_guard: None,
+            internal_compat_executable_fd: None,
+            internal_compat_scratch_fd: None,
         }
     }
 
@@ -2245,6 +2297,24 @@ mod tests {
             parse_args(&cli_args(&[])).unwrap().timeout_secs,
             DEFAULT_TIMEOUT_SECS
         );
+        assert!(parse_args(&cli_args(&["--internal-compat-executable-fd", "9"])).is_err());
+        assert!(parse_args(&cli_args(&[
+            "--internal-compat-executable-fd",
+            "2",
+            "--internal-compat-scratch-fd",
+            "10"
+        ]))
+        .is_err());
+        let internal = parse_args(&cli_args(&[
+            "--internal-compat-executable-fd",
+            "9",
+            "--internal-compat-scratch-fd",
+            "10",
+        ]));
+        #[cfg(target_os = "linux")]
+        assert!(internal.is_ok());
+        #[cfg(not(target_os = "linux"))]
+        assert!(internal.is_err());
 
         let digest = "0000000000000000000000000000000000000000000000000000000000000000";
         assert!(parse_args(&cli_args(&["--expected-config-sha256", digest])).is_err());

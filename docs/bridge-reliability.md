@@ -133,6 +133,10 @@ plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
 - Maintain two lanes:
   - **pinned:** exact production package/image versions; release-blocking;
   - **floating-current:** newly resolved packages/models; advisory until promoted deliberately.
+- After the manifest/runner, pinned/floating, and owner-bound scheduling core is merged, add OpenRouter
+  and OpenCode as independent explicit provider increments before R4. Credentials remain environment-only;
+  each integration must pass local fake/corpus gates before a separately authorized live smoke, and
+  neither becomes an automatic fallback target.
 - Run a cheap minimal canary daily and a representative review workflow weekly.
 - Trigger both lanes on adapter, protocol-crate, agent-CLI, image, auth, or model-policy changes.
 - Persist machine-readable outcomes and diff them against the previous successful run.

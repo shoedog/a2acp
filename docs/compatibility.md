@@ -54,6 +54,22 @@ retention remains R2.
 
 ## Evidence required for an update
 
+R3a provides `a2a-bridge compatibility validate|run|compare`, but its checked-in manifest and pinned
+baseline intentionally contain zero cases. R3b owns the first reviewed pinned rows. Do not add a case,
+baseline entry, or PASS row merely to exercise the runner: deterministic missing-config controls prove
+the orchestration without spending a provider turn, while support evidence still requires the exact
+candidate binary and environment named below.
+
+Pinned adapter and CLI identities use one complete semantic version. Remote API support rows must pin
+provider, API, and API-version identities rather than a generic execution row. A raw advertised model ID
+may share an alias spelling, but a fallback resolution is blocking effective-model drift. Baseline
+comparison retains per-case runner/not-run/budget outcomes and aggregate success/cancellation/budget
+state; it intentionally omits variable token and cost quantities while retaining cap violations. A
+pinned `support` row is release-blocking unless it actually completed and matched its expectation;
+`UNKNOWN` or `STALE` never turns an unrun support row green. The runner syncs blocking setup evidence
+first and atomically replaces it with the final aggregate, so finalization failure does not publish
+partially overwritten JSON.
+
 Use the release-mode candidate's `smoke` command for the minimal live turn. Do not add or refresh a PASS
 row from unit tests, an unacknowledged refusal, a source-tree helper, or a stale installed binary. Retain the
 versioned smoke artifact under disposable/operator evidence storage (not this repository), and record every

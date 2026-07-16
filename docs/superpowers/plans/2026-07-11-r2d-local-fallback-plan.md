@@ -1,8 +1,8 @@
 # R2d — Local non-billable fallback-plan implementation plan
 
-- **Status:** APPROVED / PENDING MERGE — the initial review and closure re-reviews 1–7 returned
-  `REVISE`; closure re-review 8 returned `APPROVE` on the exact v23 candidate; deterministic gates are
-  green
+- **Status:** MERGED at `a6fec94c` by PR #29 — the initial review and closure re-reviews 1–7 returned
+  `REVISE`; closure re-review 8 returned `APPROVE` on the exact v23 candidate; deterministic and CI
+  gates are green
 - **Prerequisites:** R2b and R2c merged (`be54bc51`, PR #28)
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md),
@@ -348,13 +348,13 @@ sole review-7 ledger finding `FIXED`, found no new `WRONG` or `SMELL`, and retur
 Claude, or live/billable smoke ran for this closure; R2d behavior remains proven by deterministic
 pre-spawn fixtures, and the R2c live result remains historical evidence only.
 
-R2d is `APPROVED / PENDING MERGE`; non-draft PR #29 is open. R2e remains
-`DEFERRED / BLOCKED BY POLICY`; after merge the active reliability slice becomes R3.
+R2d is `MERGED` at `a6fec94c` by PR #29. R2e remains `DEFERRED / BLOCKED BY POLICY`; R3a is active on
+`agent/reliability-r3a-manifest-runner`.
 
 Non-draft PR #29 exposed one CI-only boundary after approval: LLVM coverage's full dev debuginfo made
 the instrumented bridge exceed the unchanged 256 MiB planner evidence cap, so 11 of the 24 planner tests
 failed closed before their intended assertions. Fold `15174d0` scopes `CARGO_PROFILE_DEV_DEBUG=0` only
 to the workspace coverage step, leaving product code, tests, the cap, and all coverage thresholds
 unchanged. The instrumented planner control passes **24/0** and the replacement GitHub Build/Lint/Coverage
-run plus CLA check pass. Merge only after one exact-head Sol/xhigh review confirms this CI-only fold;
-then advance the active reliability slice to R3.
+run plus CLA check pass. The merge commit is the durable release boundary; subsequent compatibility work
+starts from that exact main head.

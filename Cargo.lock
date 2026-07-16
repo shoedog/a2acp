@@ -31,6 +31,7 @@ dependencies = [
  "notify",
  "reqwest",
  "ring",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

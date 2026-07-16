@@ -1,0 +1,9 @@
+# R3a establishes the versioned schema and local runner. R3b deliberately adds the reviewed pinned
+# cases; R3c adds floating-current candidates. Keeping this first manifest empty prevents an R3a
+# checkout from acquiring a billable default merely because the runner exists.
+schema_version = 1
+
+[budget]
+timeout_secs = 1800
+max_tokens = 500000
+max_cost_usd = 5.0
