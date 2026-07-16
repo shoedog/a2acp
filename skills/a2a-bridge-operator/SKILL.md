@@ -111,10 +111,12 @@ agent/mode, and target marker; both directory objects carry a plan-time canonica
 descriptor-derived persistent-object fingerprint. Filesystems without a durable object ID/handle refuse
 planning. The later smoke rechecks the closed guard before spawn; same-mount symlink/sibling,
 source-mount symlink retarget, or inode-reuse replacement fails closed. Because its target is already
-proven unsandboxed ACP, it performs no container recovery or run-end sweep and records the backstop as
-`not_needed`. Inspect the plan and invoke it only as a separate explicit billable operator action; never
-strip/reconstruct its guard flags, call it a retry of the original task, or infer that fixed `PONG` proves
-the original arbitrary prompt would succeed.
+proven unsandboxed ACP, guarded composition ignores target `session_cwd`/`cwd` aliases and uses the
+pinned object-addressed cwd for native MCP/Kiro inputs, process redaction, and ACP session configuration.
+It performs no container recovery or run-end sweep and records the backstop as `not_needed`. Inspect the
+plan and invoke it only as a separate explicit billable operator action; never strip/reconstruct its guard
+flags, call it a retry of the original task, or infer that fixed `PONG` proves the original arbitrary
+prompt would succeed.
 
 When an agent runtime launches the command, distinguish its managed sandbox from approved host
 execution. A sandboxed ACP failure does not prove that the computer lacks DNS, egress, or authentication;

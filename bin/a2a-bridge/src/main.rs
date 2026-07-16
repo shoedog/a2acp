@@ -373,6 +373,16 @@ fn acp_spawn_inputs(
     owner_config_path: &std::path::Path,
     run: &bridge_core::run_identity::RunHandle,
 ) -> Result<(String, Vec<String>, bridge_acp::acp_backend::AcpConfig), BridgeError> {
+    acp_spawn_inputs_with_cwd_binding(entry, cwd, owner_config_path, run, false)
+}
+
+fn acp_spawn_inputs_with_cwd_binding(
+    entry: &AgentEntry,
+    cwd: PathBuf,
+    owner_config_path: &std::path::Path,
+    run: &bridge_core::run_identity::RunHandle,
+    preserve_object_cwd: bool,
+) -> Result<(String, Vec<String>, bridge_acp::acp_backend::AcpConfig), BridgeError> {
     use bridge_core::domain::MountAccess;
     // Increment A: a `:ro` reader carries the run-id in its name (no same-owner concurrent clash) + the
     // full managed label set (so `recover_orphans`/`containers` classify it). `repo`/`cwd` are display-only.
@@ -381,9 +391,18 @@ fn acp_spawn_inputs(
     // possibly stale) entry. Canonicalize the cwd used for MCP `{cwd}` so the agent deterministically
     // hits the warmed entry (warm the SAME canonical path). The `:rw` implementor already does this via
     // `rw_canon`. Falls back to the raw cwd if canonicalize fails (e.g. unit tests, missing dir).
-    let mcp_cwd = std::fs::canonicalize(&cwd)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| cwd_str.clone());
+    let mcp_cwd = if preserve_object_cwd {
+        if !cwd.is_absolute() {
+            return Err(BridgeError::ConfigInvalid {
+                reason: "pinned host composition cwd must be absolute".into(),
+            });
+        }
+        cwd_str.clone()
+    } else {
+        std::fs::canonicalize(&cwd)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| cwd_str.clone())
+    };
     if let Some(sandbox) = &entry.sandbox {
         bridge_core::sandbox::validate_container_infrastructure(sandbox)?;
     }
@@ -915,56 +934,72 @@ fn make_spawn_fn(
         let host_process_cwd = host_process_cwd.clone();
         Box::pin(async move {
             // Ordinary host children inherit the bridge cwd; AcpConfig.cwd is their ACP session cwd.
-            // Guarded fallback instead fchdirs the child to a pinned directory object and gives ACP
-            // an object-addressed absolute session cwd installed below.
-            let resolved =
-                resolve_static_session_cwd(entry.session_cwd.as_deref(), entry.cwd.as_deref());
-            let cwd = {
-                let p = PathBuf::from(&resolved);
-                if p.is_absolute() {
-                    p
-                } else {
-                    std::env::current_dir()
-                        .map_err(|e| BridgeError::ConfigInvalid {
-                            reason: format!("cwd: {e}"),
-                        })?
-                        .join(p)
+            // Guarded fallback instead composes every cwd-derived input from the pinned object's stable
+            // absolute path, then fchdirs the child to that object. Never dereference entry cwd aliases
+            // after the fallback guard has authorized the separate trusted-repo descriptor.
+            use bridge_core::domain::AgentKind;
+            if let Some(pinned) = host_process_cwd.as_ref() {
+                if !matches!(entry.kind, AgentKind::Acp) || entry.sandbox.is_some() {
+                    return Err(BridgeError::ConfigInvalid {
+                        reason: "pinned host cwd can only be applied to an unsandboxed ACP target"
+                            .into(),
+                    });
+                }
+                if !pinned.acp_session_cwd.is_absolute() {
+                    return Err(BridgeError::ConfigInvalid {
+                        reason: "pinned host ACP cwd must be absolute".into(),
+                    });
+                }
+            }
+            let cwd = match host_process_cwd.as_ref() {
+                Some(pinned) => pinned.acp_session_cwd.clone(),
+                None => {
+                    let resolved = resolve_static_session_cwd(
+                        entry.session_cwd.as_deref(),
+                        entry.cwd.as_deref(),
+                    );
+                    let p = PathBuf::from(&resolved);
+                    if p.is_absolute() {
+                        p
+                    } else {
+                        std::env::current_dir()
+                            .map_err(|e| BridgeError::ConfigInvalid {
+                                reason: format!("cwd: {e}"),
+                            })?
+                            .join(p)
+                    }
                 }
             };
-            use bridge_core::domain::AgentKind;
             match entry.kind {
                 AgentKind::Acp => {
                     // Compose-or-raw + the `:ro` reaper via the shared helper (both factories agree).
-                    let (program, argv, mut acp) =
-                        match acp_spawn_inputs(&entry, cwd, &owner_config_path, &run) {
-                            Ok(inputs) => inputs,
-                            Err(error) => {
-                                if let BridgeError::AgentFailure { diagnostic } = &error {
-                                    if diagnostic.failed_phase()
-                                        == bridge_core::diagnostics::DiagnosticPhase::Spawn
-                                        && diagnostic.class().is_container_fallback_class()
-                                    {
-                                        observe_static_container_spawn_failure(
-                                            &observer, diagnostic,
-                                        )
+                    let inputs = if host_process_cwd.is_some() {
+                        acp_spawn_inputs_with_cwd_binding(
+                            &entry,
+                            cwd,
+                            &owner_config_path,
+                            &run,
+                            true,
+                        )
+                    } else {
+                        acp_spawn_inputs(&entry, cwd, &owner_config_path, &run)
+                    };
+                    let (program, argv, mut acp) = match inputs {
+                        Ok(inputs) => inputs,
+                        Err(error) => {
+                            if let BridgeError::AgentFailure { diagnostic } = &error {
+                                if diagnostic.failed_phase()
+                                    == bridge_core::diagnostics::DiagnosticPhase::Spawn
+                                    && diagnostic.class().is_container_fallback_class()
+                                {
+                                    observe_static_container_spawn_failure(&observer, diagnostic)
                                         .await?;
-                                    }
                                 }
-                                return Err(error);
                             }
-                        };
+                            return Err(error);
+                        }
+                    };
                     if let Some(pinned) = host_process_cwd.as_ref() {
-                        if acp.container.is_some() {
-                            return Err(BridgeError::ConfigInvalid {
-                                reason: "pinned host cwd cannot be applied to a container target"
-                                    .into(),
-                            });
-                        }
-                        if !pinned.acp_session_cwd.is_absolute() {
-                            return Err(BridgeError::ConfigInvalid {
-                                reason: "pinned host ACP cwd must be absolute".into(),
-                            });
-                        }
                         acp.cwd = pinned.acp_session_cwd.clone();
                     }
                     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -7148,6 +7183,98 @@ mod cli_tests {
             );
             assert!(sanitized.contains("REDACTED KNOWN SECRET"));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn guarded_spawn_ignores_retargeted_static_cwd_for_native_mcp() {
+        use bridge_core::mcp::{McpDelivery, McpServerSpec};
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let owned_repo = temp.path().join("owned");
+        std::fs::create_dir(&owned_repo).unwrap();
+        let shared_alias = temp.path().join("source-link");
+        symlink(&owned_repo, &shared_alias).unwrap();
+
+        let snapshot =
+            crate::local_file::snapshot_directory(&owned_repo, "guarded spawn test").unwrap();
+        let pinned = crate::local_file::PinnedDirectory::open(
+            &owned_repo,
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "guarded spawn test",
+        )
+        .unwrap();
+        let object_cwd = pinned.acp_session_cwd();
+        let argv_log = temp.path().join("argv.log");
+        let adapter = temp.path().join("codex-acp");
+        std::fs::write(
+            &adapter,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {argv_log:?}\nexit 99\n"),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&adapter).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&adapter, permissions).unwrap();
+
+        let mut entry = acp_entry("guarded-codex");
+        entry.cmd = Some(adapter.to_string_lossy().into_owned());
+        entry.session_cwd = Some(shared_alias.to_string_lossy().into_owned());
+        entry.host_fallback_eligible = true;
+        entry.mcp_delivery = McpDelivery::CodexNative;
+        entry.mcp = vec![McpServerSpec {
+            name: "prism".into(),
+            command: "/opt/prism".into(),
+            args: vec!["--repo".into(), "{cwd}".into()],
+            env: vec![],
+        }];
+
+        // Model the review's post-authorization schedule: the source check already retained the exact
+        // owned-repo descriptor, then the shared config alias was retargeted before lazy resolution.
+        std::fs::remove_file(&shared_alias).unwrap();
+        symlink(temp.path(), &shared_alias).unwrap();
+        let broadened = std::fs::canonicalize(&shared_alias).unwrap();
+
+        let policy: std::sync::Arc<dyn bridge_core::ports::PolicyEngine> =
+            std::sync::Arc::new(AutoPolicy);
+        let spawn = make_spawn_fn(
+            policy,
+            temp.path().join("a2a-bridge.toml"),
+            bridge_core::run_identity::RunHandle {
+                instance_id: "guarded-retarget".into(),
+                host: "host".into(),
+                lease: "/lease".into(),
+                start: "0".into(),
+            },
+            None,
+            1,
+            None,
+            Some(HostProcessCwd {
+                pinned_directory: pinned.file_handle(),
+                acp_session_cwd: object_cwd.clone(),
+                retain_descriptor_after_exec: pinned.retain_descriptor_after_exec(),
+            }),
+        );
+        let observer: std::sync::Arc<dyn bridge_core::ports::DiagnosticObserver> =
+            std::sync::Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default());
+        // The fake adapter does not implement ACP; only its already-composed argv is under test.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            spawn(std::sync::Arc::new(entry), observer),
+        )
+        .await;
+
+        let argv = std::fs::read_to_string(&argv_log).expect("adapter must record composed argv");
+        let object_cwd = object_cwd.to_string_lossy();
+        assert!(
+            argv.contains(object_cwd.as_ref()),
+            "guarded MCP argv must use pinned object cwd {object_cwd:?}: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&broadened.to_string_lossy().into_owned()),
+            "guarded MCP argv leaked retargeted static cwd {broadened:?}: {argv:?}"
+        );
     }
 
     #[test]

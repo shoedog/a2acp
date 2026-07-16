@@ -193,9 +193,11 @@ the generated smoke still contains `--acknowledge-billable`. At action time the 
 and executable and revalidates the exact cwd object, the exact source-mount object and containment, and
 the target marker before any agent spawn. Same-mount symlink/sibling, mount-symlink retarget, or
 inode-reuse replacement fails closed. Because the guarded target is already proven to be unsandboxed
-ACP, that smoke does not call the container runtime for recovery or run-end cleanup and records the
-backstop as `not_needed`. Never reconstruct or omit the generated guard flags by hand, and never treat a
-fixed `PONG` as a retry/resume of the original task.
+ACP, guarded composition ignores its configured `session_cwd`/`cwd` aliases and uses the pinned
+object-addressed cwd for native MCP/Kiro inputs, process redaction, and ACP session configuration. That
+smoke does not call the container runtime for recovery or run-end cleanup and records the backstop as
+`not_needed`. Never reconstruct or omit the generated guard flags by hand, and never treat a fixed
+`PONG` as a retry/resume of the original task.
 
 ## 5. Inspect / clean up containers
 

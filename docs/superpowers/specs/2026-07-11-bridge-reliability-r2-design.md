@@ -1,7 +1,7 @@
-# Bridge reliability R2 — provenance and phase-specific diagnostics (design, v21)
+# Bridge reliability R2 — provenance and phase-specific diagnostics (design, v22)
 
 - **Status:** R2a, R2b0–R2b3, and R2c merged; R2d is **IN REVIEW** on
-  `agent/reliability-r2d-fallback-plan`; v21 is the design of record for R2b–R2e
+  `agent/reliability-r2d-fallback-plan`; v22 is the design of record for R2b–R2e
 - **R2d review state:** the initial bridge-mediated `gpt-5.6-sol`/`xhigh` security review of exact
   candidate `b6424d725e56d1f3fde0b7c29b6057155d69dacd` returned `REVISE`; its nine findings were folded at
   `0b05c409cbbf9441348b2719a537f8f4978216a3`. Closure re-review 1 of that exact fold also returned
@@ -32,8 +32,13 @@
   persists the source mount's canonical path and durable object fingerprint through the plan/action
   guard, replaces the copied queue with a roadmap pointer, and aligns `AGENTS.md`. Current focused gates
   are planner **24 / 0**, smoke **22 / 0**, and local-file **7 / 0**; a Linux container also passes
-  planner **24 / 0** and local-file **7 / 0**. The changed-tree full serial workspace passes
-  **1,984 / 0 / 12 ignored** across 69 executables; format/diff, all-target check,
+  planner **24 / 0** and local-file **7 / 0**. Closure re-review 6 of exact
+  `379c3acc199fb58e6d6e1a8a8318470737ce6e8c` adjudicated all three v21 findings `FIXED`, then returned
+  `REVISE`: guarded native MCP/Kiro composition still dereferenced a target static-cwd alias after mount
+  authorization, and the roadmap next action still named an already completed commit step. V22 composes
+  every guarded cwd-derived input from the pinned object path before spawn, leaves ordinary behavior
+  unchanged, and aligns the cursor. The changed-tree full serial workspace passes
+  **1,985 / 0 / 12 ignored** across 69 executables; format/diff, all-target check,
   warnings-denied Clippy, release, and hygiene **37/7** are clean. Final closure remains pending.
 - **R2b3 review state:** implementation plus four committed review folds; fresh Sol/xhigh closure
   re-review 3 returned `REVISE` with one shared-process ownership blocker, one raw-JSON correctness item,
@@ -456,6 +461,16 @@ a forged mount fingerprint is independently refused. The same fold removes the o
 and makes `AGENTS.md` point directly to the roadmap status authority. The mount is only authorization
 evidence: after that check, host execution never reads the source path and instead retains the separately
 guarded trusted-repo descriptor through target execution.
+
+Closure re-review 6 found one remaining alias consumer: after the source check, ordinary ACP spawn
+composition resolved the marked target entry's configured `session_cwd`/`cwd`, rendered it into native
+MCP or Kiro inputs and the process redactor, and only afterward replaced the ACP session cwd with the
+pinned object path. If the target static cwd shared the source-mount symlink, a post-check retarget changed
+spawn inputs. V22 selects the pinned object-addressed cwd before any guarded composition, preserves it
+without ordinary canonicalization, and ignores target static-cwd aliases throughout guarded spawn. The
+production-spawn regression failed pre-v22 with the broader path in the real adapter argv and now admits
+only the pinned object path on macOS and Linux. Ordinary non-guarded composition retains its prior
+canonicalization.
 
 The first v18 full-suite run caught a direct smoke-side `BridgeError::agent_failure` introduced while
 transporting the local cwd-drift refusal. The final v18 fold carries an optional static diagnostic in the
@@ -1232,6 +1247,9 @@ Requirements:
   mount and durable-object fingerprint, the source agent, and the required host marker. The smoke accepts
   the complete guard only as a closed set and rechecks config bytes, executable bytes, exact cwd identity,
   exact source-mount identity and containment, and target marker before spawn.
+  Guarded spawn must then derive ACP cwd, native MCP/Kiro `{cwd}` substitution, and process redaction only
+  from the pinned object-addressed trusted cwd; configured target `session_cwd`/`cwd` aliases are not
+  dereferenced. Ordinary non-guarded spawn retains its static-cwd canonicalization contract.
   Because the guarded target is necessarily unsandboxed ACP, this smoke skips container orphan recovery
   and run-end sweeping, records the backstop as `not_needed`, and therefore does not consult the degraded
   runtime. Drift fails closed.

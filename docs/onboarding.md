@@ -79,8 +79,10 @@ argv. The exact repo and source-mount objects each carry a plan-time canonical p
 descriptor-derived persistent-object fingerprint in the closed action guard. A guarded host smoke
 revalidates both exact directory objects plus the source/target/config/executable guard before spawn; a
 same-mount symlink/sibling, source-mount symlink retarget, or inode-reuse replacement fails closed.
-Filesystems without a durable object ID/handle cannot emit an eligible plan. It does not invoke the
-degraded container runtime for recovery or run-end cleanup and records that backstop as `not_needed`.
+Guarded composition ignores target `session_cwd`/`cwd` aliases and uses the pinned object-addressed cwd
+for native MCP/Kiro inputs, process redaction, and ACP session configuration. Filesystems without a
+durable object ID/handle cannot emit an eligible plan. It does not invoke the degraded container runtime
+for recovery or run-end cleanup and records that backstop as `not_needed`.
 
 This onboarding page is a stable behavior/setup surface, not the current release-status cursor. Current
 slice, review, and gate state is owned by
