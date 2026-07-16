@@ -21,6 +21,10 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ### Fixed
 
+- Production container-backed ACP starts now distinguish a runtime object that never left its pre-start
+  state from an ACP initialization failure. The bridge reports that condition as a typed container-runtime
+  fallback candidate, terminates the exact supervised runtime client before one named-container reap, and
+  keeps that ordered cleanup alive if the requesting task is cancelled.
 - Compatibility canaries now reject additional credential-shaped prerequisite names, surface
   negative/non-finite reported costs as sticky blocking observations across later usage snapshots, and
   directly cover final-sibling same-name replacement before aggregate publication. Ambiguous duplicate

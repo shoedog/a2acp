@@ -1,20 +1,18 @@
 # R3 — Compatibility manifest and canary implementation plan
 
 - **Status:** overall R3 **IN REVIEW**; R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE** on
-  `agent/reliability-r3b-pinned-lane`. Nine pinned rows are implemented; Sol/xhigh approved the pre-live
-  deterministic tree. Authorized attempt 1 passed both Codex cases and failed both Fable cases on expired
-  OAuth after prompt start. No baseline promotion ran; the post-attempt hardening is in deterministic and
-  Sol-review closure after a deadline/config-directory fold. Exact `9d10e6f` review returned `REVISE` on
-  call accounting and complete candidate binding; exact `c458045cf3d0923457519e253d22dd545363f98d`
-  closure review adjudicated both fixed, retained the resolver fixture as accepted/nonblocking, found no new
-  `WRONG` or `SMELL`, and returned `APPROVE`. The current post-`9d10e6f`
-  closure fold passes binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
-  groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates pass OAuth
-  doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
-  **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. The provider-unexercised
-  release binary is 22,966,384 bytes at SHA-256
-  `323b4e219130480c9f0cafe90fe7c36d0a64ec17467707876698a82ef574a079`; the bound manifest SHA-256 is
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`.
+  `agent/reliability-r3b-pinned-lane`. Nine pinned rows are implemented. Exact
+  `c458045cf3d0923457519e253d22dd545363f98d` Sol/xhigh review approved the pre-incident deterministic
+  tree. Authorized attempt 1 remains non-promotable stale-auth evidence; authorized attempt 2 passed both
+  host paths and failed both reader paths before prompt acceptance when their runtime objects never started.
+  The post-incident classification/cleanup fold passes binary **395 / 0 / 0**, affected bridge-core/ACP
+  **506 / 0**, and the full serial workspace **2,077 / 0 / 12 ignored** across **70** test/doc-test
+  executables. Format/diff, check, Clippy, locked release, hygiene **37/7**, manifest, and dependency-policy
+  gates are green. The provider-unexercised release binary is 22,992,864 bytes at SHA-256
+  `e409bd76e1ae92c4ab947c8f4f818282bc20a4397e2c0f554a3ddd67fb8d313e`; the bound manifest SHA-256 is
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The earlier Linux/Rust 1.94
+  binary **396 / 0 / 0** and Linux smoke CLI **15 / 0** gates predate this fold and were not rerun while
+  local new-container starts remained degraded. Fresh exact-candidate Sol/xhigh review is required.
 - **Prerequisite:** R2c/R2d merged (`a6fec94c`, PR #29); R3a merged (`3927df3f`, PR #31)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -308,15 +306,14 @@ is unchanged.
 
 - **Branch:** `agent/reliability-r3b-pinned-lane`
 - **Implementation state (2026-07-16):** nine pinned rows validate at manifest SHA-256
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-`9d10e6f`
-  closure fold passes binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
-  groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates pass OAuth
-  doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
-  **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. The provider-unexercised
-  release binary is 22,966,384 bytes at SHA-256
-  `323b4e219130480c9f0cafe90fe7c36d0a64ec17467707876698a82ef574a079`; the bound manifest SHA-256 is
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-incident fold
+  passes binary **395 / 0 / 0**, affected bridge-core/ACP **506 / 0**, and the full serial workspace
+  **2,077 / 0 / 12 ignored** across **70** test/doc-test executables. The provider-unexercised release
+  binary is 22,992,864 bytes at SHA-256
+  `e409bd76e1ae92c4ab947c8f4f818282bc20a4397e2c0f554a3ddd67fb8d313e`; the bound manifest SHA-256 is
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. All
-  format/check/Clippy/release/hygiene/manifest/dependency-policy gates are green.
+  format/check/Clippy/release/hygiene/manifest/dependency-policy gates are green. The earlier Linux/Rust
+  1.94 binary **396 / 0 / 0** and Linux smoke CLI **15 / 0** gates apply only to the pre-incident tree.
   An intermediate Linux run was **393/1** only because the container could not resolve this worktree's
   host-absolute `.git` pointer; the exact Git pointer/common-directory mounts restored repo identity and
   the unchanged test passed in the **394/0** rerun.
@@ -383,17 +380,50 @@ Bedrock/Vertex/Foundry/Anthropic-AWS/Mantle selectors use
 external host authentication and bypass first-party file OAuth, while false-like/unknown values and mounted
 reader credentials do not. The original spawned regression
 failed pre-change **1 passed / 1 failed** because the expired case reached the fake adapter. The newer
-config-directory and delayed-recovery regressions also fail pre-change. The current post-`9d10e6f`
-closure fold passes binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
-groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates pass OAuth
+config-directory and delayed-recovery regressions also fail pre-change. The pre-attempt-2 post-`9d10e6f`
+closure fold passed binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
+groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates passed OAuth
 doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
 **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. The provider-unexercised
-release binary is 22,966,384 bytes at SHA-256
+release binary was 22,966,384 bytes at SHA-256
 `323b4e219130480c9f0cafe90fe7c36d0a64ec17467707876698a82ef574a079`; the bound manifest SHA-256 is
-`5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. After a fresh host login and
-post-login sync, require both Claude host and reader doctors green
-before requesting new explicit authorization for one new four-case aggregate. Attempt 1 must never be
-replayed or promoted.
+`5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. A fresh host login, post-login
+sync, two green Claude doctors, and separate authorization then admitted one new four-case aggregate.
+Attempt 1 must never be replayed or promoted.
+
+That precondition was satisfied and the operator separately authorized attempt 2; it was a new aggregate,
+not a replay. Candidate SHA-256 `323b4e21...a079` and the same exact manifest ran once with zero
+retry/fallback. Codex/Fable host passed exact `PONG` in 6.853 s / 7.024 s. Both readers failed before
+prompt acceptance in 30.430 s / 30.541 s: local spawn completed, ACP initialize timed out, and each exact
+named container remained only `created` with a zero start timestamp. The aggregate ended non-cancelled in
+74.853 s with 54,210 observed tokens, USD 0.227602 observed cost, no drift/budget violation, no promotion,
+and all five controls unrun. It is retained owner-only at
+`/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json`, SHA-256 `319b3cf4...a9b3e`; it must never
+be retried or promoted.
+
+Both host passes, healthy proxy/network metadata, 247 GiB free host storage, and identical failures before
+reader ACP traffic falsified provider/auth/egress/disk-specific causes. A no-network
+`alpine:latest /bin/true` start also timed out before and after the two A2A objects were removed, while
+runtime `info`, image listing, and exact-container inspection remained responsive. The settled boundary is
+a local OrbStack/Docker new-container lifecycle stall; its initiating internal cause is unknown. The two
+never-started objects were later removed exactly. OrbStack, running operator/user containers, turns, and
+warm sessions were not restarted or killed.
+
+The post-attempt deterministic fold keeps doctor read-only and adds the active startability boundary at the
+actual production container spawn. A bounded exact-name runtime observer holds Spawn open while a positively
+observed object remains pre-start; deadline then emits `container.runtime.start_timeout` as
+`ContainerRuntime / ContainerFallbackCandidate`, with no Initialize transition and false prompt acceptance.
+Started state preserves the ordinary Initialize path, while unknown observations preserve the prior diagnosis
+rather than inventing container evidence. Every no-backend container error transfers exact-client
+termination plus the one named-container reap into a cancellation-safe owner and joins it on ordinary return;
+typed reap failure is retained as a bounded cause on the new start failure. The classification, cleanup order,
+and cancellation tests each fail under their exact pre-fix mutation. The production parser also covers
+Docker/Podman pre-start and started states, unknown/nonzero/oversized output, and a killed timeout with no late
+side effect. The deadline-first regression itself failed **0 / 1** before the fix with two runtime probes
+instead of one. The full host suite passes **2,077 / 0 / 12 ignored** across **70** test/doc-test executables;
+affected core/ACP tests pass **506 / 0**, and binary tests pass **395 / 0**. No additional provider turn ran.
+Fresh Sol/xhigh review is required for this post-approval implementation; only after Sol approval use one
+clean-room Fable/xhigh adversarial implementation plus release/compatibility lens, with no Fable re-review.
 
 Seed rows for every currently claimed path or control in `docs/compatibility.md`:
 

@@ -5,33 +5,33 @@
 - **Completed through:** R3a **MERGED** at `3927df3f`; R2e remains deferred and off the critical path
 - **Active slice:** R3b pinned lane on `agent/reliability-r3b-pinned-lane`
 - **Current R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-`9d10e6f`
-  closure fold passes binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
-  groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates pass OAuth
-  doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
-  **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. The provider-unexercised
-  release binary is 22,966,384 bytes at SHA-256
-  `323b4e219130480c9f0cafe90fe7c36d0a64ec17467707876698a82ef574a079`; the bound manifest SHA-256 is
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. These include mutation-proven
-  pre-change failures for the runway, `CLAUDE_CONFIG_DIR`, immediate-expiry polling, and external-provider
-  defects at every billable stage plus direct production-parser coverage. Format/diff, workspace check,
-  all-target/all-feature
-  warnings-denied Clippy, locked release
-  build, hygiene **37/7**, manifest validation, and dependency policy are green. The first Linux harness
-  reached **393 / 1** because this worktree's host-absolute `.git` pointer was unavailable in the container;
-  mounting the exact worktree pointer plus common Git directory restored repository identity, and the
-  unchanged test passed in the then-reported **394 / 0** rerun.
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-incident
+  container-start fold passes binary **395 / 0 / 0**, affected bridge-core/ACP **506 / 0**, and the full
+  serial workspace **2,077 / 0 / 12 ignored** across **70** test/doc-test executables. Exact mutations prove
+  that the never-started classification, terminate-before-reap ordering, and cancellation-safe cleanup
+  regressions each fail without their fix; the deadline-first regression separately failed **0 / 1** with
+  two runtime probes instead of one. Format/diff, workspace check, all-target/all-feature
+  warnings-denied Clippy, locked release build, hygiene **37/7**, manifest validation, and dependency
+  policy are green. The provider-unexercised release binary is 22,992,864 bytes at SHA-256
+  `e409bd76e1ae92c4ab947c8f4f818282bc20a4397e2c0f554a3ddd67fb8d313e`; the bound manifest SHA-256 is
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The earlier Linux/Rust 1.94
+  binary **396 / 0 / 0** and Linux smoke CLI **15 / 0** gates apply to the pre-incident reviewed tree, not
+  this hardening fold; they were not rerun while local new-container starts remained degraded.
   The uniquely tagged, non-operator reader candidate is
   `sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1`; it binds exact Codex and
   Claude package labels while leaving Kiro explicitly `STALE`. Fresh Sol/xhigh closure review of exact
-  `c38978a` returned `APPROVE` with no `WRONG`; its sole nonblocking backend-error test-coverage `SMELL`
-  is closed by a mutation-proven regression. No baseline promotion has run.
-- **Current R3b live gate:** authorized pinned attempt 1 ran once with zero retry/fallback against candidate
-  SHA-256 `d852cc28...4e50`. Codex host/reader passed; Fable host/reader reached prompt start and failed
-  HTTP 401 because the copied Claude access token had expired. The five non-goal rows stayed unrun, cleanup
-  completed, no budget exhausted, and the owner-only aggregate is retained at
-  `/private/tmp/a2a-bridge-r3b-live.EeBAyf/pinned-aggregate.json` (SHA-256 `7f718f32...1571c1`). This run is
-  blocking failure evidence and must not be retried or promoted.
+  `c458045` approved the pre-incident deterministic tree. The current post-incident fold still requires a
+  fresh exact-candidate Sol/xhigh review. No baseline promotion has run.
+- **Current R3b live gate:** authorized attempt 2 ran once with zero retry/fallback against candidate
+  SHA-256 `323b4e21...a079` and the same exact manifest. Codex and Fable host passed exact `PONG`; both
+  readers failed before prompt acceptance after their named containers remained only `created` and ACP
+  initialize timed out. The aggregate is retained at
+  `/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json` (SHA-256 `319b3cf4...a9b3e`), all five
+  non-goal rows stayed unrun, and no baseline was promoted. Minimal no-network container starts also timed
+  out, falsifying provider/config/egress-specific causes and localizing the incident to the OrbStack/Docker
+  new-container lifecycle; its internal initiating cause is unknown. The two never-started A2A objects were
+  later removed exactly, without restarting OrbStack or disturbing running containers. Attempt 1 remains
+  preserved stale-auth failure evidence. Neither attempt may be retried or promoted.
 - **R3a merge evidence:** the pre-change CLI regression failed because
   `compatibility` did not exist. The latest local review fold passes macOS compatibility units
   **44 / 0**, the full binary **370 / 0**, CLI **10 / 0**, and the serial workspace suite
@@ -116,23 +116,29 @@
   review of exact `c458045cf3d0923457519e253d22dd545363f98d` adjudicated both inherited `WRONG` findings
   `FIXED`, retained the resolver fixture as `ACCEPTED-NONBLOCKING`, found no new `WRONG` or `SMELL`, and
   returned `APPROVE`. It independently inspected the complete final fold and active documentation while
-  accepting the supplied build/test gates without rerunning them. Reviews are not compatibility evidence.
+  accepting the supplied build/test gates without rerunning them. Authorized live attempt 2 then exposed
+  the never-started-container gap outside that frozen review boundary. The post-incident implementation is
+  full-host-gate green with mutation-backed classification, cleanup-order, and cancellation coverage, but
+  it is **IN REVIEW** until a fresh exact-candidate Sol/xhigh review completes. Reviews are not compatibility
+  evidence.
 - **Last merged full workspace gate:** R2d host serial **1,985 / 0 / 12 ignored** across 69 executables;
   format/diff, all-target check, warnings-denied Clippy, release build, repository hygiene **37/7**, and
   PR #29 Build/Lint/Coverage plus CLA were green
 - **Current execution boundary:** R3b has four minimal bridge-smoke support cases (Codex host,
   Codex reader, Claude 0.44 host, Claude 0.55 Fable reader) and five explicit non-goal/unrun historical
-  rows (Claude direct CLI, Claude 0.55 host ACP, managed-no-egress negative, Kiro host, Kiro reader). The
-  two Claude cases are currently ineligible because doctor reports expired OAuth; the two Codex attempt-1
-  passes do not authorize partial baseline promotion. Selection and billing acknowledgement remain
-  mandatory. The checked-in baseline has the new manifest
+  rows (Claude direct CLI, Claude 0.55 host ACP, managed-no-egress negative, Kiro host, Kiro reader).
+  Attempt 2 proved current host compatibility but blocking reader-runtime failure; host passes from either
+  failed aggregate do not authorize partial baseline promotion. Selection and billing acknowledgement
+  remain mandatory. The checked-in baseline has the new manifest
   identity but intentionally has no promoted case summaries until separately authorized exact-candidate
   live artifacts are reviewed. Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** after a fresh host login and post-login sync, require both Claude host and reader doctors
-  green before requesting new explicit authorization for one new four-case aggregate.
-  Promote only an all-green aggregate, then use one clean-room Fable/xhigh adversarial implementation plus
-  release/compatibility lens. Do not rebuild or swap the running operator; OpenRouter/OpenCode remain
-  R3e/R3f after the R3 core and before R4.
+- **Next action:** finish deterministic gates and fresh Sol/xhigh review of the never-started-container
+  classification/cleanup fold. Use one clean-room Fable/xhigh adversarial implementation plus
+  release/compatibility lens only after Sol approval; no Fable re-review. Do not request another live
+  aggregate until a non-provider start control proves the local runtime recovered, both Claude doctors are
+  green, the exact new candidate is bound, and the operator separately authorizes one new four-case run.
+  Do not rebuild or swap the running operator; OpenRouter/OpenCode remain R3e/R3f after the R3 core and
+  before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**
@@ -183,7 +189,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE**. Authorized attempt 1: Codex host/reader `PASS`, Fable host/reader `FAIL` on expired OAuth after prompt start, five controls unrun, no promotion. Exact `9d10e6f` review returned `REVISE`; exact `c458045` closure review returned `APPROVE` with both inherited `WRONG` findings fixed, accepted resolver-fixture debt, and no new findings. Deterministic closure is ready; the live lane awaits fresh Claude auth, sync, both green doctors, and new authorization. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane and deliberate promotion active; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE**. Attempt 1 is non-promotable stale-auth evidence. Attempt 2 passed both host paths and failed both readers before prompt acceptance when their runtime objects never started; it also is non-promotable. The pre-incident exact `c458045` tree was Sol-approved. The mutation-backed post-incident classification/cleanup fold is full-host-gate green and awaits fresh exact-candidate Sol review, followed only on approval by one Fable adversarial implementation plus release/compatibility review. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane and deliberate promotion active; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -223,7 +229,7 @@ model/effort `session/set_config_option` rejection can both map to `AgentCrashed
 Carry the missing structured failure projection and stale-shared-state recovery question into R2f/R3d;
 do not replay automatically or use this review as compatibility evidence.
 
-### Active incident: synchronized but expired Claude OAuth reached billable prompt
+### Resolved incident: synchronized but expired Claude OAuth reached billable prompt
 
 `INC-R3B-CLAUDE-OAUTH-EXPIRY-2026-07-16` records authorized pinned attempt 1. The exact candidate
 (`d852cc28...4e50`) and manifest (`5d18cefe...c235d828`) ran one aggregate with zero retry/fallback.
@@ -255,9 +261,57 @@ prompt, or drain once expired. Truthy exact pinned Claude third-party selectors 
 AWS/Azure/GCP/provider authentication is external; false-like/unknown values and reader mounts do not.
 Mutation-backed regressions fail pre-change when the wrong HOME credential is
 selected and when delayed recovery still reaches the fake adapter; fresh-token and ordinary-path edges still
-reach it. Do not rerun the live lane until full deterministic/review closure. After a fresh host login and
-post-login sync, require both Claude host and reader doctors green before requesting new explicit
-authorization for one new four-case aggregate.
+reach it. Full deterministic/review closure, a fresh host login, post-login sync, two green Claude doctors,
+and separate operator authorization preceded attempt 2; attempt 1 itself was never replayed.
+
+### Active incident: reader containers remained created but never started
+
+`INC-R3B-CONTAINER-START-STALL-2026-07-16` records authorized pinned attempt 2. Exact candidate SHA-256
+`323b4e21...a079` and manifest `5d18cefe...c235d828` ran one four-case aggregate with zero
+retry/fallback. Codex and Fable host returned exact `PONG` in 6.853 s / 7.024 s. Codex and Fable reader
+failed in 30.430 s / 30.541 s after local spawn completed but ACP initialize timed out; both had zero
+configure/prompt calls, terminal `not_started`, and false prompt-acceptance evidence. Their exact named
+containers existed only in state `created` with zero start timestamps and survived the detached exact-name
+reaper plus run-scoped best-effort backstop. The aggregate ended non-cancelled after 74.853 s with 54,210
+observed tokens, USD 0.227602 observed cost, no drift/budget violation, no promotion, and all five controls
+unrun. It is retained at `/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json`, SHA-256
+`319b3cf4...a9b3e`.
+
+Hypothesis/probe/result log:
+
+1. Stale auth or a provider-wide failure predicted host and reader failure. Both host lanes passed exact
+   `PONG`, while both readers failed before prompt: falsified.
+2. Egress-proxy/network degradation predicted a missing, unhealthy, or detached proxy. The proxy had been
+   running for 22 hours and remained attached to the configured internal network: falsified.
+3. Reader image, mount, credential, or agent-command defects predicted failure only under that composition.
+   A minimal no-network `alpine:latest /bin/true` start also timed out, before and after removing the two A2A
+   objects: falsified.
+4. Disk exhaustion predicted low host storage. The host retained 247 GiB free: falsified.
+5. A global new-container lifecycle stall predicted responsive metadata surfaces but blocked starts.
+   Runtime `info`, image listing, and exact-container inspection responded; `docker system df` and every
+   minimal new start hung. Both A2A objects remained `created`: supported.
+
+Settled boundary: the local OrbStack/Docker new-container lifecycle was stalled; the initiating internal
+cause is unknown. The two never-started A2A objects were later removed with one bounded exact-name command.
+No running user/operator container, bridge turn, or warm session was killed, and OrbStack was not restarted.
+The old bridge had two demonstrated product defects: it recorded local Docker-client creation as completed
+agent spawn and therefore mislabeled the failure `acp.initialize.timeout`, and it started container removal
+before the supervised Docker client had deterministically exited, without joining/reporting that attempt.
+
+The current deterministic fold adds a bounded exact-name runtime-state observer only to production
+container spawn; `doctor` remains read-only and is not claimed as a startability probe. A positively observed
+pre-start object keeps Spawn open and fails as `container.runtime.start_timeout`, class
+`ContainerRuntime`, disposition `ContainerFallbackCandidate`, with false prompt acceptance. Started state
+preserves the existing Initialize diagnosis; unknown state never manufactures container evidence. On every
+no-backend container failure, one cancellation-safe owner terminates/reaps the exact supervised client before
+joining the single named-container removal. On the new typed never-started path, a removal failure is retained
+by static typed code in the primary failure cause. Classification, ordering, cancellation, started-state,
+deadline-first polling, parser, oversized-output, and
+probe-timeout regressions are deterministic and provider-free; the classification, ordering, and cancellation
+mutations all fail on their exact pre-fix behavior, and the deadline-first test failed **0 / 1** before its
+fix. Do not request another live aggregate until full gates and
+fresh review close this fold, a non-provider control proves new-container starts recovered, both Claude
+doctors are green, and the operator separately authorizes the exact new candidate.
 
 Allowed status values are `NOT STARTED`, `IN PROGRESS`, `IN REVIEW`, `APPROVED / PENDING MERGE`,
 `MERGED`, `BLOCKED`, and `DEFERRED`. Update this table in the same PR that changes a slice status. Never
@@ -398,14 +452,14 @@ Next action:
   It also rejects a changed pinned config before provider spawn and records exact Fable-settings
   provenance only for one unambiguous host-file settings destination; duplicates remain `WARN`. The
   nine-case manifest validates at
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-`9d10e6f`
-  closure fold passes binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
-  groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates pass OAuth
-  doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
-  **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. The provider-unexercised
-  release binary is 22,966,384 bytes at SHA-256
-  `323b4e219130480c9f0cafe90fe7c36d0a64ec17467707876698a82ef574a079`; the bound manifest SHA-256 is
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. All merge/policy gates are green.
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-incident fold
+  passes binary **395 / 0 / 0**, affected bridge-core/ACP **506 / 0**, and the full serial workspace
+  **2,077 / 0 / 12 ignored** across **70** test/doc-test executables. Its provider-unexercised release
+  binary is 22,992,864 bytes at SHA-256
+  `e409bd76e1ae92c4ab947c8f4f818282bc20a4397e2c0f554a3ddd67fb8d313e`; the bound manifest SHA-256 is
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. Format/diff, check, Clippy,
+  locked release, hygiene **37/7**, manifest, and dependency-policy gates are green. The pre-incident Linux
+  gates were not rerun for this fold because local new-container starts remained degraded.
   The current expired real credentials now correctly produce Claude host **11 ok / 0 warn / 1 fail** and reader
   **18 ok / 0 warn / 1 fail**; Codex remains **10/0/0** host and **14/0/0** reader. Sol/xhigh closure
   review of exact `c38978a` returned `APPROVE` with no
@@ -424,7 +478,15 @@ Next action:
   fold closes both; its prompt-call assertion fails **0 / 1** on exact `9d10e6f` and passes **1 / 0** here.
   Its partially-progressed-resolver cleanup fixture remains an accepted nonblocking test
   debt. Fresh Sol/xhigh closure review of exact `c458045cf3d0923457519e253d22dd545363f98d` returned
-  `APPROVE` with both inherited `WRONG` findings fixed and no new `WRONG` or `SMELL`.
+  `APPROVE` with both inherited `WRONG` findings fixed and no new `WRONG` or `SMELL`; that verdict predates
+  live attempt 2 and does not cover the current container-start hardening. Fresh Sol review remains required.
+- Authorized attempt 2 is retained at
+  `/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json`, SHA-256 `319b3cf4...a9b3e`. Its exact
+  `323b4e21...a079` candidate passed both host cases and failed both reader cases before prompt acceptance
+  while their named runtime objects remained `created`; no baseline promotion or retry ran. The current
+  fold classifies only positively observed pre-start objects as typed container-runtime fallback candidates,
+  preserves the old ACP diagnosis for unknown observations, and gives exact-client termination plus one
+  named reap a cancellation-safe owner. The local OrbStack/Docker initiating cause remains unknown.
 - OpenRouter and OpenCode are recorded as R3e/R3f after the pinned/floating/scheduling core and before
   R4. Credentials remain environment-only; neither provider is eligible for automatic fallback. The
   running operator service is unchanged until a merged candidate is rebuilt and swapped during a

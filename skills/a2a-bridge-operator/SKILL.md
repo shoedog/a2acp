@@ -69,6 +69,16 @@ refresh an expired host login. After a fresh host login and post-login sync, req
 reader doctors green before requesting new explicit authorization for one new four-case aggregate. Never
 treat a successful launchd run as auth evidence.
 
+`doctor` is deliberately read-only: runtime `info` plus network/image inspection can be green while the
+runtime cannot start a new container. Do not describe green doctor output as a startability proof. During
+an actual production reader spawn, the bridge observes the exact generated container name within the same
+handshake deadline. If the runtime positively reports that object still pre-start, the attempt fails before
+Initialize/prompt as `container.runtime.start_timeout` with class `ContainerRuntime`, disposition
+`ContainerFallbackCandidate`, and false prompt acceptance. A started object retains the ordinary ACP
+Initialize diagnosis; an unknown observation never becomes container evidence. Before authorizing another
+live compatibility aggregate after this failure, require a bounded non-provider new-container start control
+to pass in addition to the normal doctors.
+
 For a minimal live compatibility probe, stop here until the implementation's deterministic timeout,
 artifact, redaction, and no-retry tests are green and the operator explicitly authorizes a billable turn.
 Then build and invoke the candidate artifact itself:
@@ -247,8 +257,12 @@ justify fallback or an automatic replay. `upstream.classification_conflict`,
 ambiguous advisory evidence, not that it inferred a provider class from it. Retry/reset hints are bounded
 metadata and never change terminal disposition.
 
-Observed container release joins one bridge-owned bounded reap flight. A successful return means that
-flight completed; `container.reap.spawn_failed`, `container.reap.timeout`,
+When container spawn fails before a backend is published, one cancellation-safe owner first terminates and
+reaps the exact supervised runtime client, then joins the exact named-container removal. An ordinary return
+means that ordered flight settled even if the original caller was canceled while waiting. On the typed
+never-started path, a failed removal is retained in the primary diagnostic causes. Observed container
+release likewise joins one bridge-owned bounded reap flight. A successful return means that flight
+completed; `container.reap.spawn_failed`, `container.reap.timeout`,
 `container.reap.nonzero_exit`, or `container.reap.worker_panicked` is a fatal accepted cleanup failure.
 All concurrent waiters receive the same result, and later observer failure cannot cancel or suppress
 cleanup. Detached drop/retirement may start the same flight but must not write late task diagnostics.

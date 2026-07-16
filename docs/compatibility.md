@@ -32,11 +32,12 @@ Containerfile.
 
 ## R3b pinned candidate — 2026-07-16
 
-The checked-in manifest preserves each claimed path as a distinct pinned case. One separately authorized
-R3b run occurred on 2026-07-16; it is blocking failure evidence, not a promoted baseline. The exact
-candidate/manifest aggregate ran once with zero retry/fallback: both Codex paths passed, while both Fable
-paths reached prompt start and failed on HTTP 401 because the shared access token had expired. The five
-historical/non-goal rows remained unrun.
+The checked-in manifest preserves each claimed path as a distinct pinned case. Two separately authorized
+R3b aggregates ran on 2026-07-16; both are blocking failure evidence, not a promoted baseline. Attempt 1
+proved stale Claude OAuth preflight: both Codex paths passed, while both Fable paths reached prompt start
+and failed HTTP 401. After credential hardening and a fresh login, attempt 2 proved a separate local
+container-runtime start outage: both host paths passed, while both readers failed before prompt acceptance.
+Each aggregate ran once with zero retry/fallback and left all five historical/non-goal rows unrun.
 
 | Case | R3b execution disposition | Release classification |
 |---|---|---|
@@ -87,9 +88,49 @@ configure, prompt, or drain after expiry. Truthy pinned Claude selectors for Bed
 Anthropic AWS, or Mantle use their
 external provider authentication instead of first-party file OAuth; false-like/unknown values and mounted
 reader credentials remain fail-closed. An expired stage is counted only after its future receives a poll;
-an unpolled prompt refusal records zero prompt calls and false prompt-acceptance evidence. After a fresh host
-login and post-login sync, require both Claude host
-and reader doctors green before requesting new explicit authorization for one new four-case aggregate.
+an unpolled prompt refusal records zero prompt calls and false prompt-acceptance evidence. Attempt 1 was
+never replayed; the fresh login, post-login sync, and two green Claude doctors admitted the separately
+authorized attempt 2 below.
+
+### R3b live attempt 2 — container start outage
+
+The owner-only aggregate at `/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json` is mode
+`0600`, 19,894 bytes, and SHA-256
+`319b3cf4b92a36b1f2e2cdd71b7a97fb6d5c4309c2f919a4e3bce39dd28a9b3e`. It binds candidate SHA-256
+`323b4e219130480c9f0cafe90fe7c36d0a64ec17467707876698a82ef574a079` and the same manifest SHA-256
+`5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`.
+
+- Codex host passed exact `PONG` in 6.853 s with 22,251 observed tokens. Claude 0.44 host passed exact
+  Fable/xhigh `PONG` in 7.024 s with 31,959 observed tokens and USD 0.227602 observed cost. Each made one
+  configure and one prompt call and completed clean teardown.
+- Codex reader and Claude 0.55 reader failed in 30.430 s / 30.541 s. Each completed the local spawn phase,
+  then reported `acp.initialize.timeout`; neither configured, prompted, started a terminal turn, nor could
+  have had a prompt accepted. Each exact named container existed only in runtime state `created`, with a
+  zero start timestamp, and survived both the detached name reaper and run-scoped best-effort backstop.
+- The aggregate ended non-cancelled after 74.853 s with success false, 54,210 observed tokens, USD 0.227602
+  observed cost, two missing token observations, three missing cost observations, no drift or budget
+  violation, and all four selected cases executed. It must not be retried or promoted.
+
+The provider-wide, credential, egress, image, and argument hypotheses were falsified: both host providers
+passed, the egress proxy/network remained healthy, and both reader failures occurred before ACP traffic.
+A minimal no-network `alpine:latest /bin/true` start also timed out before and after the two A2A objects were
+removed, while runtime `info`, image listing, and exact-container inspection remained responsive. This is
+evidence of a local OrbStack/Docker new-container lifecycle stall; its initiating internal cause remains
+unknown. The two never-started A2A objects were removed with one later bounded exact-name cleanup after the
+runtime recovered enough to accept it. OrbStack and the running operator/user containers were not restarted.
+
+The deterministic hardening following this incident keeps `doctor` read-only but adds an active exact-name
+start boundary only inside production container spawn. A runtime-observed pre-start object now fails as
+`Spawn / ContainerRuntime / ContainerFallbackCandidate` with code
+`container.runtime.start_timeout`; unknown state preserves the prior ACP diagnosis, and a started object
+preserves ordinary initialize behavior. The no-backend failure path transfers exact-client termination plus
+the single named-container removal into one cancellation-safe flight, joins it before an ordinary return,
+and the new typed never-started failure retains a cleanup code in its primary causes if removal fails. No
+additional live/provider
+turn is authorized by this hardening or by its deterministic tests. The post-incident provider-unexercised
+release binary is 22,992,864 bytes at SHA-256
+`e409bd76e1ae92c4ab947c8f4f818282bc20a4397e2c0f554a3ddd67fb8d313e`; it has not replaced or replayed
+attempt 2's exact `323b4e21...a079` live artifact.
 
 ## Resolved incident: Fable over Claude ACP
 
