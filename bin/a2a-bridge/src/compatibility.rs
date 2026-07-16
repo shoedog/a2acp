@@ -299,7 +299,23 @@ fn credential_shaped_env_name(value: &str) -> bool {
     value.split('_').any(|part| {
         matches!(
             part,
-            "KEY" | "APIKEY" | "TOKEN" | "SECRET" | "PASSWORD" | "CREDENTIAL" | "PAT"
+            "AUTH"
+                | "AUTHORIZATION"
+                | "BEARER"
+                | "COOKIE"
+                | "CRED"
+                | "CREDS"
+                | "CREDENTIAL"
+                | "CREDENTIALS"
+                | "KEY"
+                | "APIKEY"
+                | "PASS"
+                | "PASSWD"
+                | "PASSWORD"
+                | "PAT"
+                | "SECRET"
+                | "SESSION"
+                | "TOKEN"
         )
     })
 }
@@ -2054,17 +2070,34 @@ fn observed_tokens(smoke: &Value) -> Option<u64> {
         .or_else(|| smoke.pointer("/turn/usage/used").and_then(Value::as_u64))
 }
 
-fn observed_cost_usd(smoke: &Value) -> Option<f64> {
-    (smoke
-        .pointer("/turn/usage/cost/currency")
-        .and_then(Value::as_str)
-        == Some("USD"))
-    .then(|| {
-        smoke
-            .pointer("/turn/usage/cost/amount")
-            .and_then(Value::as_f64)
-    })
-    .flatten()
+enum CostObservation {
+    Missing,
+    Invalid,
+    Usd(f64),
+}
+
+fn observed_cost_usd(smoke: &Value) -> CostObservation {
+    let usage = smoke.pointer("/turn/usage");
+    if usage
+        .and_then(|usage| usage.get("cost_rejected"))
+        .is_some_and(|value| !value.is_null())
+    {
+        return CostObservation::Invalid;
+    }
+    let Some(cost) = usage.and_then(|usage| usage.get("cost")) else {
+        return CostObservation::Missing;
+    };
+    if cost.is_null() {
+        return CostObservation::Missing;
+    }
+    let amount = cost.get("amount").and_then(Value::as_f64);
+    let currency = cost.get("currency").and_then(Value::as_str);
+    match (amount, currency) {
+        (Some(amount), Some("USD")) if amount.is_finite() && amount >= 0.0 => {
+            CostObservation::Usd(amount)
+        }
+        _ => CostObservation::Invalid,
+    }
 }
 
 fn not_run_result(case: &CompatibilityCase, reason: &str) -> CaseResult {
@@ -2149,6 +2182,25 @@ fn case_environment_ready(case: &CompatibilityCase, owner: &str) -> Option<&'sta
         return Some("representative_probe_not_implemented_in_r3a");
     }
     None
+}
+
+fn pinned_config_ready(
+    loaded: &LoadedManifest,
+    case: &CompatibilityCase,
+) -> Result<(), &'static str> {
+    let Some(pins) = &case.pins else {
+        return Ok(());
+    };
+    let path = resolve_case_path(&loaded.canonical_path, &case.config);
+    match local_file::read_regular_file_bounded(
+        &path,
+        "compatibility pinned config",
+        MAX_MANIFEST_BYTES,
+    ) {
+        Ok(snapshot) if snapshot.sha256 == pins.config_sha256 => Ok(()),
+        Ok(_) => Err("config_pin_mismatch"),
+        Err(_) => Err("config_pin_unavailable"),
+    }
 }
 
 fn known_secret_values(case: &CompatibilityCase) -> Vec<String> {
@@ -2254,6 +2306,11 @@ async fn build_aggregate<I: SmokeInvoker>(
         }
         if let Some(reason) = case_environment_ready(case, environment_owner) {
             results.push(not_run_result(case, reason));
+            continue;
+        }
+        if let Err(code) = pinned_config_ready(loaded, case) {
+            results.push(runner_failure_result(case, Duration::ZERO, code));
+            prior_runner_failure = true;
             continue;
         }
         let remaining =
@@ -2400,7 +2457,7 @@ async fn build_aggregate<I: SmokeInvoker>(
             None => budget.token_observation_missing_cases += 1,
         }
         match observed_cost_usd(&smoke) {
-            Some(cost) if cost.is_finite() && cost >= 0.0 => {
+            CostObservation::Usd(cost) => {
                 let accumulated = budget.observed_cost_usd + cost;
                 if accumulated.is_finite() {
                     budget.observed_cost_usd = accumulated;
@@ -2412,7 +2469,10 @@ async fn build_aggregate<I: SmokeInvoker>(
                     budget_violations.push("case_cost_cap_exceeded".into());
                 }
             }
-            _ => budget.cost_observation_missing_cases += 1,
+            CostObservation::Missing => budget.cost_observation_missing_cases += 1,
+            CostObservation::Invalid => {
+                budget_violations.push("case_cost_observation_invalid".into());
+            }
         }
         if started.elapsed() > Duration::from_secs(budget_config.timeout_secs) {
             budget_violations.push("total_timeout_exceeded".into());
@@ -3584,6 +3644,28 @@ agent_cli = "@openai/codex=0.144.1"
             "required_env = [{ name = \"A2A_BRIDGE_ALLOW_FABLE\", one_of = [\"1\", \"true\"] }]",
         );
         parse_and_validate(&value_bound_prerequisite).unwrap();
+
+        for credential_name in [
+            "CLAUDE_AUTH",
+            "HTTP_AUTHORIZATION",
+            "SERVICE_BEARER",
+            "SESSION_COOKIE",
+            "DB_PASS",
+            "DB_PASSWD",
+            "AWS_CREDS",
+            "AWS_CREDENTIALS",
+        ] {
+            let misclassified = valid_pinned_toml().replace(
+                "required_env = []",
+                &format!("required_env = [{{ name = {credential_name:?} }}]"),
+            );
+            assert!(
+                parse_and_validate(&misclassified)
+                    .unwrap_err()
+                    .contains("credential_env, not required_env"),
+                "credential-shaped prerequisite {credential_name:?} must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -3974,6 +4056,93 @@ agent_cli = "@openai/codex=0.144.1"
     }
 
     #[tokio::test]
+    async fn invalid_reported_cost_is_explicit_and_blocks_later_cases() {
+        for invalid_cost in [
+            json!({"amount": -0.01, "currency": "USD"}),
+            json!({"amount": "NaN", "currency": "USD"}),
+            json!({"amount": "Infinity", "currency": "USD"}),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let first = case("first", EvidenceStatus::Pass);
+            let second = case("second", EvidenceStatus::Pass);
+            let mut first_smoke = smoke(&first, true, Some(1));
+            first_smoke["turn"]["usage"]["cost"] = invalid_cost;
+            let invoker = FakeInvoker::new(vec![
+                invocation(first_smoke),
+                invocation(smoke(&second, true, Some(1))),
+            ]);
+            let loaded = loaded(dir.path(), vec![first, second]);
+            let cancelled = AtomicBool::new(false);
+            let candidate = candidate_identity();
+            let selection = selection();
+            let selected_indices = [0, 1];
+
+            let aggregate = build_aggregate(
+                AggregateInputs {
+                    loaded: &loaded,
+                    candidate: &candidate,
+                    selection: &selection,
+                    selected_indices: &selected_indices,
+                    environment_owner: "test-runner",
+                    scratch: dir.path(),
+                    cancellation_requested: &cancelled,
+                },
+                &invoker,
+            )
+            .await;
+
+            assert_eq!(&*invoker.calls.lock().unwrap(), &["first"]);
+            assert_eq!(
+                aggregate.results[0].budget_violations,
+                ["case_cost_observation_invalid"]
+            );
+            assert_eq!(aggregate.budget.cost_observation_missing_cases, 0);
+            assert!(aggregate.budget.exhausted);
+            assert_eq!(
+                aggregate.results[1].not_run_reason.as_deref(),
+                Some("total_budget_exhausted")
+            );
+            assert!(!aggregate.success);
+        }
+    }
+
+    #[tokio::test]
+    async fn smoke_rejected_nonfinite_cost_is_explicit_and_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = case("first", EvidenceStatus::Pass);
+        let mut first_smoke = smoke(&first, true, Some(1));
+        first_smoke["turn"]["usage"]["cost_rejected"] =
+            Value::String("negative_or_non_finite".into());
+        let invoker = FakeInvoker::new(vec![invocation(first_smoke)]);
+        let loaded = loaded(dir.path(), vec![first]);
+        let cancelled = AtomicBool::new(false);
+        let candidate = candidate_identity();
+        let selection = selection();
+        let selected_indices = [0];
+
+        let aggregate = build_aggregate(
+            AggregateInputs {
+                loaded: &loaded,
+                candidate: &candidate,
+                selection: &selection,
+                selected_indices: &selected_indices,
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &invoker,
+        )
+        .await;
+
+        assert_eq!(
+            aggregate.results[0].budget_violations,
+            ["case_cost_observation_invalid"]
+        );
+        assert_eq!(aggregate.budget.cost_observation_missing_cases, 0);
+        assert!(!aggregate.success);
+    }
+
+    #[tokio::test]
     async fn unsupported_advisory_case_is_classified_before_budget_admission() {
         let dir = tempfile::tempdir().unwrap();
         let mut first = case("first", EvidenceStatus::Pass);
@@ -4095,6 +4264,101 @@ agent_cli = "@openai/codex=0.144.1"
         assert_eq!(
             aggregate.results[2].not_run_reason.as_deref(),
             Some("evidence_path_not_implemented_in_r3a")
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_config_digest_is_an_admission_gate_before_provider_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("case.toml");
+        std::fs::write(&config_path, b"exact config bytes").unwrap();
+        let actual_digest = local_file::sha256_hex(b"exact config bytes");
+
+        let pinned_case = |digest: String| {
+            let mut pinned = case("pinned", EvidenceStatus::Pass);
+            pinned.lane = Lane::Pinned;
+            pinned.classification = Classification::Support;
+            pinned.config = PathBuf::from("case.toml");
+            pinned.pins = Some(PinSet {
+                config_sha256: digest,
+                model: pinned.model.clone(),
+                adapter: Some("test-adapter=1.2.3".into()),
+                agent_cli: Some("test-cli=4.5.6".into()),
+                image_digest: None,
+                components: BTreeMap::new(),
+            });
+            pinned
+        };
+        let cancelled = AtomicBool::new(false);
+        let candidate = candidate_identity();
+        let selection = selection();
+        let selected_indices = [0];
+
+        let changed = pinned_case("b".repeat(64));
+        let changed_invoker = FakeInvoker::new(vec![invocation(smoke(&changed, true, Some(1)))]);
+        let changed_loaded = loaded(dir.path(), vec![changed]);
+        let changed_aggregate = build_aggregate(
+            AggregateInputs {
+                loaded: &changed_loaded,
+                candidate: &candidate,
+                selection: &selection,
+                selected_indices: &selected_indices,
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &changed_invoker,
+        )
+        .await;
+        assert!(changed_invoker.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            changed_aggregate.results[0].runner_error_code.as_deref(),
+            Some("config_pin_mismatch")
+        );
+
+        let exact = pinned_case(actual_digest);
+        let exact_invoker = FakeInvoker::new(vec![invocation(smoke(&exact, true, Some(1)))]);
+        let exact_loaded = loaded(dir.path(), vec![exact]);
+        let exact_aggregate = build_aggregate(
+            AggregateInputs {
+                loaded: &exact_loaded,
+                candidate: &candidate,
+                selection: &selection,
+                selected_indices: &selected_indices,
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &exact_invoker,
+        )
+        .await;
+        assert_eq!(&*exact_invoker.calls.lock().unwrap(), &["pinned"]);
+        assert_ne!(
+            exact_aggregate.results[0].runner_error_code.as_deref(),
+            Some("config_pin_mismatch")
+        );
+
+        std::fs::remove_file(&config_path).unwrap();
+        let missing = pinned_case("c".repeat(64));
+        let missing_invoker = FakeInvoker::new(vec![invocation(smoke(&missing, true, Some(1)))]);
+        let missing_loaded = loaded(dir.path(), vec![missing]);
+        let missing_aggregate = build_aggregate(
+            AggregateInputs {
+                loaded: &missing_loaded,
+                candidate: &candidate,
+                selection: &selection,
+                selected_indices: &selected_indices,
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &missing_invoker,
+        )
+        .await;
+        assert!(missing_invoker.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            missing_aggregate.results[0].runner_error_code.as_deref(),
+            Some("config_pin_unavailable")
         );
     }
 
@@ -4841,7 +5105,44 @@ agent_cli = "@openai/codex=0.144.1"
     }
 
     #[test]
-    fn checked_in_empty_baseline_matches_the_checked_in_manifest_identity() {
+    fn checked_in_pinned_manifest_covers_each_claimed_path_with_exact_configs() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let loaded = load_manifest(&root.join(DEFAULT_MANIFEST)).unwrap();
+        let expected = BTreeSet::from([
+            "claude-direct-host-cli-fable",
+            "claude-host-acp-044-fable",
+            "claude-host-acp-055-fable",
+            "claude-managed-no-egress-055-fable",
+            "claude-reader-055-fable",
+            "codex-host-bridge-gpt56-sol",
+            "codex-reader-bridge-gpt56-sol",
+            "kiro-host-stale",
+            "kiro-reader-stale",
+        ]);
+        let actual = loaded
+            .manifest
+            .cases
+            .iter()
+            .map(|case| case.id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+
+        for case in &loaded.manifest.cases {
+            assert_eq!(case.lane, Lane::Pinned, "{}", case.id);
+            let pins = case.pins.as_ref().expect("all R3b rows are pinned");
+            let config = resolve_case_path(&loaded.canonical_path, &case.config);
+            let snapshot = local_file::read_regular_file_bounded(
+                &config,
+                "checked-in compatibility config",
+                MAX_MANIFEST_BYTES,
+            )
+            .unwrap_or_else(|error| panic!("{} config {config:?}: {error}", case.id));
+            assert_eq!(snapshot.sha256, pins.config_sha256, "{}", case.id);
+        }
+    }
+
+    #[test]
+    fn checked_in_baseline_matches_the_checked_in_manifest_identity() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let loaded = load_manifest(&root.join(DEFAULT_MANIFEST)).unwrap();
         let baseline: BaselineArtifact = load_json(
@@ -4854,7 +5155,6 @@ agent_cli = "@openai/codex=0.144.1"
             loaded.manifest.schema_version
         );
         assert_eq!(baseline.manifest_sha256, loaded.sha256);
-        assert!(baseline.cases.is_empty());
     }
 
     #[tokio::test]

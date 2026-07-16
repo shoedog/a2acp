@@ -24,10 +24,37 @@ Status meanings:
 | Claude ACP inside managed no-egress execution | 0.44.0 and 0.55.0 controls | Fable and Sonnet | **FAIL** | Direct SDK/ACP runs retried and hung; the Claude debug log recorded `getaddrinfo ENOTFOUND api.anthropic.com`. The exact 0.55 ACP command passed through approved host execution. This is a negative environment control, not a supported host lane or an auth failure. |
 | Kiro, shipped host/container examples | host version varies; reader image installs the current Kiro musl build at image-build time | configured defaults | **STALE** | Existing ignored live tests and historical gates are not sufficient for the new compatibility release gate. Re-baseline with the smoke harness. |
 
-The reader image is not yet fully reproducible: it pins top-level npm adapter versions, but their
-transitive CLI dependencies can resolve from semver ranges, and Kiro resolves a `latest` archive at
-build time. Until the build records a lock/resolution manifest and immutable image digest, a PASS for
-one image does not automatically cover a rebuild from the same Containerfile.
+The reader image is not yet fully reproducible. R3b pins and asserts the Codex and Claude nested
+agent-package versions used by the compatibility rows, but the build still lacks a complete npm
+resolution lock/manifest and Kiro still resolves a `latest` archive at build time. Until R4 closes the
+full resolution surface, a PASS for one image does not automatically cover a rebuild from the same
+Containerfile.
+
+## R3b pinned candidate — 2026-07-16
+
+The checked-in manifest now preserves each claimed path as a distinct pinned case. This is a candidate
+contract, not new compatibility evidence: no R3b provider turn or baseline promotion has run.
+
+| Case | R3b execution disposition | Release classification |
+|---|---|---|
+| `codex-host-bridge-gpt56-sol` | eligible minimal bridge smoke | support / blocking |
+| `codex-reader-bridge-gpt56-sol` | eligible minimal bridge smoke | support / blocking |
+| `claude-direct-host-cli-fable` | explicit unrun direct-CLI control | non-goal / advisory |
+| `claude-host-acp-044-fable` | eligible minimal bridge smoke | support / blocking |
+| `claude-host-acp-055-fable` | explicit unrun direct-ACP control | non-goal / advisory |
+| `claude-reader-055-fable` | eligible minimal bridge smoke | support / blocking |
+| `claude-managed-no-egress-055-fable` | explicit unrun direct-ACP negative control | non-goal / advisory |
+| `kiro-host-stale` | explicit unrun direct-CLI control | non-goal / `STALE` |
+| `kiro-reader-stale` | explicit unrun container direct-CLI control | non-goal / `STALE` |
+
+The two reader configs name immutable candidate image
+`sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1` directly. Bounded image
+inspection reports exact Codex adapter/CLI `1.1.2`/`0.144.1` and Claude adapter/SDK
+`0.55.0`/`0.3.198`; the Fable row also binds the mounted minimal settings file at SHA-256
+`6ee4ad319cdfc34a558425ddda86f5b1da4c10912a08dfdc32c0c009eef81f19`. The candidate was built under
+a unique tag and did not replace the running operator's `latest` tag or process. Its floating Kiro
+download resolved 2.12.3, so the Kiro rows deliberately remain `STALE` pending R4's reproducible
+resolution work and a separately authorized re-baseline.
 
 ## Resolved incident: Fable over Claude ACP
 
@@ -54,11 +81,12 @@ retention remains R2.
 
 ## Evidence required for an update
 
-R3a provides `a2a-bridge compatibility validate|run|compare`, but its checked-in manifest and pinned
-baseline intentionally contain zero cases. R3b owns the first reviewed pinned rows. Do not add a case,
-baseline entry, or PASS row merely to exercise the runner: deterministic missing-config controls prove
-the orchestration without spending a provider turn, while support evidence still requires the exact
-candidate binary and environment named below.
+R3a provides `a2a-bridge compatibility validate|run|compare`; R3b adds nine reviewed pinned case
+contracts. The checked-in baseline carries the current manifest identity but intentionally has no
+promoted case summaries until the four eligible cases produce separately authorized exact-candidate
+artifacts and those artifacts are reviewed. Do not add a baseline entry or PASS row merely to exercise
+the runner: deterministic controls prove orchestration without spending a provider turn, while support
+evidence still requires the exact candidate binary and environment named below.
 
 Pinned adapter and CLI identities use one complete semantic version. Remote API support rows must pin
 provider, API, and API-version identities rather than a generic execution row. A raw advertised model ID

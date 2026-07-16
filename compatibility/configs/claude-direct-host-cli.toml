@@ -1,0 +1,13 @@
+# Historical direct-CLI control. R3a records it as non-goal/unrun and never invokes this as ACP.
+default = "claude-direct"
+
+[[agents]]
+id = "claude-direct"
+cmd = "claude"
+model = "fable"
+
+[registry]
+allowed_cmds = ["claude"]
+
+[server]
+addr = "127.0.0.1:8080"

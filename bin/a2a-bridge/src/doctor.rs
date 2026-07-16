@@ -15,6 +15,7 @@
 // wrapper: it resolves the config path, loads + parses the config once (reusing `validate_config_file`
 // for check 1, exactly as the spec requires), builds a `LoadedConfig`, and renders the result.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -172,6 +173,20 @@ pub trait RuntimeProbes {
     /// Immutable local image id from a bounded read-only inspect. Callers MUST allowlist-gate runtime.
     fn image_id(&self, _runtime: &str, _image: &str) -> Result<String, String> {
         Err("immutable local image id unavailable".into())
+    }
+    /// Exact, non-secret image labels from a bounded read-only inspect. Callers MUST allowlist-gate
+    /// the runtime and treat absent/malformed labels as unknown, never infer package identities.
+    fn image_labels(
+        &self,
+        _runtime: &str,
+        _image: &str,
+    ) -> Result<BTreeMap<String, String>, String> {
+        Err("immutable image labels unavailable".into())
+    }
+    /// SHA-256 of one bounded regular host file. Used only for an explicitly configured,
+    /// non-secret compatibility prerequisite; callers must never hash credential destinations.
+    fn file_sha256(&self, _path: &Path) -> Result<String, String> {
+        Err("file digest unavailable".into())
     }
     /// Stat a host path. Never creates, never follows into a write probe (TOCTOU/mutating — cut per
     /// the spec's adversarial review).
@@ -788,6 +803,38 @@ fn immutable_image_id(runtime: &str, image: &str) -> Result<String, String> {
     parse_immutable_image_id(&output)
 }
 
+fn parse_image_labels(output: &[u8]) -> Result<BTreeMap<String, String>, String> {
+    let labels: BTreeMap<String, String> = serde_json::from_slice(output)
+        .map_err(|_| "runtime returned invalid image labels".to_string())?;
+    if labels.iter().any(|(key, value)| {
+        key.is_empty()
+            || value.is_empty()
+            || key.len() > 4096
+            || value.len() > 4096
+            || key.chars().any(char::is_control)
+            || value.chars().any(char::is_control)
+    }) {
+        return Err("runtime returned invalid image labels".into());
+    }
+    Ok(labels)
+}
+
+fn immutable_image_labels(runtime: &str, image: &str) -> Result<BTreeMap<String, String>, String> {
+    let output = bounded_probe_stdout(
+        runtime,
+        &[
+            "image",
+            "inspect",
+            "--format",
+            "{{json .Config.Labels}}",
+            image,
+        ],
+        PROBE_TIMEOUT,
+        MAX_PROVENANCE_METADATA_BYTES,
+    )?;
+    parse_image_labels(&output)
+}
+
 /// The production `RuntimeProbes` — every method is bounded (nothing here can hang `doctor`).
 pub struct RealProbes;
 
@@ -813,6 +860,18 @@ impl RuntimeProbes for RealProbes {
     }
     fn image_id(&self, runtime: &str, image: &str) -> Result<String, String> {
         immutable_image_id(runtime, image)
+    }
+    fn image_labels(&self, runtime: &str, image: &str) -> Result<BTreeMap<String, String>, String> {
+        immutable_image_labels(runtime, image)
+    }
+    fn file_sha256(&self, path: &Path) -> Result<String, String> {
+        crate::local_file::read_regular_file_bounded(
+            path,
+            "doctor provenance file",
+            MAX_PROVENANCE_METADATA_BYTES as u64,
+        )
+        .map(|snapshot| snapshot.sha256)
+        .map_err(|_| "file digest unavailable".into())
     }
     fn path_stat(&self, path: &Path) -> PathStat {
         path_stat_impl(path)
@@ -1073,6 +1132,70 @@ fn known_agent_cli(cmd: Option<&str>, adapter: Option<&InstalledPackage>) -> boo
         })
 }
 
+struct ContainerPackageLabels {
+    adapter_key: &'static str,
+    adapter_package: &'static str,
+    cli_key: &'static str,
+    cli_package: &'static str,
+}
+
+fn container_package_labels(cmd: Option<&str>) -> Option<ContainerPackageLabels> {
+    let basename = cmd
+        .and_then(|cmd| Path::new(cmd).file_name())
+        .and_then(|name| name.to_str());
+    match basename {
+        Some("codex-acp") => Some(ContainerPackageLabels {
+            adapter_key: "io.a2a-bridge.provenance.codex.adapter",
+            adapter_package: "@agentclientprotocol/codex-acp",
+            cli_key: "io.a2a-bridge.provenance.codex.agent-cli",
+            cli_package: "@openai/codex",
+        }),
+        Some("claude-agent-acp") => Some(ContainerPackageLabels {
+            adapter_key: "io.a2a-bridge.provenance.claude.adapter",
+            adapter_package: "@agentclientprotocol/claude-agent-acp",
+            cli_key: "io.a2a-bridge.provenance.claude.agent-cli",
+            cli_package: "@anthropic-ai/claude-agent-sdk",
+        }),
+        _ => None,
+    }
+}
+
+fn exact_labeled_package<'a>(
+    labels: &'a BTreeMap<String, String>,
+    key: &str,
+    expected_package: &str,
+) -> Result<&'a str, String> {
+    let value = labels
+        .get(key)
+        .ok_or_else(|| format!("missing image label {key}"))?;
+    let Some((package, version)) = value.split_once('=') else {
+        return Err(format!("invalid image label {key}"));
+    };
+    if package != expected_package
+        || version.is_empty()
+        || version.chars().any(char::is_whitespace)
+        || semver::Version::parse(version).is_err()
+    {
+        return Err(format!("invalid image label {key}"));
+    }
+    Ok(version)
+}
+
+fn host_mount_source(volumes: &[String], destination: &str) -> Option<PathBuf> {
+    use bridge_core::sandbox::SandboxVolumeSource;
+
+    volumes.iter().find_map(|volume| {
+        let declaration = bridge_core::sandbox::parse_sandbox_volume(volume).ok()?;
+        if declaration.destination() != destination {
+            return None;
+        }
+        match declaration.source() {
+            SandboxVolumeSource::Host(path) => Some(PathBuf::from(path)),
+            SandboxVolumeSource::Anonymous | SandboxVolumeSource::Named(_) => None,
+        }
+    })
+}
+
 fn check_provenance(
     snapshot: &RegistrySnapshot,
     probes: &dyn RuntimeProbes,
@@ -1117,17 +1240,94 @@ fn check_provenance(
                     remedy,
                 ));
             }
-            out.push(CheckResult::warn(
-                format!("provenance:{id}:adapter"),
-                "container adapter package provenance is unknown; host inner command was not inspected",
-                "record package metadata in immutable image labels/manifest (R3/R4)",
-            ));
-            if known_agent_cli(entry.cmd.as_deref(), None) {
-                out.push(CheckResult::warn(
-                    format!("provenance:{id}:agent-cli"),
-                    "container agent CLI provenance is unknown; host packages were not inspected",
-                    "record exact agent CLI/SDK metadata in immutable image labels/manifest (R3/R4)",
-                ));
+            let package_rows = runtime_is_allowed(runtime, &snapshot.allowed_cmds)
+                .then(|| {
+                    container_package_labels(entry.cmd.as_deref()).map(|spec| {
+                        probes
+                            .image_labels(runtime, &sandbox.image)
+                            .and_then(|labels| {
+                                let adapter_version = exact_labeled_package(
+                                    &labels,
+                                    spec.adapter_key,
+                                    spec.adapter_package,
+                                )?;
+                                let cli_version =
+                                    exact_labeled_package(&labels, spec.cli_key, spec.cli_package)?;
+                                Ok((spec, adapter_version.to_string(), cli_version.to_string()))
+                            })
+                    })
+                })
+                .flatten();
+            match package_rows {
+                Some(Ok((spec, adapter_version, cli_version))) => {
+                    out.push(CheckResult::ok(
+                        format!("provenance:{id}:adapter"),
+                        format!(
+                            "source=immutable-image-label package={} version={adapter_version}",
+                            spec.adapter_package
+                        ),
+                    ));
+                    out.push(CheckResult::ok(
+                        format!("provenance:{id}:agent-cli"),
+                        format!(
+                            "source=immutable-image-label package={} version={cli_version}",
+                            spec.cli_package
+                        ),
+                    ));
+                }
+                Some(Err(reason)) => {
+                    out.push(CheckResult::warn(
+                        format!("provenance:{id}:adapter"),
+                        format!(
+                            "container adapter package provenance is unknown; host inner command was not inspected: {reason}"
+                        ),
+                        "record exact package identities in the immutable image labels",
+                    ));
+                    out.push(CheckResult::warn(
+                        format!("provenance:{id}:agent-cli"),
+                        "container agent CLI provenance is unknown",
+                        "record exact agent CLI/SDK identity in the immutable image labels",
+                    ));
+                }
+                None => {
+                    out.push(CheckResult::warn(
+                        format!("provenance:{id}:adapter"),
+                        "container adapter package provenance is unknown; host inner command was not inspected",
+                        "record package metadata in immutable image labels/manifest (R3/R4)",
+                    ));
+                    if known_agent_cli(entry.cmd.as_deref(), None) {
+                        out.push(CheckResult::warn(
+                            format!("provenance:{id}:agent-cli"),
+                            "container agent CLI provenance is unknown; host packages were not inspected",
+                            "record exact agent CLI/SDK metadata in immutable image labels/manifest (R3/R4)",
+                        ));
+                    }
+                }
+            }
+            if entry.model.as_deref().is_some_and(is_fable_model)
+                && is_claude_acp_cmd(entry.cmd.as_deref())
+            {
+                const SETTINGS_DEST: &str = "/root/.claude/settings.json";
+                let check = format!("provenance:{id}:fable-settings");
+                match host_mount_source(&sandbox.volumes, SETTINGS_DEST)
+                    .ok_or_else(|| "settings mount source unavailable".to_string())
+                    .and_then(|path| probes.file_sha256(&path))
+                {
+                    Ok(digest)
+                        if digest.len() == 64
+                            && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+                    {
+                        out.push(CheckResult::ok(
+                            check,
+                            format!("sha256:{}", digest.to_ascii_lowercase()),
+                        ));
+                    }
+                    Ok(_) | Err(_) => out.push(CheckResult::warn(
+                        check,
+                        "mounted Fable settings digest is unavailable",
+                        "mount one bounded regular minimal settings file and rerun doctor",
+                    )),
+                }
             }
             let image_check = format!("provenance:{id}:image");
             if !runtime_is_allowed(runtime, &snapshot.allowed_cmds) {
@@ -2112,6 +2312,8 @@ mod tests {
         networks: HashSet<String>,
         images: HashSet<String>,
         image_ids: HashMap<(String, String), Result<String, String>>,
+        image_labels: HashMap<(String, String), std::collections::BTreeMap<String, String>>,
+        file_sha256s: HashMap<PathBuf, Result<String, String>>,
         process_provenance: HashMap<String, ProcessProvenance>,
         env_vars: HashMap<String, String>,
         paths: HashMap<PathBuf, PathStat>,
@@ -2145,6 +2347,21 @@ mod tests {
         fn with_image_id(mut self, runtime: &str, image: &str, id: &str) -> Self {
             self.image_ids
                 .insert((runtime.to_string(), image.to_string()), Ok(id.to_string()));
+            self
+        }
+        fn with_image_labels(
+            mut self,
+            runtime: &str,
+            image: &str,
+            labels: &[(&str, &str)],
+        ) -> Self {
+            self.image_labels.insert(
+                (runtime.to_string(), image.to_string()),
+                labels
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
+            );
             self
         }
         fn with_process_provenance(mut self, cmd: &str, provenance: ProcessProvenance) -> Self {
@@ -2184,6 +2401,11 @@ mod tests {
                     readonly: false,
                 },
             )
+        }
+        fn with_file_sha256(mut self, path: &str, sha256: &str) -> Self {
+            self.file_sha256s
+                .insert(PathBuf::from(path), Ok(sha256.to_string()));
+            self.with_file(path)
         }
         fn runtime_probe_calls(&self) -> Vec<String> {
             self.runtime_probe_calls.borrow().clone()
@@ -2246,6 +2468,25 @@ mod tests {
                 .get(&(runtime.to_string(), image.to_string()))
                 .cloned()
                 .unwrap_or_else(|| Err("immutable local image id unavailable".into()))
+        }
+        fn image_labels(
+            &self,
+            runtime: &str,
+            image: &str,
+        ) -> Result<BTreeMap<String, String>, String> {
+            self.runtime_probe_calls
+                .borrow_mut()
+                .push(format!("image_labels:{runtime}:{image}"));
+            self.image_labels
+                .get(&(runtime.to_string(), image.to_string()))
+                .cloned()
+                .ok_or_else(|| "immutable image labels unavailable".into())
+        }
+        fn file_sha256(&self, path: &Path) -> Result<String, String> {
+            self.file_sha256s
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| Err("file digest unavailable".into()))
         }
         fn path_stat(&self, path: &Path) -> PathStat {
             self.paths.get(path).copied().unwrap_or(PathStat::ABSENT)
@@ -3182,6 +3423,98 @@ mod tests {
     }
 
     #[test]
+    fn labeled_immutable_image_reports_exact_container_adapter_and_cli_packages() {
+        const IMAGE: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut codex = acp_entry("codex", "codex-acp");
+        codex.sandbox = Some(locked_sandbox(IMAGE, "a2a-net", vec![]));
+        let cfg = base_loaded(snapshot("codex", vec![codex], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image(IMAGE)
+            .with_image_id("docker", IMAGE, IMAGE)
+            .with_image_labels(
+                "docker",
+                IMAGE,
+                &[
+                    (
+                        "io.a2a-bridge.provenance.codex.adapter",
+                        "@agentclientprotocol/codex-acp=1.1.2",
+                    ),
+                    (
+                        "io.a2a-bridge.provenance.codex.agent-cli",
+                        "@openai/codex=0.144.1",
+                    ),
+                ],
+            );
+
+        let results = run_checks(&cfg, &probes);
+        let adapter = find(&results, "provenance:codex:adapter");
+        assert_eq!(adapter.status, CheckStatus::Ok);
+        assert!(adapter
+            .detail
+            .contains("package=@agentclientprotocol/codex-acp"));
+        assert!(adapter.detail.contains("version=1.1.2"));
+        let cli = find(&results, "provenance:codex:agent-cli");
+        assert_eq!(cli.status, CheckStatus::Ok);
+        assert!(cli.detail.contains("package=@openai/codex"));
+        assert!(cli.detail.contains("version=0.144.1"));
+    }
+
+    #[test]
+    fn fable_reader_provenance_binds_the_mounted_settings_file_digest() {
+        const DIGEST: &str =
+            "sha256:6ee4ad319cdfc34a558425ddda86f5b1da4c10912a08dfdc32c0c009eef81f19";
+        let mut claude = acp_entry("claude", "claude-agent-acp");
+        claude.model = Some("claude-fable-5[1m]".into());
+        claude.sandbox = Some(locked_sandbox(
+            "reader:latest",
+            "a2a-net",
+            vec!["/cfg/settings.json:/root/.claude/settings.json:ro".into()],
+        ));
+        let cfg = base_loaded(snapshot("claude", vec![claude], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image("reader:latest")
+            .with_env("A2A_BRIDGE_ALLOW_FABLE", "1")
+            .with_file_sha256(
+                "/cfg/settings.json",
+                DIGEST.strip_prefix("sha256:").unwrap(),
+            );
+
+        let results = run_checks(&cfg, &probes);
+        let row = find(&results, "provenance:claude:fable-settings");
+        assert_eq!(row.status, CheckStatus::Ok);
+        assert_eq!(row.detail, DIGEST);
+    }
+
+    #[test]
+    fn fable_reader_provenance_never_guesses_an_unreadable_settings_digest() {
+        let mut claude = acp_entry("claude", "claude-agent-acp");
+        claude.model = Some("claude-fable-5[1m]".into());
+        claude.sandbox = Some(locked_sandbox(
+            "reader:latest",
+            "a2a-net",
+            vec!["/cfg/settings.json:/root/.claude/settings.json:ro".into()],
+        ));
+        let cfg = base_loaded(snapshot("claude", vec![claude], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image("reader:latest")
+            .with_env("A2A_BRIDGE_ALLOW_FABLE", "1")
+            .with_file("/cfg/settings.json");
+
+        let results = run_checks(&cfg, &probes);
+        assert_eq!(
+            find(&results, "provenance:claude:fable-settings").status,
+            CheckStatus::Warn
+        );
+    }
+
+    #[test]
     fn r2a_host_provenance_reports_exact_adapter_and_agent_cli_packages() {
         let cfg = base_loaded(snapshot(
             "codex",
@@ -3556,6 +3889,60 @@ mod tests {
                 .as_slice(),
         ] {
             assert!(parse_immutable_image_id(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn r3b_image_label_parser_accepts_only_a_bounded_string_map() {
+        let valid =
+            br#"{"io.a2a-bridge.provenance.codex.adapter":"@agentclientprotocol/codex-acp=1.1.2"}"#;
+        assert_eq!(
+            parse_image_labels(valid).unwrap()["io.a2a-bridge.provenance.codex.adapter"],
+            "@agentclientprotocol/codex-acp=1.1.2"
+        );
+
+        for invalid in [
+            b"null".as_slice(),
+            br#"[]"#,
+            br#"{"label":1}"#,
+            br#"{"":"value"}"#,
+            br#"{"label":""}"#,
+            br#"{"label":"line\nfeed"}"#,
+        ] {
+            assert!(parse_image_labels(invalid).is_err());
+        }
+
+        let labels = BTreeMap::from([
+            (
+                "io.a2a-bridge.provenance.codex.adapter".into(),
+                "@agentclientprotocol/codex-acp=1.1.2".into(),
+            ),
+            (
+                "io.a2a-bridge.provenance.codex.agent-cli".into(),
+                "@openai/codex=0.144.1".into(),
+            ),
+        ]);
+        assert_eq!(
+            exact_labeled_package(
+                &labels,
+                "io.a2a-bridge.provenance.codex.agent-cli",
+                "@openai/codex"
+            )
+            .unwrap(),
+            "0.144.1"
+        );
+        for invalid in ["@openai/codex=0.144", "@other/codex=0.144.1", "latest"] {
+            let mut labels = labels.clone();
+            labels.insert(
+                "io.a2a-bridge.provenance.codex.agent-cli".into(),
+                invalid.into(),
+            );
+            assert!(exact_labeled_package(
+                &labels,
+                "io.a2a-bridge.provenance.codex.agent-cli",
+                "@openai/codex"
+            )
+            .is_err());
         }
     }
 

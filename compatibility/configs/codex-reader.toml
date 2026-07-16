@@ -1,0 +1,26 @@
+# R3b pinned reader canary. The immutable image id is deliberate; never replace it with a tag.
+default = "codex-reader"
+allowed_cwd_root = "/Users/wesleyjinks/code"
+
+[[agents]]
+id = "codex-reader"
+cmd = "codex-acp"
+pre_authenticated = true
+model = "gpt-5.6-sol"
+effort = "xhigh"
+args = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
+
+[agents.sandbox]
+image = "sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1"
+mount = "/Users/wesleyjinks/code"
+access = "ro"
+egress = "locked"
+network = "a2a-egress-internal"
+proxy = "http://a2a-egress-proxy:8888"
+volumes = ["/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json"]
+
+[registry]
+allowed_cmds = ["docker"]
+
+[server]
+addr = "127.0.0.1:8080"

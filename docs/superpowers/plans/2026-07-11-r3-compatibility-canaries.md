@@ -1,15 +1,9 @@
 # R3 — Compatibility manifest and canary implementation plan
 
-- **Status:** overall R3 **IN REVIEW**; R3a **APPROVED / PENDING MERGE** — initial review and closure
-  re-reviews 1–4 on `884bc5f`,
-  `b37147c`, `c8c9452`, `a8602bb`, and `42523e1` returned `REVISE`; the intervening exact-`bc9f64c`
-  attempt ended on provider capacity without a verdict. Every completed finding set is folded on
-  `agent/reliability-r3a-manifest-runner`. Sol/xhigh closure re-review 5 of exact `fba430fe` returned
-  `APPROVE`, then the single independent Fable/xhigh adversarial implementation and
-  release/compatibility review of that same exact commit returned `READY` and `APPROVE`. This
-  approval-recording docs fold is the exact artifact for the required final targeted Sol/xhigh status
-  review before the non-draft PR
-- **Prerequisite:** R2c and R2d merged (`a6fec94c`, PR #29)
+- **Status:** overall R3 **IN REVIEW**; R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE** on
+  `agent/reliability-r3b-pinned-lane`. Nine pinned rows and four support configs are deterministically
+  green; no R3b live/billable canary or baseline promotion has run.
+- **Prerequisite:** R2c/R2d merged (`a6fec94c`, PR #29); R3a merged (`3927df3f`, PR #31)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Completion shape:** R3a local manifest/runner, R3b pinned lane, R3c floating lane, R3d scheduling,
@@ -301,6 +295,14 @@ is unchanged.
 ## R3b — pinned lane and promotion baseline
 
 - **Branch:** `agent/reliability-r3b-pinned-lane`
+- **Implementation state (2026-07-16):** nine pinned rows validate at manifest SHA-256
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. Four support configs pass
+  non-billable doctor preflight (**53 ok / 0 warn / 0 fail** total), binary units pass **380/0**, and
+  the full serial workspace passes **2,053/0/12 ignored** across **70** groups. Linux/Rust 1.94 passes
+  binary units **381/0**, smoke CLI **12/0**, and compatibility CLI **11/0**. Format/diff, workspace
+  all-target check, warnings-denied Clippy, release build, hygiene **37/7**, and release-manifest
+  validation are green. The pinned baseline has the new manifest identity but no promoted cases pending
+  separately authorized exact-candidate live artifacts and review. Exact-head review remains pending.
 
 Seed rows for every currently claimed path or control in `docs/compatibility.md`:
 
@@ -322,6 +324,14 @@ explicit negative/non-finite reported-cost handling. Preserve exact credential-v
 backstops; heuristic expansion must not be presented as general secret detection. Exact identity grammar
 may fail closed on unsupported authoring forms, but every rejected supported-provider identity needs an
 explicit reviewed spelling rather than an automatic relaxation.
+
+The implemented controls also hash each pinned config before provider spawn and bind the Fable reader's
+mounted minimal settings file by exact SHA-256 in smoke provenance. Container support rows can green only
+when bounded inspection of the configured immutable image returns exact adapter and agent-CLI labels.
+Missing/malformed labels or an unreadable settings file remain visible `WARN` provenance and therefore
+cannot satisfy the pinned drift check. The reader candidate is built under a unique non-operator tag at
+immutable id `sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1`;
+the running operator image/tag/process were not changed.
 
 Run from the candidate release binary and exact image id. Compare versioned artifacts to
 `compatibility/baselines/pinned.json`; any provenance, capability, auth, phase, terminal, or diagnostic

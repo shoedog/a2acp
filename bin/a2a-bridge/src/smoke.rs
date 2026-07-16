@@ -576,6 +576,8 @@ struct SmokeUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     cost: Option<SmokeCost>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cost_rejected: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     terminal: Option<bridge_core::orch::TerminalUsage>,
     at_ms: i64,
 }
@@ -1225,11 +1227,9 @@ fn safe_stop_reason(reason: &str) -> &'static str {
 }
 
 fn smoke_usage(value: UsageSnapshot) -> SmokeUsage {
-    SmokeUsage {
-        used: value.used,
-        size: value.size,
-        cost: value.cost.and_then(|cost| {
-            (cost.amount.is_finite() && cost.amount >= 0.0).then(|| SmokeCost {
+    let (cost, cost_rejected) = match value.cost {
+        Some(cost) if cost.amount.is_finite() && cost.amount >= 0.0 => (
+            Some(SmokeCost {
                 amount: cost.amount,
                 currency: if cost.currency.len() == 3
                     && cost.currency.bytes().all(|byte| byte.is_ascii_uppercase())
@@ -1238,8 +1238,17 @@ fn smoke_usage(value: UsageSnapshot) -> SmokeUsage {
                 } else {
                     "unknown".into()
                 },
-            })
-        }),
+            }),
+            None,
+        ),
+        Some(_) => (None, Some("negative_or_non_finite")),
+        None => (None, None),
+    };
+    SmokeUsage {
+        used: value.used,
+        size: value.size,
+        cost,
+        cost_rejected,
         terminal: value.terminal,
         at_ms: value.at_ms,
     }
@@ -3120,6 +3129,25 @@ mod tests {
             ..UsageSnapshot::default()
         });
         assert_eq!(unsafe_label.cost.unwrap().currency, "unknown");
+    }
+
+    #[test]
+    fn usage_cost_rejects_negative_and_nonfinite_amounts_visibly() {
+        for amount in [-0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let usage = smoke_usage(UsageSnapshot {
+                cost: Some(bridge_core::orch::UsageCost {
+                    amount,
+                    currency: "USD".into(),
+                }),
+                ..UsageSnapshot::default()
+            });
+            let value = serde_json::to_value(usage).unwrap();
+            assert!(value.get("cost").is_none());
+            assert_eq!(
+                value.get("cost_rejected").and_then(Value::as_str),
+                Some("negative_or_non_finite")
+            );
+        }
     }
 
     #[tokio::test]

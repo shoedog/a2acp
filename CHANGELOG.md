@@ -7,6 +7,24 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ## [Unreleased]
 
+### Added
+
+- The R3b compatibility manifest now carries exact pinned contracts for four supported bridge-smoke
+  paths plus explicit historical Claude and stale Kiro controls. Pinned configs are digest-gated before
+  provider spawn; reader provenance binds immutable image package labels and the minimal Fable settings
+  file's SHA-256.
+
+### Changed
+
+- The reader image build pins and asserts the nested Codex 0.144.1 and Claude SDK 0.3.198 package
+  resolutions and publishes their non-secret exact identities as bounded-inspection image labels.
+
+### Fixed
+
+- Compatibility canaries now reject additional credential-shaped prerequisite names, surface
+  negative/non-finite reported costs as blocking invalid observations, and directly cover final-sibling
+  same-name replacement before aggregate publication.
+
 ## [0.2.1] - 2026-07-10
 
 ### Fixed

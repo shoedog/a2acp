@@ -1,0 +1,17 @@
+# R3b pinned host canary. The compatibility manifest binds this file's SHA-256.
+default = "codex-host"
+
+[[agents]]
+id = "codex-host"
+cmd = "codex-acp"
+pre_authenticated = true
+model = "gpt-5.6-sol"
+effort = "xhigh"
+mode = "read-only"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+
+[registry]
+allowed_cmds = ["codex-acp"]
+
+[server]
+addr = "127.0.0.1:8080"

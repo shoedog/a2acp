@@ -195,11 +195,15 @@ verified file object instead of reopening its name, and accesses child smoke
 artifacts relative to the retained scratch descriptor. After hashing it rechecks cancellation and the
 full declared timeout headroom immediately before spawn. On Linux, the staged child closes its inherited
 candidate descriptor after exec and its scratch descriptor after opening the artifact, before ACP
-descendants. There is no retry, provider fallback, implicit all-case selection, baseline update,
-or production-config mutation. A case does not start unless its declared token and observable-cost caps
-fit the remaining total headroom. Comparison retains per-case execution/error/not-run/budget state and
-aggregate success/cancellation/budget state while excluding variable usage quantities. The checked-in
-R3a manifest intentionally has no cases; R3b adds reviewed pins. Read
+descendants. A pinned config's exact SHA-256 is an admission gate before provider spawn. Container pins
+require exact non-secret adapter/CLI labels from the configured immutable image, and the Fable reader
+also binds its minimal mounted settings file by SHA-256; unknown provenance cannot green a support case.
+There is no retry, provider fallback, implicit all-case selection, baseline update, or production-config
+mutation. A case does not start unless its declared token and observable-cost caps fit the remaining
+total headroom. Negative/non-finite cost observations fail explicitly. Comparison retains per-case
+execution/error/not-run/budget state and aggregate success/cancellation/budget state while excluding
+variable usage quantities. The checked-in manifest has reviewed R3b pins; its baseline is promoted only
+from separately authorized exact-candidate evidence. Read
 [`docs/compatibility.md`](docs/compatibility.md) and the current
 [`reliability roadmap`](docs/reliability-execution-roadmap.md) before spending a live turn.
 

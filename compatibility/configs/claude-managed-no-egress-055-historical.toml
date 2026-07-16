@@ -1,0 +1,14 @@
+# Historical direct-ACP negative control from an operator-approved managed no-egress environment.
+default = "claude-no-egress"
+
+[[agents]]
+id = "claude-no-egress"
+cmd = "claude-agent-acp"
+model = "claude-fable-5[1m]"
+effort = "xhigh"
+
+[registry]
+allowed_cmds = ["claude-agent-acp"]
+
+[server]
+addr = "127.0.0.1:8080"
