@@ -1,11 +1,11 @@
 # R2d — Local non-billable fallback-plan implementation plan
 
-- **Status:** IN REVIEW — the initial review and closure re-reviews 1–6 returned `REVISE`; the v22 fold
+- **Status:** IN REVIEW — the initial review and closure re-reviews 1–7 returned `REVISE`; the v23 fold
   is applied in the working tree; deterministic gates are green; final closure remains
 - **Prerequisites:** R2b and R2c merged (`be54bc51`, PR #28)
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md),
-  v22
+  v23
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Branch:** `agent/reliability-r2d-fallback-plan`
 - **Initial reviewed candidate:** `b6424d725e56d1f3fde0b7c29b6057155d69dacd`
@@ -15,6 +15,7 @@
 - **Closure re-review 4 candidate:** `349755ed8f4534db0e04b8af006ca6072e01110b` — `REVISE`
 - **Closure re-review 5 candidate:** `49716473cf405b272dd8ecff554630b90faed0e0` — `REVISE`
 - **Closure re-review 6 candidate:** `379c3acc199fb58e6d6e1a8a8318470737ce6e8c` — `REVISE`
+- **Closure re-review 7 candidate:** `7fec898b5157603ae2eccd121e8367ff1914949b` — `REVISE`
 
 R2d answers one local operator question: given complete failed R2c smoke evidence from a read-only
 container attempt, may an explicitly named host agent be proposed for a new trusted-own-repo read-only
@@ -310,17 +311,18 @@ file handle. Unsupported filesystems, kernels, or operating systems refuse plann
 - exact production pre-spawn cleanup serialization plus independent timeout/cancel/release/retire/backstop
   mutations, each ineligible with no command.
 
-Current v22 focused evidence is planner CLI **24 / 0**, smoke units **22 / 0**, and local-file units
+Current v23 focused evidence is planner CLI **24 / 0**, smoke units **22 / 0**, and local-file units
 **7 / 0** on macOS. A Linux `a2a-toolchain` container, reading the worktree through a read-only bind and
-writing its build output only inside the disposable container, also passes local-file **7 / 0** and
-planner CLI **24 / 0**. Its real overlayfs path exercises
+writing its build output only inside the disposable container, also passes local-file **7 / 0**,
+planner CLI **24 / 0**, and the guarded-composition regression **1 / 0**. Its real overlayfs path
+exercises
 `AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE`; the injected dual-mode-unavailable case proves fail-closed
 behavior. A default Linux debug artifact was 271,582,616 bytes and therefore correctly tripped the
 unchanged 256 MiB planner evidence cap (13 passed / 10 rejected); rebuilding the current test target with
 `CARGO_PROFILE_DEV_DEBUG=0` produced the stated **24 / 0**, separating debug-symbol inflation from product
 behavior without weakening the cap.
 
-The exact v22 working fold also passes:
+The exact v23 working fold also passes:
 
 - full serial workspace: **1,985 passed / 0 failed / 12 ignored** across 69 test/doc-test executables;
 - format check and `git diff --check`: clean;
@@ -329,15 +331,16 @@ The exact v22 working fold also passes:
 - repository hygiene: **37** tracked artifacts / **7** validated example configs;
 - non-prompt adapter compatibility: Codex ACP 1.1.2 and Claude Agent ACP 0.44.0 each accepted
   `initialize` + `session/new` with the macOS object-addressed absolute cwd; no model prompt was sent;
-- the v22 guarded-spawn alias-retarget regression passes on macOS and in the Linux `a2a-toolchain`
-  container, exercising `/.vol/<device>/<inode>` and `/proc/self/fd/<n>` composition respectively;
+- the v22 guarded-spawn alias-retarget regression passes on macOS and **1 / 0** in the Linux
+  `a2a-toolchain` container, exercising `/.vol/<device>/<inode>` and `/proc/self/fd/<n>` composition
+  respectively;
 - live/billable gates: not run; no live provider or agent turn is required for this deterministic
   plan/pre-spawn surface. The disposable Linux test container above ran only deterministic tests.
 
 ## Completion boundary
 
-Run one Sol/xhigh closure re-review of the fully gated exact v22 candidate that adjudicates both
-closure-re-review-6 findings and confirms the earlier inherited findings remain fixed. Do
+Run one Sol/xhigh closure re-review of the fully gated exact v23 candidate that adjudicates the sole
+closure-re-review-7 ledger finding and confirms the earlier inherited findings remain fixed. Do
 not use Fable or Claude for this closure under the current constrained usage windows. Do not run a
 live/billable smoke: R2d behavior is proven by deterministic pre-spawn fixtures, and the R2c live result
 remains historical evidence only.
