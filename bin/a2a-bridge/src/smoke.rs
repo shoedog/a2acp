@@ -1023,10 +1023,16 @@ async fn resolve_once(
     observer: Arc<dyn bridge_core::ports::DiagnosticObserver>,
     deadline: tokio::time::Instant,
 ) -> ResolveOnce {
-    match tokio::time::timeout_at(deadline, registry.resolve_observed(agent, observer)).await {
-        Err(_) => ResolveOnce::TimedOut,
-        Ok(Err(error)) => ResolveOnce::Failed(error),
-        Ok(Ok(resolved)) => ResolveOnce::Resolved(resolved),
+    // `tokio::time::timeout_at` polls its inner future before its delay. Use a biased deadline-first
+    // select so an already-expired (or simultaneously-ready) deadline cannot give resolution one
+    // last poll in which to spawn an adapter.
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => ResolveOnce::TimedOut,
+        result = registry.resolve_observed(agent, observer) => match result {
+            Err(error) => ResolveOnce::Failed(error),
+            Ok(resolved) => ResolveOnce::Resolved(resolved),
+        },
     }
 }
 
@@ -3001,6 +3007,28 @@ mod tests {
     #[tokio::test]
     async fn resolve_is_called_once_and_a_silent_resolve_is_bounded() {
         let backend: Arc<dyn AgentBackend> = Arc::new(FakeBackend::new(Behavior::Exact));
+        let already_expired = FakeRegistry {
+            resolves: AtomicUsize::new(0),
+            backend: Arc::clone(&backend),
+            hang: false,
+        };
+        let diagnostic: Arc<dyn bridge_core::ports::DiagnosticObserver> = observer();
+        assert!(matches!(
+            resolve_once(
+                &already_expired,
+                &AgentId::parse("test").unwrap(),
+                diagnostic,
+                tokio::time::Instant::now() - Duration::from_millis(1)
+            )
+            .await,
+            ResolveOnce::TimedOut
+        ));
+        assert_eq!(
+            already_expired.resolves.load(Ordering::SeqCst),
+            0,
+            "an expired deadline must win before the resolver receives its first poll"
+        );
+
         let registry = FakeRegistry {
             resolves: AtomicUsize::new(0),
             backend: Arc::clone(&backend),

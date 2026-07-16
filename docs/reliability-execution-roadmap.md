@@ -5,21 +5,23 @@
 - **Completed through:** R3a **MERGED** at `3927df3f`; R2e remains deferred and off the critical path
 - **Active slice:** R3b pinned lane on `agent/reliability-r3b-pinned-lane`
 - **Current R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-review fold
-  passes binary units **393 / 0 / 0**, full serial workspace **2,069 / 0 / 12 ignored** across **70**
-  groups, Linux/Rust 1.94 binary **394 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused doctor
-  **5 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0** include mutation-proven
-  pre-change failures for the deadline and `CLAUDE_CONFIG_DIR` defects plus direct production-parser
-  coverage. Format/diff, workspace check, all-target/all-feature warnings-denied Clippy, locked release
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-`427d2ed`
+  fold passes binary units **394 / 0 / 0**, full serial workspace **2,070 / 0 / 12 ignored** across **70**
+  groups, Linux/Rust 1.94 binary **395 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused doctor
+  provider-auth **1 / 0**, resolve-deadline **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI
+  controls **2 / 0** include mutation-proven
+  pre-change failures for the runway, `CLAUDE_CONFIG_DIR`, immediate-expiry polling, and external-provider
+  defects plus direct production-parser coverage. Format/diff, workspace check, all-target/all-feature
+  warnings-denied Clippy, locked release
   build, hygiene **37/7**, manifest validation, and dependency policy are green. The first Linux harness
   reached **393 / 1** because this worktree's host-absolute `.git` pointer was unavailable in the container;
   mounting the exact worktree pointer plus common Git directory restored repository identity, and the
-  unchanged test passed in the reported **394 / 0** rerun.
+  unchanged test passed in the then-reported **394 / 0** rerun.
   The uniquely tagged, non-operator reader candidate is
   `sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1`; it binds exact Codex and
   Claude package labels while leaving Kiro explicitly `STALE`. The folded release binary is
-  22,899,424 bytes at SHA-256
-  `25a3bf4fdcd36abfd298d033b622702c6a607fed742f6e33ddf728a102e66a9d`; it has not run a provider
+  22,918,128 bytes at SHA-256
+  `6cc16d82ec05541dd151e6bf223c28c90104ee4aa9a6c5941e1971845e60a0d1`; it has not run a provider
   turn. Fresh Sol/xhigh closure review of exact
   `c38978a` returned `APPROVE` with no `WRONG`; its sole nonblocking backend-error test-coverage `SMELL`
   is closed by a mutation-proven regression. No baseline promotion has run.
@@ -89,8 +91,13 @@
   and corrects the claim. Separate pinned-SDK inspection also demonstrated a `CLAUDE_CONFIG_DIR` mismatch;
   the fold now honors only an absolute selected directory and fails closed on empty/relative ambiguity.
   Both behavior regressions fail pre-change and pass current tests. Full host/Linux/merge-policy gates are
-  green; fresh review is pending. Reviews did not rerun supplied build/test gates and are not compatibility
-  evidence.
+  green. Fresh Sol/xhigh closure review of exact `427d2ed` then returned `APPROVE` with all four inherited
+  findings fixed and no new `WRONG` or `SMELL`. Post-review source inspection demonstrated two additional
+  `WRONG` states outside that frozen boundary: Tokio `timeout_at` polls an immediately-ready resolver once
+  before an already-expired delay, and exact pinned Claude 2.1.170 external-provider modes do not use
+  first-party OAuth. Both now have pre-change-failing focused regressions and local fixes; full gates and
+  merge-policy checks are green, and fresh re-review is pending. Reviews did not rerun supplied build/test
+  gates and are not compatibility evidence.
 - **Last merged full workspace gate:** R2d host serial **1,985 / 0 / 12 ignored** across 69 executables;
   format/diff, all-target check, warnings-denied Clippy, release build, repository hygiene **37/7**, and
   PR #29 Build/Lint/Coverage plus CLA were green
@@ -102,10 +109,10 @@
   mandatory. The checked-in baseline has the new manifest
   identity but intentionally has no promoted case summaries until separately authorized exact-candidate
   live artifacts are reviewed. Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** commit the full-gate-green post-`f9f3e68` deadline/config fold and run fresh Sol review
-  on that exact head. The operator must then refresh the host Claude login and allow the isolated sync to
-  copy a fresh token; require
-  both Claude doctors green before requesting new explicit authorization for one new four-case aggregate.
+- **Next action:** commit the full-gate-green post-`427d2ed` deadline-first/external-provider fold and run
+  fresh Sol re-review on that exact head. The operator must then refresh the host Claude login and allow the
+  isolated sync to copy a fresh token; require both Claude doctors green before requesting new explicit
+  authorization for one new four-case aggregate.
   Promote only an all-green aggregate, then use one clean-room Fable/xhigh adversarial implementation plus
   release/compatibility lens. Do not rebuild or swap the running operator; OpenRouter/OpenCode remain
   R3e/R3f after the R3 core and before R4.
@@ -226,7 +233,10 @@ bounded OAuth shape/expiry metadata, never renders token values, requires 16 min
 blocks smoke before adapter spawn on a non-OK OAuth row. A host override must select a non-empty absolute
 `CLAUDE_CONFIG_DIR`; otherwise preflight fails rather than validating a credential below the wrong cwd. The
 single absolute smoke deadline starts before provenance and orphan recovery, so accepted runway and turn
-budget cannot drift apart. Mutation-backed regressions fail pre-change when the wrong HOME credential is
+budget cannot drift apart; its biased deadline-first resolve branch refuses without polling an adapter once
+expired. Truthy exact pinned Claude third-party selectors bypass only host first-party OAuth because their
+AWS/Azure/GCP/provider authentication is external; false-like/unknown values and reader mounts do not.
+Mutation-backed regressions fail pre-change when the wrong HOME credential is
 selected and when delayed recovery still reaches the fake adapter; fresh-token and ordinary-path edges still
 reach it. Do not rerun the live lane until full deterministic/review closure, a fresh host Claude login,
 post-login sync, green host and reader doctors, and new explicit authorization.
@@ -369,9 +379,9 @@ Next action:
   that remains sticky across later usage snapshots.
   It also rejects a changed pinned config before provider spawn and records exact Fable-settings
   provenance only for one unambiguous host-file settings destination; duplicates remain `WARN`. The
-  nine-case manifest validates at `5d18cefe...c235d828`. The current post-review fold passes binary
-  **393/0**, full workspace **2,069/0/12 ignored** across **70** groups, Linux binary **394/0**, Linux
-  smoke CLI **15/0**, focused doctor **5/0**, and all merge/policy gates. The current
+  nine-case manifest validates at `5d18cefe...c235d828`. The current post-`427d2ed` fold passes binary
+  **394/0**, full workspace **2,070/0/12 ignored** across **70** groups, Linux binary **395/0**, Linux
+  smoke CLI **15/0**, focused doctor **5/0**, provider-auth **1/0**, and all merge/policy gates. The current
   expired real credentials now correctly produce Claude host **11 ok / 0 warn / 1 fail** and reader
   **18 ok / 0 warn / 1 fail**; Codex remains **10/0/0** host and **14/0/0** reader. Sol/xhigh closure
   review of exact `c38978a` returned `APPROVE` with no
@@ -381,10 +391,12 @@ Next action:
   image was available; bounded parser/runtime fakes cover Podman-shaped image IDs. Authorized attempt 1
   produced two Codex passes and two Fable HTTP 401 failures with no retry/fallback; no baseline promotion,
   operator rebuild, or operator swap has run. The folded release binary is SHA-256
-  `25a3bf4fdcd36abfd298d033b622702c6a607fed742f6e33ddf728a102e66a9d` (22,899,424 bytes) and remains
+  `6cc16d82ec05541dd151e6bf223c28c90104ee4aa9a6c5941e1971845e60a0d1` (22,918,128 bytes) and remains
   live-unexercised. A later exact-`f9f3e68` Sol review returned `REVISE` on the pre-recovery deadline gap
   plus parser/comment smells; local mutation-backed deadline/config-directory and parser folds have full
-  host/Linux/merge-policy gates green, with fresh review pending.
+  host/Linux/merge-policy gates green. Sol approved that exact tree with no findings. A subsequent local
+  audit demonstrated and folded immediate-expiry resolver polling plus pinned external-provider false-blocks;
+  current-tree full gates are green and fresh re-review remains pending.
 - OpenRouter and OpenCode are recorded as R3e/R3f after the pinned/floating/scheduling core and before
   R4. Credentials remain environment-only; neither provider is eligible for automatic fallback. The
   running operator service is unchanged until a merged candidate is rebuilt and swapped during a

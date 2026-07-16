@@ -298,21 +298,23 @@ is unchanged.
 
 - **Branch:** `agent/reliability-r3b-pinned-lane`
 - **Implementation state (2026-07-16):** nine pinned rows validate at manifest SHA-256
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-review fold
-  passes binary **393/0**, full workspace **2,069/0/12 ignored** across **70** groups, Linux/Rust 1.94
-  binary **394/0**, Linux smoke CLI **15/0**, focused doctor **5/0**, and all
-  format/check/Clippy/release/hygiene/manifest/dependency-policy gates.
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-`427d2ed`
+  fold passes binary **394/0**, full workspace **2,070/0/12 ignored** across **70** groups, Linux/Rust 1.94
+  binary **395/0**, Linux smoke CLI **15/0**, focused doctor **5/0**, provider/resolve tests **1/0** each,
+  and all format/check/Clippy/release/hygiene/manifest/dependency-policy gates.
   An intermediate Linux run was **393/1** only because the container could not resolve this worktree's
   host-absolute `.git` pointer; the exact Git pointer/common-directory mounts restored repo identity and
   the unchanged test passed in the **394/0** rerun.
-  The folded release binary is 22,899,424 bytes at SHA-256
-  `25a3bf4fdcd36abfd298d033b622702c6a607fed742f6e33ddf728a102e66a9d` and has not run a provider turn.
+  The folded release binary is 22,918,128 bytes at SHA-256
+  `6cc16d82ec05541dd151e6bf223c28c90104ee4aa9a6c5941e1971845e60a0d1` and has not run a provider turn.
   The pinned baseline remains empty pending a future all-green, separately authorized aggregate. Fresh
   Sol/xhigh closure review of
   exact `c38978a` returned `APPROVE` with no `WRONG`; its sole nonblocking test-coverage `SMELL` is
   closed. A later exact-`f9f3e68` review returned `REVISE` on the pre-recovery deadline gap plus direct
-  parser/comment smells. The current local fold has full host/Linux/merge-policy gates green and awaits
-  fresh review.
+  parser/comment smells. That fold had full host/Linux/merge-policy gates green. Sol subsequently approved
+  exact `427d2ed` with all inherited items fixed and no findings.
+  A post-review audit then demonstrated immediate-expiry inner-future polling and exact pinned third-party
+  provider false-blocks; both are mutation-proven, full-gate green locally, and pending fresh re-review.
 
 The initial fresh one-shot Sol/xhigh review of exact `57f3ee8` returned `REVISE` with two `WRONG`
 findings and three `SMELL`s. The branch now keeps invalid negative/non-finite cost history sticky across
@@ -344,10 +346,14 @@ the stale host state. R3b therefore adds bounded token-blind OAuth metadata pars
 runway row for host and exact mounted reader credentials, and a smoke guard that refuses a non-OK row
 before adapter resolution. Host automatic auth honors a non-empty absolute `CLAUDE_CONFIG_DIR` and fails
 closed on empty/relative ambiguity. The absolute smoke deadline begins before provenance and orphan
-recovery, preventing accepted runway from aging behind a fresh timeout. The original spawned regression
+recovery, preventing accepted runway from aging behind a fresh timeout; deadline-first resolution refuses
+without polling an adapter once expired. Truthy Bedrock/Vertex/Foundry/Anthropic-AWS/Mantle selectors use
+external host authentication and bypass first-party file OAuth, while false-like/unknown values and mounted
+reader credentials do not. The original spawned regression
 failed pre-change **1 passed / 1 failed** because the expired case reached the fake adapter. The newer
 config-directory and delayed-recovery regressions also fail pre-change; current focused doctor **5/0**,
-delayed-recovery CLI **1/0**, and expired/fresh CLI controls **2/0** are green. Finish Sol review, then
+provider-auth **1/0**, delayed-recovery CLI **1/0**, and expired/fresh CLI controls **2/0** are green. Finish
+fresh Sol re-review, then
 require a fresh host login, post-login sync, two green Claude doctors, and new explicit billable
 authorization. Attempt 1 must never be replayed or promoted.
 

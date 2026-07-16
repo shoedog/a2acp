@@ -119,6 +119,15 @@ const CLAUDE_EXPLICIT_AUTH_ENVS: [&str; 3] = [
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
 ];
+// These truthy selectors choose non-first-party Claude backends whose authentication is external to
+// Claude OAuth (AWS/Azure/GCP/provider credentials). The sandbox branch remains authoritative first.
+const CLAUDE_EXTERNAL_PROVIDER_ENVS: [&str; 5] = [
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_MANTLE",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaudeOauthMetadata {
@@ -1311,6 +1320,12 @@ fn claude_credential_source(
     }) {
         return Ok(None);
     }
+    if CLAUDE_EXTERNAL_PROVIDER_ENVS
+        .iter()
+        .any(|name| claude_env_flag_enabled(probes, name))
+    {
+        return Ok(None);
+    }
     if let Some(config_dir) = probes.env_var_value("CLAUDE_CONFIG_DIR") {
         let config_dir = PathBuf::from(config_dir);
         if config_dir.as_os_str().is_empty() || !config_dir.is_absolute() {
@@ -1325,6 +1340,16 @@ fn claude_credential_source(
         .host_home_dir()
         .map(|home| Some(home.join(".claude/.credentials.json")))
         .ok_or_else(|| "host HOME is unavailable for automatic Claude authentication".into())
+}
+
+fn claude_env_flag_enabled(probes: &dyn RuntimeProbes, name: &str) -> bool {
+    probes.env_var_value(name).is_some_and(|value| {
+        let value = value.trim();
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
 }
 
 fn refresh_credential_detail(metadata: ClaudeOauthMetadata, now_ms: u64) -> &'static str {
@@ -3555,6 +3580,72 @@ mod tests {
             CheckStatus::Fail
         );
         assert!(provenance_blocks_smoke_spawn(&empty_rows));
+    }
+
+    #[test]
+    fn external_claude_provider_bypasses_host_file_oauth_only_when_truthy() {
+        const NOW: u64 = 8_000_000;
+        let host = acp_entry("claude", "claude-agent-acp");
+        let host_snapshot = snapshot("claude", vec![host], vec!["claude-agent-acp"]);
+
+        for name in CLAUDE_EXTERNAL_PROVIDER_ENVS {
+            for value in ["1", "true", " YES ", "on"] {
+                let probes = FakeProbes::new()
+                    .with_host_home("/home/test")
+                    .at_time(NOW)
+                    .with_claude_oauth("/home/test/.claude/.credentials.json", NOW - 1, false, None)
+                    .with_env(name, value);
+                let mut rows = Vec::new();
+                check_provenance(&host_snapshot, &probes, &mut rows);
+                assert!(
+                    rows.iter()
+                        .all(|row| row.check != "provenance:claude:oauth-credential"),
+                    "external provider {name}={value:?} must not require first-party OAuth"
+                );
+                assert!(!provenance_blocks_smoke_spawn(&rows));
+            }
+        }
+
+        for value in ["", "0", "false", " no ", "off", "junk"] {
+            let probes = FakeProbes::new()
+                .with_host_home("/home/test")
+                .at_time(NOW)
+                .with_claude_oauth("/home/test/.claude/.credentials.json", NOW - 1, false, None)
+                .with_env("CLAUDE_CODE_USE_BEDROCK", value);
+            let mut rows = Vec::new();
+            check_provenance(&host_snapshot, &probes, &mut rows);
+            assert_eq!(
+                find(&rows, "provenance:claude:oauth-credential").status,
+                CheckStatus::Fail,
+                "false-like or unknown provider value {value:?} must not bypass OAuth"
+            );
+            assert!(provenance_blocks_smoke_spawn(&rows));
+        }
+
+        let mut reader = acp_entry("claude-reader", "claude-agent-acp");
+        reader.pre_authenticated = true;
+        reader.sandbox = Some(locked_sandbox(
+            "reader:fixed",
+            "a2a-net",
+            vec!["/creds/.credentials.json:/root/.claude/.credentials.json".to_string()],
+        ));
+        let reader_snapshot = snapshot(
+            "claude-reader",
+            vec![reader],
+            vec!["claude-agent-acp", "docker"],
+        );
+        let probes = FakeProbes::new()
+            .at_time(NOW)
+            .with_claude_oauth("/creds/.credentials.json", NOW - 1, false, None)
+            .with_env("CLAUDE_CODE_USE_BEDROCK", "1");
+        let mut rows = Vec::new();
+        check_provenance(&reader_snapshot, &probes, &mut rows);
+        assert_eq!(
+            find(&rows, "provenance:claude-reader:oauth-credential").status,
+            CheckStatus::Fail,
+            "ambient host provider selection must not bypass the mounted reader credential"
+        );
+        assert!(provenance_blocks_smoke_spawn(&rows));
     }
 
     #[test]

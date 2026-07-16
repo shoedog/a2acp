@@ -156,7 +156,12 @@ spawn when bounded OAuth metadata is expired or has less than 16 minutes of runw
 credential copy does not refresh an expired host login. When `CLAUDE_CONFIG_DIR` is present for a host
 Claude entry, it must be a non-empty absolute path so doctor and every possible child cwd select the same
 `.credentials.json`; unset uses `$HOME/.claude/.credentials.json`. The one smoke deadline begins before
-provenance and orphan recovery, so those phases cannot consume the runway and then receive a fresh timeout.
+provenance and orphan recovery, so those phases cannot consume the runway and then receive a fresh timeout;
+deadline-first resolution refuses without polling the adapter when time is already exhausted. Truthy
+`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`,
+`CLAUDE_CODE_USE_ANTHROPIC_AWS`, or `CLAUDE_CODE_USE_MANTLE` selects external provider auth and therefore
+skips first-party file OAuth on host entries; false-like or unknown values do not, and ambient host flags
+never bypass a mounted reader credential.
 Never use a stale installed binary
 for compatibility evidence, and never automatically rerun a failed or timed-out smoke: the first prompt may
 have been accepted. Do not update `docs/compatibility.md` until the release-mode artifact records the exact

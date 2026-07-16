@@ -30,6 +30,8 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   sync from turning an already expired host token into a billable host/reader failure. Host preflight honors
   an absolute `CLAUDE_CONFIG_DIR`, rejects ambiguous empty/relative overrides, and starts the absolute smoke
   deadline before provenance and orphan recovery so an accepted runway cannot age behind a fresh timeout.
+  Deadline-first resolution never polls an adapter after expiry, while truthy pinned Claude third-party
+  provider selectors bypass first-party file OAuth without weakening mounted-reader checks.
 
 ## [0.2.1] - 2026-07-10
 

@@ -57,8 +57,12 @@ For Claude ACP, `doctor` inspects only bounded OAuth shape/expiry metadata: it n
 An expired access token fails; less than 16 minutes of runway warns (the 15-minute maximum smoke plus a
 one-minute preflight margin). A present host `CLAUDE_CONFIG_DIR` must be a non-empty absolute path; unset
 uses `$HOME/.claude`, while empty/relative values fail closed because guarded fallback can change the child
-cwd. The absolute smoke deadline starts before provenance and orphan recovery. A non-OK OAuth row blocks
-`smoke` before adapter spawn. `deploy/containers/sync-creds.sh claude` only copies the host file—it cannot
+cwd. Truthy `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`,
+`CLAUDE_CODE_USE_ANTHROPIC_AWS`, and `CLAUDE_CODE_USE_MANTLE` select external host authentication and skip
+first-party file OAuth; false-like/unknown values do not, and host flags never bypass a reader mount. The
+absolute smoke deadline starts before provenance and orphan recovery, and deadline-first resolution does
+not poll the adapter after expiry. A non-OK OAuth row blocks `smoke` before adapter spawn.
+`deploy/containers/sync-creds.sh claude` only copies the host file—it cannot
 refresh an expired host login—so require a green doctor after sync and never treat a successful launchd run
 as auth evidence.
 
