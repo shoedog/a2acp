@@ -1,11 +1,14 @@
 # R3 — Compatibility manifest and canary implementation plan
 
-- **Status:** IN REVIEW — initial review and closure re-reviews 1–4 on `884bc5f`, `b37147c`,
-  `c8c9452`, `a8602bb`, and `42523e1` returned `REVISE`; the intervening exact-`bc9f64c` attempt ended
-  on provider capacity without a verdict. Every completed finding set is folded locally on
-  `agent/reliability-r3a-manifest-runner` with deterministic gates green. One fresh Sol/xhigh review of
-  the corrected exact head remains pending; after Sol approves, one independent Fable/xhigh pass owns
-  the adversarial implementation and release/compatibility lenses
+- **Status:** overall R3 **IN REVIEW**; R3a **APPROVED / PENDING MERGE** — initial review and closure
+  re-reviews 1–4 on `884bc5f`,
+  `b37147c`, `c8c9452`, `a8602bb`, and `42523e1` returned `REVISE`; the intervening exact-`bc9f64c`
+  attempt ended on provider capacity without a verdict. Every completed finding set is folded on
+  `agent/reliability-r3a-manifest-runner`. Sol/xhigh closure re-review 5 of exact `fba430fe` returned
+  `APPROVE`, then the single independent Fable/xhigh adversarial implementation and
+  release/compatibility review of that same exact commit returned `READY` and `APPROVE`. This
+  approval-recording docs fold is the exact artifact for the required final targeted Sol/xhigh status
+  review before the non-draft PR
 - **Prerequisite:** R2c and R2d merged (`a6fec94c`, PR #29)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -147,9 +150,11 @@ and exact API-key environment identity/presence fail visibly.
 
 The current review fold also passes format/diff, workspace all-target check, warnings-denied Clippy,
 workspace release build, hygiene **37/7**, and release-candidate manifest validation at SHA-256
-`f6481b2e88d55ebbdbed33d73bac40b871627ed1ef6779f582c3943858249007`. One fresh Sol/xhigh closure
-re-review remains pending; after it approves, one independent Fable/xhigh adversarial implementation and
-release/compatibility review remains. No ignored or live test was run or re-baselined.
+`f6481b2e88d55ebbdbed33d73bac40b871627ed1ef6779f582c3943858249007`. Sol/xhigh closure re-review 5
+and the one clean-room Fable/xhigh adversarial implementation plus release/compatibility review both
+approved exact `fba430fe`; this docs fold is the final publication-status review boundary. No ignored or
+live test was run or re-baselined, and review turns remain review evidence rather than compatibility
+evidence.
 
 Each manifest case records:
 
@@ -263,8 +268,35 @@ blocking setup copy described above; the injected pre-change directory-sync fail
 at the output, while the corrected test restores `blocking setup` and removes both staging names. A
 companion negative control removes the green output name when the rollback name itself vanishes. The
 roadmap top cursor now names only the pending exact-head Sol review followed by the single Fable review.
-A fresh exact-head Sol/xhigh review is still required before that clean-room Fable/xhigh adversarial and
-release/compatibility pass.
+### R3a exact-head approval reviews
+
+Fresh bridge-mediated `gpt-5.6-sol`/xhigh/read-only closure re-review 5 of exact `fba430fe` returned
+`APPROVE`. It adjudicated the remote-identity, post-rename sync, and top-cursor findings `FIXED`; retained
+the hostile same-UID/root race as accepted/nonblocking; confirmed the four prior fixes did not regress;
+and found no new `WRONG`. Its one new nonblocking `SMELL` is symmetric coverage debt: target rebinding
+and rollback-name loss are mutation-tested, while final-sibling same-name replacement before validation
+is guarded in production but lacks an equivalent direct negative test. The reviewer inspected all 21
+changed files, independently confirmed the exact head/base, clean tree, diff check, and manifest hash,
+and accepted the supplied test/build totals without rerunning them.
+
+The one independent clean-room bridge-mediated `claude-fable-5[1m]`/xhigh/plan review of the same exact
+commit returned release verdict `READY` and gate `APPROVE`, with no `WRONG`. The trusted-own-repo Tier 0
+turn used an explicit strict read-only prompt and left the detached worktree clean. It reran only the
+manifest SHA-256, accepted the supplied test/build evidence, and reported four minor nonblocking
+`SMELL`s: the parent runner has no outer deadline if the already-bounded child smoke itself wedges; the
+enumerated secret-shape heuristics are incomplete but remain backstopped by exact credential-value scans,
+sensitive-key checks, and R2c redaction; the accepted hostile same-UID/root races remain; and a few
+identity/cost edges can false-reject or produce a less-specific visible counter without greening.
+
+These approval findings do not change the R3a merge gate. R3b owns additive final-sibling mutation
+coverage and heuristic/diagnostic edge tests before adding real credential-bearing rows. R3d must add a
+parent-owned hard deadline plus bounded termination escalation before scheduling unattended canaries;
+an internally wedged or stopped smoke must not park the scheduler indefinitely, and repeated operator
+cancellation must remain possible. The stronger hostile same-UID/root actor remains an explicit non-goal,
+not a silently closed threat. There will be no Fable re-review; this approval-recording docs fold receives
+one targeted Sol/xhigh status review before publication. The docs-only fold reruns format/diff, the full
+serial workspace **2,043/0/12 ignored** across **70** groups, and hygiene **37/7**; the approved code tree
+is unchanged.
 
 ## R3b — pinned lane and promotion baseline
 
@@ -283,6 +315,13 @@ R3a deliberately executes only minimal bridge-smoke rows. Historic direct-CLI/di
 retained as explicit non-goal/unrun rows rather than being relabeled as bridge evidence or invoked by a
 new prompt engine. They do not become supported release paths without a separately reviewed bounded
 artifact contract.
+
+Before adding credential-bearing rows, extend the deterministic runner controls with symmetric
+final-sibling same-name replacement coverage, additional credential-shaped environment names, and
+explicit negative/non-finite reported-cost handling. Preserve exact credential-value and sensitive-key
+backstops; heuristic expansion must not be presented as general secret detection. Exact identity grammar
+may fail closed on unsupported authoring forms, but every rejected supported-provider identity needs an
+explicit reviewed spelling rather than an automatic relaxation.
 
 Run from the candidate release binary and exact image id. Compare versioned artifacts to
 `compatibility/baselines/pinned.json`; any provenance, capability, auth, phase, terminal, or diagnostic
@@ -315,6 +354,9 @@ developer's subscription auth and must not receive copied personal state casuall
 
 After that owner decision:
 
+- before any unattended schedule, add a parent-owned hard process deadline and bounded TERM/KILL
+  escalation around the child smoke. A stopped or internally wedged child must not park the scheduler
+  indefinitely, and a later operator cancellation must not be swallowed after the first signal;
 - daily: cheap minimal pinned and floating cases within a fixed total budget;
 - weekly: one representative read-only review per supported provider lane, but only after R3d adds and
   deterministically validates a bounded bridge-workflow artifact adapter; never schedule R3a's explicit
