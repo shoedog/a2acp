@@ -1699,6 +1699,12 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     let artifact_redactor = artifact_redactor(&entry, session_cwd.as_ref());
     sanitize_optional_artifact_text(&mut state.artifact.request.model, &artifact_redactor);
     sanitize_optional_artifact_text(&mut state.artifact.request.mode, &artifact_redactor);
+    // Start the one absolute deadline before credential provenance and orphan recovery. Those
+    // pre-spawn phases therefore consume the same bounded budget as resolve/configure/prompt/drain;
+    // an eventually-returning recovery can never age an accepted OAuth credential past the
+    // preflight runway and then receive a fresh turn deadline.
+    state.artifact.attempt.started_at_ms = diagnostic_timestamp_ms();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout_secs);
     let provenance = artifact_provenance(&snapshot, &args.agent, &artifact_redactor);
     let stale_oauth = doctor::provenance_blocks_smoke_spawn(&provenance);
     state.artifact.target = Some(TargetRecord {
@@ -1808,10 +1814,8 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         return state.finalize(args.include_redacted_stderr).await;
     }
 
-    // One absolute turn deadline covers resolve/spawn, session config/mint, prompt installation, and
-    // terminal drain. Cleanup has its own short bounded grace so a timeout can still reap ownership.
-    state.artifact.attempt.started_at_ms = diagnostic_timestamp_ms();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout_secs);
+    // The absolute deadline already covers provenance and recovery. Cleanup has its own short bounded
+    // grace so a timeout can still reap ownership.
     let observer_dyn: Arc<dyn bridge_core::ports::DiagnosticObserver> = state.observer.clone();
     let resolved = match resolve_once(registry.as_ref(), &args.agent, observer_dyn, deadline).await
     {

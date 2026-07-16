@@ -55,10 +55,12 @@ a2a-bridge models --config /path/to/a2a-bridge.toml --json
 
 For Claude ACP, `doctor` inspects only bounded OAuth shape/expiry metadata: it never renders token values.
 An expired access token fails; less than 16 minutes of runway warns (the 15-minute maximum smoke plus a
-one-minute preflight margin). Either status blocks `smoke` before
-adapter spawn. `deploy/containers/sync-creds.sh claude` only copies the host file—it cannot refresh an
-expired host login—so require a green doctor after sync and never treat a successful launchd run as auth
-evidence.
+one-minute preflight margin). A present host `CLAUDE_CONFIG_DIR` must be a non-empty absolute path; unset
+uses `$HOME/.claude`, while empty/relative values fail closed because guarded fallback can change the child
+cwd. The absolute smoke deadline starts before provenance and orphan recovery. A non-OK OAuth row blocks
+`smoke` before adapter spawn. `deploy/containers/sync-creds.sh claude` only copies the host file—it cannot
+refresh an expired host login—so require a green doctor after sync and never treat a successful launchd run
+as auth evidence.
 
 For a minimal live compatibility probe, stop here until the implementation's deterministic timeout,
 artifact, redaction, and no-retry tests are green and the operator explicitly authorizes a billable turn.

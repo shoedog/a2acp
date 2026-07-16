@@ -5,17 +5,21 @@
 - **Completed through:** R3a **MERGED** at `3927df3f`; R2e remains deferred and off the critical path
 - **Active slice:** R3b pinned lane on `agent/reliability-r3b-pinned-lane`
 - **Current R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. Post-attempt OAuth hardening
-  passes binary units **391 / 0 / 0**, full serial workspace **2,066 / 0 / 12 ignored** across **70**
-  groups, Linux/Rust 1.94 binary **392 / 0 / 0**, and Linux smoke CLI **14 / 0**. Focused doctor
-  **4 / 0** and spawned smoke CLI **2 / 0** include a pre-change **1 passed / 1 failed** red. Format/diff,
-  workspace check, all-feature warnings-denied Clippy, locked release build, hygiene **37/7**, manifest
-  validation, and dependency policy are green.
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-review fold
+  passes binary units **393 / 0 / 0**, full serial workspace **2,069 / 0 / 12 ignored** across **70**
+  groups, Linux/Rust 1.94 binary **394 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused doctor
+  **5 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0** include mutation-proven
+  pre-change failures for the deadline and `CLAUDE_CONFIG_DIR` defects plus direct production-parser
+  coverage. Format/diff, workspace check, all-target/all-feature warnings-denied Clippy, locked release
+  build, hygiene **37/7**, manifest validation, and dependency policy are green. The first Linux harness
+  reached **393 / 1** because this worktree's host-absolute `.git` pointer was unavailable in the container;
+  mounting the exact worktree pointer plus common Git directory restored repository identity, and the
+  unchanged test passed in the reported **394 / 0** rerun.
   The uniquely tagged, non-operator reader candidate is
   `sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1`; it binds exact Codex and
-  Claude package labels while leaving Kiro explicitly `STALE`. The post-hardening release binary is
-  22,899,664 bytes at SHA-256
-  `638d44c00b81a5d03ee92ac3f6c6761a7ce067fa1958ff2eb659fe3b7ab7baa0`; it has not run a provider
+  Claude package labels while leaving Kiro explicitly `STALE`. The folded release binary is
+  22,899,424 bytes at SHA-256
+  `25a3bf4fdcd36abfd298d033b622702c6a607fed742f6e33ddf728a102e66a9d`; it has not run a provider
   turn. Fresh Sol/xhigh closure review of exact
   `c38978a` returned `APPROVE` with no `WRONG`; its sole nonblocking backend-error test-coverage `SMELL`
   is closed by a mutation-proven regression. No baseline promotion has run.
@@ -78,7 +82,15 @@
   coverage. The current tree closes that gap for both usage orders; the identical regression passes **1/0**
   here and failed **0/1** on pre-fold `9c2b712` because invalid-then-valid leaked `cost`. The full host suite
   then passed **2,060/0/12 ignored** across **70** groups and Linux/Rust 1.94 binary units passed **388/0**.
-  The review did not rerun supplied build/test gates and is not compatibility evidence.
+  Fresh Sol/xhigh review of exact `f9f3e68` returned `REVISE`: one `WRONG` showed that orphan recovery
+  could consume the 16-minute runway before the 15-minute deadline began; two `SMELL`s requested direct
+  parser coverage and corrected the inaccurate "never hashed" comment. The current local fold starts the
+  absolute deadline before provenance/recovery, directly tests malformed/required/optional parser shape,
+  and corrects the claim. Separate pinned-SDK inspection also demonstrated a `CLAUDE_CONFIG_DIR` mismatch;
+  the fold now honors only an absolute selected directory and fails closed on empty/relative ambiguity.
+  Both behavior regressions fail pre-change and pass current tests. Full host/Linux/merge-policy gates are
+  green; fresh review is pending. Reviews did not rerun supplied build/test gates and are not compatibility
+  evidence.
 - **Last merged full workspace gate:** R2d host serial **1,985 / 0 / 12 ignored** across 69 executables;
   format/diff, all-target check, warnings-denied Clippy, release build, repository hygiene **37/7**, and
   PR #29 Build/Lint/Coverage plus CLA were green
@@ -90,8 +102,9 @@
   mandatory. The checked-in baseline has the new manifest
   identity but intentionally has no promoted case summaries until separately authorized exact-candidate
   live artifacts are reviewed. Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** finish full deterministic and Sol review closure of the OAuth preflight hardening. The
-  operator must then refresh the host Claude login and allow the isolated sync to copy a fresh token; require
+- **Next action:** commit the full-gate-green post-`f9f3e68` deadline/config fold and run fresh Sol review
+  on that exact head. The operator must then refresh the host Claude login and allow the isolated sync to
+  copy a fresh token; require
   both Claude doctors green before requesting new explicit authorization for one new four-case aggregate.
   Promote only an all-green aggregate, then use one clean-room Fable/xhigh adversarial implementation plus
   release/compatibility lens. Do not rebuild or swap the running operator; OpenRouter/OpenCode remain
@@ -210,10 +223,13 @@ Hypothesis/probe/result log:
 Settled root cause: the bridge checked credential source type but not freshness, so a successful sync of an
 already expired host access token passed doctor and crossed the billable boundary. R3b now parses only
 bounded OAuth shape/expiry metadata, never renders token values, requires 16 minutes of access runway, and
-blocks smoke before adapter spawn on a non-OK OAuth row. The mutation-backed spawned-CLI regression failed
-pre-change because the fake adapter was reached, while a fresh-token edge still reaches it. Do not rerun the
-live lane until full deterministic/review closure, a fresh host Claude login, post-login sync, green host and
-reader doctors, and new explicit authorization.
+blocks smoke before adapter spawn on a non-OK OAuth row. A host override must select a non-empty absolute
+`CLAUDE_CONFIG_DIR`; otherwise preflight fails rather than validating a credential below the wrong cwd. The
+single absolute smoke deadline starts before provenance and orphan recovery, so accepted runway and turn
+budget cannot drift apart. Mutation-backed regressions fail pre-change when the wrong HOME credential is
+selected and when delayed recovery still reaches the fake adapter; fresh-token and ordinary-path edges still
+reach it. Do not rerun the live lane until full deterministic/review closure, a fresh host Claude login,
+post-login sync, green host and reader doctors, and new explicit authorization.
 
 Allowed status values are `NOT STARTED`, `IN PROGRESS`, `IN REVIEW`, `APPROVED / PENDING MERGE`,
 `MERGED`, `BLOCKED`, and `DEFERRED`. Update this table in the same PR that changes a slice status. Never
@@ -353,9 +369,9 @@ Next action:
   that remains sticky across later usage snapshots.
   It also rejects a changed pinned config before provider spawn and records exact Fable-settings
   provenance only for one unambiguous host-file settings destination; duplicates remain `WARN`. The
-  nine-case manifest validates at `5d18cefe...c235d828`. Post-live OAuth hardening passes binary
-  **391/0**, full workspace **2,066/0/12 ignored** across **70** groups, Linux binary **392/0**, Linux
-  smoke CLI **14/0**, focused doctor **4/0**, spawned CLI **2/0**, and all merge/policy gates. The current
+  nine-case manifest validates at `5d18cefe...c235d828`. The current post-review fold passes binary
+  **393/0**, full workspace **2,069/0/12 ignored** across **70** groups, Linux binary **394/0**, Linux
+  smoke CLI **15/0**, focused doctor **5/0**, and all merge/policy gates. The current
   expired real credentials now correctly produce Claude host **11 ok / 0 warn / 1 fail** and reader
   **18 ok / 0 warn / 1 fail**; Codex remains **10/0/0** host and **14/0/0** reader. Sol/xhigh closure
   review of exact `c38978a` returned `APPROVE` with no
@@ -364,9 +380,11 @@ Next action:
   against the candidate image. A real Podman label inspection remains unverified because no local Podman
   image was available; bounded parser/runtime fakes cover Podman-shaped image IDs. Authorized attempt 1
   produced two Codex passes and two Fable HTTP 401 failures with no retry/fallback; no baseline promotion,
-  operator rebuild, or operator swap has run. The hardened release binary is SHA-256
-  `638d44c00b81a5d03ee92ac3f6c6761a7ce067fa1958ff2eb659fe3b7ab7baa0` (22,899,664 bytes) and remains
-  live-unexercised.
+  operator rebuild, or operator swap has run. The folded release binary is SHA-256
+  `25a3bf4fdcd36abfd298d033b622702c6a607fed742f6e33ddf728a102e66a9d` (22,899,424 bytes) and remains
+  live-unexercised. A later exact-`f9f3e68` Sol review returned `REVISE` on the pre-recovery deadline gap
+  plus parser/comment smells; local mutation-backed deadline/config-directory and parser folds have full
+  host/Linux/merge-policy gates green, with fresh review pending.
 - OpenRouter and OpenCode are recorded as R3e/R3f after the pinned/floating/scheduling core and before
   R4. Credentials remain environment-only; neither provider is eligible for automatic fallback. The
   running operator service is unchanged until a merged candidate is rebuilt and swapped during a

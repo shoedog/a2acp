@@ -27,7 +27,9 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   Fable-settings destinations no longer report exact provenance.
 - Claude smoke/doctor preflight now reads only bounded, non-secret OAuth shape/expiry metadata and blocks
   expired or short-runway credentials before adapter spawn. This prevents an automated isolated-credential
-  sync from turning an already expired host token into a billable host/reader failure.
+  sync from turning an already expired host token into a billable host/reader failure. Host preflight honors
+  an absolute `CLAUDE_CONFIG_DIR`, rejects ambiguous empty/relative overrides, and starts the absolute smoke
+  deadline before provenance and orphan recovery so an accepted runway cannot age behind a fresh timeout.
 
 ## [0.2.1] - 2026-07-10
 

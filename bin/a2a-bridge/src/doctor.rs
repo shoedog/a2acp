@@ -206,7 +206,7 @@ pub trait RuntimeProbes {
         Err("file digest unavailable".into())
     }
     /// Non-secret shape and expiry metadata from one bounded Claude OAuth credential file. Token
-    /// values are never returned, rendered, hashed, or persisted.
+    /// values are never returned, rendered, or persisted outside the bounded in-memory parse.
     fn claude_oauth_metadata(&self, _path: &Path) -> Result<ClaudeOauthMetadata, String> {
         Err("Claude OAuth metadata unavailable".into())
     }
@@ -1310,6 +1310,16 @@ fn claude_credential_source(
             .is_some_and(|value| !value.is_empty())
     }) {
         return Ok(None);
+    }
+    if let Some(config_dir) = probes.env_var_value("CLAUDE_CONFIG_DIR") {
+        let config_dir = PathBuf::from(config_dir);
+        if config_dir.as_os_str().is_empty() || !config_dir.is_absolute() {
+            return Err(
+                "CLAUDE_CONFIG_DIR must be a non-empty absolute path for exact credential preflight"
+                    .into(),
+            );
+        }
+        return Ok(Some(config_dir.join(".credentials.json")));
     }
     probes
         .host_home_dir()
@@ -3545,6 +3555,116 @@ mod tests {
             CheckStatus::Fail
         );
         assert!(provenance_blocks_smoke_spawn(&empty_rows));
+    }
+
+    #[test]
+    fn host_claude_oauth_uses_only_an_absolute_config_dir_override() {
+        const NOW: u64 = 9_000_000;
+        let host = acp_entry("claude", "claude-agent-acp");
+        let snapshot = snapshot("claude", vec![host], vec!["claude-agent-acp"]);
+
+        let alternate_is_fresh = FakeProbes::new()
+            .with_host_home("/home/test")
+            .with_env("CLAUDE_CONFIG_DIR", "/isolated/claude")
+            .at_time(NOW)
+            .with_claude_oauth("/home/test/.claude/.credentials.json", NOW - 1, false, None)
+            .with_claude_oauth(
+                "/isolated/claude/.credentials.json",
+                NOW + MIN_CLAUDE_ACCESS_RUNWAY_MS,
+                true,
+                None,
+            );
+        let mut fresh_rows = Vec::new();
+        check_provenance(&snapshot, &alternate_is_fresh, &mut fresh_rows);
+        assert_eq!(
+            find(&fresh_rows, "provenance:claude:oauth-credential").status,
+            CheckStatus::Ok,
+            "the ACP wrapper reads credentials below CLAUDE_CONFIG_DIR, not HOME"
+        );
+
+        let alternate_is_expired = FakeProbes::new()
+            .with_host_home("/home/test")
+            .with_env("CLAUDE_CONFIG_DIR", "/isolated/claude")
+            .at_time(NOW)
+            .with_claude_oauth(
+                "/home/test/.claude/.credentials.json",
+                NOW + MIN_CLAUDE_ACCESS_RUNWAY_MS,
+                true,
+                None,
+            )
+            .with_claude_oauth("/isolated/claude/.credentials.json", NOW - 1, false, None);
+        let mut expired_rows = Vec::new();
+        check_provenance(&snapshot, &alternate_is_expired, &mut expired_rows);
+        assert_eq!(
+            find(&expired_rows, "provenance:claude:oauth-credential").status,
+            CheckStatus::Fail,
+            "a fresh HOME credential must not mask the selected expired credential"
+        );
+
+        for ambiguous in ["", "relative/claude"] {
+            let probes = FakeProbes::new()
+                .with_host_home("/home/test")
+                .with_env("CLAUDE_CONFIG_DIR", ambiguous)
+                .at_time(NOW)
+                .with_claude_oauth(
+                    "/home/test/.claude/.credentials.json",
+                    NOW + MIN_CLAUDE_ACCESS_RUNWAY_MS,
+                    true,
+                    None,
+                );
+            let mut rows = Vec::new();
+            check_provenance(&snapshot, &probes, &mut rows);
+            let row = find(&rows, "provenance:claude:oauth-credential");
+            assert_eq!(row.status, CheckStatus::Fail);
+            assert!(row.detail.contains("CLAUDE_CONFIG_DIR"), "{}", row.detail);
+            assert!(provenance_blocks_smoke_spawn(&rows));
+        }
+    }
+
+    #[test]
+    fn production_claude_oauth_parser_rejects_bad_required_shape_and_ignores_bad_refresh_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+
+        std::fs::write(&path, b"{not-json").unwrap();
+        assert_eq!(
+            read_claude_oauth_metadata(&path).unwrap_err(),
+            "credential JSON is malformed"
+        );
+
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "synthetic-token",
+                    "expiresAt": "tomorrow"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_claude_oauth_metadata(&path).unwrap_err(),
+            "credential is missing a valid access-token expiry"
+        );
+
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "claudeAiOauth": {
+                    "expiresAt": 42,
+                    "refreshToken": "synthetic-refresh-token",
+                    "refreshTokenExpiresAt": "not-an-integer"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let metadata = read_claude_oauth_metadata(&path).unwrap();
+        assert!(!metadata.access_token_present);
+        assert_eq!(metadata.access_expires_at_ms, 42);
+        assert!(metadata.refresh_token_present);
+        assert_eq!(metadata.refresh_expires_at_ms, None);
     }
 
     #[test]

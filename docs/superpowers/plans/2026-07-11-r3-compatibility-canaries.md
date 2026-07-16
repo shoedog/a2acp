@@ -3,7 +3,8 @@
 - **Status:** overall R3 **IN REVIEW**; R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE** on
   `agent/reliability-r3b-pinned-lane`. Nine pinned rows are implemented; Sol/xhigh approved the pre-live
   deterministic tree. Authorized attempt 1 passed both Codex cases and failed both Fable cases on expired
-  OAuth after prompt start. No baseline promotion ran; OAuth preflight hardening is in deterministic closure.
+  OAuth after prompt start. No baseline promotion ran; the post-attempt hardening is in deterministic and
+  Sol-review closure after a deadline/config-directory fold.
 - **Prerequisite:** R2c/R2d merged (`a6fec94c`, PR #29); R3a merged (`3927df3f`, PR #31)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -297,16 +298,21 @@ is unchanged.
 
 - **Branch:** `agent/reliability-r3b-pinned-lane`
 - **Implementation state (2026-07-16):** nine pinned rows validate at manifest SHA-256
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. Attempt-1 OAuth hardening
-  passes binary **391/0**, full workspace **2,066/0/12 ignored** across **70** groups, Linux/Rust 1.94
-  binary **392/0**, Linux smoke CLI **14/0**, focused doctor **4/0**, spawned smoke CLI **2/0**, and all
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-review fold
+  passes binary **393/0**, full workspace **2,069/0/12 ignored** across **70** groups, Linux/Rust 1.94
+  binary **394/0**, Linux smoke CLI **15/0**, focused doctor **5/0**, and all
   format/check/Clippy/release/hygiene/manifest/dependency-policy gates.
-  The hardened release binary is 22,899,664 bytes at SHA-256
-  `638d44c00b81a5d03ee92ac3f6c6761a7ce067fa1958ff2eb659fe3b7ab7baa0` and has not run a provider turn.
+  An intermediate Linux run was **393/1** only because the container could not resolve this worktree's
+  host-absolute `.git` pointer; the exact Git pointer/common-directory mounts restored repo identity and
+  the unchanged test passed in the **394/0** rerun.
+  The folded release binary is 22,899,424 bytes at SHA-256
+  `25a3bf4fdcd36abfd298d033b622702c6a607fed742f6e33ddf728a102e66a9d` and has not run a provider turn.
   The pinned baseline remains empty pending a future all-green, separately authorized aggregate. Fresh
   Sol/xhigh closure review of
   exact `c38978a` returned `APPROVE` with no `WRONG`; its sole nonblocking test-coverage `SMELL` is
-  closed on the current tree.
+  closed. A later exact-`f9f3e68` review returned `REVISE` on the pre-recovery deadline gap plus direct
+  parser/comment smells. The current local fold has full host/Linux/merge-policy gates green and awaits
+  fresh review.
 
 The initial fresh one-shot Sol/xhigh review of exact `57f3ee8` returned `REVISE` with two `WRONG`
 findings and three `SMELL`s. The branch now keeps invalid negative/non-finite cost history sticky across
@@ -336,10 +342,14 @@ on both paths and host/reader failed symmetrically. Both access tokens had expir
 the run. The five-minute launchd sync had succeeded, proving that byte synchronization alone propagated
 the stale host state. R3b therefore adds bounded token-blind OAuth metadata parsing, a 16-minute access
 runway row for host and exact mounted reader credentials, and a smoke guard that refuses a non-OK row
-before adapter resolution. The spawned regression failed pre-change **1 passed / 1 failed** because the
-expired case reached the fake adapter; current focused doctor **4/0** and CLI **2/0** are green. Finish full
-gates and Sol review, then require a fresh host login, post-login sync, two green Claude doctors, and new
-explicit billable authorization. Attempt 1 must never be replayed or promoted.
+before adapter resolution. Host automatic auth honors a non-empty absolute `CLAUDE_CONFIG_DIR` and fails
+closed on empty/relative ambiguity. The absolute smoke deadline begins before provenance and orphan
+recovery, preventing accepted runway from aging behind a fresh timeout. The original spawned regression
+failed pre-change **1 passed / 1 failed** because the expired case reached the fake adapter. The newer
+config-directory and delayed-recovery regressions also fail pre-change; current focused doctor **5/0**,
+delayed-recovery CLI **1/0**, and expired/fresh CLI controls **2/0** are green. Finish Sol review, then
+require a fresh host login, post-login sync, two green Claude doctors, and new explicit billable
+authorization. Attempt 1 must never be replayed or promoted.
 
 Seed rows for every currently claimed path or control in `docs/compatibility.md`:
 

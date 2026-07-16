@@ -87,6 +87,49 @@ fn claude_oauth_fixture(
     (dir, marker, config, home)
 }
 
+fn delayed_recovery_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("spawned");
+    let recovery_started = dir.path().join("recovery-started");
+    let adapter = dir.path().join("marker-agent");
+    fs::write(
+        &adapter,
+        format!("#!/bin/sh\ntouch {:?}\nexec /bin/cat\n", marker),
+    )
+    .unwrap();
+    let runtime = dir.path().join("delayed-runtime");
+    fs::write(
+        &runtime,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = ps ] && [ ! -e {:?} ]; then\n  touch {:?}\n  sleep 2\nfi\nexit 0\n",
+            recovery_started, recovery_started
+        ),
+    )
+    .unwrap();
+    for executable in [&adapter, &runtime] {
+        let mut permissions = fs::metadata(executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(executable, permissions).unwrap();
+    }
+
+    let config = dir.path().join("a2a-bridge.toml");
+    fs::write(
+        &config,
+        format!(
+            "default = \"marker\"\nallowed_cwd_root = {:?}\n\n\
+             [registry]\nallowed_cmds = [{adapter:?}, {runtime:?}]\n\n\
+             [[agents]]\nid = \"marker\"\ncmd = {adapter:?}\n\n\
+             [[agents]]\nid = \"recovery-owner\"\ncmd = {adapter:?}\n\n\
+             [agents.sandbox]\nruntime = {runtime:?}\nimage = \"reader:fixed\"\nmount = {:?}\naccess = \"ro\"\negress = \"open\"\n\n\
+             [server]\n",
+            dir.path(),
+            dir.path()
+        ),
+    )
+    .unwrap();
+    (dir, marker, recovery_started, config)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -209,6 +252,36 @@ fn fresh_claude_oauth_does_not_block_adapter_spawn() {
         artifact["diagnostics"]["failure"]["code"],
         "smoke.auth_credential_stale"
     );
+}
+
+#[test]
+fn smoke_timeout_covers_pre_spawn_orphan_recovery() {
+    let (_dir, marker, recovery_started, config) = delayed_recovery_fixture();
+    let output = smoke_command(&config)
+        .arg("--acknowledge-billable")
+        .arg("--timeout-secs")
+        .arg("1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        recovery_started.exists(),
+        "the regression must exercise delayed orphan recovery; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "an exhausted absolute smoke deadline must prevent adapter spawn"
+    );
+    let artifact: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        artifact["diagnostics"]["failure"]["code"],
+        "smoke.resolve_timeout"
+    );
+    assert_eq!(artifact["attempt"]["prompt_may_have_been_accepted"], false);
+    assert_eq!(artifact["turn"]["prompt_calls"], 0);
 }
 
 #[test]

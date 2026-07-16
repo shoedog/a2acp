@@ -80,8 +80,10 @@ The settled cause is stale credential preflight, not model selection or containe
 launchd sync ran successfully but copied a host Claude access token that had expired about five hours
 earlier; post-attempt host and isolated files shared that expired access token, while the host refresh token
 was absent. R3b now adds token-blind bounded expiry/runway checks to doctor and smoke so this state refuses
-before adapter spawn. A fresh host login, subsequent isolated-copy sync, green doctor, and new explicit
-billable authorization are required before another run.
+before adapter spawn. Host checks honor a non-empty absolute `CLAUDE_CONFIG_DIR` and fail closed on an
+empty/relative override; the single absolute smoke deadline starts before provenance and orphan recovery so
+an accepted runway cannot age behind a fresh timeout. A fresh host login, subsequent isolated-copy sync,
+green doctor, and new explicit billable authorization are required before another run.
 
 ## Resolved incident: Fable over Claude ACP
 

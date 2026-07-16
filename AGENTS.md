@@ -153,7 +153,11 @@ resolution or spawn; an existing file/link or failure to apply that restriction 
 
 Run `validate`, `doctor --json`, and `models --agent <id> --json` first. Claude smoke refuses before adapter
 spawn when bounded OAuth metadata is expired or has less than 16 minutes of runway; syncing an isolated
-credential copy does not refresh an expired host login. Never use a stale installed binary
+credential copy does not refresh an expired host login. When `CLAUDE_CONFIG_DIR` is present for a host
+Claude entry, it must be a non-empty absolute path so doctor and every possible child cwd select the same
+`.credentials.json`; unset uses `$HOME/.claude/.credentials.json`. The one smoke deadline begins before
+provenance and orphan recovery, so those phases cannot consume the runway and then receive a fresh timeout.
+Never use a stale installed binary
 for compatibility evidence, and never automatically rerun a failed or timed-out smoke: the first prompt may
 have been accepted. Do not update `docs/compatibility.md` until the release-mode artifact records the exact
 lane that actually ran.
