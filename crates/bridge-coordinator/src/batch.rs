@@ -1199,6 +1199,7 @@ mod tests {
                     watchdog: None,
                     auth_method: None,
                     pre_authenticated: false,
+                    host_fallback_eligible: false,
                     name: None,
                     description: None,
                     tags: vec![],

@@ -1,6 +1,6 @@
 # R2c — Explicit bounded live smoke implementation plan
 
-- **Status:** APPROVED / PENDING MERGE
+- **Status:** MERGED at `be54bc51` by PR #28 on 2026-07-15
 - **Prerequisite:** all R2b sub-slices merged
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -132,7 +132,11 @@ resolve/spawn/prompt calls.
 
 ### C2 — versioned artifact
 
-Define private-field `SmokeArtifactV1` and validated subrecords containing:
+The merged R2c artifact was schema v1. R2d extends the private record to `SmokeArtifactV2` by adding the
+exact config SHA-256 and an optional closed fallback-action guard. Historical attempt evidence below
+remains schema v1 and is not accepted as current R2d fallback evidence.
+
+Define private-field `SmokeArtifactV2` and validated subrecords containing:
 
 - artifact schema version and terminal success/failure;
 - bridge package version and git/build identity when available;

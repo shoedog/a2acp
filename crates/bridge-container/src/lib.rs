@@ -30,6 +30,12 @@ use tokio::sync::Mutex;
 /// (and applies the system `PolicyEngine` to the inner backend — see `main.rs`'s `AcpContainerSpawn`).
 #[async_trait]
 pub trait ContainerSpawn: Send + Sync {
+    /// Production validates composition-owned host/runtime evidence before a generation is published.
+    /// Test seams default to healthy so Docker-free behavior tests do not depend on host tooling.
+    fn validate_infrastructure(&self, _sandbox: &SandboxConfig) -> Result<(), BridgeError> {
+        Ok(())
+    }
+
     async fn spawn(
         &self,
         program: &str,
@@ -448,6 +454,12 @@ impl ContainerRwBackend {
             reason: "missing session cwd".into(),
         })?;
         let rw_canon = self.resolve_rw_target(&cwd)?;
+        let preflight_sandbox = SandboxConfig {
+            mount: rw_canon.as_str().to_owned(),
+            access: bridge_core::domain::MountAccess::Rw,
+            ..self.cfg.sandbox.clone()
+        };
+        self.spawn.validate_infrastructure(&preflight_sandbox)?;
         let generation = self.turn_seq.fetch_add(1, Ordering::Relaxed);
         // Increment A: the run-id segment defeats same-owner concurrent name clashes; the label set is
         // built PER MINT so `kind` (warm|perturn) is never stale and `repo`/`cwd` reflect this :rw target.
@@ -1644,6 +1656,31 @@ mod tests {
         turn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         cancel_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
+
+    #[derive(Default)]
+    struct RejectingPreflightSpawn {
+        spawn_count: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ContainerSpawn for RejectingPreflightSpawn {
+        fn validate_infrastructure(&self, sandbox: &SandboxConfig) -> Result<(), BridgeError> {
+            let mut invalid = sandbox.clone();
+            invalid.image.clear();
+            bridge_core::sandbox::validate_container_infrastructure(&invalid)
+        }
+
+        async fn spawn(
+            &self,
+            _program: &str,
+            _argv: &[String],
+            _cfg: AcpConfig,
+        ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+            self.spawn_count.fetch_add(1, Ordering::SeqCst);
+            Err(BridgeError::InvalidStateTransition)
+        }
+    }
+
     impl CountingSpawn {
         fn new(fail: bool) -> Arc<Self> {
             Self::with_optional_gates(fail, None, None, None, None, None)
@@ -1739,7 +1776,9 @@ mod tests {
                 release.notified().await;
             }
             if self.fail {
-                return Err(BridgeError::agent_crashed("boom"));
+                return Err(BridgeError::agent_crashed(
+                    "boom docker image network mount credential",
+                ));
             }
             if let Some(resource_exists) = &self.resource_exists {
                 resource_exists.store(true, Ordering::SeqCst);
@@ -2194,7 +2233,12 @@ mod tests {
         be.configure_turn(&s, turn_meta("ctx-spawn-fail", 1, "turn-spawn-fail"))
             .await;
         let err = prompt_err(&be, &s).await;
-        assert!(format!("{err:?}").contains("boom"), "got {err:?}");
+        let BridgeError::AgentCrashed { reason } = &err else {
+            panic!("inner process prose must remain an agent-process error: {err:?}");
+        };
+        for keyword in ["docker", "image", "network", "mount", "credential"] {
+            assert!(reason.contains(keyword));
+        }
         wait_for_reaps(&reaps, 1).await;
         assert_eq!(reaps.load(Ordering::SeqCst), 1, "spawn failure MUST reap");
         assert!(be.inflight.lock().await.is_empty(), "reservation removed");
@@ -2202,6 +2246,62 @@ mod tests {
             !be.pending_turn_meta.lock().await.contains_key(&s),
             "open_inner failure consumed pending turn metadata"
         );
+    }
+
+    #[tokio::test]
+    async fn typed_preflight_failure_stops_before_generation_or_spawn() {
+        use bridge_core::diagnostics::{DiagnosticFailureClass, FailureDisposition};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = Arc::new(RejectingPreflightSpawn::default());
+        let (reap, reaps) = counting_reap();
+        let be = backend(root, spawn.clone(), reap).await;
+        let session = SessionId::parse("typed-preflight").unwrap();
+        be.configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+
+        let error = prompt_err(&be, &session).await;
+        let BridgeError::AgentFailure { diagnostic } = error else {
+            panic!("typed preflight should return a structured failure");
+        };
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::ContainerImage);
+        assert_eq!(
+            diagnostic.disposition(),
+            FailureDisposition::ContainerFallbackCandidate
+        );
+        assert!(!diagnostic.prompt_may_have_been_accepted());
+        assert_eq!(spawn.spawn_count.load(Ordering::SeqCst), 0);
+        assert_eq!(reaps.load(Ordering::SeqCst), 0);
+        assert!(be.inflight.lock().await.is_empty());
+        assert!(be
+            .session_reaps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_failure_is_preserved_without_keyword_promotion_and_still_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(true);
+        let (reap, reaps) = counting_reap();
+        let be = backend(root, spawn.clone(), reap).await;
+        let session = SessionId::parse("post-failure-preserve").unwrap();
+        be.configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+
+        let error = prompt_err(&be, &session).await;
+        let BridgeError::AgentCrashed { reason } = error else {
+            panic!("opaque launch failure should be preserved");
+        };
+        assert_eq!(reason, "boom docker image network mount credential");
+        assert_eq!(spawn.count.load(Ordering::SeqCst), 1);
+        wait_for_reaps(&reaps, 1).await;
+        assert!(be.inflight.lock().await.is_empty());
     }
 
     #[tokio::test]

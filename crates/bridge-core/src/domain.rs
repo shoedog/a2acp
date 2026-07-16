@@ -151,6 +151,9 @@ pub struct AgentEntry {
     /// The launched ACP process already has ambient credentials; do not invoke
     /// an advertised interactive authentication method during initialization.
     pub pre_authenticated: bool,
+    /// Whether this unsandboxed ACP entry may be named as a target in a local R2d fallback plan.
+    /// This capability never asserts trust and never authorizes or performs execution.
+    pub host_fallback_eligible: bool,
     pub name: Option<String>,
     pub description: Option<String>,
     pub tags: Vec<String>,
@@ -424,6 +427,7 @@ mod tests {
             watchdog: None,
             auth_method: None,
             pre_authenticated: false,
+            host_fallback_eligible: false,
             name: None,
             description: None,
             tags: vec![],
@@ -456,6 +460,7 @@ mod tests {
             watchdog: None,
             auth_method: None,
             pre_authenticated: false,
+            host_fallback_eligible: false,
             name: None,
             description: None,
             tags: vec![],
@@ -486,6 +491,7 @@ mod tests {
             watchdog: None,
             auth_method: None,
             pre_authenticated: false,
+            host_fallback_eligible: false,
             name: None,
             description: None,
             tags: vec![],

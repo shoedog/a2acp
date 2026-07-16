@@ -139,7 +139,7 @@ fn acknowledged_pre_spawn_failure_emits_artifact_before_nonzero_exit() {
     assert!(!output.status.success());
     let artifact: serde_json::Value = serde_json::from_slice(&output.stdout)
         .expect("failure must emit machine-readable JSON before returning nonzero");
-    assert_eq!(artifact["schema_version"], 1);
+    assert_eq!(artifact["schema_version"], 2);
     assert_eq!(artifact["success"], false);
     assert_eq!(
         artifact["diagnostics"]["failure"]["code"],
@@ -167,7 +167,7 @@ fn explicit_out_gets_failure_artifact_and_stdout_stays_empty() {
     assert!(output.stdout.is_empty());
     let artifact: serde_json::Value =
         serde_json::from_slice(&fs::read(&artifact_path).unwrap()).unwrap();
-    assert_eq!(artifact["schema_version"], 1);
+    assert_eq!(artifact["schema_version"], 2);
     assert_eq!(artifact["success"], false);
     assert_eq!(
         fs::metadata(artifact_path).unwrap().permissions().mode() & 0o777,
@@ -338,7 +338,7 @@ fn stdout_remains_one_json_artifact_when_tracing_is_enabled() {
     assert!(!output.status.success());
     let artifact: serde_json::Value = serde_json::from_slice(&output.stdout)
         .expect("stdout must remain exactly one JSON artifact under tracing");
-    assert_eq!(artifact["schema_version"], 1);
+    assert_eq!(artifact["schema_version"], 2);
 }
 
 #[test]

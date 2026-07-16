@@ -1,27 +1,49 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main base:** `origin/main` at `14b69bb2` on 2026-07-15 (PR #26 merged; model-probe
-  failures retained)
-- **Completed through:** R2b3 **MERGED** at `afcc856c` after closure re-review 4 `APPROVE` on
-  `492946cb` and final status re-review `APPROVE` on the merge head
-- **Active slice:** R2c **APPROVED / PENDING MERGE** on `agent/reliability-r2c-live-smoke`; the fixed
-  candidate passed its explicitly authorized artifact-exact host-Codex lane
-- **R2b3 implementation commit:** `ed172ee726c06c3ee2e3f363c80178d367f8834a`
-- **Current exact R2c deterministic gate:** smoke unit **19 / 0 / 0 ignored**, smoke CLI **11 / 0 / 0
-  ignored**, and `bridge-api` **59 / 0 / 1 ignored**; format/diff clean
-- **Review state:** initial bridge-mediated Fable/xhigh review returned `REVISE` on `a2946bc` with two
-  `WRONG/MAJOR`, one `WRONG/MINOR`, and three `SMELL/MINOR`; closure re-review returned `APPROVE` on
-  `0e3b8ce`; permission-fold review returned `APPROVE` on `23384622`; its concrete inode-reuse/link risks
-  are folded with create-new refusal, and targeted closure review returned `APPROVE` on `ffb7e891`
-- **Full workspace gate:** the create-new artifact fold passes host serial **1,933 / 0 / 12 ignored**
-  across 68 executables; workspace/all-target check, warnings-denied Clippy, release build, and repository
-  hygiene **37/7** are clean
+- **Current main base:** `origin/main` at `be54bc51` on 2026-07-15 (PR #28 merged R2c)
+- **Completed through:** R2c **MERGED** at `be54bc51`; its fixed candidate passed the explicitly
+  authorized artifact-exact host-Codex lane before merge
+- **Active slice:** R2d **APPROVED / PENDING MERGE** on `agent/reliability-r2d-fallback-plan`
+- **Current exact R2d deterministic gate:** the v23 working fold passes fallback-plan CLI **24 / 0**,
+  smoke units **22 / 0**, and local-file units **7 / 0**; a Linux container also passes planner **24 / 0**,
+  local-file **7 / 0**, and the guarded-composition regression **1 / 0**. The full serial workspace passes
+  **1,985 / 0 / 12 ignored** across 69
+  test/doc-test executables. Format/diff, all-target check, warnings-denied Clippy, release build, and
+  repository hygiene **37/7** are clean. PR #29's replacement GitHub Build/Lint/Coverage run and CLA
+  check are green after the post-approval CI-only fold `15174d0`
+- **Review state:** the initial bridge-mediated `gpt-5.6-sol`/`xhigh` review of `b6424d7`, closure
+  re-review 1 of `0b05c409`, closure re-review 2 of `c8d17b2`, closure re-review 3 of `69152d73`,
+  closure re-review 4 of `349755ed`, closure re-review 5 of `4971647`, closure re-review 6 of
+  `379c3ac`, and closure re-review 7 of `7fec898` all returned `REVISE`. Closure re-review 8 of
+  `1586f24` adjudicated the sole review-7 ledger finding `FIXED`, found no new `WRONG` or `SMELL`, and
+  returned `APPROVE`.
+  Re-review 4 marked secrecy/auth items `FIXED`,
+  kept directory-object identity `PARTIAL`, and found serializer-impossible cleanup evidence plus two
+  documentation smells. V19 added a descriptor-derived persistent object fingerprint, exact cleanup-tuple
+  eligibility, explicit status-cursor ownership, and the corrected spawn comment. V20 binds Darwin file
+  identity to its volume UUID and Linux file-handle identity to the boot ID plus a non-reused 64-bit unique
+  mount ID. Re-review 5 marked all four inherited items `FIXED`, then found unbound semantic source-mount
+  drift plus two stale authority surfaces. V21 binds the plan-time mount object through action and aligns
+  both docs. Re-review 6 marked all three v21 items `FIXED`, then found target static-cwd alias
+  dereferencing after authorization plus a stale next-action clause. V22 composes every guarded
+  cwd-derived input from the pinned object path before spawn and aligns the cursor. Re-review 7 marked
+  both inherited findings `FIXED` and found only that the current Linux gate ledger omitted the explicit
+  guarded-composition **1/0** total. V23 aligns that total across every current review-boundary surface.
+  The post-approval CI-only fold `15174d0` sets workspace coverage builds to `CARGO_PROFILE_DEV_DEBUG=0`
+  so LLVM instrumentation does not inflate the bridge past the unchanged 256 MiB planner evidence cap;
+  it changes no product code, test, cap, or coverage threshold. The pre-fold GitHub run failed 11 of 24
+  planner tests only at that cap, the instrumented focused control passes **24/0**, and the replacement
+  Build/Lint/Coverage run passes. Fable and Claude are not planned under the constrained usage windows
+- **Last merged full workspace gate:** R2c host serial **1,933 / 0 / 12 ignored** across 68 executables;
+  workspace/all-target check, warnings-denied Clippy, release build, and repository hygiene **37/7** clean
 - **Current execution boundary:** attempt 1 on `ce605eaf` passed provider/lifecycle but was rejected for an
   initial `0644` artifact; after reviewed create-new hardening, separately authorized attempt 2 on
   `1c9e4a43` passed in 8.770 seconds with a `0600` artifact, exact terminal `PONG`, no tools/retry/fallback,
   and completed teardown
-- **Next action:** run final status/evidence review and open the non-draft R2c PR; after merge, begin R2d
+- **Next action:** PR #29 is open and non-draft. Merge only after one exact-head Sol/xhigh review of the
+  post-approval CI-only fold and all required GitHub checks are green; after merge, advance the roadmap
+  to R3. R2e remains deferred and must not start from this branch
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Operating runbook:**
@@ -30,7 +52,9 @@
 This file is the durable program cursor. A new session should be able to start here, find the exact
 active slice, open its implementation plan, and continue without reconstructing the July 2026 incident
 history. The detailed design remains normative for R2; this roadmap owns sequencing, status, handoff,
-and completion evidence.
+and completion evidence. It is the sole volatile release-status cursor. The active design and plan mirror
+review-boundary evidence; `AGENTS.md`, CLI help, onboarding, and the operator skill are stable behavior/runbook
+surfaces that point here and do not duplicate changing commit hashes or gate totals.
 
 ## Dependency graph
 
@@ -40,8 +64,8 @@ R2a provenance (MERGED)
   -> R2b1 diagnostic types + rollback-safe persistence surface (MERGED)
   -> R2b2 ACP/Fable lifecycle evidence + no-replay/warm-session safety (MERGED)
   -> R2b3 API/provider mapping + remaining container/dispatch observation (MERGED)
-  -> R2c explicit one-turn billable smoke (APPROVED / PENDING MERGE)
-       -> R2d local non-billable fallback plan
+  -> R2c explicit one-turn billable smoke (MERGED)
+       -> R2d local non-billable fallback plan (APPROVED / PENDING MERGE)
        -> R3 compatibility manifest + pinned/floating canaries
             -> R4 reproducible dependency/image pins + release promotion gate
 
@@ -63,8 +87,8 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2b1 — diagnostic foundation | **MERGED** at `7b788c1f` | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Validated types and rollback-safe persistence/projection compatibility; no production failure-site migration. |
 | R2b2 — ACP/Fable lifecycle diagnostics | **MERGED** at `0627e911` (2a `4ed12f1`; 2b `f40096df`; 2c `40790720`; 2d `14402f8`; final folds `a459b31`/`e63d4d0`; closure re-review 2 `APPROVE` at `0c0e3fe`; exact **1,100 / 0 / 0**; full host workspace **1,816 / 0 / 12 ignored**; hygiene **37/7**) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Observer/registry, ACP evidence, owner threading, concurrency-qualified warm cleanup, then aggregate cold-path closure; one final merge boundary. |
 | R2b3 — API/container diagnostics | **MERGED** at `afcc856c` (affected packages **602 / 0 / 1 ignored**; full host workspace **1,896 / 0 / 12 ignored**; hygiene **37/7**; initial review and closure re-reviews 1–3 `REVISE`; four review folds; closure re-review 4 `APPROVE` at `492946c`; final status re-review `APPROVE` at `afcc856c`) | [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md) | Independently reviewed implementation after R2b2. |
-| R2c — live smoke | **APPROVED / PENDING MERGE** on `agent/reliability-r2c-live-smoke` (initial Fable/xhigh review `REVISE`; closure re-review `APPROVE` at `0e3b8ce`; attempt 1 rejected for initial `0644`; permission-fold review `APPROVE` at `23384622`; create-new closure review `APPROVE` at `ffb7e891`; full host workspace **1,933 / 0 / 12 ignored**; separately authorized attempt 2 on `1c9e4a43` passed artifact-exact in 8.770 s with mode `0600`, exact terminal `PONG`, no retry/fallback, and clean teardown) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
-| R2d — fallback plan | **NOT STARTED** | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local recommendation only; never executes fallback. |
+| R2c — live smoke | **MERGED** at `be54bc51` by PR #28 (initial Fable/xhigh review `REVISE`; closure re-review `APPROVE` at `0e3b8ce`; attempt 1 rejected for initial `0644`; permission-fold review `APPROVE` at `23384622`; create-new closure review `APPROVE` at `ffb7e891`; full host workspace **1,933 / 0 / 12 ignored**; separately authorized attempt 2 on `1c9e4a43` passed artifact-exact in 8.770 s with mode `0600`, exact terminal `PONG`, no retry/fallback, and clean teardown) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
+| R2d — fallback plan | **APPROVED / PENDING MERGE** in non-draft PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
 | R3 — compatibility canaries | **NOT STARTED** | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | Local manifest/runner first; scheduling requires runner/credential owner. |
@@ -209,6 +233,78 @@ Next action:
 ```
 
 ## Current handoff
+
+- R2c merged through PR #28 at `be54bc51bf1d54df028d44f0cbd8dfdf45f779d7`. R2d is active on
+  `agent/reliability-r2d-fallback-plan`, based directly on that merge head.
+- R2d adds a default-off unsandboxed-ACP target capability and a local non-billable `fallback-plan`.
+  The planner accepts only a complete failed smoke-v2 regular-file artifact bound by canonical path and
+  exact-byte SHA-256 to the current pinned registry-only config. It rejects task envelopes and smoke-v1,
+  requires an independently supplied exact canonical trusted cwd that agrees with artifact evidence and
+  remains within the current source entry's canonical read-only sandbox mount, emits a schema-v2 plan,
+  and never resolves, spawns, prompts, performs network/runtime probes, or executes its output.
+- An eligible output is a new distinct fixed-PONG verification smoke, not an original-task retry. Its
+  absolute candidate-binary argv is guarded by executable/config SHA-256, source agent/mount/mode, and
+  the target's current eligibility marker plus the exact plan-time canonical cwd. The later smoke
+  revalidates the closed guard before spawn and, because the target is unsandboxed ACP, performs no
+  container recovery/sweep and records that backstop as `not_needed`; drift fails closed.
+  Source/config/executable reads reject symlink, FIFO, device, socket, oversized, and descriptor/path
+  replacement inputs. Absolute host, named, and anonymous volume forms share one grammar; `~/` is rejected
+  because direct runtime argv does not expand it. External post-failure probes were removed.
+- The initial bridge-mediated Sol/xhigh review of exact `b6424d725e56d1f3fde0b7c29b6057155d69dacd`
+  returned `REVISE` with the nine findings recorded in the R2d plan and design v15; closure re-review 1 of
+  exact `0b05c409cbbf9441348b2719a537f8f4978216a3` also returned `REVISE` with four new findings. Design v16
+  closed them plus exact-cwd/runtime-dependency hardening and passed full gates at reviewed candidate
+  `c8d17b2`, but closure re-review 2 returned `REVISE` with exact-cwd identity, full-diagnostic equality,
+  provenance secrecy, and cleanup-evidence findings. Design v17 folds all four plus adjacent structured
+  model/mode secrecy. Closure re-review 3 of exact `69152d7360a4900fe49390338b56efd94c784495`
+  adjudicated all four v17 findings `FIXED`, kept adjacent complete-artifact secrecy `PARTIAL`, found no
+  `SMELL`, found three new `WRONG` items, and returned `REVISE`. Design v18 binds plan/action/spawn to a
+  pinned cwd directory object, sanitizes selected-entry request fields before every early return, and
+  validates tagged-redacted authentication through the exact production serializer/redactor. Planner
+  and smoke units pass **22/0** each, the full workspace passes **1,979/0/12 ignored** across 69
+  executables, and format/diff, check, warnings-denied Clippy, release, and hygiene **37/7** are clean.
+  Closure re-review 4 of exact `349755ed8f4534db0e04b8af006ca6072e01110b` returned `REVISE`: only
+  device/inode survived the plan/action gap, serializer-impossible cleanup could authorize a command,
+  stable operator surfaces did not explicitly name the status authority, and one source comment described
+  the old relative cwd. V19 introduced a descriptor-derived persistent-object fingerprint in the closed
+  guard and fails closed where unavailable, requires exact ordinary pre-spawn cleanup evidence, names this
+  roadmap as the sole volatile status cursor, and corrects the comment. V20 additionally binds Darwin's
+  persistent file ID to its volume UUID and Linux's opaque handle to a valid boot ID plus
+  `AT_HANDLE_MNT_ID_UNIQUE`; older kernels/filesystems fail closed instead of using a reusable mount ID.
+  Focused v20 gates pass planner **23/0**, smoke **22/0**, and local-file **7/0**; Linux passes planner
+  **23/0** and local-file **7/0**; the full workspace passes **1,983/0/12 ignored** across 69 executables;
+  format/diff, all-target check, warnings-denied Clippy, release, and hygiene **37/7** are clean. Closure
+  re-review 5 of exact `49716473cf405b272dd8ecff554630b90faed0e0` adjudicated all four prior findings
+  `FIXED`, then returned `REVISE` for an unbound plan-time source-mount object, the overview's stale v18
+  queue, and the missing `AGENTS.md` authority link. V21 carries the mount's canonical path plus durable
+  identity through the 12-field guard, refuses symlink retargeting and fingerprint drift before spawn,
+  replaces the copied queue with a roadmap pointer, and aligns `AGENTS.md`. Focused v21 gates pass planner
+  **24/0**, smoke **22/0**, and local-file **7/0** on macOS and planner **24/0** plus local-file **7/0** on
+  Linux; the full workspace passes **1,984/0/12 ignored** across 69 executables. Closure re-review 6 of
+  exact `379c3acc199fb58e6d6e1a8a8318470737ce6e8c` adjudicated all three v21 findings `FIXED`, then
+  returned `REVISE`: a marked target's static cwd alias could still be dereferenced during native MCP/Kiro
+  composition after source authorization, and the top next action named an already completed commit step.
+  V22 selects and preserves the pinned object-addressed cwd before every guarded composition input,
+  ignores target static-cwd aliases, retains ordinary canonicalization, and aligns the next action. Its
+  production-spawn regression failed pre-v22 with the broadened path in the real adapter argv and now
+  passes with object-addressed cwd composition on macOS and Linux. Focused
+  planner/smoke/local-file totals remain **24/0**, **22/0**, and **7/0**; the Linux guarded-composition
+  regression passes **1/0**; the full workspace passes **1,985/0/12 ignored** across 69 executables.
+  Closure re-review 7 of exact `7fec898b5157603ae2eccd121e8367ff1914949b` adjudicated both v22
+  findings `FIXED`, found no code defect or `SMELL`, and returned `REVISE` only because the current
+  roadmap/plan/design ledgers did not state that Linux regression's explicit **1/0** total. V23 aligns
+  that exact total across all current review-boundary evidence.
+  Adapter-only, non-prompt probes also proved the macOS object path through Codex ACP 1.1.2 and Claude
+  Agent ACP 0.44.0 `initialize` + `session/new`. Closure re-review 8 of exact
+  `1586f24b17f5d7a7561642900fdccc9bba5fcb53` adjudicated the sole review-7 ledger finding `FIXED`,
+  found no new `WRONG` or `SMELL`, and returned `APPROVE`; R2d is `APPROVED / PENDING MERGE`. No Fable,
+  Claude model/Haiku, or live smoke ran; the recorded Sol/xhigh reviews are the only provider turns in
+  this closure chain. Non-draft PR #29 then exposed a CI-only incompatibility: LLVM coverage debuginfo
+  inflated the instrumented bridge above the unchanged 256 MiB executable-evidence cap, so 11 planner
+  tests correctly refused before their intended assertions. Fold `15174d0` scopes
+  `CARGO_PROFILE_DEV_DEBUG=0` to workspace coverage only. The instrumented planner control passes
+  **24/0**, the replacement GitHub Build/Lint/Coverage run passes in 7m40s, CLA passes, and product code,
+  tests, the cap, and every coverage threshold remain unchanged.
 
 - R2b3 is implemented at `ed172ee726c06c3ee2e3f363c80178d367f8834a` with four review folds on
   `agent/reliability-r2b3-api-container`, based on `origin/main` at

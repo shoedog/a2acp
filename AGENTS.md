@@ -156,6 +156,49 @@ for compatibility evidence, and never automatically rerun a failed or timed-out 
 have been accepted. Do not update `docs/compatibility.md` until the release-mode artifact records the exact
 lane that actually ran.
 
+## 4d. Plan an explicit host verification after classified container degradation
+
+Current slice status, review evidence, sequencing, and handoff are owned solely by
+[`docs/reliability-execution-roadmap.md`](docs/reliability-execution-roadmap.md). This file defines the
+stable operator behavior and must not duplicate changing candidate hashes or gate totals.
+
+Only a complete failed smoke schema-v2 artifact can be evaluated. The source config must still be the
+same canonical regular file with the same SHA-256, its configured source agent must still be a read-only
+container using the same canonical mount, and the target must be an unsandboxed ACP entry explicitly
+marked `host_fallback_eligible = true`:
+
+```bash
+./target/release/a2a-bridge fallback-plan \
+  --from /absolute/path/to/failed-container-smoke.json \
+  --host-agent trusted-host-review \
+  --config /absolute/path/to/a2a-bridge.toml \
+  --trusted-session-cwd /absolute/path/to/exact-owned-repo \
+  --confirm-trusted-own-repo-read-only \
+  > /private/tmp/fallback-plan.json
+```
+
+The command is local and non-billable. It accepts only a pinned, bounded regular-file smoke-v2 artifact;
+hand-assembled task envelopes and historical smoke-v1 artifacts are not trusted fallback evidence. An
+ineligible plan contains no command. An eligible plan emits an absolute candidate-binary argv for a
+distinct fixed-`PONG` verification smoke, bound to the current executable/config SHA-256, source-agent
+marker, and the plan-time source mount's canonical path plus descriptor-derived persistent-object
+fingerprint. The separately supplied trusted cwd must be an existing canonical directory, must exactly
+match the artifact-reported cwd as evidence, and must remain under that mount snapshot. Only that exact
+operator-selected directory enters the host smoke argv, and its own plan-time canonical value plus a
+descriptor-derived persistent-object fingerprint are separate closed-set guard fields. Filesystems
+without a durable object ID/handle fail closed.
+
+`fallback-plan` never runs the emitted argv. Inspect the JSON and explicitly decide whether to invoke it;
+the generated smoke still contains `--acknowledge-billable`. At action time the smoke re-reads the config
+and executable and revalidates the exact cwd object, the exact source-mount object and containment, and
+the target marker before any agent spawn. Same-mount symlink/sibling, mount-symlink retarget, or
+inode-reuse replacement fails closed. Because the guarded target is already proven to be unsandboxed
+ACP, guarded composition ignores its configured `session_cwd`/`cwd` aliases and uses the pinned
+object-addressed cwd for native MCP/Kiro inputs, process redaction, and ACP session configuration. That
+smoke does not call the container runtime for recovery or run-end cleanup and records the backstop as
+`not_needed`. Never reconstruct or omit the generated guard flags by hand, and never treat a fixed
+`PONG` as a retry/resume of the original task.
+
 ## 5. Inspect / clean up containers
 
 ```bash

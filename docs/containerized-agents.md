@@ -120,6 +120,27 @@ codex-acp's advertised browser-login action. Do not also set `auth_method` on th
 - **ollama** — local needs a pulled model (`ollama pull qwen2.5-coder:7b`); cloud needs
   `OLLAMA_API_KEY` in the serve process env (`base_url = https://ollama.com/v1`).
 
+### Sandbox declaration grammar and static preflight
+
+Each `[agents.sandbox].volumes` item uses one of these exact forms:
+
+- `/absolute/container/destination` for an anonymous runtime volume;
+- `/absolute/host/source:/absolute/container/destination[:options]` for a bind;
+- `named-volume:/absolute/container/destination[:options]` for a runtime-owned named volume.
+
+Destinations must be normalized absolute paths and must not equal or nest under the primary read-only
+repository mount. Bind sources must be absolute; `~/` is rejected because the validated token is passed
+directly to runtime argv and is not shell-expanded. Runtime, image, and locked-network operands must be
+nonempty, unpadded, control-free, and must not begin with `-`; malformed declarations fail config
+validation before spawn.
+
+The credential destinations have stronger source-type gates. `/root/.claude/.credentials.json` and
+`/root/.codex/auth.json` require a host regular file; anonymous and named volumes are rejected for those
+single-file destinations. `/root/.local/share` requires a host directory or named volume. An ordinary
+missing/wrong-type bind is `container_mount`; a wrong credential source type is
+`container_credentials`. These are bounded local metadata checks only—no image pull, network query,
+container start, credential refresh, or post-failure runtime probe occurs.
+
 ## 4. Serve / run
 
 ```bash

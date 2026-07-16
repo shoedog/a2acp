@@ -21,6 +21,9 @@ authentication, and container failures without guessing.
 
 Treat checked-in docs and the live executable as the sources of truth. Treat historical files under
 `docs/superpowers/` and `docs/history/` as provenance, not current operating instructions.
+This skill is the stable operating runbook, not a release-status cursor. Current slice, review, and gate
+state is owned only by
+[`../../docs/reliability-execution-roadmap.md`](../../docs/reliability-execution-roadmap.md).
 
 ## Choose the execution tier before running
 
@@ -79,6 +82,42 @@ for the JSON artifact. An explicit output path must not already exist. On Unix, 
 `0600` before agent resolution or spawn; an existing file/link or failure to apply that restriction is a
 pre-attempt refusal.
 
+### Plan, then explicitly run, a trusted host verification
+
+After a failed read-only container smoke, use the local planner only when its artifact is complete schema
+v2 evidence and the repository is a trusted owned repository:
+
+```bash
+a2a-bridge fallback-plan \
+  --from /absolute/path/to/failed-container-smoke.json \
+  --host-agent <explicit-marked-host-id> \
+  --config /absolute/path/to/a2a-bridge.toml \
+  --trusted-session-cwd /absolute/path/to/exact-owned-repo \
+  --confirm-trusted-own-repo-read-only
+```
+
+The selected unsandboxed ACP target must declare `host_fallback_eligible = true`; absence defaults to
+false. The planner performs no registry resolution, spawn, prompt, network call, or automatic execution.
+It accepts only a bounded regular-file smoke-v2 artifact whose canonical config path and SHA-256 still
+match the current bounded regular config. It rejects hand-assembled task envelopes, incomplete lifecycle
+evidence, any prompt barrier, source/config drift, write-capable sources, and non-container classes.
+
+An eligible schema-v2 plan emits an absolute candidate-binary argv for a **new distinct fixed-PONG
+verification smoke**. The separately supplied trusted cwd must be an existing canonical directory, must
+exactly match the artifact-reported cwd as evidence, and must remain under the current canonical source
+mount. Only that exact operator-selected directory enters argv. The plan binds the later smoke to the
+config SHA-256, executable SHA-256, exact cwd object identity, exact source-mount object identity, source
+agent/mode, and target marker; both directory objects carry a plan-time canonical path plus a
+descriptor-derived persistent-object fingerprint. Filesystems without a durable object ID/handle refuse
+planning. The later smoke rechecks the closed guard before spawn; same-mount symlink/sibling,
+source-mount symlink retarget, or inode-reuse replacement fails closed. Because its target is already
+proven unsandboxed ACP, guarded composition ignores target `session_cwd`/`cwd` aliases and uses the
+pinned object-addressed cwd for native MCP/Kiro inputs, process redaction, and ACP session configuration.
+It performs no container recovery or run-end sweep and records the backstop as `not_needed`. Inspect the
+plan and invoke it only as a separate explicit billable operator action; never strip/reconstruct its guard
+flags, call it a retry of the original task, or infer that fixed `PONG` proves the original arbitrary
+prompt would succeed.
+
 When an agent runtime launches the command, distinguish its managed sandbox from approved host
 execution. A sandboxed ACP failure does not prove that the computer lacks DNS, egress, or authentication;
 repeat the exact minimal control through approved host execution before changing credentials, packages,
@@ -112,6 +151,9 @@ Provider capacity is not container health. Before a long full-branch review, che
 usage window as well as bridge preflight. For trusted own-repo reviews:
 
 - Use Fable at `xhigh` only when its usage window has headroom.
+- Claude Haiku may be dogfooded for a small, tightly specified Anthropic-model or Claude Code
+  compatibility check. Do not assign it complex implementation, broad diagnosis, architecture, or a
+  review expected to match Sonnet/Opus/Fable/Sol rigor.
 - When Claude is known to be near its usage limit, select the separately configured raw
   `gpt-5.6-sol` model at `xhigh` before starting. Confirm both the raw id and `xhigh` in `models`; do not
   reconstruct an effort-suffixed id by hand.

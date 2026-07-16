@@ -209,6 +209,7 @@ fn agent_entry() -> AgentEntry {
         mcp_delivery: Default::default(),
         auth_method: None,
         pre_authenticated: false,
+        host_fallback_eligible: false,
         name: None,
         description: None,
         tags: Vec::new(),

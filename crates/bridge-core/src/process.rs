@@ -239,6 +239,27 @@ impl Supervised {
         cwd: Option<&std::path::Path>,
         stderr_redactor: DiagnosticRedactor,
     ) -> std::io::Result<Self> {
+        Self::spawn_with_stderr_redactor_and_pinned_cwd(
+            prog,
+            args,
+            cwd,
+            stderr_redactor,
+            None,
+            false,
+        )
+    }
+
+    /// Spawn after changing the forked child to one already-open directory descriptor. The bridge
+    /// parent's descriptor stays close-on-exec; the child may retain only its forked copy when its
+    /// absolute object path requires the descriptor after exec.
+    pub fn spawn_with_stderr_redactor_and_pinned_cwd(
+        prog: &str,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+        stderr_redactor: DiagnosticRedactor,
+        pinned_cwd_fd: Option<std::os::fd::RawFd>,
+        retain_pinned_cwd_fd_after_exec: bool,
+    ) -> std::io::Result<Self> {
         let mut cmd = Command::new(prog);
         cmd.args(args)
             .stdin(Stdio::piped())
@@ -248,6 +269,28 @@ impl Supervised {
             .kill_on_drop(true);
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
+        }
+        if let Some(fd) = pinned_cwd_fd {
+            // SAFETY: this callback runs in the forked child after fork and before exec. It performs
+            // only async-signal-safe fchdir/fcntl calls. The parent descriptor remains FD_CLOEXEC.
+            // When Linux needs /proc/self/fd/N as the ACP cwd, only this already-forked child clears
+            // its copy, avoiding a concurrent-spawn inheritance window in the bridge process.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::fchdir(fd) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if retain_pinned_cwd_fd_after_exec {
+                        let flags = libc::fcntl(fd, libc::F_GETFD);
+                        if flags == -1
+                            || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
         }
         let mut child = cmd.spawn()?;
         let pid = child.id().expect("child has a pid before wait");
@@ -382,6 +425,7 @@ impl Drop for Supervised {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd as _;
     use std::time::Duration;
 
     // returns the `stat`/`state` column for a pid, or None if the pid is gone/reaped.
@@ -396,6 +440,97 @@ mod tests {
         } else {
             Some(s)
         }
+    }
+
+    #[tokio::test]
+    async fn pinned_directory_fd_changes_only_the_child_process_cwd() {
+        use tokio::io::AsyncReadExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("original-marker"), b"ok").unwrap();
+        let directory = std::fs::File::open(dir.path()).unwrap();
+        let fd = directory.as_raw_fd();
+        let parent_flags_before = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_ne!(parent_flags_before & libc::FD_CLOEXEC, 0);
+
+        let mut pinned = Supervised::spawn_with_stderr_redactor_and_pinned_cwd(
+            "/bin/sh",
+            &["-c", "test -f original-marker && echo pinned"],
+            None,
+            DiagnosticRedactor::default(),
+            Some(fd),
+            false,
+        )
+        .unwrap();
+        let mut stdout = String::new();
+        pinned
+            .child_mut()
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .await
+            .unwrap();
+        assert_eq!(stdout.trim(), "pinned");
+
+        let parent_flags_after = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_ne!(parent_flags_after & libc::FD_CLOEXEC, 0);
+
+        let mut unpinned = Supervised::spawn_with_stderr_redactor_and_pinned_cwd(
+            "/bin/sh",
+            &["-c", "test ! -f original-marker && echo unpinned"],
+            None,
+            DiagnosticRedactor::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        let mut stdout = String::new();
+        unpinned
+            .child_mut()
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .await
+            .unwrap();
+        assert_eq!(stdout.trim(), "unpinned");
+    }
+
+    #[tokio::test]
+    async fn retained_pinned_directory_fd_is_visible_only_in_the_execed_child() {
+        use tokio::io::AsyncReadExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let directory = std::fs::File::open(dir.path()).unwrap();
+        let fd = directory.as_raw_fd();
+        #[cfg(target_os = "macos")]
+        let child_handle = format!("/dev/fd/{fd}");
+        #[cfg(target_os = "linux")]
+        let child_handle = format!("/proc/self/fd/{fd}");
+        let command = format!("test -e {child_handle} && echo retained");
+        let mut child = Supervised::spawn_with_stderr_redactor_and_pinned_cwd(
+            "/bin/sh",
+            &["-c", &command],
+            None,
+            DiagnosticRedactor::default(),
+            Some(fd),
+            true,
+        )
+        .unwrap();
+        let mut stdout = String::new();
+        child
+            .child_mut()
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .await
+            .unwrap();
+
+        assert_eq!(stdout.trim(), "retained");
+        let parent_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_ne!(parent_flags & libc::FD_CLOEXEC, 0);
     }
 
     #[tokio::test]

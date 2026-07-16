@@ -50,7 +50,11 @@ may have been accepted; the retry could duplicate cost or side effects. The curr
 host and container entries but no automatic fallback policy. R2's first fallback surface is a local,
 non-billable operator plan/recommendation only; caller-supplied A2A metadata cannot assert trust or start
 a host attempt. In-process fallback is deferred until policy can bind a non-forgeable trust attestation
-to authenticated caller context.
+to authenticated caller context. The local planner accepts only complete smoke-v2 evidence bound to the
+current config bytes, derives host scope from a plan-time identity snapshot of the read-only source mount
+rather than artifact cwd, and emits a guarded distinct fixed-PONG smoke that the operator must invoke
+separately. The later smoke refuses if that source-mount object changed. The planner performs no external
+post-failure runtime probe and never executes the emitted plan.
 
 Provider capacity is a separate axis. For trusted own-repo full-branch reviews, use Fable xhigh only when
 its usage window has headroom; when Claude is known to be near its usage limit, select the explicit
@@ -60,6 +64,10 @@ already reached prompt start, a Sol review
 is a new operator-selected attempt, not an automatic retry: preserve the first attempt as possibly
 accepted and record both costs/provenance. A structured provider-limit/reset signal may recommend that
 choice but never executes it. Tier 2/3 rules still apply independently.
+
+Claude Haiku is available only as a low-cost dogfood lane for small, tightly specified Anthropic-model or
+Claude Code compatibility checks. It is not a substitute for a broad implementation or for
+Sonnet/Opus/Fable/Sol-caliber review.
 
 ## Work slices
 
@@ -148,23 +156,12 @@ Exit: upstream drift is found by the canary rather than an unrelated feature bra
 
 Exit: a release cannot claim an agent path that was not tested from its distributable artifact.
 
-## Immediate queue
+## Current execution queue
 
-1. Finish, independently review, and merge R2b3's API/provider/container portion of the reviewed R2b
-   phase/diagnostic contract, including post-acceptance no-replay mappings and joinable cleanup. Use the
-   [R2b implementation plan](superpowers/plans/2026-07-11-r2b-structured-diagnostics.md).
-2. Add the separate explicitly billable R2c live-smoke command from the
-   [R2c plan](superpowers/plans/2026-07-11-r2c-live-smoke.md).
-3. Implement R2d's local non-billable fallback-plan only from the
-   [R2d plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md); keep authenticated in-process
-   [R2e](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) deferred.
-4. Preserve adapter stderr and the deepest prompt error in the task journal.
-5. Make provider-limit failures explicit and keep the Fable-xhigh → Sol-xhigh full-review fallback an
-   operator-selected, separately recorded attempt.
-6. Establish the pinned/floating compatibility lanes in the
-   [R3 plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md).
-7. Make the reader image reproducible and the compatibility matrix a release gate through the
-   [R4 plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md).
+Volatile slice status, review evidence, sequencing, and the next action live only in the
+[reliability execution roadmap](reliability-execution-roadmap.md). This behavior overview does not copy
+changing candidate hashes or gate totals. Keep provider/model fallback operator-selected and separately
+recorded; it never enters the container-degradation eligibility gate.
 
 ## Guardrails
 

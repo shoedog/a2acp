@@ -1,7 +1,55 @@
-# Bridge reliability R2 — provenance and phase-specific diagnostics (design, v14)
+# Bridge reliability R2 — provenance and phase-specific diagnostics (design, v23)
 
-- **Status:** R2a and R2b0–R2b3 merged; R2c is **APPROVED / PENDING MERGE** on
-  `agent/reliability-r2c-live-smoke`; v14 is the design of record for R2b–R2c
+- **Status:** R2a, R2b0–R2b3, and R2c merged; R2d is **APPROVED / PENDING MERGE** on
+  `agent/reliability-r2d-fallback-plan`; v23 is the design of record for R2b–R2e
+- **R2d review state:** the initial bridge-mediated `gpt-5.6-sol`/`xhigh` security review of exact
+  candidate `b6424d725e56d1f3fde0b7c29b6057155d69dacd` returned `REVISE`; its nine findings were folded at
+  `0b05c409cbbf9441348b2719a537f8f4978216a3`. Closure re-review 1 of that exact fold also returned
+  `REVISE`: genuine static preflight artifacts lacked an observer-owned spawn failure, provenance/auth
+  admitted serializer-impossible evidence, lifecycle validation admitted phase re-entry, and `~/` bind
+  sources validated a different path than direct runtime argv launched. V16 closes those four, requires
+  an independently supplied exact trusted repo cwd under the current source mount, and prevents guarded
+  host smoke from consulting the degraded container runtime. V16 passed the full serial workspace at
+  **1,969 / 0 / 12 ignored** across 69 executables. Closure re-review 2 of exact
+  `c8d17b2acbe3b113ce8fcdbce243ea2e08561141` adjudicated all six requested findings `FIXED`, found four
+  new `WRONG` items, no `SMELL`, and returned `REVISE`. V17 closes them; planner and smoke-unit focused
+  gates were green at **20 / 0** each. Closure re-review 3 of exact
+  `69152d7360a4900fe49390338b56efd94c784495` adjudicated those four `FIXED`, kept adjacent
+  complete-artifact secrecy `PARTIAL`, found three new `WRONG` items, no `SMELL`, and returned `REVISE`.
+  V18 closes them; planner and smoke-unit focused gates are green at **22 / 0** each, and the full serial
+  workspace is green at **1,979 / 0 / 12 ignored** across 69 executables, with format/diff, check,
+  warnings-denied Clippy, release, and hygiene **37/7** clean. Closure re-review 4 of exact
+  `349755ed8f4534db0e04b8af006ca6072e01110b` returned `REVISE`: directory identity remained partial
+  across the descriptor-close plan/action gap, cleanup admitted serializer-impossible evidence, stable
+  runbook/help surfaces did not name their status authority, and one source comment still described the
+  removed relative cwd. V19 introduced a descriptor-derived durable-object fingerprint, requires the exact
+  production pre-spawn cleanup tuple, names the roadmap as the sole volatile status cursor, and corrects
+  the comment. V20 scopes Darwin identity with the descriptor's volume UUID and scopes Linux identity with
+  the boot ID plus Linux 6.12's non-reused 64-bit unique mount ID; no reusable mount-ID downgrade exists.
+  Closure re-review 5 of exact `49716473cf405b272dd8ecff554630b90faed0e0` adjudicated all four prior
+  findings `FIXED`, then returned `REVISE`: the guard did not bind semantic source-mount identity, the
+  behavior overview copied a stale v18 queue, and `AGENTS.md` did not link the roadmap authority. V21
+  persists the source mount's canonical path and durable object fingerprint through the plan/action
+  guard, replaces the copied queue with a roadmap pointer, and aligns `AGENTS.md`. Current focused gates
+  are planner **24 / 0**, smoke **22 / 0**, and local-file **7 / 0**; a Linux container also passes
+  planner **24 / 0**, local-file **7 / 0**, and the guarded-composition regression **1 / 0**. Closure
+  re-review 6 of exact
+  `379c3acc199fb58e6d6e1a8a8318470737ce6e8c` adjudicated all three v21 findings `FIXED`, then returned
+  `REVISE`: guarded native MCP/Kiro composition still dereferenced a target static-cwd alias after mount
+  authorization, and the roadmap next action still named an already completed commit step. V22 composes
+  every guarded cwd-derived input from the pinned object path before spawn, leaves ordinary behavior
+  unchanged, and aligns the cursor. The changed-tree full serial workspace passes
+  **1,985 / 0 / 12 ignored** across 69 executables; format/diff, all-target check,
+  warnings-denied Clippy, release, and hygiene **37/7** are clean. Closure re-review 7 of exact
+  `7fec898b5157603ae2eccd121e8367ff1914949b` adjudicated both v22 findings `FIXED`, found no code
+  defect or `SMELL`, and returned `REVISE` only because the current numerical ledgers omitted the
+  Linux regression's explicit **1/0** total. V23 aligns that evidence. Closure re-review 8 of exact
+  `1586f24b17f5d7a7561642900fdccc9bba5fcb53` adjudicated that finding `FIXED`, found no new `WRONG`
+  or `SMELL`, and returned `APPROVE`. Post-approval CI-only fold `15174d0` scopes
+  `CARGO_PROFILE_DEV_DEBUG=0` to the workspace LLVM coverage step after full dev debuginfo inflated the
+  instrumented bridge beyond the unchanged 256 MiB planner evidence cap. It changes no product code,
+  test, cap, or coverage threshold; the instrumented planner control passes **24/0**, and PR #29's
+  replacement Build/Lint/Coverage run plus CLA check pass.
 - **R2b3 review state:** implementation plus four committed review folds; fresh Sol/xhigh closure
   re-review 3 returned `REVISE` with one shared-process ownership blocker, one raw-JSON correctness item,
   and one release-race coverage gap. The fourth fold passes affected packages **602 / 0 / 1 ignored**,
@@ -37,6 +85,7 @@
 - **R2b2 merge head:** `0627e91144e79d9328ed9b5635033cf410c9e96e`
 - **R2b3 implementation commit:** `ed172ee726c06c3ee2e3f363c80178d367f8834a`
 - **R2b3 merge head:** `afcc856c3276fe682fb78dc657591021f5e604fc`
+- **R2c merge head:** `be54bc51bf1d54df028d44f0cbd8dfdf45f779d7` (PR #28)
 - **Program:** [`docs/bridge-reliability.md`](../../bridge-reliability.md), R2
 - **Security boundary:** [`ADR-0032`](../../adr/0032-sandbox-tier-model.md)
 
@@ -342,6 +391,107 @@ missing test pair. V14 closes all three without changing the approved R2b0/R2b2 
 | **WRONG:** the ACP SDK exposes error `data` as `serde_json::Value`, after same-object duplicate members have collapsed | Production `spawn` and `from_child` validate every raw ACP JSON frame for unique object members before SDK deserialization. Malformed or duplicate-bearing frames fail at the transport boundary; typed in-process transports cannot construct duplicate object members. |
 | **SMELL:** cancel/retire dispatch-gate tests did not directly cover checked release | Add one cold and one warm checked-release regression at the inner-prompt installation gate, and mutation-prove both fail when only that gate wait is removed. |
 
+The first R2d security review of `b6424d7` found one blocker, six major correctness failures, and two
+minor correctness failures. V15 closes them without changing the merged R2b/R2c wire contract:
+
+| Finding | Disposition in v15 |
+|---|---|
+| **WRONG/BLOCKER:** artifact cwd can widen unsandboxed host scope | Treat artifact cwd as informational; derive the generated smoke cwd only from the current source entry's canonical read-only sandbox mount. |
+| **WRONG/MAJOR:** runnable output is not bound to candidate binary/config/marker at action time | Emit current executable/config SHA-256 and source/target guards; smoke revalidates the closed set before spawn. |
+| **WRONG/MAJOR:** outer post-failure probes overwrite precise lifecycle failures | Remove all external post-failure probes; use composition/config-owned static evidence only. |
+| **WRONG/MAJOR:** config switching and hand-assembled task envelopes lack complete provenance | Accept only complete smoke-v2; require its canonical config path and exact-byte digest to match the current pinned config. |
+| **WRONG/MAJOR:** FIFO/special-file input can block before inspection | Open source/config/executable descriptor-first with bounded regular-file, no-follow/nonblocking Unix flags and descriptor/path identity checks. |
+| **WRONG/MAJOR:** probe descendants can escape group cleanup | Remove the probe subprocess surface; dynamic daemon/image/network inspection remains deferred. |
+| **WRONG/MAJOR:** volume and credential grammar differs among validation/evidence/composition | Share one parser; accept anonymous destinations, host binds, and named volumes; enforce option-safe operands and credential source types. |
+| **WRONG/MINOR:** planner and smoke validate different/reopened config surfaces | Parse one pinned registry-only byte snapshot for both commands; exclude unrelated config surfaces. |
+| **WRONG/MINOR:** current status/docs describe stale schema and probe behavior | Promote v15 and align roadmap, plan, operator skill, onboarding, and command help. |
+
+Closure re-review 1 of exact `0b05c409cbbf9441348b2719a537f8f4978216a3` adjudicated findings 2, 3,
+5, 6, and 8 `FIXED`, findings 1, 4, 7, and 9 `PARTIAL`, found four new correctness defects, and returned
+`REVISE`. V16 closes them and the adjacent action-scope/runtime-dependency gaps:
+
+| Finding | Disposition in v16 |
+|---|---|
+| **WRONG/BLOCKER:** genuine typed static preflight failure has no matching lifecycle failure and can never become eligible | The composition root emits one observer-owned `Spawn/Started` → `Spawn/Failed` pair only when static container preflight returns a typed spawn-phase container failure; the registry still closes the enclosing resolve. A real smoke serialization feeds `fallback-plan` in the regression. |
+| **WRONG/MAJOR:** keyword-only provenance and config-contradictory authentication remain eligible | Require the exact container provenance row set/status grammar, including conditional agent-CLI evidence; deserialize the real redacted auth wire shape and match it to the pinned current source entry. |
+| **WRONG/MAJOR:** retry-shaped spawn histories pass generic open/close pairing | Prohibit phase re-entry and require the unique candidate lifecycle to be exactly one nested resolve/spawn failure attempt carrying the outer diagnostic. |
+| **WRONG/MAJOR:** `~/` bind validation expands a path that direct runtime argv does not | Reject `~/` volume sources consistently; accepted host bind sources must be absolute. Doctor and Claude credential preflight consume the shared typed parser and credential source requirements. |
+| **WRONG/BLOCKER:** a broad config source mount can still broaden the generated host cwd | Require `--trusted-session-cwd` as an independent canonical existing directory, require the artifact-reported cwd to agree as evidence, and require the exact trusted cwd to be component-wise under the current canonical source mount. Only the exact operator path enters argv. |
+| **WRONG/MAJOR:** guarded host smoke can wedge in synchronous container recovery when the runtime is degraded | A guarded target is already proven unsandboxed ACP, so its smoke performs no container orphan recovery or run-end sweep; marker-runtime coverage proves zero runtime invocation. |
+
+Closure re-review 2 of exact `c8d17b2acbe3b113ce8fcdbce243ea2e08561141` adjudicated all six v16
+findings `FIXED`, found no `SMELL`, found four new correctness defects, and returned `REVISE`. V17 closes
+them and the adjacent structured artifact-secrecy path:
+
+| Finding | Disposition in v17 |
+|---|---|
+| **WRONG/BLOCKER:** same-mount cwd replacement between plan and action can redirect the host agent | Add the plan-time canonical repo as `--expected-session-cwd` in the closed guard. Action-time canonical cwd must equal it before the existing current-mount containment check; a symlink/sibling-swap regression proves refusal before target spawn. |
+| **WRONG/MAJOR:** a lifecycle event failure can contradict un-compared outer diagnostic fields | Compare the complete validated `FailureDiagnostic` values with derived `Eq`; summary, causes, stderr metadata, retry metadata, and every other field must match. |
+| **WRONG/MAJOR:** bridge-known credentials can enter smoke provenance text | Apply the exact-value diagnostic sanitizer to every provenance detail/remedy. The same known value also passes through request/effective model and mode sanitization so the complete artifact, not only provenance, satisfies the R2c secrecy boundary. |
+| **WRONG/MINOR:** guarded host cleanup reports a run-scoped backstop that did not run | Thread whether the ordinary `RunEndGuard` exists into cleanup recording. Ordinary smoke retains `invoked_best_effort`; guarded host smoke records `not_needed`. |
+
+Closure re-review 3 of exact `69152d7360a4900fe49390338b56efd94c784495` adjudicated all four v17
+findings `FIXED`, kept the adjacent complete-artifact secrecy item `PARTIAL`, found no `SMELL`, found
+three new correctness defects, and returned `REVISE`. V18 closes them and preserves the central
+lifecycle-constructor boundary:
+
+| Finding | Disposition in v18 |
+|---|---|
+| **WRONG/BLOCKER:** canonical pathname equality does not preserve repository object identity across same-path replacement or the check/use window | Snapshot the canonical directory with an open descriptor and its device/inode identity; carry both identity fields in the closed plan/action guard; reopen and pin the expected object at action time; revalidate the named path before registry resolution, before configure, and after configure immediately before prompt. The guarded host adapter child performs `fchdir` to the pinned object before exec and ACP receives an object-addressed absolute cwd (`/.vol/<device>/<inode>` on macOS; inherited `/proc/self/fd/<n>` on Linux), so a later rename cannot redirect the process and the ACP absolute-cwd contract remains intact. Same-path pre-spawn and configure-window replacements are deterministic regressions. |
+| **WRONG/MAJOR:** early smoke failures can serialize raw selected-entry credentials in request model/mode before the cwd-aware redactor exists | Construct the selected-entry redactor immediately after entry selection and sanitize request model/mode before every later return. A second cwd-aware pass still expands sanitization before effective/provenance serialization. The invalid-cwd regression searches the complete artifact for the injected credential. |
+| **WRONG/MAJOR:** planner authentication validation rejects genuine tagged-redacted production evidence | Reconstruct the current source authentication through the exact production smoke serializer and exact source redactor, then compare the complete tagged JSON value. Genuine configured-secret evidence matches; a fabricated `redacted` tag for an ordinary non-secret configured method remains ineligible. |
+
+Closure re-review 4 of exact `349755ed8f4534db0e04b8af006ca6072e01110b` marked the early-secrecy,
+tagged-authentication, and adjacent-secrecy items `FIXED`, kept durable cwd identity `PARTIAL`, found one
+new correctness defect and two documentation smells, and returned `REVISE`. V19 closes them:
+
+| Finding | Disposition in v19 |
+|---|---|
+| **WRONG/BLOCKER (inherited partial):** after planning closes its directory descriptor, device/inode alone can admit a different object after inode reuse | Fingerprint a durable identifier read from the open descriptor and carry it in the closed guard. Darwin accepts only persistent 64-bit volume file IDs; Linux uses the opaque `name_to_handle_at(fd, "", ..., AT_EMPTY_PATH)` handle. Unsupported filesystems/OSes fail closed. Action reopens the named path, recomputes the descriptor fingerprint, and requires full `(device, inode, object fingerprint)` equality. |
+| **WRONG/MAJOR:** syntactically valid but production-impossible cleanup evidence can authorize fallback | Separate grammar validation from eligibility and require exact equality with the ordinary production pre-spawn serializer: 10-second grace, three `not_needed` session steps, and `invoked_best_effort` run backstop. Every field has an independent ineligibility mutation; a real production preflight artifact is the positive control. |
+| **SMELL/MAJOR:** help, onboarding, and operator skill do not state which surface owns release state | The roadmap is the sole volatile status/sequencing/handoff cursor. The active plan and design mirror review-boundary evidence; stable help/onboarding/skill surfaces state their behavior contract and link to the roadmap rather than copying commit/test totals. |
+| **SMELL/MINOR:** the spawn comment still claims guarded ACP uses `.` | Describe the actual object-addressed absolute ACP cwd installed after the child `fchdir`. |
+
+Post-v19 self-review found one adjacent scope ambiguity: a Darwin persistent file ID is volume-relative,
+while Linux's ordinary 32-bit mount ID may be reused after unmount. V20 binds Darwin's file ID to the
+descriptor's nonzero volume UUID. Linux requires the current valid boot ID and
+`AT_HANDLE_MNT_ID_UNIQUE`'s 64-bit non-reused-per-boot mount ID in both the identity-only and compatible
+handle modes. Older kernels, unsupported filesystems, and malformed/all-zero scope identifiers fail
+closed. Direct pre-v20 regressions failed for the missing Darwin volume scope and missing Linux unique
+flag before the implementation was changed.
+
+Closure re-review 5 found that config-byte equality plus a current-only containment check did not preserve
+the configured source mount's plan-time semantics: an unchanged symlink mount could be retargeted to a
+broader ancestor while the trusted repo object remained unchanged. V21 records the source mount's
+plan-time canonical path and descriptor-derived device/inode/object fingerprint in the plan and 12-field
+guard. Action recomputes and compares the complete mount identity before registry resolution, then checks
+the exact trusted repo is beneath that unchanged mount. The end-to-end regression first proved the old
+guard spawned the adapter after retargeting and now proves `smoke.fallback_source_drift` with zero spawn;
+a forged mount fingerprint is independently refused. The same fold removes the overview's volatile queue
+and makes `AGENTS.md` point directly to the roadmap status authority. The mount is only authorization
+evidence: after that check, host execution never reads the source path and instead retains the separately
+guarded trusted-repo descriptor through target execution.
+
+Closure re-review 6 found one remaining alias consumer: after the source check, ordinary ACP spawn
+composition resolved the marked target entry's configured `session_cwd`/`cwd`, rendered it into native
+MCP or Kiro inputs and the process redactor, and only afterward replaced the ACP session cwd with the
+pinned object path. If the target static cwd shared the source-mount symlink, a post-check retarget changed
+spawn inputs. V22 selects the pinned object-addressed cwd before any guarded composition, preserves it
+without ordinary canonicalization, and ignores target static-cwd aliases throughout guarded spawn. The
+production-spawn regression failed pre-v22 with the broader path in the real adapter argv and now admits
+only the pinned object path on macOS and Linux. Ordinary non-guarded composition retains its prior
+canonicalization.
+
+Closure re-review 7 adjudicated both v22 findings `FIXED` and found no code defect or `SMELL`. Its sole
+`WRONG/MINOR` was release-ledger completeness: the current surfaces described the Linux regression as
+passing but omitted its explicit **1/0** total. V23 records that total consistently without changing
+the implementation or its already-green exact-head gates.
+
+The first v18 full-suite run caught a direct smoke-side `BridgeError::agent_failure` introduced while
+transporting the local cwd-drift refusal. The final v18 fold carries an optional static diagnostic in the
+smoke drain result instead, while backend errors continue through their audited lifecycle builders. The
+constructor guard and the behavior regression both pass without adding an allowlist exemption.
+
 The first bridge-mediated Sol/xhigh R2b1 implementation review returned `REVISE` with four `WRONG` and
 three `SMELL` findings. The implementation folds all seven before re-review:
 
@@ -608,21 +758,27 @@ map several diagnostic classes to one existing label, but must not lose the diag
 The fallback-candidate column is only the failure-level gate. Eligibility to emit an R2d local plan
 additionally requires all of:
 
-1. the local operator passes the explicit trusted-own-repo-read-only confirmation flag;
-2. a named host target is explicitly configured/selected and is not sandboxed or write-capable;
-3. `prompt_may_have_been_accepted == false`;
-4. the primary failure is one of the five container classes above; and
-5. `fallback-plan` is invoked directly on a local source artifact.
+1. the local operator passes the explicit trusted-own-repo-read-only confirmation flag and independently
+   supplies the exact canonical trusted repo cwd;
+2. the complete source is smoke schema v2, its canonical config path/exact-byte digest match the current
+   pinned config, and its current source entry is still `container_ro` with a canonical mount whose
+   descriptor-derived identity can be snapshotted;
+3. a named host target is explicitly configured/selected, marked eligible, and is not sandboxed or
+   write-capable;
+4. `prompt_may_have_been_accepted == false`, lifecycle evidence is closed, and no events were dropped;
+5. the primary failure is one of the five container classes above; and
+6. `fallback-plan` is invoked directly on the local artifact with an explicit trust confirmation.
 
 R2e replaces item 1 with a policy-issued authenticated attestation; caller metadata never satisfies it.
 
 `unknown`, `AgentCrashed`, exit code 1/125, or a substring such as `docker` is never sufficient.
-The five `container_*` classes may be constructed only from composition-owned typed validation (for
-example runtime ENOENT, mount/credential source validation, or configured image/network identity) or a
-bounded, read-only post-failure runtime probe with a structured result. An inner adapter's stdout/stderr,
-generic runtime prose, or an exit code alone is never classification evidence. When the typed evidence
-is unavailable, contradictory, or ambiguous, construction returns `unknown`/`Fatal`; the probe never
-pulls an image, starts a container, or changes runtime state.
+The five `container_*` classes may be constructed only from composition/config-owned typed validation,
+such as runtime ENOENT, mount/credential source validation, and valid image/network declarations. An
+inner adapter's stdout/stderr, generic runtime prose, or an exit code alone is never classification
+evidence. R2d runs no external post-failure runtime/image/network probe because the bridge cannot yet
+prove descendant containment or prevent a late probe from replacing a more precise lifecycle failure.
+When local typed evidence is unavailable, contradictory, or ambiguous, construction remains
+`unknown`/`Fatal`; dynamic daemon/image/network-state classification is deferred.
 
 ### Closed provider evidence mapping (diagnostic schema v1)
 
@@ -1042,15 +1198,17 @@ R2d exposes a local operator command only; no A2A request field, metadata key, w
 configuration can invoke it:
 
 ```text
-a2a-bridge fallback-plan --from <failed-smoke-or-task-artifact.json>
+a2a-bridge fallback-plan --from <failed-smoke-v2-artifact.json>
                          --host-agent <explicit-agent-id>
+                         --trusted-session-cwd <exact-owned-repo>
                          --confirm-trusted-own-repo-read-only
                          --config <path>
 ```
 
-The command is read-only and non-billable. It validates an already persisted source diagnostic and emits
-a versioned JSON plan plus an exact separate rerun command. It does not resolve/spawn an agent or execute
-the rerun.
+The command is read-only and non-billable. It reads bounded regular-file snapshots of one complete
+smoke-v2 artifact and the explicit current config, then emits a schema-v2 JSON plan plus an exact separate
+rerun command. Historical smoke-v1 and hand-assembled task-diagnostic envelopes are rejected. It does not
+resolve/spawn an agent or execute the rerun.
 
 The selected host entry must also opt in at its declaration site:
 
@@ -1070,11 +1228,46 @@ Requirements:
   Claude/Fable is eligible through this marker even though its upstream CLI has no native read-only flag.
 - Never infer content trust from repository ownership, filesystem path, git remote, workflow name, or
   branch name.
-- Require the source artifact to prove `prompt_may_have_been_accepted=false` and one of the five typed
-  container classes. Legacy `AgentCrashed`, a missing artifact, or ambiguous evidence is ineligible.
+- Require `--trusted-session-cwd` as a separate existing canonical directory selected by the local
+  operator. The artifact cwd is evidence only: it must canonicalize to the same directory. The exact
+  trusted cwd must be equal to or below the current source entry's canonical read-only mount; a broad
+  source mount never becomes the generated host cwd. Planning records that mount's canonical path and
+  complete descriptor-derived identity; action requires exact equality before registry resolution. The
+  emitted closed guard carries the repo object under `--expected-session-cwd` and its identity flags, and
+  independently carries the mount object under `--expected-source-mount` and its identity flags.
+  Action-time canonicalization and complete object identity must match for both objects, so a same-mount
+  symlink, sibling replacement, mount retarget, or inode-reuse replacement fails before spawn. Darwin
+  requires persistent 64-bit volume object IDs bound to a nonzero volume UUID. Linux requires a valid boot
+  ID, a non-reused 64-bit unique mount ID, and an opaque file handle; unavailable support fails closed
+  rather than using a reusable ordinary mount ID.
+- Source, config, and current executable inputs are descriptor-first bounded regular-file snapshots. On
+  Unix, final symlinks/special files fail closed, FIFO opens are nonblocking, and descriptor/path identity
+  rejects replacement between open and canonicalization.
+- Require the smoke-v2 source to prove `prompt_may_have_been_accepted=false`, the exact single-attempt
+  `Resolve/Started → Spawn/Started → Spawn/Failed → Resolve/Failed` lifecycle inside the attempt interval
+  carrying the unique field-equivalent outer `FailureDiagnostic`, zero dropped events, no turn activity,
+  complete production-shaped provenance/auth plus the exact ordinary pre-spawn cleanup tuple, and one of
+  the five typed spawn-phase container classes. Legacy `AgentCrashed`, missing/incomplete evidence,
+  contradictory phase records, success, or timeout is ineligible or rejected.
+- Require the source's canonical config path and exact-byte SHA-256 to match the current pinned config.
+  Resolve the source agent in that same snapshot, record its canonical read-only sandbox mount's
+  descriptor-derived identity, require the explicit trusted cwd to remain within it, and use only that
+  exact operator path for the rerun.
 - Include source attempt id, original agent, failure code/class, selected host target, local trust
-  assertion, config provenance, and generated rerun command in the plan. The eventual rerun creates a
-  distinct task/attempt and cost record; it never resumes or mutates the source attempt.
+  assertion, config path/digest, and generated rerun command in the plan. The eventual fixed-PONG smoke
+  creates a distinct attempt/cost record and is only a compatibility verification; it never resumes,
+  mutates, or proves the original arbitrary task.
+- Bind the generated absolute candidate-binary argv to current executable/config SHA-256, the exact
+  plan-time canonical session cwd and durable-object fingerprint, the exact plan-time canonical source
+  mount and durable-object fingerprint, the source agent, and the required host marker. The smoke accepts
+  the complete guard only as a closed set and rechecks config bytes, executable bytes, exact cwd identity,
+  exact source-mount identity and containment, and target marker before spawn.
+  Guarded spawn must then derive ACP cwd, native MCP/Kiro `{cwd}` substitution, and process redaction only
+  from the pinned object-addressed trusted cwd; configured target `session_cwd`/`cwd` aliases are not
+  dereferenced. Ordinary non-guarded spawn retains its static-cwd canonicalization contract.
+  Because the guarded target is necessarily unsandboxed ACP, this smoke skips container orphan recovery
+  and run-end sweeping, records the backstop as `not_needed`, and therefore does not consult the degraded
+  runtime. Drift fails closed.
 - A2A caller-supplied `content_trust` or equivalent metadata is ignored/rejected and has no code path to
   `fallback-plan`. `AlwaysGrant` is not a trust authority.
 - If any predicate is false, emit an ineligible plan with stable reasons and no runnable command.
@@ -1093,6 +1286,8 @@ For trusted own-repo full-branch reviews, the operating policy is:
   configured `gpt-5.6-sol` reviewer at `xhigh` up front. Reserve max for tightly connected concurrency,
   transaction-safety, critical-proof/migration, complex leak, or rare-failure work, or after High/xhigh
   fails to resolve the issue; provider degradation alone is not sufficient.
+- Claude Haiku may run a small, tightly specified Anthropic-model or Claude Code compatibility check. It
+  is not a broad implementation lane or a substitute for Sonnet/Opus/Fable/Sol review quality.
 - If a Fable turn fails after `prompt_start`, do not resume, retry, or automatically route the same
   attempt. Preserve it as possibly accepted. An operator may explicitly start a distinct cross-provider
   review attempt; the new attempt has its own id, provenance, usage, and cost.
@@ -1270,8 +1465,8 @@ For trusted own-repo full-branch reviews, the operating policy is:
 
 - Every non-container class refuses fallback.
 - An inner-agent crash in an otherwise healthy container, including stderr containing `docker`, `image`,
-  `network`, or `mount`, cannot construct any `container_*` class. A typed composition error or bounded
-  structured runtime probe can construct only its matching class; an ambiguous probe returns `unknown`.
+  `network`, or `mount`, cannot construct any `container_*` class. Only typed static
+  composition/config evidence can construct its matching class; no external post-failure probe runs.
 - Every candidate container class still refuses when trust, host target, enablement, or replay safety is
   missing.
 - An absent/false eligibility marker, sandboxed entry, API entry, or write-capable target is rejected at
@@ -1279,7 +1474,25 @@ For trusted own-repo full-branch reviews, the operating policy is:
 - `prompt_start` begun is a hard no-replay barrier with a constructible same-poll race test.
 - Untrusted read and every write-capable request fail closed.
 - `fallback-plan` performs zero resolve/spawn/prompt calls. A valid local operator assertion plus an
-  eligible source artifact emits a versioned plan and separate rerun command; it never executes it.
+  eligible complete smoke-v2 artifact emits a versioned plan and separate rerun command; it never
+  executes it. Historical smoke-v1 and hand-assembled task envelopes reject.
+- Artifact cwd cannot control host scope. It must agree with the independently supplied exact trusted cwd,
+  which must remain within the canonical source mount whose descriptor-derived identity was snapshotted.
+  Current config
+  path/digest/source/mount drift makes the plan ineligible, and config/executable/exact-cwd/source-mount/
+  source-marker/target-marker drift before the later smoke refuses before spawn, including a same-mount
+  symlink/sibling swap or a mismatched
+  durable-object fingerprint with matching device/inode, Darwin all-zero/volume-scope failures, and Linux
+  malformed boot identity or unavailable unique-mount identity. Retargeting an unchanged configured
+  source-mount symlink or forging its object fingerprint also refuses before spawn.
+- A genuine static container preflight failure serializes the unique nested resolve/spawn lifecycle that
+  the planner accepts; its event and outer diagnostics must match in full. Retry-shaped or
+  config-contradictory provenance/auth evidence rejects. Known credentials are absent from provenance and
+  structured request/effective model/mode fields. Only the exact ordinary pre-spawn cleanup tuple can
+  authorize a plan. A guarded host smoke invokes no container runtime recovery or sweep and records that
+  backstop as `not_needed`.
+- Symlink, FIFO, device, socket, and descriptor/path replacement inputs fail promptly; anonymous volume
+  syntax, option-like operands, and credential file/directory source types have direct regressions.
 - Spoofed A2A `content_trust` metadata under `AlwaysGrant`, server config, and workflow input cannot reach
   plan generation or host execution. Missing/malformed/legacy source diagnostics and every failed
   eligibility predicate emit an ineligible plan with no command.

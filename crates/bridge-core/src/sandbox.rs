@@ -3,6 +3,529 @@
 
 use crate::domain::{EgressPolicy, MountAccess, SandboxConfig};
 
+/// Composition-owned container infrastructure dimensions. This deliberately excludes inner-agent
+/// process state: adapter stderr, generic runtime prose, and exit status are not evidence for these
+/// classes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerInfrastructureKind {
+    Runtime,
+    Image,
+    Network,
+    Mount,
+    Credentials,
+}
+
+impl ContainerInfrastructureKind {
+    pub const ALL: [Self; 5] = [
+        Self::Runtime,
+        Self::Image,
+        Self::Network,
+        Self::Mount,
+        Self::Credentials,
+    ];
+
+    fn diagnostic_class(self) -> crate::diagnostics::DiagnosticFailureClass {
+        use crate::diagnostics::DiagnosticFailureClass;
+        match self {
+            Self::Runtime => DiagnosticFailureClass::ContainerRuntime,
+            Self::Image => DiagnosticFailureClass::ContainerImage,
+            Self::Network => DiagnosticFailureClass::ContainerNetwork,
+            Self::Mount => DiagnosticFailureClass::ContainerMount,
+            Self::Credentials => DiagnosticFailureClass::ContainerCredentials,
+        }
+    }
+
+    fn diagnostic_code(self) -> &'static str {
+        match self {
+            Self::Runtime => "container.runtime.preflight",
+            Self::Image => "container.image.preflight",
+            Self::Network => "container.network.preflight",
+            Self::Mount => "container.mount.preflight",
+            Self::Credentials => "container.credentials.preflight",
+        }
+    }
+
+    fn summary(self) -> &'static str {
+        match self {
+            Self::Runtime => "Container runtime preflight failed",
+            Self::Image => "Container image declaration preflight failed",
+            Self::Network => "Container network declaration preflight failed",
+            Self::Mount => "Container source mount preflight failed",
+            Self::Credentials => "Container credential-volume preflight failed",
+        }
+    }
+}
+
+/// Result of one structured, composition-owned check. `Unavailable` is distinct from `Failed`: the
+/// former cannot safely support a narrow fallback class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerEvidenceState {
+    Healthy,
+    Failed,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContainerInfrastructureEvidence {
+    runtime: ContainerEvidenceState,
+    image: ContainerEvidenceState,
+    network: ContainerEvidenceState,
+    mount: ContainerEvidenceState,
+    credentials: ContainerEvidenceState,
+}
+
+impl ContainerInfrastructureEvidence {
+    pub const fn healthy() -> Self {
+        Self {
+            runtime: ContainerEvidenceState::Healthy,
+            image: ContainerEvidenceState::Healthy,
+            network: ContainerEvidenceState::Healthy,
+            mount: ContainerEvidenceState::Healthy,
+            credentials: ContainerEvidenceState::Healthy,
+        }
+    }
+
+    pub fn with(
+        mut self,
+        kind: ContainerInfrastructureKind,
+        state: ContainerEvidenceState,
+    ) -> Self {
+        match kind {
+            ContainerInfrastructureKind::Runtime => self.runtime = state,
+            ContainerInfrastructureKind::Image => self.image = state,
+            ContainerInfrastructureKind::Network => self.network = state,
+            ContainerInfrastructureKind::Mount => self.mount = state,
+            ContainerInfrastructureKind::Credentials => self.credentials = state,
+        }
+        self
+    }
+
+    fn states(self) -> [(ContainerInfrastructureKind, ContainerEvidenceState); 5] {
+        [
+            (ContainerInfrastructureKind::Runtime, self.runtime),
+            (ContainerInfrastructureKind::Image, self.image),
+            (ContainerInfrastructureKind::Network, self.network),
+            (ContainerInfrastructureKind::Mount, self.mount),
+            (ContainerInfrastructureKind::Credentials, self.credentials),
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerInfrastructureAssessment {
+    Healthy,
+    Failure(ContainerInfrastructureKind),
+    Unknown,
+}
+
+/// A narrow class requires exactly one failed typed dimension and complete healthy evidence for every
+/// other dimension. This makes contradictory and partial probes fail closed.
+pub fn classify_container_infrastructure(
+    evidence: ContainerInfrastructureEvidence,
+) -> ContainerInfrastructureAssessment {
+    let mut failed = None;
+    for (kind, state) in evidence.states() {
+        match state {
+            ContainerEvidenceState::Healthy => {}
+            ContainerEvidenceState::Unavailable => {
+                return ContainerInfrastructureAssessment::Unknown;
+            }
+            ContainerEvidenceState::Failed if failed.is_none() => failed = Some(kind),
+            ContainerEvidenceState::Failed => return ContainerInfrastructureAssessment::Unknown,
+        }
+    }
+    failed.map_or(
+        ContainerInfrastructureAssessment::Healthy,
+        ContainerInfrastructureAssessment::Failure,
+    )
+}
+
+fn valid_declaration(value: &str) -> bool {
+    !value.is_empty() && value.trim() == value && !value.chars().any(char::is_control)
+}
+
+fn valid_runtime_operand(value: &str) -> bool {
+    valid_declaration(value) && !value.starts_with('-')
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SandboxVolumeHostRequirement {
+    MountSource,
+    RegularFile,
+    Directory,
+}
+
+fn filesystem_state(
+    path: &std::path::Path,
+    requirement: SandboxVolumeHostRequirement,
+) -> ContainerEvidenceState {
+    match std::fs::metadata(path) {
+        Ok(metadata)
+            if match requirement {
+                SandboxVolumeHostRequirement::MountSource => {
+                    metadata.is_file() || metadata.is_dir()
+                }
+                SandboxVolumeHostRequirement::RegularFile => metadata.is_file(),
+                SandboxVolumeHostRequirement::Directory => metadata.is_dir(),
+            } =>
+        {
+            ContainerEvidenceState::Healthy
+        }
+        Ok(_) => ContainerEvidenceState::Failed,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            ContainerEvidenceState::Failed
+        }
+        Err(_) => ContainerEvidenceState::Unavailable,
+    }
+}
+
+fn executable_state(program: &str) -> ContainerEvidenceState {
+    if !valid_declaration(program) {
+        return ContainerEvidenceState::Failed;
+    }
+    let path = std::path::Path::new(program);
+    if path.is_absolute() || program.contains(std::path::MAIN_SEPARATOR) {
+        return executable_path_state(path);
+    }
+    let Some(path_value) = std::env::var_os("PATH") else {
+        return ContainerEvidenceState::Unavailable;
+    };
+    if std::env::split_paths(&path_value)
+        .map(|directory| directory.join(program))
+        .any(|candidate| executable_path_state(&candidate) == ContainerEvidenceState::Healthy)
+    {
+        ContainerEvidenceState::Healthy
+    } else {
+        ContainerEvidenceState::Failed
+    }
+}
+
+fn executable_path_state(path: &std::path::Path) -> ContainerEvidenceState {
+    let state = filesystem_state(path, SandboxVolumeHostRequirement::RegularFile);
+    if state != ContainerEvidenceState::Healthy {
+        return state;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
+                ContainerEvidenceState::Healthy
+            }
+            Ok(_) => ContainerEvidenceState::Failed,
+            Err(_) => ContainerEvidenceState::Unavailable,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ContainerEvidenceState::Healthy
+    }
+}
+
+fn merge_evidence_state(
+    left: ContainerEvidenceState,
+    right: ContainerEvidenceState,
+) -> ContainerEvidenceState {
+    match (left, right) {
+        (ContainerEvidenceState::Failed, _) | (_, ContainerEvidenceState::Failed) => {
+            ContainerEvidenceState::Failed
+        }
+        (ContainerEvidenceState::Unavailable, _) | (_, ContainerEvidenceState::Unavailable) => {
+            ContainerEvidenceState::Unavailable
+        }
+        (ContainerEvidenceState::Healthy, ContainerEvidenceState::Healthy) => {
+            ContainerEvidenceState::Healthy
+        }
+    }
+}
+
+pub fn is_credential_destination(destination: &str) -> bool {
+    matches!(
+        destination,
+        "/root/.claude/.credentials.json" | "/root/.codex/auth.json" | "/root/.local/share"
+    )
+}
+
+pub fn sandbox_volume_host_requirement(destination: &str) -> SandboxVolumeHostRequirement {
+    match destination {
+        "/root/.claude/.credentials.json" | "/root/.codex/auth.json" => {
+            SandboxVolumeHostRequirement::RegularFile
+        }
+        "/root/.local/share" => SandboxVolumeHostRequirement::Directory,
+        _ => SandboxVolumeHostRequirement::MountSource,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SandboxVolumeSource {
+    Anonymous,
+    Host(String),
+    Named(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxVolumeDeclaration {
+    source: SandboxVolumeSource,
+    destination: String,
+}
+
+impl SandboxVolumeDeclaration {
+    pub fn source(&self) -> &SandboxVolumeSource {
+        &self.source
+    }
+
+    pub fn destination(&self) -> &str {
+        &self.destination
+    }
+}
+
+fn valid_named_volume(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => true,
+            b'_' | b'.' | b'-' => index > 0,
+            _ => false,
+        })
+}
+
+/// Parse the `-v` grammar used by config validation, static evidence, and composition. Supported
+/// forms are an anonymous absolute destination or `source:absolute-destination[:options]` where the
+/// source is an absolute host path or a runtime-owned named volume. Shell-style `~/` sources are rejected:
+/// container runtimes receive direct argv and do not perform shell expansion.
+pub fn parse_sandbox_volume(value: &str) -> Result<SandboxVolumeDeclaration, &'static str> {
+    if !valid_declaration(value) {
+        return Err("volume declaration is empty, padded, or contains controls");
+    }
+    let fields: Vec<&str> = value.split(':').collect();
+    let (source, destination, options) = match fields.as_slice() {
+        [destination] => (SandboxVolumeSource::Anonymous, *destination, None),
+        [source, destination] => (
+            if source.starts_with('/') {
+                SandboxVolumeSource::Host((*source).to_owned())
+            } else if valid_named_volume(source) {
+                SandboxVolumeSource::Named((*source).to_owned())
+            } else {
+                return Err("volume source is not a host path or named volume");
+            },
+            *destination,
+            None,
+        ),
+        [source, destination, options] => (
+            if source.starts_with('/') {
+                SandboxVolumeSource::Host((*source).to_owned())
+            } else if valid_named_volume(source) {
+                SandboxVolumeSource::Named((*source).to_owned())
+            } else {
+                return Err("volume source is not a host path or named volume");
+            },
+            *destination,
+            Some(*options),
+        ),
+        _ => return Err("volume declaration has too many colon-separated fields"),
+    };
+    let destination = crate::SessionCwd::parse(destination)
+        .map_err(|_| "volume destination must be an absolute normalized path")?;
+    if options.is_some_and(|options| {
+        options.is_empty()
+            || options.split(',').any(|option| {
+                !valid_declaration(option) || option.starts_with('-') || option.contains('/')
+            })
+    }) {
+        return Err("volume options are malformed");
+    }
+    Ok(SandboxVolumeDeclaration {
+        source,
+        destination: destination.as_str().to_owned(),
+    })
+}
+
+fn host_volume_path(source: &str) -> Result<std::path::PathBuf, ()> {
+    if source.starts_with('/') {
+        return Ok(std::path::PathBuf::from(source));
+    }
+    Err(())
+}
+
+pub fn validate_sandbox_declarations(sandbox: &SandboxConfig) -> Result<(), &'static str> {
+    if !valid_runtime_operand(sandbox.runtime()) {
+        return Err("sandbox runtime is not a valid command operand");
+    }
+    if !valid_runtime_operand(&sandbox.image) {
+        return Err("sandbox image is not a valid runtime operand");
+    }
+    if let EgressPolicy::Locked {
+        network,
+        proxy,
+        no_proxy,
+    } = &sandbox.egress
+    {
+        if !valid_runtime_operand(network)
+            || !valid_declaration(proxy)
+            || no_proxy
+                .as_deref()
+                .is_some_and(|value| !valid_declaration(value))
+        {
+            return Err("locked sandbox egress declaration is malformed");
+        }
+    }
+    for volume in &sandbox.volumes {
+        parse_sandbox_volume(volume)?;
+    }
+    Ok(())
+}
+
+/// Classify extra volumes from their structured source/destination fields. Only the closed set of
+/// bridge-supported authentication destinations is credential evidence; MCP binaries, caches, and
+/// other data mounts remain ordinary mount evidence.
+fn extra_volume_states(volumes: &[String]) -> (ContainerEvidenceState, ContainerEvidenceState) {
+    let mut mount = ContainerEvidenceState::Healthy;
+    let mut credentials = ContainerEvidenceState::Healthy;
+    for volume in volumes {
+        let declaration = match parse_sandbox_volume(volume) {
+            Ok(declaration) => declaration,
+            Err(_) => {
+                mount = merge_evidence_state(mount, ContainerEvidenceState::Unavailable);
+                continue;
+            }
+        };
+        let credential = is_credential_destination(declaration.destination());
+        let selected = if credential {
+            &mut credentials
+        } else {
+            &mut mount
+        };
+        let requirement = sandbox_volume_host_requirement(declaration.destination());
+        let state = match declaration.source() {
+            SandboxVolumeSource::Anonymous if credential => ContainerEvidenceState::Failed,
+            SandboxVolumeSource::Anonymous => ContainerEvidenceState::Healthy,
+            SandboxVolumeSource::Named(_)
+                if credential
+                    && matches!(requirement, SandboxVolumeHostRequirement::RegularFile) =>
+            {
+                ContainerEvidenceState::Failed
+            }
+            SandboxVolumeSource::Named(_) => ContainerEvidenceState::Healthy,
+            SandboxVolumeSource::Host(source) => match host_volume_path(source) {
+                Ok(path) => filesystem_state(&path, requirement),
+                Err(()) => ContainerEvidenceState::Unavailable,
+            },
+        };
+        *selected = merge_evidence_state(*selected, state);
+    }
+    (mount, credentials)
+}
+
+/// Inspect only bridge-owned configuration and host filesystem/executable metadata. This performs no
+/// network access, image pull, runtime mutation, container start, credential refresh, or subprocess
+/// execution.
+pub fn inspect_container_infrastructure(
+    sandbox: &SandboxConfig,
+) -> ContainerInfrastructureEvidence {
+    let (extra_mount, credentials) = extra_volume_states(&sandbox.volumes);
+    let image = if valid_runtime_operand(&sandbox.image) {
+        ContainerEvidenceState::Healthy
+    } else {
+        ContainerEvidenceState::Failed
+    };
+    let network = match &sandbox.egress {
+        EgressPolicy::Open => ContainerEvidenceState::Healthy,
+        EgressPolicy::Locked {
+            network,
+            proxy,
+            no_proxy,
+        } if valid_runtime_operand(network)
+            && valid_declaration(proxy)
+            && no_proxy.as_deref().is_none_or(valid_declaration) =>
+        {
+            ContainerEvidenceState::Healthy
+        }
+        EgressPolicy::Locked { .. } => ContainerEvidenceState::Failed,
+    };
+    ContainerInfrastructureEvidence::healthy()
+        .with(
+            ContainerInfrastructureKind::Runtime,
+            executable_state(sandbox.runtime()),
+        )
+        .with(ContainerInfrastructureKind::Image, image)
+        .with(ContainerInfrastructureKind::Network, network)
+        .with(
+            ContainerInfrastructureKind::Mount,
+            merge_evidence_state(
+                filesystem_state(
+                    std::path::Path::new(&sandbox.mount),
+                    SandboxVolumeHostRequirement::Directory,
+                ),
+                extra_mount,
+            ),
+        )
+        .with(ContainerInfrastructureKind::Credentials, credentials)
+}
+
+fn container_infrastructure_failure_error(
+    assessment: ContainerInfrastructureAssessment,
+) -> crate::error::BridgeError {
+    use crate::diagnostics::{
+        DiagnosticFailureClass, DiagnosticPhase, DiagnosticRedactor, FailureDiagnostic,
+        FailureDiagnosticInput, FailureDisposition,
+    };
+    use crate::error::BridgeError;
+    let (class, disposition, code, summary) = match assessment {
+        ContainerInfrastructureAssessment::Failure(kind) => (
+            kind.diagnostic_class(),
+            FailureDisposition::ContainerFallbackCandidate,
+            kind.diagnostic_code(),
+            kind.summary(),
+        ),
+        ContainerInfrastructureAssessment::Unknown => (
+            DiagnosticFailureClass::Unknown,
+            FailureDisposition::Fatal,
+            "container.preflight.unknown",
+            "Container infrastructure preflight was inconclusive",
+        ),
+        ContainerInfrastructureAssessment::Healthy => return BridgeError::InvalidStateTransition,
+    };
+    let diagnostic = FailureDiagnostic::build_static_code(
+        FailureDiagnosticInput {
+            failed_phase: DiagnosticPhase::Spawn,
+            last_completed_phase: None,
+            class,
+            disposition,
+            code: String::new(),
+            summary: summary.to_owned(),
+            causes: Vec::new(),
+            stderr_observed: false,
+            stderr_line_count: 0,
+            stderr_scope: None,
+            stderr_tail: None,
+            stderr_redaction: None,
+            retry_after_ms: None,
+            reset_at_ms: None,
+            prompt_may_have_been_accepted: false,
+        },
+        code,
+        &DiagnosticRedactor::default(),
+    );
+    match diagnostic {
+        Ok(diagnostic) => BridgeError::agent_failure(diagnostic),
+        Err(_) => BridgeError::InvalidStateTransition,
+    }
+}
+
+/// Fail closed before container spawn unless all composition-owned evidence is healthy.
+pub fn validate_container_infrastructure(
+    sandbox: &SandboxConfig,
+) -> Result<(), crate::error::BridgeError> {
+    match classify_container_infrastructure(inspect_container_infrastructure(sandbox)) {
+        ContainerInfrastructureAssessment::Healthy => Ok(()),
+        assessment => Err(container_infrastructure_failure_error(assessment)),
+    }
+}
+
 /// PURE. Managed container name: `a2a-<role>-<owner>-<run_id>-<tail>` (run_id defeats same-owner clashes).
 pub fn a2a_name(role: &str, owner: &str, run_id: &str, tail: &str) -> String {
     format!("a2a-{role}-{owner}-{run_id}-{tail}")
@@ -677,5 +1200,165 @@ mod tests {
             format!("{err:?}").contains("escapes mount root"),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn container_infrastructure_evidence_requires_one_unique_typed_failure() {
+        for (index, kind) in ContainerInfrastructureKind::ALL.into_iter().enumerate() {
+            let positive = ContainerInfrastructureEvidence::healthy()
+                .with(kind, ContainerEvidenceState::Failed);
+            assert_eq!(
+                classify_container_infrastructure(positive),
+                ContainerInfrastructureAssessment::Failure(kind),
+                "one typed {kind:?} failure should remain specific"
+            );
+
+            let other = ContainerInfrastructureKind::ALL
+                [(index + 1) % ContainerInfrastructureKind::ALL.len()];
+            let contradictory = positive.with(other, ContainerEvidenceState::Failed);
+            assert_eq!(
+                classify_container_infrastructure(contradictory),
+                ContainerInfrastructureAssessment::Unknown,
+                "conflicting {kind:?}/{other:?} evidence must fail closed"
+            );
+
+            let unavailable = positive.with(other, ContainerEvidenceState::Unavailable);
+            assert_eq!(
+                classify_container_infrastructure(unavailable),
+                ContainerInfrastructureAssessment::Unknown,
+                "unavailable corroboration must not promote {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn healthy_container_infrastructure_evidence_is_not_a_failure() {
+        assert_eq!(
+            classify_container_infrastructure(ContainerInfrastructureEvidence::healthy()),
+            ContainerInfrastructureAssessment::Healthy
+        );
+    }
+
+    #[test]
+    fn missing_ordinary_extra_bind_is_mount_not_credentials() {
+        use crate::diagnostics::DiagnosticFailureClass;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().join("repo");
+        std::fs::create_dir(&mount).unwrap();
+        let sandbox = SandboxConfig {
+            runtime: Some(
+                std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            image: "reader:fixed".into(),
+            mount: mount.to_string_lossy().into_owned(),
+            access: MountAccess::Ro,
+            egress: EgressPolicy::Open,
+            volumes: vec![format!(
+                "{}:/opt/prism/prism-mcp:ro",
+                temp.path().join("missing-prism").display()
+            )],
+        };
+        let error = validate_container_infrastructure(&sandbox).unwrap_err();
+        let crate::error::BridgeError::AgentFailure { diagnostic } = error else {
+            panic!("missing bind should return structured evidence");
+        };
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::ContainerMount);
+    }
+
+    #[test]
+    fn volume_parser_accepts_anonymous_destination_and_rejects_option_like_operands() {
+        assert_eq!(
+            parse_sandbox_volume("/cache").unwrap(),
+            SandboxVolumeDeclaration {
+                source: SandboxVolumeSource::Anonymous,
+                destination: "/cache".into(),
+            }
+        );
+        assert!(
+            parse_sandbox_volume("~/.config/auth.json:/root/.codex/auth.json:ro").is_err(),
+            "direct runtime argv does not expand shell-style tilde sources"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut sandbox = SandboxConfig {
+            runtime: Some("docker".into()),
+            image: "reader:fixed".into(),
+            mount: temp.path().to_string_lossy().into_owned(),
+            access: MountAccess::Ro,
+            egress: EgressPolicy::Open,
+            volumes: vec!["/cache".into()],
+        };
+        assert!(validate_sandbox_declarations(&sandbox).is_ok());
+
+        sandbox.runtime = Some("--help".into());
+        assert!(validate_sandbox_declarations(&sandbox)
+            .unwrap_err()
+            .contains("runtime"));
+        sandbox.runtime = Some("docker".into());
+        sandbox.image = "--help".into();
+        assert!(validate_sandbox_declarations(&sandbox)
+            .unwrap_err()
+            .contains("image"));
+        sandbox.image = "reader:fixed".into();
+        sandbox.egress = EgressPolicy::Locked {
+            network: "--help".into(),
+            proxy: "http://proxy:3128".into(),
+            no_proxy: None,
+        };
+        assert!(validate_sandbox_declarations(&sandbox)
+            .unwrap_err()
+            .contains("egress"));
+    }
+
+    #[test]
+    fn credential_destinations_require_the_declared_source_type() {
+        use crate::diagnostics::DiagnosticFailureClass;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().join("repo");
+        let directory = temp.path().join("directory");
+        let file = temp.path().join("file");
+        std::fs::create_dir(&mount).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, b"credential").unwrap();
+
+        let base = SandboxConfig {
+            runtime: Some(
+                std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            image: "reader:fixed".into(),
+            mount: mount.to_string_lossy().into_owned(),
+            access: MountAccess::Ro,
+            egress: EgressPolicy::Open,
+            volumes: vec![],
+        };
+        let invalid = [
+            format!("{}:/root/.codex/auth.json:ro", directory.display()),
+            format!("{}:/root/.local/share:ro", file.display()),
+            "/root/.codex/auth.json".into(),
+            "codex-auth:/root/.codex/auth.json:ro".into(),
+        ];
+
+        for volume in invalid {
+            let mut sandbox = base.clone();
+            sandbox.volumes = vec![volume.clone()];
+            let error = validate_container_infrastructure(&sandbox)
+                .expect_err("credential source type must fail static preflight");
+            let crate::error::BridgeError::AgentFailure { diagnostic } = error else {
+                panic!("{volume:?} should return structured credential evidence");
+            };
+            assert_eq!(
+                diagnostic.class(),
+                DiagnosticFailureClass::ContainerCredentials,
+                "wrong class for {volume:?}"
+            );
+        }
     }
 }

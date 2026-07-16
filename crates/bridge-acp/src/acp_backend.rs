@@ -510,7 +510,8 @@ impl AcpTraceEvent {
 pub struct AcpConfig {
     /// Registry id of the agent this config belongs to, used in operator-facing diagnostics.
     pub agent_id: String,
-    /// Absolute working directory the agent runs sessions in.
+    /// Absolute working directory the agent runs sessions in. The guarded host-fallback seam uses an
+    /// OS object-addressed absolute path after the child process cwd is descriptor-pinned.
     pub cwd: PathBuf,
     /// Optional model id to request via advertised `session/set_config_option`.
     pub model: Option<String>,
@@ -1739,6 +1740,31 @@ impl AcpBackend {
         observer: Arc<dyn DiagnosticObserver>,
         container_controller: Option<ReapController>,
     ) -> Result<Self, BridgeError> {
+        Self::spawn_observed_with_container_controller_and_pinned_cwd(
+            cmd,
+            args,
+            config,
+            observer,
+            container_controller,
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// Guarded host-smoke seam: start the adapter with its process cwd bound to a pinned directory
+    /// descriptor. The parent stays close-on-exec; Linux may retain only the child's forked copy so
+    /// `/proc/self/fd/N` remains a valid absolute ACP cwd.
+    #[doc(hidden)]
+    pub async fn spawn_observed_with_container_controller_and_pinned_cwd(
+        cmd: &str,
+        args: &[&str],
+        config: AcpConfig,
+        observer: Arc<dyn DiagnosticObserver>,
+        container_controller: Option<ReapController>,
+        pinned_cwd_fd: Option<std::os::fd::RawFd>,
+        retain_pinned_cwd_fd_after_exec: bool,
+    ) -> Result<Self, BridgeError> {
         let redactor = config.diagnostic_redactor.clone();
         let lifecycle = AcpLifecycle::new(observer.clone(), redactor.clone(), None);
         lifecycle
@@ -1760,27 +1786,33 @@ impl AcpBackend {
                 .map(ContainerReap::legacy_controller)
         });
         let container_on_fail = container_controller.clone();
-        let mut supervised =
-            match Supervised::spawn_with_stderr_redactor(cmd, args, None, redactor.clone()) {
-                Ok(supervised) => supervised,
-                Err(error) => {
-                    return Err(lifecycle
-                        .failure(
-                            DiagnosticPhase::Spawn,
-                            None,
-                            DiagnosticFailureClass::AgentProcess,
-                            FailureDisposition::RetrySameTarget,
-                            "acp.spawn.failed",
-                            "ACP agent process failed to start",
-                            Some(error.to_string()),
-                            false,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await)
-                }
-            };
+        let mut supervised = match Supervised::spawn_with_stderr_redactor_and_pinned_cwd(
+            cmd,
+            args,
+            None,
+            redactor.clone(),
+            pinned_cwd_fd,
+            retain_pinned_cwd_fd_after_exec,
+        ) {
+            Ok(supervised) => supervised,
+            Err(error) => {
+                return Err(lifecycle
+                    .failure(
+                        DiagnosticPhase::Spawn,
+                        None,
+                        DiagnosticFailureClass::AgentProcess,
+                        FailureDisposition::RetrySameTarget,
+                        "acp.spawn.failed",
+                        "ACP agent process failed to start",
+                        Some(error.to_string()),
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await)
+            }
+        };
         let stderr_ring = supervised.stderr_ring();
         let stderr_cursor = stderr_ring.origin();
         let lifecycle = AcpLifecycle::new(
@@ -12541,6 +12573,25 @@ mod tests {
             "with no stashed cwd, ensure_session must use the static AcpConfig.cwd (/tmp); \
              got {recorded:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn mint_preserves_object_addressed_absolute_static_cwd() {
+        let rec = Recorder::new("agent-sess-PINNED-CWD");
+        let mut config = test_config();
+        config.cwd = PathBuf::from("/.bridge-pinned/42");
+        let be = connect_recording_with(rec.clone(), config).await;
+        let key = bkey("bridge-PINNED-CWD");
+
+        be.configure_session(&key, &SessionSpec::from_config(EffectiveConfig::default()))
+            .await
+            .unwrap();
+        be.ensure_session(&key).await.unwrap();
+
+        let recorded = rec.new_session_cwd.lock().await.clone();
+        let recorded = recorded.expect("session/new cwd recorded");
+        assert!(recorded.is_absolute());
+        assert_eq!(recorded, std::path::Path::new("/.bridge-pinned/42"));
     }
 
     #[tokio::test]
