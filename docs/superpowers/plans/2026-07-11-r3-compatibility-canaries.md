@@ -2,7 +2,8 @@
 
 - **Status:** overall R3 **IN REVIEW**; R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE** on
   `agent/reliability-r3b-pinned-lane`. Nine pinned rows and four support configs are deterministically
-  green; no R3b live/billable canary or baseline promotion has run.
+  green; Sol/xhigh deterministic closure review is `APPROVE`; no R3b live/billable canary or baseline
+  promotion has run.
 - **Prerequisite:** R2c/R2d merged (`a6fec94c`, PR #29); R3a merged (`3927df3f`, PR #31)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -297,21 +298,29 @@ is unchanged.
 - **Branch:** `agent/reliability-r3b-pinned-lane`
 - **Implementation state (2026-07-16):** nine pinned rows validate at manifest SHA-256
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. Four support configs pass
-  non-billable doctor preflight (**53 ok / 0 warn / 0 fail** total), binary units pass **386/0**, and
-  the full serial workspace passes **2,059/0/12 ignored** across **70** groups. Linux/Rust 1.94 passes
-  binary units **387/0**, smoke CLI **12/0**, and compatibility CLI **11/0**. Format/diff, workspace
+  non-billable doctor preflight (**53 ok / 0 warn / 0 fail** total), binary units pass **387/0**, and
+  the full serial workspace passes **2,060/0/12 ignored** across **70** groups. Linux/Rust 1.94 passes
+  binary units **388/0**, smoke CLI **12/0**, and compatibility CLI **11/0**. Format/diff, workspace
   all-target check, warnings-denied Clippy, release build, hygiene **37/7**, and release-manifest
   validation are green. The pinned baseline has the new manifest identity but no promoted cases pending
-  separately authorized exact-candidate live artifacts and review. Exact-head closure review remains
-  pending.
+  separately authorized exact-candidate live artifacts and review. Fresh Sol/xhigh closure review of
+  exact `c38978a` returned `APPROVE` with no `WRONG`; its sole nonblocking test-coverage `SMELL` is
+  closed on the current tree.
 
 The initial fresh one-shot Sol/xhigh review of exact `57f3ee8` returned `REVISE` with two `WRONG`
 findings and three `SMELL`s. The branch now keeps invalid negative/non-finite cost history sticky across
 later snapshots, aligns both reader-count surfaces, refuses ambiguous duplicate settings provenance,
 adds Claude image-label/drift mutation coverage, and test-locks the baseline empty until authorized
-promotion. All findings are folded; exact-head closure review remains pending. The separate shared
-operator pre-prompt crash is recorded in the central roadmap and did not trigger a replay or process
-restart.
+promotion. All findings are folded. Fresh Sol/xhigh closure review of exact `c38978a` returned `APPROVE`
+with no `WRONG` and one nonblocking `SMELL`: both sticky-cost usage orders were tested only on normal
+completion, not the backend-error serializer exit. The current tree drives both orders into an actual
+stream error and asserts the terminal state plus rejected-cost artifact. That exact regression passes
+**1/0** here and failed **0/1** on pre-fold `9c2b712`, where invalid-then-valid leaked `cost`. The full
+host suite then passed **2,060/0/12 ignored** across **70** groups; corrected Linux/Rust 1.94 binary units
+passed **388/0**. A reconstructed Linux harness first produced three unrelated execution failures because
+its `/tmp` tmpfs was `noexec`; a direct execute probe exited **126** there and **0** with explicit `exec`,
+after which the unchanged product tests were green. The separate shared operator pre-prompt crash
+is recorded in the central roadmap and did not trigger a replay or process restart.
 
 Seed rows for every currently claimed path or control in `docs/compatibility.md`:
 

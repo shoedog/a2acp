@@ -2057,6 +2057,8 @@ mod tests {
         Silent,
         InvalidThenValidUsage,
         ValidThenInvalidUsage,
+        InvalidThenValidUsageThenBackendError,
+        ValidThenInvalidUsageThenBackendError,
         ConfigFailure,
         PromptFailure,
     }
@@ -2235,6 +2237,44 @@ mod tests {
                         stop_reason: "end_turn".into(),
                     }),
                 ])),
+                Behavior::InvalidThenValidUsageThenBackendError => {
+                    Box::pin(futures::stream::iter(vec![
+                        Ok(Update::Usage(UsageSnapshot {
+                            cost: Some(bridge_core::orch::UsageCost {
+                                amount: -0.01,
+                                currency: "USD".into(),
+                            }),
+                            ..UsageSnapshot::default()
+                        })),
+                        Ok(Update::Usage(UsageSnapshot {
+                            cost: Some(bridge_core::orch::UsageCost {
+                                amount: 0.01,
+                                currency: "USD".into(),
+                            }),
+                            ..UsageSnapshot::default()
+                        })),
+                        Err(BridgeError::FrameError),
+                    ]))
+                }
+                Behavior::ValidThenInvalidUsageThenBackendError => {
+                    Box::pin(futures::stream::iter(vec![
+                        Ok(Update::Usage(UsageSnapshot {
+                            cost: Some(bridge_core::orch::UsageCost {
+                                amount: 0.01,
+                                currency: "USD".into(),
+                            }),
+                            ..UsageSnapshot::default()
+                        })),
+                        Ok(Update::Usage(UsageSnapshot {
+                            cost: Some(bridge_core::orch::UsageCost {
+                                amount: -0.01,
+                                currency: "USD".into(),
+                            }),
+                            ..UsageSnapshot::default()
+                        })),
+                        Err(BridgeError::FrameError),
+                    ]))
+                }
                 Behavior::ConfigFailure => unreachable!("configure rejects first"),
                 Behavior::PromptFailure => unreachable!("prompt rejects before stream"),
             };
@@ -2577,6 +2617,24 @@ mod tests {
             usage.get("cost_rejected").and_then(Value::as_str),
             Some("negative_or_non_finite")
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_usage_cost_remains_rejected_on_backend_error_exit() {
+        for behavior in [
+            Behavior::InvalidThenValidUsageThenBackendError,
+            Behavior::ValidThenInvalidUsageThenBackendError,
+        ] {
+            let (_, result) = execute(behavior, Duration::from_secs(1)).await;
+            assert!(result.error.is_some());
+            assert_eq!(result.turn.terminal_state, "backend_error");
+            let usage = serde_json::to_value(result.turn.usage.unwrap()).unwrap();
+            assert!(usage.get("cost").is_none());
+            assert_eq!(
+                usage.get("cost_rejected").and_then(Value::as_str),
+                Some("negative_or_non_finite")
+            );
+        }
     }
 
     #[tokio::test]
