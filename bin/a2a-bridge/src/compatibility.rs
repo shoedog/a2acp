@@ -402,6 +402,17 @@ fn exact_model(label: &str, value: &str) -> Result<(), BoxError> {
     exact_component(label, value)
 }
 
+fn exact_remote_component(label: &str, value: &str) -> Result<(), BoxError> {
+    exact_component(label, value)?;
+    if stable_id(label, value).is_err() {
+        return Err(format!(
+            "compatibility manifest: {label} must be one exact identity, not a compound or ranged expression"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn exact_package_pin(label: &str, value: &str) -> Result<(), BoxError> {
     bounded_text(label, value, MAX_TEXT_BYTES)?;
     reject_secret_text(label, value)?;
@@ -704,6 +715,12 @@ fn validate_case(case: &CompatibilityCase, budget: &ManifestBudget) -> Result<()
                             case.id
                         )
                         .into());
+                    }
+                    for name in ["provider", "api", "api_version"] {
+                        exact_remote_component(
+                            "remote component pin",
+                            pins.components.get(name).expect("presence checked above"),
+                        )?;
                     }
                 }
                 (_, EvidencePath::DirectCli) => {
@@ -1641,6 +1658,7 @@ impl PinnedOutputDirectory {
     fn replace_setup_with_final(
         &self,
         setup_file: &File,
+        setup_aggregate: &AggregateArtifact,
         aggregate: &AggregateArtifact,
     ) -> Result<(), BoxError> {
         let replacement_name = OsString::from(format!(
@@ -1648,20 +1666,56 @@ impl PinnedOutputDirectory {
             std::process::id(),
             crate::implement::nonce(20)
         ));
+        let rollback_name = OsString::from(format!(
+            ".a2a-compat-setup-{}-{}",
+            std::process::id(),
+            crate::implement::nonce(20)
+        ));
         let mut replacement =
             self.pin
                 .create_new_file(&replacement_name, 0o600, "compatibility final aggregate")?;
-        let published = write_aggregate(&mut replacement, aggregate).and_then(|()| {
-            self.pin.replace_regular_child(
-                &self.output_name,
-                setup_file,
+        let mut rollback = match self.pin.create_new_file(
+            &rollback_name,
+            0o600,
+            "compatibility setup rollback aggregate",
+        ) {
+            Ok(rollback) => rollback,
+            Err(error) => {
+                drop(replacement);
+                let _ = self.pin.remove_child(
+                    &replacement_name,
+                    false,
+                    "compatibility final aggregate cleanup",
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = write_aggregate(&mut replacement, aggregate)
+            .and_then(|()| write_aggregate(&mut rollback, setup_aggregate))
+        {
+            drop(replacement);
+            drop(rollback);
+            let _ = self.pin.remove_child(
                 &replacement_name,
-                &replacement,
-                "compatibility final aggregate",
-            )
-        });
+                false,
+                "compatibility final aggregate cleanup",
+            );
+            let _ = self.pin.remove_child(
+                &rollback_name,
+                false,
+                "compatibility setup rollback cleanup",
+            );
+            return Err(error);
+        }
+        let published = self.pin.replace_regular_child(
+            local_file::RegularChildRef::new(&self.output_name, setup_file),
+            local_file::RegularChildRef::new(&replacement_name, &replacement),
+            local_file::RegularChildRef::new(&rollback_name, &rollback),
+            "compatibility final aggregate",
+        );
         if let Err(error) = published {
             drop(replacement);
+            drop(rollback);
             let _ = self.pin.remove_child(
                 &replacement_name,
                 false,
@@ -1669,6 +1723,7 @@ impl PinnedOutputDirectory {
             );
             return Err(error);
         }
+        drop(rollback);
         Ok(())
     }
 
@@ -2798,7 +2853,7 @@ async fn run_command(args: RunArgs) -> Result<(), BoxError> {
     .await;
     signal_task.abort();
     let success = aggregate.success;
-    output_directory.replace_setup_with_final(&output, &aggregate)?;
+    output_directory.replace_setup_with_final(&output, &setup_evidence, &aggregate)?;
     if success {
         Ok(())
     } else {
@@ -3454,7 +3509,7 @@ agent_cli = "@openai/codex=0.144.1"
         );
         parse_and_validate(&remote).unwrap();
 
-        for ranged_version in ["v1 || v2", "v1 - v2"] {
+        for ranged_version in ["v1 || v2", "v1 - v2", "v1 or v2", "v1 v2", "v1/v2"] {
             let ranged = remote.replace(
                 "api_version = \"v1\"",
                 &format!("api_version = {ranged_version:?}"),
@@ -5097,7 +5152,7 @@ agent_cli = "@openai/codex=0.144.1"
         final_aggregate.ended_at_ms += 1;
 
         output_directory
-            .replace_setup_with_final(&output, &final_aggregate)
+            .replace_setup_with_final(&output, &setup, &final_aggregate)
             .unwrap();
 
         let published: AggregateArtifact = load_json(&output_path, "published aggregate").unwrap();
@@ -5112,6 +5167,13 @@ agent_cli = "@openai/codex=0.144.1"
             preserved.results[0].runner_error_code.as_deref(),
             Some("compatibility_setup_incomplete")
         );
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".a2a-compat-")
+        }));
     }
 
     #[test]
@@ -5137,7 +5199,7 @@ agent_cli = "@openai/codex=0.144.1"
         final_aggregate.success = true;
 
         let error = output_directory
-            .replace_setup_with_final(&output, &final_aggregate)
+            .replace_setup_with_final(&output, &setup, &final_aggregate)
             .unwrap_err();
 
         assert!(error.to_string().contains("target identity changed"));
@@ -5152,13 +5214,28 @@ agent_cli = "@openai/codex=0.144.1"
             preserved.results[0].runner_error_code.as_deref(),
             Some("compatibility_setup_incomplete")
         );
-        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".a2a-compat-final-")
-        }));
+        let staging: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".a2a-compat-")
+            })
+            .collect();
+        assert_eq!(staging.len(), 1);
+        assert!(staging[0]
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".a2a-compat-setup-"));
+        let recovery: AggregateArtifact =
+            load_json(&staging[0].path(), "setup recovery aggregate").unwrap();
+        assert!(!recovery.success);
+        assert_eq!(
+            recovery.results[0].runner_error_code.as_deref(),
+            Some("compatibility_setup_incomplete")
+        );
     }
 
     #[tokio::test]

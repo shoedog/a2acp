@@ -1,8 +1,8 @@
 # R3 — Compatibility manifest and canary implementation plan
 
-- **Status:** IN REVIEW — initial review and closure re-reviews 1–3 on `884bc5f`, `b37147c`,
-  `c8c9452`, and `a8602bb` returned `REVISE`; the intervening exact-`bc9f64c` attempt ended on
-  provider capacity without a verdict. Every completed finding set is folded locally on
+- **Status:** IN REVIEW — initial review and closure re-reviews 1–4 on `884bc5f`, `b37147c`,
+  `c8c9452`, `a8602bb`, and `42523e1` returned `REVISE`; the intervening exact-`bc9f64c` attempt ended
+  on provider capacity without a verdict. Every completed finding set is folded locally on
   `agent/reliability-r3a-manifest-runner` with deterministic gates green. One fresh Sol/xhigh review of
   the corrected exact head remains pending; after Sol approves, one independent Fable/xhigh pass owns
   the adversarial implementation and release/compatibility lenses
@@ -51,11 +51,15 @@ the manifest, requires an explicit selection (there is no implicit all-case bill
 aggregate output as a single-link regular file with mode `0600` before any provider process. The output
 immediately contains a valid blocking setup-incomplete aggregate with explicit selected-case rows, so a
 later scratch or candidate-staging failure cannot leave a zero-byte artifact. After execution finishes,
-the runner writes and syncs the final aggregate to a new owner-only sibling, verifies that both names
-still identify the retained files, and atomically replaces the provisional inode relative to the pinned
-directory. A serialization, write, sync, identity, or rename failure therefore leaves the valid setup
-artifact at the output path rather than partially overwriting it. The output
-parent is canonicalized and descriptor-pinned; output and private-scratch entries are created relative to
+the runner writes and syncs the final aggregate plus a separate blocking setup copy to new owner-only
+siblings, verifies that all three names still identify the retained files, and atomically replaces the
+provisional inode relative to the pinned directory. It then syncs the directory before returning green.
+If that post-rename sync fails, it renames the separately synced setup copy back over the output, makes a
+best-effort directory sync, and returns an error; if restoration itself fails, it best-effort removes the
+green output name and leaves any surviving blocking recovery copy in place. Normal success removes the
+rollback sibling best effort. A failed hostile identity rebind may therefore leave one owner-only blocking recovery copy,
+but serialization, write, identity, or rename failure never partially overwrites JSON. The output parent
+is canonicalized and descriptor-pinned; output and private-scratch entries are created relative to
 the retained descriptor, and its identity is rechecked before and during creation, so a name or symlink
 retarget cannot redirect an effect into its replacement. Normal worktrees and bare Git repositories are both excluded. Each
 eligible `evidence_path = "bridge_smoke"`, `probe = "minimal"` case shells back into the exact candidate
@@ -119,16 +123,17 @@ and zero-byte setup evidence. Exact `a8602bb` then passed **41/0** macOS compati
 closure re-review 3 nevertheless returned `REVISE`. Its exactness-range regression and the independently
 reproduced pinned-support and atomic-publication regressions failed before their fixes. The Linux ambient
 fd and provider-descendant controls cover the remaining descriptor findings. The current local fold passes
-**44/0** macOS compatibility units, the full `a2a-bridge` binary target **368/0**, CLI regressions
-**10/0**, and the serial workspace suite **2,041/0/12 ignored** across **70** test/doc-test executables.
+**44/0** macOS compatibility units, the full `a2a-bridge` binary target **370/0**, CLI regressions
+**10/0**, and the serial workspace suite **2,043/0/12 ignored** across **70** test/doc-test executables.
 Linux/Rust 1.94 passes compatibility units **45/0**, smoke CLI **12/0**, and compatibility CLI **11/0**
 with `CARGO_PROFILE_TEST_DEBUG=0`; an initial normal-debug compatibility CLI run stopped **8/3** because
 the instrumented candidate exceeded the unchanged 256 MiB evidence cap, and the debug-free rerun
 separated that fixture artifact from product behavior. The earlier candidate-overwrite control as uid
-65534 remains **1/0**. The CLI
+65534 remains **1/0**, and the Linux directory-sync rollback controls pass **2/0**. The CLI
 suite includes a deterministic missing-config control that invokes the nested smoke exactly once, fails
 before provider spawn, and preserves the smoke-v2 failure inside an aggregate created mode `0600`; no
-live or billable provider turn ran. The unit suite also proves that the staged candidate is owner-only,
+live or billable compatibility canary ran, and review turns do not count as compatibility evidence. The
+unit suite also proves that the staged candidate is owner-only,
 non-writable after publication, and that digest drift refuses before process spawn. Pinned models reject
 automatic/default/floating selectors. Alias-shaped raw IDs remain pinnable because ACP resolves an
 advertised raw ID before alias fallback; a fallback resolution cannot green because requested and
@@ -231,15 +236,34 @@ support case green the release aggregate; ambient Linux fd variables could close
 and an in-place final write could corrupt the already-synced setup artifact. Its one new `SMELL` noted
 that the Linux descriptor unit did not exercise the staged-child/provider boundary.
 
-The current fold closes all five items. Exact component pins reject alternation, lists, and spaced ranges.
-A pinned support result blocks unless execution completed and its expectation matched, while pinned
-non-goals remain advisory. Linux carries descriptor numbers in explicit internal argv fields, validates
-the executable against `/proc/self/exe` and scratch against the opened `--out` parent before closing, and
-ignores the retired ambient variables; a Linux integration control starts a fake provider and proves it
-inherits neither capability. Final publication uses a synced owner-only sibling plus descriptor-relative
-atomic rename after both entry identities are revalidated; an open reader retains the blocking setup
-inode, and a target-rebinding negative control refuses without mutation or staging residue. A fresh exact
-head Sol/xhigh review is still required before the one clean-room Fable/xhigh adversarial and
+The exact `42523e1` fold closes the four non-exactness items. A pinned support result blocks unless
+execution completed and its expectation matched, while pinned non-goals remain advisory. Linux carries
+descriptor numbers in explicit internal argv fields, validates the executable against `/proc/self/exe`
+and scratch against the opened `--out` parent before closing, and ignores the retired ambient variables;
+a Linux integration control starts a fake provider and proves it inherits neither capability. Final
+publication uses a synced owner-only sibling plus descriptor-relative atomic rename after both entry
+identities are revalidated; an open reader retains the blocking setup inode, and a target-rebinding
+negative control refuses without mutating the rebound output or leaving final staging residue.
+
+### R3a fourth closure re-review ledger
+
+Fresh bridge-mediated Sol/xhigh closure re-review of exact `42523e1` returned `REVISE`. It marked pinned
+support enforcement, explicit Linux fd authority, atomic sibling publication, and provider-descendant
+coverage `FIXED`. Exact remote identities remained `PARTIAL` because `api_version = "v1 or v2"` and
+`"v1 v2"` still validated. It found two new `WRONG` states: a directory-sync failure after rename could
+leave a green final artifact while the command returned publication failure, and the roadmap's top next
+action still named already-completed gate/commit work. One `SMELL` recorded the remaining identity-check
+to rename race against an active hostile same-UID actor or root; that is outside the documented
+ordinary-writer boundary and remains accepted and nonblocking.
+
+The current fold closes the partial and both `WRONG` findings. Required remote `provider`, `api`, and
+`api_version` values must now be one lowercase stable identity; focused pre-change evidence accepted
+`"v1 or v2"` and the corrected regression passes. Final publication now keeps the separately synced
+blocking setup copy described above; the injected pre-change directory-sync failure left `green final`
+at the output, while the corrected test restores `blocking setup` and removes both staging names. A
+companion negative control removes the green output name when the rollback name itself vanishes. The
+roadmap top cursor now names only the pending exact-head Sol review followed by the single Fable review.
+A fresh exact-head Sol/xhigh review is still required before that clean-room Fable/xhigh adversarial and
 release/compatibility pass.
 
 ## R3b — pinned lane and promotion baseline

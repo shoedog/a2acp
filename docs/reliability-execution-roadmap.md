@@ -6,21 +6,23 @@
 - **Active slice:** R3a **IN REVIEW** on `agent/reliability-r3a-manifest-runner`
 - **Current R3a deterministic gate:** the pre-change CLI regression failed because
   `compatibility` did not exist. The latest local review fold passes macOS compatibility units
-  **44 / 0**, the full binary **368 / 0**, CLI **10 / 0**, and the serial workspace suite
-  **2,041 / 0 / 12 ignored** across **70** test/doc-test executables. Linux/Rust 1.94 passes
+  **44 / 0**, the full binary **370 / 0**, CLI **10 / 0**, and the serial workspace suite
+  **2,043 / 0 / 12 ignored** across **70** test/doc-test executables. Linux/Rust 1.94 passes
   compatibility units **45 / 0**, smoke CLI **12 / 0**, and compatibility CLI **11 / 0** with test
   debug info disabled so the candidate remains under its unchanged 256 MiB evidence cap; the earlier
-  unprivileged candidate-overwrite control remains **1 / 0**. Format/diff, workspace all-target check,
-  warnings-denied Clippy, workspace release build, hygiene **37/7**, and release-manifest validation are
-  green on this fold. The focused fold proves strict manifest/pin/budget/secret boundaries, one invocation with
+  unprivileged candidate-overwrite control remains **1 / 0**, and the new Linux directory-sync rollback
+  controls pass **2 / 0**. Format/diff, workspace all-target check, warnings-denied Clippy, workspace
+  release build, hygiene **37/7**, and release-manifest validation are green on this fold. The focused
+  fold proves strict manifest/pin/budget/secret boundaries, one invocation with
   zero retry, aggregate-on-failure, owner-only output, stop-before-next budget/cancellation behavior,
   stop-after-unaccounted-runner-failure, exact agent-specific package/version and capability matching,
   explicit unrun rows, cumulative evidence/final aggregate size bounds, independent baseline drift
   dimensions, exact auth/effective-capability binding, value-aware prerequisites, prospective budget
   headroom at admission and again after hashing, final-case elapsed exhaustion, descriptor-relative
   output/scratch effects, raw-first model identity with effective-model drift, complete semantic package
-  pins, provider/API/version remote pins, outer comparison outcomes, atomic final aggregate publication,
-  valid setup-failure evidence, pinned-support execution before release success, and
+  pins, exact provider/API/version remote identities, outer comparison outcomes, atomic final aggregate
+  publication with blocking rollback on post-rename directory-sync failure, valid setup-failure evidence,
+  pinned-support execution before release success, and
   owner-executable/non-writable same-digest candidate staging with stable-file-object execution after name
   retarget.
 - **Review state:** initial bridge-mediated Sol/xhigh review of exact `884bc5f` returned `REVISE` with
@@ -31,20 +33,24 @@
   closure re-review of exact `c8c9452` returned `REVISE` with five `WRONG` findings and two `SMELL`s;
   all blockers plus narrow link-count/comment and Linux descriptor-lifetime hardening are folded locally.
   Closure re-review 3 of exact `a8602bb` returned `REVISE` with one inherited `PARTIAL`, three new
-  `WRONG` findings, and one integration-coverage `SMELL`; all are folded locally. A fresh Sol/xhigh
+  `WRONG` findings, and one integration-coverage `SMELL`; all are folded locally. Closure re-review 4
+  of exact `42523e1` marked four inherited findings `FIXED`, kept exact remote identities `PARTIAL`,
+  added two `WRONG` findings for post-rename sync failure and the stale top cursor, and recorded one
+  same-UID/root race `SMELL` outside the ordinary-writer threat boundary. The partial and both `WRONG`
+  findings are folded locally; the scoped `SMELL` remains accepted and nonblocking. A fresh Sol/xhigh
   closure re-review of the next exact green head is pending, followed only after approval by one
   independent Fable/xhigh adversarial implementation and release/compatibility review
 - **Last merged full workspace gate:** R2d host serial **1,985 / 0 / 12 ignored** across 69 executables;
   format/diff, all-target check, warnings-denied Clippy, release build, repository hygiene **37/7**, and
   PR #29 Build/Lint/Coverage plus CLA were green
 - **Current execution boundary:** R3a's checked-in manifest and pinned baseline intentionally contain
-  zero cases. No live provider, Fable, Claude, OpenRouter, OpenCode, or other billable turn has run for
-  R3a. The deterministic CLI control invokes R2c exactly once against a missing config, which fails
-  before provider spawn and preserves its smoke-v2 failure in the aggregate.
-- **Next action:** refresh deterministic release gates, commit the fold, obtain one fresh Sol/xhigh
-  closure re-review of that exact head, then run one clean-room Fable/xhigh adversarial implementation
-  and release/compatibility review before publishing the PR. R3b seeds pinned cases only after R3a
-  merges; OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
+  zero cases. No live or billable compatibility canary has run for R3a; review turns are review evidence,
+  never compatibility evidence. The deterministic CLI control invokes R2c exactly once against a missing
+  config, which fails before provider spawn and preserves its smoke-v2 failure in the aggregate.
+- **Next action:** obtain one fresh Sol/xhigh closure re-review of the exact committed green head, then
+  run one clean-room Fable/xhigh adversarial implementation and release/compatibility review before
+  publishing the PR. R3b seeds pinned cases only after R3a merges; OpenRouter/OpenCode remain R3e/R3f
+  after the R3 core and before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**
@@ -94,7 +100,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a initial review plus closure reviews 1–3 Sol/xhigh `REVISE`; capacity-ended attempt had no verdict; latest local fold passes macOS units **44/0**, binary **368/0**, CLI **10/0**, workspace **2,041/0/12 ignored**, and Linux units **45/0** + smoke CLI **12/0** + compatibility CLI **11/0**; fresh Sol review then one clean-room Fable release/compatibility review pending | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner first; R3b pinned, R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a initial review plus closure reviews 1–4 Sol/xhigh `REVISE`; capacity-ended attempt had no verdict; latest local fold passes macOS units **44/0**, binary **370/0**, CLI **10/0**, workspace **2,043/0/12 ignored**, and Linux units **45/0** + smoke CLI **12/0** + compatibility CLI **11/0** + sync rollback **2/0**; fresh Sol review then one clean-room Fable release/compatibility review pending | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner first; R3b pinned, R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -245,20 +251,27 @@ Next action:
   private staged candidate file object before every spawn, creates output/scratch entries and accesses
   smoke artifacts relative to retained descriptors, rechecks cancellation/time headroom after hashing,
   authenticates and closes compatibility-only Linux descriptors before ACP descendants, writes valid
-  setup evidence before scratch/staging, atomically publishes the final aggregate without destroying that
-  blocker on failure, and compares per-case plus aggregate blocking outcomes in one owner-only artifact,
-  and never retries, falls back, promotes, or mutates production inputs. Initial Sol/xhigh review of exact
+  setup evidence before scratch/staging, and creates separately synced final and blocking-rollback
+  siblings before atomic publication. A post-rename directory-sync error restores the blocking setup at
+  the live output name; failed hostile identity rebinding may retain one owner-only blocking recovery
+  copy, never a partial JSON write. The runner compares per-case plus aggregate blocking outcomes in one
+  owner-only artifact and never retries, falls back, promotes, or mutates production inputs. Initial
+  Sol/xhigh review of exact
   `884bc5f` and first closure re-review of exact `b37147c` returned `REVISE`; all inherited and new
   findings are folded locally. The later exact-`bc9f64c` Sol/xhigh attempt ended on provider capacity
   before a verdict; its concrete partial leads are folded and the attempt is not a gate. Fresh closure
   re-review of exact `c8c9452` returned `REVISE`; its findings are folded. Closure re-review 3 of exact
-  `a8602bb` also returned `REVISE`; the current fold closes its inherited exact-pin gap, three new
-  `WRONG` findings, and Linux integration `SMELL`. The current fold passes macOS units **44/0**, binary
-  **368/0**, CLI **10/0**, serial workspace **2,041/0/12 ignored** across **70** executables, and
-  Linux/Rust 1.94 units **45/0** + smoke CLI **12/0** + compatibility CLI **11/0**. The prior
-  unprivileged overwrite control remains **1/0**; format/diff, all-target check, warnings-denied Clippy,
-  workspace release build, hygiene **37/7**, and release-manifest validation are green on the current
-  fold. Fresh Sol closure review, then one clean-room Fable adversarial/release review, remain pending.
+  `a8602bb` also returned `REVISE`; its inherited exact-pin gap, three new `WRONG` findings, and Linux
+  integration `SMELL` were folded at `42523e1`. Closure re-review 4 of that exact head returned
+  `REVISE`: exact remote identities remained `PARTIAL`, four inherited findings were `FIXED`, and it
+  added post-rename sync plus stale-cursor `WRONG` findings and a scoped same-UID/root race `SMELL`. The
+  current fold closes the partial and both `WRONG` findings; the threat-boundary `SMELL` remains accepted
+  and nonblocking. The current fold passes macOS units **44/0**, binary **370/0**, CLI **10/0**, serial
+  workspace **2,043/0/12 ignored** across **70** executables, and Linux/Rust 1.94 units **45/0** + smoke
+  CLI **12/0** + compatibility CLI **11/0** + sync rollback **2/0**. The prior unprivileged overwrite
+  control remains **1/0**; format/diff, all-target check, warnings-denied Clippy, workspace release build,
+  hygiene **37/7**, and release-manifest validation are green on the current fold. Fresh Sol closure
+  review, then one clean-room Fable adversarial/release review, remain pending.
 - OpenRouter and OpenCode are recorded as R3e/R3f after the pinned/floating/scheduling core and before
   R4. Credentials remain environment-only; neither provider is eligible for automatic fallback. The
   running operator service is unchanged until a merged candidate is rebuilt and swapped during a

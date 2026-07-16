@@ -324,6 +324,18 @@ pub(crate) struct PinnedDirectory {
     retain_descriptor_after_exec: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RegularChildRef<'a> {
+    name: &'a OsStr,
+    file: &'a File,
+}
+
+impl<'a> RegularChildRef<'a> {
+    pub(crate) fn new(name: &'a OsStr, file: &'a File) -> Self {
+        Self { name, file }
+    }
+}
+
 fn open_read_only_nonblocking(path: &Path) -> Result<File, std::io::Error> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -707,24 +719,45 @@ impl PinnedDirectory {
     /// still identify the caller's retained file objects beneath this exact directory descriptor.
     pub(crate) fn replace_regular_child(
         &self,
-        target_name: &OsStr,
-        expected_target: &File,
-        replacement_name: &OsStr,
-        expected_replacement: &File,
+        target: RegularChildRef<'_>,
+        replacement: RegularChildRef<'_>,
+        rollback: RegularChildRef<'_>,
         label: &str,
     ) -> Result<(), BoxError> {
+        self.replace_regular_child_with_sync(target, replacement, rollback, label, || {
+            self.file.sync_all()
+        })
+    }
+
+    fn replace_regular_child_with_sync<F>(
+        &self,
+        target: RegularChildRef<'_>,
+        replacement: RegularChildRef<'_>,
+        rollback: RegularChildRef<'_>,
+        label: &str,
+        sync_directory: F,
+    ) -> Result<(), BoxError>
+    where
+        F: FnOnce() -> std::io::Result<()>,
+    {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd as _;
 
-            let opened_target = self.open_regular_file(target_name, label)?;
-            let opened_replacement = self.open_regular_file(replacement_name, label)?;
-            let target_metadata = expected_target
+            let opened_target = self.open_regular_file(target.name, label)?;
+            let opened_replacement = self.open_regular_file(replacement.name, label)?;
+            let opened_rollback = self.open_regular_file(rollback.name, label)?;
+            let target_metadata = target
+                .file
                 .metadata()
                 .map_err(|error| format!("{label}: cannot inspect retained target: {error}"))?;
-            let replacement_metadata = expected_replacement.metadata().map_err(|error| {
+            let replacement_metadata = replacement.file.metadata().map_err(|error| {
                 format!("{label}: cannot inspect retained replacement: {error}")
             })?;
+            let rollback_metadata = rollback
+                .file
+                .metadata()
+                .map_err(|error| format!("{label}: cannot inspect retained rollback: {error}"))?;
             if !same_file(&opened_target.metadata()?, &target_metadata) {
                 return Err(format!("{label}: target identity changed before replacement").into());
             }
@@ -733,13 +766,17 @@ impl PinnedDirectory {
                     format!("{label}: replacement identity changed before publication").into(),
                 );
             }
+            if !same_file(&opened_rollback.metadata()?, &rollback_metadata) {
+                return Err(
+                    format!("{label}: rollback identity changed before publication").into(),
+                );
+            }
 
-            let target_name = child_name_cstring(target_name, label)?;
-            let replacement_name = child_name_cstring(replacement_name, label)?;
-            // SAFETY: both names are validated single components, the retained directory descriptor
-            // is live, and the identity checks above bind both names to the caller's open files.
-            // POSIX rename is atomic: failure leaves the target untouched; success publishes the
-            // fully-written replacement in one namespace operation.
+            let target_name = child_name_cstring(target.name, label)?;
+            let replacement_name = child_name_cstring(replacement.name, label)?;
+            let rollback_name = child_name_cstring(rollback.name, label)?;
+            // SAFETY: target and replacement are validated single components bound to the retained
+            // open files above. POSIX rename atomically publishes the synced replacement.
             if unsafe {
                 libc::renameat(
                     self.file.as_raw_fd(),
@@ -749,25 +786,58 @@ impl PinnedDirectory {
                 )
             } == -1
             {
+                // SAFETY: best-effort cleanup of the still-separate rollback copy.
+                unsafe {
+                    libc::unlinkat(self.file.as_raw_fd(), rollback_name.as_ptr(), 0);
+                }
                 return Err(format!(
                     "{label}: cannot atomically publish descriptor-relative replacement: {}",
                     std::io::Error::last_os_error()
                 )
                 .into());
             }
-            self.file
-                .sync_all()
-                .map_err(|error| format!("{label}: cannot sync replacement directory: {error}"))?;
+            if let Err(sync_error) = sync_directory() {
+                // SAFETY: rollback is a separately synced copy of the blocking setup aggregate.
+                if unsafe {
+                    libc::renameat(
+                        self.file.as_raw_fd(),
+                        rollback_name.as_ptr(),
+                        self.file.as_raw_fd(),
+                        target_name.as_ptr(),
+                    )
+                } == -1
+                {
+                    let rollback_error = std::io::Error::last_os_error();
+                    // SAFETY: if restoration itself fails, best-effort removal prevents a green
+                    // artifact from remaining authoritative at the requested output name.
+                    unsafe {
+                        libc::unlinkat(self.file.as_raw_fd(), target_name.as_ptr(), 0);
+                    }
+                    return Err(format!(
+                        "{label}: cannot sync replacement directory: {sync_error}; cannot restore blocking target: {rollback_error}"
+                    )
+                    .into());
+                }
+                let _ = self.file.sync_all();
+                return Err(format!(
+                    "{label}: cannot sync replacement directory: {sync_error}; blocking target restored"
+                )
+                .into());
+            }
+            // The output name now durably identifies the final file. Rollback-copy cleanup is
+            // best-effort because a cleanup failure must not turn a valid green artifact into a
+            // command failure; any residue remains owner-only setup evidence outside repositories.
+            // SAFETY: rollback remains the validated setup-copy component created by the caller.
+            unsafe {
+                libc::unlinkat(self.file.as_raw_fd(), rollback_name.as_ptr(), 0);
+            }
+            let _ = self.file.sync_all();
             Ok(())
         }
         #[cfg(not(unix))]
         {
-            let _ = (
-                target_name,
-                expected_target,
-                replacement_name,
-                expected_replacement,
-            );
+            let _ = (target, replacement, rollback);
+            let _ = sync_directory;
             Err(format!("{label}: atomic descriptor-relative replacement is unsupported").into())
         }
     }
@@ -1131,6 +1201,114 @@ mod tests {
             .unwrap();
         pin.remove_child(OsStr::new("evidence.json"), false, "test evidence cleanup")
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_child_replacement_restores_target_when_directory_sync_fails() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_directory(dir.path(), "test publication directory").unwrap();
+        let pin = PinnedDirectory::open(
+            dir.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test publication directory",
+        )
+        .unwrap();
+        let mut setup = pin
+            .create_new_file(OsStr::new("aggregate.json"), 0o600, "test setup aggregate")
+            .unwrap();
+        setup.write_all(b"blocking setup").unwrap();
+        setup.sync_all().unwrap();
+        let mut replacement = pin
+            .create_new_file(OsStr::new("final.json"), 0o600, "test final aggregate")
+            .unwrap();
+        replacement.write_all(b"green final").unwrap();
+        replacement.sync_all().unwrap();
+        let mut rollback = pin
+            .create_new_file(
+                OsStr::new("setup-rollback.json"),
+                0o600,
+                "test rollback aggregate",
+            )
+            .unwrap();
+        rollback.write_all(b"blocking setup").unwrap();
+        rollback.sync_all().unwrap();
+
+        let error = pin
+            .replace_regular_child_with_sync(
+                RegularChildRef::new(OsStr::new("aggregate.json"), &setup),
+                RegularChildRef::new(OsStr::new("final.json"), &replacement),
+                RegularChildRef::new(OsStr::new("setup-rollback.json"), &rollback),
+                "test final publication",
+                || Err(std::io::Error::other("injected directory sync failure")),
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("injected directory sync failure"));
+        assert_eq!(
+            fs::read(dir.path().join("aggregate.json")).unwrap(),
+            b"blocking setup"
+        );
+        assert!(!dir.path().join("final.json").exists());
+        assert!(!dir.path().join("setup-rollback.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_child_replacement_removes_green_target_when_rollback_fails() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_directory(dir.path(), "test publication directory").unwrap();
+        let pin = PinnedDirectory::open(
+            dir.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test publication directory",
+        )
+        .unwrap();
+        let mut setup = pin
+            .create_new_file(OsStr::new("aggregate.json"), 0o600, "test setup aggregate")
+            .unwrap();
+        setup.write_all(b"blocking setup").unwrap();
+        setup.sync_all().unwrap();
+        let mut replacement = pin
+            .create_new_file(OsStr::new("final.json"), 0o600, "test final aggregate")
+            .unwrap();
+        replacement.write_all(b"green final").unwrap();
+        replacement.sync_all().unwrap();
+        let mut rollback = pin
+            .create_new_file(
+                OsStr::new("setup-rollback.json"),
+                0o600,
+                "test rollback aggregate",
+            )
+            .unwrap();
+        rollback.write_all(b"blocking setup").unwrap();
+        rollback.sync_all().unwrap();
+
+        let error = pin
+            .replace_regular_child_with_sync(
+                RegularChildRef::new(OsStr::new("aggregate.json"), &setup),
+                RegularChildRef::new(OsStr::new("final.json"), &replacement),
+                RegularChildRef::new(OsStr::new("setup-rollback.json"), &rollback),
+                "test final publication",
+                || {
+                    fs::remove_file(dir.path().join("setup-rollback.json")).unwrap();
+                    Err(std::io::Error::other("injected directory sync failure"))
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cannot restore blocking target"));
+        assert!(!dir.path().join("aggregate.json").exists());
+        assert!(!dir.path().join("final.json").exists());
+        assert!(!dir.path().join("setup-rollback.json").exists());
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
