@@ -1,7 +1,8 @@
 # R2d — Local non-billable fallback-plan implementation plan
 
-- **Status:** IN REVIEW — the initial review and closure re-reviews 1–7 returned `REVISE`; the v23 fold
-  is applied in the working tree; deterministic gates are green; final closure remains
+- **Status:** APPROVED / PENDING MERGE — the initial review and closure re-reviews 1–7 returned
+  `REVISE`; closure re-review 8 returned `APPROVE` on the exact v23 candidate; deterministic gates are
+  green
 - **Prerequisites:** R2b and R2c merged (`be54bc51`, PR #28)
 - **Source design:**
   [`../specs/2026-07-11-bridge-reliability-r2-design.md`](../specs/2026-07-11-bridge-reliability-r2-design.md),
@@ -16,6 +17,7 @@
 - **Closure re-review 5 candidate:** `49716473cf405b272dd8ecff554630b90faed0e0` — `REVISE`
 - **Closure re-review 6 candidate:** `379c3acc199fb58e6d6e1a8a8318470737ce6e8c` — `REVISE`
 - **Closure re-review 7 candidate:** `7fec898b5157603ae2eccd121e8367ff1914949b` — `REVISE`
+- **Closure re-review 8 candidate:** `1586f24b17f5d7a7561642900fdccc9bba5fcb53` — `APPROVE`
 
 R2d answers one local operator question: given complete failed R2c smoke evidence from a read-only
 container attempt, may an explicitly named host agent be proposed for a new trusted-own-repo read-only
@@ -339,11 +341,10 @@ The exact v23 working fold also passes:
 
 ## Completion boundary
 
-Run one Sol/xhigh closure re-review of the fully gated exact v23 candidate that adjudicates the sole
-closure-re-review-7 ledger finding and confirms the earlier inherited findings remain fixed. Do
-not use Fable or Claude for this closure under the current constrained usage windows. Do not run a
-live/billable smoke: R2d behavior is proven by deterministic pre-spawn fixtures, and the R2c live result
-remains historical evidence only.
+Satisfied: closure re-review 8 of exact `1586f24b17f5d7a7561642900fdccc9bba5fcb53` adjudicated the
+sole review-7 ledger finding `FIXED`, found no new `WRONG` or `SMELL`, and returned `APPROVE`. No Fable,
+Claude, or live/billable smoke ran for this closure; R2d behavior remains proven by deterministic
+pre-spawn fixtures, and the R2c live result remains historical evidence only.
 
-After a green closure review, mark R2d `APPROVED / PENDING MERGE` and open one non-draft PR. R2e remains
+R2d is `APPROVED / PENDING MERGE`; push the branch and open one non-draft PR. R2e remains
 `DEFERRED / BLOCKED BY POLICY`; after merge the active reliability slice becomes R3.

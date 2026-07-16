@@ -1,6 +1,6 @@
 # Bridge reliability R2 — provenance and phase-specific diagnostics (design, v23)
 
-- **Status:** R2a, R2b0–R2b3, and R2c merged; R2d is **IN REVIEW** on
+- **Status:** R2a, R2b0–R2b3, and R2c merged; R2d is **APPROVED / PENDING MERGE** on
   `agent/reliability-r2d-fallback-plan`; v23 is the design of record for R2b–R2e
 - **R2d review state:** the initial bridge-mediated `gpt-5.6-sol`/`xhigh` security review of exact
   candidate `b6424d725e56d1f3fde0b7c29b6057155d69dacd` returned `REVISE`; its nine findings were folded at
@@ -43,7 +43,9 @@
   warnings-denied Clippy, release, and hygiene **37/7** are clean. Closure re-review 7 of exact
   `7fec898b5157603ae2eccd121e8367ff1914949b` adjudicated both v22 findings `FIXED`, found no code
   defect or `SMELL`, and returned `REVISE` only because the current numerical ledgers omitted the
-  Linux regression's explicit **1/0** total. V23 aligns that evidence. Final closure remains pending.
+  Linux regression's explicit **1/0** total. V23 aligns that evidence. Closure re-review 8 of exact
+  `1586f24b17f5d7a7561642900fdccc9bba5fcb53` adjudicated that finding `FIXED`, found no new `WRONG`
+  or `SMELL`, and returned `APPROVE`.
 - **R2b3 review state:** implementation plus four committed review folds; fresh Sol/xhigh closure
   re-review 3 returned `REVISE` with one shared-process ownership blocker, one raw-JSON correctness item,
   and one release-race coverage gap. The fourth fold passes affected packages **602 / 0 / 1 ignored**,
