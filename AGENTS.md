@@ -157,7 +157,8 @@ credential copy does not refresh an expired host login. When `CLAUDE_CONFIG_DIR`
 Claude entry, it must be a non-empty absolute path so doctor and every possible child cwd select the same
 `.credentials.json`; unset uses `$HOME/.claude/.credentials.json`. The one smoke deadline begins before
 provenance and orphan recovery, so those phases cannot consume the runway and then receive a fresh timeout;
-deadline-first resolution refuses without polling the adapter when time is already exhausted. Truthy
+one deadline-first primitive refuses without polling resolution, configure, prompt, or drain when time is
+already exhausted. Truthy
 `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`,
 `CLAUDE_CODE_USE_ANTHROPIC_AWS`, or `CLAUDE_CODE_USE_MANTLE` selects external provider auth and therefore
 skips first-party file OAuth on host entries; false-like or unknown values do not, and ambient host flags

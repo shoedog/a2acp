@@ -4,7 +4,11 @@
   `agent/reliability-r3b-pinned-lane`. Nine pinned rows are implemented; Sol/xhigh approved the pre-live
   deterministic tree. Authorized attempt 1 passed both Codex cases and failed both Fable cases on expired
   OAuth after prompt start. No baseline promotion ran; the post-attempt hardening is in deterministic and
-  Sol-review closure after a deadline/config-directory fold.
+  Sol-review closure after a deadline/config-directory fold. The current post-`4574cbb`
+  closure fold passes binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
+  groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates pass OAuth
+  doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
+  **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**.
 - **Prerequisite:** R2c/R2d merged (`a6fec94c`, PR #29); R3a merged (`3927df3f`, PR #31)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -298,15 +302,17 @@ is unchanged.
 
 - **Branch:** `agent/reliability-r3b-pinned-lane`
 - **Implementation state (2026-07-16):** nine pinned rows validate at manifest SHA-256
-  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-`427d2ed`
-  fold passes binary **394/0**, full workspace **2,070/0/12 ignored** across **70** groups, Linux/Rust 1.94
-  binary **395/0**, Linux smoke CLI **15/0**, focused doctor **5/0**, provider/resolve tests **1/0** each,
-  and all format/check/Clippy/release/hygiene/manifest/dependency-policy gates.
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-`4574cbb`
+  closure fold passes binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
+  groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates pass OAuth
+  doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
+  **1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. All
+  format/check/Clippy/release/hygiene/manifest/dependency-policy gates are green.
   An intermediate Linux run was **393/1** only because the container could not resolve this worktree's
   host-absolute `.git` pointer; the exact Git pointer/common-directory mounts restored repo identity and
   the unchanged test passed in the **394/0** rerun.
-  The folded release binary is 22,918,128 bytes at SHA-256
-  `6cc16d82ec05541dd151e6bf223c28c90104ee4aa9a6c5941e1971845e60a0d1` and has not run a provider turn.
+  The folded release binary is 22,965,312 bytes at SHA-256
+  `b60315b23fb4a54876254ff94cff6d4dfca31d66f9c8c6cbab105115d030c202` and has not run a provider turn.
   The pinned baseline remains empty pending a future all-green, separately authorized aggregate. Fresh
   Sol/xhigh closure review of
   exact `c38978a` returned `APPROVE` with no `WRONG`; its sole nonblocking test-coverage `SMELL` is
@@ -314,7 +320,14 @@ is unchanged.
   parser/comment smells. That fold had full host/Linux/merge-policy gates green. Sol subsequently approved
   exact `427d2ed` with all inherited items fixed and no findings.
   A post-review audit then demonstrated immediate-expiry inner-future polling and exact pinned third-party
-  provider false-blocks; both are mutation-proven, full-gate green locally, and pending fresh re-review.
+  provider false-blocks. Review of exact `4574cbb` adjudicated both fixed, then returned `REVISE` because
+  configure/prompt/drain retained inner-first deadline polling, the active gate inventories differed, and
+  two operator surfaces allowed a rerun after only one green Claude doctor. Its provider-selector oracle
+  `SMELL` is closed by an independent exact five-name assertion. The current fold uses one deadline-first
+  primitive through resolution/configure/prompt/drain, aligns the literal gate and two-doctor /
+  one-new-four-case-aggregate contracts, and is full-gate green pending fresh exact-head re-review. The
+  partially-progressed-resolver cleanup mutation `SMELL` remains accepted and nonblocking because the
+  inspected ownership/drop, invalidation, and run-scoped backstop are not a direct acquisition fixture.
 
 The initial fresh one-shot Sol/xhigh review of exact `57f3ee8` returned `REVISE` with two `WRONG`
 findings and three `SMELL`s. The branch now keeps invalid negative/non-finite cost history sticky across
@@ -346,16 +359,20 @@ the stale host state. R3b therefore adds bounded token-blind OAuth metadata pars
 runway row for host and exact mounted reader credentials, and a smoke guard that refuses a non-OK row
 before adapter resolution. Host automatic auth honors a non-empty absolute `CLAUDE_CONFIG_DIR` and fails
 closed on empty/relative ambiguity. The absolute smoke deadline begins before provenance and orphan
-recovery, preventing accepted runway from aging behind a fresh timeout; deadline-first resolution refuses
-without polling an adapter once expired. Truthy Bedrock/Vertex/Foundry/Anthropic-AWS/Mantle selectors use
+recovery, preventing accepted runway from aging behind a fresh timeout; one deadline-first primitive refuses
+without polling resolution, configure, prompt, or drain once expired. Truthy
+Bedrock/Vertex/Foundry/Anthropic-AWS/Mantle selectors use
 external host authentication and bypass first-party file OAuth, while false-like/unknown values and mounted
 reader credentials do not. The original spawned regression
 failed pre-change **1 passed / 1 failed** because the expired case reached the fake adapter. The newer
-config-directory and delayed-recovery regressions also fail pre-change; current focused doctor **5/0**,
-provider-auth **1/0**, delayed-recovery CLI **1/0**, and expired/fresh CLI controls **2/0** are green. Finish
-fresh Sol re-review, then
-require a fresh host login, post-login sync, two green Claude doctors, and new explicit billable
-authorization. Attempt 1 must never be replayed or promoted.
+config-directory and delayed-recovery regressions also fail pre-change. The current post-`4574cbb`
+closure fold passes binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
+groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates pass OAuth
+doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
+**1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. Finish fresh Sol
+re-review. After a fresh host login and post-login sync, require both Claude host and reader doctors green
+before requesting new explicit authorization for one new four-case aggregate. Attempt 1 must never be
+replayed or promoted.
 
 Seed rows for every currently claimed path or control in `docs/compatibility.md`:
 

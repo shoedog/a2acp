@@ -3585,6 +3585,17 @@ mod tests {
     #[test]
     fn external_claude_provider_bypasses_host_file_oauth_only_when_truthy() {
         const NOW: u64 = 8_000_000;
+        assert_eq!(
+            CLAUDE_EXTERNAL_PROVIDER_ENVS,
+            [
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+                "CLAUDE_CODE_USE_FOUNDRY",
+                "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+                "CLAUDE_CODE_USE_MANTLE",
+            ],
+            "the exact pinned external-provider selector set must not shrink or substitute names"
+        );
         let host = acp_entry("claude", "claude-agent-acp");
         let host_snapshot = snapshot("claude", vec![host], vec!["claude-agent-acp"]);
 

@@ -1023,16 +1023,29 @@ async fn resolve_once(
     observer: Arc<dyn bridge_core::ports::DiagnosticObserver>,
     deadline: tokio::time::Instant,
 ) -> ResolveOnce {
-    // `tokio::time::timeout_at` polls its inner future before its delay. Use a biased deadline-first
-    // select so an already-expired (or simultaneously-ready) deadline cannot give resolution one
-    // last poll in which to spawn an adapter.
+    match deadline_first(deadline, registry.resolve_observed(agent, observer)).await {
+        None => ResolveOnce::TimedOut,
+        Some(Err(error)) => ResolveOnce::Failed(error),
+        Some(Ok(resolved)) => ResolveOnce::Resolved(resolved),
+    }
+}
+
+async fn deadline_first<F>(deadline: tokio::time::Instant, future: F) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    // A newly constructed `Sleep` can require a timer-driver turn even when synchronous work has just
+    // crossed its deadline. Refuse from the monotonic clock before constructing or polling either branch.
+    if tokio::time::Instant::now() >= deadline {
+        return None;
+    }
+    // `tokio::time::timeout_at` polls its inner future before its delay. Use one biased deadline-first
+    // primitive for every billable stage so an already-expired (or simultaneously-ready) deadline
+    // cannot give resolver/configure/prompt/drain one last poll.
     tokio::select! {
         biased;
-        _ = tokio::time::sleep_until(deadline) => ResolveOnce::TimedOut,
-        result = registry.resolve_observed(agent, observer) => match result {
-            Err(error) => ResolveOnce::Failed(error),
-            Ok(resolved) => ResolveOnce::Resolved(resolved),
-        },
+        _ = tokio::time::sleep_until(deadline) => None,
+        output = future => Some(output),
     }
 }
 
@@ -1065,8 +1078,8 @@ async fn execute_one(
         return cwd_drift();
     }
 
-    match tokio::time::timeout_at(deadline, backend.configure_session(session, spec)).await {
-        Err(_) => {
+    match deadline_first(deadline, backend.configure_session(session, spec)).await {
+        None => {
             turn.terminal_state = "timeout";
             return DrainResult {
                 turn,
@@ -1074,7 +1087,7 @@ async fn execute_one(
                 static_failure: None,
             };
         }
-        Ok(Err(error)) => {
+        Some(Err(error)) => {
             turn.terminal_state = "config_failed";
             return DrainResult {
                 turn,
@@ -1082,7 +1095,7 @@ async fn execute_one(
                 static_failure: None,
             };
         }
-        Ok(Ok(())) => turn.prompt_calls = 0,
+        Some(Ok(())) => turn.prompt_calls = 0,
     }
 
     // ACP configure only stashes SessionSpec; lazy session mint happens at prompt. Revalidate after
@@ -1095,7 +1108,7 @@ async fn execute_one(
     turn.prompt_calls = 1;
     let rich_dyn: Arc<dyn RichEventSink> = rich.clone();
     let diagnostic_dyn: Arc<dyn bridge_core::ports::DiagnosticObserver> = observer;
-    let stream = match tokio::time::timeout_at(
+    let stream = match deadline_first(
         deadline,
         backend.prompt_with_observers(
             session,
@@ -1107,7 +1120,7 @@ async fn execute_one(
     )
     .await
     {
-        Err(_) => {
+        None => {
             turn.terminal_state = "timeout";
             return DrainResult {
                 turn,
@@ -1115,7 +1128,7 @@ async fn execute_one(
                 static_failure: None,
             };
         }
-        Ok(Err(error)) => {
+        Some(Err(error)) => {
             turn.terminal_state = "prompt_failed";
             return DrainResult {
                 turn,
@@ -1123,11 +1136,11 @@ async fn execute_one(
                 static_failure: None,
             };
         }
-        Ok(Ok(stream)) => stream,
+        Some(Ok(stream)) => stream,
     };
 
-    match tokio::time::timeout_at(deadline, drain_stream(stream, Arc::clone(&rich))).await {
-        Err(_) => {
+    match deadline_first(deadline, drain_stream(stream, Arc::clone(&rich))).await {
+        None => {
             turn.terminal_state = "timeout";
             turn.tool_event_count = rich.tool_event_count();
             DrainResult {
@@ -1136,7 +1149,7 @@ async fn execute_one(
                 static_failure: None,
             }
         }
-        Ok(result) => result,
+        Some(result) => result,
     }
 }
 
@@ -2095,6 +2108,8 @@ mod tests {
         hanging_release: bool,
         failing_release: bool,
         release_failure_accepted: bool,
+        configure_block: Option<Duration>,
+        prompt_block: Option<Duration>,
         prompts: Mutex<Vec<String>>,
         cwd_swap: Mutex<Option<(PathBuf, PathBuf, PathBuf)>>,
     }
@@ -2111,6 +2126,8 @@ mod tests {
                 hanging_release: false,
                 failing_release: false,
                 release_failure_accepted: true,
+                configure_block: None,
+                prompt_block: None,
                 prompts: Mutex::new(Vec::new()),
                 cwd_swap: Mutex::new(None),
             }
@@ -2124,6 +2141,16 @@ mod tests {
         fn with_unaccepted_failing_release(mut self) -> Self {
             self.failing_release = true;
             self.release_failure_accepted = false;
+            self
+        }
+
+        fn with_blocking_configure(mut self, duration: Duration) -> Self {
+            self.configure_block = Some(duration);
+            self
+        }
+
+        fn with_blocking_prompt(mut self, duration: Duration) -> Self {
+            self.prompt_block = Some(duration);
             self
         }
 
@@ -2150,6 +2177,9 @@ mod tests {
             observers: BackendObservers,
         ) -> Result<BackendStream, BridgeError> {
             self.prompt_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(duration) = self.prompt_block {
+                std::thread::sleep(duration);
+            }
             self.prompts
                 .lock()
                 .unwrap()
@@ -2341,6 +2371,9 @@ mod tests {
             _spec: &SessionSpec,
         ) -> Result<(), BridgeError> {
             self.configure_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(duration) = self.configure_block {
+                std::thread::sleep(duration);
+            }
             if let Some((planned, moved, replacement)) = self.cwd_swap.lock().unwrap().take() {
                 fs::rename(&planned, &moved).unwrap();
                 fs::rename(&replacement, &planned).unwrap();
@@ -2804,6 +2837,77 @@ mod tests {
         assert_eq!(backend.configure_calls.load(Ordering::SeqCst), 1);
         assert_eq!(backend.prompt_calls.load(Ordering::SeqCst), 1);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn absolute_deadline_wins_before_each_execute_stage_is_polled() {
+        let session = SessionId::parse("deadline-stage-test").unwrap();
+        let spec = SessionSpec::from_config(EffectiveConfig::default());
+
+        let expired = Arc::new(FakeBackend::new(Behavior::Exact));
+        let expired_result = execute_one(
+            expired.clone(),
+            &session,
+            &spec,
+            observer(),
+            Arc::new(SmokeRichSink::default()),
+            tokio::time::Instant::now() - Duration::from_millis(1),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(expired_result.error, Some(BridgeError::AgentTimedOut)),
+            "error={:?} terminal={} configure_calls={} prompt_calls={}",
+            expired_result.error,
+            expired_result.turn.terminal_state,
+            expired.configure_calls.load(Ordering::SeqCst),
+            expired.prompt_calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(expired_result.turn.terminal_state, "timeout");
+        assert_eq!(expired.configure_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(expired.prompt_calls.load(Ordering::SeqCst), 0);
+
+        let configure_crosses = Arc::new(
+            FakeBackend::new(Behavior::Exact).with_blocking_configure(Duration::from_millis(250)),
+        );
+        let configure_result = execute_one(
+            configure_crosses.clone(),
+            &session,
+            &spec,
+            observer(),
+            Arc::new(SmokeRichSink::default()),
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            configure_result.error,
+            Some(BridgeError::AgentTimedOut)
+        ));
+        assert_eq!(configure_result.turn.terminal_state, "timeout");
+        assert_eq!(configure_crosses.configure_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(configure_crosses.prompt_calls.load(Ordering::SeqCst), 0);
+
+        let prompt_crosses = Arc::new(
+            FakeBackend::new(Behavior::Exact).with_blocking_prompt(Duration::from_millis(250)),
+        );
+        let prompt_result = execute_one(
+            prompt_crosses.clone(),
+            &session,
+            &spec,
+            observer(),
+            Arc::new(SmokeRichSink::default()),
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            prompt_result.error,
+            Some(BridgeError::AgentTimedOut)
+        ));
+        assert_eq!(prompt_result.turn.terminal_state, "timeout");
+        assert_eq!(prompt_crosses.configure_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(prompt_crosses.prompt_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

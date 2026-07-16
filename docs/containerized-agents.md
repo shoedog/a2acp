@@ -96,9 +96,9 @@ codex-acp's advertised browser-login action. Do not also set `auth_method` on th
 > ```bash
 > deploy/containers/sync-creds.sh && a2a-bridge serve --config examples/a2a-bridge.containerized.toml
 > ```
-> The sync copies bytes; it does **not** authenticate or refresh an already expired host token. Require a
-> green `doctor` after sync. If the Claude OAuth row fails, refresh the host login first and let the sync
-> copy that fresh access token before requesting another billable action.
+> The sync copies bytes; it does **not** authenticate or refresh an already expired host token. After a fresh
+> host login and post-login sync, require both Claude host and reader doctors green before requesting new
+> explicit authorization for one new four-case aggregate.
 > (claude/codex are host-file copies; **kiro** is the `a2a-kiro-data` volume — re-run its device-flow
 > login if it has fully expired, not a host sync.)
 >

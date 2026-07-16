@@ -60,11 +60,13 @@ uses `$HOME/.claude`, while empty/relative values fail closed because guarded fa
 cwd. Truthy `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`,
 `CLAUDE_CODE_USE_ANTHROPIC_AWS`, and `CLAUDE_CODE_USE_MANTLE` select external host authentication and skip
 first-party file OAuth; false-like/unknown values do not, and host flags never bypass a reader mount. The
-absolute smoke deadline starts before provenance and orphan recovery, and deadline-first resolution does
-not poll the adapter after expiry. A non-OK OAuth row blocks `smoke` before adapter spawn.
+absolute smoke deadline starts before provenance and orphan recovery, and one deadline-first primitive does
+not poll resolution, configure, prompt, or drain after expiry. A non-OK OAuth row blocks `smoke` before
+adapter spawn.
 `deploy/containers/sync-creds.sh claude` only copies the host file—it cannot
-refresh an expired host login—so require a green doctor after sync and never treat a successful launchd run
-as auth evidence.
+refresh an expired host login. After a fresh host login and post-login sync, require both Claude host and
+reader doctors green before requesting new explicit authorization for one new four-case aggregate. Never
+treat a successful launchd run as auth evidence.
 
 For a minimal live compatibility probe, stop here until the implementation's deterministic timeout,
 artifact, redaction, and no-retry tests are green and the operator explicitly authorizes a billable turn.
