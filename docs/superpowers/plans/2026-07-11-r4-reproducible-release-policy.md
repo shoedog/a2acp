@@ -1,7 +1,7 @@
 # R4 — Reproducible dependency, image, and release policy implementation plan
 
 - **Status:** NOT STARTED
-- **Prerequisite:** R3 pinned/floating artifacts available
+- **Prerequisite:** R3a–R3f merged with pinned/floating artifacts available for every claimed provider
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Release baseline:** [`../specs/2026-07-03-m2-release-engineering.md`](../specs/2026-07-03-m2-release-engineering.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)

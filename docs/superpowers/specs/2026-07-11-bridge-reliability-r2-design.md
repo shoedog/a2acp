@@ -1,7 +1,7 @@
 # Bridge reliability R2 — provenance and phase-specific diagnostics (design, v23)
 
-- **Status:** R2a, R2b0–R2b3, and R2c merged; R2d is **APPROVED / PENDING MERGE** on
-  `agent/reliability-r2d-fallback-plan`; v23 is the design of record for R2b–R2e
+- **Status:** R2a, R2b0–R2b3, R2c, and R2d merged (`a6fec94c`, PR #29); R2e remains deferred;
+  v23 is the design of record for R2b–R2e
 - **R2d review state:** the initial bridge-mediated `gpt-5.6-sol`/`xhigh` security review of exact
   candidate `b6424d725e56d1f3fde0b7c29b6057155d69dacd` returned `REVISE`; its nine findings were folded at
   `0b05c409cbbf9441348b2719a537f8f4978216a3`. Closure re-review 1 of that exact fold also returned

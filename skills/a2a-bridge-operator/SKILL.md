@@ -82,6 +82,40 @@ for the JSON artifact. An explicit output path must not already exist. On Unix, 
 `0600` before agent resolution or spawn; an existing file/link or failure to apply that restriction is a
 pre-attempt refusal.
 
+### Run the versioned compatibility manifest
+
+Validate locally before selecting any case:
+
+```bash
+a2a-bridge compatibility validate --manifest compatibility/manifest.toml
+```
+
+`compatibility run` is a billable orchestration boundary even when a negative control is expected to
+fail before the prompt. It refuses before manifest access unless `--acknowledge-billable` is present and
+requires `--lane`, repeated `--case`, or explicit `--all`; never use `--all` as a convenience default.
+Pass the exact `environment_owner` recorded by the selected cases and write the aggregate outside any
+repository. The runner enforces this against the aggregate parent:
+
+```bash
+a2a-bridge compatibility run \
+  --manifest compatibility/manifest.toml \
+  --case <exact-case-id> \
+  --environment-owner <exact-owner-id> \
+  --acknowledge-billable \
+  --out /private/tmp/<new-aggregate>.json
+```
+
+The runner takes one bounded snapshot of this candidate binary, stages the exact bytes privately, records
+the SHA-256 and byte length in the aggregate, and invokes that snapshot's existing `smoke` command once
+per eligible minimal bridge case. It refuses staged digest drift before spawn. Direct CLI/ACP,
+representative, wrong-owner/platform, and missing-prerequisite cases are retained as explicit unrun rows.
+Ctrl-C allows an already-running smoke to finish its bounded cleanup and starts no next case. Never treat
+a floating pass as promotion, rewrite a baseline from a run, or route a failed case to another provider.
+Use `compatibility compare --current <aggregate>` against the checked-in pinned baseline; any changed
+provenance, capability, auth, phase, terminal, or diagnostic dimension requires review. The candidate
+path, digest, and byte length are recorded in each aggregate for release review; they are not normalized
+away or treated as a baseline-owned provider pin.
+
 ### Plan, then explicitly run, a trusted host verification
 
 After a failed read-only container smoke, use the local planner only when its artifact is complete schema

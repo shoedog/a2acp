@@ -35,6 +35,7 @@
 //                                                       — emit a local-only host fallback plan
 
 mod catalog_probe;
+mod compatibility;
 mod config;
 mod containers;
 mod doctor;
@@ -103,6 +104,8 @@ SUBCOMMANDS:
                       --manifest <file> [--concurrency K] [--detach] [--url <url>]
   batch               Batch store.  status <id> | list | cancel <id>
   models              List each agent's advertised models/effort/modes (probed live).  [--config <f>] [--agent <id>] [--json]
+  compatibility       Validate or run the checked-in compatibility matrix and compare pinned evidence.
+                      validate | run | compare
   smoke               Run one explicitly acknowledged, bounded, fixed PONG probe.
                       --agent <id> --config <f> --acknowledge-billable [--out <f>]
   fallback-plan       Validate a local failed artifact and emit a host fallback recommendation.
@@ -210,6 +213,7 @@ enum TopSubcommand {
     RunBatch,
     Batch,
     Models,
+    Compatibility,
     Implement,
     Merge,
     Containers,
@@ -235,6 +239,7 @@ fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
         Some("run-batch") => TopSubcommand::RunBatch,
         Some("batch") => TopSubcommand::Batch,
         Some("models") => TopSubcommand::Models,
+        Some("compatibility") => TopSubcommand::Compatibility,
         Some("implement") => TopSubcommand::Implement,
         Some("merge") => TopSubcommand::Merge,
         Some("containers") => TopSubcommand::Containers,
@@ -280,6 +285,7 @@ fn dispatcher_help(sub: &TopSubcommand, raw_args: &[String]) -> Option<&'static 
         TopSubcommand::Merge => Some(MERGE_USAGE),
         TopSubcommand::Init => Some(INIT_USAGE),
         TopSubcommand::Doctor => Some(DOCTOR_USAGE),
+        TopSubcommand::Compatibility => Some(compatibility::USAGE),
         TopSubcommand::Smoke => Some(SMOKE_USAGE),
         TopSubcommand::FallbackPlan => Some(fallback_plan::USAGE),
         _ => None,
@@ -6184,6 +6190,9 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::RunBatch => return run_batch_cmd(&raw_args[2..]).await,
         TopSubcommand::Batch => return batch_cmd(&raw_args[2..]).await,
         TopSubcommand::Models => return models_cmd(&raw_args[2..]).await,
+        TopSubcommand::Compatibility => {
+            return compatibility::compatibility_cmd(&raw_args[2..]).await
+        }
         TopSubcommand::Implement => return implement_cmd(&raw_args[2..]).await,
         TopSubcommand::Merge => return merge_cmd(&raw_args[2..]).await,
         TopSubcommand::Containers => return containers_cmd(&raw_args[2..]),
@@ -6208,7 +6217,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         TopSubcommand::Unknown(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | smoke | fallback-plan | implement | merge | containers | submit | task | task-spec | prompt | session | init | validate | doctor | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | compatibility | smoke | fallback-plan | implement | merge | containers | submit | task | task-spec | prompt | session | init | validate | doctor | help)"
             )
             .into());
         }
@@ -7690,6 +7699,21 @@ mod cli_tests {
             let sub = parse_top_subcommand(&args);
             assert_eq!(sub, TopSubcommand::Smoke);
             assert_eq!(dispatcher_help(&sub, &args), Some(SMOKE_USAGE));
+        }
+    }
+
+    #[test]
+    fn dispatcher_help_covers_compatibility_before_the_billing_barrier() {
+        assert!(compatibility::USAGE.starts_with("usage: a2a-bridge compatibility"));
+        for help in ["--help", "-h"] {
+            let args = vec![
+                "a2a-bridge".to_string(),
+                "compatibility".to_string(),
+                help.to_string(),
+            ];
+            let sub = parse_top_subcommand(&args);
+            assert_eq!(sub, TopSubcommand::Compatibility);
+            assert_eq!(dispatcher_help(&sub, &args), Some(compatibility::USAGE));
         }
     }
 

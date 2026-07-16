@@ -54,6 +54,12 @@ retention remains R2.
 
 ## Evidence required for an update
 
+R3a provides `a2a-bridge compatibility validate|run|compare`, but its checked-in manifest and pinned
+baseline intentionally contain zero cases. R3b owns the first reviewed pinned rows. Do not add a case,
+baseline entry, or PASS row merely to exercise the runner: deterministic missing-config controls prove
+the orchestration without spending a provider turn, while support evidence still requires the exact
+candidate binary and environment named below.
+
 Use the release-mode candidate's `smoke` command for the minimal live turn. Do not add or refresh a PASS
 row from unit tests, an unacknowledged refusal, a source-tree helper, or a stale installed binary. Retain the
 versioned smoke artifact under disposable/operator evidence storage (not this repository), and record every

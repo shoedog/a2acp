@@ -156,7 +156,37 @@ for compatibility evidence, and never automatically rerun a failed or timed-out 
 have been accepted. Do not update `docs/compatibility.md` until the release-mode artifact records the exact
 lane that actually ran.
 
-## 4d. Plan an explicit host verification after classified container degradation
+## 4d. Validate or run the compatibility matrix
+
+The checked-in compatibility manifest is non-billable to validate:
+
+```bash
+a2a-bridge compatibility validate --manifest compatibility/manifest.toml
+```
+
+Running cases is potentially billable and therefore requires an explicit lane/case selection, the
+environment owner, an acknowledgement, and a new aggregate output path:
+
+```bash
+a2a-bridge compatibility run \
+  --manifest compatibility/manifest.toml \
+  --lane pinned \
+  --environment-owner <manifest-owner> \
+  --acknowledge-billable \
+  --out /private/tmp/compatibility-aggregate.json
+```
+
+The runner refuses an aggregate path inside any detected repository; keep compatibility evidence in
+disposable operator-owned storage.
+
+Each eligible case invokes one bounded, privately staged snapshot of the exact candidate binary's
+fixed-PONG `smoke` once. The aggregate records its SHA-256 and byte length, and the runner refuses digest
+drift before spawn. There is no retry, provider fallback, implicit all-case selection, baseline update,
+or production-config mutation. The checked-in R3a manifest intentionally has no cases; R3b adds reviewed pins. Read
+[`docs/compatibility.md`](docs/compatibility.md) and the current
+[`reliability roadmap`](docs/reliability-execution-roadmap.md) before spending a live turn.
+
+## 4e. Plan an explicit host verification after classified container degradation
 
 Current slice status, review evidence, sequencing, and handoff are owned solely by
 [`docs/reliability-execution-roadmap.md`](docs/reliability-execution-roadmap.md). This file defines the
