@@ -201,7 +201,8 @@ also binds exactly one minimal host-mounted settings file by SHA-256; missing, u
 duplicate settings destinations cannot green a support case.
 There is no retry, provider fallback, implicit all-case selection, baseline update, or production-config
 mutation. A case does not start unless its declared token and observable-cost caps fit the remaining
-total headroom. Negative/non-finite cost observations fail explicitly. Comparison retains per-case
+total headroom. Negative/non-finite cost observations fail explicitly and remain sticky across later
+usage snapshots. Comparison retains per-case
 execution/error/not-run/budget state and aggregate success/cancellation/budget state while excluding
 variable usage quantities. The checked-in manifest has reviewed R3b pins; its baseline is promoted only
 from separately authorized exact-candidate evidence. Read

@@ -297,12 +297,21 @@ is unchanged.
 - **Branch:** `agent/reliability-r3b-pinned-lane`
 - **Implementation state (2026-07-16):** nine pinned rows validate at manifest SHA-256
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. Four support configs pass
-  non-billable doctor preflight (**53 ok / 0 warn / 0 fail** total), binary units pass **381/0**, and
-  the full serial workspace passes **2,054/0/12 ignored** across **70** groups. Linux/Rust 1.94 passes
-  binary units **382/0**, smoke CLI **12/0**, and compatibility CLI **11/0**. Format/diff, workspace
+  non-billable doctor preflight (**53 ok / 0 warn / 0 fail** total), binary units pass **386/0**, and
+  the full serial workspace passes **2,059/0/12 ignored** across **70** groups. Linux/Rust 1.94 passes
+  binary units **387/0**, smoke CLI **12/0**, and compatibility CLI **11/0**. Format/diff, workspace
   all-target check, warnings-denied Clippy, release build, hygiene **37/7**, and release-manifest
   validation are green. The pinned baseline has the new manifest identity but no promoted cases pending
-  separately authorized exact-candidate live artifacts and review. Exact-head review remains pending.
+  separately authorized exact-candidate live artifacts and review. Exact-head closure review remains
+  pending.
+
+The initial fresh one-shot Sol/xhigh review of exact `57f3ee8` returned `REVISE` with two `WRONG`
+findings and three `SMELL`s. The branch now keeps invalid negative/non-finite cost history sticky across
+later snapshots, aligns both reader-count surfaces, refuses ambiguous duplicate settings provenance,
+adds Claude image-label/drift mutation coverage, and test-locks the baseline empty until authorized
+promotion. All findings are folded; exact-head closure review remains pending. The separate shared
+operator pre-prompt crash is recorded in the central roadmap and did not trigger a replay or process
+restart.
 
 Seed rows for every currently claimed path or control in `docs/compatibility.md`:
 
@@ -320,7 +329,8 @@ artifact contract.
 
 Before adding credential-bearing rows, extend the deterministic runner controls with symmetric
 final-sibling same-name replacement coverage, additional credential-shaped environment names, and
-explicit negative/non-finite reported-cost handling. Preserve exact credential-value and sensitive-key
+explicit negative/non-finite reported-cost handling that remains sticky across later usage snapshots.
+Preserve exact credential-value and sensitive-key
 backstops; heuristic expansion must not be presented as general secret detection. Exact identity grammar
 may fail closed on unsupported authoring forms, but every rejected supported-provider identity needs an
 explicit reviewed spelling rather than an automatic relaxation.

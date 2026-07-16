@@ -7,14 +7,14 @@
 - **Current R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`; four executable support
   configs pass non-billable doctor preflight with **53 ok / 0 warn / 0 fail** total. The binary unit
-  target passes **381 / 0 / 0**, and the full serial workspace passes **2,054 / 0 / 12 ignored**
-  across **70** test/doc-test groups. Linux/Rust 1.94 passes binary units **382 / 0 / 0**, smoke CLI
+  target passes **386 / 0 / 0**, and the full serial workspace passes **2,059 / 0 / 12 ignored**
+  across **70** test/doc-test groups. Linux/Rust 1.94 passes binary units **387 / 0 / 0**, smoke CLI
   **12 / 0**, and compatibility CLI **11 / 0**. Format/diff, workspace all-target check,
   warnings-denied Clippy, workspace release build, hygiene **37/7**, and release-manifest validation
   are green. The uniquely tagged, non-operator reader candidate is
   `sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1`; it binds exact Codex and
-  Claude package labels while leaving Kiro explicitly `STALE`. Exact-head review remains pending. No
-  R3b live/billable canary or baseline promotion has run.
+  Claude package labels while leaving Kiro explicitly `STALE`. Closure review of the post-finding fold
+  remains pending. No R3b live/billable canary or baseline promotion has run.
 - **R3a merge evidence:** the pre-change CLI regression failed because
   `compatibility` did not exist. The latest local review fold passes macOS compatibility units
   **44 / 0**, the full binary **370 / 0**, CLI **10 / 0**, and the serial workspace suite
@@ -57,6 +57,14 @@
   manifest SHA-256 and both inspected the complete branch read-only through the running bridge. This
   docs-only approval fold reran format/diff, the full serial workspace **2,043 / 0 / 12 ignored** across
   **70** groups, and hygiene **37/7**; the reviewed implementation tree is unchanged
+- **R3b review state:** a direct Sol/xhigh request through the long-lived shared operator failed before
+  observable prompt start as recorded in `INC-SHARED-WARM-CRASH-2026-07-16`; no replay or process action
+  followed. A separately selected fresh one-shot bridge then completed the exact-`57f3ee8` review and
+  returned `REVISE` with two `WRONG` findings (non-sticky invalid-cost history and reader-count prose)
+  plus three `SMELL`s (ambiguous Fable settings destinations, missing Claude label mutation coverage,
+  and an unguarded empty baseline). All five are folded on the current branch with pre-change red evidence
+  for both behavior defects; closure review of the resulting exact head remains pending. The review did
+  not rerun supplied build/test gates and is not compatibility evidence.
 - **Last merged full workspace gate:** R2d host serial **1,985 / 0 / 12 ignored** across 69 executables;
   format/diff, all-target check, warnings-denied Clippy, release build, repository hygiene **37/7**, and
   PR #29 Build/Lint/Coverage plus CLA were green
@@ -121,7 +129,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE** with nine pinned rows, four deterministic-green support preflights, five explicit historical/unrun rows, full workspace **2,054/0/12 ignored** across 70 groups, and no live artifact or baseline promotion yet | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane and deliberate promotion active; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE** with nine pinned rows, four deterministic-green support preflights, five explicit historical/unrun rows, full workspace **2,059/0/12 ignored** across 70 groups, and no live artifact or baseline promotion yet | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane and deliberate promotion active; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -141,6 +149,25 @@ The deferred [R2f plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md
 meaningful-progress evidence, false-positive controls for silent long tests, a stagnation snapshot, exact
 process-tree identity, and a bounded takeover artifact. Do not use file mtime or process existence alone,
 do not broad-kill by process name, and do not auto-start a duplicate billable attempt.
+
+### Deferred incident: shared operator fails before observable prompt boundary
+
+`INC-SHARED-WARM-CRASH-2026-07-16` records an R3b dogfood review against exact `57f3ee8`. A direct
+request to the long-lived operator selected host Codex, raw `gpt-5.6-sol`, `xhigh`, `read-only`, and a
+trusted detached worktree under `~/code`, then returned generic `AgentCrashed` in about 0.1 seconds. The
+service log retained only the generic internal failure; no durable task or turn-log row was created, no
+prompt-start/usage evidence was present, and the roughly ten-hour-old ACP/app-server process tree stayed
+alive. No process, warm session, image, config, or operator service was stopped, reset, rebuilt, or
+restarted.
+
+A separately selected fresh one-shot bridge used the same installed codex-acp 1.1.2, Codex 0.144.1,
+model, effort, mode, and exact review worktree. Its non-billable validate/model/doctor preflight was green
+(doctor **10 ok / 0 warn / 0 fail**) and the full Sol review completed normally. This rules out a general
+package/model/auth/cwd incompatibility but does not distinguish stale shared ACP connection state from a
+serve-only session/configuration defect. Source inspection confirms `session/new` transport failure and
+model/effort `session/set_config_option` rejection can both map to `AgentCrashed` before a turn-log row.
+Carry the missing structured failure projection and stale-shared-state recovery question into R2f/R3d;
+do not replay automatically or use this review as compatibility evidence.
 
 Allowed status values are `NOT STARTED`, `IN PROGRESS`, `IN REVIEW`, `APPROVED / PENDING MERGE`,
 `MERGED`, `BLOCKED`, and `DEFERRED`. Update this table in the same PR that changes a slice status. Never
@@ -268,7 +295,7 @@ Next action:
   `agent/reliability-r3b-pinned-lane`, based directly on that merge. The manifest now contains nine
   exact pinned rows: four release-blocking minimal bridge-smoke support cases and five explicit
   historical/non-goal controls. Every config is checked in and SHA-bound before provider spawn. The two
-  reader cases use the separately tagged immutable image
+  supported reader cases and the stale Kiro reader control use the separately tagged immutable image
   `sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1`; bounded image inspection
   supplies exact adapter/CLI package labels, and Claude Fable additionally binds the mounted minimal
   settings file at SHA-256 `6ee4ad31...eef81f19`. The existing operator image/tag/process were not
@@ -276,13 +303,14 @@ Next action:
   fails if the bundled Claude version is not 2.1.198. Its still-floating Kiro download resolved 2.12.3,
   so both Kiro rows remain `STALE` for R4 rather than becoming support evidence.
 - R3b closes the R3a approval debt with symmetric final-sibling replacement coverage, expanded
-  credential-shaped prerequisite rejection, and explicit blocking negative/non-finite cost evidence.
+  credential-shaped prerequisite rejection, and explicit blocking negative/non-finite cost evidence
+  that remains sticky across later usage snapshots.
   It also rejects a changed pinned config before provider spawn and records exact Fable-settings
   provenance only for one unambiguous host-file settings destination; duplicates remain `WARN`. The
-  nine-case manifest validates at `5d18cefe...c235d828`; binary units pass **381/0**,
-  the full serial workspace passes **2,054/0/12 ignored** across **70** groups, and the four support
+  nine-case manifest validates at `5d18cefe...c235d828`; binary units pass **386/0**,
+  the full serial workspace passes **2,059/0/12 ignored** across **70** groups, and the four support
   configs pass non-billable doctor preflight with **53 ok / 0 warn / 0 fail** total. Linux/Rust 1.94
-  passes binary units **382/0**, smoke CLI **12/0**, and compatibility CLI **11/0**. Format/diff,
+  passes binary units **387/0**, smoke CLI **12/0**, and compatibility CLI **11/0**. Format/diff,
   workspace all-target check, warnings-denied Clippy, release build, hygiene **37/7**, and release
   manifest validation are green; exact-head review remains pending. The Docker label path was exercised
   against the candidate image. A real Podman label inspection remains unverified because no local Podman

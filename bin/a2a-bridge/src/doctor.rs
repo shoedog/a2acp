@@ -3467,6 +3467,90 @@ mod tests {
     }
 
     #[test]
+    fn labeled_claude_image_reports_exact_adapter_and_sdk_packages() {
+        const IMAGE: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut claude = acp_entry("claude", "claude-agent-acp");
+        claude.sandbox = Some(locked_sandbox(IMAGE, "a2a-net", vec![]));
+        let cfg = base_loaded(snapshot("claude", vec![claude], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image(IMAGE)
+            .with_image_id("docker", IMAGE, IMAGE)
+            .with_image_labels(
+                "docker",
+                IMAGE,
+                &[
+                    (
+                        "io.a2a-bridge.provenance.claude.adapter",
+                        "@agentclientprotocol/claude-agent-acp=0.55.0",
+                    ),
+                    (
+                        "io.a2a-bridge.provenance.claude.agent-cli",
+                        "@anthropic-ai/claude-agent-sdk=0.3.198",
+                    ),
+                ],
+            );
+
+        let results = run_checks(&cfg, &probes);
+        let adapter = find(&results, "provenance:claude:adapter");
+        assert_eq!(adapter.status, CheckStatus::Ok);
+        assert!(adapter
+            .detail
+            .contains("package=@agentclientprotocol/claude-agent-acp"));
+        assert!(adapter.detail.contains("version=0.55.0"));
+        let cli = find(&results, "provenance:claude:agent-cli");
+        assert_eq!(cli.status, CheckStatus::Ok);
+        assert!(cli
+            .detail
+            .contains("package=@anthropic-ai/claude-agent-sdk"));
+        assert!(cli.detail.contains("version=0.3.198"));
+    }
+
+    #[test]
+    fn claude_image_labels_never_guess_missing_or_wrong_sdk_identity() {
+        const IMAGE: &str =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        for labels in [
+            vec![(
+                "io.a2a-bridge.provenance.claude.adapter",
+                "@agentclientprotocol/claude-agent-acp=0.55.0",
+            )],
+            vec![
+                (
+                    "io.a2a-bridge.provenance.claude.adapter",
+                    "@agentclientprotocol/claude-agent-acp=0.55.0",
+                ),
+                (
+                    "io.a2a-bridge.provenance.claude.agent-cli",
+                    "@openai/codex=0.144.1",
+                ),
+            ],
+        ] {
+            let mut claude = acp_entry("claude", "claude-agent-acp");
+            claude.sandbox = Some(locked_sandbox(IMAGE, "a2a-net", vec![]));
+            let cfg = base_loaded(snapshot("claude", vec![claude], vec!["docker"]));
+            let probes = FakeProbes::new()
+                .allow_runtime("docker")
+                .allow_network("a2a-net")
+                .allow_image(IMAGE)
+                .with_image_id("docker", IMAGE, IMAGE)
+                .with_image_labels("docker", IMAGE, &labels);
+
+            let results = run_checks(&cfg, &probes);
+            assert_eq!(
+                find(&results, "provenance:claude:adapter").status,
+                CheckStatus::Warn
+            );
+            assert_eq!(
+                find(&results, "provenance:claude:agent-cli").status,
+                CheckStatus::Warn
+            );
+        }
+    }
+
+    #[test]
     fn fable_reader_provenance_binds_the_mounted_settings_file_digest() {
         const DIGEST: &str =
             "sha256:6ee4ad319cdfc34a558425ddda86f5b1da4c10912a08dfdc32c0c009eef81f19";

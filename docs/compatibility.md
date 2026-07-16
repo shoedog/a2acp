@@ -47,7 +47,7 @@ contract, not new compatibility evidence: no R3b provider turn or baseline promo
 | `kiro-host-stale` | explicit unrun direct-CLI control | non-goal / `STALE` |
 | `kiro-reader-stale` | explicit unrun container direct-CLI control | non-goal / `STALE` |
 
-The two reader configs name immutable candidate image
+The two supported reader configs name immutable candidate image
 `sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1` directly. Bounded image
 inspection reports exact Codex adapter/CLI `1.1.2`/`0.144.1` and Claude adapter/SDK
 `0.55.0`/`0.3.198`; the Fable row requires exactly one host-file declaration for its in-container

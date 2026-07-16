@@ -1145,13 +1145,15 @@ async fn drain_stream(
     let mut captured = Vec::new();
     let mut capture_overflow = false;
     let mut usage: Option<UsageSnapshot> = None;
+    let mut invalid_cost_observed = false;
 
     while let Some(update) = stream.next().await {
         match update {
             Err(error) => {
                 turn.terminal_state = "backend_error";
                 turn.tool_event_count = rich.tool_event_count();
-                turn.usage = usage.map(smoke_usage);
+                turn.usage =
+                    usage.map(|value| smoke_usage_with_history(value, invalid_cost_observed));
                 return DrainResult {
                     turn,
                     error: Some(error),
@@ -1171,6 +1173,10 @@ async fn drain_stream(
                 turn.permission_update_count = turn.permission_update_count.saturating_add(1);
             }
             Ok(Update::Usage(next)) => {
+                invalid_cost_observed |= next
+                    .cost
+                    .as_ref()
+                    .is_some_and(|cost| !cost.amount.is_finite() || cost.amount < 0.0);
                 let mut next = next;
                 if let Some(previous) = &usage {
                     next.merge_missing_from(previous);
@@ -1194,7 +1200,7 @@ async fn drain_stream(
 
     let _ = rich.flush().await;
     turn.tool_event_count = rich.tool_event_count();
-    turn.usage = usage.map(smoke_usage);
+    turn.usage = usage.map(|value| smoke_usage_with_history(value, invalid_cost_observed));
     if turn.stop_reason.is_none() {
         turn.terminal_state = "eof_without_terminal";
     }
@@ -1226,7 +1232,22 @@ fn safe_stop_reason(reason: &str) -> &'static str {
     }
 }
 
-fn smoke_usage(value: UsageSnapshot) -> SmokeUsage {
+fn smoke_usage_with_history(value: UsageSnapshot, invalid_cost_observed: bool) -> SmokeUsage {
+    let invalid_cost_observed = invalid_cost_observed
+        || value
+            .cost
+            .as_ref()
+            .is_some_and(|cost| !cost.amount.is_finite() || cost.amount < 0.0);
+    if invalid_cost_observed {
+        return SmokeUsage {
+            used: value.used,
+            size: value.size,
+            cost: None,
+            cost_rejected: Some("negative_or_non_finite"),
+            terminal: value.terminal,
+            at_ms: value.at_ms,
+        };
+    }
     let (cost, cost_rejected) = match value.cost {
         Some(cost) if cost.amount.is_finite() && cost.amount >= 0.0 => (
             Some(SmokeCost {
@@ -2034,6 +2055,8 @@ mod tests {
         Refusal,
         Empty,
         Silent,
+        InvalidThenValidUsage,
+        ValidThenInvalidUsage,
         ConfigFailure,
         PromptFailure,
     }
@@ -2172,6 +2195,46 @@ mod tests {
                 ])),
                 Behavior::Empty => Box::pin(futures::stream::empty()),
                 Behavior::Silent => Box::pin(futures::stream::pending()),
+                Behavior::InvalidThenValidUsage => Box::pin(futures::stream::iter(vec![
+                    Ok(Update::Usage(UsageSnapshot {
+                        cost: Some(bridge_core::orch::UsageCost {
+                            amount: -0.01,
+                            currency: "USD".into(),
+                        }),
+                        ..UsageSnapshot::default()
+                    })),
+                    Ok(Update::Usage(UsageSnapshot {
+                        cost: Some(bridge_core::orch::UsageCost {
+                            amount: 0.01,
+                            currency: "USD".into(),
+                        }),
+                        ..UsageSnapshot::default()
+                    })),
+                    Ok(Update::Text("PONG".into())),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".into(),
+                    }),
+                ])),
+                Behavior::ValidThenInvalidUsage => Box::pin(futures::stream::iter(vec![
+                    Ok(Update::Usage(UsageSnapshot {
+                        cost: Some(bridge_core::orch::UsageCost {
+                            amount: 0.01,
+                            currency: "USD".into(),
+                        }),
+                        ..UsageSnapshot::default()
+                    })),
+                    Ok(Update::Usage(UsageSnapshot {
+                        cost: Some(bridge_core::orch::UsageCost {
+                            amount: -0.01,
+                            currency: "USD".into(),
+                        }),
+                        ..UsageSnapshot::default()
+                    })),
+                    Ok(Update::Text("PONG".into())),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".into(),
+                    }),
+                ])),
                 Behavior::ConfigFailure => unreachable!("configure rejects first"),
                 Behavior::PromptFailure => unreachable!("prompt rejects before stream"),
             };
@@ -2490,6 +2553,30 @@ mod tests {
         assert_eq!(backend.configure_calls.load(Ordering::SeqCst), 1);
         assert_eq!(backend.prompt_calls.load(Ordering::SeqCst), 1);
         assert_eq!(backend.prompts.lock().unwrap().as_slice(), [FIXED_PROMPT]);
+    }
+
+    #[tokio::test]
+    async fn earlier_invalid_usage_cost_is_not_erased_by_a_later_valid_snapshot() {
+        let (_, result) = execute(Behavior::InvalidThenValidUsage, Duration::from_secs(1)).await;
+        assert!(result.error.is_none());
+        let usage = serde_json::to_value(result.turn.usage.unwrap()).unwrap();
+        assert!(usage.get("cost").is_none());
+        assert_eq!(
+            usage.get("cost_rejected").and_then(Value::as_str),
+            Some("negative_or_non_finite")
+        );
+    }
+
+    #[tokio::test]
+    async fn later_invalid_usage_cost_remains_rejected() {
+        let (_, result) = execute(Behavior::ValidThenInvalidUsage, Duration::from_secs(1)).await;
+        assert!(result.error.is_none());
+        let usage = serde_json::to_value(result.turn.usage.unwrap()).unwrap();
+        assert!(usage.get("cost").is_none());
+        assert_eq!(
+            usage.get("cost_rejected").and_then(Value::as_str),
+            Some("negative_or_non_finite")
+        );
     }
 
     #[tokio::test]
@@ -3112,35 +3199,44 @@ mod tests {
 
     #[test]
     fn usage_cost_preserves_safe_non_usd_currency_and_collapses_unsafe_labels() {
-        let cad = smoke_usage(UsageSnapshot {
-            cost: Some(bridge_core::orch::UsageCost {
-                amount: 1.25,
-                currency: "CAD".into(),
-            }),
-            ..UsageSnapshot::default()
-        });
+        let cad = smoke_usage_with_history(
+            UsageSnapshot {
+                cost: Some(bridge_core::orch::UsageCost {
+                    amount: 1.25,
+                    currency: "CAD".into(),
+                }),
+                ..UsageSnapshot::default()
+            },
+            false,
+        );
         assert_eq!(cad.cost.unwrap().currency, "CAD");
 
-        let unsafe_label = smoke_usage(UsageSnapshot {
-            cost: Some(bridge_core::orch::UsageCost {
-                amount: 1.25,
-                currency: "USD\nsecret".into(),
-            }),
-            ..UsageSnapshot::default()
-        });
+        let unsafe_label = smoke_usage_with_history(
+            UsageSnapshot {
+                cost: Some(bridge_core::orch::UsageCost {
+                    amount: 1.25,
+                    currency: "USD\nsecret".into(),
+                }),
+                ..UsageSnapshot::default()
+            },
+            false,
+        );
         assert_eq!(unsafe_label.cost.unwrap().currency, "unknown");
     }
 
     #[test]
     fn usage_cost_rejects_negative_and_nonfinite_amounts_visibly() {
         for amount in [-0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let usage = smoke_usage(UsageSnapshot {
-                cost: Some(bridge_core::orch::UsageCost {
-                    amount,
-                    currency: "USD".into(),
-                }),
-                ..UsageSnapshot::default()
-            });
+            let usage = smoke_usage_with_history(
+                UsageSnapshot {
+                    cost: Some(bridge_core::orch::UsageCost {
+                        amount,
+                        currency: "USD".into(),
+                    }),
+                    ..UsageSnapshot::default()
+                },
+                false,
+            );
             let value = serde_json::to_value(usage).unwrap();
             assert!(value.get("cost").is_none());
             assert_eq!(

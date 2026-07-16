@@ -4110,15 +4110,19 @@ agent_cli = "@openai/codex=0.144.1"
     async fn smoke_rejected_nonfinite_cost_is_explicit_and_blocking() {
         let dir = tempfile::tempdir().unwrap();
         let first = case("first", EvidenceStatus::Pass);
+        let second = case("second", EvidenceStatus::Pass);
         let mut first_smoke = smoke(&first, true, Some(1));
         first_smoke["turn"]["usage"]["cost_rejected"] =
             Value::String("negative_or_non_finite".into());
-        let invoker = FakeInvoker::new(vec![invocation(first_smoke)]);
-        let loaded = loaded(dir.path(), vec![first]);
+        let invoker = FakeInvoker::new(vec![
+            invocation(first_smoke),
+            invocation(smoke(&second, true, Some(1))),
+        ]);
+        let loaded = loaded(dir.path(), vec![first, second]);
         let cancelled = AtomicBool::new(false);
         let candidate = candidate_identity();
         let selection = selection();
-        let selected_indices = [0];
+        let selected_indices = [0, 1];
 
         let aggregate = build_aggregate(
             AggregateInputs {
@@ -4139,6 +4143,11 @@ agent_cli = "@openai/codex=0.144.1"
             ["case_cost_observation_invalid"]
         );
         assert_eq!(aggregate.budget.cost_observation_missing_cases, 0);
+        assert_eq!(&*invoker.calls.lock().unwrap(), &["first"]);
+        assert_eq!(
+            aggregate.results[1].not_run_reason.as_deref(),
+            Some("total_budget_exhausted")
+        );
         assert!(!aggregate.success);
     }
 
@@ -4707,6 +4716,45 @@ agent_cli = "@openai/codex=0.144.1"
     }
 
     #[test]
+    fn claude_pins_require_exact_ok_adapter_and_sdk_rows() {
+        let mut case = case("claude", EvidenceStatus::Pass);
+        case.pins = Some(PinSet {
+            config_sha256: "a".repeat(64),
+            model: case.model.clone(),
+            adapter: Some("@agentclientprotocol/claude-agent-acp=0.55.0".into()),
+            agent_cli: Some("@anthropic-ai/claude-agent-sdk=0.3.198".into()),
+            image_digest: None,
+            components: BTreeMap::new(),
+        });
+        let mut artifact = smoke(&case, true, Some(1));
+        artifact["request"]["config_sha256"] = Value::String("a".repeat(64));
+        artifact["target"]["provenance"] = json!([
+            {
+                "check": "provenance:claude:adapter",
+                "status": "ok",
+                "detail": "source=immutable-image-label package=@agentclientprotocol/claude-agent-acp version=0.55.0",
+                "remedy": ""
+            },
+            {
+                "check": "provenance:claude:agent-cli",
+                "status": "ok",
+                "detail": "source=immutable-image-label package=@anthropic-ai/claude-agent-sdk version=0.3.198",
+                "remedy": ""
+            }
+        ]);
+        assert!(drift_for(&case, &artifact).is_empty());
+
+        artifact["target"]["provenance"][1]["detail"] =
+            Value::String("package=@openai/codex version=0.144.1".into());
+        assert!(drift_for(&case, &artifact).contains(&"provenance.agent_cli".into()));
+
+        artifact["target"]["provenance"][1]["detail"] =
+            Value::String("package=@anthropic-ai/claude-agent-sdk version=0.3.198".into());
+        artifact["target"]["provenance"][1]["status"] = Value::String("warn".into());
+        assert!(drift_for(&case, &artifact).contains(&"provenance.agent_cli".into()));
+    }
+
+    #[test]
     fn successful_api_case_binds_exact_credential_and_effective_capabilities() {
         let mut case = case("api", EvidenceStatus::Pass);
         case.execution_mode = ExecutionMode::RemoteApi;
@@ -5155,6 +5203,10 @@ agent_cli = "@openai/codex=0.144.1"
             loaded.manifest.schema_version
         );
         assert_eq!(baseline.manifest_sha256, loaded.sha256);
+        assert!(
+            baseline.cases.is_empty(),
+            "the checked-in baseline must remain unpromoted until authorized live evidence replaces this assertion"
+        );
     }
 
     #[tokio::test]
