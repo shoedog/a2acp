@@ -297,9 +297,9 @@ is unchanged.
 - **Branch:** `agent/reliability-r3b-pinned-lane`
 - **Implementation state (2026-07-16):** nine pinned rows validate at manifest SHA-256
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. Four support configs pass
-  non-billable doctor preflight (**53 ok / 0 warn / 0 fail** total), binary units pass **380/0**, and
-  the full serial workspace passes **2,053/0/12 ignored** across **70** groups. Linux/Rust 1.94 passes
-  binary units **381/0**, smoke CLI **12/0**, and compatibility CLI **11/0**. Format/diff, workspace
+  non-billable doctor preflight (**53 ok / 0 warn / 0 fail** total), binary units pass **381/0**, and
+  the full serial workspace passes **2,054/0/12 ignored** across **70** groups. Linux/Rust 1.94 passes
+  binary units **382/0**, smoke CLI **12/0**, and compatibility CLI **11/0**. Format/diff, workspace
   all-target check, warnings-denied Clippy, release build, hygiene **37/7**, and release-manifest
   validation are green. The pinned baseline has the new manifest identity but no promoted cases pending
   separately authorized exact-candidate live artifacts and review. Exact-head review remains pending.
@@ -328,8 +328,9 @@ explicit reviewed spelling rather than an automatic relaxation.
 The implemented controls also hash each pinned config before provider spawn and bind the Fable reader's
 mounted minimal settings file by exact SHA-256 in smoke provenance. Container support rows can green only
 when bounded inspection of the configured immutable image returns exact adapter and agent-CLI labels.
-Missing/malformed labels or an unreadable settings file remain visible `WARN` provenance and therefore
-cannot satisfy the pinned drift check. The reader candidate is built under a unique non-operator tag at
+Missing/malformed labels, an unreadable settings file, or multiple declarations for the same settings
+destination remain visible `WARN` provenance and therefore cannot satisfy the pinned drift check. The
+reader candidate is built under a unique non-operator tag at
 immutable id `sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1`;
 the running operator image/tag/process were not changed.
 

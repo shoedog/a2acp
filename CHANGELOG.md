@@ -23,7 +23,8 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 - Compatibility canaries now reject additional credential-shaped prerequisite names, surface
   negative/non-finite reported costs as blocking invalid observations, and directly cover final-sibling
-  same-name replacement before aggregate publication.
+  same-name replacement before aggregate publication. Ambiguous duplicate Fable-settings destinations
+  no longer report exact provenance.
 
 ## [0.2.1] - 2026-07-10
 

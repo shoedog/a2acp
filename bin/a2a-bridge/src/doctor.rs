@@ -1184,16 +1184,20 @@ fn exact_labeled_package<'a>(
 fn host_mount_source(volumes: &[String], destination: &str) -> Option<PathBuf> {
     use bridge_core::sandbox::SandboxVolumeSource;
 
-    volumes.iter().find_map(|volume| {
+    let mut matches = volumes.iter().filter_map(|volume| {
         let declaration = bridge_core::sandbox::parse_sandbox_volume(volume).ok()?;
-        if declaration.destination() != destination {
-            return None;
-        }
-        match declaration.source() {
-            SandboxVolumeSource::Host(path) => Some(PathBuf::from(path)),
-            SandboxVolumeSource::Anonymous | SandboxVolumeSource::Named(_) => None,
-        }
-    })
+        (declaration.destination() == destination).then_some(declaration)
+    });
+    let declaration = matches.next()?;
+    // Container runtimes need not agree on duplicate destination handling. Exact provenance is
+    // unavailable unless one and only one declaration selects this in-container path.
+    if matches.next().is_some() {
+        return None;
+    }
+    match declaration.source() {
+        SandboxVolumeSource::Host(path) => Some(PathBuf::from(path)),
+        SandboxVolumeSource::Anonymous | SandboxVolumeSource::Named(_) => None,
+    }
 }
 
 fn check_provenance(
@@ -3488,6 +3492,35 @@ mod tests {
         let row = find(&results, "provenance:claude:fable-settings");
         assert_eq!(row.status, CheckStatus::Ok);
         assert_eq!(row.detail, DIGEST);
+    }
+
+    #[test]
+    fn fable_reader_provenance_rejects_ambiguous_settings_destinations() {
+        let mut claude = acp_entry("claude", "claude-agent-acp");
+        claude.model = Some("claude-fable-5[1m]".into());
+        claude.sandbox = Some(locked_sandbox(
+            "reader:latest",
+            "a2a-net",
+            vec![
+                "/cfg/reviewed-settings.json:/root/.claude/settings.json:ro".into(),
+                "/cfg/other-settings.json:/root/.claude/settings.json:ro".into(),
+            ],
+        ));
+        let cfg = base_loaded(snapshot("claude", vec![claude], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image("reader:latest")
+            .with_env("A2A_BRIDGE_ALLOW_FABLE", "1")
+            .with_file_sha256("/cfg/reviewed-settings.json", &"a".repeat(64))
+            .with_file_sha256("/cfg/other-settings.json", &"b".repeat(64));
+
+        let results = run_checks(&cfg, &probes);
+        assert_eq!(
+            find(&results, "provenance:claude:fable-settings").status,
+            CheckStatus::Warn,
+            "duplicate destinations must not select one source as exact runtime provenance"
+        );
     }
 
     #[test]

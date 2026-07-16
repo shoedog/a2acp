@@ -197,7 +197,8 @@ full declared timeout headroom immediately before spawn. On Linux, the staged ch
 candidate descriptor after exec and its scratch descriptor after opening the artifact, before ACP
 descendants. A pinned config's exact SHA-256 is an admission gate before provider spawn. Container pins
 require exact non-secret adapter/CLI labels from the configured immutable image, and the Fable reader
-also binds its minimal mounted settings file by SHA-256; unknown provenance cannot green a support case.
+also binds exactly one minimal host-mounted settings file by SHA-256; missing, unreadable, or ambiguous
+duplicate settings destinations cannot green a support case.
 There is no retry, provider fallback, implicit all-case selection, baseline update, or production-config
 mutation. A case does not start unless its declared token and observable-cost caps fit the remaining
 total headroom. Negative/non-finite cost observations fail explicitly. Comparison retains per-case

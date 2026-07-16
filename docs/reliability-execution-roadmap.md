@@ -7,8 +7,8 @@
 - **Current R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`; four executable support
   configs pass non-billable doctor preflight with **53 ok / 0 warn / 0 fail** total. The binary unit
-  target passes **380 / 0 / 0**, and the full serial workspace passes **2,053 / 0 / 12 ignored**
-  across **70** test/doc-test groups. Linux/Rust 1.94 passes binary units **381 / 0 / 0**, smoke CLI
+  target passes **381 / 0 / 0**, and the full serial workspace passes **2,054 / 0 / 12 ignored**
+  across **70** test/doc-test groups. Linux/Rust 1.94 passes binary units **382 / 0 / 0**, smoke CLI
   **12 / 0**, and compatibility CLI **11 / 0**. Format/diff, workspace all-target check,
   warnings-denied Clippy, workspace release build, hygiene **37/7**, and release-manifest validation
   are green. The uniquely tagged, non-operator reader candidate is
@@ -121,7 +121,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE** with nine pinned rows, four deterministic-green support preflights, five explicit historical/unrun rows, full workspace **2,053/0/12 ignored** across 70 groups, and no live artifact or baseline promotion yet | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane and deliberate promotion active; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE** with nine pinned rows, four deterministic-green support preflights, five explicit historical/unrun rows, full workspace **2,054/0/12 ignored** across 70 groups, and no live artifact or baseline promotion yet | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane and deliberate promotion active; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -278,10 +278,11 @@ Next action:
 - R3b closes the R3a approval debt with symmetric final-sibling replacement coverage, expanded
   credential-shaped prerequisite rejection, and explicit blocking negative/non-finite cost evidence.
   It also rejects a changed pinned config before provider spawn and records exact Fable-settings
-  provenance. The nine-case manifest validates at `5d18cefe...c235d828`; binary units pass **380/0**,
-  the full serial workspace passes **2,053/0/12 ignored** across **70** groups, and the four support
+  provenance only for one unambiguous host-file settings destination; duplicates remain `WARN`. The
+  nine-case manifest validates at `5d18cefe...c235d828`; binary units pass **381/0**,
+  the full serial workspace passes **2,054/0/12 ignored** across **70** groups, and the four support
   configs pass non-billable doctor preflight with **53 ok / 0 warn / 0 fail** total. Linux/Rust 1.94
-  passes binary units **381/0**, smoke CLI **12/0**, and compatibility CLI **11/0**. Format/diff,
+  passes binary units **382/0**, smoke CLI **12/0**, and compatibility CLI **11/0**. Format/diff,
   workspace all-target check, warnings-denied Clippy, release build, hygiene **37/7**, and release
   manifest validation are green; exact-head review remains pending. The Docker label path was exercised
   against the candidate image. A real Podman label inspection remains unverified because no local Podman

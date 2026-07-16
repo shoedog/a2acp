@@ -50,7 +50,8 @@ contract, not new compatibility evidence: no R3b provider turn or baseline promo
 The two reader configs name immutable candidate image
 `sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1` directly. Bounded image
 inspection reports exact Codex adapter/CLI `1.1.2`/`0.144.1` and Claude adapter/SDK
-`0.55.0`/`0.3.198`; the Fable row also binds the mounted minimal settings file at SHA-256
+`0.55.0`/`0.3.198`; the Fable row requires exactly one host-file declaration for its in-container
+settings destination and binds that minimal settings file at SHA-256
 `6ee4ad319cdfc34a558425ddda86f5b1da4c10912a08dfdc32c0c009eef81f19`. The candidate was built under
 a unique tag and did not replace the running operator's `latest` tag or process. Its floating Kiro
 download resolved 2.12.3, so the Kiro rows deliberately remain `STALE` pending R4's reproducible
