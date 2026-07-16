@@ -4,8 +4,9 @@
 //! regular-file gate. On Unix, `O_NOFOLLOW` rejects a final symlink and `O_NONBLOCK` makes every special
 //! file return promptly; descriptor/path identity is then compared before the canonical path is trusted.
 
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Seek as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,6 +17,12 @@ use crate::BoxError;
 #[derive(Debug)]
 pub(crate) struct LocalFileSnapshot {
     pub(crate) canonical_path: PathBuf,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) sha256: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct OpenFileSnapshot {
     pub(crate) bytes: Vec<u8>,
     pub(crate) sha256: String,
 }
@@ -480,6 +487,232 @@ impl PinnedDirectory {
         .ok()
         .is_some_and(|(_file, snapshot)| snapshot.identity == self.identity)
     }
+
+    /// Create one owner-private regular file relative to the retained directory object. The effect
+    /// never re-resolves the directory's pathname, so a same-name replacement cannot redirect it.
+    pub(crate) fn create_new_file(
+        &self,
+        name: &OsStr,
+        mode: u32,
+        label: &str,
+    ) -> Result<File, BoxError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+            let name = child_name_cstring(name, label)?;
+            // SAFETY: the parent descriptor and NUL-terminated single-component name are live for
+            // this call. O_EXCL prevents replacement, O_NOFOLLOW rejects a final symlink, and the
+            // returned descriptor is uniquely adopted by File.
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    mode as libc::c_uint,
+                )
+            };
+            if fd == -1 {
+                return Err(format!(
+                    "{label}: cannot create descriptor-relative file: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            // SAFETY: `fd` was returned uniquely by openat above.
+            let file = unsafe { File::from_raw_fd(fd) };
+            // SAFETY: `file` owns a live descriptor and `mode` is a normal permission mask.
+            if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } == -1 {
+                let error = std::io::Error::last_os_error();
+                drop(file);
+                // SAFETY: the same live parent/name pair identifies the just-created entry. Cleanup
+                // is best-effort because the original permission failure remains authoritative.
+                unsafe {
+                    libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0);
+                }
+                return Err(
+                    format!("{label}: cannot set owner-only file permissions: {error}").into(),
+                );
+            }
+            let metadata = file
+                .metadata()
+                .map_err(|error| format!("{label}: cannot inspect created file: {error}"))?;
+            use std::os::unix::fs::MetadataExt as _;
+            if !metadata.is_file() || metadata.nlink() != 1 {
+                return Err(
+                    format!("{label}: created entry is not a single-link regular file").into(),
+                );
+            }
+            Ok(file)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (name, mode);
+            Err(format!("{label}: descriptor-relative file creation is unsupported").into())
+        }
+    }
+
+    /// Open one existing regular child relative to the retained directory object.
+    pub(crate) fn open_regular_file(&self, name: &OsStr, label: &str) -> Result<File, BoxError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+            let name = child_name_cstring(name, label)?;
+            // SAFETY: the parent descriptor and single-component name are live. The returned
+            // descriptor is uniquely adopted by File.
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                )
+            };
+            if fd == -1 {
+                return Err(format!(
+                    "{label}: cannot open descriptor-relative file: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            // SAFETY: `fd` was returned uniquely by openat above.
+            let file = unsafe { File::from_raw_fd(fd) };
+            if !file
+                .metadata()
+                .map_err(|error| format!("{label}: cannot inspect opened file: {error}"))?
+                .is_file()
+            {
+                return Err(format!("{label}: child must be a regular file").into());
+            }
+            Ok(file)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            Err(format!("{label}: descriptor-relative file opening is unsupported").into())
+        }
+    }
+
+    /// Atomically create and retain one child directory beneath this directory object.
+    pub(crate) fn create_child_directory(
+        &self,
+        name: &OsStr,
+        mode: u32,
+        label: &str,
+    ) -> Result<Self, BoxError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+            let c_name = child_name_cstring(name, label)?;
+            // SAFETY: the parent descriptor and single-component name are live for mkdirat.
+            if unsafe {
+                libc::mkdirat(self.file.as_raw_fd(), c_name.as_ptr(), mode as libc::mode_t)
+            } == -1
+            {
+                return Err(format!(
+                    "{label}: cannot create descriptor-relative directory: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            // SAFETY: the parent descriptor and name remain live; the returned descriptor is
+            // uniquely adopted by File.
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                )
+            };
+            if fd == -1 {
+                let error = std::io::Error::last_os_error();
+                // SAFETY: best-effort removal of the directory just created beneath the same parent.
+                unsafe {
+                    libc::unlinkat(self.file.as_raw_fd(), c_name.as_ptr(), libc::AT_REMOVEDIR);
+                }
+                return Err(format!("{label}: cannot retain created directory: {error}").into());
+            }
+            // SAFETY: `fd` was returned uniquely by openat above.
+            let file = unsafe { File::from_raw_fd(fd) };
+            // SAFETY: `file` owns a live descriptor and `mode` is a normal permission mask.
+            if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } == -1 {
+                return Err(format!(
+                    "{label}: cannot set owner-only directory permissions: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            let metadata = file
+                .metadata()
+                .map_err(|error| format!("{label}: cannot inspect created directory: {error}"))?;
+            if !metadata.is_dir() {
+                return Err(format!("{label}: created entry is not a directory").into());
+            }
+            let identity = DirectoryIdentity::from_open_directory(&file, &metadata, label)?;
+            let (acp_session_cwd, retain_descriptor_after_exec) =
+                stable_directory_path(&file, &identity, label)?;
+            let canonical_child = Path::new(self.canonical_cwd.as_str()).join(name);
+            let canonical_cwd = SessionCwd::parse(&canonical_child.to_string_lossy())
+                .map_err(|_| format!("{label}: created directory is not a valid session cwd"))?;
+            Ok(Self {
+                file: Arc::new(file),
+                canonical_cwd,
+                identity,
+                acp_session_cwd,
+                retain_descriptor_after_exec,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (name, mode);
+            Err(format!("{label}: descriptor-relative directory creation is unsupported").into())
+        }
+    }
+
+    pub(crate) fn remove_child(
+        &self,
+        name: &OsStr,
+        directory: bool,
+        label: &str,
+    ) -> Result<(), BoxError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+
+            let name = child_name_cstring(name, label)?;
+            let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
+            // SAFETY: the retained parent descriptor and single-component name are live.
+            if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), flags) } == -1 {
+                return Err(format!(
+                    "{label}: cannot remove descriptor-relative child: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (name, directory);
+            Err(format!("{label}: descriptor-relative removal is unsupported").into())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn child_name_cstring(name: &OsStr, label: &str) -> Result<std::ffi::CString, BoxError> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(format!("{label}: child name must be one non-special path component").into());
+    }
+    std::ffi::CString::new(bytes).map_err(|_| format!("{label}: child name contains NUL").into())
 }
 
 #[cfg(not(unix))]
@@ -501,6 +734,96 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 
 pub(crate) fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(crate) fn sha256_regular_file_bounded(
+    file: &File,
+    label: &str,
+    max_bytes: u64,
+) -> Result<String, BoxError> {
+    Ok(read_open_regular_file_bounded(file, label, max_bytes)?.sha256)
+}
+
+pub(crate) fn read_open_regular_file_bounded(
+    file: &File,
+    label: &str,
+    max_bytes: u64,
+) -> Result<OpenFileSnapshot, BoxError> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("{label}: cannot inspect open file: {error}"))?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(format!("{label}: open file is not a bounded regular file").into());
+    }
+    let mut reader = file
+        .try_clone()
+        .map_err(|error| format!("{label}: cannot clone open file: {error}"))?;
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| format!("{label}: cannot rewind open file: {error}"))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    reader
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{label}: read failed: {error}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("{label}: content exceeds the {max_bytes}-byte limit").into());
+    }
+    let sha256 = sha256_hex(&bytes);
+    Ok(OpenFileSnapshot { bytes, sha256 })
+}
+
+pub(crate) fn stable_regular_file_path(
+    file: &File,
+    label: &str,
+) -> Result<(PathBuf, bool), BoxError> {
+    #[cfg(target_os = "macos")]
+    let (path, retain_descriptor_after_exec) = {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("{label}: cannot inspect open file: {error}"))?;
+        (
+            PathBuf::from(format!("/.vol/{}/{}", metadata.dev(), metadata.ino())),
+            false,
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let (path, retain_descriptor_after_exec) = {
+        use std::os::fd::AsRawFd as _;
+
+        (
+            PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
+            true,
+        )
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return Err(format!("{label}: stable executable object paths are unsupported").into());
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let descriptor_metadata = file
+            .metadata()
+            .map_err(|error| format!("{label}: cannot inspect open file: {error}"))?;
+        let path_metadata = std::fs::metadata(&path).map_err(|error| {
+            format!(
+                "{label}: stable file handle {} is unavailable: {error}",
+                path.display()
+            )
+        })?;
+        if !descriptor_metadata.is_file()
+            || !path_metadata.is_file()
+            || !same_file(&descriptor_metadata, &path_metadata)
+        {
+            return Err(format!(
+                "{label}: stable file handle {} does not identify the opened file",
+                path.display()
+            )
+            .into());
+        }
+        Ok((path, retain_descriptor_after_exec))
+    }
 }
 
 pub(crate) fn read_regular_file_bounded(
@@ -668,6 +991,67 @@ mod tests {
         assert!(!pin.retain_descriptor_after_exec());
         #[cfg(target_os = "linux")]
         assert!(pin.retain_descriptor_after_exec());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn descriptor_relative_children_stay_on_the_pinned_parent_and_reject_escape_names() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let planned = dir.path().join("planned");
+        let moved = dir.path().join("moved");
+        fs::create_dir(&planned).unwrap();
+        let snapshot = snapshot_directory(&planned, "test parent").unwrap();
+        let pin = PinnedDirectory::open(
+            &planned,
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test parent",
+        )
+        .unwrap();
+
+        fs::rename(&planned, &moved).unwrap();
+        fs::create_dir(&planned).unwrap();
+        fs::create_dir(planned.join(".git")).unwrap();
+
+        let mut evidence = pin
+            .create_new_file(OsStr::new("evidence.json"), 0o600, "test evidence")
+            .unwrap();
+        evidence.write_all(b"original-parent").unwrap();
+        drop(evidence);
+        let scratch = pin
+            .create_child_directory(OsStr::new("scratch"), 0o700, "test scratch")
+            .unwrap();
+        let mut marker = scratch
+            .create_new_file(OsStr::new("marker"), 0o600, "test marker")
+            .unwrap();
+        marker.write_all(b"pinned-child").unwrap();
+        drop(marker);
+
+        assert_eq!(
+            fs::read(moved.join("evidence.json")).unwrap(),
+            b"original-parent"
+        );
+        assert_eq!(
+            fs::read(moved.join("scratch/marker")).unwrap(),
+            b"pinned-child"
+        );
+        assert!(!planned.join("evidence.json").exists());
+        assert!(!planned.join("scratch").exists());
+        assert!(pin
+            .create_new_file(OsStr::new("../escape"), 0o600, "escape")
+            .is_err());
+        assert!(!dir.path().join("escape").exists());
+
+        scratch
+            .remove_child(OsStr::new("marker"), false, "test marker cleanup")
+            .unwrap();
+        drop(scratch);
+        pin.remove_child(OsStr::new("scratch"), true, "test scratch cleanup")
+            .unwrap();
+        pin.remove_child(OsStr::new("evidence.json"), false, "test evidence cleanup")
+            .unwrap();
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

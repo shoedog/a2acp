@@ -296,8 +296,9 @@ fn acknowledged_run_calls_the_smoke_contract_once_and_keeps_failure_evidence() {
 
     assert!(
         output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "stderr: {}\naggregate: {}",
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&out).unwrap_or_else(|error| format!("<unreadable: {error}>"))
     );
     assert!(output.stdout.is_empty());
     let aggregate: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();

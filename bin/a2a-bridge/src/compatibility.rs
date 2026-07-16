@@ -5,13 +5,13 @@
 //! one fixed-PONG smoke process; every other selected case remains an explicit aggregate row.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -378,6 +378,17 @@ fn exact_component(label: &str, value: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
+fn exact_model(label: &str, value: &str) -> Result<(), BoxError> {
+    exact_component(label, value)?;
+    if value.eq_ignore_ascii_case("auto") {
+        return Err(format!(
+            "compatibility manifest: {label} must be an exact identity, not automatic or floating model selection"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn exact_package_pin(label: &str, value: &str) -> Result<(), BoxError> {
     exact_component(label, value)?;
     let mut pieces = value.split('=');
@@ -615,7 +626,7 @@ fn validate_case(case: &CompatibilityCase, budget: &ManifestBudget) -> Result<()
                 )
                 .into());
             }
-            exact_component("pinned model", &pins.model)?;
+            exact_model("pinned model", &pins.model)?;
             if let Some(adapter) = &pins.adapter {
                 exact_package_pin("adapter pin", adapter)?;
             }
@@ -1078,20 +1089,42 @@ trait SmokeInvoker: Send + Sync {
     async fn invoke(&self, request: &SmokeRequest) -> InvocationResult;
 }
 
-struct ProcessSmokeInvoker {
-    executable: PathBuf,
+struct StagedExecutable {
+    file: Arc<File>,
+    object_path: PathBuf,
+    #[cfg(test)]
+    staged_path: PathBuf,
+    retain_executable_after_exec: bool,
+}
+
+struct ProcessSmokeInvoker<'a> {
+    executable: StagedExecutable,
+    artifact_directory: &'a local_file::PinnedDirectory,
     expected_sha256: String,
 }
 
 #[async_trait]
-impl SmokeInvoker for ProcessSmokeInvoker {
+impl SmokeInvoker for ProcessSmokeInvoker<'_> {
     async fn invoke(&self, request: &SmokeRequest) -> InvocationResult {
-        let candidate = match local_file::read_regular_file_bounded(
-            &self.executable,
+        self.invoke_after_candidate_check(request, || {}).await
+    }
+}
+
+impl ProcessSmokeInvoker<'_> {
+    async fn invoke_after_candidate_check<F>(
+        &self,
+        request: &SmokeRequest,
+        after_candidate_check: F,
+    ) -> InvocationResult
+    where
+        F: FnOnce(),
+    {
+        let candidate_sha256 = match local_file::sha256_regular_file_bounded(
+            &self.executable.file,
             "compatibility staged candidate",
             MAX_EXECUTABLE_BYTES,
         ) {
-            Ok(candidate) if candidate.sha256 == self.expected_sha256 => candidate,
+            Ok(sha256) if sha256 == self.expected_sha256 => sha256,
             _ => {
                 return InvocationResult {
                     artifact: None,
@@ -1100,7 +1133,46 @@ impl SmokeInvoker for ProcessSmokeInvoker {
                 }
             }
         };
-        let mut command = tokio::process::Command::new(&self.executable);
+        after_candidate_check();
+        #[cfg(unix)]
+        let mut command = {
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::process::CommandExt as _;
+
+            let executable_fd = self.executable.file.as_raw_fd();
+            let retained_directory = self.artifact_directory.file_handle();
+            let retained_directory_fd = retained_directory.as_raw_fd();
+            let executable_path = self.executable.object_path.clone();
+            let retain_executable = self.executable.retain_executable_after_exec;
+            let retain_directory = self.artifact_directory.retain_descriptor_after_exec();
+            let mut command = tokio::process::Command::new(executable_path);
+            // SAFETY: this callback runs after fork and before exec. It performs only async-signal-
+            // safe fcntl calls. The bridge parent's descriptors stay FD_CLOEXEC; only the forked
+            // smoke child retains the verified executable and, on Linux, its descriptor-backed
+            // scratch path.
+            unsafe {
+                command.as_std_mut().pre_exec(move || {
+                    if retain_executable {
+                        clear_close_on_exec(executable_fd)?;
+                    }
+                    if retain_directory && retained_directory_fd != executable_fd {
+                        clear_close_on_exec(retained_directory_fd)?;
+                    }
+                    Ok(())
+                });
+            }
+            command
+        };
+        #[cfg(not(unix))]
+        {
+            let _ = candidate_sha256;
+            return InvocationResult {
+                artifact: None,
+                process_success: false,
+                runner_error_code: Some("smoke_process_launch_failed"),
+            };
+        }
+        #[cfg(unix)]
         command
             .arg("smoke")
             .arg("--agent")
@@ -1117,7 +1189,7 @@ impl SmokeInvoker for ProcessSmokeInvoker {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        drop(candidate);
+        drop(candidate_sha256);
         if let Some(effort) = &request.effort {
             command.arg("--effort").arg(effort);
         }
@@ -1139,14 +1211,30 @@ impl SmokeInvoker for ProcessSmokeInvoker {
             }
         };
         let process_success = status.success();
-        let snapshot = match local_file::read_regular_file_bounded(
-            &request.artifact_path,
-            "compatibility smoke artifact",
-            MAX_AGGREGATE_BYTES,
-        ) {
+        let Some(artifact_name) = request.artifact_path.file_name() else {
+            return InvocationResult {
+                artifact: None,
+                process_success,
+                runner_error_code: Some("smoke_artifact_missing_or_invalid_file"),
+            };
+        };
+        let snapshot = match self
+            .artifact_directory
+            .open_regular_file(artifact_name, "compatibility smoke artifact")
+            .and_then(|file| {
+                local_file::read_open_regular_file_bounded(
+                    &file,
+                    "compatibility smoke artifact",
+                    MAX_AGGREGATE_BYTES,
+                )
+            }) {
             Ok(snapshot) => snapshot,
             Err(_) => {
-                let _ = std::fs::remove_file(&request.artifact_path);
+                let _ = self.artifact_directory.remove_child(
+                    artifact_name,
+                    false,
+                    "compatibility smoke artifact cleanup",
+                );
                 return InvocationResult {
                     artifact: None,
                     process_success,
@@ -1154,7 +1242,11 @@ impl SmokeInvoker for ProcessSmokeInvoker {
                 };
             }
         };
-        let _ = std::fs::remove_file(&request.artifact_path);
+        let _ = self.artifact_directory.remove_child(
+            artifact_name,
+            false,
+            "compatibility smoke artifact cleanup",
+        );
         match serde_json::from_slice(&snapshot.bytes) {
             Ok(artifact) => InvocationResult {
                 artifact: Some(artifact),
@@ -1170,109 +1262,102 @@ impl SmokeInvoker for ProcessSmokeInvoker {
     }
 }
 
+#[cfg(unix)]
+fn clear_close_on_exec(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: the caller supplies a live descriptor in the forked child. fcntl is async-signal-safe.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 struct ScratchDir {
     path: PathBuf,
+    pin: local_file::PinnedDirectory,
+    parent: Arc<File>,
+    name: OsString,
 }
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-fn create_scratch_dir(parent: &Path) -> Result<ScratchDir, BoxError> {
-    for _ in 0..32 {
-        let path = parent.join(format!(
-            ".a2a-compat-{}-{}",
-            std::process::id(),
-            crate::implement::nonce(10)
-        ));
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        builder.mode(0o700);
-        match builder.create(&path) {
-            Ok(()) => {
-                #[cfg(unix)]
-                {
-                    let mut permissions = std::fs::metadata(&path)?.permissions();
-                    permissions.set_mode(0o700);
-                    std::fs::set_permissions(&path, permissions)?;
+        if let Ok(entries) = std::fs::read_dir(&self.path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    let _ = std::fs::remove_dir_all(path);
+                } else {
+                    let _ = std::fs::remove_file(path);
                 }
-                return Ok(ScratchDir { path });
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "compatibility run: cannot create private scratch directory under {}: {error}",
-                    parent.display()
-                )
-                .into())
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::ffi::OsStrExt as _;
+
+            if let Ok(name) = std::ffi::CString::new(self.name.as_os_str().as_bytes()) {
+                // SAFETY: `parent` retains the directory descriptor through Drop and `name` is the
+                // single component created beneath it. Cleanup is best effort.
+                unsafe {
+                    libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+                }
             }
         }
     }
-    Err("compatibility run: could not allocate a unique private scratch directory".into())
+}
+
+fn create_scratch_dir(parent: &local_file::PinnedDirectory) -> Result<ScratchDir, BoxError> {
+    let name = OsString::from(format!(
+        ".a2a-compat-{}-{}",
+        std::process::id(),
+        crate::implement::nonce(20)
+    ));
+    let pin =
+        parent.create_child_directory(&name, 0o700, "compatibility private scratch directory")?;
+    let path = pin.acp_session_cwd();
+    Ok(ScratchDir {
+        path,
+        pin,
+        parent: parent.file_handle(),
+        name,
+    })
 }
 
 fn stage_candidate(
     snapshot: &local_file::LocalFileSnapshot,
-    scratch: &Path,
-) -> Result<PathBuf, BoxError> {
-    let path = scratch.join("a2a-bridge-candidate");
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o700);
-    let mut file = options.open(&path).map_err(|error| {
-        format!("compatibility run: cannot stage candidate binary in private scratch: {error}")
-    })?;
+    scratch: &ScratchDir,
+) -> Result<StagedExecutable, BoxError> {
+    let name = OsStr::new("a2a-bridge-candidate");
+    #[cfg(test)]
+    let staged_path = scratch.path.join(name);
+    let mut file = scratch
+        .pin
+        .create_new_file(name, 0o700, "compatibility staged candidate")?;
     file.write_all(&snapshot.bytes)?;
     file.flush()?;
     file.sync_all()?;
-    #[cfg(unix)]
-    {
-        let mut permissions = file.metadata()?.permissions();
-        permissions.set_mode(0o700);
-        file.set_permissions(permissions)?;
-    }
-    let staged = local_file::read_regular_file_bounded(
-        &path,
+    drop(file);
+    let file = scratch
+        .pin
+        .open_regular_file(name, "compatibility staged candidate")?;
+    let staged_sha256 = local_file::sha256_regular_file_bounded(
+        &file,
         "compatibility staged candidate",
         MAX_EXECUTABLE_BYTES,
     )?;
-    if staged.sha256 != snapshot.sha256 {
+    if staged_sha256 != snapshot.sha256 {
         return Err("compatibility run: staged candidate digest mismatch".into());
     }
-    Ok(path)
-}
-
-fn prepare_output(path: &Path) -> Result<File, BoxError> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let file = options.open(path).map_err(|error| {
-        format!(
-            "compatibility run: cannot create aggregate {}: {error}",
-            path.display()
-        )
-    })?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("compatibility run: cannot inspect aggregate output: {error}"))?;
-    if !metadata.is_file() {
-        return Err("compatibility run: aggregate output is not a regular file".into());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if metadata.nlink() != 1 {
-            return Err("compatibility run: aggregate output must have exactly one link".into());
-        }
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(0o600);
-        file.set_permissions(permissions)?;
-    }
-    Ok(file)
+    let (object_path, retain_executable_after_exec) =
+        local_file::stable_regular_file_path(&file, "compatibility staged candidate")?;
+    Ok(StagedExecutable {
+        file: Arc::new(file),
+        object_path,
+        #[cfg(test)]
+        staged_path,
+        retain_executable_after_exec,
+    })
 }
 
 fn repository_root(path: &Path) -> Option<PathBuf> {
@@ -1295,20 +1380,35 @@ fn looks_like_bare_git_repository(path: &Path) -> bool {
 
 struct PinnedOutputDirectory {
     pin: local_file::PinnedDirectory,
-    canonical_parent: PathBuf,
-    output_path: PathBuf,
+    output_name: OsString,
 }
 
 impl PinnedOutputDirectory {
     fn prepare_output(&self) -> Result<File, BoxError> {
+        self.prepare_output_after_guard(|| {})
+    }
+
+    fn prepare_output_after_guard<F>(&self, after_guard: F) -> Result<File, BoxError>
+    where
+        F: FnOnce(),
+    {
         if !self.pin.current_path_matches() {
             return Err(
                 "compatibility run: aggregate parent identity changed before output creation"
                     .into(),
             );
         }
-        let file = prepare_output(&self.output_path)?;
+        after_guard();
+        let file =
+            self.pin
+                .create_new_file(&self.output_name, 0o600, "compatibility aggregate output")?;
         if !self.pin.current_path_matches() {
+            drop(file);
+            let _ = self.pin.remove_child(
+                &self.output_name,
+                false,
+                "compatibility aggregate output cleanup",
+            );
             return Err(
                 "compatibility run: aggregate parent identity changed during output creation"
                     .into(),
@@ -1324,7 +1424,7 @@ impl PinnedOutputDirectory {
                     .into(),
             );
         }
-        let scratch = create_scratch_dir(&self.canonical_parent)?;
+        let scratch = create_scratch_dir(&self.pin)?;
         if !self.pin.current_path_matches() {
             return Err(
                 "compatibility run: aggregate parent identity changed during scratch creation"
@@ -1351,11 +1451,9 @@ fn ensure_output_outside_repositories(output: &Path) -> Result<PinnedOutputDirec
         &snapshot.identity,
         "compatibility aggregate parent",
     )?;
-    let output_path = canonical_parent.join(file_name);
     Ok(PinnedOutputDirectory {
         pin,
-        canonical_parent,
-        output_path,
+        output_name: file_name.to_os_string(),
     })
 }
 
@@ -1795,6 +1893,10 @@ async fn build_aggregate<I: SmokeInvoker>(
             results.push(not_run_result(case, "prior_runner_failure"));
             continue;
         }
+        if let Some(reason) = case_environment_ready(case, environment_owner) {
+            results.push(not_run_result(case, reason));
+            continue;
+        }
         let remaining =
             Duration::from_secs(budget_config.timeout_secs).checked_sub(started.elapsed());
         let total_cost_exhausted = budget_config
@@ -1824,11 +1926,6 @@ async fn build_aggregate<I: SmokeInvoker>(
             results.push(not_run_result(case, "total_budget_insufficient_for_case"));
             continue;
         }
-        if let Some(reason) = case_environment_ready(case, environment_owner) {
-            results.push(not_run_result(case, reason));
-            continue;
-        }
-
         let artifact_path = scratch.join(format!("case-{ordinal:03}.json"));
         let request = SmokeRequest {
             agent: case.agent.clone(),
@@ -2072,7 +2169,7 @@ fn diagnostic_projection(value: &Value) -> Value {
         Value::Object(values) => Value::Object(
             values
                 .iter()
-                .filter(|(key, _)| !matches!(key.as_str(), "at_ms" | "failed_phase"))
+                .filter(|(key, _)| key.as_str() != "at_ms")
                 .map(|(key, value)| (key.clone(), diagnostic_projection(value)))
                 .collect(),
         ),
@@ -2291,10 +2388,11 @@ async fn run_command(args: RunArgs) -> Result<(), BoxError> {
     };
     let mut output = output_directory.prepare_output()?;
     let scratch = output_directory.create_scratch()?;
-    let staged_executable = stage_candidate(&executable, &scratch.path)?;
+    let staged_executable = stage_candidate(&executable, &scratch)?;
     drop(executable);
     let invoker = ProcessSmokeInvoker {
         executable: staged_executable,
+        artifact_directory: &scratch.pin,
         expected_sha256: candidate.sha256.clone(),
     };
     let cancellation_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2383,8 +2481,22 @@ pub(crate) async fn compatibility_cmd(args: &[String]) -> Result<(), BoxError> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
+
+    fn scratch_in(parent: &Path) -> ScratchDir {
+        let snapshot = local_file::snapshot_directory(parent, "test scratch parent").unwrap();
+        let pin = local_file::PinnedDirectory::open(
+            parent,
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test scratch parent",
+        )
+        .unwrap();
+        create_scratch_dir(&pin).unwrap()
+    }
 
     fn case(id: &str, expected_status: EvidenceStatus) -> CompatibilityCase {
         CompatibilityCase {
@@ -3206,6 +3318,46 @@ agent_cli = "@openai/codex=0.144.1"
     }
 
     #[tokio::test]
+    async fn unsupported_advisory_case_is_classified_before_budget_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = case("first", EvidenceStatus::Pass);
+        first.max_tokens = 5;
+        let mut unsupported = case("unsupported", EvidenceStatus::Stale);
+        unsupported.evidence_path = EvidencePath::DirectCli;
+        unsupported.classification = Classification::NonGoal;
+        unsupported.max_tokens = 7;
+        let invoker = FakeInvoker::new(vec![invocation(smoke(&first, true, Some(4)))]);
+        let mut loaded = loaded(dir.path(), vec![first, unsupported]);
+        loaded.manifest.budget.max_tokens = 10;
+        let cancelled = AtomicBool::new(false);
+        let candidate = candidate_identity();
+        let selection = selection();
+        let selected_indices = [0, 1];
+
+        let aggregate = build_aggregate(
+            AggregateInputs {
+                loaded: &loaded,
+                candidate: &candidate,
+                selection: &selection,
+                selected_indices: &selected_indices,
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &invoker,
+        )
+        .await;
+
+        assert_eq!(&*invoker.calls.lock().unwrap(), &["first"]);
+        assert_eq!(
+            aggregate.results[1].not_run_reason.as_deref(),
+            Some("evidence_path_not_implemented_in_r3a")
+        );
+        assert!(!aggregate.budget.exhausted);
+        assert!(aggregate.success);
+    }
+
+    #[tokio::test]
     async fn final_case_elapsed_time_exhaustion_is_recorded() {
         let dir = tempfile::tempdir().unwrap();
         let only = case("only", EvidenceStatus::Pass);
@@ -3794,6 +3946,99 @@ agent_cli = "@openai/codex=0.144.1"
     }
 
     #[test]
+    fn comparison_ignores_lifecycle_timestamps_but_keeps_nested_failed_phase() {
+        let mut case = case("pinned", EvidenceStatus::Fail);
+        case.lane = Lane::Pinned;
+        let mut smoke = smoke(&case, false, Some(1));
+        smoke["phase"] = json!("resolve");
+        smoke["diagnostics"]["lifecycle"] = json!([{
+            "transition": {"phase": "resolve", "status": "failed", "at_ms": 10},
+            "failure": {"failed_phase": "resolve", "class": "agent_crashed"}
+        }]);
+        let result = CaseResult {
+            case_id: case.id.clone(),
+            lane: Lane::Pinned,
+            evidence_path: EvidencePath::BridgeSmoke,
+            probe: ProbeType::Minimal,
+            billable: true,
+            execution: ExecutionState::Completed,
+            expected_status: EvidenceStatus::Fail,
+            actual_status: EvidenceStatus::Fail,
+            expectation_met: true,
+            classification: Classification::Support,
+            artifact_policy: case.artifact,
+            duration_ms: 1,
+            not_run_reason: None,
+            runner_error_code: None,
+            drift: Vec::new(),
+            budget_violations: Vec::new(),
+            smoke: Some(smoke),
+        };
+        let baseline = BaselineArtifact {
+            schema_version: 1,
+            manifest_schema_version: 1,
+            manifest_sha256: "a".repeat(64),
+            cases: vec![baseline_from_result(&result)],
+        };
+        let mut current = AggregateArtifact {
+            schema_version: 1,
+            candidate: candidate_identity(),
+            manifest: ManifestIdentity {
+                schema_version: 1,
+                canonical_path: "/tmp/manifest.toml".into(),
+                sha256: "a".repeat(64),
+            },
+            selection: selection(),
+            environment_owner: "test-runner".into(),
+            started_at_ms: 1,
+            ended_at_ms: 2,
+            cancelled: false,
+            success: false,
+            budget: BudgetOutcome {
+                timeout_secs: 1,
+                max_tokens: 10,
+                max_cost_usd: None,
+                observed_tokens: 1,
+                observed_cost_usd: 0.0,
+                token_observation_missing_cases: 0,
+                cost_observation_missing_cases: 1,
+                exhausted: false,
+            },
+            results: vec![result],
+        };
+
+        current.results[0].smoke.as_mut().unwrap()["diagnostics"]["lifecycle"][0]["transition"]
+            ["at_ms"] = json!(999);
+        assert!(compare_artifacts(&current, &baseline).unwrap().equal);
+
+        current.results[0].smoke.as_mut().unwrap()["diagnostics"]["lifecycle"][0]["failure"]
+            ["failed_phase"] = json!("prompt_stream");
+        let report = compare_artifacts(&current, &baseline).unwrap();
+        assert!(!report.equal);
+        assert_eq!(report.changes[0].dimensions, ["diagnostic"]);
+    }
+
+    #[test]
+    fn pinned_case_rejects_automatic_model_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pinned = case("pinned-auto", EvidenceStatus::Pass);
+        pinned.lane = Lane::Pinned;
+        pinned.model = "auto".into();
+        pinned.pins = Some(PinSet {
+            model: "auto".into(),
+            adapter: Some("codex-acp=1.1.2".into()),
+            agent_cli: Some("codex=0.1.0".into()),
+            config_sha256: "a".repeat(64),
+            image_digest: None,
+            components: BTreeMap::new(),
+        });
+        let manifest = loaded(dir.path(), vec![pinned]).manifest;
+
+        let error = validate_manifest(&manifest).unwrap_err();
+        assert!(error.to_string().contains("floating"));
+    }
+
+    #[test]
     fn checked_in_empty_baseline_matches_the_checked_in_manifest_identity() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let loaded = load_manifest(&root.join(DEFAULT_MANIFEST)).unwrap();
@@ -3819,17 +4064,23 @@ agent_cli = "@openai/codex=0.144.1"
             sha256: local_file::sha256_hex(&bytes),
             bytes,
         };
-        let staged = stage_candidate(&snapshot, dir.path()).unwrap();
-        assert_eq!(std::fs::read(&staged).unwrap(), snapshot.bytes);
+        let scratch = scratch_in(dir.path());
+        let staged = stage_candidate(&snapshot, &scratch).unwrap();
+        assert_eq!(std::fs::read(&staged.staged_path).unwrap(), snapshot.bytes);
         #[cfg(unix)]
         assert_eq!(
-            std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&staged.staged_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o700
         );
 
-        std::fs::write(&staged, b"changed").unwrap();
+        std::fs::write(&staged.staged_path, b"changed").unwrap();
         let invoker = ProcessSmokeInvoker {
             executable: staged,
+            artifact_directory: &scratch.pin,
             expected_sha256: snapshot.sha256,
         };
         let request = SmokeRequest {
@@ -3846,6 +4097,55 @@ agent_cli = "@openai/codex=0.144.1"
         assert_eq!(result.runner_error_code, Some("candidate_binary_changed"));
         assert!(result.artifact.is_none());
         assert!(!request.artifact_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_candidate_exec_is_bound_to_the_verified_file_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = local_file::read_regular_file_bounded(
+            Path::new("/usr/bin/true"),
+            "test true executable",
+            MAX_EXECUTABLE_BYTES,
+        )
+        .unwrap();
+        let replacement = local_file::read_regular_file_bounded(
+            Path::new("/usr/bin/false"),
+            "test false executable",
+            MAX_EXECUTABLE_BYTES,
+        )
+        .unwrap();
+        let scratch = scratch_in(dir.path());
+        let staged = stage_candidate(&snapshot, &scratch).unwrap();
+        let staged_path = staged.staged_path.clone();
+        let moved = dir.path().join("verified-object");
+        let invoker = ProcessSmokeInvoker {
+            executable: staged,
+            artifact_directory: &scratch.pin,
+            expected_sha256: snapshot.sha256,
+        };
+        let request = SmokeRequest {
+            agent: "test-agent".into(),
+            config: dir.path().join("missing.toml"),
+            model: "test-model".into(),
+            effort: None,
+            mode: None,
+            session_cwd: None,
+            timeout_secs: 1,
+            artifact_path: dir.path().join("artifact.json"),
+        };
+
+        let result = invoker
+            .invoke_after_candidate_check(&request, || {
+                std::fs::rename(&staged_path, &moved).unwrap();
+                std::fs::write(&staged_path, &replacement.bytes).unwrap();
+                let mut permissions = std::fs::metadata(&staged_path).unwrap().permissions();
+                permissions.set_mode(0o700);
+                std::fs::set_permissions(&staged_path, permissions).unwrap();
+            })
+            .await;
+
+        assert!(result.process_success);
     }
 
     #[test]
@@ -3886,5 +4186,28 @@ agent_cli = "@openai/codex=0.144.1"
         assert!(error.to_string().contains("parent identity changed"));
         assert!(!moved.join("aggregate.json").exists());
         assert!(!repository.join("aggregate.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_creation_is_bound_to_the_guarded_parent_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let safe = dir.path().join("safe");
+        let moved = dir.path().join("moved-safe");
+        std::fs::create_dir(&safe).unwrap();
+        let requested = safe.join("aggregate.json");
+        let resolved = ensure_output_outside_repositories(&requested).unwrap();
+
+        let error = resolved
+            .prepare_output_after_guard(|| {
+                std::fs::rename(&safe, &moved).unwrap();
+                std::fs::create_dir(&safe).unwrap();
+                std::fs::create_dir(safe.join(".git")).unwrap();
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("parent identity changed"));
+        assert!(!safe.join("aggregate.json").exists());
+        assert!(!moved.join("aggregate.json").exists());
     }
 }

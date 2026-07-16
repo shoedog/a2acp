@@ -1,7 +1,8 @@
 # R3 — Compatibility manifest and canary implementation plan
 
-- **Status:** IN REVIEW — initial Sol/xhigh review of `884bc5f` returned `REVISE`; the complete review
-  and self-audit fold is active on `agent/reliability-r3a-manifest-runner`
+- **Status:** IN REVIEW — initial Sol/xhigh review of `884bc5f` and first closure re-review of
+  `b37147c` returned `REVISE`; both finding sets are folded on
+  `agent/reliability-r3a-manifest-runner`, with one fresh exact-head closure re-review pending
 - **Prerequisite:** R2c and R2d merged (`a6fec94c`, PR #29)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -45,14 +46,17 @@ a2a-bridge compatibility compare --current <aggregate.json>
 `validate` performs bounded regular-file parsing only. `run` checks its acknowledgement before reading
 the manifest, requires an explicit selection (there is no implicit all-case billing), and pre-creates the
 aggregate output as a single-link regular file with mode `0600` before any provider process. The output
-parent is canonicalized and descriptor-pinned; its identity is rechecked before and during output/scratch
-creation, so a name or symlink retarget fails closed. Normal worktrees and bare Git repositories are both excluded. Each
+parent is canonicalized and descriptor-pinned; output and private-scratch entries are created relative to
+the retained descriptor, and its identity is rechecked before and during creation, so a name or symlink
+retarget cannot redirect an effect into its replacement. Normal worktrees and bare Git repositories are both excluded. Each
 eligible `evidence_path = "bridge_smoke"`, `probe = "minimal"` case shells back into the exact candidate
 binary's existing R2c `smoke` command once. Before opening the aggregate, the runner takes one bounded
 snapshot of the candidate executable and records its SHA-256 and byte length. After allocating the
 owner-only aggregate, but before any provider process, it stages those exact bytes as a private
 mode-`0700` executable inside the run's mode-`0700` scratch directory. It rechecks the staged digest
-before every spawn, so one aggregate cannot silently combine different candidate bytes.
+before every spawn and executes the verified file object rather than reopening its mutable name. Smoke
+artifacts are opened and removed relative to the retained scratch descriptor, so one aggregate cannot
+silently combine different candidate bytes or read evidence from a retargeted scratch pathname.
 Child stdout/stderr is discarded; the runner embeds only the bounded smoke-v2 artifact. Direct-CLI,
 direct-ACP, representative-workflow, wrong-platform, wrong-owner, and missing-prerequisite cases remain
 explicit `not_run` rows rather than being omitted or routed to a different path.
@@ -80,8 +84,10 @@ token or cost observations remain explicit counters; caps are observational wher
 report the corresponding metric.
 
 Pre-change evidence: the focused CLI regression failed because `compatibility` was an unknown
-subcommand. Initial-review regressions then failed **9** concrete unsafe states on `884bc5f`; the fold
-now passes compatibility units **30/0** and CLI regressions **10/0**. The CLI
+subcommand. Initial-review regressions then failed **9** concrete unsafe states on `884bc5f`; that fold
+passed compatibility units **30/0**. First-closure mutation locks then failed exactly **5** reviewed
+states (**30 passed / 5 failed / 0 ignored**) on `b37147c`; the complete fold now passes compatibility
+units **35/0**, the full `a2a-bridge` binary target **359/0**, and CLI regressions **10/0**. The CLI
 suite includes a deterministic missing-config control that invokes the nested smoke exactly once, fails
 before provider spawn, and preserves the smoke-v2 failure inside an aggregate created mode `0600`; no
 live or billable provider turn ran. The unit suite also proves that the staged candidate is owner-only
@@ -93,7 +99,7 @@ and exact API-key environment identity/presence fail visibly.
 
 The exact review-fold deterministic gates pass: `cargo fmt --all -- --check`, `git diff --check`,
 workspace all-target check, warnings-denied workspace/all-target Clippy, serial workspace tests
-**2,026 passed / 0 failed / 12 ignored** across **70** test/doc-test executables, release binary build,
+**2,032 passed / 0 failed / 12 ignored** across **70** test/doc-test executables, release binary build,
 repository hygiene **37/7**, and release-candidate manifest validation at SHA-256
 `f6481b2e88d55ebbdbed33d73bac40b871627ed1ef6779f582c3943858249007`. One fresh Sol/xhigh closure
 re-review remains pending. The 12 ignored tests are the unchanged explicitly live/authenticated provider
@@ -131,6 +137,19 @@ stale durable cursor. The same fold closes self-audit defects for effective capa
 support-only pinned blocking, prospective token/cost headroom, secret-shaped ids/comments, and canonical
 output-parent symlink retargeting. The reviewer `SMELL` is closed by multi-case lane/case/all tests,
 all comparison dimensions, and truly cumulative evidence-limit coverage.
+
+### R3a first closure re-review ledger
+
+The fresh bridge-mediated Sol/xhigh closure re-review of exact `b37147c` returned `REVISE`. Four
+inherited findings and the inherited coverage `SMELL` were `FIXED`; the dependency-pin finding was
+`PARTIAL` because the advertised automatic model id still validated as pinned. That partial is closed
+by pinned `auto` rejection. The five new `WRONG` findings are folded together: stable file-object
+execution after staged-name retarget; descriptor-relative aggregate/scratch creation and artifact access; complete nested
+`failed_phase` comparison while timestamps remain normalized; advisory unsupported-case classification
+before prospective budget admission; and one literal `IN REVIEW` token across the roadmap cursor,
+dependency graph, and status table. The macOS fold also mutation-locks the platform seam: APFS permits
+child output through a stable directory-object path but `canonicalize` rejects that path, so the child
+uses the stable path while the parent reads and removes evidence relative to its retained descriptor.
 
 ## R3b — pinned lane and promotion baseline
 

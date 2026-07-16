@@ -95,7 +95,8 @@ fail before the prompt. It refuses before manifest access unless `--acknowledge-
 requires `--lane`, repeated `--case`, or explicit `--all`; never use `--all` as a convenience default.
 Pass the exact `environment_owner` recorded by the selected cases and write the aggregate outside any
 normal or bare Git repository. The runner canonicalizes and descriptor-pins that parent, then rechecks
-its identity before and during scratch/output creation so a retarget fails closed:
+its identity before and during descriptor-relative scratch/output creation so a retarget cannot redirect
+an effect into the replacement object:
 
 ```bash
 a2a-bridge compatibility run \
@@ -108,7 +109,9 @@ a2a-bridge compatibility run \
 
 The runner takes one bounded snapshot of this candidate binary, stages the exact bytes privately, records
 the SHA-256 and byte length in the aggregate, and invokes that snapshot's existing `smoke` command once
-per eligible minimal bridge case. It refuses staged digest drift before spawn. Direct CLI/ACP,
+per eligible minimal bridge case. It refuses staged digest drift, executes the verified file object
+instead of reopening its name, and reads/removes smoke artifacts relative to the retained scratch
+descriptor. Direct CLI/ACP,
 representative, wrong-owner/platform, and missing-prerequisite cases are retained as explicit unrun rows.
 Use structured non-secret prerequisites: `{ name = "PATH" }` requires presence, while
 `{ name = "A2A_BRIDGE_ALLOW_FABLE", one_of = ["1", "true"] }` requires an accepted exact value.
