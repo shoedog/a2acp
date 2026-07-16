@@ -6,13 +6,15 @@
   tree. Authorized attempt 1 remains non-promotable stale-auth evidence; authorized attempt 2 passed both
   host paths and failed both reader paths before prompt acceptance when their runtime objects never started.
   The post-incident classification/cleanup fold passes binary **395 / 0 / 0**, affected bridge-core/ACP
-  **506 / 0**, and the full serial workspace **2,077 / 0 / 12 ignored** across **70** test/doc-test
+  **511 / 0**, and the full serial workspace **2,082 / 0 / 12 ignored** across **70** test/doc-test
   executables. Format/diff, check, Clippy, locked release, hygiene **37/7**, manifest, and dependency-policy
-  gates are green. The provider-unexercised release binary is 22,992,864 bytes at SHA-256
-  `e409bd76e1ae92c4ab947c8f4f818282bc20a4397e2c0f554a3ddd67fb8d313e`; the bound manifest SHA-256 is
+  gates are green. The provider-unexercised release binary is 23,075,312 bytes at SHA-256
+  `25e5f00c7838081d14528118cfdb39a7ecf94b1e33f220fc6417255855069866`; the bound manifest SHA-256 is
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The earlier Linux/Rust 1.94
   binary **396 / 0 / 0** and Linux smoke CLI **15 / 0** gates predate this fold and were not rerun while
-  local new-container starts remained degraded. Fresh exact-candidate Sol/xhigh review is required.
+  local new-container starts remained degraded. Exact `a1641d0` Sol/xhigh review returned `REVISE` on
+  pre-settlement cancellation ownership plus lifecycle-negative and legacy-compatibility coverage. The
+  current fold closes all three with red-before-green evidence and awaits exact-candidate closure re-review.
 - **Prerequisite:** R2c/R2d merged (`a6fec94c`, PR #29); R3a merged (`3927df3f`, PR #31)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -307,10 +309,10 @@ is unchanged.
 - **Branch:** `agent/reliability-r3b-pinned-lane`
 - **Implementation state (2026-07-16):** nine pinned rows validate at manifest SHA-256
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-incident fold
-  passes binary **395 / 0 / 0**, affected bridge-core/ACP **506 / 0**, and the full serial workspace
-  **2,077 / 0 / 12 ignored** across **70** test/doc-test executables. The provider-unexercised release
-  binary is 22,992,864 bytes at SHA-256
-  `e409bd76e1ae92c4ab947c8f4f818282bc20a4397e2c0f554a3ddd67fb8d313e`; the bound manifest SHA-256 is
+  passes binary **395 / 0 / 0**, affected bridge-core/ACP **511 / 0**, and the full serial workspace
+  **2,082 / 0 / 12 ignored** across **70** test/doc-test executables. The provider-unexercised release
+  binary is 23,075,312 bytes at SHA-256
+  `25e5f00c7838081d14528118cfdb39a7ecf94b1e33f220fc6417255855069866`; the bound manifest SHA-256 is
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. All
   format/check/Clippy/release/hygiene/manifest/dependency-policy gates are green. The earlier Linux/Rust
   1.94 binary **396 / 0 / 0** and Linux smoke CLI **15 / 0** gates apply only to the pre-incident tree.
@@ -343,6 +345,18 @@ is unchanged.
   the current fold. The
   partially-progressed-resolver cleanup mutation `SMELL` remains accepted and nonblocking because the
   inspected ownership/drop, invalidation, and run-scoped backstop are not a direct acquisition fixture.
+
+Fresh Sol/xhigh review of exact `a1641d063cc8564514bfc641e91f9f1ba323aa60` returned `REVISE` with one
+`WRONG` and two `SMELL`s. The `WRONG` demonstrated that a registry initializer canceled after positive
+`NotStarted` evidence but before timeout dropped `Supervised` without ever starting the exact named reap,
+then allowed one successor initializer. The regression failed **0 / 1** on that reviewed tree by timing out
+with zero reaps. The current fold establishes an unpublished-spawn guard immediately after process creation;
+normal success transfers both owners, ordinary error joins cleanup, and cancellation at any pre-publication
+await detaches terminate-then-reap. The corrected regression uses Tokio `OnceCell`, observes exact client
+exit before one reap, and permits one clean successor. The lifecycle-coverage `SMELL` is closed by direct
+`container.runtime.start_failed`, repeated-`Unknown`, and synchronous/asynchronous probe-panic controls.
+The compatibility `SMELL` is closed by proving a blocking conforming legacy `ReapFn` still runs detached and
+does not delay the original spawn error. Exact-candidate Sol closure re-review remains required.
 
 The initial fresh one-shot Sol/xhigh review of exact `57f3ee8` returned `REVISE` with two `WRONG`
 findings and three `SMELL`s. The branch now keeps invalid negative/non-finite cost history sticky across
@@ -414,16 +428,20 @@ actual production container spawn. A bounded exact-name runtime observer holds S
 observed object remains pre-start; deadline then emits `container.runtime.start_timeout` as
 `ContainerRuntime / ContainerFallbackCandidate`, with no Initialize transition and false prompt acceptance.
 Started state preserves the ordinary Initialize path, while unknown observations preserve the prior diagnosis
-rather than inventing container evidence. Every no-backend container error transfers exact-client
-termination plus the one named-container reap into a cancellation-safe owner and joins it on ordinary return;
-typed reap failure is retained as a bounded cause on the new start failure. The classification, cleanup order,
-and cancellation tests each fail under their exact pre-fix mutation. The production parser also covers
-Docker/Podman pre-start and started states, unknown/nonzero/oversized output, and a killed timeout with no late
-side effect. The deadline-first regression itself failed **0 / 1** before the fix with two runtime probes
-instead of one. The full host suite passes **2,077 / 0 / 12 ignored** across **70** test/doc-test executables;
-affected core/ACP tests pass **506 / 0**, and binary tests pass **395 / 0**. No additional provider turn ran.
-Fresh Sol/xhigh review is required for this post-approval implementation; only after Sol approval use one
-clean-room Fable/xhigh adversarial implementation plus release/compatibility lens, with no Fable re-review.
+rather than inventing container evidence. A bridge-owned production guard takes exact-client/controller
+ownership immediately after spawn, transfers it only with a complete backend, joins it on ordinary error, and
+detaches terminate-then-reap when any earlier await is canceled. Public legacy callbacks retain detached
+fire-and-forget behavior. Typed reap failure is retained as a bounded cause on the new start failure. The
+classification, cleanup order, pre/post-settlement cancellation, one-successor `OnceCell`, `start_failed`,
+started/unknown lifecycle, sync/async panic, deadline-first, parser, bounded-output/timeout, and legacy
+regressions are deterministic. The pre-settlement cancellation regression failed **0 / 1** with zero reaps;
+the deadline-first regression failed **0 / 1** with two runtime probes; the original three mutations also
+fail under their exact pre-fix behavior. The full host suite passes **2,082 / 0 / 12 ignored** across **70**
+test/doc-test executables; affected core/ACP tests pass **511 / 0**, and binary tests pass **395 / 0**. No
+additional compatibility/model smoke ran; one source-only Sol review ran. Exact `a1641d0` review returned
+`REVISE`; this fold
+requires Sol closure approval before one clean-room Fable/xhigh adversarial implementation plus
+release/compatibility lens, with no Fable re-review.
 
 Seed rows for every currently claimed path or control in `docs/compatibility.md`:
 

@@ -257,10 +257,12 @@ justify fallback or an automatic replay. `upstream.classification_conflict`,
 ambiguous advisory evidence, not that it inferred a provider class from it. Retry/reset hints are bounded
 metadata and never change terminal disposition.
 
-When container spawn fails before a backend is published, one cancellation-safe owner first terminates and
-reaps the exact supervised runtime client, then joins the exact named-container removal. An ordinary return
-means that ordered flight settled even if the original caller was canceled while waiting. On the typed
-never-started path, a failed removal is retained in the primary diagnostic causes. Observed container
+On bridge-owned production container spawn, one cancellation-safe owner is armed immediately after process
+creation. Success transfers it to the backend; ordinary failure first terminates and reaps the exact
+supervised runtime client, then joins the exact named-container removal; cancellation before publication
+detaches the same ordered flight. Public legacy callbacks remain fire-and-forget. An ordinary production
+error return means that ordered flight settled even if the original caller was canceled while waiting. On
+the typed never-started path, a failed removal is retained in the primary diagnostic causes. Observed container
 release likewise joins one bridge-owned bounded reap flight. A successful return means that flight
 completed; `container.reap.spawn_failed`, `container.reap.timeout`,
 `container.reap.nonzero_exit`, or `container.reap.worker_panicked` is a fatal accepted cleanup failure.

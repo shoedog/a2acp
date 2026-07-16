@@ -539,6 +539,29 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn panicking_start_probes_fail_closed_to_unknown() {
+        let attempt: ReapAttemptFn = Arc::new(|_runtime, _name| Box::pin(async move { Ok(()) }));
+        let synchronous: ContainerStartProbeFn =
+            Arc::new(|_runtime, _name| panic!("synchronous start probe panic"));
+        let controller = ReapController::new("docker", "a2a-ro-sync-panic", Arc::clone(&attempt))
+            .with_start_probe(synchronous);
+        assert_eq!(
+            controller.probe_start_state().await,
+            ContainerStartState::Unknown
+        );
+
+        let asynchronous: ContainerStartProbeFn = Arc::new(|_runtime, _name| {
+            Box::pin(async move { panic!("asynchronous start probe panic") })
+        });
+        let controller = ReapController::new("docker", "a2a-ro-async-panic", attempt)
+            .with_start_probe(asynchronous);
+        assert_eq!(
+            controller.probe_start_state().await,
+            ContainerStartState::Unknown
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn production_start_probe_is_bounded_and_requires_exact_status() {

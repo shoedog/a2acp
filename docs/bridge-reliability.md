@@ -60,8 +60,10 @@ post-failure runtime probe and never executes the emitted plan.
 Production container spawn separately observes the exact generated name inside the handshake deadline. A
 runtime-confirmed pre-start object fails in `Spawn` as `container.runtime.start_timeout` /
 `ContainerRuntime` with `ContainerFallbackCandidate` and a false replay barrier; started or unknown state
-cannot be relabeled as that failure. Before returning without a backend, one cancellation-safe cleanup owner
-terminates the exact runtime client and then joins the exact named-container removal. This active boundary
+cannot be relabeled as that failure. Bridge-owned production spawn arms one cancellation-safe cleanup owner
+immediately after process creation; success transfers it to the backend, ordinary error joins exact-client
+termination then exact named-container removal, and pre-publication cancellation detaches the same order.
+Public legacy reap callbacks retain their detached fire-and-forget contract. This active boundary
 runs only after an operator-selected container path is actually spawned; it does not make doctor mutating or
 billable.
 

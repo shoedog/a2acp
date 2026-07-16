@@ -123,13 +123,13 @@ The deterministic hardening following this incident keeps `doctor` read-only but
 start boundary only inside production container spawn. A runtime-observed pre-start object now fails as
 `Spawn / ContainerRuntime / ContainerFallbackCandidate` with code
 `container.runtime.start_timeout`; unknown state preserves the prior ACP diagnosis, and a started object
-preserves ordinary initialize behavior. The no-backend failure path transfers exact-client termination plus
-the single named-container removal into one cancellation-safe flight, joins it before an ordinary return,
-and the new typed never-started failure retains a cleanup code in its primary causes if removal fails. No
-additional live/provider
-turn is authorized by this hardening or by its deterministic tests. The post-incident provider-unexercised
-release binary is 22,992,864 bytes at SHA-256
-`e409bd76e1ae92c4ab947c8f4f818282bc20a4397e2c0f554a3ddd67fb8d313e`; it has not replaced or replayed
+preserves ordinary initialize behavior. On bridge-owned production paths, an unpublished-spawn guard owns
+the exact client and named removal before the first cancellable post-spawn await; ordinary errors join its
+terminate-then-reap flight and cancellation detaches it. The new typed never-started failure retains a cleanup
+code in its primary causes if removal fails. Public legacy callbacks remain detached fire-and-forget. No
+additional compatibility turn is authorized by this hardening or by its deterministic tests/reviews. The post-incident provider-unexercised
+release binary is 23,075,312 bytes at SHA-256
+`25e5f00c7838081d14528118cfdb39a7ecf94b1e33f220fc6417255855069866`; it has not replaced or replayed
 attempt 2's exact `323b4e21...a079` live artifact.
 
 ## Resolved incident: Fable over Claude ACP
