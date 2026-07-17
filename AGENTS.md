@@ -243,8 +243,13 @@ chmod 700 "$evidence_root"
 
 The recipe's selectors are requests, not compatibility evidence. Resolution may use the npm registry,
 runtime cache, and one unique disposable image tag, but it starts no adapter/provider session, calls no
-`models`, copies no credentials, replaces no shared tag, and grants no billing permission. Inspect the
-complete `resolution.json`, validate and doctor its generated configs, then obtain separate authorization
+`models`, copies no credentials, replaces no shared tag, and grants no billing permission. The npm
+subprocess may create only the exact lock through the bridge's fixed npmjs CONNECT proxy; it never receives
+tree-write authority.
+The bridge downloads the exact integrity-bound npmjs HTTPS archives, preflights their paths/types, reserves
+the entire aggregate entry/byte budget before the first package entry write, and materializes the private
+tree descriptor-relatively. Inspect the complete `resolution.json`, validate and doctor its generated
+configs, then obtain separate authorization
 for the exact resolution id, unchanged candidate binary, selected cases, owner, and budget:
 
 ```bash

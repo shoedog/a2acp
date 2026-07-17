@@ -174,6 +174,10 @@ Recipe validation is local and effect-free:
 Resolution can contact the npm registry, inspect the requested base image, populate package/runtime caches,
 build one uniquely tagged disposable image, and write a private bundle. It does not start an adapter or
 provider session, call `models`, read/copy credentials, replace a shared tag, or authorize a later prompt.
+For packages, npm may only resolve the exact lock through the fixed npmjs CONNECT proxy; it never writes the
+package tree. The bridge downloads each exact integrity-bound npmjs HTTPS archive, rejects unsafe archive
+paths/types before publication, reserves the complete aggregate entry/byte budget before the first package
+entry write, and materializes descriptor-relatively below the private bundle.
 Require explicit operator authorization for those exact registry/image effects, selected cases, recipe
 bytes, owner, runtime, candidate binary, and a new output directory outside every normal or bare Git
 repository:

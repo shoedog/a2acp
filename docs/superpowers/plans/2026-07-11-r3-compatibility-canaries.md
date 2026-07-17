@@ -543,6 +543,8 @@ updates `docs/compatibility.md` and the changelog when release-relevant.
 - **Branch:** `agent/reliability-r3c-floating-lane`
 - **State:** **IN PROGRESS** from clean base
   `504c1e434fd5845bc6745e0b0a0aae95427afbdd`
+- **Current code head:** `f15ae88eae4e8ec3d0e8ed5d45c1b8a101f9dcc8`; deterministic full-branch
+  gates are green and exact-head re-review remains pending.
 - **Design evidence:** one bridge-mediated clean-room Sol/xhigh read-only design pass inspected exact
   `504c1e43`. It ran no provider turn, package resolution, container action, build, test, or nested agent.
   The design turn is architecture evidence, not compatibility evidence.
@@ -706,15 +708,22 @@ runtime subcommand.
 
 For npm:
 
-- create package metadata, `HOME`, npm cache/prefix/temp/user-config, and the materialized tree only below
-  the bundle capability;
-- use only the fixed npmjs registry;
-- resolve with `--package-lock-only`, then materialize with
-  `npm ci --ignore-scripts --no-audit --no-fund`;
+- create package metadata, `HOME`, npm cache/prefix/temp/user-config, downloaded archives, and the
+  materialized tree only below the bundle capability;
+- give npm only the fixed CONNECT proxy and only enough authority to produce an exact lock with
+  `--package-lock-only`; npm never receives tree-write authority;
+- parse only fixed npmjs HTTPS tarball URLs and exact SHA-512 integrity from that lock, reserve one shared
+  download budget before every chunk write, and let the bridge download, verify, preflight, and unpack one
+  exact archive at a time;
 - strip provider and credential variables from the child environment;
-- reject install hooks, git/file/path dependencies, missing integrity, escaping symlinks, devices,
-  sockets, duplicates, excessive files/bytes, and lock/tree mismatch;
-- find the adapter executable through the package's bounded `bin` map, not guessed `.bin` paths;
+- reject install hooks, git/file/path dependencies, missing or bad integrity, non-HTTPS/non-npmjs URLs,
+  hardlinks, escaping symlinks, devices, sockets, duplicate paths, excessive files/bytes, and lock/tree
+  mismatch before publication;
+- reserve the full descriptor-relative tree's aggregate entries and declared regular-file bytes before the
+  first package entry write; reopen ancestor directories on demand instead of retaining one descriptor per
+  directory;
+- apply the package's bounded `bin` map to the target file's executable mode, without creating `.bin`
+  shims or guessing paths;
 - reuse a typed package-identity helper extracted from doctor provenance, never parse human
   `CheckResult.detail` strings.
 
@@ -902,14 +911,26 @@ were post-effect; infrastructure failure/cancellation could remain definitive; r
 orphan descendants; inventory omitted mode/owner; unrelated baselines were accepted; catalog-only drift
 leaked into generic capability; aggregate cancellation/budget was omitted; and the cursor overstated the
 reviewed head. `e3459a5` closes all nine. `d86e418` adds the missing catalog-only regression after an exact
-old-code mutation proved the broader test was vacuous for that behavior.
+old-code mutation proved the broader test was vacuous for that behavior. The closure review of exact
+`646d61bada59146be3818c6fed816f8c969f5bda` adjudicated inherited findings 1 and 3-9 fixed, but left the
+shared resource-bound finding unresolved because a 10 ms watcher plus per-file `RLIMIT_FSIZE` could not
+prevent a transient aggregate overshoot. It also found a new process-group reuse `WRONG`: normal completion
+reaped the group leader before later `kill(-PGID)`, so the numeric group could be reassigned. Exact
+`f15ae88eae4e8ec3d0e8ed5d45c1b8a101f9dcc8` removes npm tree-write authority, verifies and unpacks exact
+integrity-bound archives under bridge-owned pre-reserved hard aggregate limits, reopens descriptor-relative
+ancestors instead of retaining unbounded directory descriptors, and keeps a trusted live process-group
+leader until group termination and reap are complete.
 
-Latest focused gates are resolution **37 / 0**, compatibility unit **54 / 0**, compatibility CLI **20 / 0**,
-ACP same-session catalog **1 / 0**, smoke catalog **1 / 0**, and additive fallback schema **1 / 0**. The
-exact-head host workspace passes **2,141 / 0 / 12 ignored** across **70** test/doc-test executables.
-Format/diff, workspace all-target check, warnings-denied all-target/all-feature Clippy, locked release,
-hygiene **37/7**, pinned manifest, four-case recipe, protected-input identity, and dependency policy are
-green. Removed-check mutations produce these exact reds: unauthorized CONNECT admission wedged the negative
+Latest focused resolution gates are **47 / 0**. The exact `646d61b` pre-hardening host workspace passed
+**2,141 / 0 / 12 ignored** across **70** test/doc-test executables, with compatibility unit **54 / 0**,
+compatibility CLI **20 / 0**, and ACP same-session catalog, smoke catalog, and additive fallback controls
+**1 / 0** each. Its format/diff, workspace all-target check, warnings-denied all-target/all-feature Clippy,
+locked release, hygiene **37/7**, pinned manifest, four-case recipe, protected-input identity, and dependency
+policy gates were green. Exact-`f15ae88` host gates pass **2,151 / 0 / 12 ignored** across **70** test and
+doc-test executables. Format/diff, workspace all-target check, warnings-denied all-target/all-feature Clippy,
+locked release, hygiene **37/7**, pinned manifest **9 cases**, floating recipe **4 cases**, protected-input
+identity, and dependency policy are green. Final review remains pending.
+Prior removed-check mutations produce these exact reds: unauthorized CONNECT admission wedged the negative
 proxy test until bounded termination; a per-proxy counter left shared budget **5** instead of **2**; removing
 RLIMIT plus the watcher returned late `PackageTreeDrift` instead of immediate `NpmDownloadBudgetExceeded`;
 authentication became `Fail` instead of `Unknown`; cancelled active evidence stayed `Pass` instead of
@@ -919,16 +940,25 @@ positive control; an unrelated pinned hash returned `Ok`; aggregate cancellation
 instead of only the latter. Each green test retains its exact-bound, valid-definitive, direct-child,
 same-content, malformed-binding, identical-catalog, or unchanged-aggregate control as applicable.
 
+New deterministic controls cover aggregate entry/byte limits one below and at the exact edge before any
+`node_modules` publication; exact-edge and one-byte-over streaming downloads; bad integrity; archive
+deadline, hardlink, special-file, duplicate, and escaping-link rejection; npm alias versus ordinary semver;
+host-plus-Linux package selection; owner normalization below Darwin `/private/tmp`; more sibling directories
+than the macOS soft descriptor ceiling; package-bin mode/path normalization without `.bin`; and retention of
+the process-group anchor through final cleanup. The process-group regression failed against the pre-fix
+leader-reap ordering and passes at `f15ae88`.
+
 The earlier `57e63a0` Linux/Rust 1.94.0 run passes complete `a2a-bridge` package **508 / 0 / 11 ignored**
 across **16** groups, including binary **434 / 0**, compatibility CLI **21 / 0**, smoke CLI **15 / 0**, plus
-ACP catalog **1 / 0**. It is historical evidence, not an exact-`d86e418` rerun: cleanup removed the local
-Rust image, Docker has no equivalent cached image, and no new registry pull was authorized. The
-provider-unexercised release candidate is 24,432,672 bytes at SHA-256
-`48ecafdf3d22c91b635a83b91ddc62726f389eb6541f423c34e6933932ac871e`; the recipe SHA-256 is
+ACP catalog **1 / 0**. It is historical evidence, not an exact-`f15ae88` rerun: cleanup removed the local
+Rust image, Docker has no equivalent cached image, and no new image pull was authorized. The current
+provider-unexercised release candidate is 24,679,168 bytes at SHA-256
+`206aaa28893a985ac22f679bf513dc0a8f9f1c5d55d21c71f77afde22b65c9f2`; the recipe SHA-256 is
 `11d8f50de5515b2f6703741c9a00980e1dc96f766e6370677fd654a0968f0160`. The pinned manifest/baseline,
-production configs/Cargo inputs/Containerfiles, compatibility matrix, support matrix, and changelog remain
-byte-identical to `504c1e43`. No provider, package-registry resolution, bridge runtime/container,
-model-discovery, compatibility aggregate, operator rebuild, or operator swap ran.
+production configs, Containerfiles, compatibility matrix, support matrix, and changelog remain byte-identical
+to `504c1e43`; `f15ae88` deliberately changes the bridge crate dependencies and workspace lock for its
+bridge-owned gzip/tar path. No provider turn, model discovery, compatibility aggregate, image resolution or
+build, operator rebuild, or operator swap ran.
 
 Each commit must build and keep existing pinned behavior green. Focused tests run first; final closure runs
 format/diff, workspace check, warnings-denied all-target Clippy, the full workspace suite with exact totals,
@@ -942,12 +972,25 @@ inherited findings first. No review turn is compatibility evidence.
 
 ### Live gates and restart handoff
 
-No live prompt or real registry/image resolution is needed for deterministic implementation closure.
-Neither is authorized by the current session.
+No live prompt or image resolution is needed for deterministic implementation closure. Explicitly
+authorized, provider-free host package-resolution diagnostics exercised the registry/materialization path
+before `f15ae88`: the retained Codex bundle resolved codex-acp **1.1.4** plus Codex **0.144.5** and passed
+doctor **10 ok / 0 warn / 0 fail**; the retained Claude bundle resolved claude-agent-acp **0.59.0**,
+Claude Agent SDK **0.3.207**, and bundled Claude **2.1.207**, then passed doctor
+**11 ok / 0 warn / 0 fail**. Both owner-private, sealed bundles include host and Linux/glibc arm64 package
+variants and left no npm cache/temp/prefix/home state. The failed diagnostic attempts exposed alias/semver,
+Darwin ownership, descriptor retention, published bin-mode, and safe-leading-`./` defects that the current
+deterministic tests now cover; those failed bundles were removed after their evidence was folded.
+
+Those diagnostics started no adapter/provider session, called no `models`, built or inspected no image,
+produced no aggregate, and spent no provider turn. The two retained successful bundles predate the final
+archive-plan aggregate reservation in `f15ae88`, so they are diagnostic evidence rather than exact-current
+compatibility or promotion evidence.
 
 After deterministic gates and reviews:
 
-1. Obtain explicit authorization for registry/image effects against one exact recipe SHA and case set.
+1. Obtain explicit authorization for exact-current registry/image effects against one exact recipe SHA and
+   case set.
 2. Run one `compatibility resolve` and inspect the owner-private artifact/configs/package/base/image proof.
 3. Run non-billable validation and doctor on generated configs. Do not call `models`.
 4. Obtain separate authorization for one exact resolution id, candidate binary, case set, and budget.
@@ -963,14 +1006,16 @@ operator-reviewed cleanup proves no running container uses them. Automated reten
 scheduler deadlines, termination escalation, quarantine, and concurrency remain R3d. Promotion, production
 pins/baselines, support wording, release integration, and rollback exercises remain R4.
 
-**Restart point:** continue from the current tip of `agent/reliability-r3c-floating-lane`; `d86e418` is the
-tested code head and the later docs commit records its evidence. Exact-head host and mutation gates are
-green; Linux/Rust 1.94 is green only on historical `57e63a0` until an image pull is separately authorized.
-Run the fresh Sol/xhigh closure review, adjudicating the nine inherited `WRONG` findings first; fold and
-reverify every unresolved `WRONG`, and only after correctness is green run the release/compatibility lens.
-Keep the pinned manifest/baseline and every protected production/support input unchanged. Do not run a real
-compatibility resolution, bridge runtime/container, model discovery, provider turn beyond the two authorized
-reviews, operator rebuild, or operator swap without the separate authorizations described under live gates.
+**Restart point:** continue from the current tip of `agent/reliability-r3c-floating-lane`;
+`f15ae88eae4e8ec3d0e8ed5d45c1b8a101f9dcc8` is the current code head. Focused resolution tests are green;
+full host, release, hygiene, manifest/recipe, protected-input, and dependency-policy gates are green;
+exact-head review remains. Linux/Rust 1.94 is green only on historical `57e63a0` until an image pull is
+separately authorized. Run a fresh Sol/xhigh closure review that first adjudicates all inherited findings from
+the `a5dfef8` and `646d61b` reviews; fold and reverify every unresolved `WRONG`, and only after correctness is
+green run the release/compatibility lens. Keep the pinned manifest/baseline and every protected production/
+support input unchanged. Do not run an exact-current compatibility resolution, bridge runtime/container,
+model discovery, provider turn beyond the two authorized reviews, operator rebuild, or operator swap without
+the separate authorizations described under live gates.
 
 ## R3d — scheduling and evidence retention
 

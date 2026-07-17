@@ -5,26 +5,31 @@
 - **Completed through:** R3b **MERGED** at `504c1e43`; R2e remains deferred and off the critical path
 - **Active slice:** R3c floating-current lane **IN PROGRESS** on
   `agent/reliability-r3c-floating-lane`
-- **Current R3c deterministic gate:** tested code head `d86e418` completes all four implementation slices
-  and the first adversarial-review fold. The initial Sol/xhigh review of exact `a5dfef8` returned nine
-  `WRONG`, no `SMELL`, and `GATE: REVISE`; `e3459a5` closes all nine, and `d86e418` adds the missing
-  pre-fix-red catalog-only comparison regression. Later branch commits record evidence and review folds, so
-  restart from the tip of the named branch rather than treating this tested hash as the branch tip.
-  Focused gates pass resolution **37 / 0**, compatibility unit **54 / 0**, compatibility CLI **20 / 0**,
-  plus ACP catalog, smoke catalog, and additive fallback controls **1 / 0** each. The exact-head host
-  workspace passes **2,141 / 0 / 12 ignored** across **70** test/doc-test executables. Format/diff,
-  all-target workspace check, warnings-denied all-target/all-feature Clippy, locked release, hygiene
-  **37/7**, protected-input identity, pinned manifest, four-case recipe, and dependency policy are green.
-  Exact removed-check mutations turn red for registry authority, shared download budget, in-flight resource
-  limits, cancellation classification and descendant cleanup, mode/ownership binding, production-manifest
-  baseline identity, catalog-only projection, and aggregate cancellation/budget dimensions. The earlier
-  `57e63a0` Linux/Rust 1.94.0 gate remains green at full package **508 / 0 / 11 ignored** across **16**
-  groups (binary **434 / 0**, compatibility CLI **21 / 0**, smoke CLI **15 / 0**) plus ACP catalog **1 / 0**;
-  it was not rerun for `d86e418` because cleanup removed the local Rust image and a new registry pull was
-  not authorized. The provider-unexercised candidate is 24,432,672 bytes at SHA-256
-  `48ecafdf3d22c91b635a83b91ddc62726f389eb6541f423c34e6933932ac871e`; recipe SHA-256 is
-  `11d8f50de5515b2f6703741c9a00980e1dc96f766e6370677fd654a0968f0160`. No compatibility resolution,
-  model discovery, provider aggregate, operator rebuild, or operator swap ran.
+- **Current R3c deterministic gate:** code head
+  `f15ae88eae4e8ec3d0e8ed5d45c1b8a101f9dcc8` completes all four implementation slices and two
+  adversarial-review folds. The initial Sol/xhigh review of exact `a5dfef8` returned nine `WRONG`, no
+  `SMELL`, and `GATE: REVISE`; `e3459a5` closes all nine, and `d86e418` adds the missing pre-fix-red
+  catalog-only comparison regression. Closure review of exact `646d61b` adjudicated inherited findings 1
+  and 3-9 fixed but left transient aggregate tree-resource overshoot unresolved and found a process-group
+  reuse `WRONG`. `f15ae88` removes npm tree-write authority, downloads/verifies exact integrity-bound
+  archives under bridge-owned hard aggregate reservation, avoids retained per-directory descriptors, and
+  retains a trusted group-leader anchor through final group kill/reap. Focused resolution gates pass
+  **47 / 0**. The exact `646d61b` pre-hardening workspace passed **2,141 / 0 / 12 ignored** across **70**
+  test/doc-test executables, with compatibility unit **54 / 0**, compatibility CLI **20 / 0**, and ACP
+  catalog, smoke catalog, and additive fallback controls **1 / 0** each. Exact-`f15ae88` host gates pass
+  **2,151 / 0 / 12 ignored** across **70** test/doc-test executables. Format/diff, all-target workspace
+  check, warnings-denied all-target/all-feature Clippy, locked release, hygiene **37/7**, pinned manifest
+  **9 cases**, floating recipe **4 cases**, protected-input identity, and dependency policy are green; final
+  review remains pending. The provider-unexercised release binary is 24,679,168 bytes at SHA-256
+  `206aaa28893a985ac22f679bf513dc0a8f9f1c5d55d21c71f77afde22b65c9f2`. The earlier `57e63a0`
+  Linux/Rust 1.94.0 gate
+  remains green at full package **508 / 0 / 11 ignored** across **16** groups (binary **434 / 0**,
+  compatibility CLI **21 / 0**, smoke CLI **15 / 0**) plus ACP catalog **1 / 0**; it was not rerun for
+  `f15ae88` because cleanup removed the local Rust image and no new image pull was authorized. Explicitly
+  authorized provider-free host diagnostics resolved Codex and Claude package trees; generated-config
+  doctors passed **10/0/0** and **11/0/0** respectively, but the retained bundles predate `f15ae88` and are
+  diagnostic rather than exact-current compatibility evidence. No provider turn, model discovery, image
+  resolution/build, compatibility aggregate, operator rebuild, or operator swap ran.
 - **Last merged R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-incident
   container-start fold passes binary **395 / 0 / 0**, affected bridge-core/ACP **514 / 0**, and the full
@@ -199,11 +204,11 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** run a fresh Sol/xhigh closure review of exact branch tip, adjudicating the nine inherited
-  `WRONG` findings first; fold/reverify any remaining `WRONG`, then run the separate release/compatibility
-  lens only after correctness is green. No live resolution, model discovery, compatibility aggregate,
-  operator rebuild, or operator swap is authorized. OpenRouter/OpenCode remain R3e/R3f after the R3 core and
-  before R4.
+- **Next action:** run a fresh Sol/xhigh closure review of the exact branch tip, adjudicating every inherited
+  `WRONG` from both earlier reviews first; fold/reverify any remaining
+  `WRONG`, then run the separate release/compatibility lens only after correctness is green. No exact-current
+  live resolution, model discovery, compatibility aggregate, operator rebuild, or operator swap is
+  authorized. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**
@@ -254,7 +259,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **IN PROGRESS**. Attempts 1 and 2 remain non-promotable failure evidence. Exact `a1641d0` and `d0be430` reviews returned `REVISE`; exact `87c8f4e` Sol closure review adjudicated both inherited items fixed, found no new `WRONG`, and returned `APPROVE`. The one clean-room Fable/xhigh review of exact `a0c2c4c` independently found no `WRONG`, returned release verdict `READY`, and ended `GATE: APPROVE` with nonblocking smells recorded. No Fable re-review. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner and R3b pinned lane merged; R3c owns provider-free floating resolution plus bound execution; then R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **IN PROGRESS** at code head `f15ae88`. R3b attempts 1 and 2 remain non-promotable failure evidence. R3b exact `87c8f4e` Sol closure review approved and the one clean-room Fable/xhigh review of exact `a0c2c4c` returned release verdict `READY` and `GATE: APPROVE`; no Fable re-review. R3c's initial `a5dfef8` and closure `646d61b` Sol reviews returned `REVISE`; `f15ae88` closes the latter review's unresolved hard-bound and PGID-reuse findings. Exact-head full/release/policy gates are green; re-review is pending. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner and R3b pinned lane merged; R3c owns provider-free floating resolution plus bound execution; then R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -293,6 +298,26 @@ serve-only session/configuration defect. Source inspection confirms `session/new
 model/effort `session/set_config_option` rejection can both map to `AgentCrashed` before a turn-log row.
 Carry the missing structured failure projection and stale-shared-state recovery question into R2f/R3d;
 do not replay automatically or use this review as compatibility evidence.
+
+### Deferred incident: long-lived operator accumulated unreleased ACP sessions
+
+`INC-SHARED-SESSION-CAPACITY-2026-07-17` extends the earlier shared-warm crash evidence. The long-lived
+operator on port 18080 returned two immediate Codex `AgentCrashed` failures before any provider turn while
+its bridge, codex-acp, and Codex app-server processes remained alive. An isolated operator on port 18081 then
+completed the same selected package/model/effort/mode and review shape. The old Codex app-server had observed
+15 distinct session thread ids and no close notifications; bridge release removed its local session entry
+without sending ACP `session/close`, while codex-acp retains sessions until such a close.
+
+The leading hypothesis is leaked or exhausted agent-session capacity, but root cause remains **unknown**:
+the evidence has not yet separated a capacity ceiling from a poisoned long-lived transport. General package,
+model, auth, and cwd incompatibility predict failure in the isolated operator and are falsified by its green
+turn. A transport-specific fault predicts old-only failure without requiring a particular session count and
+remains viable. No operator process, warm session, or active turn was stopped or restarted.
+
+Carry this into R2f/R3d as structured pre-turn ACP error retention, backend/session-capacity health,
+capability-gated close semantics, dead-backend detection, a deterministic threshold regression, and a
+non-disruptive drain/rotate design that never interrupts running turns or warm sessions. Do not automatically
+replay the failed request or treat the isolated review as compatibility evidence.
 
 ### Resolved incident: synchronized but expired Claude OAuth reached billable prompt
 
@@ -578,14 +603,21 @@ Next action:
   returned nine `WRONG`, no `SMELL`, and `GATE: REVISE`. `e3459a5` closes registry authority/shared-budget,
   in-flight resource, definitive-failure/cancellation, descendant-cleanup, inventory-security,
   production-manifest baseline, catalog-projection, aggregate-comparison, and cursor defects. `d86e418`
-  adds the catalog-only pre-fix-red regression. Focused, full-host, release, hygiene, protected-input,
-  manifest/recipe, dependency-policy, and removed-check mutation gates are green at the exact totals in the
-  top cursor. Linux/Rust 1.94 remains green on historical implementation head `57e63a0`, not rerun on the
-  reviewed fold because no local image remained and no pull was authorized. Correctness closure and
-  release/compatibility reviews remain. No provider, package-registry resolution, bridge runtime/container,
-  model-discovery, compatibility aggregate, operator rebuild, or operator swap ran; the complete restart
-  contract, schemas, failure taxonomy, mutation matrix, live authorization gates, rollback, and deferrals
-  remain in the active R3 plan.
+  adds the catalog-only pre-fix-red regression. Closure review of exact `646d61b` fixed eight inherited
+  items but returned `REVISE` on transient aggregate resource overshoot and process-group reuse. Current code
+  head `f15ae88` moves exact integrity-bound tree materialization behind bridge-owned hard aggregate
+  reservation, avoids retained per-directory descriptors, and retains a trusted process-group leader until
+  cleanup; focused resolution tests pass **47 / 0** and the exact-head host suite passes
+  **2,151 / 0 / 12 ignored** across **70** executables. Format/diff, all-target check, warnings-denied
+  all-feature Clippy, locked release, hygiene **37/7**, both manifests, protected inputs, and dependency
+  policy are green; re-review remains. Explicitly authorized provider-free host diagnostics resolved current
+  Codex and Claude package
+  trees and produced green generated-config doctors, but the retained bundles predate `f15ae88` and are
+  diagnostic rather than exact-current compatibility evidence. Linux/Rust 1.94 remains green only on
+  historical implementation head `57e63a0`; no local image remains and no pull was authorized. No provider
+  turn, model discovery, image resolution/build, compatibility aggregate, operator rebuild, or operator swap
+  ran; the complete restart contract, schemas, failure taxonomy, mutation matrix, live authorization gates,
+  rollback, and deferrals remain in the active R3 plan.
 - Authorized attempt 2 is retained at
   `/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json`, SHA-256 `319b3cf4...a9b3e`. Its exact
   `323b4e21...a079` candidate passed both host cases and failed both reader cases before prompt acceptance
