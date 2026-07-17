@@ -541,7 +541,7 @@ updates `docs/compatibility.md` and the changelog when release-relevant.
 ## R3c — floating-current lane
 
 - **Branch:** `agent/reliability-r3c-floating-lane`
-- **State:** **IN PROGRESS** from clean base
+- **State:** **APPROVED / PENDING MERGE** from clean base
   `504c1e434fd5845bc6745e0b0a0aae95427afbdd`
 - **Current code head:** `4bd63f3f129a08586742c3c3e946fecfa02839ba`; deterministic full-branch
   gates are green. Sol/xhigh review of exact
@@ -549,7 +549,8 @@ updates `docs/compatibility.md` and the changelog when release-relevant.
   `SMELL`, and returned `GATE: REVISE` on one new archive-metadata allocation `WRONG`; `4bd63f3` closes it.
   Fresh Sol/xhigh closure review of exact docs head `056738111075317d3e7bcb3784491975e138e771`
   adjudicated all 15 inherited findings **FIXED**, found no new `WRONG` or `SMELL`, and returned
-  `GATE: APPROVE`; one release/compatibility lens remains.
+  `GATE: APPROVE`. The separate Opus 4.8/xhigh release/compatibility lens of exact clean `6637c13`
+  found no `WRONG` or `SMELL`, returned `READY`, and ended `GATE: APPROVE`.
 - **Design evidence:** one bridge-mediated clean-room Sol/xhigh read-only design pass inspected exact
   `504c1e43`. Beyond that review turn, it ran no provider compatibility prompt, package resolution,
   container action, build, test, or nested agent. The design turn is architecture evidence, not
