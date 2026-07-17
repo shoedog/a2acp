@@ -1,15 +1,29 @@
 # R3 — Compatibility manifest and canary implementation plan
 
-- **Status:** overall R3 **IN REVIEW**; R3a **APPROVED / PENDING MERGE** — initial review and closure
-  re-reviews 1–4 on `884bc5f`,
-  `b37147c`, `c8c9452`, `a8602bb`, and `42523e1` returned `REVISE`; the intervening exact-`bc9f64c`
-  attempt ended on provider capacity without a verdict. Every completed finding set is folded on
-  `agent/reliability-r3a-manifest-runner`. Sol/xhigh closure re-review 5 of exact `fba430fe` returned
-  `APPROVE`, then the single independent Fable/xhigh adversarial implementation and
-  release/compatibility review of that same exact commit returned `READY` and `APPROVE`. This
-  approval-recording docs fold is the exact artifact for the required final targeted Sol/xhigh status
-  review before the non-draft PR
-- **Prerequisite:** R2c and R2d merged (`a6fec94c`, PR #29)
+- **Status:** overall R3 **IN REVIEW**; R3a **MERGED** at `3927df3f` by PR #31; R3b
+  **APPROVED / PENDING MERGE** on
+  `agent/reliability-r3b-pinned-lane`. Nine pinned rows are implemented. Exact
+  `c458045cf3d0923457519e253d22dd545363f98d` Sol/xhigh review approved the pre-incident deterministic
+  tree. Authorized attempt 1 remains non-promotable stale-auth evidence; authorized attempt 2 passed both
+  host paths and failed both reader paths before prompt acceptance when their runtime objects never started.
+  The post-incident classification/cleanup fold passes binary **395 / 0 / 0**, affected bridge-core/ACP
+  **514 / 0**, and the full serial workspace **2,085 / 0 / 12 ignored** across **70** test/doc-test
+  executables. Format/diff, check, Clippy, locked release, hygiene **37/7**, manifest, and dependency-policy
+  gates are green. The provider-unexercised release binary is 22,984,800 bytes at SHA-256
+  `7c6cf5407fecb114c51ff211d8526df96c084d07217dc03f2913583c2481093d`; the bound manifest SHA-256 is
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The earlier Linux/Rust 1.94
+  binary **396 / 0 / 0** and Linux smoke CLI **15 / 0** gates predate this fold and were not rerun while
+  local new-container starts remained degraded. Exact `a1641d0` Sol/xhigh review returned `REVISE` on
+  pre-settlement cancellation ownership plus lifecycle-negative and legacy-compatibility coverage. Exact
+  `d0be430` closure review fixed the live-runtime ownership and legacy findings, but returned `REVISE` on
+  runtime-shutdown cleanup plus partial repeated-`Unknown` coverage. Exact `87c8f4e` closure review
+  adjudicated both inherited items `FIXED`, found no new `WRONG`, and returned `APPROVE`; two
+  resource/pathological-OS fault-boundary `SMELL`s remain accepted/nonblocking and unverified. The stale
+  next-action wording it identified is fixed. The one clean-room Fable/xhigh/plan review of exact `a0c2c4c`
+  independently found no `WRONG`, reported five nonblocking `SMELL`s, returned release verdict `READY`, and
+  ended `GATE: APPROVE`. This docs fold closes its non-USD cost wording gap; all other verification/fault
+  boundaries remain accepted/nonblocking. No Fable re-review will run.
+- **Prerequisite:** R2c/R2d merged (`a6fec94c`, PR #29); R3a merged (`3927df3f`, PR #31)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Completion shape:** R3a local manifest/runner, R3b pinned lane, R3c floating lane, R3d scheduling,
@@ -301,6 +315,186 @@ is unchanged.
 ## R3b — pinned lane and promotion baseline
 
 - **Branch:** `agent/reliability-r3b-pinned-lane`
+- **Implementation state (2026-07-16):** nine pinned rows validate at manifest SHA-256
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-incident fold
+  passes binary **395 / 0 / 0**, affected bridge-core/ACP **514 / 0**, and the full serial workspace
+  **2,085 / 0 / 12 ignored** across **70** test/doc-test executables. The provider-unexercised release
+  binary is 22,984,800 bytes at SHA-256
+  `7c6cf5407fecb114c51ff211d8526df96c084d07217dc03f2913583c2481093d`; the bound manifest SHA-256 is
+  `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. All
+  format/check/Clippy/release/hygiene/manifest/dependency-policy gates are green. The earlier Linux/Rust
+  1.94 binary **396 / 0 / 0** and Linux smoke CLI **15 / 0** gates apply only to the pre-incident tree.
+  An intermediate Linux run was **393/1** only because the container could not resolve this worktree's
+  host-absolute `.git` pointer; the exact Git pointer/common-directory mounts restored repo identity and
+  the unchanged test passed in the **394/0** rerun.
+  The pinned baseline remains empty pending a future all-green, separately authorized aggregate. Fresh
+  Sol/xhigh closure review of
+  exact `c38978a` returned `APPROVE` with no `WRONG`; its sole nonblocking test-coverage `SMELL` is
+  closed. A later exact-`f9f3e68` review returned `REVISE` on the pre-recovery deadline gap plus direct
+  parser/comment smells. That fold had full host/Linux/merge-policy gates green. Sol subsequently approved
+  exact `427d2ed` with all inherited items fixed and no findings.
+  A post-review audit then demonstrated immediate-expiry inner-future polling and exact pinned third-party
+  provider false-blocks. Review of exact `4574cbb` adjudicated both fixed, then returned `REVISE` because
+  configure/prompt/drain retained inner-first deadline polling, the active gate inventories differed, and
+  two operator surfaces allowed a rerun after only one green Claude doctor. Its provider-selector oracle
+  `SMELL` is closed by an independent exact five-name assertion. The `9d10e6f` fold uses one deadline-first
+  primitive through resolution/configure/prompt/drain, aligns the literal gate and two-doctor /
+  one-new-four-case-aggregate contracts, and is full-gate green. Fresh Sol/xhigh review of exact `9d10e6f`
+  adjudicated deadline ordering, two-doctor wording, and the provider-list oracle fixed; kept the release
+  inventory partial and resolver fixture accepted/nonblocking; and returned `REVISE` because unpolled
+  expired stages still serialized configure/prompt calls plus false acceptance and because active
+  inventories omitted full binary/manifest bindings. The current fold tracks first poll before counting a
+  stage, preserves exact timeout phase/last-completed evidence, repeats the full candidate binding on every
+  active inventory surface, and is full-gate green. Fresh Sol/xhigh closure review of exact
+  `c458045cf3d0923457519e253d22dd545363f98d` adjudicated both inherited `WRONG` findings fixed, retained
+  the resolver fixture as accepted/nonblocking, found no new `WRONG` or `SMELL`, and returned `APPROVE`.
+  The prompt-call
+  assertion fails **0 / 1** on exact `9d10e6f` with actual `1` versus expected `0` and passes **1 / 0** on
+  the current fold. The
+  partially-progressed-resolver cleanup mutation `SMELL` remains accepted and nonblocking because the
+  inspected ownership/drop, invalidation, and run-scoped backstop are not a direct acquisition fixture.
+
+Fresh Sol/xhigh review of exact `a1641d063cc8564514bfc641e91f9f1ba323aa60` returned `REVISE` with one
+`WRONG` and two `SMELL`s. The `WRONG` demonstrated that a registry initializer canceled after positive
+`NotStarted` evidence but before timeout dropped `Supervised` without ever starting the exact named reap,
+then allowed one successor initializer. The regression failed **0 / 1** on that reviewed tree by timing out
+with zero reaps. The current fold establishes an unpublished-spawn guard immediately after process creation;
+normal success transfers both owners, ordinary error joins cleanup, and cancellation at any pre-publication
+await starts terminate-then-reap. The corrected regression uses Tokio `OnceCell`, observes exact client
+exit before one reap, and permits one clean successor. The lifecycle-coverage `SMELL` is closed by direct
+`container.runtime.start_failed`, repeated-`Unknown`, and synchronous/asynchronous probe-panic controls.
+The compatibility `SMELL` is closed by proving a blocking conforming legacy `ReapFn` still runs detached and
+does not delay the original spawn error. That fold then required exact-candidate Sol closure re-review.
+
+Fresh Sol/xhigh closure review of exact `d0be43075e2ba9792bf9e47e5e3631ecf0d22b8b` marked the inherited
+live-runtime cancellation `WRONG` and legacy compatibility `SMELL` fixed. It kept the repeated-`Unknown`
+control `PARTIAL` because the 100 ms deadline permitted at most one observation, then returned `REVISE`
+with one new `WRONG`: guard Drop could submit cleanup to the current Tokio runtime during shutdown, where
+the new task need never be polled, leaving the exact named container behind. That shutdown regression failed
+**0 / 1** on the reviewed tree with zero reaps. A second control then proved the same **0 / 1** zero-reap
+result when shutdown occurred after ordinary-error settlement had already transferred both resources into
+its runtime-bound task. The current fold terminates and reaps the exact client without Tokio, starts the
+shared named reaper on a fresh OS thread/runtime, and retains one RAII join handle across the async
+ordinary-error wait. The two corrected regressions prove client exit before one exact reap whether source
+shutdown occurs before classification or during settlement; the strengthened unknown-state control counts
+at least two observations before preserving the initialize timeout. A combined affected run also exposed one fixture-only 200 ms
+exact-status timeout under post-compile load (**259 / 1** in bridge-core); default and all-feature isolated
+controls passed, so the ordinary-status fixture now uses the production 1 s bound while the independent
+20 ms hung-command cancellation control remains unchanged.
+
+Fresh Sol/xhigh closure review of exact `87c8f4e096fbcd255bf97664cf6605cfb14c9e77` adjudicated the
+runtime-shutdown `WRONG` and repeated-`Unknown` `SMELL` `FIXED`, confirmed the previously closed live-runtime
+and legacy schedules remained fixed, found no new `WRONG`, and returned `APPROVE`. It accepted two
+nonblocking fault-boundary `SMELL`s: OS-thread/fresh-runtime creation failure was not fault-injected, and the
+five-second post-SIGKILL `try_wait` ceiling cannot prove exit under a pathological OS state. Its third
+`SMELL` was the roadmap's stale “commit the fold” next action, fixed in this approval-recording docs fold.
+The reviewer accepted the supplied gates without rerunning them and performed no container/provider action.
+
+The one clean-room Fable/xhigh/plan adversarial implementation plus release/compatibility review of exact
+`a0c2c4c5a526f99603702f826d5401aa39864d4d` independently inspected the full 29-path branch, found no
+`WRONG`, returned release verdict `READY`, and ended `GATE: APPROVE`. It independently recomputed the
+manifest, settings, and nine config hashes; verified the empty baseline; and rechecked both retained
+aggregate files' mode, size, and SHA-256 without running a compatibility case. Its five nonblocking `SMELL`
+groups are dispositioned as follows:
+
+- the docs' negative/non-finite cost wording omitted the fail-closed non-USD-against-USD-cap case; fixed in
+  this approval-recording fold;
+- the exact external-provider truthiness agreement remains based on recorded pinned-SDK inspection rather
+  than an in-tree oracle; accepted/nonblocking;
+- OS-thread/fresh-runtime creation failure and the pathological post-SIGKILL ceiling remain the same
+  explicitly unverified, accepted/nonblocking fault boundaries from the Sol review;
+- intentionally broad fail-closed credential/Fable spelling rules and real-Podman label coverage remain
+  accepted/nonblocking policy/coverage edges.
+
+This was the only Fable review turn for the fold. It is review evidence, not compatibility evidence, and no
+Fable re-review will run.
+
+The initial fresh one-shot Sol/xhigh review of exact `57f3ee8` returned `REVISE` with two `WRONG`
+findings and three `SMELL`s. The branch now keeps negative, non-finite, or non-USD cost history sticky across
+later snapshots, aligns both reader-count surfaces, refuses ambiguous duplicate settings provenance,
+adds Claude image-label/drift mutation coverage, and test-locks the baseline empty until authorized
+promotion. All findings are folded. Fresh Sol/xhigh closure review of exact `c38978a` returned `APPROVE`
+with no `WRONG` and one nonblocking `SMELL`: both sticky-cost usage orders were tested only on normal
+completion, not the backend-error serializer exit. The current tree drives both orders into an actual
+stream error and asserts the terminal state plus rejected-cost artifact. That exact regression passes
+**1/0** here and failed **0/1** on pre-fold `9c2b712`, where invalid-then-valid leaked `cost`. The full
+host suite then passed **2,060/0/12 ignored** across **70** groups; corrected Linux/Rust 1.94 binary units
+passed **388/0**. A reconstructed Linux harness first produced three unrelated execution failures because
+its `/tmp` tmpfs was `noexec`; a direct execute probe exited **126** there and **0** with explicit `exec`,
+after which the unchanged product tests were green. The separate shared operator pre-prompt crash
+is recorded in the central roadmap and did not trigger a replay or process restart.
+
+Authorized live attempt 1 ran exact candidate SHA-256 `d852cc28...4e50` and manifest
+`5d18cefe...c235d828` once, with zero retry/fallback. Codex host/reader returned terminal exact `PONG`
+in 8.649 s / 4.751 s. Claude 0.44 host and 0.55 reader both initialized, created sessions, applied exact
+Fable/xhigh, and reached prompt start, then failed HTTP 401 in 3.117 s / 2.992 s; both cleanup paths
+completed. The aggregate ended non-cancelled after 19.512 s, observed 38,053 tokens and zero cost, exhausted
+no budget, left all five controls unrun, and is non-promotable. Its mode-`0600` artifact is
+`/private/tmp/a2a-bridge-r3b-live.EeBAyf/pinned-aggregate.json`, SHA-256 `7f718f32...1571c1`.
+
+The failure falsified model selection and container-only degradation: model/effort application completed
+on both paths and host/reader failed symmetrically. Both access tokens had expired about five hours before
+the run. The five-minute launchd sync had succeeded, proving that byte synchronization alone propagated
+the stale host state. R3b therefore adds bounded token-blind OAuth metadata parsing, a 16-minute access
+runway row for host and exact mounted reader credentials, and a smoke guard that refuses a non-OK row
+before adapter resolution. Host automatic auth honors a non-empty absolute `CLAUDE_CONFIG_DIR` and fails
+closed on empty/relative ambiguity. The absolute smoke deadline begins before provenance and orphan
+recovery, preventing accepted runway from aging behind a fresh timeout; one deadline-first primitive refuses
+without polling resolution, configure, prompt, or drain once expired. Truthy
+Bedrock/Vertex/Foundry/Anthropic-AWS/Mantle selectors use
+external host authentication and bypass first-party file OAuth, while false-like/unknown values and mounted
+reader credentials do not. The original spawned regression
+failed pre-change **1 passed / 1 failed** because the expired case reached the fake adapter. The newer
+config-directory and delayed-recovery regressions also fail pre-change. The pre-attempt-2 post-`9d10e6f`
+closure fold passed binary **395 / 0 / 0**, full serial workspace **2,071 / 0 / 12 ignored** across **70**
+groups, Linux/Rust 1.94 binary **396 / 0 / 0**, and Linux smoke CLI **15 / 0**. Focused gates passed OAuth
+doctor **5 / 0**, external-provider auth **1 / 0**, resolve-deadline **1 / 0**, execute-stage deadline
+**1 / 0**, delayed-recovery CLI **1 / 0**, and expired/fresh CLI controls **2 / 0**. The provider-unexercised
+release binary was 22,966,384 bytes at SHA-256
+`323b4e219130480c9f0cafe90fe7c36d0a64ec17467707876698a82ef574a079`; the bound manifest SHA-256 is
+`5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. A fresh host login, post-login
+sync, two green Claude doctors, and separate authorization then admitted one new four-case aggregate.
+Attempt 1 must never be replayed or promoted.
+
+That precondition was satisfied and the operator separately authorized attempt 2; it was a new aggregate,
+not a replay. Candidate SHA-256 `323b4e21...a079` and the same exact manifest ran once with zero
+retry/fallback. Codex/Fable host passed exact `PONG` in 6.853 s / 7.024 s. Both readers failed before
+prompt acceptance in 30.430 s / 30.541 s: local spawn completed, ACP initialize timed out, and each exact
+named container remained only `created` with a zero start timestamp. The aggregate ended non-cancelled in
+74.853 s with 54,210 observed tokens, USD 0.227602 observed cost, no drift/budget violation, no promotion,
+and all five controls unrun. It is retained owner-only at
+`/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json`, SHA-256 `319b3cf4...a9b3e`; it must never
+be retried or promoted.
+
+Both host passes, healthy proxy/network metadata, 247 GiB free host storage, and identical failures before
+reader ACP traffic falsified provider/auth/egress/disk-specific causes. A no-network
+`alpine:latest /bin/true` start also timed out before and after the two A2A objects were removed, while
+runtime `info`, image listing, and exact-container inspection remained responsive. The settled boundary is
+a local OrbStack/Docker new-container lifecycle stall; its initiating internal cause is unknown. The two
+never-started objects were later removed exactly. OrbStack, running operator/user containers, turns, and
+warm sessions were not restarted or killed.
+
+The post-attempt deterministic fold keeps doctor read-only and adds the active startability boundary at the
+actual production container spawn. A bounded exact-name runtime observer holds Spawn open while a positively
+observed object remains pre-start; deadline then emits `container.runtime.start_timeout` as
+`ContainerRuntime / ContainerFallbackCandidate`, with no Initialize transition and false prompt acceptance.
+Started state preserves the ordinary Initialize path, while unknown observations preserve the prior diagnosis
+rather than inventing container evidence. A bridge-owned production guard takes exact-client/controller
+ownership immediately after spawn, transfers it only with a complete backend, and retains one independent
+joined thread/runtime flight across ordinary error, cancellation, and source-runtime shutdown.
+Public legacy callbacks retain detached fire-and-forget behavior. Typed reap failure is retained as a
+bounded cause on the new start failure. The
+classification, cleanup order, pre/post-settlement cancellation, one-successor `OnceCell`, `start_failed`,
+started/unknown lifecycle, sync/async panic, deadline-first, parser, bounded-output/timeout, and legacy
+regressions are deterministic. The pre-settlement cancellation and both source-runtime-shutdown regressions
+each failed **0 / 1** with zero reaps; the deadline-first regression failed **0 / 1** with two runtime probes;
+the original three mutations also fail under their exact pre-fix behavior. The full host suite passes
+**2,085 / 0 / 12 ignored** across **70** test/doc-test executables; affected core/ACP tests pass **514 / 0**,
+and binary tests pass **395 / 0**. No additional compatibility/model smoke ran; three source-only Sol reviews
+ran. Exact `a1641d0` and `d0be430` reviews returned `REVISE`; exact `87c8f4e` returned `APPROVE` with no new
+`WRONG` and two accepted nonblocking fault-boundary `SMELL`s. The one clean-room Fable/xhigh/plan review of
+exact `a0c2c4c` independently found no `WRONG`, returned `READY`, and ended `GATE: APPROVE`; its nonblocking
+findings are recorded above. R3b is **APPROVED / PENDING MERGE**, with no Fable re-review.
 
 Seed rows for every currently claimed path or control in `docs/compatibility.md`:
 
@@ -317,11 +511,22 @@ new prompt engine. They do not become supported release paths without a separate
 artifact contract.
 
 Before adding credential-bearing rows, extend the deterministic runner controls with symmetric
-final-sibling same-name replacement coverage, additional credential-shaped environment names, and
-explicit negative/non-finite reported-cost handling. Preserve exact credential-value and sensitive-key
+final-sibling same-name replacement coverage, additional credential-shaped environment names, and explicit
+negative, non-finite, or non-USD reported-cost handling that remains sticky across later usage snapshots and
+fails closed against the USD-denominated cap.
+Preserve exact credential-value and sensitive-key
 backstops; heuristic expansion must not be presented as general secret detection. Exact identity grammar
 may fail closed on unsupported authoring forms, but every rejected supported-provider identity needs an
 explicit reviewed spelling rather than an automatic relaxation.
+
+The implemented controls also hash each pinned config before provider spawn and bind the Fable reader's
+mounted minimal settings file by exact SHA-256 in smoke provenance. Container support rows can green only
+when bounded inspection of the configured immutable image returns exact adapter and agent-CLI labels.
+Missing/malformed labels, an unreadable settings file, or multiple declarations for the same settings
+destination remain visible `WARN` provenance and therefore cannot satisfy the pinned drift check. The
+reader candidate is built under a unique non-operator tag at
+immutable id `sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1`;
+the running operator image/tag/process were not changed.
 
 Run from the candidate release binary and exact image id. Compare versioned artifacts to
 `compatibility/baselines/pinned.json`; any provenance, capability, auth, phase, terminal, or diagnostic

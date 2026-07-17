@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "manifest_schema_version": 1,
-  "manifest_sha256": "f6481b2e88d55ebbdbed33d73bac40b871627ed1ef6779f582c3943858249007",
+  "manifest_sha256": "5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828",
   "aggregate": {
     "success": true,
     "cancelled": false,

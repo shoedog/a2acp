@@ -1,9 +1,303 @@
-# R3a establishes the versioned schema and local runner. R3b deliberately adds the reviewed pinned
-# cases; R3c adds floating-current candidates. Keeping this first manifest empty prevents an R3a
-# checkout from acquiring a billable default merely because the runner exists.
+# R3b pinned lane. Selection remains explicit and every run still requires --acknowledge-billable.
+# `os`/`architecture` identify the owner machine that launches the runner; immutable image ids bind
+# the inner Linux/arm64 environment for container cases. Historical controls stay explicit and unrun.
 schema_version = 1
 
 [budget]
 timeout_secs = 1800
 max_tokens = 500000
 max_cost_usd = 5.0
+
+[[cases]]
+id = "codex-host-bridge-gpt56-sol"
+lane = "pinned"
+evidence_path = "bridge_smoke"
+execution_mode = "host"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+config = "configs/codex-host.toml"
+agent = "codex-host"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+mode = "read-only"
+session_cwd = "/Users/wesleyjinks/code/a2a-bridge"
+auth_path = "pre_authenticated"
+required_env = []
+probe = "minimal"
+billable = true
+timeout_secs = 180
+max_tokens = 100000
+retry_cap = 0
+expected_status = "PASS"
+classification = "support"
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[cases.pins]
+config_sha256 = "b87249229c6888249b202705993fadc764d3520536f7a0a00612bc2811dcea5d"
+model = "gpt-5.6-sol"
+adapter = "@agentclientprotocol/codex-acp=1.1.2"
+agent_cli = "@openai/codex=0.144.1"
+
+[[cases]]
+id = "codex-reader-bridge-gpt56-sol"
+lane = "pinned"
+evidence_path = "bridge_smoke"
+execution_mode = "container_ro"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+expected_image_digest = "sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1"
+config = "configs/codex-reader.toml"
+agent = "codex-reader"
+model = "gpt-5.6-sol"
+effort = "xhigh"
+session_cwd = "/Users/wesleyjinks/code/a2a-bridge"
+auth_path = "pre_authenticated"
+required_env = []
+probe = "minimal"
+billable = true
+timeout_secs = 300
+max_tokens = 100000
+retry_cap = 0
+expected_status = "PASS"
+classification = "support"
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[cases.pins]
+config_sha256 = "70d0b54aa905db58e253576fcb92d57c63b001f9fdcf05e79ed1262554bd5ad2"
+model = "gpt-5.6-sol"
+adapter = "@agentclientprotocol/codex-acp=1.1.2"
+agent_cli = "@openai/codex=0.144.1"
+image_digest = "sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1"
+
+[[cases]]
+id = "claude-direct-host-cli-fable"
+lane = "pinned"
+evidence_path = "direct_cli"
+execution_mode = "host"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+config = "configs/claude-direct-host-cli.toml"
+agent = "claude-direct"
+model = "fable"
+auth_path = "automatic"
+required_env = []
+probe = "minimal"
+billable = true
+timeout_secs = 120
+max_tokens = 100000
+retry_cap = 0
+expected_status = "PASS"
+classification = "non_goal"
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[cases.pins]
+config_sha256 = "43745bcd55f396abb76b945d2a7cbe106b0380d07cf64d00acad50dab3a137ad"
+model = "fable"
+agent_cli = "@anthropic-ai/claude-code=2.1.207"
+
+[[cases]]
+id = "claude-host-acp-044-fable"
+lane = "pinned"
+evidence_path = "bridge_smoke"
+execution_mode = "host"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+config = "configs/claude-host-044.toml"
+agent = "claude-host"
+model = "claude-fable-5[1m]"
+effort = "xhigh"
+session_cwd = "/Users/wesleyjinks/code/a2a-bridge"
+auth_path = "automatic"
+required_env = [{ name = "A2A_BRIDGE_ALLOW_FABLE", one_of = ["1", "true"] }]
+probe = "minimal"
+billable = true
+timeout_secs = 180
+max_tokens = 100000
+retry_cap = 0
+expected_status = "PASS"
+classification = "support"
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[cases.pins]
+config_sha256 = "d6b69b54aab7566336841d8713c17074083d9ed7c3ad7692e171e389d4c82ef2"
+model = "claude-fable-5[1m]"
+adapter = "@agentclientprotocol/claude-agent-acp=0.44.0"
+agent_cli = "@anthropic-ai/claude-agent-sdk=0.3.170"
+
+[[cases]]
+id = "claude-host-acp-055-fable"
+lane = "pinned"
+evidence_path = "direct_acp"
+execution_mode = "host"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+config = "configs/claude-host-055-historical.toml"
+agent = "claude-055"
+model = "claude-fable-5[1m]"
+effort = "xhigh"
+auth_path = "automatic"
+required_env = [{ name = "A2A_BRIDGE_ALLOW_FABLE", one_of = ["1", "true"] }]
+probe = "minimal"
+billable = true
+timeout_secs = 120
+max_tokens = 100000
+retry_cap = 0
+expected_status = "PASS"
+classification = "non_goal"
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[cases.pins]
+config_sha256 = "bdb472b9c85a802b794ee8954ee6f1bde8a8afe2b3a3f987095a21f540d74ac8"
+model = "claude-fable-5[1m]"
+adapter = "@agentclientprotocol/claude-agent-acp=0.55.0"
+agent_cli = "@anthropic-ai/claude-agent-sdk=0.3.198"
+
+[[cases]]
+id = "claude-reader-055-fable"
+lane = "pinned"
+evidence_path = "bridge_smoke"
+execution_mode = "container_ro"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+expected_image_digest = "sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1"
+config = "configs/claude-reader-055.toml"
+agent = "claude-reader"
+model = "claude-fable-5[1m]"
+effort = "xhigh"
+session_cwd = "/Users/wesleyjinks/code/a2a-bridge"
+auth_path = "pre_authenticated"
+required_env = [{ name = "A2A_BRIDGE_ALLOW_FABLE", one_of = ["1", "true"] }]
+probe = "minimal"
+billable = true
+timeout_secs = 600
+max_tokens = 100000
+retry_cap = 0
+expected_status = "PASS"
+classification = "support"
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[cases.pins]
+config_sha256 = "3517aeab56e82dce43e33c10ffe5b15bb396dee7a65ddcf1147603e4817484ee"
+model = "claude-fable-5[1m]"
+adapter = "@agentclientprotocol/claude-agent-acp=0.55.0"
+agent_cli = "@anthropic-ai/claude-agent-sdk=0.3.198"
+image_digest = "sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1"
+components = { fable-settings = "sha256:6ee4ad319cdfc34a558425ddda86f5b1da4c10912a08dfdc32c0c009eef81f19" }
+
+[[cases]]
+id = "claude-managed-no-egress-055-fable"
+lane = "pinned"
+evidence_path = "direct_acp"
+execution_mode = "host"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "managed-no-egress"
+config = "configs/claude-managed-no-egress-055-historical.toml"
+agent = "claude-no-egress"
+model = "claude-fable-5[1m]"
+effort = "xhigh"
+auth_path = "automatic"
+required_env = [{ name = "A2A_BRIDGE_ALLOW_FABLE", one_of = ["1", "true"] }]
+probe = "minimal"
+billable = true
+timeout_secs = 120
+max_tokens = 100000
+retry_cap = 0
+expected_status = "FAIL"
+classification = "non_goal"
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[cases.pins]
+config_sha256 = "2848e206f60dd771ab20872eb5c9e492b0648236b0f8d0d68911055d0e582922"
+model = "claude-fable-5[1m]"
+adapter = "@agentclientprotocol/claude-agent-acp=0.55.0"
+agent_cli = "@anthropic-ai/claude-agent-sdk=0.3.198"
+
+[[cases]]
+id = "kiro-host-stale"
+lane = "pinned"
+evidence_path = "direct_cli"
+execution_mode = "host"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+config = "configs/kiro-host-stale.toml"
+agent = "kiro-host"
+model = "claude-sonnet-4.5"
+auth_path = "automatic"
+required_env = []
+probe = "minimal"
+billable = true
+timeout_secs = 120
+max_tokens = 100000
+retry_cap = 0
+expected_status = "STALE"
+classification = "non_goal"
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[cases.pins]
+config_sha256 = "f9726ceeb8ae441709340ddfb1e7ff4f6d173703e5579abedd369e37102ab94e"
+model = "claude-sonnet-4.5"
+agent_cli = "kiro-cli=2.5.0"
+
+[[cases]]
+id = "kiro-reader-stale"
+lane = "pinned"
+evidence_path = "direct_cli"
+execution_mode = "container_ro"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+expected_image_digest = "sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1"
+config = "configs/kiro-reader-stale.toml"
+agent = "kiro-reader"
+model = "claude-sonnet-4.5"
+auth_path = "automatic"
+required_env = []
+probe = "minimal"
+billable = true
+timeout_secs = 120
+max_tokens = 100000
+retry_cap = 0
+expected_status = "STALE"
+classification = "non_goal"
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[cases.pins]
+config_sha256 = "cfe725ebfb427262c7fbfb929e2f45f35447a1410b0a49db4310578d18173ae4"
+model = "claude-sonnet-4.5"
+agent_cli = "kiro-cli=2.12.3"
+image_digest = "sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1"

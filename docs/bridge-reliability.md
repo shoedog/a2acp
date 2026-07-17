@@ -56,6 +56,18 @@ rather than artifact cwd, and emits a guarded distinct fixed-PONG smoke that the
 separately. The later smoke refuses if that source-mount object changed. The planner performs no external
 post-failure runtime probe and never executes the emitted plan.
 
+`doctor` remains a read-only configuration/metadata check and is not a new-container startability proof.
+Production container spawn separately observes the exact generated name inside the handshake deadline. A
+runtime-confirmed pre-start object fails in `Spawn` as `container.runtime.start_timeout` /
+`ContainerRuntime` with `ContainerFallbackCandidate` and a false replay barrier; started or unknown state
+cannot be relabeled as that failure. Bridge-owned production spawn arms one cancellation-safe cleanup owner
+immediately after process creation; success transfers it to the backend, ordinary error joins exact-client
+termination then exact named-container removal, and one independent joined thread/runtime owns that order
+through pre-publication cancellation or shutdown during ordinary-error settlement.
+Public legacy reap callbacks retain their detached fire-and-forget contract. This active boundary
+runs only after an operator-selected container path is actually spawned; it does not make doctor mutating or
+billable.
+
 Provider capacity is a separate axis. For trusted own-repo full-branch reviews, use Fable xhigh only when
 its usage window has headroom; when Claude is known to be near its usage limit, select the explicit
 `gpt-5.6-sol` reviewer at `xhigh` before starting. Reserve max for the tightly connected correctness and

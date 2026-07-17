@@ -1,0 +1,14 @@
+# Historical Kiro control retained as STALE until a separately authorized smoke re-baselines it.
+default = "kiro-host"
+
+[[agents]]
+id = "kiro-host"
+cmd = "kiro-cli"
+args = ["acp"]
+model = "claude-sonnet-4.5"
+
+[registry]
+allowed_cmds = ["kiro-cli"]
+
+[server]
+addr = "127.0.0.1:8080"

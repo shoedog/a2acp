@@ -1,0 +1,14 @@
+# Historical isolated 0.55 ACP control. The installed host adapter is 0.44; R3a keeps this row unrun.
+default = "claude-055"
+
+[[agents]]
+id = "claude-055"
+cmd = "claude-agent-acp"
+model = "claude-fable-5[1m]"
+effort = "xhigh"
+
+[registry]
+allowed_cmds = ["claude-agent-acp"]
+
+[server]
+addr = "127.0.0.1:8080"

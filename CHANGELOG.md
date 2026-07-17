@@ -7,6 +7,42 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ## [Unreleased]
 
+### Added
+
+- The R3b compatibility manifest now carries exact pinned contracts for four supported bridge-smoke
+  paths plus explicit historical Claude and stale Kiro controls. Pinned configs are digest-gated before
+  provider spawn; reader provenance binds immutable image package labels and the minimal Fable settings
+  file's SHA-256.
+
+### Changed
+
+- The reader image build pins and asserts the nested Codex 0.144.1 and Claude SDK 0.3.198 package
+  resolutions and publishes their non-secret exact identities as bounded-inspection image labels.
+
+### Fixed
+
+- Production container-backed ACP starts now distinguish a runtime object that never left its pre-start
+  state from an ACP initialization failure. The bridge reports that condition as a typed container-runtime
+  fallback candidate, terminates the exact supervised runtime client before one named-container reap, and
+  arms that ordered cleanup before the first cancellable post-spawn await so an initializing task cancelled
+  before failure classification cannot strand the named container. Cancellation or ordinary-error
+  settlement during Tokio runtime shutdown retains the same independent joined thread/runtime cleanup
+  owner instead of handing either flight back to the shutting reactor. Legacy reap callbacks remain detached.
+- Compatibility canaries now reject additional credential-shaped prerequisite names, surface negative,
+  non-finite, or non-USD costs against the USD-denominated cap as sticky blocking observations, and
+  directly cover final-sibling same-name replacement before aggregate publication. Ambiguous duplicate
+  Fable-settings destinations no longer report exact provenance.
+- Claude smoke/doctor preflight now reads only bounded, non-secret OAuth shape/expiry metadata and blocks
+  expired or short-runway credentials before adapter spawn. This prevents an automated isolated-credential
+  sync from turning an already expired host token into a billable host/reader failure. Host preflight honors
+  an absolute `CLAUDE_CONFIG_DIR`, rejects ambiguous empty/relative overrides, and starts the absolute smoke
+  deadline before provenance and orphan recovery so an accepted runway cannot age behind a fresh timeout.
+  One deadline-first primitive prevents resolution, configure, prompt, or drain from receiving an inner-first
+  poll after expiry, while truthy pinned Claude third-party provider selectors bypass first-party file OAuth
+  without weakening mounted-reader checks. Deadline refusal now counts configure/prompt calls only after the
+  corresponding future is polled and preserves the exact failed and last-completed phases without falsely
+  claiming prompt acceptance.
+
 ## [0.2.1] - 2026-07-10
 
 ### Fixed

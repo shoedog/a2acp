@@ -3,9 +3,14 @@
 use futures::FutureExt;
 use std::future::Future;
 use std::pin::Pin;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
+
+const CONTAINER_START_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const CONTAINER_START_STATUS_MAX_BYTES: u64 = 64;
 
 /// `(runtime, name) -> fire-and-forget reap`. Injectable so tests don't spawn Docker.
 pub type ReapFn = Arc<dyn Fn(String, String) + Send + Sync>;
@@ -14,6 +19,23 @@ pub type ReapFn = Arc<dyn Fn(String, String) + Send + Sync>;
 /// with operation-owned teardown diagnostics.
 pub type ReapAttemptFn = Arc<
     dyn Fn(String, String) -> Pin<Box<dyn Future<Output = Result<(), ReapFailure>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Runtime-observed state of one exact named container. `NotStarted` is deliberately narrower than
+/// generic runtime unavailability: it is returned only when the runtime itself says the object remains
+/// in a pre-start state. Callers must preserve their existing diagnosis for `Unknown`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerStartState {
+    NotStarted,
+    Started,
+    Unknown,
+}
+
+/// One bounded exact-name state observation. Injectable so ACP lifecycle tests never invoke Docker.
+pub type ContainerStartProbeFn = Arc<
+    dyn Fn(String, String) -> Pin<Box<dyn Future<Output = ContainerStartState> + Send>>
         + Send
         + Sync,
 >;
@@ -57,6 +79,7 @@ pub struct ReapController {
     runtime: String,
     name: String,
     attempt: ReapAttemptFn,
+    start_probe: Option<ContainerStartProbeFn>,
     shared: Arc<ReapShared>,
 }
 
@@ -80,6 +103,7 @@ impl ReapController {
             runtime: runtime.into(),
             name: name.into(),
             attempt,
+            start_probe: None,
             shared: Arc::new(ReapShared {
                 state: StdMutex::new(ReapState::NotStarted),
                 settled: tokio::sync::Notify::new(),
@@ -133,6 +157,40 @@ impl ReapController {
             })
         });
         Self::new(runtime, name, attempt)
+            .with_start_probe(production_start_probe(CONTAINER_START_PROBE_TIMEOUT))
+    }
+
+    /// Attach the bridge-owned exact-name start observer. Legacy controllers intentionally omit this
+    /// active runtime seam and retain their historical handshake behavior.
+    #[doc(hidden)]
+    pub fn with_start_probe(mut self, start_probe: ContainerStartProbeFn) -> Self {
+        self.start_probe = Some(start_probe);
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn has_start_probe(&self) -> bool {
+        self.start_probe.is_some()
+    }
+
+    /// Observe the exact named container once. A panicking injected observer fails closed to `Unknown`;
+    /// only positive runtime evidence can become `NotStarted` or `Started`.
+    #[doc(hidden)]
+    pub async fn probe_start_state(&self) -> ContainerStartState {
+        let Some(probe) = &self.start_probe else {
+            return ContainerStartState::Unknown;
+        };
+        let runtime = self.runtime.clone();
+        let name = self.name.clone();
+        let future =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe(runtime, name))) {
+                Ok(future) => future,
+                Err(_) => return ContainerStartState::Unknown,
+            };
+        match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+            Ok(state) => state,
+            Err(_) => ContainerStartState::Unknown,
+        }
     }
 
     fn ensure_started(&self) {
@@ -211,6 +269,66 @@ impl ReapController {
             ReapState::NotStarted | ReapState::Running => None,
         }
     }
+}
+
+fn classify_container_start_status(status: &[u8]) -> ContainerStartState {
+    let Ok(status) = std::str::from_utf8(status) else {
+        return ContainerStartState::Unknown;
+    };
+    match status.trim() {
+        // Docker reports `created`; Podman may expose the adjacent `configured`/`initialized` states.
+        "created" | "configured" | "initialized" => ContainerStartState::NotStarted,
+        "running" | "restarting" | "paused" | "exited" | "stopped" | "dead" | "removing"
+        | "stopping" => ContainerStartState::Started,
+        _ => ContainerStartState::Unknown,
+    }
+}
+
+fn production_start_probe(timeout: Duration) -> ContainerStartProbeFn {
+    Arc::new(move |runtime, name| {
+        Box::pin(async move {
+            let mut command = tokio::process::Command::new(&runtime);
+            command
+                .args([
+                    "container",
+                    "inspect",
+                    "--format",
+                    "{{.State.Status}}",
+                    &name,
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(_) => return ContainerStartState::Unknown,
+            };
+            let Some(stdout) = child.stdout.take() else {
+                return ContainerStartState::Unknown;
+            };
+            let observation = async move {
+                let mut bytes = Vec::new();
+                stdout
+                    .take(CONTAINER_START_STATUS_MAX_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .await
+                    .map_err(|_| ())?;
+                let status = child.wait().await.map_err(|_| ())?;
+                if !status.success()
+                    || u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+                        > CONTAINER_START_STATUS_MAX_BYTES
+                {
+                    return Ok(ContainerStartState::Unknown);
+                }
+                Ok(classify_container_start_status(&bytes))
+            };
+            match tokio::time::timeout(timeout, observation).await {
+                Ok(Ok(state)) => state,
+                Ok(Err(())) | Err(_) => ContainerStartState::Unknown,
+            }
+        })
+    })
 }
 
 /// Reap a named container exactly once (idempotent via the shared `reaped` flag).
@@ -382,6 +500,129 @@ mod tests {
         .join()
         .unwrap();
         // No panic = pass (the detached work runs on its own thread; we don't join it).
+    }
+
+    #[test]
+    fn container_start_status_classification_is_closed() {
+        for status in [b"created".as_slice(), b"configured", b"initialized"] {
+            assert_eq!(
+                classify_container_start_status(status),
+                ContainerStartState::NotStarted
+            );
+        }
+        for status in [
+            b"running".as_slice(),
+            b"restarting",
+            b"paused",
+            b"exited",
+            b"stopped",
+            b"dead",
+            b"removing",
+            b"stopping",
+        ] {
+            assert_eq!(
+                classify_container_start_status(status),
+                ContainerStartState::Started
+            );
+        }
+        for status in [
+            b"".as_slice(),
+            b"unknown",
+            b"CREATED",
+            b"created extra",
+            &[0xff],
+        ] {
+            assert_eq!(
+                classify_container_start_status(status),
+                ContainerStartState::Unknown
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_start_probes_fail_closed_to_unknown() {
+        let attempt: ReapAttemptFn = Arc::new(|_runtime, _name| Box::pin(async move { Ok(()) }));
+        let synchronous: ContainerStartProbeFn =
+            Arc::new(|_runtime, _name| panic!("synchronous start probe panic"));
+        let controller = ReapController::new("docker", "a2a-ro-sync-panic", Arc::clone(&attempt))
+            .with_start_probe(synchronous);
+        assert_eq!(
+            controller.probe_start_state().await,
+            ContainerStartState::Unknown
+        );
+
+        let asynchronous: ContainerStartProbeFn = Arc::new(|_runtime, _name| {
+            Box::pin(async move { panic!("asynchronous start probe panic") })
+        });
+        let controller = ReapController::new("docker", "a2a-ro-async-panic", attempt)
+            .with_start_probe(asynchronous);
+        assert_eq!(
+            controller.probe_start_state().await,
+            ContainerStartState::Unknown
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_start_probe_is_bounded_and_requires_exact_status() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        std::fs::write(
+            &runtime,
+            "#!/bin/sh\ncase \"$5\" in\n  created) printf created ;;\n  running) printf running ;;\n  oversized) printf '%065d' 0 ;;\n  *) exit 1 ;;\nesac\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&runtime, permissions).unwrap();
+        // Match the production bound for ordinary exact-status observations. The separate hung-runtime
+        // control below keeps its deliberately short timeout and proves cancellation independently.
+        let probe = production_start_probe(CONTAINER_START_PROBE_TIMEOUT);
+        let runtime = runtime.to_string_lossy().into_owned();
+
+        assert_eq!(
+            probe(runtime.clone(), "created".into()).await,
+            ContainerStartState::NotStarted
+        );
+        assert_eq!(
+            probe(runtime.clone(), "running".into()).await,
+            ContainerStartState::Started
+        );
+        assert_eq!(
+            probe(runtime.clone(), "oversized".into()).await,
+            ContainerStartState::Unknown
+        );
+        assert_eq!(
+            probe(runtime, "missing".into()).await,
+            ContainerStartState::Unknown
+        );
+
+        let hung_runtime = temp.path().join("hung-runtime");
+        let marker = temp.path().join("late-side-effect");
+        std::fs::write(
+            &hung_runtime,
+            "#!/bin/sh\nsleep 0.25\nprintf reached > \"$5\"\nprintf running\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&hung_runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hung_runtime, permissions).unwrap();
+        let probe = production_start_probe(Duration::from_millis(20));
+        assert_eq!(
+            probe(
+                hung_runtime.to_string_lossy().into_owned(),
+                marker.to_string_lossy().into_owned(),
+            )
+            .await,
+            ContainerStartState::Unknown
+        );
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(
+            !marker.exists(),
+            "a timed-out runtime probe must not reach its delayed side effect"
+        );
     }
 
     #[tokio::test]

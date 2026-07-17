@@ -71,7 +71,9 @@ use bridge_core::process::{
     ProcessStderrCursor, ProcessStderrRing, ProcessStderrSnapshot, Supervised,
 };
 use bridge_core::provider::{classify_acp_error_data, ProviderEvidence};
-use bridge_core::reaper::{production_reap_fn, ReapController, ReapFn};
+use bridge_core::reaper::{
+    production_reap_fn, ContainerStartState, ReapController, ReapFailure, ReapFn,
+};
 
 /// Default bound on the `initialize` handshake. A real agent that connects its
 /// stdio but never sends the initialize response would otherwise hang
@@ -88,10 +90,46 @@ const DEFAULT_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// Grace handed to `Supervised::terminate` between SIGTERM and the SIGKILL
 /// escalation when we nuke the agent process on a cancel/drop timeout.
 const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+const CONTAINER_START_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 const RICH_CONTENT_CAP: usize = 2048;
 const RICH_VEC_CAP: usize = 64;
 const PERMISSION_VIEW_CAP: usize = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContainerStartFailure {
+    TimedOut,
+    ProcessExited,
+}
+
+impl ContainerStartFailure {
+    fn code(self) -> &'static str {
+        match self {
+            Self::TimedOut => "container.runtime.start_timeout",
+            Self::ProcessExited => "container.runtime.start_failed",
+        }
+    }
+
+    fn summary(self) -> &'static str {
+        match self {
+            Self::TimedOut => "Container runtime did not start the ACP agent container in time",
+            Self::ProcessExited => {
+                "Container runtime left the ACP agent container unstarted when its client exited"
+            }
+        }
+    }
+}
+
+enum SpawnObservedFailure {
+    Bridge(BridgeError),
+    ContainerStart(ContainerStartFailure),
+}
+
+impl From<BridgeError> for SpawnObservedFailure {
+    fn from(error: BridgeError) -> Self {
+        Self::Bridge(error)
+    }
+}
 
 struct UniqueJsonObjectMembers;
 
@@ -1088,6 +1126,204 @@ pub struct AcpBackend {
 type PolicyHandle = Arc<StdMutex<Arc<dyn PolicyEngine>>>;
 type PermissionRegistryHandle = Arc<StdMutex<Option<Arc<PermissionRegistry>>>>;
 
+/// Hold the containerized spawn phase open until the exact named object has actually crossed its
+/// runtime start boundary. Unknown observations preserve the historical ACP handshake diagnosis; only
+/// a positively observed pre-start object can become a typed container-runtime failure.
+async fn await_container_start(
+    controller: Option<&ReapController>,
+    supervised: &mut Supervised,
+    deadline: tokio::time::Instant,
+) -> Result<(), ContainerStartFailure> {
+    let Some(controller) = controller.filter(|controller| controller.has_start_probe()) else {
+        return Ok(());
+    };
+    let mut saw_not_started = false;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return if saw_not_started {
+                Err(ContainerStartFailure::TimedOut)
+            } else {
+                Ok(())
+            };
+        }
+        let state = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                return if saw_not_started {
+                    Err(ContainerStartFailure::TimedOut)
+                } else {
+                    Ok(())
+                };
+            }
+            state = controller.probe_start_state() => state,
+        };
+        match state {
+            ContainerStartState::NotStarted => saw_not_started = true,
+            ContainerStartState::Started => return Ok(()),
+            ContainerStartState::Unknown => {}
+        }
+
+        if supervised.child_mut().try_wait().ok().flatten().is_some() {
+            return if saw_not_started {
+                Err(ContainerStartFailure::ProcessExited)
+            } else {
+                Ok(())
+            };
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return if saw_not_started {
+                Err(ContainerStartFailure::TimedOut)
+            } else {
+                Ok(())
+            };
+        }
+        tokio::time::sleep_until(std::cmp::min(deadline, now + CONTAINER_START_POLL_INTERVAL))
+            .await;
+    }
+}
+
+/// One runtime-independent cleanup flight. The thread owns both resources; this handle remains in the
+/// initializer across its async wait, so cancellation or runtime shutdown joins the same flight in Drop.
+struct UnpublishedContainerCleanup {
+    worker: Option<std::thread::JoinHandle<Option<ReapFailure>>>,
+    settled: Option<tokio::sync::oneshot::Receiver<Option<ReapFailure>>>,
+}
+
+impl UnpublishedContainerCleanup {
+    fn start(supervised: Supervised, controller: ReapController) -> Result<Self, ReapFailure> {
+        let (settled_tx, settled) = tokio::sync::oneshot::channel();
+        let worker = std::thread::Builder::new()
+            .name("a2a-unpublished-container-cleanup".to_owned())
+            .spawn(move || {
+                supervised.terminate_blocking(TERMINATE_GRACE);
+                let result = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(controller.reap_observed()).err(),
+                    Err(_) => Some(ReapFailure::Spawn),
+                };
+                let _ = settled_tx.send(result);
+                result
+            })
+            .map_err(|_| ReapFailure::Spawn)?;
+        Ok(Self {
+            worker: Some(worker),
+            settled: Some(settled),
+        })
+    }
+
+    async fn wait(mut self) -> Option<ReapFailure> {
+        let settled = self
+            .settled
+            .take()
+            .expect("unpublished cleanup receiver must remain owned");
+        let _ = settled.await;
+        self.join_worker()
+    }
+
+    fn join(mut self) -> Option<ReapFailure> {
+        self.join_worker()
+    }
+
+    fn join_worker(&mut self) -> Option<ReapFailure> {
+        let worker = self
+            .worker
+            .take()
+            .expect("unpublished cleanup worker must remain owned");
+        match worker.join() {
+            Ok(result) => result,
+            Err(_) => Some(ReapFailure::WorkerPanicked),
+        }
+    }
+}
+
+impl Drop for UnpublishedContainerCleanup {
+    fn drop(&mut self) {
+        if self.worker.is_some() {
+            let _ = self.join_worker();
+        }
+    }
+}
+
+/// Own the local runtime client and exact named-container cleanup from the instant process spawn
+/// succeeds until a backend receives that process. Dropping any cancellable pre-publication await starts
+/// the same ordered cleanup flight; ordinary errors join it and successful publication disarms it.
+struct UnpublishedContainerSpawn {
+    supervised: Option<Supervised>,
+    controller: Option<ReapController>,
+}
+
+impl UnpublishedContainerSpawn {
+    fn new(supervised: Supervised, controller: Option<ReapController>) -> Self {
+        Self {
+            supervised: Some(supervised),
+            controller,
+        }
+    }
+
+    fn supervised_mut(&mut self) -> &mut Supervised {
+        self.supervised
+            .as_mut()
+            .expect("unpublished supervised process must remain owned")
+    }
+
+    fn publish(mut self) -> Supervised {
+        self.controller = None;
+        self.supervised
+            .take()
+            .expect("published supervised process must remain owned")
+    }
+
+    /// The failed connection never publishes a backend owner. Stop and reap its exact
+    /// process/container in that order, and do not return while the bounded removal attempt is in flight.
+    async fn settle(mut self) -> Option<ReapFailure> {
+        let supervised = self
+            .supervised
+            .take()
+            .expect("failed supervised process must remain owned");
+        let Some(controller) = self.controller.take() else {
+            drop(supervised);
+            return None;
+        };
+        if !controller.has_start_probe() {
+            // Public legacy `ReapFn` controllers remain fire-and-forget. Bridge-owned production
+            // controllers carry the active probe and therefore use the ordered, joinable path below.
+            drop(supervised);
+            controller.reap_detached();
+            return None;
+        }
+        match UnpublishedContainerCleanup::start(supervised, controller) {
+            Ok(cleanup) => cleanup.wait().await,
+            Err(failure) => Some(failure),
+        }
+    }
+}
+
+impl Drop for UnpublishedContainerSpawn {
+    fn drop(&mut self) {
+        let Some(supervised) = self.supervised.take() else {
+            return;
+        };
+        let Some(controller) = self.controller.take() else {
+            drop(supervised);
+            return;
+        };
+        if !controller.has_start_probe() {
+            drop(supervised);
+            controller.reap_detached();
+            return;
+        }
+        // A Drop can run inside Tokio's shutdown context, where spawning on the current handle loses the
+        // new task. Settle on a fresh OS thread/runtime and join it before returning from Drop.
+        if let Ok(cleanup) = UnpublishedContainerCleanup::start(supervised, controller) {
+            let _ = cleanup.join();
+        }
+    }
+}
+
 impl AcpBackend {
     fn install_prompt_request<T>(
         dispatch_gate: &Arc<StdMutex<()>>,
@@ -1776,17 +2012,16 @@ impl AcpBackend {
                 None,
             )
             .await?;
-        // Reaper handle for the SPAWN-FAILURE path (Site A): once `Supervised::spawn` succeeds the
-        // `docker run` container is up, but if pipe-take or the handshake then fails there is no backend
-        // to reap from — so reap here. Cloned before `config` moves into `connect`.
+        // Controller for the SPAWN-FAILURE path (Site A). Starting the local `docker run` client does
+        // not prove its named container crossed the runtime start boundary; the production controller
+        // supplies that exact-name evidence and owns the one bounded reap when no backend is published.
         let container_controller = container_controller.or_else(|| {
             config
                 .container
                 .as_ref()
                 .map(ContainerReap::legacy_controller)
         });
-        let container_on_fail = container_controller.clone();
-        let mut supervised = match Supervised::spawn_with_stderr_redactor_and_pinned_cwd(
+        let supervised = match Supervised::spawn_with_stderr_redactor_and_pinned_cwd(
             cmd,
             args,
             None,
@@ -1813,56 +2048,75 @@ impl AcpBackend {
                     .await)
             }
         };
-        let stderr_ring = supervised.stderr_ring();
+        // Establish cancellation-safe cleanup ownership before the first post-spawn await. The guard
+        // remains armed until a complete backend receives the process and the shared controller.
+        let mut unpublished =
+            UnpublishedContainerSpawn::new(supervised, container_controller.clone());
+        let handshake_deadline = tokio::time::Instant::now() + config.handshake_timeout;
+        let stderr_ring = unpublished.supervised_mut().stderr_ring();
         let stderr_cursor = stderr_ring.origin();
         let lifecycle = AcpLifecycle::new(
             observer.clone(),
             redactor,
             Some((stderr_ring.clone(), stderr_cursor)),
         );
-        // Everything after the (now-running) child: any error orphans the container → reap it.
-        let result = async {
-            let child = supervised.child_mut();
+        // Everything after the local child starts: any error leaves no backend owner, so the outer
+        // path terminates that exact client and joins its exact named-container reap before returning.
+        let result: Result<Self, SpawnObservedFailure> = async {
+            let child = unpublished.supervised_mut().child_mut();
             let stdin = match child.stdin.take() {
                 Some(stdin) => stdin,
                 None => {
-                    return Err(lifecycle
-                        .failure(
-                            DiagnosticPhase::Spawn,
-                            None,
-                            DiagnosticFailureClass::AgentProcess,
-                            FailureDisposition::RetrySameTarget,
-                            "acp.spawn.stdin_unavailable",
-                            "ACP agent stdin was unavailable after spawn",
-                            None,
-                            false,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await)
+                    return Err(SpawnObservedFailure::Bridge(
+                        lifecycle
+                            .failure(
+                                DiagnosticPhase::Spawn,
+                                None,
+                                DiagnosticFailureClass::AgentProcess,
+                                FailureDisposition::RetrySameTarget,
+                                "acp.spawn.stdin_unavailable",
+                                "ACP agent stdin was unavailable after spawn",
+                                None,
+                                false,
+                                None,
+                                None,
+                                None,
+                            )
+                            .await,
+                    ))
                 }
             };
             let stdout = match child.stdout.take() {
                 Some(stdout) => stdout,
                 None => {
-                    return Err(lifecycle
-                        .failure(
-                            DiagnosticPhase::Spawn,
-                            None,
-                            DiagnosticFailureClass::AgentProcess,
-                            FailureDisposition::RetrySameTarget,
-                            "acp.spawn.stdout_unavailable",
-                            "ACP agent stdout was unavailable after spawn",
-                            None,
-                            false,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await)
+                    return Err(SpawnObservedFailure::Bridge(
+                        lifecycle
+                            .failure(
+                                DiagnosticPhase::Spawn,
+                                None,
+                                DiagnosticFailureClass::AgentProcess,
+                                FailureDisposition::RetrySameTarget,
+                                "acp.spawn.stdout_unavailable",
+                                "ACP agent stdout was unavailable after spawn",
+                                None,
+                                false,
+                                None,
+                                None,
+                                None,
+                            )
+                            .await,
+                    ))
                 }
             };
+            if let Err(failure) = await_container_start(
+                container_controller.as_ref(),
+                unpublished.supervised_mut(),
+                handshake_deadline,
+            )
+            .await
+            {
+                return Err(SpawnObservedFailure::ContainerStart(failure));
+            }
             // Validate raw JSON object-member uniqueness before the ACP SDK
             // deserializes error data into `serde_json::Value` (which otherwise
             // collapses duplicate keys). The crate uses `futures` async-io; our
@@ -1884,8 +2138,10 @@ impl AcpBackend {
                 observer,
                 Some(DiagnosticPhase::Spawn),
                 Some((stderr_ring.clone(), stderr_cursor)),
+                Some(handshake_deadline),
             )
             .await
+            .map_err(SpawnObservedFailure::Bridge)
         }
         .await;
         match result {
@@ -1893,15 +2149,33 @@ impl AcpBackend {
                 // `supervised` (the process-group owner) MUST live for the whole backend lifetime:
                 // `kill_on_drop(true)` would SIGKILL the child the instant it dropped, killing the
                 // event-loop task's pipes. Hold it on the backend.
-                *backend.supervised.lock().expect("supervised lock") = Some(supervised);
+                *backend.supervised.lock().expect("supervised lock") = Some(unpublished.publish());
                 backend.stderr_ring = Some(stderr_ring);
                 Ok(backend)
             }
-            Err(e) => {
-                // One-shot reap (no backend exists; `supervised` drops here → SIGKILLs the client).
-                let reaped = Arc::new(AtomicBool::new(false));
-                AcpBackend::reap_container(&container_on_fail, &reaped);
-                Err(e)
+            Err(SpawnObservedFailure::Bridge(error)) => {
+                let _cleanup_failure = unpublished.settle().await;
+                Err(error)
+            }
+            Err(SpawnObservedFailure::ContainerStart(failure)) => {
+                let cause = unpublished.settle().await.map(|reap_failure| {
+                    format!("container cleanup failed: {}", reap_failure.code())
+                });
+                Err(lifecycle
+                    .failure(
+                        DiagnosticPhase::Spawn,
+                        None,
+                        DiagnosticFailureClass::ContainerRuntime,
+                        FailureDisposition::ContainerFallbackCandidate,
+                        failure.code(),
+                        failure.summary(),
+                        cause,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await)
             }
         }
     }
@@ -1928,7 +2202,7 @@ impl AcpBackend {
         config: AcpConfig,
         observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<Self, BridgeError> {
-        Self::connect_observed_after(transport, config, None, observer, None, None).await
+        Self::connect_observed_after(transport, config, None, observer, None, None, None).await
     }
 
     async fn connect_observed_after(
@@ -1938,6 +2212,7 @@ impl AcpBackend {
         observer: Arc<dyn DiagnosticObserver>,
         last_completed_before_initialize: Option<DiagnosticPhase>,
         stderr: Option<(ProcessStderrRing, ProcessStderrCursor)>,
+        handshake_deadline: Option<tokio::time::Instant>,
     ) -> Result<Self, BridgeError> {
         if config.pre_authenticated && config.auth_method.is_some() {
             return Err(BridgeError::config_invalid(
@@ -2115,7 +2390,8 @@ impl AcpBackend {
         // One deadline bounds transport connect, initialize, and authenticate,
         // while each await is observed separately so a timeout cannot be
         // mislabeled as a later phase.
-        let deadline = tokio::time::Instant::now() + config.handshake_timeout;
+        let deadline = handshake_deadline
+            .unwrap_or_else(|| tokio::time::Instant::now() + config.handshake_timeout);
         let auth_method_cfg = config.auth_method.clone();
         let pre_authenticated = config.pre_authenticated;
         lifecycle
@@ -3336,6 +3612,7 @@ impl AcpBackend {
             Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
             None,
             Some((stderr_ring.clone(), stderr_cursor)),
+            None,
         )
         .await?;
         *backend.supervised.lock().expect("supervised lock") = Some(supervised);
@@ -4822,7 +5099,7 @@ mod tests {
     use bridge_core::error::BridgeError;
     use bridge_core::ports::{AgentBackend, BackendObservers, RichEventSink, Update};
     use bridge_core::process::Supervised;
-    use bridge_core::reaper::{ReapAttemptFn, ReapFailure};
+    use bridge_core::reaper::{ContainerStartProbeFn, ReapAttemptFn, ReapFailure};
     use bridge_core::SessionCwd;
     use futures::StreamExt;
     use std::time::Duration;
@@ -5773,6 +6050,775 @@ mod tests {
         })
         .await
         .expect("the started container is reaped on the spawn-error path");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_reap_callback_remains_fire_and_forget_on_spawn_failure() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let released = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reap_fn: ReapFn = {
+            let entered = Arc::clone(&entered);
+            let released = Arc::clone(&released);
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_runtime, _name| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                entered.notify_one();
+                let (lock, ready) = &*released;
+                let mut release = lock.lock().unwrap();
+                while !*release {
+                    release = ready.wait(release).unwrap();
+                }
+            })
+        };
+        let config = AcpConfig {
+            cwd: std::env::temp_dir(),
+            handshake_timeout: Duration::from_millis(50),
+            container: Some(ContainerReap::from_legacy(
+                "docker",
+                "a2a-ro-legacy-fire-and-forget",
+                reap_fn,
+            )),
+            ..AcpConfig::default()
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            AcpBackend::spawn("/bin/cat", &[], config),
+        )
+        .await;
+        if result.is_err() {
+            let (lock, ready) = &*released;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+            panic!("a legacy fire-and-forget callback must not delay the spawn failure return");
+        }
+        assert!(
+            result.unwrap().is_err(),
+            "the ACP handshake must still fail"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("the detached legacy callback must still run");
+        let (lock, ready) = &*released;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn observed_never_started_container_is_typed_and_joins_failed_reap_after_client_exit() {
+        static PATH_NONCE: AtomicU64 = AtomicU64::new(0);
+        let pid_path = std::env::temp_dir().join(format!(
+            "a2a-bridge-acp-container-client-{}-{}.pid",
+            std::process::id(),
+            PATH_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&pid_path);
+        let pid_arg = pid_path.to_string_lossy().into_owned();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let client_stopped_before_reap = Arc::new(AtomicBool::new(false));
+        let attempt: ReapAttemptFn = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let client_stopped = Arc::clone(&client_stopped_before_reap);
+            let pid_path = pid_path.clone();
+            Arc::new(move |_runtime, _name| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let client_stopped = Arc::clone(&client_stopped);
+                let pid_path = pid_path.clone();
+                Box::pin(async move {
+                    let pid = std::fs::read_to_string(pid_path)
+                        .ok()
+                        .and_then(|value| value.parse::<i32>().ok());
+                    client_stopped.store(
+                        pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == -1),
+                        Ordering::SeqCst,
+                    );
+                    entered.notify_one();
+                    release.notified().await;
+                    Err(ReapFailure::Timeout)
+                })
+            })
+        };
+        let probe: ContainerStartProbeFn =
+            Arc::new(|_runtime, _name| Box::pin(async move { ContainerStartState::NotStarted }));
+        let controller =
+            ReapController::new("docker", "a2a-ro-created", attempt).with_start_probe(probe);
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let config = AcpConfig {
+            cwd: std::env::temp_dir(),
+            handshake_timeout: Duration::from_millis(150),
+            ..AcpConfig::default()
+        };
+        let args = [
+            "-c",
+            "printf '%s' $$ > \"$1\"; exec /bin/cat",
+            "a2a-test",
+            pid_arg.as_str(),
+        ];
+        let mut spawn = Box::pin(AcpBackend::spawn_observed_with_container_controller(
+            "/bin/sh",
+            &args,
+            config,
+            observer.clone(),
+            Some(controller.clone()),
+        ));
+
+        tokio::select! {
+            _result = &mut spawn => panic!("spawn returned before the reap attempt began"),
+            _ = entered.notified() => {}
+        }
+        assert!(
+            client_stopped_before_reap.load(Ordering::SeqCst),
+            "the exact docker client process must be reaped before container removal begins"
+        );
+        tokio::select! {
+            _result = &mut spawn => panic!("spawn returned before the joined reap settled"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        release.notify_one();
+
+        let error = match spawn.await {
+            Err(error) => error,
+            Ok(_) => panic!("an unstarted container must fail spawn"),
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::Spawn,
+            DiagnosticFailureClass::ContainerRuntime,
+            false,
+        );
+        assert_eq!(diagnostic.last_completed_phase(), None);
+        assert_eq!(
+            diagnostic.disposition(),
+            FailureDisposition::ContainerFallbackCandidate
+        );
+        assert_eq!(
+            diagnostic.code().as_str(),
+            "container.runtime.start_timeout"
+        );
+        assert_eq!(
+            diagnostic.causes(),
+            &["container cleanup failed: container.reap.timeout"]
+        );
+        assert_eq!(controller.result(), Some(Err(ReapFailure::Timeout)));
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transition().phase(), DiagnosticPhase::Spawn);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().phase(), DiagnosticPhase::Spawn);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Failed);
+        let _ = std::fs::remove_file(pid_path);
+    }
+
+    #[tokio::test]
+    async fn container_start_deadline_does_not_poll_runtime_after_expiry() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe: ContainerStartProbeFn = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_runtime, _name| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { ContainerStartState::NotStarted })
+            })
+        };
+        let controller = ReapController::new(
+            "docker",
+            "a2a-ro-deadline",
+            Arc::new(|_runtime, _name| Box::pin(async move { Ok(()) })),
+        )
+        .with_start_probe(probe);
+        let mut supervised = Supervised::spawn("/bin/cat", &[], None).expect("spawn cat");
+
+        let result = await_container_start(
+            Some(&controller),
+            &mut supervised,
+            tokio::time::Instant::now() + Duration::from_millis(25),
+        )
+        .await;
+
+        assert_eq!(result, Err(ContainerStartFailure::TimedOut));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the shared deadline must be checked before starting another runtime probe"
+        );
+        supervised.terminate(Duration::from_millis(10)).await;
+    }
+
+    #[tokio::test]
+    async fn observed_not_started_then_client_exit_reports_start_failed() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempt: ReapAttemptFn = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_runtime, _name| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(()) })
+            })
+        };
+        let probe: ContainerStartProbeFn =
+            Arc::new(|_runtime, _name| Box::pin(async move { ContainerStartState::NotStarted }));
+        let controller =
+            ReapController::new("docker", "a2a-ro-client-exited", attempt).with_start_probe(probe);
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let config = AcpConfig {
+            cwd: std::env::temp_dir(),
+            handshake_timeout: Duration::from_millis(500),
+            ..AcpConfig::default()
+        };
+
+        let error = match AcpBackend::spawn_observed_with_container_controller(
+            "/bin/sh",
+            &["-c", "exit 0"],
+            config,
+            observer.clone(),
+            Some(controller.clone()),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => {
+                panic!("an exited runtime client cannot publish an unstarted container backend")
+            }
+        };
+
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::Spawn,
+            DiagnosticFailureClass::ContainerRuntime,
+            false,
+        );
+        assert_eq!(diagnostic.last_completed_phase(), None);
+        assert_eq!(
+            diagnostic.disposition(),
+            FailureDisposition::ContainerFallbackCandidate
+        );
+        assert_eq!(diagnostic.code().as_str(), "container.runtime.start_failed");
+        assert_eq!(controller.result(), Some(Ok(())));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transition().phase(), DiagnosticPhase::Spawn);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().phase(), DiagnosticPhase::Spawn);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn unknown_start_observations_preserve_initialize_timeout() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempt: ReapAttemptFn = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_runtime, _name| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(()) })
+            })
+        };
+        let probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe: ContainerStartProbeFn = {
+            let probe_calls = Arc::clone(&probe_calls);
+            Arc::new(move |_runtime, _name| {
+                probe_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { ContainerStartState::Unknown })
+            })
+        };
+        let controller =
+            ReapController::new("docker", "a2a-ro-start-unknown", attempt).with_start_probe(probe);
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let config = AcpConfig {
+            cwd: std::env::temp_dir(),
+            handshake_timeout: Duration::from_millis(350),
+            ..AcpConfig::default()
+        };
+
+        let error = match AcpBackend::spawn_observed_with_container_controller(
+            "/bin/sh",
+            &["-c", "cat >/dev/null"],
+            config,
+            observer.clone(),
+            Some(controller.clone()),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("unknown runtime evidence must preserve the initialize timeout"),
+        };
+
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::Initialize,
+            DiagnosticFailureClass::Timeout,
+            false,
+        );
+        assert_eq!(
+            diagnostic.last_completed_phase(),
+            Some(DiagnosticPhase::Spawn)
+        );
+        assert_eq!(
+            diagnostic.disposition(),
+            FailureDisposition::RetrySameTarget
+        );
+        assert_eq!(diagnostic.code().as_str(), "acp.initialize.timeout");
+        assert_eq!(controller.result(), Some(Ok(())));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            probe_calls.load(Ordering::SeqCst) >= 2,
+            "the lifecycle control must preserve its diagnosis across repeated unknown observations"
+        );
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].transition().phase(), DiagnosticPhase::Spawn);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().phase(), DiagnosticPhase::Spawn);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Completed);
+        assert_eq!(events[2].transition().phase(), DiagnosticPhase::Initialize);
+        assert_eq!(events[2].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[3].transition().phase(), DiagnosticPhase::Initialize);
+        assert_eq!(events[3].transition().status(), PhaseStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn observed_started_container_preserves_initialize_timeout_and_joins_reap() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let attempt: ReapAttemptFn = {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move |_runtime, _name| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+            })
+        };
+        let probe: ContainerStartProbeFn =
+            Arc::new(|_runtime, _name| Box::pin(async move { ContainerStartState::Started }));
+        let controller =
+            ReapController::new("docker", "a2a-ro-running", attempt).with_start_probe(probe);
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let config = AcpConfig {
+            cwd: std::env::temp_dir(),
+            handshake_timeout: Duration::from_millis(100),
+            ..AcpConfig::default()
+        };
+        let mut spawn = Box::pin(AcpBackend::spawn_observed_with_container_controller(
+            "/bin/sh",
+            &["-c", "cat >/dev/null"],
+            config,
+            observer.clone(),
+            Some(controller.clone()),
+        ));
+
+        tokio::select! {
+            _result = &mut spawn => panic!("spawn returned before the reap attempt began"),
+            _ = entered.notified() => {}
+        }
+        tokio::select! {
+            _result = &mut spawn => panic!("spawn returned before the joined reap settled"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        release.notify_one();
+
+        let error = match spawn.await {
+            Err(error) => error,
+            Ok(_) => panic!("a started cat process must still time out during initialize"),
+        };
+        let diagnostic = assert_agent_failure(
+            &error,
+            DiagnosticPhase::Initialize,
+            DiagnosticFailureClass::Timeout,
+            false,
+        );
+        assert_eq!(
+            diagnostic.last_completed_phase(),
+            Some(DiagnosticPhase::Spawn)
+        );
+        assert_eq!(
+            diagnostic.disposition(),
+            FailureDisposition::RetrySameTarget
+        );
+        assert_eq!(diagnostic.code().as_str(), "acp.initialize.timeout");
+        assert_eq!(controller.result(), Some(Ok(())));
+        let events = observer.snapshot().await;
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].transition().phase(), DiagnosticPhase::Spawn);
+        assert_eq!(events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[1].transition().phase(), DiagnosticPhase::Spawn);
+        assert_eq!(events[1].transition().status(), PhaseStatus::Completed);
+        assert_eq!(events[2].transition().phase(), DiagnosticPhase::Initialize);
+        assert_eq!(events[2].transition().status(), PhaseStatus::Started);
+        assert_eq!(events[3].transition().phase(), DiagnosticPhase::Initialize);
+        assert_eq!(events[3].transition().status(), PhaseStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn canceled_spawn_after_not_started_observation_still_owns_ordered_cleanup() {
+        static PATH_NONCE: AtomicU64 = AtomicU64::new(0);
+        let pid_path = std::env::temp_dir().join(format!(
+            "a2a-bridge-acp-pre-settlement-cancel-{}-{}.pid",
+            std::process::id(),
+            PATH_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&pid_path);
+        let pid_arg = pid_path.to_string_lossy().into_owned();
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let reap_entered = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client_stopped_before_reap = Arc::new(AtomicBool::new(false));
+        let attempt: ReapAttemptFn = {
+            let reap_entered = Arc::clone(&reap_entered);
+            let calls = Arc::clone(&calls);
+            let client_stopped = Arc::clone(&client_stopped_before_reap);
+            let pid_path = pid_path.clone();
+            Arc::new(move |_runtime, _name| {
+                let reap_entered = Arc::clone(&reap_entered);
+                let calls = Arc::clone(&calls);
+                let client_stopped = Arc::clone(&client_stopped);
+                let pid_path = pid_path.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let pid = std::fs::read_to_string(pid_path)
+                        .ok()
+                        .and_then(|value| value.parse::<i32>().ok());
+                    client_stopped.store(
+                        pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == -1),
+                        Ordering::SeqCst,
+                    );
+                    reap_entered.notify_one();
+                    Ok(())
+                })
+            })
+        };
+        let probe: ContainerStartProbeFn = {
+            let observed = Arc::clone(&observed);
+            let pid_path = pid_path.clone();
+            Arc::new(move |_runtime, _name| {
+                let observed = Arc::clone(&observed);
+                let pid_path = pid_path.clone();
+                Box::pin(async move {
+                    while !pid_path.exists() {
+                        tokio::task::yield_now().await;
+                    }
+                    observed.notify_one();
+                    ContainerStartState::NotStarted
+                })
+            })
+        };
+        let controller = ReapController::new("docker", "a2a-ro-pre-settlement-cancel", attempt)
+            .with_start_probe(probe);
+        let config = AcpConfig {
+            cwd: std::env::temp_dir(),
+            handshake_timeout: Duration::from_secs(5),
+            ..AcpConfig::default()
+        };
+        let args = [
+            "-c",
+            "trap '' TERM; printf '%s' $$ > \"$1\"; while :; do sleep 1; done",
+            "a2a-test",
+            pid_arg.as_str(),
+        ];
+        let initializer = tokio::sync::OnceCell::<()>::new();
+        let controller_for_spawn = controller.clone();
+        let mut spawn = Box::pin(initializer.get_or_try_init(|| async move {
+            AcpBackend::spawn_observed_with_container_controller(
+                "/bin/sh",
+                &args,
+                config,
+                Arc::new(InMemoryDiagnosticObserver::new(8).unwrap()),
+                Some(controller_for_spawn),
+            )
+            .await
+            .map(|_| ())
+        }));
+
+        tokio::select! {
+            _result = &mut spawn => panic!("spawn returned before the pre-start observation"),
+            _ = observed.notified() => {}
+        }
+        assert_eq!(controller.result(), None);
+        drop(spawn);
+
+        tokio::time::timeout(Duration::from_secs(2), reap_entered.notified())
+            .await
+            .expect("canceling before typed failure settlement must still start the exact reap");
+        assert!(
+            client_stopped_before_reap.load(Ordering::SeqCst),
+            "the exact runtime client must exit before the cancellation-owned reap begins"
+        );
+        assert_eq!(controller.reap_observed().await, Ok(()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let successor_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let successor_count = Arc::clone(&successor_calls);
+        initializer
+            .get_or_try_init(|| async move {
+                successor_count.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), BridgeError>(())
+            })
+            .await
+            .expect("the canceled initializer must permit one clean successor");
+        assert_eq!(successor_calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(pid_path);
+    }
+
+    #[test]
+    fn runtime_shutdown_after_not_started_observation_still_settles_exact_cleanup() {
+        static PATH_NONCE: AtomicU64 = AtomicU64::new(0);
+        let pid_path = std::env::temp_dir().join(format!(
+            "a2a-bridge-acp-runtime-shutdown-{}-{}.pid",
+            std::process::id(),
+            PATH_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&pid_path);
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let (settled_tx, settled_rx) = std::sync::mpsc::sync_channel(1);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempt: ReapAttemptFn = {
+            let calls = Arc::clone(&calls);
+            let pid_path = pid_path.clone();
+            Arc::new(move |_runtime, _name| {
+                let calls = Arc::clone(&calls);
+                let pid_path = pid_path.clone();
+                let settled_tx = settled_tx.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let pid = std::fs::read_to_string(pid_path)
+                        .ok()
+                        .and_then(|value| value.parse::<i32>().ok());
+                    let stopped = pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == -1);
+                    let _ = settled_tx.send(stopped);
+                    Ok(())
+                })
+            })
+        };
+        let probe: ContainerStartProbeFn = {
+            let observed = Arc::clone(&observed);
+            let pid_path = pid_path.clone();
+            Arc::new(move |_runtime, _name| {
+                let observed = Arc::clone(&observed);
+                let pid_path = pid_path.clone();
+                Box::pin(async move {
+                    while !pid_path.exists() {
+                        tokio::task::yield_now().await;
+                    }
+                    observed.notify_one();
+                    ContainerStartState::NotStarted
+                })
+            })
+        };
+        let controller = ReapController::new("docker", "a2a-ro-runtime-shutdown", attempt)
+            .with_start_probe(probe);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let observed_wait = Arc::clone(&observed);
+        let pid_arg = pid_path.to_string_lossy().into_owned();
+        let controller_for_spawn = controller.clone();
+        let task = runtime.spawn(async move {
+            let args = [
+                "-c",
+                "trap '' TERM; printf '%s' $$ > \"$1\"; while :; do sleep 1; done",
+                "a2a-test",
+                pid_arg.as_str(),
+            ];
+            AcpBackend::spawn_observed_with_container_controller(
+                "/bin/sh",
+                &args,
+                AcpConfig {
+                    cwd: std::env::temp_dir(),
+                    handshake_timeout: Duration::from_secs(5),
+                    ..AcpConfig::default()
+                },
+                Arc::new(InMemoryDiagnosticObserver::new(8).unwrap()),
+                Some(controller_for_spawn),
+            )
+            .await
+        });
+        runtime.block_on(async move {
+            tokio::time::timeout(Duration::from_secs(2), observed_wait.notified())
+                .await
+                .expect("the private runtime must reach a positive pre-start observation");
+        });
+
+        drop(runtime);
+        drop(task);
+        let stopped = settled_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("runtime shutdown must still settle the exact named reap");
+        assert!(
+            stopped,
+            "the exact client must exit before shutdown-time reap"
+        );
+        assert_eq!(controller.result(), Some(Ok(())));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(pid_path);
+    }
+
+    #[test]
+    fn runtime_shutdown_during_error_settlement_still_settles_exact_cleanup() {
+        static PATH_NONCE: AtomicU64 = AtomicU64::new(0);
+        let pid_path = std::env::temp_dir().join(format!(
+            "a2a-bridge-acp-settlement-shutdown-{}-{}.pid",
+            std::process::id(),
+            PATH_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&pid_path);
+        let (settled_tx, settled_rx) = std::sync::mpsc::sync_channel(1);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempt: ReapAttemptFn = {
+            let calls = Arc::clone(&calls);
+            let pid_path = pid_path.clone();
+            Arc::new(move |_runtime, _name| {
+                let calls = Arc::clone(&calls);
+                let pid_path = pid_path.clone();
+                let settled_tx = settled_tx.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let pid = std::fs::read_to_string(pid_path)
+                        .ok()
+                        .and_then(|value| value.parse::<i32>().ok());
+                    let stopped = pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == -1);
+                    let _ = settled_tx.send(stopped);
+                    Ok(())
+                })
+            })
+        };
+        let probe: ContainerStartProbeFn =
+            Arc::new(|_runtime, _name| Box::pin(async move { ContainerStartState::NotStarted }));
+        let controller = ReapController::new("docker", "a2a-ro-settlement-shutdown", attempt)
+            .with_start_probe(probe);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pid_arg = pid_path.to_string_lossy().into_owned();
+        let controller_for_spawn = controller.clone();
+        let task = runtime.spawn(async move {
+            let args = [
+                "-c",
+                "trap '' TERM; printf '%s' $$ > \"$1\"; while :; do sleep 1; done",
+                "a2a-test",
+                pid_arg.as_str(),
+            ];
+            AcpBackend::spawn_observed_with_container_controller(
+                "/bin/sh",
+                &args,
+                AcpConfig {
+                    cwd: std::env::temp_dir(),
+                    handshake_timeout: Duration::from_millis(50),
+                    ..AcpConfig::default()
+                },
+                Arc::new(InMemoryDiagnosticObserver::new(8).unwrap()),
+                Some(controller_for_spawn),
+            )
+            .await
+        });
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !pid_path.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the private runtime must publish the supervised client pid");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        assert_eq!(controller.result(), None);
+        drop(runtime);
+        drop(task);
+        let stopped = settled_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime shutdown during settlement must still run the exact named reap");
+        assert!(stopped, "the exact client must exit before settlement reap");
+        assert_eq!(controller.result(), Some(Ok(())));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(pid_path);
+    }
+
+    #[tokio::test]
+    async fn canceled_spawn_cannot_interrupt_ordered_container_cleanup_flight() {
+        static PATH_NONCE: AtomicU64 = AtomicU64::new(0);
+        let pid_path = std::env::temp_dir().join(format!(
+            "a2a-bridge-acp-canceled-container-client-{}-{}.pid",
+            std::process::id(),
+            PATH_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&pid_path);
+        let pid_arg = pid_path.to_string_lossy().into_owned();
+        let reap_entered = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempt: ReapAttemptFn = {
+            let reap_entered = Arc::clone(&reap_entered);
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_runtime, _name| {
+                let reap_entered = Arc::clone(&reap_entered);
+                let calls = Arc::clone(&calls);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    reap_entered.notify_one();
+                    Ok(())
+                })
+            })
+        };
+        let probe: ContainerStartProbeFn =
+            Arc::new(|_runtime, _name| Box::pin(async move { ContainerStartState::NotStarted }));
+        let controller =
+            ReapController::new("docker", "a2a-ro-canceled", attempt).with_start_probe(probe);
+        let config = AcpConfig {
+            cwd: std::env::temp_dir(),
+            handshake_timeout: Duration::from_millis(100),
+            ..AcpConfig::default()
+        };
+        let args = [
+            "-c",
+            "trap '' TERM; printf '%s' $$ > \"$1\"; while :; do sleep 1; done",
+            "a2a-test",
+            pid_arg.as_str(),
+        ];
+        let mut spawn = Box::pin(AcpBackend::spawn_observed_with_container_controller(
+            "/bin/sh",
+            &args,
+            config,
+            Arc::new(InMemoryDiagnosticObserver::new(8).unwrap()),
+            Some(controller.clone()),
+        ));
+
+        tokio::select! {
+            _result = &mut spawn => panic!("TERM-ignoring client returned before its cleanup grace"),
+            ready = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if pid_path.exists() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }) => ready.expect("the supervised client must publish its pid"),
+        }
+        tokio::select! {
+            _result = &mut spawn => panic!("TERM-ignoring client returned before SIGKILL escalation"),
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+        assert_eq!(controller.result(), None);
+        drop(spawn);
+
+        tokio::time::timeout(Duration::from_secs(2), reap_entered.notified())
+            .await
+            .expect("canceling the waiter must not cancel the ordered cleanup flight");
+        assert_eq!(controller.reap_observed().await, Ok(()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let pid = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        let _ = std::fs::remove_file(pid_path);
     }
 
     #[tokio::test]

@@ -80,7 +80,9 @@ mount breaks refresh):
   `model` and `effortLevel`; do not mount or copy the full host `~/.claude/settings.json`,
   `~/.claude.json`, hooks, permissions, project history, or account caches. Run
   `A2A_BRIDGE_ALLOW_FABLE=1 a2a-bridge doctor` before the live turn; it reports a missing opt-in or
-  settings mount.
+  settings mount and fails when the exact host/mounted Claude OAuth access token is expired. A token with
+  less than 16 minutes of runway warns and is ineligible for `smoke`; that covers the 15-minute maximum
+  smoke timeout plus a one-minute preflight margin. Token values are never rendered.
 
 The shipped container configs pair these mounted files with `pre_authenticated = true`. That setting is
 required for browserless ChatGPT-auth containers: it reuses the mounted login instead of invoking
@@ -94,12 +96,16 @@ codex-acp's advertised browser-login action. Do not also set `auth_method` on th
 > ```bash
 > deploy/containers/sync-creds.sh && a2a-bridge serve --config examples/a2a-bridge.containerized.toml
 > ```
+> The sync copies bytes; it does **not** authenticate or refresh an already expired host token. After a fresh
+> host login and post-login sync, require both Claude host and reader doctors green before requesting new
+> explicit authorization for one new four-case aggregate.
 > (claude/codex are host-file copies; **kiro** is the `a2a-kiro-data` volume — re-run its device-flow
 > login if it has fully expired, not a host sync.)
 >
 > **Automate it (optional, macOS launchd).** Instead of running the pre-flight sync by hand, keep the
-> copies continuously fresh with a LaunchAgent that runs `sync-creds.sh` every 5 min (token TTLs are hours,
-> so the copy is always valid; short container turns don't refresh, so no rotation). A version-controlled
+> copies synchronized with a LaunchAgent that runs `sync-creds.sh` every 5 min. Synchronization does not
+> prove freshness: an expired host token is copied as expired and `doctor` must still gate execution. A
+> version-controlled
 > template lives at `deploy/containers/com.a2a-bridge.creds-refresh.plist`:
 > ```bash
 > cp deploy/containers/com.a2a-bridge.creds-refresh.plist ~/Library/LaunchAgents/

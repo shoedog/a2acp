@@ -151,7 +151,20 @@ Without `--out`, stdout is JSON only; human direction goes to stderr. Do not pas
 An explicit output path must not already exist. On Unix, it is created owner-only as `0600` before agent
 resolution or spawn; an existing file/link or failure to apply that restriction is a pre-attempt refusal.
 
-Run `validate`, `doctor --json`, and `models --agent <id> --json` first. Never use a stale installed binary
+Run `validate`, `doctor --json`, and `models --agent <id> --json` first. Claude smoke refuses before adapter
+spawn when bounded OAuth metadata is expired or has less than 16 minutes of runway; syncing an isolated
+credential copy does not refresh an expired host login. When `CLAUDE_CONFIG_DIR` is present for a host
+Claude entry, it must be a non-empty absolute path so doctor and every possible child cwd select the same
+`.credentials.json`; unset uses `$HOME/.claude/.credentials.json`. The one smoke deadline begins before
+provenance and orphan recovery, so those phases cannot consume the runway and then receive a fresh timeout;
+one deadline-first primitive refuses without polling resolution, configure, prompt, or drain when time is
+already exhausted. A stage is counted only after its future receives a poll; an unpolled prompt refusal
+records zero prompt calls and false prompt-acceptance evidence. Truthy
+`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`,
+`CLAUDE_CODE_USE_ANTHROPIC_AWS`, or `CLAUDE_CODE_USE_MANTLE` selects external provider auth and therefore
+skips first-party file OAuth on host entries; false-like or unknown values do not, and ambient host flags
+never bypass a mounted reader credential.
+Never use a stale installed binary
 for compatibility evidence, and never automatically rerun a failed or timed-out smoke: the first prompt may
 have been accepted. Do not update `docs/compatibility.md` until the release-mode artifact records the exact
 lane that actually ran.
@@ -195,11 +208,17 @@ verified file object instead of reopening its name, and accesses child smoke
 artifacts relative to the retained scratch descriptor. After hashing it rechecks cancellation and the
 full declared timeout headroom immediately before spawn. On Linux, the staged child closes its inherited
 candidate descriptor after exec and its scratch descriptor after opening the artifact, before ACP
-descendants. There is no retry, provider fallback, implicit all-case selection, baseline update,
-or production-config mutation. A case does not start unless its declared token and observable-cost caps
-fit the remaining total headroom. Comparison retains per-case execution/error/not-run/budget state and
-aggregate success/cancellation/budget state while excluding variable usage quantities. The checked-in
-R3a manifest intentionally has no cases; R3b adds reviewed pins. Read
+descendants. A pinned config's exact SHA-256 is an admission gate before provider spawn. Container pins
+require exact non-secret adapter/CLI labels from the configured immutable image, and the Fable reader
+also binds exactly one minimal host-mounted settings file by SHA-256; missing, unreadable, or ambiguous
+duplicate settings destinations cannot green a support case.
+There is no retry, provider fallback, implicit all-case selection, baseline update, or production-config
+mutation. A case does not start unless its declared token and observable-cost caps fit the remaining
+total headroom. Negative/non-finite cost observations fail explicitly and remain sticky across later
+usage snapshots. Comparison retains per-case
+execution/error/not-run/budget state and aggregate success/cancellation/budget state while excluding
+variable usage quantities. The checked-in manifest has reviewed R3b pins; its baseline is promoted only
+from separately authorized exact-candidate evidence. Read
 [`docs/compatibility.md`](docs/compatibility.md) and the current
 [`reliability roadmap`](docs/reliability-execution-roadmap.md) before spending a live turn.
 

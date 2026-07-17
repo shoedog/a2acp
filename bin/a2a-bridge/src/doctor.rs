@@ -15,8 +15,9 @@
 // wrapper: it resolves the config path, loads + parses the config once (reusing `validate_config_file`
 // for check 1, exactly as the spec requires), builds a `LoadedConfig`, and renders the result.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bridge_core::domain::{AgentKind, EgressPolicy, RegistrySnapshot};
 
@@ -109,6 +110,32 @@ impl PathStat {
 }
 
 const MAX_PROVENANCE_METADATA_BYTES: usize = 1024 * 1024;
+const MAX_CLAUDE_CREDENTIAL_BYTES: u64 = 64 * 1024;
+const MAX_SMOKE_TIMEOUT_MS: u64 = 15 * 60 * 1000;
+const CREDENTIAL_PREFLIGHT_MARGIN_MS: u64 = 60 * 1000;
+const MIN_CLAUDE_ACCESS_RUNWAY_MS: u64 = MAX_SMOKE_TIMEOUT_MS + CREDENTIAL_PREFLIGHT_MARGIN_MS;
+const CLAUDE_EXPLICIT_AUTH_ENVS: [&str; 3] = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
+// These truthy selectors choose non-first-party Claude backends whose authentication is external to
+// Claude OAuth (AWS/Azure/GCP/provider credentials). The sandbox branch remains authoritative first.
+const CLAUDE_EXTERNAL_PROVIDER_ENVS: [&str; 5] = [
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_MANTLE",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaudeOauthMetadata {
+    access_token_present: bool,
+    access_expires_at_ms: u64,
+    refresh_token_present: bool,
+    refresh_expires_at_ms: Option<u64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledPackage {
@@ -172,6 +199,34 @@ pub trait RuntimeProbes {
     /// Immutable local image id from a bounded read-only inspect. Callers MUST allowlist-gate runtime.
     fn image_id(&self, _runtime: &str, _image: &str) -> Result<String, String> {
         Err("immutable local image id unavailable".into())
+    }
+    /// Exact, non-secret image labels from a bounded read-only inspect. Callers MUST allowlist-gate
+    /// the runtime and treat absent/malformed labels as unknown, never infer package identities.
+    fn image_labels(
+        &self,
+        _runtime: &str,
+        _image: &str,
+    ) -> Result<BTreeMap<String, String>, String> {
+        Err("immutable image labels unavailable".into())
+    }
+    /// SHA-256 of one bounded regular host file. Used only for an explicitly configured,
+    /// non-secret compatibility prerequisite; callers must never hash credential destinations.
+    fn file_sha256(&self, _path: &Path) -> Result<String, String> {
+        Err("file digest unavailable".into())
+    }
+    /// Non-secret shape and expiry metadata from one bounded Claude OAuth credential file. Token
+    /// values are never returned, rendered, or persisted outside the bounded in-memory parse.
+    fn claude_oauth_metadata(&self, _path: &Path) -> Result<ClaudeOauthMetadata, String> {
+        Err("Claude OAuth metadata unavailable".into())
+    }
+    /// Host home used only to locate Claude's standard credential file for an unsandboxed automatic
+    /// auth entry. The path is never accepted from bridge config.
+    fn host_home_dir(&self) -> Option<PathBuf> {
+        None
+    }
+    /// Wall clock for credential expiry checks. Injectable for deterministic boundary tests.
+    fn now_unix_ms(&self) -> Result<u64, String> {
+        Err("current time unavailable".into())
     }
     /// Stat a host path. Never creates, never follows into a write probe (TOCTOU/mutating — cut per
     /// the spec's adversarial review).
@@ -788,6 +843,74 @@ fn immutable_image_id(runtime: &str, image: &str) -> Result<String, String> {
     parse_immutable_image_id(&output)
 }
 
+fn parse_image_labels(output: &[u8]) -> Result<BTreeMap<String, String>, String> {
+    let labels: BTreeMap<String, String> = serde_json::from_slice(output)
+        .map_err(|_| "runtime returned invalid image labels".to_string())?;
+    if labels.iter().any(|(key, value)| {
+        key.is_empty()
+            || value.is_empty()
+            || key.len() > 4096
+            || value.len() > 4096
+            || key.chars().any(char::is_control)
+            || value.chars().any(char::is_control)
+    }) {
+        return Err("runtime returned invalid image labels".into());
+    }
+    Ok(labels)
+}
+
+fn immutable_image_labels(runtime: &str, image: &str) -> Result<BTreeMap<String, String>, String> {
+    let output = bounded_probe_stdout(
+        runtime,
+        &[
+            "image",
+            "inspect",
+            "--format",
+            "{{json .Config.Labels}}",
+            image,
+        ],
+        PROBE_TIMEOUT,
+        MAX_PROVENANCE_METADATA_BYTES,
+    )?;
+    parse_image_labels(&output)
+}
+
+fn read_claude_oauth_metadata(path: &Path) -> Result<ClaudeOauthMetadata, String> {
+    let snapshot = crate::local_file::read_regular_file_bounded(
+        path,
+        "Claude OAuth credential",
+        MAX_CLAUDE_CREDENTIAL_BYTES,
+    )
+    .map_err(|_| "credential is unavailable or is not one bounded regular file".to_string())?;
+    let value: serde_json::Value = serde_json::from_slice(&snapshot.bytes)
+        .map_err(|_| "credential JSON is malformed".to_string())?;
+    let oauth = value
+        .get("claudeAiOauth")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "credential is missing claudeAiOauth metadata".to_string())?;
+    let access_token_present = oauth
+        .get("accessToken")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|token| !token.is_empty());
+    let access_expires_at_ms = oauth
+        .get("expiresAt")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "credential is missing a valid access-token expiry".to_string())?;
+    let refresh_token_present = oauth
+        .get("refreshToken")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|token| !token.is_empty());
+    let refresh_expires_at_ms = oauth
+        .get("refreshTokenExpiresAt")
+        .and_then(serde_json::Value::as_u64);
+    Ok(ClaudeOauthMetadata {
+        access_token_present,
+        access_expires_at_ms,
+        refresh_token_present,
+        refresh_expires_at_ms,
+    })
+}
+
 /// The production `RuntimeProbes` — every method is bounded (nothing here can hang `doctor`).
 pub struct RealProbes;
 
@@ -813,6 +936,32 @@ impl RuntimeProbes for RealProbes {
     }
     fn image_id(&self, runtime: &str, image: &str) -> Result<String, String> {
         immutable_image_id(runtime, image)
+    }
+    fn image_labels(&self, runtime: &str, image: &str) -> Result<BTreeMap<String, String>, String> {
+        immutable_image_labels(runtime, image)
+    }
+    fn file_sha256(&self, path: &Path) -> Result<String, String> {
+        crate::local_file::read_regular_file_bounded(
+            path,
+            "doctor provenance file",
+            MAX_PROVENANCE_METADATA_BYTES as u64,
+        )
+        .map(|snapshot| snapshot.sha256)
+        .map_err(|_| "file digest unavailable".into())
+    }
+    fn claude_oauth_metadata(&self, path: &Path) -> Result<ClaudeOauthMetadata, String> {
+        read_claude_oauth_metadata(path)
+    }
+    fn host_home_dir(&self) -> Option<PathBuf> {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+    fn now_unix_ms(&self) -> Result<u64, String> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system clock is before the Unix epoch".to_string())?
+            .as_millis()
+            .try_into()
+            .map_err(|_| "current time exceeds supported range".to_string())
     }
     fn path_stat(&self, path: &Path) -> PathStat {
         path_stat_impl(path)
@@ -1073,6 +1222,225 @@ fn known_agent_cli(cmd: Option<&str>, adapter: Option<&InstalledPackage>) -> boo
         })
 }
 
+struct ContainerPackageLabels {
+    adapter_key: &'static str,
+    adapter_package: &'static str,
+    cli_key: &'static str,
+    cli_package: &'static str,
+}
+
+fn container_package_labels(cmd: Option<&str>) -> Option<ContainerPackageLabels> {
+    let basename = cmd
+        .and_then(|cmd| Path::new(cmd).file_name())
+        .and_then(|name| name.to_str());
+    match basename {
+        Some("codex-acp") => Some(ContainerPackageLabels {
+            adapter_key: "io.a2a-bridge.provenance.codex.adapter",
+            adapter_package: "@agentclientprotocol/codex-acp",
+            cli_key: "io.a2a-bridge.provenance.codex.agent-cli",
+            cli_package: "@openai/codex",
+        }),
+        Some("claude-agent-acp") => Some(ContainerPackageLabels {
+            adapter_key: "io.a2a-bridge.provenance.claude.adapter",
+            adapter_package: "@agentclientprotocol/claude-agent-acp",
+            cli_key: "io.a2a-bridge.provenance.claude.agent-cli",
+            cli_package: "@anthropic-ai/claude-agent-sdk",
+        }),
+        _ => None,
+    }
+}
+
+fn exact_labeled_package<'a>(
+    labels: &'a BTreeMap<String, String>,
+    key: &str,
+    expected_package: &str,
+) -> Result<&'a str, String> {
+    let value = labels
+        .get(key)
+        .ok_or_else(|| format!("missing image label {key}"))?;
+    let Some((package, version)) = value.split_once('=') else {
+        return Err(format!("invalid image label {key}"));
+    };
+    if package != expected_package
+        || version.is_empty()
+        || version.chars().any(char::is_whitespace)
+        || semver::Version::parse(version).is_err()
+    {
+        return Err(format!("invalid image label {key}"));
+    }
+    Ok(version)
+}
+
+fn host_mount_source(volumes: &[String], destination: &str) -> Option<PathBuf> {
+    use bridge_core::sandbox::SandboxVolumeSource;
+
+    let mut matches = volumes.iter().filter_map(|volume| {
+        let declaration = bridge_core::sandbox::parse_sandbox_volume(volume).ok()?;
+        (declaration.destination() == destination).then_some(declaration)
+    });
+    let declaration = matches.next()?;
+    // Container runtimes need not agree on duplicate destination handling. Exact provenance is
+    // unavailable unless one and only one declaration selects this in-container path.
+    if matches.next().is_some() {
+        return None;
+    }
+    match declaration.source() {
+        SandboxVolumeSource::Host(path) => Some(PathBuf::from(path)),
+        SandboxVolumeSource::Anonymous | SandboxVolumeSource::Named(_) => None,
+    }
+}
+
+const CLAUDE_CREDENTIAL_DESTINATION: &str = "/root/.claude/.credentials.json";
+
+fn claude_credential_source(
+    entry: &bridge_core::domain::AgentEntry,
+    probes: &dyn RuntimeProbes,
+) -> Result<Option<PathBuf>, String> {
+    if !is_claude_acp_cmd(entry.cmd.as_deref()) {
+        return Ok(None);
+    }
+    if let Some(sandbox) = &entry.sandbox {
+        if let Some(path) = host_mount_source(&sandbox.volumes, CLAUDE_CREDENTIAL_DESTINATION) {
+            return Ok(Some(path));
+        }
+        return if entry.pre_authenticated {
+            Err("pre-authenticated Claude container requires exactly one regular-file credential bind"
+                .into())
+        } else {
+            Ok(None)
+        };
+    }
+    if entry.auth_method.is_some() {
+        return Ok(None);
+    }
+    if CLAUDE_EXPLICIT_AUTH_ENVS.iter().any(|name| {
+        probes
+            .env_var_value(name)
+            .is_some_and(|value| !value.is_empty())
+    }) {
+        return Ok(None);
+    }
+    if CLAUDE_EXTERNAL_PROVIDER_ENVS
+        .iter()
+        .any(|name| claude_env_flag_enabled(probes, name))
+    {
+        return Ok(None);
+    }
+    if let Some(config_dir) = probes.env_var_value("CLAUDE_CONFIG_DIR") {
+        let config_dir = PathBuf::from(config_dir);
+        if config_dir.as_os_str().is_empty() || !config_dir.is_absolute() {
+            return Err(
+                "CLAUDE_CONFIG_DIR must be a non-empty absolute path for exact credential preflight"
+                    .into(),
+            );
+        }
+        return Ok(Some(config_dir.join(".credentials.json")));
+    }
+    probes
+        .host_home_dir()
+        .map(|home| Some(home.join(".claude/.credentials.json")))
+        .ok_or_else(|| "host HOME is unavailable for automatic Claude authentication".into())
+}
+
+fn claude_env_flag_enabled(probes: &dyn RuntimeProbes, name: &str) -> bool {
+    probes.env_var_value(name).is_some_and(|value| {
+        let value = value.trim();
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
+}
+
+fn refresh_credential_detail(metadata: ClaudeOauthMetadata, now_ms: u64) -> &'static str {
+    if !metadata.refresh_token_present {
+        "refresh_token=absent"
+    } else if metadata
+        .refresh_expires_at_ms
+        .is_some_and(|expires| expires <= now_ms)
+    {
+        "refresh_token=expired"
+    } else {
+        "refresh_token=present"
+    }
+}
+
+fn claude_oauth_provenance_row(
+    id: &str,
+    entry: &bridge_core::domain::AgentEntry,
+    probes: &dyn RuntimeProbes,
+) -> Option<CheckResult> {
+    let check = format!("provenance:{id}:oauth-credential");
+    let path = match claude_credential_source(entry, probes) {
+        Ok(Some(path)) => path,
+        Ok(None) => return None,
+        Err(reason) => {
+            return Some(CheckResult::fail(
+                check,
+                reason,
+                "establish a fresh host Claude login, sync the isolated copy when applicable, then rerun doctor",
+            ));
+        }
+    };
+    let metadata = match probes.claude_oauth_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(reason) => {
+            return Some(CheckResult::fail(
+                check,
+                format!("Claude OAuth credential freshness unavailable: {reason}"),
+                "refresh the host Claude login, run deploy/containers/sync-creds.sh claude when applicable, then rerun doctor",
+            ));
+        }
+    };
+    if !metadata.access_token_present {
+        return Some(CheckResult::fail(
+            check,
+            "Claude OAuth access token is absent",
+            "refresh the host Claude login, run deploy/containers/sync-creds.sh claude when applicable, then rerun doctor",
+        ));
+    }
+    let now_ms = match probes.now_unix_ms() {
+        Ok(now_ms) => now_ms,
+        Err(reason) => {
+            return Some(CheckResult::fail(
+                check,
+                format!("Claude OAuth credential freshness unavailable: {reason}"),
+                "fix the local clock before starting a billable Claude smoke",
+            ));
+        }
+    };
+    let refresh = refresh_credential_detail(metadata, now_ms);
+    if metadata.access_expires_at_ms <= now_ms {
+        let expired_secs = now_ms.saturating_sub(metadata.access_expires_at_ms) / 1000;
+        return Some(CheckResult::fail(
+            check,
+            format!("Claude OAuth access token expired {expired_secs}s ago; {refresh}"),
+            "refresh the host Claude login, run deploy/containers/sync-creds.sh claude when applicable, then request a separately authorized smoke",
+        ));
+    }
+    let remaining_ms = metadata.access_expires_at_ms - now_ms;
+    let remaining_secs = remaining_ms / 1000;
+    if remaining_ms < MIN_CLAUDE_ACCESS_RUNWAY_MS {
+        return Some(CheckResult::warn(
+            check,
+            format!("Claude OAuth access token has only {remaining_secs}s remaining; {refresh}"),
+            "refresh the host Claude login and isolated copy before a billable smoke",
+        ));
+    }
+    Some(CheckResult::ok(
+        check,
+        format!("Claude OAuth access token has {remaining_secs}s remaining; {refresh}"),
+    ))
+}
+
+pub(crate) fn provenance_blocks_smoke_spawn(rows: &[CheckResult]) -> bool {
+    rows.iter().any(|row| {
+        row.check.starts_with("provenance:")
+            && row.check.ends_with(":oauth-credential")
+            && row.status != CheckStatus::Ok
+    })
+}
+
 fn check_provenance(
     snapshot: &RegistrySnapshot,
     probes: &dyn RuntimeProbes,
@@ -1117,17 +1485,94 @@ fn check_provenance(
                     remedy,
                 ));
             }
-            out.push(CheckResult::warn(
-                format!("provenance:{id}:adapter"),
-                "container adapter package provenance is unknown; host inner command was not inspected",
-                "record package metadata in immutable image labels/manifest (R3/R4)",
-            ));
-            if known_agent_cli(entry.cmd.as_deref(), None) {
-                out.push(CheckResult::warn(
-                    format!("provenance:{id}:agent-cli"),
-                    "container agent CLI provenance is unknown; host packages were not inspected",
-                    "record exact agent CLI/SDK metadata in immutable image labels/manifest (R3/R4)",
-                ));
+            let package_rows = runtime_is_allowed(runtime, &snapshot.allowed_cmds)
+                .then(|| {
+                    container_package_labels(entry.cmd.as_deref()).map(|spec| {
+                        probes
+                            .image_labels(runtime, &sandbox.image)
+                            .and_then(|labels| {
+                                let adapter_version = exact_labeled_package(
+                                    &labels,
+                                    spec.adapter_key,
+                                    spec.adapter_package,
+                                )?;
+                                let cli_version =
+                                    exact_labeled_package(&labels, spec.cli_key, spec.cli_package)?;
+                                Ok((spec, adapter_version.to_string(), cli_version.to_string()))
+                            })
+                    })
+                })
+                .flatten();
+            match package_rows {
+                Some(Ok((spec, adapter_version, cli_version))) => {
+                    out.push(CheckResult::ok(
+                        format!("provenance:{id}:adapter"),
+                        format!(
+                            "source=immutable-image-label package={} version={adapter_version}",
+                            spec.adapter_package
+                        ),
+                    ));
+                    out.push(CheckResult::ok(
+                        format!("provenance:{id}:agent-cli"),
+                        format!(
+                            "source=immutable-image-label package={} version={cli_version}",
+                            spec.cli_package
+                        ),
+                    ));
+                }
+                Some(Err(reason)) => {
+                    out.push(CheckResult::warn(
+                        format!("provenance:{id}:adapter"),
+                        format!(
+                            "container adapter package provenance is unknown; host inner command was not inspected: {reason}"
+                        ),
+                        "record exact package identities in the immutable image labels",
+                    ));
+                    out.push(CheckResult::warn(
+                        format!("provenance:{id}:agent-cli"),
+                        "container agent CLI provenance is unknown",
+                        "record exact agent CLI/SDK identity in the immutable image labels",
+                    ));
+                }
+                None => {
+                    out.push(CheckResult::warn(
+                        format!("provenance:{id}:adapter"),
+                        "container adapter package provenance is unknown; host inner command was not inspected",
+                        "record package metadata in immutable image labels/manifest (R3/R4)",
+                    ));
+                    if known_agent_cli(entry.cmd.as_deref(), None) {
+                        out.push(CheckResult::warn(
+                            format!("provenance:{id}:agent-cli"),
+                            "container agent CLI provenance is unknown; host packages were not inspected",
+                            "record exact agent CLI/SDK metadata in immutable image labels/manifest (R3/R4)",
+                        ));
+                    }
+                }
+            }
+            if entry.model.as_deref().is_some_and(is_fable_model)
+                && is_claude_acp_cmd(entry.cmd.as_deref())
+            {
+                const SETTINGS_DEST: &str = "/root/.claude/settings.json";
+                let check = format!("provenance:{id}:fable-settings");
+                match host_mount_source(&sandbox.volumes, SETTINGS_DEST)
+                    .ok_or_else(|| "settings mount source unavailable".to_string())
+                    .and_then(|path| probes.file_sha256(&path))
+                {
+                    Ok(digest)
+                        if digest.len() == 64
+                            && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+                    {
+                        out.push(CheckResult::ok(
+                            check,
+                            format!("sha256:{}", digest.to_ascii_lowercase()),
+                        ));
+                    }
+                    Ok(_) | Err(_) => out.push(CheckResult::warn(
+                        check,
+                        "mounted Fable settings digest is unavailable",
+                        "mount one bounded regular minimal settings file and rerun doctor",
+                    )),
+                }
             }
             let image_check = format!("provenance:{id}:image");
             if !runtime_is_allowed(runtime, &snapshot.allowed_cmds) {
@@ -1275,6 +1720,9 @@ fn check_provenance(
             format!("provenance:{id}:auth"),
             auth_detail,
         ));
+        if let Some(row) = claude_oauth_provenance_row(id, entry, probes) {
+            out.push(row);
+        }
 
         out.push(CheckResult::ok(
             format!("provenance:{id}:model"),
@@ -1724,7 +2172,8 @@ fn check_review_slice_cmd(
 /// Check 9 — configured bind-mount sources (the sandbox's `volumes`, e.g. mounted credentials or an
 /// isolated settings file) exist as host files; named volumes are skipped (informational — not a host
 /// path). The `creds:*` check-name prefix is retained for output compatibility with the original check.
-/// STATIC only (no freshness/expiry check — cut per review as TOCTOU/mutating-adjacent).
+/// Static source/type checks live here. Claude OAuth freshness is an additive provenance row because
+/// smoke also consumes that exact row as a read-only pre-spawn billing guard.
 /// NOTE: item 9's "env vars named by config are set" clause is the SAME fact as check 3's
 /// `api_key_env` check (the only config surface naming an env var) — folded there, not duplicated here.
 fn check_creds(
@@ -2112,6 +2561,11 @@ mod tests {
         networks: HashSet<String>,
         images: HashSet<String>,
         image_ids: HashMap<(String, String), Result<String, String>>,
+        image_labels: HashMap<(String, String), std::collections::BTreeMap<String, String>>,
+        file_sha256s: HashMap<PathBuf, Result<String, String>>,
+        claude_oauth: HashMap<PathBuf, Result<ClaudeOauthMetadata, String>>,
+        host_home: Option<PathBuf>,
+        now_ms: u64,
         process_provenance: HashMap<String, ProcessProvenance>,
         env_vars: HashMap<String, String>,
         paths: HashMap<PathBuf, PathStat>,
@@ -2145,6 +2599,21 @@ mod tests {
         fn with_image_id(mut self, runtime: &str, image: &str, id: &str) -> Self {
             self.image_ids
                 .insert((runtime.to_string(), image.to_string()), Ok(id.to_string()));
+            self
+        }
+        fn with_image_labels(
+            mut self,
+            runtime: &str,
+            image: &str,
+            labels: &[(&str, &str)],
+        ) -> Self {
+            self.image_labels.insert(
+                (runtime.to_string(), image.to_string()),
+                labels
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
+            );
             self
         }
         fn with_process_provenance(mut self, cmd: &str, provenance: ProcessProvenance) -> Self {
@@ -2184,6 +2653,42 @@ mod tests {
                     readonly: false,
                 },
             )
+        }
+        fn with_file_sha256(mut self, path: &str, sha256: &str) -> Self {
+            self.file_sha256s
+                .insert(PathBuf::from(path), Ok(sha256.to_string()));
+            self.with_file(path)
+        }
+        fn with_claude_oauth(
+            mut self,
+            path: &str,
+            access_expires_at_ms: u64,
+            refresh_token_present: bool,
+            refresh_expires_at_ms: Option<u64>,
+        ) -> Self {
+            self.claude_oauth.insert(
+                PathBuf::from(path),
+                Ok(ClaudeOauthMetadata {
+                    access_token_present: true,
+                    access_expires_at_ms,
+                    refresh_token_present,
+                    refresh_expires_at_ms,
+                }),
+            );
+            self.with_file(path)
+        }
+        fn with_claude_oauth_error(mut self, path: &str, reason: &str) -> Self {
+            self.claude_oauth
+                .insert(PathBuf::from(path), Err(reason.to_string()));
+            self.with_file(path)
+        }
+        fn with_host_home(mut self, path: &str) -> Self {
+            self.host_home = Some(PathBuf::from(path));
+            self
+        }
+        fn at_time(mut self, now_ms: u64) -> Self {
+            self.now_ms = now_ms;
+            self
         }
         fn runtime_probe_calls(&self) -> Vec<String> {
             self.runtime_probe_calls.borrow().clone()
@@ -2246,6 +2751,37 @@ mod tests {
                 .get(&(runtime.to_string(), image.to_string()))
                 .cloned()
                 .unwrap_or_else(|| Err("immutable local image id unavailable".into()))
+        }
+        fn image_labels(
+            &self,
+            runtime: &str,
+            image: &str,
+        ) -> Result<BTreeMap<String, String>, String> {
+            self.runtime_probe_calls
+                .borrow_mut()
+                .push(format!("image_labels:{runtime}:{image}"));
+            self.image_labels
+                .get(&(runtime.to_string(), image.to_string()))
+                .cloned()
+                .ok_or_else(|| "immutable image labels unavailable".into())
+        }
+        fn file_sha256(&self, path: &Path) -> Result<String, String> {
+            self.file_sha256s
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| Err("file digest unavailable".into()))
+        }
+        fn claude_oauth_metadata(&self, path: &Path) -> Result<ClaudeOauthMetadata, String> {
+            self.claude_oauth
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| Err("Claude OAuth metadata unavailable".into()))
+        }
+        fn host_home_dir(&self) -> Option<PathBuf> {
+            self.host_home.clone()
+        }
+        fn now_unix_ms(&self) -> Result<u64, String> {
+            Ok(self.now_ms)
         }
         fn path_stat(&self, path: &Path) -> PathStat {
             self.paths.get(path).copied().unwrap_or(PathStat::ABSENT)
@@ -2926,6 +3462,338 @@ mod tests {
         assert_eq!(find(&results, "creds:reader:1").status, CheckStatus::Fail);
     }
 
+    #[test]
+    fn expired_claude_oauth_fails_for_host_and_pre_authenticated_reader() {
+        const NOW: u64 = 2_000_000;
+        let host = acp_entry("claude-host", "claude-agent-acp");
+        let mut reader = acp_entry("claude-reader", "claude-agent-acp");
+        reader.pre_authenticated = true;
+        reader.sandbox = Some(locked_sandbox(
+            "reader:fixed",
+            "a2a-net",
+            vec!["/creds/.credentials.json:/root/.claude/.credentials.json".to_string()],
+        ));
+        let snapshot = snapshot(
+            "claude-host",
+            vec![host, reader],
+            vec!["claude-agent-acp", "docker"],
+        );
+        let probes = FakeProbes::new()
+            .with_host_home("/home/test")
+            .at_time(NOW)
+            .with_claude_oauth(
+                "/home/test/.claude/.credentials.json",
+                NOW - 1,
+                false,
+                Some(NOW + 10_000),
+            )
+            .with_claude_oauth(
+                "/creds/.credentials.json",
+                NOW - 1,
+                true,
+                Some(NOW + 10_000),
+            );
+        let mut rows = Vec::new();
+        check_provenance(&snapshot, &probes, &mut rows);
+
+        for id in ["claude-host", "claude-reader"] {
+            let row = find(&rows, &format!("provenance:{id}:oauth-credential"));
+            assert_eq!(row.status, CheckStatus::Fail);
+            assert!(row.detail.contains("expired"), "{}", row.detail);
+            assert!(!row.detail.contains("/home/test"));
+            assert!(!row.detail.contains("/creds"));
+        }
+        assert!(provenance_blocks_smoke_spawn(&rows));
+    }
+
+    #[test]
+    fn claude_oauth_runway_boundary_warns_below_minimum_and_accepts_exact_minimum() {
+        const NOW: u64 = 5_000_000;
+        let host = acp_entry("claude", "claude-agent-acp");
+        let snapshot = snapshot("claude", vec![host], vec!["claude-agent-acp"]);
+
+        let below = FakeProbes::new()
+            .with_host_home("/home/test")
+            .at_time(NOW)
+            .with_claude_oauth(
+                "/home/test/.claude/.credentials.json",
+                NOW + MIN_CLAUDE_ACCESS_RUNWAY_MS - 1,
+                true,
+                None,
+            );
+        let mut below_rows = Vec::new();
+        check_provenance(&snapshot, &below, &mut below_rows);
+        assert_eq!(
+            find(&below_rows, "provenance:claude:oauth-credential").status,
+            CheckStatus::Warn
+        );
+        assert!(provenance_blocks_smoke_spawn(&below_rows));
+
+        let exact = FakeProbes::new()
+            .with_host_home("/home/test")
+            .at_time(NOW)
+            .with_claude_oauth(
+                "/home/test/.claude/.credentials.json",
+                NOW + MIN_CLAUDE_ACCESS_RUNWAY_MS,
+                false,
+                None,
+            );
+        let mut exact_rows = Vec::new();
+        check_provenance(&snapshot, &exact, &mut exact_rows);
+        assert_eq!(
+            find(&exact_rows, "provenance:claude:oauth-credential").status,
+            CheckStatus::Ok
+        );
+        assert!(!provenance_blocks_smoke_spawn(&exact_rows));
+    }
+
+    #[test]
+    fn explicit_host_claude_auth_environment_bypasses_file_oauth_gate() {
+        let host = acp_entry("claude", "claude-agent-acp");
+        let snapshot = snapshot("claude", vec![host], vec!["claude-agent-acp"]);
+
+        for name in CLAUDE_EXPLICIT_AUTH_ENVS {
+            let probes = FakeProbes::new()
+                .with_host_home("/home/test")
+                .at_time(10)
+                .with_claude_oauth("/home/test/.claude/.credentials.json", 1, false, None)
+                .with_env(name, "synthetic-secret");
+            let mut rows = Vec::new();
+            check_provenance(&snapshot, &probes, &mut rows);
+            assert!(
+                rows.iter()
+                    .all(|row| row.check != "provenance:claude:oauth-credential"),
+                "explicit auth env {name} must not be overridden by file OAuth preflight"
+            );
+            assert!(!provenance_blocks_smoke_spawn(&rows));
+        }
+
+        let empty = FakeProbes::new()
+            .with_host_home("/home/test")
+            .at_time(10)
+            .with_claude_oauth("/home/test/.claude/.credentials.json", 1, false, None)
+            .with_env("ANTHROPIC_API_KEY", "");
+        let mut empty_rows = Vec::new();
+        check_provenance(&snapshot, &empty, &mut empty_rows);
+        assert_eq!(
+            find(&empty_rows, "provenance:claude:oauth-credential").status,
+            CheckStatus::Fail
+        );
+        assert!(provenance_blocks_smoke_spawn(&empty_rows));
+    }
+
+    #[test]
+    fn external_claude_provider_bypasses_host_file_oauth_only_when_truthy() {
+        const NOW: u64 = 8_000_000;
+        assert_eq!(
+            CLAUDE_EXTERNAL_PROVIDER_ENVS,
+            [
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+                "CLAUDE_CODE_USE_FOUNDRY",
+                "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+                "CLAUDE_CODE_USE_MANTLE",
+            ],
+            "the exact pinned external-provider selector set must not shrink or substitute names"
+        );
+        let host = acp_entry("claude", "claude-agent-acp");
+        let host_snapshot = snapshot("claude", vec![host], vec!["claude-agent-acp"]);
+
+        for name in CLAUDE_EXTERNAL_PROVIDER_ENVS {
+            for value in ["1", "true", " YES ", "on"] {
+                let probes = FakeProbes::new()
+                    .with_host_home("/home/test")
+                    .at_time(NOW)
+                    .with_claude_oauth("/home/test/.claude/.credentials.json", NOW - 1, false, None)
+                    .with_env(name, value);
+                let mut rows = Vec::new();
+                check_provenance(&host_snapshot, &probes, &mut rows);
+                assert!(
+                    rows.iter()
+                        .all(|row| row.check != "provenance:claude:oauth-credential"),
+                    "external provider {name}={value:?} must not require first-party OAuth"
+                );
+                assert!(!provenance_blocks_smoke_spawn(&rows));
+            }
+        }
+
+        for value in ["", "0", "false", " no ", "off", "junk"] {
+            let probes = FakeProbes::new()
+                .with_host_home("/home/test")
+                .at_time(NOW)
+                .with_claude_oauth("/home/test/.claude/.credentials.json", NOW - 1, false, None)
+                .with_env("CLAUDE_CODE_USE_BEDROCK", value);
+            let mut rows = Vec::new();
+            check_provenance(&host_snapshot, &probes, &mut rows);
+            assert_eq!(
+                find(&rows, "provenance:claude:oauth-credential").status,
+                CheckStatus::Fail,
+                "false-like or unknown provider value {value:?} must not bypass OAuth"
+            );
+            assert!(provenance_blocks_smoke_spawn(&rows));
+        }
+
+        let mut reader = acp_entry("claude-reader", "claude-agent-acp");
+        reader.pre_authenticated = true;
+        reader.sandbox = Some(locked_sandbox(
+            "reader:fixed",
+            "a2a-net",
+            vec!["/creds/.credentials.json:/root/.claude/.credentials.json".to_string()],
+        ));
+        let reader_snapshot = snapshot(
+            "claude-reader",
+            vec![reader],
+            vec!["claude-agent-acp", "docker"],
+        );
+        let probes = FakeProbes::new()
+            .at_time(NOW)
+            .with_claude_oauth("/creds/.credentials.json", NOW - 1, false, None)
+            .with_env("CLAUDE_CODE_USE_BEDROCK", "1");
+        let mut rows = Vec::new();
+        check_provenance(&reader_snapshot, &probes, &mut rows);
+        assert_eq!(
+            find(&rows, "provenance:claude-reader:oauth-credential").status,
+            CheckStatus::Fail,
+            "ambient host provider selection must not bypass the mounted reader credential"
+        );
+        assert!(provenance_blocks_smoke_spawn(&rows));
+    }
+
+    #[test]
+    fn host_claude_oauth_uses_only_an_absolute_config_dir_override() {
+        const NOW: u64 = 9_000_000;
+        let host = acp_entry("claude", "claude-agent-acp");
+        let snapshot = snapshot("claude", vec![host], vec!["claude-agent-acp"]);
+
+        let alternate_is_fresh = FakeProbes::new()
+            .with_host_home("/home/test")
+            .with_env("CLAUDE_CONFIG_DIR", "/isolated/claude")
+            .at_time(NOW)
+            .with_claude_oauth("/home/test/.claude/.credentials.json", NOW - 1, false, None)
+            .with_claude_oauth(
+                "/isolated/claude/.credentials.json",
+                NOW + MIN_CLAUDE_ACCESS_RUNWAY_MS,
+                true,
+                None,
+            );
+        let mut fresh_rows = Vec::new();
+        check_provenance(&snapshot, &alternate_is_fresh, &mut fresh_rows);
+        assert_eq!(
+            find(&fresh_rows, "provenance:claude:oauth-credential").status,
+            CheckStatus::Ok,
+            "the ACP wrapper reads credentials below CLAUDE_CONFIG_DIR, not HOME"
+        );
+
+        let alternate_is_expired = FakeProbes::new()
+            .with_host_home("/home/test")
+            .with_env("CLAUDE_CONFIG_DIR", "/isolated/claude")
+            .at_time(NOW)
+            .with_claude_oauth(
+                "/home/test/.claude/.credentials.json",
+                NOW + MIN_CLAUDE_ACCESS_RUNWAY_MS,
+                true,
+                None,
+            )
+            .with_claude_oauth("/isolated/claude/.credentials.json", NOW - 1, false, None);
+        let mut expired_rows = Vec::new();
+        check_provenance(&snapshot, &alternate_is_expired, &mut expired_rows);
+        assert_eq!(
+            find(&expired_rows, "provenance:claude:oauth-credential").status,
+            CheckStatus::Fail,
+            "a fresh HOME credential must not mask the selected expired credential"
+        );
+
+        for ambiguous in ["", "relative/claude"] {
+            let probes = FakeProbes::new()
+                .with_host_home("/home/test")
+                .with_env("CLAUDE_CONFIG_DIR", ambiguous)
+                .at_time(NOW)
+                .with_claude_oauth(
+                    "/home/test/.claude/.credentials.json",
+                    NOW + MIN_CLAUDE_ACCESS_RUNWAY_MS,
+                    true,
+                    None,
+                );
+            let mut rows = Vec::new();
+            check_provenance(&snapshot, &probes, &mut rows);
+            let row = find(&rows, "provenance:claude:oauth-credential");
+            assert_eq!(row.status, CheckStatus::Fail);
+            assert!(row.detail.contains("CLAUDE_CONFIG_DIR"), "{}", row.detail);
+            assert!(provenance_blocks_smoke_spawn(&rows));
+        }
+    }
+
+    #[test]
+    fn production_claude_oauth_parser_rejects_bad_required_shape_and_ignores_bad_refresh_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+
+        std::fs::write(&path, b"{not-json").unwrap();
+        assert_eq!(
+            read_claude_oauth_metadata(&path).unwrap_err(),
+            "credential JSON is malformed"
+        );
+
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "synthetic-token",
+                    "expiresAt": "tomorrow"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_claude_oauth_metadata(&path).unwrap_err(),
+            "credential is missing a valid access-token expiry"
+        );
+
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "claudeAiOauth": {
+                    "expiresAt": 42,
+                    "refreshToken": "synthetic-refresh-token",
+                    "refreshTokenExpiresAt": "not-an-integer"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let metadata = read_claude_oauth_metadata(&path).unwrap();
+        assert!(!metadata.access_token_present);
+        assert_eq!(metadata.access_expires_at_ms, 42);
+        assert!(metadata.refresh_token_present);
+        assert_eq!(metadata.refresh_expires_at_ms, None);
+    }
+
+    #[test]
+    fn malformed_claude_oauth_metadata_fails_without_blocking_on_unrelated_warnings() {
+        let host = acp_entry("claude", "claude-agent-acp");
+        let snapshot = snapshot("claude", vec![host], vec!["claude-agent-acp"]);
+        let probes = FakeProbes::new()
+            .with_host_home("/home/test")
+            .at_time(1)
+            .with_claude_oauth_error(
+                "/home/test/.claude/.credentials.json",
+                "synthetic malformed credential",
+            );
+        let mut rows = Vec::new();
+        check_provenance(&snapshot, &probes, &mut rows);
+        let row = find(&rows, "provenance:claude:oauth-credential");
+        assert_eq!(row.status, CheckStatus::Fail);
+        assert!(row.detail.contains("freshness unavailable"));
+        assert!(provenance_blocks_smoke_spawn(&rows));
+
+        assert!(!provenance_blocks_smoke_spawn(&[CheckResult::warn(
+            "provenance:claude:adapter",
+            "unrelated warning",
+            "fix provenance",
+        )]));
+    }
+
     // ---- check 10: explicit Fable prerequisites ----
 
     #[test]
@@ -3178,6 +4046,211 @@ mod tests {
                 .all(|call| !call.contains("codex-acp")),
             "sandbox provenance must never inspect the host inner command: {:?}",
             probes.executable_probe_calls()
+        );
+    }
+
+    #[test]
+    fn labeled_immutable_image_reports_exact_container_adapter_and_cli_packages() {
+        const IMAGE: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut codex = acp_entry("codex", "codex-acp");
+        codex.sandbox = Some(locked_sandbox(IMAGE, "a2a-net", vec![]));
+        let cfg = base_loaded(snapshot("codex", vec![codex], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image(IMAGE)
+            .with_image_id("docker", IMAGE, IMAGE)
+            .with_image_labels(
+                "docker",
+                IMAGE,
+                &[
+                    (
+                        "io.a2a-bridge.provenance.codex.adapter",
+                        "@agentclientprotocol/codex-acp=1.1.2",
+                    ),
+                    (
+                        "io.a2a-bridge.provenance.codex.agent-cli",
+                        "@openai/codex=0.144.1",
+                    ),
+                ],
+            );
+
+        let results = run_checks(&cfg, &probes);
+        let adapter = find(&results, "provenance:codex:adapter");
+        assert_eq!(adapter.status, CheckStatus::Ok);
+        assert!(adapter
+            .detail
+            .contains("package=@agentclientprotocol/codex-acp"));
+        assert!(adapter.detail.contains("version=1.1.2"));
+        let cli = find(&results, "provenance:codex:agent-cli");
+        assert_eq!(cli.status, CheckStatus::Ok);
+        assert!(cli.detail.contains("package=@openai/codex"));
+        assert!(cli.detail.contains("version=0.144.1"));
+    }
+
+    #[test]
+    fn labeled_claude_image_reports_exact_adapter_and_sdk_packages() {
+        const IMAGE: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut claude = acp_entry("claude", "claude-agent-acp");
+        claude.sandbox = Some(locked_sandbox(IMAGE, "a2a-net", vec![]));
+        let cfg = base_loaded(snapshot("claude", vec![claude], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image(IMAGE)
+            .with_image_id("docker", IMAGE, IMAGE)
+            .with_image_labels(
+                "docker",
+                IMAGE,
+                &[
+                    (
+                        "io.a2a-bridge.provenance.claude.adapter",
+                        "@agentclientprotocol/claude-agent-acp=0.55.0",
+                    ),
+                    (
+                        "io.a2a-bridge.provenance.claude.agent-cli",
+                        "@anthropic-ai/claude-agent-sdk=0.3.198",
+                    ),
+                ],
+            );
+
+        let results = run_checks(&cfg, &probes);
+        let adapter = find(&results, "provenance:claude:adapter");
+        assert_eq!(adapter.status, CheckStatus::Ok);
+        assert!(adapter
+            .detail
+            .contains("package=@agentclientprotocol/claude-agent-acp"));
+        assert!(adapter.detail.contains("version=0.55.0"));
+        let cli = find(&results, "provenance:claude:agent-cli");
+        assert_eq!(cli.status, CheckStatus::Ok);
+        assert!(cli
+            .detail
+            .contains("package=@anthropic-ai/claude-agent-sdk"));
+        assert!(cli.detail.contains("version=0.3.198"));
+    }
+
+    #[test]
+    fn claude_image_labels_never_guess_missing_or_wrong_sdk_identity() {
+        const IMAGE: &str =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        for labels in [
+            vec![(
+                "io.a2a-bridge.provenance.claude.adapter",
+                "@agentclientprotocol/claude-agent-acp=0.55.0",
+            )],
+            vec![
+                (
+                    "io.a2a-bridge.provenance.claude.adapter",
+                    "@agentclientprotocol/claude-agent-acp=0.55.0",
+                ),
+                (
+                    "io.a2a-bridge.provenance.claude.agent-cli",
+                    "@openai/codex=0.144.1",
+                ),
+            ],
+        ] {
+            let mut claude = acp_entry("claude", "claude-agent-acp");
+            claude.sandbox = Some(locked_sandbox(IMAGE, "a2a-net", vec![]));
+            let cfg = base_loaded(snapshot("claude", vec![claude], vec!["docker"]));
+            let probes = FakeProbes::new()
+                .allow_runtime("docker")
+                .allow_network("a2a-net")
+                .allow_image(IMAGE)
+                .with_image_id("docker", IMAGE, IMAGE)
+                .with_image_labels("docker", IMAGE, &labels);
+
+            let results = run_checks(&cfg, &probes);
+            assert_eq!(
+                find(&results, "provenance:claude:adapter").status,
+                CheckStatus::Warn
+            );
+            assert_eq!(
+                find(&results, "provenance:claude:agent-cli").status,
+                CheckStatus::Warn
+            );
+        }
+    }
+
+    #[test]
+    fn fable_reader_provenance_binds_the_mounted_settings_file_digest() {
+        const DIGEST: &str =
+            "sha256:6ee4ad319cdfc34a558425ddda86f5b1da4c10912a08dfdc32c0c009eef81f19";
+        let mut claude = acp_entry("claude", "claude-agent-acp");
+        claude.model = Some("claude-fable-5[1m]".into());
+        claude.sandbox = Some(locked_sandbox(
+            "reader:latest",
+            "a2a-net",
+            vec!["/cfg/settings.json:/root/.claude/settings.json:ro".into()],
+        ));
+        let cfg = base_loaded(snapshot("claude", vec![claude], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image("reader:latest")
+            .with_env("A2A_BRIDGE_ALLOW_FABLE", "1")
+            .with_file_sha256(
+                "/cfg/settings.json",
+                DIGEST.strip_prefix("sha256:").unwrap(),
+            );
+
+        let results = run_checks(&cfg, &probes);
+        let row = find(&results, "provenance:claude:fable-settings");
+        assert_eq!(row.status, CheckStatus::Ok);
+        assert_eq!(row.detail, DIGEST);
+    }
+
+    #[test]
+    fn fable_reader_provenance_rejects_ambiguous_settings_destinations() {
+        let mut claude = acp_entry("claude", "claude-agent-acp");
+        claude.model = Some("claude-fable-5[1m]".into());
+        claude.sandbox = Some(locked_sandbox(
+            "reader:latest",
+            "a2a-net",
+            vec![
+                "/cfg/reviewed-settings.json:/root/.claude/settings.json:ro".into(),
+                "/cfg/other-settings.json:/root/.claude/settings.json:ro".into(),
+            ],
+        ));
+        let cfg = base_loaded(snapshot("claude", vec![claude], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image("reader:latest")
+            .with_env("A2A_BRIDGE_ALLOW_FABLE", "1")
+            .with_file_sha256("/cfg/reviewed-settings.json", &"a".repeat(64))
+            .with_file_sha256("/cfg/other-settings.json", &"b".repeat(64));
+
+        let results = run_checks(&cfg, &probes);
+        assert_eq!(
+            find(&results, "provenance:claude:fable-settings").status,
+            CheckStatus::Warn,
+            "duplicate destinations must not select one source as exact runtime provenance"
+        );
+    }
+
+    #[test]
+    fn fable_reader_provenance_never_guesses_an_unreadable_settings_digest() {
+        let mut claude = acp_entry("claude", "claude-agent-acp");
+        claude.model = Some("claude-fable-5[1m]".into());
+        claude.sandbox = Some(locked_sandbox(
+            "reader:latest",
+            "a2a-net",
+            vec!["/cfg/settings.json:/root/.claude/settings.json:ro".into()],
+        ));
+        let cfg = base_loaded(snapshot("claude", vec![claude], vec!["docker"]));
+        let probes = FakeProbes::new()
+            .allow_runtime("docker")
+            .allow_network("a2a-net")
+            .allow_image("reader:latest")
+            .with_env("A2A_BRIDGE_ALLOW_FABLE", "1")
+            .with_file("/cfg/settings.json");
+
+        let results = run_checks(&cfg, &probes);
+        assert_eq!(
+            find(&results, "provenance:claude:fable-settings").status,
+            CheckStatus::Warn
         );
     }
 
@@ -3556,6 +4629,60 @@ mod tests {
                 .as_slice(),
         ] {
             assert!(parse_immutable_image_id(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn r3b_image_label_parser_accepts_only_a_bounded_string_map() {
+        let valid =
+            br#"{"io.a2a-bridge.provenance.codex.adapter":"@agentclientprotocol/codex-acp=1.1.2"}"#;
+        assert_eq!(
+            parse_image_labels(valid).unwrap()["io.a2a-bridge.provenance.codex.adapter"],
+            "@agentclientprotocol/codex-acp=1.1.2"
+        );
+
+        for invalid in [
+            b"null".as_slice(),
+            br#"[]"#,
+            br#"{"label":1}"#,
+            br#"{"":"value"}"#,
+            br#"{"label":""}"#,
+            br#"{"label":"line\nfeed"}"#,
+        ] {
+            assert!(parse_image_labels(invalid).is_err());
+        }
+
+        let labels = BTreeMap::from([
+            (
+                "io.a2a-bridge.provenance.codex.adapter".into(),
+                "@agentclientprotocol/codex-acp=1.1.2".into(),
+            ),
+            (
+                "io.a2a-bridge.provenance.codex.agent-cli".into(),
+                "@openai/codex=0.144.1".into(),
+            ),
+        ]);
+        assert_eq!(
+            exact_labeled_package(
+                &labels,
+                "io.a2a-bridge.provenance.codex.agent-cli",
+                "@openai/codex"
+            )
+            .unwrap(),
+            "0.144.1"
+        );
+        for invalid in ["@openai/codex=0.144", "@other/codex=0.144.1", "latest"] {
+            let mut labels = labels.clone();
+            labels.insert(
+                "io.a2a-bridge.provenance.codex.agent-cli".into(),
+                invalid.into(),
+            );
+            assert!(exact_labeled_package(
+                &labels,
+                "io.a2a-bridge.provenance.codex.agent-cli",
+                "@openai/codex"
+            )
+            .is_err());
         }
     }
 

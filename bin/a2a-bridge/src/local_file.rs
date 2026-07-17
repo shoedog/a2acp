@@ -1260,6 +1260,73 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn atomic_child_replacement_refuses_same_name_rebound_replacement() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_directory(dir.path(), "test publication directory").unwrap();
+        let pin = PinnedDirectory::open(
+            dir.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test publication directory",
+        )
+        .unwrap();
+        let mut setup = pin
+            .create_new_file(OsStr::new("aggregate.json"), 0o600, "test setup aggregate")
+            .unwrap();
+        setup.write_all(b"blocking setup").unwrap();
+        setup.sync_all().unwrap();
+        let mut replacement = pin
+            .create_new_file(OsStr::new("final.json"), 0o600, "test final aggregate")
+            .unwrap();
+        replacement.write_all(b"green final").unwrap();
+        replacement.sync_all().unwrap();
+        let mut rollback = pin
+            .create_new_file(
+                OsStr::new("setup-rollback.json"),
+                0o600,
+                "test rollback aggregate",
+            )
+            .unwrap();
+        rollback.write_all(b"blocking setup").unwrap();
+        rollback.sync_all().unwrap();
+
+        fs::rename(
+            dir.path().join("final.json"),
+            dir.path().join("retained-final.json"),
+        )
+        .unwrap();
+        fs::write(dir.path().join("final.json"), b"same-name rebound final").unwrap();
+
+        let error = pin
+            .replace_regular_child(
+                RegularChildRef::new(OsStr::new("aggregate.json"), &setup),
+                RegularChildRef::new(OsStr::new("final.json"), &replacement),
+                RegularChildRef::new(OsStr::new("setup-rollback.json"), &rollback),
+                "test final publication",
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("replacement identity changed before publication"));
+        assert_eq!(
+            fs::read(dir.path().join("aggregate.json")).unwrap(),
+            b"blocking setup"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("final.json")).unwrap(),
+            b"same-name rebound final"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("retained-final.json")).unwrap(),
+            b"green final"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn atomic_child_replacement_removes_green_target_when_rollback_fails() {
         use std::io::Write as _;
 

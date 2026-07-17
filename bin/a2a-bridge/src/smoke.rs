@@ -576,6 +576,8 @@ struct SmokeUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     cost: Option<SmokeCost>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cost_rejected: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     terminal: Option<bridge_core::orch::TerminalUsage>,
     at_ms: i64,
 }
@@ -740,6 +742,18 @@ impl ArtifactState {
         self.artifact.attempt.prompt_may_have_been_accepted = accepted;
     }
 
+    fn fail_deadline_timeout(&mut self, context: DeadlineTimeoutContext) {
+        self.failure = Some(static_failure_with_context(
+            context.failed_phase,
+            context.last_completed_phase,
+            DiagnosticFailureClass::Timeout,
+            "smoke.timeout",
+            "Agent turn timed out",
+            context.prompt_may_have_been_accepted,
+        ));
+        self.artifact.attempt.prompt_may_have_been_accepted = context.prompt_may_have_been_accepted;
+    }
+
     fn fail_error(&mut self, error: &BridgeError, fallback_phase: DiagnosticPhase, accepted: bool) {
         if let BridgeError::AgentFailure { diagnostic } = error {
             self.artifact.attempt.prompt_may_have_been_accepted |=
@@ -854,6 +868,17 @@ fn static_failure(
     } else {
         None
     };
+    static_failure_with_context(phase, last_completed_phase, class, code, summary, accepted)
+}
+
+fn static_failure_with_context(
+    phase: DiagnosticPhase,
+    last_completed_phase: Option<DiagnosticPhase>,
+    class: DiagnosticFailureClass,
+    code: &'static str,
+    summary: &'static str,
+    accepted: bool,
+) -> FailureDiagnostic {
     FailureDiagnostic::build_static_code(
         FailureDiagnosticInput {
             failed_phase: phase,
@@ -990,8 +1015,22 @@ impl PolicyEngine for DenyAllPolicy {
 
 struct DrainResult {
     turn: TurnRecord,
+    configure_calls: u8,
     error: Option<BridgeError>,
     static_failure: Option<FailureDiagnostic>,
+    deadline_timeout: Option<DeadlineTimeoutContext>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeadlineTimeoutContext {
+    failed_phase: DiagnosticPhase,
+    last_completed_phase: Option<DiagnosticPhase>,
+    prompt_may_have_been_accepted: bool,
+}
+
+enum DeadlineFirst<T> {
+    Completed(T),
+    TimedOut { future_polled: bool },
 }
 
 enum ResolveOnce {
@@ -1021,10 +1060,38 @@ async fn resolve_once(
     observer: Arc<dyn bridge_core::ports::DiagnosticObserver>,
     deadline: tokio::time::Instant,
 ) -> ResolveOnce {
-    match tokio::time::timeout_at(deadline, registry.resolve_observed(agent, observer)).await {
-        Err(_) => ResolveOnce::TimedOut,
-        Ok(Err(error)) => ResolveOnce::Failed(error),
-        Ok(Ok(resolved)) => ResolveOnce::Resolved(resolved),
+    match deadline_first(deadline, registry.resolve_observed(agent, observer)).await {
+        DeadlineFirst::TimedOut { .. } => ResolveOnce::TimedOut,
+        DeadlineFirst::Completed(Err(error)) => ResolveOnce::Failed(error),
+        DeadlineFirst::Completed(Ok(resolved)) => ResolveOnce::Resolved(resolved),
+    }
+}
+
+async fn deadline_first<F>(deadline: tokio::time::Instant, future: F) -> DeadlineFirst<F::Output>
+where
+    F: std::future::Future,
+{
+    // A newly constructed `Sleep` can require a timer-driver turn even when synchronous work has just
+    // crossed its deadline. Refuse from the monotonic clock before constructing or polling either branch.
+    if tokio::time::Instant::now() >= deadline {
+        return DeadlineFirst::TimedOut {
+            future_polled: false,
+        };
+    }
+    // `tokio::time::timeout_at` polls its inner future before its delay. Use one biased deadline-first
+    // primitive for every billable stage so an already-expired (or simultaneously-ready) deadline
+    // cannot give resolver/configure/prompt/drain one last poll.
+    let future_polled = std::sync::atomic::AtomicBool::new(false);
+    let tracked = async {
+        future_polled.store(true, Ordering::Relaxed);
+        future.await
+    };
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => DeadlineFirst::TimedOut {
+            future_polled: future_polled.load(Ordering::Relaxed),
+        },
+        output = tracked => DeadlineFirst::Completed(output),
     }
 }
 
@@ -1039,11 +1106,12 @@ async fn execute_one(
 ) -> DrainResult {
     let mut turn = TurnRecord::default();
 
-    let cwd_drift = || DrainResult {
+    let cwd_drift = |configure_calls| DrainResult {
         turn: TurnRecord {
             terminal_state: "config_failed",
             ..TurnRecord::default()
         },
+        configure_calls,
         error: None,
         static_failure: Some(static_failure(
             DiagnosticPhase::ConfigApply,
@@ -1052,42 +1120,51 @@ async fn execute_one(
             "Fallback smoke cwd identity changed before host execution",
             false,
         )),
+        deadline_timeout: None,
     };
     if fallback_cwd.is_some_and(|cwd| !cwd.current_path_matches()) {
-        return cwd_drift();
+        return cwd_drift(0);
     }
 
-    match tokio::time::timeout_at(deadline, backend.configure_session(session, spec)).await {
-        Err(_) => {
-            turn.terminal_state = "timeout";
-            return DrainResult {
-                turn,
-                error: Some(BridgeError::AgentTimedOut),
-                static_failure: None,
-            };
-        }
-        Ok(Err(error)) => {
-            turn.terminal_state = "config_failed";
-            return DrainResult {
-                turn,
-                error: Some(error),
-                static_failure: None,
-            };
-        }
-        Ok(Ok(())) => turn.prompt_calls = 0,
-    }
+    let configure_calls =
+        match deadline_first(deadline, backend.configure_session(session, spec)).await {
+            DeadlineFirst::TimedOut { future_polled } => {
+                turn.terminal_state = "timeout";
+                return DrainResult {
+                    turn,
+                    configure_calls: u8::from(future_polled),
+                    error: Some(BridgeError::AgentTimedOut),
+                    static_failure: None,
+                    deadline_timeout: Some(DeadlineTimeoutContext {
+                        failed_phase: DiagnosticPhase::ConfigApply,
+                        last_completed_phase: Some(DiagnosticPhase::Resolve),
+                        prompt_may_have_been_accepted: false,
+                    }),
+                };
+            }
+            DeadlineFirst::Completed(Err(error)) => {
+                turn.terminal_state = "config_failed";
+                return DrainResult {
+                    turn,
+                    configure_calls: 1,
+                    error: Some(error),
+                    static_failure: None,
+                    deadline_timeout: None,
+                };
+            }
+            DeadlineFirst::Completed(Ok(())) => 1,
+        };
 
     // ACP configure only stashes SessionSpec; lazy session mint happens at prompt. Revalidate after
     // configure so a replacement in that exact window cannot reach the billable handoff. A later
     // replacement is still pinned by the host process spawn context and object-addressed ACP cwd.
     if fallback_cwd.is_some_and(|cwd| !cwd.current_path_matches()) {
-        return cwd_drift();
+        return cwd_drift(configure_calls);
     }
 
-    turn.prompt_calls = 1;
     let rich_dyn: Arc<dyn RichEventSink> = rich.clone();
     let diagnostic_dyn: Arc<dyn bridge_core::ports::DiagnosticObserver> = observer;
-    let stream = match tokio::time::timeout_at(
+    let stream = match deadline_first(
         deadline,
         backend.prompt_with_observers(
             session,
@@ -1099,37 +1176,94 @@ async fn execute_one(
     )
     .await
     {
-        Err(_) => {
+        DeadlineFirst::TimedOut { future_polled } => {
+            turn.prompt_calls = u8::from(future_polled);
             turn.terminal_state = "timeout";
             return DrainResult {
                 turn,
+                configure_calls,
                 error: Some(BridgeError::AgentTimedOut),
                 static_failure: None,
+                deadline_timeout: Some(DeadlineTimeoutContext {
+                    failed_phase: DiagnosticPhase::PromptStart,
+                    last_completed_phase: Some(DiagnosticPhase::ConfigApply),
+                    prompt_may_have_been_accepted: future_polled,
+                }),
             };
         }
-        Ok(Err(error)) => {
+        DeadlineFirst::Completed(Err(error)) => {
+            turn.prompt_calls = 1;
             turn.terminal_state = "prompt_failed";
             return DrainResult {
                 turn,
+                configure_calls,
                 error: Some(error),
                 static_failure: None,
+                deadline_timeout: None,
             };
         }
-        Ok(Ok(stream)) => stream,
+        DeadlineFirst::Completed(Ok(stream)) => {
+            turn.prompt_calls = 1;
+            stream
+        }
     };
 
-    match tokio::time::timeout_at(deadline, drain_stream(stream, Arc::clone(&rich))).await {
-        Err(_) => {
+    match deadline_first(deadline, drain_stream(stream, Arc::clone(&rich))).await {
+        DeadlineFirst::TimedOut { .. } => {
             turn.terminal_state = "timeout";
             turn.tool_event_count = rich.tool_event_count();
             DrainResult {
                 turn,
+                configure_calls,
                 error: Some(BridgeError::AgentTimedOut),
                 static_failure: None,
+                deadline_timeout: Some(DeadlineTimeoutContext {
+                    failed_phase: DiagnosticPhase::PromptStream,
+                    last_completed_phase: Some(DiagnosticPhase::PromptStart),
+                    prompt_may_have_been_accepted: true,
+                }),
             }
         }
-        Ok(result) => result,
+        DeadlineFirst::Completed(mut result) => {
+            result.configure_calls = configure_calls;
+            result
+        }
     }
+}
+
+fn apply_execute_result(state: &mut ArtifactState, result: DrainResult) -> bool {
+    let DrainResult {
+        turn,
+        configure_calls,
+        error,
+        static_failure,
+        deadline_timeout,
+    } = result;
+    state.artifact.session.configure_calls = configure_calls;
+    state.artifact.turn = turn;
+    let failed = error.is_some() || static_failure.is_some();
+
+    if let Some(failure) = static_failure {
+        state.artifact.attempt.prompt_may_have_been_accepted |=
+            failure.prompt_may_have_been_accepted();
+        state.failure = Some(failure);
+    } else if let Some(error) = &error {
+        state.artifact.attempt.timed_out = is_timeout_failure(error);
+        if let Some(context) = deadline_timeout {
+            debug_assert!(matches!(error, BridgeError::AgentTimedOut));
+            state.fail_deadline_timeout(context);
+        } else {
+            let accepted = state.artifact.turn.prompt_calls == 1;
+            let phase = turn_failure_phase(&state.artifact.turn);
+            state.fail_turn_error(error, phase, accepted);
+        }
+    } else {
+        debug_assert!(deadline_timeout.is_none());
+        state.artifact.success = true;
+        state.artifact.attempt.prompt_may_have_been_accepted = true;
+    }
+
+    failed
 }
 
 async fn drain_stream(
@@ -1143,17 +1277,21 @@ async fn drain_stream(
     let mut captured = Vec::new();
     let mut capture_overflow = false;
     let mut usage: Option<UsageSnapshot> = None;
+    let mut invalid_cost_observed = false;
 
     while let Some(update) = stream.next().await {
         match update {
             Err(error) => {
                 turn.terminal_state = "backend_error";
                 turn.tool_event_count = rich.tool_event_count();
-                turn.usage = usage.map(smoke_usage);
+                turn.usage =
+                    usage.map(|value| smoke_usage_with_history(value, invalid_cost_observed));
                 return DrainResult {
                     turn,
+                    configure_calls: 0,
                     error: Some(error),
                     static_failure: None,
+                    deadline_timeout: None,
                 };
             }
             Ok(Update::Text(text)) => {
@@ -1169,6 +1307,10 @@ async fn drain_stream(
                 turn.permission_update_count = turn.permission_update_count.saturating_add(1);
             }
             Ok(Update::Usage(next)) => {
+                invalid_cost_observed |= next
+                    .cost
+                    .as_ref()
+                    .is_some_and(|cost| !cost.amount.is_finite() || cost.amount < 0.0);
                 let mut next = next;
                 if let Some(previous) = &usage {
                     next.merge_missing_from(previous);
@@ -1192,7 +1334,7 @@ async fn drain_stream(
 
     let _ = rich.flush().await;
     turn.tool_event_count = rich.tool_event_count();
-    turn.usage = usage.map(smoke_usage);
+    turn.usage = usage.map(|value| smoke_usage_with_history(value, invalid_cost_observed));
     if turn.stop_reason.is_none() {
         turn.terminal_state = "eof_without_terminal";
     }
@@ -1206,8 +1348,10 @@ async fn drain_stream(
     let error = (!successful).then_some(BridgeError::FrameError);
     DrainResult {
         turn,
+        configure_calls: 0,
         error,
         static_failure: None,
+        deadline_timeout: None,
     }
 }
 
@@ -1224,12 +1368,25 @@ fn safe_stop_reason(reason: &str) -> &'static str {
     }
 }
 
-fn smoke_usage(value: UsageSnapshot) -> SmokeUsage {
-    SmokeUsage {
-        used: value.used,
-        size: value.size,
-        cost: value.cost.and_then(|cost| {
-            (cost.amount.is_finite() && cost.amount >= 0.0).then(|| SmokeCost {
+fn smoke_usage_with_history(value: UsageSnapshot, invalid_cost_observed: bool) -> SmokeUsage {
+    let invalid_cost_observed = invalid_cost_observed
+        || value
+            .cost
+            .as_ref()
+            .is_some_and(|cost| !cost.amount.is_finite() || cost.amount < 0.0);
+    if invalid_cost_observed {
+        return SmokeUsage {
+            used: value.used,
+            size: value.size,
+            cost: None,
+            cost_rejected: Some("negative_or_non_finite"),
+            terminal: value.terminal,
+            at_ms: value.at_ms,
+        };
+    }
+    let (cost, cost_rejected) = match value.cost {
+        Some(cost) if cost.amount.is_finite() && cost.amount >= 0.0 => (
+            Some(SmokeCost {
                 amount: cost.amount,
                 currency: if cost.currency.len() == 3
                     && cost.currency.bytes().all(|byte| byte.is_ascii_uppercase())
@@ -1238,8 +1395,17 @@ fn smoke_usage(value: UsageSnapshot) -> SmokeUsage {
                 } else {
                     "unknown".into()
                 },
-            })
-        }),
+            }),
+            None,
+        ),
+        Some(_) => (None, Some("negative_or_non_finite")),
+        None => (None, None),
+    };
+    SmokeUsage {
+        used: value.used,
+        size: value.size,
+        cost,
+        cost_rejected,
         terminal: value.terminal,
         at_ms: value.at_ms,
     }
@@ -1669,11 +1835,29 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     let artifact_redactor = artifact_redactor(&entry, session_cwd.as_ref());
     sanitize_optional_artifact_text(&mut state.artifact.request.model, &artifact_redactor);
     sanitize_optional_artifact_text(&mut state.artifact.request.mode, &artifact_redactor);
+    // Start the one absolute deadline before credential provenance and orphan recovery. Those
+    // pre-spawn phases therefore consume the same bounded budget as resolve/configure/prompt/drain;
+    // an eventually-returning recovery can never age an accepted OAuth credential past the
+    // preflight runway and then receive a fresh turn deadline.
+    state.artifact.attempt.started_at_ms = diagnostic_timestamp_ms();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout_secs);
+    let provenance = artifact_provenance(&snapshot, &args.agent, &artifact_redactor);
+    let stale_oauth = doctor::provenance_blocks_smoke_spawn(&provenance);
     state.artifact.target = Some(TargetRecord {
         execution_mode: execution_mode(&entry),
-        provenance: artifact_provenance(&snapshot, &args.agent, &artifact_redactor),
+        provenance,
         authentication: authentication(&entry, &artifact_redactor),
     });
+    if stale_oauth {
+        state.fail_static(
+            DiagnosticPhase::Authenticate,
+            DiagnosticFailureClass::Authentication,
+            "smoke.auth_credential_stale",
+            "Claude OAuth credential is stale or lacks safe preflight runway",
+            false,
+        );
+        return state.finalize(args.include_redacted_stderr).await;
+    }
 
     let overrides = AgentOverride {
         model: args.model.clone(),
@@ -1766,10 +1950,8 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         return state.finalize(args.include_redacted_stderr).await;
     }
 
-    // One absolute turn deadline covers resolve/spawn, session config/mint, prompt installation, and
-    // terminal drain. Cleanup has its own short bounded grace so a timeout can still reap ownership.
-    state.artifact.attempt.started_at_ms = diagnostic_timestamp_ms();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout_secs);
+    // The absolute deadline already covers provenance and recovery. Cleanup has its own short bounded
+    // grace so a timeout can still reap ownership.
     let observer_dyn: Arc<dyn bridge_core::ports::DiagnosticObserver> = state.observer.clone();
     let resolved = match resolve_once(registry.as_ref(), &args.agent, observer_dyn, deadline).await
     {
@@ -1808,7 +1990,6 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     let backend = Arc::clone(&resolved.backend);
     let session = SessionId::parse(state.artifact.session.id.clone())
         .expect("generated non-empty smoke session id");
-    state.artifact.session.configure_calls = 1;
     let rich = Arc::new(SmokeRichSink::default());
     let result = execute_one(
         Arc::clone(&backend),
@@ -1820,27 +2001,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         pinned_session_cwd.as_ref(),
     )
     .await;
-    let DrainResult {
-        turn,
-        error,
-        static_failure,
-    } = result;
-    state.artifact.turn = turn;
-    let failed = error.is_some() || static_failure.is_some();
-
-    if let Some(failure) = static_failure {
-        state.artifact.attempt.prompt_may_have_been_accepted |=
-            failure.prompt_may_have_been_accepted();
-        state.failure = Some(failure);
-    } else if let Some(error) = &error {
-        state.artifact.attempt.timed_out = is_timeout_failure(error);
-        let accepted = state.artifact.turn.prompt_calls == 1;
-        let phase = turn_failure_phase(&state.artifact.turn);
-        state.fail_turn_error(error, phase, accepted);
-    } else {
-        state.artifact.success = true;
-        state.artifact.attempt.prompt_may_have_been_accepted = true;
-    }
+    let failed = apply_execute_result(&mut state, result);
 
     let cleanup = cleanup_backend(
         backend,
@@ -2025,6 +2186,10 @@ mod tests {
         Refusal,
         Empty,
         Silent,
+        InvalidThenValidUsage,
+        ValidThenInvalidUsage,
+        InvalidThenValidUsageThenBackendError,
+        ValidThenInvalidUsageThenBackendError,
         ConfigFailure,
         PromptFailure,
     }
@@ -2039,6 +2204,8 @@ mod tests {
         hanging_release: bool,
         failing_release: bool,
         release_failure_accepted: bool,
+        configure_block: Option<Duration>,
+        prompt_block: Option<Duration>,
         prompts: Mutex<Vec<String>>,
         cwd_swap: Mutex<Option<(PathBuf, PathBuf, PathBuf)>>,
     }
@@ -2055,6 +2222,8 @@ mod tests {
                 hanging_release: false,
                 failing_release: false,
                 release_failure_accepted: true,
+                configure_block: None,
+                prompt_block: None,
                 prompts: Mutex::new(Vec::new()),
                 cwd_swap: Mutex::new(None),
             }
@@ -2068,6 +2237,16 @@ mod tests {
         fn with_unaccepted_failing_release(mut self) -> Self {
             self.failing_release = true;
             self.release_failure_accepted = false;
+            self
+        }
+
+        fn with_blocking_configure(mut self, duration: Duration) -> Self {
+            self.configure_block = Some(duration);
+            self
+        }
+
+        fn with_blocking_prompt(mut self, duration: Duration) -> Self {
+            self.prompt_block = Some(duration);
             self
         }
 
@@ -2094,6 +2273,9 @@ mod tests {
             observers: BackendObservers,
         ) -> Result<BackendStream, BridgeError> {
             self.prompt_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(duration) = self.prompt_block {
+                std::thread::sleep(duration);
+            }
             self.prompts
                 .lock()
                 .unwrap()
@@ -2163,6 +2345,84 @@ mod tests {
                 ])),
                 Behavior::Empty => Box::pin(futures::stream::empty()),
                 Behavior::Silent => Box::pin(futures::stream::pending()),
+                Behavior::InvalidThenValidUsage => Box::pin(futures::stream::iter(vec![
+                    Ok(Update::Usage(UsageSnapshot {
+                        cost: Some(bridge_core::orch::UsageCost {
+                            amount: -0.01,
+                            currency: "USD".into(),
+                        }),
+                        ..UsageSnapshot::default()
+                    })),
+                    Ok(Update::Usage(UsageSnapshot {
+                        cost: Some(bridge_core::orch::UsageCost {
+                            amount: 0.01,
+                            currency: "USD".into(),
+                        }),
+                        ..UsageSnapshot::default()
+                    })),
+                    Ok(Update::Text("PONG".into())),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".into(),
+                    }),
+                ])),
+                Behavior::ValidThenInvalidUsage => Box::pin(futures::stream::iter(vec![
+                    Ok(Update::Usage(UsageSnapshot {
+                        cost: Some(bridge_core::orch::UsageCost {
+                            amount: 0.01,
+                            currency: "USD".into(),
+                        }),
+                        ..UsageSnapshot::default()
+                    })),
+                    Ok(Update::Usage(UsageSnapshot {
+                        cost: Some(bridge_core::orch::UsageCost {
+                            amount: -0.01,
+                            currency: "USD".into(),
+                        }),
+                        ..UsageSnapshot::default()
+                    })),
+                    Ok(Update::Text("PONG".into())),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".into(),
+                    }),
+                ])),
+                Behavior::InvalidThenValidUsageThenBackendError => {
+                    Box::pin(futures::stream::iter(vec![
+                        Ok(Update::Usage(UsageSnapshot {
+                            cost: Some(bridge_core::orch::UsageCost {
+                                amount: -0.01,
+                                currency: "USD".into(),
+                            }),
+                            ..UsageSnapshot::default()
+                        })),
+                        Ok(Update::Usage(UsageSnapshot {
+                            cost: Some(bridge_core::orch::UsageCost {
+                                amount: 0.01,
+                                currency: "USD".into(),
+                            }),
+                            ..UsageSnapshot::default()
+                        })),
+                        Err(BridgeError::FrameError),
+                    ]))
+                }
+                Behavior::ValidThenInvalidUsageThenBackendError => {
+                    Box::pin(futures::stream::iter(vec![
+                        Ok(Update::Usage(UsageSnapshot {
+                            cost: Some(bridge_core::orch::UsageCost {
+                                amount: 0.01,
+                                currency: "USD".into(),
+                            }),
+                            ..UsageSnapshot::default()
+                        })),
+                        Ok(Update::Usage(UsageSnapshot {
+                            cost: Some(bridge_core::orch::UsageCost {
+                                amount: -0.01,
+                                currency: "USD".into(),
+                            }),
+                            ..UsageSnapshot::default()
+                        })),
+                        Err(BridgeError::FrameError),
+                    ]))
+                }
                 Behavior::ConfigFailure => unreachable!("configure rejects first"),
                 Behavior::PromptFailure => unreachable!("prompt rejects before stream"),
             };
@@ -2207,6 +2467,9 @@ mod tests {
             _spec: &SessionSpec,
         ) -> Result<(), BridgeError> {
             self.configure_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(duration) = self.configure_block {
+                std::thread::sleep(duration);
+            }
             if let Some((planned, moved, replacement)) = self.cwd_swap.lock().unwrap().take() {
                 fs::rename(&planned, &moved).unwrap();
                 fs::rename(&replacement, &planned).unwrap();
@@ -2484,6 +2747,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn earlier_invalid_usage_cost_is_not_erased_by_a_later_valid_snapshot() {
+        let (_, result) = execute(Behavior::InvalidThenValidUsage, Duration::from_secs(1)).await;
+        assert!(result.error.is_none());
+        let usage = serde_json::to_value(result.turn.usage.unwrap()).unwrap();
+        assert!(usage.get("cost").is_none());
+        assert_eq!(
+            usage.get("cost_rejected").and_then(Value::as_str),
+            Some("negative_or_non_finite")
+        );
+    }
+
+    #[tokio::test]
+    async fn later_invalid_usage_cost_remains_rejected() {
+        let (_, result) = execute(Behavior::ValidThenInvalidUsage, Duration::from_secs(1)).await;
+        assert!(result.error.is_none());
+        let usage = serde_json::to_value(result.turn.usage.unwrap()).unwrap();
+        assert!(usage.get("cost").is_none());
+        assert_eq!(
+            usage.get("cost_rejected").and_then(Value::as_str),
+            Some("negative_or_non_finite")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_usage_cost_remains_rejected_on_backend_error_exit() {
+        for behavior in [
+            Behavior::InvalidThenValidUsageThenBackendError,
+            Behavior::ValidThenInvalidUsageThenBackendError,
+        ] {
+            let (_, result) = execute(behavior, Duration::from_secs(1)).await;
+            assert!(result.error.is_some());
+            assert_eq!(result.turn.terminal_state, "backend_error");
+            let usage = serde_json::to_value(result.turn.usage.unwrap()).unwrap();
+            assert!(usage.get("cost").is_none());
+            assert_eq!(
+                usage.get("cost_rejected").and_then(Value::as_str),
+                Some("negative_or_non_finite")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn protocol_whitespace_is_normalized_but_no_other_success_condition_is_relaxed() {
         let (_, whitespace) = execute(Behavior::Whitespace, Duration::from_secs(1)).await;
         assert!(whitespace.error.is_none());
@@ -2628,6 +2933,147 @@ mod tests {
         assert_eq!(backend.configure_calls.load(Ordering::SeqCst), 1);
         assert_eq!(backend.prompt_calls.load(Ordering::SeqCst), 1);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn absolute_deadline_wins_before_each_execute_stage_is_polled() {
+        let session = SessionId::parse("deadline-stage-test").unwrap();
+        let spec = SessionSpec::from_config(EffectiveConfig::default());
+
+        let expired = Arc::new(FakeBackend::new(Behavior::Exact));
+        let expired_result = execute_one(
+            expired.clone(),
+            &session,
+            &spec,
+            observer(),
+            Arc::new(SmokeRichSink::default()),
+            tokio::time::Instant::now() - Duration::from_millis(1),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(expired_result.error, Some(BridgeError::AgentTimedOut)),
+            "error={:?} terminal={} configure_calls={} prompt_calls={}",
+            expired_result.error,
+            expired_result.turn.terminal_state,
+            expired.configure_calls.load(Ordering::SeqCst),
+            expired.prompt_calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(expired_result.turn.terminal_state, "timeout");
+        assert_eq!(expired_result.configure_calls, 0);
+        assert_eq!(
+            expired_result.deadline_timeout,
+            Some(DeadlineTimeoutContext {
+                failed_phase: DiagnosticPhase::ConfigApply,
+                last_completed_phase: Some(DiagnosticPhase::Resolve),
+                prompt_may_have_been_accepted: false,
+            })
+        );
+        assert_eq!(expired.configure_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(expired.prompt_calls.load(Ordering::SeqCst), 0);
+        let mut expired_state = ArtifactState::new(&args());
+        assert!(apply_execute_result(&mut expired_state, expired_result));
+        assert_eq!(expired_state.artifact.session.configure_calls, 0);
+        assert_eq!(expired_state.artifact.turn.prompt_calls, 0);
+        assert!(!expired_state.artifact.attempt.prompt_may_have_been_accepted);
+        let expired_failure = expired_state.failure.as_ref().unwrap();
+        assert_eq!(expired_failure.failed_phase(), DiagnosticPhase::ConfigApply);
+        assert_eq!(
+            expired_failure.last_completed_phase(),
+            Some(DiagnosticPhase::Resolve)
+        );
+
+        let configure_crosses = Arc::new(
+            FakeBackend::new(Behavior::Exact).with_blocking_configure(Duration::from_millis(250)),
+        );
+        let configure_result = execute_one(
+            configure_crosses.clone(),
+            &session,
+            &spec,
+            observer(),
+            Arc::new(SmokeRichSink::default()),
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            configure_result.error,
+            Some(BridgeError::AgentTimedOut)
+        ));
+        assert_eq!(configure_result.turn.terminal_state, "timeout");
+        assert_eq!(configure_result.configure_calls, 1);
+        assert_eq!(configure_result.turn.prompt_calls, 0);
+        assert_eq!(
+            configure_result.deadline_timeout,
+            Some(DeadlineTimeoutContext {
+                failed_phase: DiagnosticPhase::PromptStart,
+                last_completed_phase: Some(DiagnosticPhase::ConfigApply),
+                prompt_may_have_been_accepted: false,
+            })
+        );
+        assert_eq!(configure_crosses.configure_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(configure_crosses.prompt_calls.load(Ordering::SeqCst), 0);
+        let mut configure_state = ArtifactState::new(&args());
+        assert!(apply_execute_result(&mut configure_state, configure_result));
+        assert_eq!(configure_state.artifact.session.configure_calls, 1);
+        assert_eq!(configure_state.artifact.turn.prompt_calls, 0);
+        assert!(
+            !configure_state
+                .artifact
+                .attempt
+                .prompt_may_have_been_accepted
+        );
+        let configure_failure = configure_state.failure.as_ref().unwrap();
+        assert_eq!(
+            configure_failure.failed_phase(),
+            DiagnosticPhase::PromptStart
+        );
+        assert_eq!(
+            configure_failure.last_completed_phase(),
+            Some(DiagnosticPhase::ConfigApply)
+        );
+
+        let prompt_crosses = Arc::new(
+            FakeBackend::new(Behavior::Exact).with_blocking_prompt(Duration::from_millis(250)),
+        );
+        let prompt_result = execute_one(
+            prompt_crosses.clone(),
+            &session,
+            &spec,
+            observer(),
+            Arc::new(SmokeRichSink::default()),
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            prompt_result.error,
+            Some(BridgeError::AgentTimedOut)
+        ));
+        assert_eq!(prompt_result.turn.terminal_state, "timeout");
+        assert_eq!(prompt_result.configure_calls, 1);
+        assert_eq!(prompt_result.turn.prompt_calls, 1);
+        assert_eq!(
+            prompt_result.deadline_timeout,
+            Some(DeadlineTimeoutContext {
+                failed_phase: DiagnosticPhase::PromptStream,
+                last_completed_phase: Some(DiagnosticPhase::PromptStart),
+                prompt_may_have_been_accepted: true,
+            })
+        );
+        assert_eq!(prompt_crosses.configure_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(prompt_crosses.prompt_calls.load(Ordering::SeqCst), 1);
+        let mut prompt_state = ArtifactState::new(&args());
+        assert!(apply_execute_result(&mut prompt_state, prompt_result));
+        assert_eq!(prompt_state.artifact.session.configure_calls, 1);
+        assert_eq!(prompt_state.artifact.turn.prompt_calls, 1);
+        assert!(prompt_state.artifact.attempt.prompt_may_have_been_accepted);
+        let prompt_failure = prompt_state.failure.as_ref().unwrap();
+        assert_eq!(prompt_failure.failed_phase(), DiagnosticPhase::PromptStream);
+        assert_eq!(
+            prompt_failure.last_completed_phase(),
+            Some(DiagnosticPhase::PromptStart)
+        );
     }
 
     #[tokio::test]
@@ -2831,6 +3277,28 @@ mod tests {
     #[tokio::test]
     async fn resolve_is_called_once_and_a_silent_resolve_is_bounded() {
         let backend: Arc<dyn AgentBackend> = Arc::new(FakeBackend::new(Behavior::Exact));
+        let already_expired = FakeRegistry {
+            resolves: AtomicUsize::new(0),
+            backend: Arc::clone(&backend),
+            hang: false,
+        };
+        let diagnostic: Arc<dyn bridge_core::ports::DiagnosticObserver> = observer();
+        assert!(matches!(
+            resolve_once(
+                &already_expired,
+                &AgentId::parse("test").unwrap(),
+                diagnostic,
+                tokio::time::Instant::now() - Duration::from_millis(1)
+            )
+            .await,
+            ResolveOnce::TimedOut
+        ));
+        assert_eq!(
+            already_expired.resolves.load(Ordering::SeqCst),
+            0,
+            "an expired deadline must win before the resolver receives its first poll"
+        );
+
         let registry = FakeRegistry {
             resolves: AtomicUsize::new(0),
             backend: Arc::clone(&backend),
@@ -3103,23 +3571,51 @@ mod tests {
 
     #[test]
     fn usage_cost_preserves_safe_non_usd_currency_and_collapses_unsafe_labels() {
-        let cad = smoke_usage(UsageSnapshot {
-            cost: Some(bridge_core::orch::UsageCost {
-                amount: 1.25,
-                currency: "CAD".into(),
-            }),
-            ..UsageSnapshot::default()
-        });
+        let cad = smoke_usage_with_history(
+            UsageSnapshot {
+                cost: Some(bridge_core::orch::UsageCost {
+                    amount: 1.25,
+                    currency: "CAD".into(),
+                }),
+                ..UsageSnapshot::default()
+            },
+            false,
+        );
         assert_eq!(cad.cost.unwrap().currency, "CAD");
 
-        let unsafe_label = smoke_usage(UsageSnapshot {
-            cost: Some(bridge_core::orch::UsageCost {
-                amount: 1.25,
-                currency: "USD\nsecret".into(),
-            }),
-            ..UsageSnapshot::default()
-        });
+        let unsafe_label = smoke_usage_with_history(
+            UsageSnapshot {
+                cost: Some(bridge_core::orch::UsageCost {
+                    amount: 1.25,
+                    currency: "USD\nsecret".into(),
+                }),
+                ..UsageSnapshot::default()
+            },
+            false,
+        );
         assert_eq!(unsafe_label.cost.unwrap().currency, "unknown");
+    }
+
+    #[test]
+    fn usage_cost_rejects_negative_and_nonfinite_amounts_visibly() {
+        for amount in [-0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let usage = smoke_usage_with_history(
+                UsageSnapshot {
+                    cost: Some(bridge_core::orch::UsageCost {
+                        amount,
+                        currency: "USD".into(),
+                    }),
+                    ..UsageSnapshot::default()
+                },
+                false,
+            );
+            let value = serde_json::to_value(usage).unwrap();
+            assert!(value.get("cost").is_none());
+            assert_eq!(
+                value.get("cost_rejected").and_then(Value::as_str),
+                Some("negative_or_non_finite")
+            );
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,24 @@
+# Current reader candidate retained as STALE. R3b does not turn a rebuild into compatibility evidence.
+default = "kiro-reader"
+allowed_cwd_root = "/Users/wesleyjinks/code"
+
+[[agents]]
+id = "kiro-reader"
+cmd = "kiro-cli"
+args = ["acp"]
+model = "claude-sonnet-4.5"
+
+[agents.sandbox]
+image = "sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1"
+mount = "/Users/wesleyjinks/code"
+access = "ro"
+egress = "locked"
+network = "a2a-egress-internal"
+proxy = "http://a2a-egress-proxy:8888"
+volumes = ["a2a-kiro-data:/root/.local/share"]
+
+[registry]
+allowed_cmds = ["docker"]
+
+[server]
+addr = "127.0.0.1:8080"

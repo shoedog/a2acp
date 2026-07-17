@@ -53,6 +53,32 @@ a2a-bridge doctor --config /path/to/a2a-bridge.toml
 a2a-bridge models --config /path/to/a2a-bridge.toml --json
 ```
 
+For Claude ACP, `doctor` inspects only bounded OAuth shape/expiry metadata: it never renders token values.
+An expired access token fails; less than 16 minutes of runway warns (the 15-minute maximum smoke plus a
+one-minute preflight margin). A present host `CLAUDE_CONFIG_DIR` must be a non-empty absolute path; unset
+uses `$HOME/.claude`, while empty/relative values fail closed because guarded fallback can change the child
+cwd. Truthy `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`,
+`CLAUDE_CODE_USE_ANTHROPIC_AWS`, and `CLAUDE_CODE_USE_MANTLE` select external host authentication and skip
+first-party file OAuth; false-like/unknown values do not, and host flags never bypass a reader mount. The
+absolute smoke deadline starts before provenance and orphan recovery, and one deadline-first primitive does
+not poll resolution, configure, prompt, or drain after expiry. A non-OK OAuth row blocks `smoke` before
+adapter spawn. A stage is counted only after its future receives a poll; an unpolled prompt refusal records
+zero prompt calls and false prompt-acceptance evidence.
+`deploy/containers/sync-creds.sh claude` only copies the host file—it cannot
+refresh an expired host login. After a fresh host login and post-login sync, require both Claude host and
+reader doctors green before requesting new explicit authorization for one new four-case aggregate. Never
+treat a successful launchd run as auth evidence.
+
+`doctor` is deliberately read-only: runtime `info` plus network/image inspection can be green while the
+runtime cannot start a new container. Do not describe green doctor output as a startability proof. During
+an actual production reader spawn, the bridge observes the exact generated container name within the same
+handshake deadline. If the runtime positively reports that object still pre-start, the attempt fails before
+Initialize/prompt as `container.runtime.start_timeout` with class `ContainerRuntime`, disposition
+`ContainerFallbackCandidate`, and false prompt acceptance. A started object retains the ordinary ACP
+Initialize diagnosis; an unknown observation never becomes container evidence. Before authorizing another
+live compatibility aggregate after this failure, require a bounded non-provider new-container start control
+to pass in addition to the normal doctors.
+
 For a minimal live compatibility probe, stop here until the implementation's deterministic timeout,
 artifact, redaction, and no-retry tests are green and the operator explicitly authorizes a billable turn.
 Then build and invoke the candidate artifact itself:
@@ -231,8 +257,15 @@ justify fallback or an automatic replay. `upstream.classification_conflict`,
 ambiguous advisory evidence, not that it inferred a provider class from it. Retry/reset hints are bounded
 metadata and never change terminal disposition.
 
-Observed container release joins one bridge-owned bounded reap flight. A successful return means that
-flight completed; `container.reap.spawn_failed`, `container.reap.timeout`,
+On bridge-owned production container spawn, one cancellation-safe owner is armed immediately after process
+creation. Success transfers it to the backend; ordinary failure first terminates and reaps the exact
+supervised runtime client, then joins the exact named-container removal. One RAII-held independent OS
+thread/runtime owns that flight through cancellation or source-runtime shutdown before or during ordinary
+error settlement, so the spawning reactor cannot discard it. Public legacy callbacks remain fire-and-forget. An ordinary production error
+return means that ordered flight settled even if the original caller was canceled while waiting. On the
+typed never-started path, a failed removal is retained in the primary diagnostic causes. Observed container
+release likewise joins one bridge-owned bounded reap flight. A successful return means that flight
+completed; `container.reap.spawn_failed`, `container.reap.timeout`,
 `container.reap.nonzero_exit`, or `container.reap.worker_panicked` is a fatal accepted cleanup failure.
 All concurrent waiters receive the same result, and later observer failure cannot cancel or suppress
 cleanup. Detached drop/retirement may start the same flight but must not write late task diagnostics.

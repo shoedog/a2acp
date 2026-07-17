@@ -24,10 +24,114 @@ Status meanings:
 | Claude ACP inside managed no-egress execution | 0.44.0 and 0.55.0 controls | Fable and Sonnet | **FAIL** | Direct SDK/ACP runs retried and hung; the Claude debug log recorded `getaddrinfo ENOTFOUND api.anthropic.com`. The exact 0.55 ACP command passed through approved host execution. This is a negative environment control, not a supported host lane or an auth failure. |
 | Kiro, shipped host/container examples | host version varies; reader image installs the current Kiro musl build at image-build time | configured defaults | **STALE** | Existing ignored live tests and historical gates are not sufficient for the new compatibility release gate. Re-baseline with the smoke harness. |
 
-The reader image is not yet fully reproducible: it pins top-level npm adapter versions, but their
-transitive CLI dependencies can resolve from semver ranges, and Kiro resolves a `latest` archive at
-build time. Until the build records a lock/resolution manifest and immutable image digest, a PASS for
-one image does not automatically cover a rebuild from the same Containerfile.
+The reader image is not yet fully reproducible. R3b pins and asserts the Codex and Claude nested
+agent-package versions used by the compatibility rows, but the build still lacks a complete npm
+resolution lock/manifest and Kiro still resolves a `latest` archive at build time. Until R4 closes the
+full resolution surface, a PASS for one image does not automatically cover a rebuild from the same
+Containerfile.
+
+## R3b pinned candidate — 2026-07-16
+
+The checked-in manifest preserves each claimed path as a distinct pinned case. Two separately authorized
+R3b aggregates ran on 2026-07-16; both are blocking failure evidence, not a promoted baseline. Attempt 1
+proved stale Claude OAuth preflight: both Codex paths passed, while both Fable paths reached prompt start
+and failed HTTP 401. After credential hardening and a fresh login, attempt 2 proved a separate local
+container-runtime start outage: both host paths passed, while both readers failed before prompt acceptance.
+Each aggregate ran once with zero retry/fallback and left all five historical/non-goal rows unrun.
+
+| Case | R3b execution disposition | Release classification |
+|---|---|---|
+| `codex-host-bridge-gpt56-sol` | eligible minimal bridge smoke | support / blocking |
+| `codex-reader-bridge-gpt56-sol` | eligible minimal bridge smoke | support / blocking |
+| `claude-direct-host-cli-fable` | explicit unrun direct-CLI control | non-goal / advisory |
+| `claude-host-acp-044-fable` | eligible minimal bridge smoke | support / blocking |
+| `claude-host-acp-055-fable` | explicit unrun direct-ACP control | non-goal / advisory |
+| `claude-reader-055-fable` | eligible minimal bridge smoke | support / blocking |
+| `claude-managed-no-egress-055-fable` | explicit unrun direct-ACP negative control | non-goal / advisory |
+| `kiro-host-stale` | explicit unrun direct-CLI control | non-goal / `STALE` |
+| `kiro-reader-stale` | explicit unrun container direct-CLI control | non-goal / `STALE` |
+
+The two supported reader configs name immutable candidate image
+`sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1` directly. Bounded image
+inspection reports exact Codex adapter/CLI `1.1.2`/`0.144.1` and Claude adapter/SDK
+`0.55.0`/`0.3.198`; the Fable row requires exactly one host-file declaration for its in-container
+settings destination and binds that minimal settings file at SHA-256
+`6ee4ad319cdfc34a558425ddda86f5b1da4c10912a08dfdc32c0c009eef81f19`. The candidate was built under
+a unique tag and did not replace the running operator's `latest` tag or process. Its floating Kiro
+download resolved 2.12.3, so the Kiro rows deliberately remain `STALE` pending R4's reproducible
+resolution work and a separately authorized re-baseline.
+
+### R3b live attempt 1 — auth freshness failure
+
+The owner-only aggregate at `/private/tmp/a2a-bridge-r3b-live.EeBAyf/pinned-aggregate.json` is mode
+`0600`, 25,128 bytes, and SHA-256
+`7f718f32743170fd7ae73a3027c870f052a8fabbd282762554922abf5e1571c1`. It binds candidate SHA-256
+`d852cc28a09d0a2705d5084119813e27b7a7e7d99087d7d76063b6aa74894e50` and manifest SHA-256
+`5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`.
+
+- Codex host passed exact `PONG` in 8.649 s; Codex reader passed in 4.751 s. Each made one prompt call,
+  recorded no drift/budget violation, and completed release/retirement.
+- Claude 0.44 host and Claude 0.55 reader each initialized, created a session, applied exact Fable/xhigh,
+  and reached `prompt_start`, then failed in 3.117 s / 2.992 s with a retained HTTP 401 authentication
+  cause. Both reported prompt-may-have-been-accepted, zero cost/tokens, and complete cancel/release/retire.
+- The aggregate ended non-cancelled after 19.512 s, observed 38,053 Codex tokens, exhausted no budget,
+  and did not run the five non-goal controls. It must not be replayed or promoted.
+
+The settled cause is stale credential preflight, not model selection or container health. The five-minute
+launchd sync ran successfully but copied a host Claude access token that had expired about five hours
+earlier; post-attempt host and isolated files shared that expired access token, while the host refresh token
+was absent. R3b now adds token-blind bounded expiry/runway checks to doctor and smoke so this state refuses
+before adapter spawn. Host checks honor a non-empty absolute `CLAUDE_CONFIG_DIR` and fail closed on an
+empty/relative override; the single absolute smoke deadline starts before provenance and orphan recovery so
+an accepted runway cannot age behind a fresh timeout, and one deadline-first primitive cannot poll resolution,
+configure, prompt, or drain after expiry. Truthy pinned Claude selectors for Bedrock, Vertex, Foundry,
+Anthropic AWS, or Mantle use their
+external provider authentication instead of first-party file OAuth; false-like/unknown values and mounted
+reader credentials remain fail-closed. An expired stage is counted only after its future receives a poll;
+an unpolled prompt refusal records zero prompt calls and false prompt-acceptance evidence. Attempt 1 was
+never replayed; the fresh login, post-login sync, and two green Claude doctors admitted the separately
+authorized attempt 2 below.
+
+### R3b live attempt 2 — container start outage
+
+The owner-only aggregate at `/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json` is mode
+`0600`, 19,894 bytes, and SHA-256
+`319b3cf4b92a36b1f2e2cdd71b7a97fb6d5c4309c2f919a4e3bce39dd28a9b3e`. It binds candidate SHA-256
+`323b4e219130480c9f0cafe90fe7c36d0a64ec17467707876698a82ef574a079` and the same manifest SHA-256
+`5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`.
+
+- Codex host passed exact `PONG` in 6.853 s with 22,251 observed tokens. Claude 0.44 host passed exact
+  Fable/xhigh `PONG` in 7.024 s with 31,959 observed tokens and USD 0.227602 observed cost. Each made one
+  configure and one prompt call and completed clean teardown.
+- Codex reader and Claude 0.55 reader failed in 30.430 s / 30.541 s. Each completed the local spawn phase,
+  then reported `acp.initialize.timeout`; neither configured, prompted, started a terminal turn, nor could
+  have had a prompt accepted. Each exact named container existed only in runtime state `created`, with a
+  zero start timestamp, and survived both the detached name reaper and run-scoped best-effort backstop.
+- The aggregate ended non-cancelled after 74.853 s with success false, 54,210 observed tokens, USD 0.227602
+  observed cost, two missing token observations, three missing cost observations, no drift or budget
+  violation, and all four selected cases executed. It must not be retried or promoted.
+
+The provider-wide, credential, egress, image, and argument hypotheses were falsified: both host providers
+passed, the egress proxy/network remained healthy, and both reader failures occurred before ACP traffic.
+A minimal no-network `alpine:latest /bin/true` start also timed out before and after the two A2A objects were
+removed, while runtime `info`, image listing, and exact-container inspection remained responsive. This is
+evidence of a local OrbStack/Docker new-container lifecycle stall; its initiating internal cause remains
+unknown. The two never-started A2A objects were removed with one later bounded exact-name cleanup after the
+runtime recovered enough to accept it. OrbStack and the running operator/user containers were not restarted.
+
+The deterministic hardening following this incident keeps `doctor` read-only but adds an active exact-name
+start boundary only inside production container spawn. A runtime-observed pre-start object now fails as
+`Spawn / ContainerRuntime / ContainerFallbackCandidate` with code
+`container.runtime.start_timeout`; unknown state preserves the prior ACP diagnosis, and a started object
+preserves ordinary initialize behavior. On bridge-owned production paths, an unpublished-spawn guard owns
+the exact client and named removal before the first cancellable post-spawn await; ordinary errors join its
+terminate-then-reap flight. One RAII-held independent OS thread/runtime owns that same order through caller
+cancellation or source-runtime shutdown before or during ordinary-error settlement. The new typed failure retains a
+cleanup code in its primary causes if removal fails. Public legacy callbacks remain detached fire-and-forget.
+No additional compatibility turn is authorized by this hardening or by its deterministic tests/reviews. The
+post-incident provider-unexercised release binary is 22,984,800 bytes at SHA-256
+`7c6cf5407fecb114c51ff211d8526df96c084d07217dc03f2913583c2481093d`; it has not replaced or replayed
+attempt 2's exact `323b4e21...a079` live artifact.
 
 ## Resolved incident: Fable over Claude ACP
 
@@ -54,11 +158,12 @@ retention remains R2.
 
 ## Evidence required for an update
 
-R3a provides `a2a-bridge compatibility validate|run|compare`, but its checked-in manifest and pinned
-baseline intentionally contain zero cases. R3b owns the first reviewed pinned rows. Do not add a case,
-baseline entry, or PASS row merely to exercise the runner: deterministic missing-config controls prove
-the orchestration without spending a provider turn, while support evidence still requires the exact
-candidate binary and environment named below.
+R3a provides `a2a-bridge compatibility validate|run|compare`; R3b adds nine reviewed pinned case
+contracts. The checked-in baseline carries the current manifest identity but intentionally has no
+promoted case summaries until the four eligible cases produce separately authorized exact-candidate
+artifacts and those artifacts are reviewed. Do not add a baseline entry or PASS row merely to exercise
+the runner: deterministic controls prove orchestration without spending a provider turn, while support
+evidence still requires the exact candidate binary and environment named below.
 
 Pinned adapter and CLI identities use one complete semantic version. Remote API support rows must pin
 provider, API, and API-version identities rather than a generic execution row. A raw advertised model ID
