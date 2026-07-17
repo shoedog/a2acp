@@ -838,6 +838,25 @@ Record these five exact pre-change reds on `504c1e43` before green implementatio
 4. A completed floating smoke failure can leave aggregate `success = true`.
 5. Smoke does not retain the actual session catalog.
 
+Recorded on unmodified `504c1e43` before the green implementation:
+
+- `cargo run -q -p a2a-bridge -- compatibility resolve` exited 1 with unknown subcommand
+  `"resolve"`.
+- `cargo test -p a2a-bridge --test compatibility_cli
+  validate_is_non_billable_and_accepts_the_versioned_manifest` passed **1 / 0** while its floating row
+  had neither a resolution binding nor generated-config hash.
+- `cargo test -p a2a-bridge --test compatibility_cli
+  acknowledged_run_calls_the_smoke_contract_once_and_keeps_failure_evidence` passed **1 / 0** while
+  invoking `run --lane floating-current` directly and returning command success for a completed FAIL.
+- `cargo test -p a2a-bridge
+  compatibility::tests::selected_cases_invoke_once_each_and_failures_are_not_retried` passed **1 / 0**
+  while explicitly asserting aggregate success for one floating FAIL plus one floating PASS.
+- `rg -n 'model_catalog|session_catalog' bin/a2a-bridge/src crates/bridge-core/src crates/bridge-acp/src`
+  returned no match. There was no backend/session catalog contract or smoke evidence field.
+
+These were deterministic contract probes only: no provider, registry, runtime, container, or output
+materialization effect ran.
+
 Every new path needs a pre-change-failing regression or exact removed-check mutation plus a negative/edge
 control. Focused coverage must include:
 
@@ -870,6 +889,14 @@ control. Focused coverage must include:
 4. **Checked-in recipes and operator docs:** four recipes, stable CLI/help/runbook, final handoff and gate
    evidence. Do not change the pinned manifest/baseline, production configs/locks/Containerfiles, support
    matrix, or changelog.
+
+Implementation cursor on 2026-07-16: slice 1 is implemented on this branch. It adds strict recipe,
+resolution, resolved-binding, canary-outcome, acknowledgement, and unresolved-floating admission
+contracts, but deliberately has no registry/runtime/materialization executor. Focused gates are **7 / 0**
+resolution-contract tests, **17 / 0** compatibility CLI tests, and **49 / 0** compatibility unit tests;
+the complete `a2a-bridge` package gate is **470 passed / 0 failed / 11 ignored** across 16 groups, and
+warnings-denied all-target Clippy is green. The ignored tests are the pre-existing explicitly live Kiro and
+multi-bridge cases. No provider, registry, runtime, container, or output-materialization effect ran.
 
 Each commit must build and keep existing pinned behavior green. Focused tests run first; final closure runs
 format/diff, workspace check, warnings-denied all-target Clippy, the full workspace suite with exact totals,
@@ -904,9 +931,11 @@ operator-reviewed cleanup proves no running container uses them. Automated reten
 scheduler deadlines, termination escalation, quarantine, and concurrency remain R3d. Promotion, production
 pins/baselines, support wording, release integration, and rollback exercises remain R4.
 
-**Restart point:** start from `504c1e43` and implement slice 1 only. Keep the pinned manifest and baseline
-unchanged. Do not add registry, runtime, or provider effects until contract tests prove a floating case
-cannot run without one completed exact resolution.
+**Restart point:** continue from the latest commit on `agent/reliability-r3c-floating-lane`; slice 1 is the
+effect-free contract commit and its gates are recorded above. Implement slice 2 next with only fake
+executors and provider-free package/image/materialization tests. Keep the pinned manifest and baseline
+unchanged, and do not run a real registry, runtime, container, or provider operation without the separate
+authorization described under live gates.
 
 ## R3d — scheduling and evidence retention
 

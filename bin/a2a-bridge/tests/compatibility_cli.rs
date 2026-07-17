@@ -34,12 +34,22 @@ timeout_secs = 1
 max_tokens = 1000
 max_cost_usd = 0.01
 retry_cap = 0
-expected_status = "FAIL"
-classification = "non_goal"
+expected_status = "PASS"
+classification = "canary"
+baseline_case = "pinned-support-control"
 
 [cases.artifact]
 retention_days = 1
 redaction = "strict"
+
+[cases.resolved]
+resolution_id = "resolution-1"
+recipe_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+config_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+adapter = "@agentclientprotocol/codex-acp=1.2.3"
+agent_cli = "@openai/codex=0.150.0"
+package_inventory_sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+package_tree_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 "#,
             os = std::env::consts::OS,
             arch = std::env::consts::ARCH,
@@ -59,9 +69,95 @@ fn write_two_case_manifest(dir: &Path) -> PathBuf {
         .replace(
             "id = \"missing-config-control\"",
             "id = \"second-missing-config-control\"",
+        )
+        .replace(
+            "baseline_case = \"pinned-support-control\"",
+            "baseline_case = \"second-pinned-support-control\"",
         );
     fs::write(&manifest, format!("{first}\n[[cases]]{second}")).unwrap();
     manifest
+}
+
+fn write_unresolved_manifest(dir: &Path) -> PathBuf {
+    let manifest = write_manifest(dir);
+    let raw = fs::read_to_string(&manifest).unwrap();
+    let unresolved = raw.split("\n[cases.resolved]").next().unwrap();
+    fs::write(&manifest, unresolved).unwrap();
+    manifest
+}
+
+#[cfg(target_os = "linux")]
+fn sha256_hex(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn write_pinned_manifest(dir: &Path, config_sha256: &str) -> PathBuf {
+    let manifest = write_manifest(dir);
+    let raw = fs::read_to_string(&manifest).unwrap();
+    let pinned = raw
+        .split("\n[cases.resolved]")
+        .next()
+        .unwrap()
+        .replace("lane = \"floating-current\"", "lane = \"pinned\"")
+        .replace(
+            "classification = \"canary\"",
+            "classification = \"non_goal\"",
+        )
+        .replace("baseline_case = \"pinned-support-control\"\n", "");
+    fs::write(
+        &manifest,
+        format!(
+            "{pinned}\n[cases.pins]\nconfig_sha256 = {config_sha256:?}\nmodel = \"test-model\"\nadapter = \"test-adapter=1.2.3\"\nagent_cli = \"test-cli=4.5.6\"\n"
+        ),
+    )
+    .unwrap();
+    manifest
+}
+
+fn write_recipes(dir: &Path) -> PathBuf {
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compatibility/manifest.toml"),
+        dir.join("manifest.toml"),
+    )
+    .unwrap();
+    let recipes = dir.join("floating-current.toml");
+    fs::write(
+        &recipes,
+        r#"schema_version = 1
+production_manifest = "manifest.toml"
+
+[limits]
+timeout_secs = 900
+max_download_bytes = 536870912
+max_unpacked_bytes = 1073741824
+max_files = 100000
+
+[artifact]
+retention_days = 30
+redaction = "strict"
+
+[[package_sets]]
+id = "codex-current"
+ecosystem = "npm"
+registry = "npmjs"
+adapter = "@agentclientprotocol/codex-acp"
+adapter_selector = "latest"
+agent_cli = "@openai/codex"
+
+[[cases]]
+id = "codex-host-floating-current"
+baseline_case = "codex-host-bridge-gpt56-sol"
+package_set = "codex-current"
+target = "host-package-tree"
+config_template = "codex-host-read-only-v1"
+"#,
+    )
+    .unwrap();
+    recipes
 }
 
 fn compatibility_command() -> Command {
@@ -88,6 +184,203 @@ fn validate_is_non_billable_and_accepts_the_versioned_manifest() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("1 case"));
+}
+
+#[test]
+fn validate_rejects_unresolved_floating_manifest_before_any_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_unresolved_manifest(dir.path());
+
+    let output = compatibility_command()
+        .arg("validate")
+        .arg("--manifest")
+        .arg(&manifest)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("requires exact candidate resolution evidence"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let missing_baseline = write_manifest(dir.path());
+    let raw = fs::read_to_string(&missing_baseline)
+        .unwrap()
+        .replace("baseline_case = \"pinned-support-control\"\n", "");
+    fs::write(&missing_baseline, raw).unwrap();
+    let baseline_output = compatibility_command()
+        .arg("validate")
+        .arg("--manifest")
+        .arg(&missing_baseline)
+        .output()
+        .unwrap();
+    assert!(!baseline_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&baseline_output.stderr).contains("requires baseline_case"),
+        "stderr: {}",
+        String::from_utf8_lossy(&baseline_output.stderr)
+    );
+}
+
+#[test]
+fn validate_rejects_a_floating_canary_that_treats_failure_as_expected_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = write_manifest(dir.path());
+    let raw = fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("expected_status = \"PASS\"", "expected_status = \"FAIL\"");
+    fs::write(&manifest, raw).unwrap();
+
+    let output = compatibility_command()
+        .arg("validate")
+        .arg("--manifest")
+        .arg(&manifest)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("expecting PASS"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn validate_accepts_closed_floating_recipes_against_the_pinned_support_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let recipes = write_recipes(dir.path());
+
+    let output = compatibility_command()
+        .arg("validate")
+        .arg("--recipes")
+        .arg(&recipes)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("floating recipes valid: 1 case"));
+}
+
+#[test]
+fn validate_rejects_recipe_mapping_to_a_pinned_non_support_control() {
+    let dir = tempfile::tempdir().unwrap();
+    let recipes = write_recipes(dir.path());
+    let raw = fs::read_to_string(&recipes).unwrap().replace(
+        "baseline_case = \"codex-host-bridge-gpt56-sol\"",
+        "baseline_case = \"claude-direct-host-cli-fable\"",
+    );
+    fs::write(&recipes, raw).unwrap();
+
+    let output = compatibility_command()
+        .arg("validate")
+        .arg("--recipes")
+        .arg(&recipes)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("pinned minimal bridge-smoke support"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn resolve_acknowledgement_wins_before_recipe_or_output_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing-recipes.toml");
+    let out = dir.path().join("bundle");
+
+    let output = compatibility_command()
+        .arg("resolve")
+        .arg("--recipes")
+        .arg(&missing)
+        .arg("--all")
+        .arg("--environment-owner")
+        .arg("test-runner")
+        .arg("--runtime")
+        .arg("docker")
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--acknowledge-resolution-effects"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("cannot open"), "stderr: {stderr}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn resolved_run_billing_acknowledgement_wins_before_resolution_or_output_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing-resolution.json");
+    let out = dir.path().join("aggregate.json");
+
+    let output = compatibility_command()
+        .arg("run")
+        .arg("--resolution")
+        .arg(&missing)
+        .arg("--all-resolved")
+        .arg("--environment-owner")
+        .arg("test-runner")
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--acknowledge-billable"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("cannot open"), "stderr: {stderr}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn acknowledged_resolve_validates_contract_but_has_no_effect_executor_yet() {
+    let dir = tempfile::tempdir().unwrap();
+    let recipes = write_recipes(dir.path());
+    let out = dir.path().join("bundle");
+
+    let output = compatibility_command()
+        .arg("resolve")
+        .arg("--recipes")
+        .arg(&recipes)
+        .arg("--case")
+        .arg("codex-host-floating-current")
+        .arg("--environment-owner")
+        .arg("test-runner")
+        .arg("--runtime")
+        .arg("docker")
+        .arg("--acknowledge-resolution-effects")
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("contract slice"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!out.exists());
 }
 
 #[test]
@@ -214,7 +507,7 @@ fn run_rejects_aggregate_output_inside_the_manifest_repository() {
     fs::create_dir(dir.path().join(".git")).unwrap();
     let manifest_dir = dir.path().join("compatibility");
     fs::create_dir(&manifest_dir).unwrap();
-    let manifest = write_manifest(&manifest_dir);
+    let manifest = write_pinned_manifest(&manifest_dir, &"a".repeat(64));
     let out = dir.path().join("new-aggregate.json");
 
     let output = compatibility_command()
@@ -243,7 +536,7 @@ fn run_rejects_aggregate_output_inside_the_manifest_repository() {
 #[test]
 fn existing_aggregate_is_never_overwritten() {
     let dir = tempfile::tempdir().unwrap();
-    let manifest = write_manifest(dir.path());
+    let manifest = write_pinned_manifest(dir.path(), &"a".repeat(64));
     let out = dir.path().join("aggregate.json");
     fs::write(&out, b"reviewed evidence").unwrap();
     let mut permissions = fs::metadata(&out).unwrap().permissions();
@@ -273,13 +566,11 @@ fn existing_aggregate_is_never_overwritten() {
 }
 
 #[test]
-fn acknowledged_run_calls_the_smoke_contract_once_and_keeps_failure_evidence() {
+fn acknowledged_direct_floating_run_requires_a_resolution_before_output_effects() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_manifest(dir.path());
     let out = dir.path().join("aggregate.json");
 
-    // The selected config intentionally does not exist. The nested R2c smoke therefore emits a
-    // deterministic pre-spawn FAIL artifact; no provider process or billable turn can start.
     let output = compatibility_command()
         .arg("run")
         .arg("--manifest")
@@ -294,31 +585,13 @@ fn acknowledged_run_calls_the_smoke_contract_once_and_keeps_failure_evidence() {
         .output()
         .unwrap();
 
+    assert!(!output.status.success());
     assert!(
-        output.status.success(),
-        "stderr: {}\naggregate: {}",
-        String::from_utf8_lossy(&output.stderr),
-        fs::read_to_string(&out).unwrap_or_else(|error| format!("<unreadable: {error}>"))
+        String::from_utf8_lossy(&output.stderr).contains("floating_resolution_required"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stdout.is_empty());
-    let aggregate: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
-    assert_eq!(aggregate["schema_version"], 1);
-    assert_eq!(aggregate["candidate"]["sha256"].as_str().unwrap().len(), 64);
-    assert!(aggregate["candidate"]["byte_length"].as_u64().unwrap() > 0);
-    assert_eq!(aggregate["results"].as_array().unwrap().len(), 1);
-    assert_eq!(aggregate["results"][0]["case_id"], "missing-config-control");
-    assert_eq!(aggregate["results"][0]["execution"], "completed");
-    assert_eq!(aggregate["results"][0]["actual_status"], "FAIL");
-    assert_eq!(aggregate["results"][0]["expectation_met"], true);
-    assert_eq!(aggregate["results"][0]["smoke"]["schema_version"], 2);
-    assert_eq!(
-        aggregate["results"][0]["smoke"]["diagnostics"]["failure"]["code"],
-        "smoke.config_path"
-    );
-    assert_eq!(
-        fs::metadata(&out).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
+    assert!(!out.exists());
 }
 
 #[cfg(target_os = "linux")]
@@ -350,7 +623,8 @@ fn compatibility_child_closes_staged_capabilities_before_provider_spawn() {
         ),
     )
     .unwrap();
-    let manifest = write_manifest(dir.path());
+    let config_bytes = fs::read(&config).unwrap();
+    let manifest = write_pinned_manifest(dir.path(), &sha256_hex(&config_bytes));
     let manifest_text = fs::read_to_string(&manifest)
         .unwrap()
         .replace("config = \"missing.toml\"", "config = \"a2a-bridge.toml\"")
@@ -389,7 +663,7 @@ fn compatibility_child_closes_staged_capabilities_before_provider_spawn() {
 }
 
 #[test]
-fn case_selection_is_not_all_and_explicit_all_keeps_every_row() {
+fn case_and_all_selection_cannot_bypass_the_floating_resolution_artifact() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = write_two_case_manifest(dir.path());
     let selected_out = dir.path().join("selected.json");
@@ -408,18 +682,13 @@ fn case_selection_is_not_all_and_explicit_all_keeps_every_row() {
         .arg(&selected_out)
         .output()
         .unwrap();
+    assert!(!selected.status.success());
     assert!(
-        selected.status.success(),
+        String::from_utf8_lossy(&selected.stderr).contains("floating_resolution_required"),
         "stderr: {}",
         String::from_utf8_lossy(&selected.stderr)
     );
-    let selected: serde_json::Value =
-        serde_json::from_slice(&fs::read(&selected_out).unwrap()).unwrap();
-    assert_eq!(selected["results"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        selected["results"][0]["case_id"],
-        "second-missing-config-control"
-    );
+    assert!(!selected_out.exists());
 
     let all = compatibility_command()
         .arg("run")
@@ -433,18 +702,13 @@ fn case_selection_is_not_all_and_explicit_all_keeps_every_row() {
         .arg(&all_out)
         .output()
         .unwrap();
+    assert!(!all.status.success());
     assert!(
-        all.status.success(),
+        String::from_utf8_lossy(&all.stderr).contains("floating_resolution_required"),
         "stderr: {}",
         String::from_utf8_lossy(&all.stderr)
     );
-    let all: serde_json::Value = serde_json::from_slice(&fs::read(&all_out).unwrap()).unwrap();
-    assert_eq!(all["results"].as_array().unwrap().len(), 2);
-    assert_eq!(all["results"][0]["case_id"], "missing-config-control");
-    assert_eq!(
-        all["results"][1]["case_id"],
-        "second-missing-config-control"
-    );
+    assert!(!all_out.exists());
 }
 
 #[test]

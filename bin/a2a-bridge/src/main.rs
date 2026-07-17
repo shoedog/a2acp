@@ -36,6 +36,7 @@
 
 mod catalog_probe;
 mod compatibility;
+mod compatibility_resolution;
 mod config;
 mod containers;
 mod doctor;
@@ -104,8 +105,8 @@ SUBCOMMANDS:
                       --manifest <file> [--concurrency K] [--detach] [--url <url>]
   batch               Batch store.  status <id> | list | cancel <id>
   models              List each agent's advertised models/effort/modes (probed live).  [--config <f>] [--agent <id>] [--json]
-  compatibility       Validate or run the checked-in compatibility matrix and compare pinned evidence.
-                      validate | run | compare
+  compatibility       Validate recipes/manifests, resolve floating candidates, run exact canaries,
+                      and compare evidence.  validate | resolve | run | compare
   smoke               Run one explicitly acknowledged, bounded, fixed PONG probe.
                       --agent <id> --config <f> --acknowledge-billable [--out <f>]
   fallback-plan       Validate a local failed artifact and emit a host fallback recommendation.
