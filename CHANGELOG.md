@@ -28,8 +28,8 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   before failure classification cannot strand the named container. Cancellation or ordinary-error
   settlement during Tokio runtime shutdown retains the same independent joined thread/runtime cleanup
   owner instead of handing either flight back to the shutting reactor. Legacy reap callbacks remain detached.
-- Compatibility canaries now reject additional credential-shaped prerequisite names, surface
-  negative/non-finite reported costs as sticky blocking observations across later usage snapshots, and
+- Compatibility canaries now reject additional credential-shaped prerequisite names, surface negative,
+  non-finite, or non-USD costs against the USD-denominated cap as sticky blocking observations, and
   directly cover final-sibling same-name replacement before aggregate publication. Ambiguous duplicate
   Fable-settings destinations no longer report exact provenance.
 - Claude smoke/doctor preflight now reads only bounded, non-secret OAuth shape/expiry metadata and blocks

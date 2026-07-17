@@ -1,6 +1,7 @@
 # R3 — Compatibility manifest and canary implementation plan
 
-- **Status:** overall R3 **IN REVIEW**; R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE** on
+- **Status:** overall R3 **IN REVIEW**; R3a **MERGED** at `3927df3f` by PR #31; R3b
+  **APPROVED / PENDING MERGE** on
   `agent/reliability-r3b-pinned-lane`. Nine pinned rows are implemented. Exact
   `c458045cf3d0923457519e253d22dd545363f98d` Sol/xhigh review approved the pre-incident deterministic
   tree. Authorized attempt 1 remains non-promotable stale-auth evidence; authorized attempt 2 passed both
@@ -18,8 +19,10 @@
   runtime-shutdown cleanup plus partial repeated-`Unknown` coverage. Exact `87c8f4e` closure review
   adjudicated both inherited items `FIXED`, found no new `WRONG`, and returned `APPROVE`; two
   resource/pathological-OS fault-boundary `SMELL`s remain accepted/nonblocking and unverified. The stale
-  next-action wording it identified is fixed in the current docs fold. One clean-room Fable/xhigh adversarial
-  implementation plus release/compatibility review remains; no Fable re-review.
+  next-action wording it identified is fixed. The one clean-room Fable/xhigh/plan review of exact `a0c2c4c`
+  independently found no `WRONG`, reported five nonblocking `SMELL`s, returned release verdict `READY`, and
+  ended `GATE: APPROVE`. This docs fold closes its non-USD cost wording gap; all other verification/fault
+  boundaries remain accepted/nonblocking. No Fable re-review will run.
 - **Prerequisite:** R2c/R2d merged (`a6fec94c`, PR #29); R3a merged (`3927df3f`, PR #31)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -387,8 +390,27 @@ five-second post-SIGKILL `try_wait` ceiling cannot prove exit under a pathologic
 `SMELL` was the roadmap's stale “commit the fold” next action, fixed in this approval-recording docs fold.
 The reviewer accepted the supplied gates without rerunning them and performed no container/provider action.
 
+The one clean-room Fable/xhigh/plan adversarial implementation plus release/compatibility review of exact
+`a0c2c4c5a526f99603702f826d5401aa39864d4d` independently inspected the full 29-path branch, found no
+`WRONG`, returned release verdict `READY`, and ended `GATE: APPROVE`. It independently recomputed the
+manifest, settings, and nine config hashes; verified the empty baseline; and rechecked both retained
+aggregate files' mode, size, and SHA-256 without running a compatibility case. Its five nonblocking `SMELL`
+groups are dispositioned as follows:
+
+- the docs' negative/non-finite cost wording omitted the fail-closed non-USD-against-USD-cap case; fixed in
+  this approval-recording fold;
+- the exact external-provider truthiness agreement remains based on recorded pinned-SDK inspection rather
+  than an in-tree oracle; accepted/nonblocking;
+- OS-thread/fresh-runtime creation failure and the pathological post-SIGKILL ceiling remain the same
+  explicitly unverified, accepted/nonblocking fault boundaries from the Sol review;
+- intentionally broad fail-closed credential/Fable spelling rules and real-Podman label coverage remain
+  accepted/nonblocking policy/coverage edges.
+
+This was the only Fable review turn for the fold. It is review evidence, not compatibility evidence, and no
+Fable re-review will run.
+
 The initial fresh one-shot Sol/xhigh review of exact `57f3ee8` returned `REVISE` with two `WRONG`
-findings and three `SMELL`s. The branch now keeps invalid negative/non-finite cost history sticky across
+findings and three `SMELL`s. The branch now keeps negative, non-finite, or non-USD cost history sticky across
 later snapshots, aligns both reader-count surfaces, refuses ambiguous duplicate settings provenance,
 adds Claude image-label/drift mutation coverage, and test-locks the baseline empty until authorized
 promotion. All findings are folded. Fresh Sol/xhigh closure review of exact `c38978a` returned `APPROVE`
@@ -470,8 +492,9 @@ the original three mutations also fail under their exact pre-fix behavior. The f
 **2,085 / 0 / 12 ignored** across **70** test/doc-test executables; affected core/ACP tests pass **514 / 0**,
 and binary tests pass **395 / 0**. No additional compatibility/model smoke ran; three source-only Sol reviews
 ran. Exact `a1641d0` and `d0be430` reviews returned `REVISE`; exact `87c8f4e` returned `APPROVE` with no new
-`WRONG` and two accepted nonblocking fault-boundary `SMELL`s. One clean-room Fable/xhigh adversarial
-implementation plus release/compatibility review remains, with no Fable re-review.
+`WRONG` and two accepted nonblocking fault-boundary `SMELL`s. The one clean-room Fable/xhigh/plan review of
+exact `a0c2c4c` independently found no `WRONG`, returned `READY`, and ended `GATE: APPROVE`; its nonblocking
+findings are recorded above. R3b is **APPROVED / PENDING MERGE**, with no Fable re-review.
 
 Seed rows for every currently claimed path or control in `docs/compatibility.md`:
 
@@ -488,8 +511,9 @@ new prompt engine. They do not become supported release paths without a separate
 artifact contract.
 
 Before adding credential-bearing rows, extend the deterministic runner controls with symmetric
-final-sibling same-name replacement coverage, additional credential-shaped environment names, and
-explicit negative/non-finite reported-cost handling that remains sticky across later usage snapshots.
+final-sibling same-name replacement coverage, additional credential-shaped environment names, and explicit
+negative, non-finite, or non-USD reported-cost handling that remains sticky across later usage snapshots and
+fails closed against the USD-denominated cap.
 Preserve exact credential-value and sensitive-key
 backstops; heuristic expansion must not be presented as general secret detection. Exact identity grammar
 may fail closed on unsupported authoring forms, but every rejected supported-provider identity needs an
