@@ -3018,22 +3018,20 @@ fn package_archive_relative_path(path: &Path) -> Result<Option<PathBuf>, String>
     }
 }
 
-fn symlink_target_stays_in_package(link: &Path, target: &Path) -> bool {
+fn normalized_package_symlink_target(link: &Path, target: &Path) -> Option<PathBuf> {
     if target.is_absolute() {
-        return false;
+        return None;
     }
-    let mut depth = link
-        .parent()
-        .map_or(0, |parent| parent.components().count());
+    let mut normalized = link.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
     for component in target.components() {
         match component {
-            Component::Normal(_) => depth = depth.saturating_add(1),
+            Component::Normal(name) => normalized.push(name),
             Component::CurDir => {}
-            Component::ParentDir if depth != 0 => depth -= 1,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+            Component::ParentDir if normalized.pop() => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
         }
     }
-    true
+    Some(normalized)
 }
 
 fn normalized_package_bin_target(target: &Path) -> Result<PathBuf, String> {
@@ -3161,7 +3159,7 @@ fn package_archive_plan(
                 MAX_TEXT_BYTES,
             )?;
             portable_tree_path_key("package archive symlink target", &target)?;
-            if !symlink_target_stays_in_package(&relative_path, &target) {
+            if normalized_package_symlink_target(&relative_path, &target).is_none() {
                 return Err("package archive symlink escapes its package".into());
             }
             ArchiveEntryKind::Symlink { target }
@@ -3212,6 +3210,31 @@ fn package_archive_plan(
             return Err("package archive package.json bin target is not a regular file".into());
         };
         *executable = true;
+    }
+    let mut portable_namespace = BTreeMap::new();
+    for entry in &plan {
+        let mut current = PathBuf::new();
+        for component in entry.relative_path.components() {
+            current.push(component.as_os_str());
+            let key = portable_tree_path_key("package archive path", &current)?;
+            portable_namespace.entry(key).or_insert(current.clone());
+        }
+    }
+    for entry in &plan {
+        let ArchiveEntryKind::Symlink { target } = &entry.kind else {
+            continue;
+        };
+        let normalized = normalized_package_symlink_target(&entry.relative_path, target)
+            .ok_or("package archive symlink escapes its package")?;
+        let key = portable_tree_path_key("package archive symlink target", &normalized)?;
+        if portable_namespace
+            .get(&key)
+            .is_some_and(|planned| planned != &normalized)
+        {
+            return Err(
+                "package archive symlink target must use the exact portable spelling".into(),
+            );
+        }
     }
     if plan.is_empty() {
         return Err("package archive contains no materializable entries".into());
@@ -7613,6 +7636,43 @@ image = "reader-current"
         )
         .unwrap_err()
         .contains("portable ASCII namespace"));
+    }
+
+    #[test]
+    fn package_archive_rejects_portable_only_symlink_target_spelling() {
+        let package = locked_package_for_test("node_modules/test");
+        let portable_only = test_named_package_archive(
+            "test",
+            "1.0.0",
+            &[
+                TestArchiveEntry::File("Lib/tool.js", b"body", 0o600),
+                TestArchiveEntry::Symlink("dist/tool", "../lib/tool.js"),
+            ],
+        );
+        assert!(
+            package_archive_plan(
+                &portable_only,
+                &package,
+                test_archive_deadline(),
+                &tree_limits(),
+            )
+            .unwrap_err()
+            .contains("exact portable spelling"),
+            "a symlink target must not rely on case-insensitive host lookup"
+        );
+
+        let exact = test_named_package_archive(
+            "test",
+            "1.0.0",
+            &[
+                TestArchiveEntry::File("Lib/tool.js", b"body", 0o600),
+                TestArchiveEntry::Symlink("dist/tool", "../Lib/tool.js"),
+            ],
+        );
+        assert!(
+            package_archive_plan(&exact, &package, test_archive_deadline(), &tree_limits()).is_ok(),
+            "an exact-spelling in-package symlink target must remain accepted"
+        );
     }
 
     #[test]
