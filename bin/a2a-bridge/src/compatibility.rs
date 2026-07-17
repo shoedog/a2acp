@@ -7288,6 +7288,18 @@ agent_cli = "@openai/codex=0.144.1"
             unchanged.changes
         );
 
+        let mut catalog_only_baseline = clean_baseline.clone();
+        catalog_only_baseline.cases[0].capability["model_catalog"]["current_model"] =
+            Value::String("different-model".into());
+        let catalog_only = compare_floating_to_pinned(&current, &catalog_only_baseline).unwrap();
+        assert_eq!(catalog_only.changes.len(), 1);
+        assert_eq!(catalog_only.changes[0].case_id, "only");
+        assert_eq!(
+            catalog_only.changes[0].dimensions,
+            ["catalog.current_model"],
+            "catalog-only drift must not be duplicated as generic capability drift"
+        );
+
         let mut cancelled = current.clone();
         cancelled.cancelled = true;
         cancelled.success = false;
