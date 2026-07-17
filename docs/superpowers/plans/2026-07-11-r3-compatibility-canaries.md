@@ -890,16 +890,29 @@ control. Focused coverage must include:
    evidence. Do not change the pinned manifest/baseline, production configs/locks/Containerfiles, support
    matrix, or changelog.
 
-Implementation cursor on 2026-07-16: slices 1-3 are implemented. `1c1115cb` defines the strict
+Implementation cursor on 2026-07-16: all four implementation slices are complete. `1c1115cb` defines the strict
 recipe/resolution contracts and the five recorded red-before-green boundaries; `0c25686c` adds the
 provider-free typed package/image/config materializer and atomic private bundle; `e159915` adds exact
 pre-provider revalidation, same-session bounded catalog evidence, floating pass/fail/unknown truth, and
-independent floating-to-pinned comparison while preserving old smoke-v2 fallback compatibility. Slice 4 is
-in progress with the four-case recipe and stable operator runbook. Latest focused gates are resolution
+independent floating-to-pinned comparison while preserving old smoke-v2 fallback compatibility. `356092f`
+adds the four-case recipe and stable operator runbook; `57e63a0` is a lint-only fold that removes one owned
+path comparison and documents the deliberately uniform internal drift taxonomy. Latest focused gates are resolution
 **32 / 0**, compatibility unit **53 / 0**, compatibility CLI **20 / 0**, ACP same-session catalog **1 / 0**,
-smoke catalog **1 / 0**, and additive fallback schema **1 / 0**; workspace all-target check is green. The
-current full package/workspace, Clippy, release, hygiene, Linux/Rust 1.94, and review closure gates remain to
-run. No provider, registry, runtime, container, model-discovery, or output-materialization effect ran.
+smoke catalog **1 / 0**, and additive fallback schema **1 / 0**. The full host workspace is **2,135 passed /
+0 failed / 12 ignored** across **70** test/doc-test executables. Linux/Rust 1.94.0 passes the complete
+`a2a-bridge` package **508 / 0 / 11 ignored** across **16** groups, including binary **434 / 0**,
+compatibility CLI **21 / 0**, smoke CLI **15 / 0**, plus ACP catalog **1 / 0**. The first two Linux harness
+attempts were invalid before a green gate: a login shell omitted Cargo, then a macOS bind-mounted target and
+missing absolute worktree gitdir caused cache/repository-discovery failures. The final run used a fresh
+Docker volume plus the exact read-only source/common-git paths, and all temporary image/volume/target evidence
+was removed afterward. Format/diff, workspace all-target check, warnings-denied all-target Clippy, locked
+release, hygiene **37/7**, pinned manifest, four-case recipe, protected-input identity, and dependency policy
+are green. The provider-unexercised release candidate is 24,230,192 bytes at SHA-256
+`6209ceb9d99d654715aa37f485dc3d251ad3fd29c25bb16739219e8f2a39e51a`; the recipe SHA-256 is
+`11d8f50de5515b2f6703741c9a00980e1dc96f766e6370677fd654a0968f0160`. The pinned manifest/baseline,
+production configs/Cargo inputs/Containerfiles, compatibility matrix, support matrix, and changelog remain
+byte-identical to `504c1e43`. No provider, package-registry resolution, bridge runtime/container,
+model-discovery, compatibility aggregate, operator rebuild, or operator swap ran.
 
 Each commit must build and keep existing pinned behavior green. Focused tests run first; final closure runs
 format/diff, workspace check, warnings-denied all-target Clippy, the full workspace suite with exact totals,
@@ -934,11 +947,13 @@ operator-reviewed cleanup proves no running container uses them. Automated reten
 scheduler deadlines, termination escalation, quarantine, and concurrency remain R3d. Promotion, production
 pins/baselines, support wording, release integration, and rollback exercises remain R4.
 
-**Restart point:** continue from `e159915` on `agent/reliability-r3c-floating-lane`. Finish slice 4 by
-validating and committing the four-case recipe plus stable CLI/runbook surfaces, then run the complete host
-and Linux closure inventories and the two ordered reviews. Keep the pinned manifest/baseline and every
-protected production/support input unchanged. Do not run a real registry, runtime, container, model
-discovery, or provider operation without the separate authorizations described under live gates.
+**Restart point:** continue from `57e63a0` on `agent/reliability-r3c-floating-lane`. The deterministic host
+and Linux closure inventory above is green. Run the fresh Sol/xhigh adversarial full-branch correctness
+review, fold and reverify every `WRONG`, and only after that review is green run the release/compatibility
+lens. Keep the pinned manifest/baseline and every protected production/support input unchanged. Do not run a
+real compatibility resolution, bridge runtime/container, model discovery, provider turn beyond the two
+authorized reviews, operator rebuild, or operator swap without the separate authorizations described under
+live gates.
 
 ## R3d — scheduling and evidence retention
 
