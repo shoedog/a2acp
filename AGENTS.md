@@ -248,10 +248,12 @@ subprocess may create only the exact lock through the bridge's fixed npmjs CONNE
 tree-write authority.
 The bridge downloads the exact integrity-bound npmjs HTTPS archives, requires matching package identity and
 present declared bin targets, and preflights paths/types in a case-insensitive portable ASCII namespace. It
-binds symlink targets to the exact spelling of portable-equivalent planned paths, reserves the entire
-aggregate entry/byte budget before the first package entry write, and materializes the private tree
-descriptor-relatively. Inspect the complete `resolution.json`, validate and doctor its generated configs,
-then obtain separate authorization
+raw-preflights every GNU long-name/long-link and local/global PAX metadata record against a 1 MiB cap before
+tar preprocessing in both planning and materialization, accounts PAX-effective file sizes, binds symlink
+targets to the exact spelling of portable-equivalent planned paths, reserves the entire aggregate entry/byte
+budget before the first package entry write, and materializes the private tree descriptor-relatively.
+Inspect the complete `resolution.json`, validate and doctor its generated configs, then obtain separate
+authorization
 for the exact resolution id, unchanged candidate binary, selected cases, owner, and budget:
 
 ```bash
