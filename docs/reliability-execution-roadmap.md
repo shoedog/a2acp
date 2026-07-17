@@ -552,7 +552,7 @@ Next action:
 ## Current handoff
 
 - R3a merged through PR #31 at `3927df3f1dce03fde50b7754151a718017f45815`. R3b merged through PR #32
-  at `504c1e434fd5845bc6745e0b0a0aae95427afbdd`. R3c is **IN PROGRESS** on
+  at `504c1e434fd5845bc6745e0b0a0aae95427afbdd`. R3c is **APPROVED / PENDING MERGE** on
   `agent/reliability-r3c-floating-lane`, based directly on that merge. The
   manifest now contains nine
   exact pinned rows: four release-blocking minimal bridge-smoke support cases and five explicit
@@ -647,7 +647,16 @@ Next action:
   host suite passes **2,165 / 0 / 12 ignored** across **70** executables. Format/diff, all-target check,
   warnings-denied Clippy, locked release, hygiene **37/7**, both manifests, protected inputs, and dependency
   policy are green. Exact-`0567381` Sol/xhigh closure review adjudicated all 15 inherited findings fixed,
-  found no new `WRONG` or `SMELL`, and returned `GATE: APPROVE`; one release/compatibility lens remains.
+  found no new `WRONG` or `SMELL`, and returned `GATE: APPROVE`. A separate clean-room Opus 4.8/xhigh
+  release/compatibility lens inspected exact clean `6637c13b7e3f82dde4f59790c40d8e0eded47aa6`, found no
+  `WRONG` or `SMELL`, returned release determination `READY`, and ended `GATE: APPROVE`. Three preceding
+  Claude diagnostic requests (Fable on the operator, Fable on a fresh isolated ACP process, and Opus on
+  the operator) incorrectly supplied `a2a-bridge.mode=read-only` to the Tier 0 prompt-only Claude agent.
+  Each was rejected before model configuration in about 0.5-0.6 seconds with no review output or usage;
+  they are neither reviews nor evidence of Fable/Opus model degradation. Omitting only `mode` produced
+  `acp.config_resolved` and the completed Opus review, ruling out stale warm-session state and confirming
+  the controller-request mismatch. The corrected Opus turn is the single policy-limited second opinion
+  after Sol approval; no Opus re-review is required.
   Explicitly authorized provider-free host
   diagnostics resolved current Codex and Claude package trees and produced green generated-config doctors,
   but the retained bundles predate `f15ae88`, `b3793e8`, `4621ab5`, `dd99267`, and `4bd63f3` and are

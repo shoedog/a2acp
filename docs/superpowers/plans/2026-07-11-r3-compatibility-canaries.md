@@ -1,7 +1,7 @@
 # R3 — Compatibility manifest and canary implementation plan
 
 - **Status:** overall R3 **IN REVIEW**; R3a **MERGED** at `3927df3f` by PR #31; R3b
-  **MERGED** at `504c1e43` by PR #32; R3c **IN PROGRESS** on
+  **MERGED** at `504c1e43` by PR #32; R3c **APPROVED / PENDING MERGE** on
   `agent/reliability-r3c-floating-lane`. Nine pinned rows are implemented. Exact
   `c458045cf3d0923457519e253d22dd545363f98d` Sol/xhigh review approved the pre-incident deterministic
   tree. Authorized attempt 1 remains non-promotable stale-auth evidence; authorized attempt 2 passed both
@@ -988,8 +988,22 @@ immediate isolated rerun passed **1 / 0**, and three subsequent full-workspace r
 timing-sensitive signal remains reported and unmodified rather than rebaselined. Fresh exact-head
 Sol/xhigh closure review of exact `056738111075317d3e7bcb3784491975e138e771` adjudicated all 15 inherited
 findings **FIXED**, found no new `WRONG` or `SMELL`, and returned `GATE: APPROVE`; the reviewer accepted the
-supplied gates and ran no builds, tests, containers, registries, providers, or network services. One
-release/compatibility lens remains.
+supplied gates and ran no builds, tests, containers, registries, providers, or network services. A separate
+clean-room Opus 4.8/xhigh release/compatibility review inspected exact clean
+`6637c13b7e3f82dde4f59790c40d8e0eded47aa6`, independently challenged credentials/secrets, registry and
+dependency authority, mutable images/tags, cost/admission, artifact atomicity/rollback/retention, and
+promotion/compatibility truth, found no `WRONG` or `SMELL`, returned release determination `READY`, and ended
+`GATE: APPROVE`. It accepted the supplied deterministic gates and ran no builds, tests, containers,
+registries, provider smokes, model discovery, image resolution/build, or promotion action.
+
+Three preceding Claude diagnostics are explicitly not reviews: operator Fable, fresh-isolated-process
+Fable, and operator Opus each incorrectly supplied `a2a-bridge.mode=read-only` to the Tier 0 prompt-only
+Claude agent. Mode application precedes model configuration, so each request failed as `agent crashed` in
+about 0.5-0.6 seconds with no `acp.config_resolved`, review output, or usage. The fresh isolated failure
+falsified stale warm-session state; a corrected Opus request that omitted only `mode` emitted both
+`acp.config_resolved` records and completed normally. This confirms a controller-request mismatch rather
+than Fable/Opus degradation. The corrected Opus turn is the one policy-limited second opinion after the
+green Sol correctness review; no Opus re-review is required.
 Prior removed-check mutations produce these exact reds: unauthorized CONNECT admission wedged the negative
 proxy test until bounded termination; a per-proxy counter left shared budget **5** instead of **2**; removing
 RLIMIT plus the watcher returned late `PackageTreeDrift` instead of immediate `NpmDownloadBudgetExceeded`;
@@ -1033,10 +1047,10 @@ format/diff, workspace check, warnings-denied all-target Clippy, the full worksp
 locked release build, hygiene, pinned-manifest validation, floating-recipe validation, and Linux/Rust 1.94
 coverage for modes, descriptor publication, candidate execution, and strict parsing.
 
-The fresh Sol/xhigh adversarial full-branch correctness requirement is satisfied at exact `0567381`. Before
-merge require one release/compatibility review focused on credentials, registry authority, mutable tags, cost,
-mutation proof, artifact rollback, and non-promotion. Tag every finding `WRONG` or `SMELL` and adjudicate
-inherited findings first. No review turn is compatibility evidence.
+The fresh Sol/xhigh adversarial full-branch correctness requirement is satisfied at exact `0567381`. The
+separate release/compatibility requirement is satisfied by the corrected Opus 4.8/xhigh review of exact
+`6637c13`, with no `WRONG` or `SMELL`, release determination `READY`, and `GATE: APPROVE`. Both reviewers
+adjudicated inherited findings first where applicable. No review turn is compatibility evidence.
 
 ### Live gates and restart handoff
 
@@ -1075,13 +1089,15 @@ operator-reviewed cleanup proves no running container uses them. Automated reten
 scheduler deadlines, termination escalation, quarantine, and concurrency remain R3d. Promotion, production
 pins/baselines, support wording, release integration, and rollback exercises remain R4.
 
-**Restart point:** continue from the current tip of `agent/reliability-r3c-floating-lane`;
-`4bd63f3f129a08586742c3c3e946fecfa02839ba` is the current code head. Focused resolution tests pass
+**Restart point:** R3c deterministic implementation and both required review lenses are complete on
+`agent/reliability-r3c-floating-lane`; `4bd63f3f129a08586742c3c3e946fecfa02839ba` is the final code head,
+and exact `6637c13b7e3f82dde4f59790c40d8e0eded47aa6` is the approved release-review boundary. Focused resolution tests pass
 **61 / 0**; full host **2,165 / 0 / 12 ignored** across **70** groups, release, hygiene, manifest/recipe,
 protected-input, and dependency-policy gates are green. Exact-`0567381` Sol/xhigh closure review approved all
-15 inherited findings with no new `WRONG` or `SMELL`; one release/compatibility lens remains. Linux/Rust 1.94
-is green only on historical `57e63a0` until an image pull is separately authorized. Record the approval,
-verify the docs-only fold, and run the one clean-room release/compatibility lens. Keep the pinned
+15 inherited findings with no new `WRONG` or `SMELL`; exact-`6637c13` Opus 4.8/xhigh release review found no
+`WRONG` or `SMELL`, returned `READY`, and ended `GATE: APPROVE`. Linux/Rust 1.94 is green only on historical
+`57e63a0` until an image pull is separately authorized. Commit this docs-only approval fold, rerun the exact
+full local gate, then push and open the non-draft R3c PR. Keep the pinned
 manifest/baseline and every protected production/support input unchanged. Do not run an exact-current
 compatibility resolution, bridge runtime/container, model discovery, any provider turn outside the
 authorized review sequence, operator rebuild, or operator swap without the separate authorizations described
