@@ -6,7 +6,7 @@
 - **Active slice:** R3c floating-current lane **IN PROGRESS** on
   `agent/reliability-r3c-floating-lane`
 - **Current R3c deterministic gate:** code head
-  `4621ab5cd01612db2f72fae8b9b9b467def5fb93` completes all four implementation slices and four
+  `dd99267ba4bd806b1cd33939cc2d0f16505d2f3f` completes all four implementation slices and five
   adversarial-review rounds. The initial Sol/xhigh review of exact `a5dfef8` returned nine `WRONG`, no
   `SMELL`, and `GATE: REVISE`; `e3459a5` closes all nine, and `d86e418` adds the missing pre-fix-red
   catalog-only comparison regression. Closure review of exact `646d61b` left transient aggregate
@@ -21,24 +21,29 @@
   could collide only after writes on a case-insensitive destination. `4621ab5` now requires every declared
   bin target to name a planned regular file and applies one fail-closed, case-insensitive portable ASCII
   namespace to archive entries, symlink targets, implicit directories, and cumulative leaves before the
-  reservation commits. The three red-first closure controls failed **50 / 3** on missing bin, portable case
-  collision, and non-ASCII namespace acceptance; current focused resolution gates pass **54 / 0**.
-  Exact-`4621ab5` host gates pass **2,158 / 0 / 12 ignored** across **70** test/doc-test executables.
+  reservation commits. Sol/xhigh review of exact `af69806` adjudicated all 13 inherited findings **FIXED**,
+  found no `SMELL`, but returned `GATE: REVISE` on one new `WRONG`: a symlink target could use spelling that
+  resolved only on the case-insensitive macOS host and became dangling in the Linux reader image.
+  `dd99267` normalizes each in-package target and rejects it before writes when its portable-equivalent
+  planned path has different spelling, while retaining an exact-spelling positive control. The prior three
+  red-first controls failed **50 / 3**; the new symlink-spelling control failed **0 / 1** because planning
+  returned `Ok`; current focused resolution gates pass **55 / 0**. Exact-`dd99267` host gates pass
+  **2,159 / 0 / 12 ignored** across **70** test/doc-test executables.
   Format/diff, all-target workspace check, warnings-denied all-target/all-feature Clippy, locked release,
   hygiene **37/7**, pinned manifest **9 cases**, floating recipe **4 cases**, protected-input identity, and
   dependency policy are green; fresh correctness re-review remains pending. One first post-fix grouped
   focused run reported the existing cancellation-descendant test failed **0 / 1**; its immediate isolated
   rerun passed **1 / 0**, the complete focused reruns passed **53 / 0** then **54 / 0**, and the full suite
   passed it. This non-reproduced timing signal is reported, not rebaselined. The provider-unexercised release
-  binary is 24,692,192 bytes at SHA-256
-  `59c1ddcec5f386bdb954aae46f57e9e6b25e8259218b25014abb6216bf7eaaeb`. The earlier `57e63a0`
+  binary is 24,693,056 bytes at SHA-256
+  `041350e2df307b0992e057052c42abccf1ce08b24c41f2c266edc9524ddfe90a`. The earlier `57e63a0`
   Linux/Rust 1.94.0 gate
   remains green at full package **508 / 0 / 11 ignored** across **16** groups (binary **434 / 0**,
   compatibility CLI **21 / 0**, smoke CLI **15 / 0**) plus ACP catalog **1 / 0**; it was not rerun for
-  `4621ab5` because cleanup removed the local Rust image and no new image pull was authorized. Explicitly
+  `dd99267` because cleanup removed the local Rust image and no new image pull was authorized. Explicitly
   authorized provider-free host diagnostics resolved Codex and Claude package trees; generated-config
   doctors passed **10/0/0** and **11/0/0** respectively, but the retained bundles predate `f15ae88`,
-  `b3793e8`, and `4621ab5` and are
+  `b3793e8`, `4621ab5`, and `dd99267` and are
   diagnostic rather than exact-current compatibility evidence. No compatibility/provider smoke turn, model
   discovery, image resolution/build, compatibility aggregate, operator rebuild, or operator swap ran; the
   recorded review turns are review evidence only.
@@ -271,7 +276,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **IN PROGRESS** at code head `4621ab5`. R3b attempts 1 and 2 remain non-promotable failure evidence. R3b exact `87c8f4e` Sol closure review approved and the one clean-room Fable/xhigh review of exact `a0c2c4c` returned release verdict `READY` and `GATE: APPROVE`; no Fable re-review. R3c Sol reviews of exact `a5dfef8`, `646d61b`, `5facc9c`, and `260e4a6` returned `REVISE`; the last review fixed all 11 inherited findings but found missing-bin and filesystem-equivalence `WRONG`s. `4621ab5` closes both in code. Exact-head full/release/policy gates are green; fresh correctness re-review is pending. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner and R3b pinned lane merged; R3c owns provider-free floating resolution plus bound execution; then R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **IN PROGRESS** at code head `dd99267`. R3b attempts 1 and 2 remain non-promotable failure evidence. R3b exact `87c8f4e` Sol closure review approved and the one clean-room Fable/xhigh review of exact `a0c2c4c` returned release verdict `READY` and `GATE: APPROVE`; no Fable re-review. R3c Sol reviews of exact `a5dfef8`, `646d61b`, `5facc9c`, `260e4a6`, and `af69806` returned `REVISE`; the last review fixed all 13 inherited findings but found a host-to-reader symlink-spelling `WRONG`. `dd99267` closes it in code. Exact-head full/release/policy gates are green; fresh correctness re-review is pending. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner and R3b pinned lane merged; R3c owns provider-free floating resolution plus bound execution; then R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -624,15 +629,18 @@ Next action:
   `GATE: REVISE`. `b3793e8` preflights all selected archives, reserves the whole tree once before any
   package-entry write, and binds archive name/version to the lock entry. Sol/xhigh review of exact `260e4a6`
   adjudicated all 11 inherited findings fixed, then returned `REVISE` on missing declared bin targets and
-  filesystem-equivalent paths reaching writes. Current code head `4621ab5` requires each bin target to be a
-  planned regular file and uses a fail-closed portable ASCII/case-insensitive namespace across archive and
-  cumulative-tree checks. The three red-first regressions failed **50 / 3**; focused resolution tests now
-  pass **54 / 0** and the exact-head host suite passes **2,158 / 0 / 12 ignored** across **70** executables.
+  filesystem-equivalent paths reaching writes. `4621ab5` requires each bin target to be a planned regular
+  file and uses a fail-closed portable ASCII/case-insensitive namespace across archive and cumulative-tree
+  checks. Sol/xhigh review of exact `af69806` fixed all 13 inherited findings, then returned `REVISE` on a
+  symlink target whose host-only case spelling could become dangling in the Linux reader. Current code head
+  `dd99267` binds portable-equivalent symlink targets to planned exact spelling. The new red-first control
+  failed **0 / 1**; focused resolution tests now pass **55 / 0** and the exact-head host suite passes
+  **2,159 / 0 / 12 ignored** across **70** executables.
   Format/diff, all-target check, warnings-denied
   all-feature Clippy, locked release, hygiene **37/7**, both manifests, protected inputs, and dependency
   policy are green; fresh correctness re-review remains. Explicitly authorized provider-free host
   diagnostics resolved current Codex and Claude package trees and produced green generated-config doctors,
-  but the retained bundles predate `f15ae88`, `b3793e8`, and `4621ab5` and are
+  but the retained bundles predate `f15ae88`, `b3793e8`, `4621ab5`, and `dd99267` and are
   diagnostic rather than exact-current compatibility evidence. Linux/Rust 1.94 remains green only on
   historical implementation head `57e63a0`; no local image remains and no pull was authorized. No
   compatibility/provider smoke turn, model discovery, image resolution/build, compatibility aggregate,

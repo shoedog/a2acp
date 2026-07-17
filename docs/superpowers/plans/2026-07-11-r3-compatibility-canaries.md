@@ -543,7 +543,7 @@ updates `docs/compatibility.md` and the changelog when release-relevant.
 - **Branch:** `agent/reliability-r3c-floating-lane`
 - **State:** **IN PROGRESS** from clean base
   `504c1e434fd5845bc6745e0b0a0aae95427afbdd`
-- **Current code head:** `4621ab5cd01612db2f72fae8b9b9b467def5fb93`; deterministic full-branch
+- **Current code head:** `dd99267ba4bd806b1cd33939cc2d0f16505d2f3f`; deterministic full-branch
   gates are green and fresh exact-head correctness re-review remains pending.
 - **Design evidence:** one bridge-mediated clean-room Sol/xhigh read-only design pass inspected exact
   `504c1e43`. Beyond that review turn, it ran no provider compatibility prompt, package resolution,
@@ -938,7 +938,13 @@ case-insensitive destination after the first write. Exact
 `4621ab5cd01612db2f72fae8b9b9b467def5fb93` requires every declared bin target to name a planned regular
 file. It also defines one fail-closed portable package-tree namespace: paths and symlink targets must be
 UTF-8 ASCII, and archive entries, implicit/explicit directories, and leaves share case-insensitive keys
-while preserving their original spelling for descriptor-relative writes.
+while preserving their original spelling for descriptor-relative writes. The next Sol/xhigh review
+inspected exact `af698066456bc76f5f52a725221bbafb574fd154`, adjudicated all 13 inherited findings
+**FIXED**, reported no `SMELL`, and returned `GATE: REVISE` on one new `WRONG`: a symlink target's lowercase
+key was discarded, so a target spelling that resolved on case-insensitive macOS could be retained verbatim
+and become dangling in the Linux reader image. Exact `dd99267ba4bd806b1cd33939cc2d0f16505d2f3f`
+syntactically normalizes each in-package target and rejects it before writes when a portable-equivalent
+planned path has different spelling. An exact-spelling target remains accepted.
 
 With the two closure regressions applied to the pre-fix code, the focused gate failed **47 / 2**: the first
 package had already published `node_modules` when the later package exceeded the complete-tree limit, and a
@@ -946,13 +952,14 @@ wrong-identity archive was accepted. A separate removed-reservation mutation fai
 test **0 / 1** because the over-limit materialization returned `Ok`; restoration passed **1 / 0**. Latest
 focused resolution gates at `b3793e8` were **50 / 0**. With the three new red-first controls applied to
 `260e4a6`, the focused gate failed **50 / 3**: missing bin, portable case collision, and non-ASCII namespace
-acceptance each returned `Ok`. Current focused resolution gates pass **54 / 0**. The exact `646d61b`
-pre-hardening host workspace passed
+acceptance each returned `Ok`; focused resolution gates at `4621ab5` passed **54 / 0**. The new
+symlink-spelling regression failed **0 / 1** against `af69806` because planning returned `Ok`; current
+focused resolution gates pass **55 / 0**. The exact `646d61b` pre-hardening host workspace passed
 **2,141 / 0 / 12 ignored** across **70** test/doc-test executables, with compatibility unit **54 / 0**,
 compatibility CLI **20 / 0**, and ACP same-session catalog, smoke catalog, and additive fallback controls
 **1 / 0** each. Its format/diff, workspace all-target check, warnings-denied all-target/all-feature Clippy,
 locked release, hygiene **37/7**, pinned manifest, four-case recipe, protected-input identity, and dependency
-policy gates were green. Exact-`4621ab5` host gates pass **2,158 / 0 / 12 ignored** across **70** test and
+policy gates were green. Exact-`dd99267` host gates pass **2,159 / 0 / 12 ignored** across **70** test and
 doc-test executables. Format/diff, workspace all-target check, warnings-denied all-target/all-feature Clippy,
 locked release, hygiene **37/7**, pinned manifest **9 cases**, floating recipe **4 cases**, protected-input
 identity, and dependency policy are green. The first post-fix grouped focused run reported the unrelated
@@ -975,17 +982,18 @@ integrity; archive deadline, hardlink, special-file, duplicate, and escaping-lin
 mismatched, exact, and explicit-alias archive identities; npm alias versus ordinary semver; host-plus-Linux
 package selection; owner normalization below Darwin `/private/tmp`; more sibling directories than the macOS
 soft descriptor ceiling; present/missing package-bin targets and mode/path normalization without `.bin`;
-portable-equivalent leaf/implicit-directory rejection; non-ASCII entry/symlink-target rejection; and
-retention of the process-group anchor through final cleanup. The process-group regression failed against the
-pre-fix leader-reap ordering and passes at `f15ae88`; complete-tree and identity regressions pass at
-`b3793e8`; bin/portable-namespace regressions pass at `4621ab5`.
+portable-equivalent leaf/implicit-directory rejection; non-ASCII entry/symlink-target rejection;
+portable-only symlink-target spelling rejection with an exact-spelling positive control; and retention of
+the process-group anchor through final cleanup. The process-group regression failed against the pre-fix
+leader-reap ordering and passes at `f15ae88`; complete-tree and identity regressions pass at `b3793e8`;
+bin/portable-namespace regressions pass at `4621ab5`; symlink-target spelling passes at `dd99267`.
 
 The earlier `57e63a0` Linux/Rust 1.94.0 run passes complete `a2a-bridge` package **508 / 0 / 11 ignored**
 across **16** groups, including binary **434 / 0**, compatibility CLI **21 / 0**, smoke CLI **15 / 0**, plus
-ACP catalog **1 / 0**. It is historical evidence, not an exact-`4621ab5` rerun: cleanup removed the local
+ACP catalog **1 / 0**. It is historical evidence, not an exact-`dd99267` rerun: cleanup removed the local
 Rust image, Docker has no equivalent cached image, and no new image pull was authorized. The current
-provider-unexercised release candidate is 24,692,192 bytes at SHA-256
-`59c1ddcec5f386bdb954aae46f57e9e6b25e8259218b25014abb6216bf7eaaeb`; the recipe SHA-256 is
+provider-unexercised release candidate is 24,693,056 bytes at SHA-256
+`041350e2df307b0992e057052c42abccf1ce08b24c41f2c266edc9524ddfe90a`; the recipe SHA-256 is
 `11d8f50de5515b2f6703741c9a00980e1dc96f766e6370677fd654a0968f0160`. The pinned manifest/baseline,
 production configs, Containerfiles, compatibility matrix, support matrix, and changelog remain byte-identical
 to `504c1e43`; `f15ae88` deliberately changes the bridge crate dependencies and workspace lock for its
@@ -1016,9 +1024,10 @@ Darwin ownership, descriptor retention, published bin-mode, and safe-leading-`./
 deterministic tests now cover; those failed bundles were removed after their evidence was folded.
 
 Those diagnostics started no adapter/provider session, called no `models`, built or inspected no image,
-produced no aggregate, and spent no provider turn. The two retained successful bundles predate both
-`f15ae88`, the complete-selected-tree reservation in `b3793e8`, and the portable namespace/bin enforcement
-in `4621ab5`, so they are diagnostic evidence rather than exact-current compatibility or promotion evidence.
+produced no aggregate, and spent no provider turn. The two retained successful bundles predate all of
+`f15ae88`, the complete-selected-tree reservation in `b3793e8`, the portable namespace/bin enforcement in
+`4621ab5`, and symlink-target spelling enforcement in `dd99267`, so they are diagnostic evidence rather than
+exact-current compatibility or promotion evidence.
 
 After deterministic gates and reviews:
 
@@ -1040,12 +1049,13 @@ scheduler deadlines, termination escalation, quarantine, and concurrency remain 
 pins/baselines, support wording, release integration, and rollback exercises remain R4.
 
 **Restart point:** continue from the current tip of `agent/reliability-r3c-floating-lane`;
-`4621ab5cd01612db2f72fae8b9b9b467def5fb93` is the current code head. Focused resolution tests pass
-**54 / 0**; full host, release, hygiene, manifest/recipe, protected-input, and dependency-policy gates are
+`dd99267ba4bd806b1cd33939cc2d0f16505d2f3f` is the current code head. Focused resolution tests pass
+**55 / 0**; full host, release, hygiene, manifest/recipe, protected-input, and dependency-policy gates are
 green; fresh exact-head correctness review remains. Linux/Rust 1.94 is green only on historical `57e63a0`
 until an image pull is separately authorized. Run a fresh Sol/xhigh closure review that first adjudicates all
-inherited findings from the `a5dfef8`, `646d61b`, `5facc9c`, and `260e4a6` reviews; fold and reverify every
-unresolved `WRONG`, and only after correctness is green run the release/compatibility lens. Keep the pinned manifest/
+inherited findings from the `a5dfef8`, `646d61b`, `5facc9c`, `260e4a6`, and `af69806` reviews; fold and
+reverify every unresolved `WRONG`, and only after correctness is green run the release/compatibility lens.
+Keep the pinned manifest/
 baseline and every protected production/support input unchanged. Do not run an exact-current compatibility
 resolution, bridge runtime/container, model discovery, any provider turn outside the authorized review
 sequence, operator rebuild, or operator swap without the separate authorizations described under live gates.

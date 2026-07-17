@@ -177,8 +177,9 @@ provider session, call `models`, read/copy credentials, replace a shared tag, or
 For packages, npm may only resolve the exact lock through the fixed npmjs CONNECT proxy; it never writes the
 package tree. The bridge downloads each exact integrity-bound npmjs HTTPS archive, requires matching package
 identity and present declared bin targets, and rejects unsafe paths/types outside one case-insensitive
-portable ASCII namespace before publication. It reserves the complete aggregate entry/byte budget before
-the first package entry write and materializes descriptor-relatively below the private bundle.
+portable ASCII namespace before publication. It binds symlink targets to the exact spelling of
+portable-equivalent planned paths, reserves the complete aggregate entry/byte budget before the first
+package entry write, and materializes descriptor-relatively below the private bundle.
 Require explicit operator authorization for those exact registry/image effects, selected cases, recipe
 bytes, owner, runtime, candidate binary, and a new output directory outside every normal or bare Git
 repository:
