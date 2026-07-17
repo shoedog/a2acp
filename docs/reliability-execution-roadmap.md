@@ -6,28 +6,36 @@
 - **Active slice:** R3c floating-current lane **IN PROGRESS** on
   `agent/reliability-r3c-floating-lane`
 - **Current R3c deterministic gate:** code head
-  `f15ae88eae4e8ec3d0e8ed5d45c1b8a101f9dcc8` completes all four implementation slices and two
-  adversarial-review folds. The initial Sol/xhigh review of exact `a5dfef8` returned nine `WRONG`, no
+  `b3793e834056d8c9d58a1cae815e463aa124d72b` completes all four implementation slices and three
+  adversarial-review rounds. The initial Sol/xhigh review of exact `a5dfef8` returned nine `WRONG`, no
   `SMELL`, and `GATE: REVISE`; `e3459a5` closes all nine, and `d86e418` adds the missing pre-fix-red
   catalog-only comparison regression. Closure review of exact `646d61b` adjudicated inherited findings 1
   and 3-9 fixed but left transient aggregate tree-resource overshoot unresolved and found a process-group
-  reuse `WRONG`. `f15ae88` removes npm tree-write authority, downloads/verifies exact integrity-bound
-  archives under bridge-owned hard aggregate reservation, avoids retained per-directory descriptors, and
-  retains a trusted group-leader anchor through final group kill/reap. Focused resolution gates pass
-  **47 / 0**. The exact `646d61b` pre-hardening workspace passed **2,141 / 0 / 12 ignored** across **70**
+  reuse `WRONG`. `f15ae88` removes npm tree-write authority, uses bridge-owned archive materialization,
+  avoids retained per-directory descriptors, and retains a trusted group-leader anchor through final group
+  kill/reap. The next Sol/xhigh review of exact `5facc9c` adjudicated inherited findings 1 and 3-10
+  **FIXED**, but finding 2 **PARTIAL** because packages were still reserved and written sequentially; it
+  also found a new `WRONG` because ordinary transitive archives were not bound to their lock-entry name and
+  version. `b3793e8` downloads, verifies, and preflights every selected archive; reserves the complete
+  selected tree once before the first package-entry write; then reopens, materializes, and removes one
+  archive at a time. It also requires every archive `package.json` identity to match the lock entry,
+  including explicit npm-alias names. With the two closure regressions applied to the pre-fix code, the
+  focused gate failed **47 / 2**; current focused resolution gates pass **50 / 0**. The exact `646d61b`
+  pre-hardening workspace passed **2,141 / 0 / 12 ignored** across **70**
   test/doc-test executables, with compatibility unit **54 / 0**, compatibility CLI **20 / 0**, and ACP
-  catalog, smoke catalog, and additive fallback controls **1 / 0** each. Exact-`f15ae88` host gates pass
-  **2,151 / 0 / 12 ignored** across **70** test/doc-test executables. Format/diff, all-target workspace
+  catalog, smoke catalog, and additive fallback controls **1 / 0** each. Exact-`b3793e8` host gates pass
+  **2,154 / 0 / 12 ignored** across **70** test/doc-test executables. Format/diff, all-target workspace
   check, warnings-denied all-target/all-feature Clippy, locked release, hygiene **37/7**, pinned manifest
-  **9 cases**, floating recipe **4 cases**, protected-input identity, and dependency policy are green; final
-  review remains pending. The provider-unexercised release binary is 24,679,168 bytes at SHA-256
-  `206aaa28893a985ac22f679bf513dc0a8f9f1c5d55d21c71f77afde22b65c9f2`. The earlier `57e63a0`
+  **9 cases**, floating recipe **4 cases**, protected-input identity, and dependency policy are green; fresh
+  correctness re-review remains pending. The provider-unexercised release binary is 24,690,400 bytes at
+  SHA-256 `2a156b9f0f2e5814408a8e674cb237d0b3a3e4c38f4b7f562792b454404328e6`. The earlier `57e63a0`
   Linux/Rust 1.94.0 gate
   remains green at full package **508 / 0 / 11 ignored** across **16** groups (binary **434 / 0**,
   compatibility CLI **21 / 0**, smoke CLI **15 / 0**) plus ACP catalog **1 / 0**; it was not rerun for
-  `f15ae88` because cleanup removed the local Rust image and no new image pull was authorized. Explicitly
+  `b3793e8` because cleanup removed the local Rust image and no new image pull was authorized. Explicitly
   authorized provider-free host diagnostics resolved Codex and Claude package trees; generated-config
-  doctors passed **10/0/0** and **11/0/0** respectively, but the retained bundles predate `f15ae88` and are
+  doctors passed **10/0/0** and **11/0/0** respectively, but the retained bundles predate both `f15ae88`
+  and `b3793e8` and are
   diagnostic rather than exact-current compatibility evidence. No provider turn, model discovery, image
   resolution/build, compatibility aggregate, operator rebuild, or operator swap ran.
 - **Last merged R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
@@ -259,7 +267,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **IN PROGRESS** at code head `f15ae88`. R3b attempts 1 and 2 remain non-promotable failure evidence. R3b exact `87c8f4e` Sol closure review approved and the one clean-room Fable/xhigh review of exact `a0c2c4c` returned release verdict `READY` and `GATE: APPROVE`; no Fable re-review. R3c's initial `a5dfef8` and closure `646d61b` Sol reviews returned `REVISE`; `f15ae88` closes the latter review's unresolved hard-bound and PGID-reuse findings. Exact-head full/release/policy gates are green; re-review is pending. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner and R3b pinned lane merged; R3c owns provider-free floating resolution plus bound execution; then R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **IN PROGRESS** at code head `b3793e8`. R3b attempts 1 and 2 remain non-promotable failure evidence. R3b exact `87c8f4e` Sol closure review approved and the one clean-room Fable/xhigh review of exact `a0c2c4c` returned release verdict `READY` and `GATE: APPROVE`; no Fable re-review. R3c's initial `a5dfef8`, closure `646d61b`, and exact-`5facc9c` Sol reviews returned `REVISE`; `b3793e8` closes in code the last review's complete-selected-tree and transitive-archive-identity findings. Exact-head full/release/policy gates are green; fresh correctness re-review is pending. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner and R3b pinned lane merged; R3c owns provider-free floating resolution plus bound execution; then R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -604,15 +612,19 @@ Next action:
   in-flight resource, definitive-failure/cancellation, descendant-cleanup, inventory-security,
   production-manifest baseline, catalog-projection, aggregate-comparison, and cursor defects. `d86e418`
   adds the catalog-only pre-fix-red regression. Closure review of exact `646d61b` fixed eight inherited
-  items but returned `REVISE` on transient aggregate resource overshoot and process-group reuse. Current code
-  head `f15ae88` moves exact integrity-bound tree materialization behind bridge-owned hard aggregate
-  reservation, avoids retained per-directory descriptors, and retains a trusted process-group leader until
-  cleanup; focused resolution tests pass **47 / 0** and the exact-head host suite passes
-  **2,151 / 0 / 12 ignored** across **70** executables. Format/diff, all-target check, warnings-denied
+  items but returned `REVISE` on transient aggregate resource overshoot and process-group reuse. `f15ae88`
+  moved exact integrity-bound tree materialization behind a bridge-owned hard reservation, avoided retained
+  per-directory descriptors, and retained a trusted process-group leader until cleanup. Sol/xhigh review of
+  exact `5facc9c` fixed inherited findings 1 and 3-10, left finding 2 partial because package reservation was
+  still sequential, found ordinary transitive archive identity unbound, reported no `SMELL`, and returned
+  `GATE: REVISE`. Current code head `b3793e8` preflights all selected archives, reserves the whole tree once
+  before any package-entry write, and binds archive name/version to the lock entry. The two pre-fix
+  regressions failed **47 / 2**; focused resolution tests now pass **50 / 0** and the exact-head host suite
+  passes **2,154 / 0 / 12 ignored** across **70** executables. Format/diff, all-target check, warnings-denied
   all-feature Clippy, locked release, hygiene **37/7**, both manifests, protected inputs, and dependency
-  policy are green; re-review remains. Explicitly authorized provider-free host diagnostics resolved current
-  Codex and Claude package
-  trees and produced green generated-config doctors, but the retained bundles predate `f15ae88` and are
+  policy are green; fresh correctness re-review remains. Explicitly authorized provider-free host
+  diagnostics resolved current Codex and Claude package trees and produced green generated-config doctors,
+  but the retained bundles predate both `f15ae88` and `b3793e8` and are
   diagnostic rather than exact-current compatibility evidence. Linux/Rust 1.94 remains green only on
   historical implementation head `57e63a0`; no local image remains and no pull was authorized. No provider
   turn, model discovery, image resolution/build, compatibility aggregate, operator rebuild, or operator swap

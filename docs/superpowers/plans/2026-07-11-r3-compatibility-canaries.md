@@ -543,8 +543,8 @@ updates `docs/compatibility.md` and the changelog when release-relevant.
 - **Branch:** `agent/reliability-r3c-floating-lane`
 - **State:** **IN PROGRESS** from clean base
   `504c1e434fd5845bc6745e0b0a0aae95427afbdd`
-- **Current code head:** `f15ae88eae4e8ec3d0e8ed5d45c1b8a101f9dcc8`; deterministic full-branch
-  gates are green and exact-head re-review remains pending.
+- **Current code head:** `b3793e834056d8c9d58a1cae815e463aa124d72b`; deterministic full-branch
+  gates are green and fresh exact-head correctness re-review remains pending.
 - **Design evidence:** one bridge-mediated clean-room Sol/xhigh read-only design pass inspected exact
   `504c1e43`. It ran no provider turn, package resolution, container action, build, test, or nested agent.
   The design turn is architecture evidence, not compatibility evidence.
@@ -919,17 +919,30 @@ reaped the group leader before later `kill(-PGID)`, so the numeric group could b
 `f15ae88eae4e8ec3d0e8ed5d45c1b8a101f9dcc8` removes npm tree-write authority, verifies and unpacks exact
 integrity-bound archives under bridge-owned pre-reserved hard aggregate limits, reopens descriptor-relative
 ancestors instead of retaining unbounded directory descriptors, and keeps a trusted live process-group
-leader until group termination and reap are complete.
+leader until group termination and reap are complete. The next Sol/xhigh review inspected exact
+`5facc9c7d8438afdec3ad2bb92358154e0a743dd`, adjudicated inherited findings 1 and 3-10 **FIXED**, but left
+finding 2 **PARTIAL** because production still reserved and wrote each package before preflighting the next.
+It found one new `WRONG`: an integrity-matching ordinary transitive archive could omit `package.json` or
+claim another name/version because the lock entry's archive identity was discarded. It reported no
+`SMELL` and returned `GATE: REVISE`. Exact `b3793e834056d8c9d58a1cae815e463aa124d72b` downloads, verifies,
+and preflights every selected archive; accumulates and commits one complete selected-tree reservation before
+the first package-entry write; then reopens, materializes, and removes one archive at a time. Each archive
+must contain a bounded `package.json` whose name/version equals the lock entry, including an explicit npm
+alias name when the install path differs from the archive identity.
 
-Latest focused resolution gates are **47 / 0**. The exact `646d61b` pre-hardening host workspace passed
+With the two closure regressions applied to the pre-fix code, the focused gate failed **47 / 2**: the first
+package had already published `node_modules` when the later package exceeded the complete-tree limit, and a
+wrong-identity archive was accepted. A separate removed-reservation mutation failed its focused hard-bound
+test **0 / 1** because the over-limit materialization returned `Ok`; restoration passed **1 / 0**. Latest
+focused resolution gates are **50 / 0**. The exact `646d61b` pre-hardening host workspace passed
 **2,141 / 0 / 12 ignored** across **70** test/doc-test executables, with compatibility unit **54 / 0**,
 compatibility CLI **20 / 0**, and ACP same-session catalog, smoke catalog, and additive fallback controls
 **1 / 0** each. Its format/diff, workspace all-target check, warnings-denied all-target/all-feature Clippy,
 locked release, hygiene **37/7**, pinned manifest, four-case recipe, protected-input identity, and dependency
-policy gates were green. Exact-`f15ae88` host gates pass **2,151 / 0 / 12 ignored** across **70** test and
+policy gates were green. Exact-`b3793e8` host gates pass **2,154 / 0 / 12 ignored** across **70** test and
 doc-test executables. Format/diff, workspace all-target check, warnings-denied all-target/all-feature Clippy,
 locked release, hygiene **37/7**, pinned manifest **9 cases**, floating recipe **4 cases**, protected-input
-identity, and dependency policy are green. Final review remains pending.
+identity, and dependency policy are green. Fresh exact-head correctness re-review remains pending.
 Prior removed-check mutations produce these exact reds: unauthorized CONNECT admission wedged the negative
 proxy test until bounded termination; a per-proxy counter left shared budget **5** instead of **2**; removing
 RLIMIT plus the watcher returned late `PackageTreeDrift` instead of immediate `NpmDownloadBudgetExceeded`;
@@ -940,20 +953,21 @@ positive control; an unrelated pinned hash returned `Ok`; aggregate cancellation
 instead of only the latter. Each green test retains its exact-bound, valid-definitive, direct-child,
 same-content, malformed-binding, identical-catalog, or unchanged-aggregate control as applicable.
 
-New deterministic controls cover aggregate entry/byte limits one below and at the exact edge before any
-`node_modules` publication; exact-edge and one-byte-over streaming downloads; bad integrity; archive
-deadline, hardlink, special-file, duplicate, and escaping-link rejection; npm alias versus ordinary semver;
-host-plus-Linux package selection; owner normalization below Darwin `/private/tmp`; more sibling directories
-than the macOS soft descriptor ceiling; package-bin mode/path normalization without `.bin`; and retention of
-the process-group anchor through final cleanup. The process-group regression failed against the pre-fix
-leader-reap ordering and passes at `f15ae88`.
+New deterministic controls cover single- and multi-package aggregate entry/byte limits one below and at the
+exact edge before any `node_modules` publication; exact-edge and one-byte-over streaming downloads; bad
+integrity; archive deadline, hardlink, special-file, duplicate, and escaping-link rejection; missing,
+mismatched, exact, and explicit-alias archive identities; npm alias versus ordinary semver; host-plus-Linux
+package selection; owner normalization below Darwin `/private/tmp`; more sibling directories than the macOS
+soft descriptor ceiling; package-bin mode/path normalization without `.bin`; and retention of the
+process-group anchor through final cleanup. The process-group regression failed against the pre-fix
+leader-reap ordering and passes at `f15ae88`; the complete-tree and identity regressions pass at `b3793e8`.
 
 The earlier `57e63a0` Linux/Rust 1.94.0 run passes complete `a2a-bridge` package **508 / 0 / 11 ignored**
 across **16** groups, including binary **434 / 0**, compatibility CLI **21 / 0**, smoke CLI **15 / 0**, plus
-ACP catalog **1 / 0**. It is historical evidence, not an exact-`f15ae88` rerun: cleanup removed the local
+ACP catalog **1 / 0**. It is historical evidence, not an exact-`b3793e8` rerun: cleanup removed the local
 Rust image, Docker has no equivalent cached image, and no new image pull was authorized. The current
-provider-unexercised release candidate is 24,679,168 bytes at SHA-256
-`206aaa28893a985ac22f679bf513dc0a8f9f1c5d55d21c71f77afde22b65c9f2`; the recipe SHA-256 is
+provider-unexercised release candidate is 24,690,400 bytes at SHA-256
+`2a156b9f0f2e5814408a8e674cb237d0b3a3e4c38f4b7f562792b454404328e6`; the recipe SHA-256 is
 `11d8f50de5515b2f6703741c9a00980e1dc96f766e6370677fd654a0968f0160`. The pinned manifest/baseline,
 production configs, Containerfiles, compatibility matrix, support matrix, and changelog remain byte-identical
 to `504c1e43`; `f15ae88` deliberately changes the bridge crate dependencies and workspace lock for its
@@ -983,9 +997,9 @@ Darwin ownership, descriptor retention, published bin-mode, and safe-leading-`./
 deterministic tests now cover; those failed bundles were removed after their evidence was folded.
 
 Those diagnostics started no adapter/provider session, called no `models`, built or inspected no image,
-produced no aggregate, and spent no provider turn. The two retained successful bundles predate the final
-archive-plan aggregate reservation in `f15ae88`, so they are diagnostic evidence rather than exact-current
-compatibility or promotion evidence.
+produced no aggregate, and spent no provider turn. The two retained successful bundles predate both
+`f15ae88` and the complete-selected-tree reservation in `b3793e8`, so they are diagnostic evidence rather
+than exact-current compatibility or promotion evidence.
 
 After deterministic gates and reviews:
 
@@ -1007,15 +1021,15 @@ scheduler deadlines, termination escalation, quarantine, and concurrency remain 
 pins/baselines, support wording, release integration, and rollback exercises remain R4.
 
 **Restart point:** continue from the current tip of `agent/reliability-r3c-floating-lane`;
-`f15ae88eae4e8ec3d0e8ed5d45c1b8a101f9dcc8` is the current code head. Focused resolution tests are green;
-full host, release, hygiene, manifest/recipe, protected-input, and dependency-policy gates are green;
-exact-head review remains. Linux/Rust 1.94 is green only on historical `57e63a0` until an image pull is
-separately authorized. Run a fresh Sol/xhigh closure review that first adjudicates all inherited findings from
-the `a5dfef8` and `646d61b` reviews; fold and reverify every unresolved `WRONG`, and only after correctness is
-green run the release/compatibility lens. Keep the pinned manifest/baseline and every protected production/
-support input unchanged. Do not run an exact-current compatibility resolution, bridge runtime/container,
-model discovery, provider turn beyond the two authorized reviews, operator rebuild, or operator swap without
-the separate authorizations described under live gates.
+`b3793e834056d8c9d58a1cae815e463aa124d72b` is the current code head. Focused resolution tests pass
+**50 / 0**; full host, release, hygiene, manifest/recipe, protected-input, and dependency-policy gates are
+green; fresh exact-head correctness review remains. Linux/Rust 1.94 is green only on historical `57e63a0`
+until an image pull is separately authorized. Run a fresh Sol/xhigh closure review that first adjudicates all
+inherited findings from the `a5dfef8`, `646d61b`, and `5facc9c` reviews; fold and reverify every unresolved
+`WRONG`, and only after correctness is green run the release/compatibility lens. Keep the pinned manifest/
+baseline and every protected production/support input unchanged. Do not run an exact-current compatibility
+resolution, bridge runtime/container, model discovery, any provider turn outside the authorized review
+sequence, operator rebuild, or operator swap without the separate authorizations described under live gates.
 
 ## R3d — scheduling and evidence retention
 
