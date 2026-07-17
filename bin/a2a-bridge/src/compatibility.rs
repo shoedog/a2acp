@@ -101,6 +101,17 @@ enum EvidencePath {
     BridgeWorkflow,
 }
 
+impl EvidencePath {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::DirectCli => "direct_cli",
+            Self::DirectAcp => "direct_acp",
+            Self::BridgeSmoke => "bridge_smoke",
+            Self::BridgeWorkflow => "bridge_workflow",
+        }
+    }
+}
+
 impl ExecutionMode {
     fn wire(self) -> &'static str {
         match self {
@@ -145,6 +156,15 @@ enum ProbeType {
     Representative,
 }
 
+impl ProbeType {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Representative => "representative",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum EvidenceStatus {
@@ -152,6 +172,17 @@ enum EvidenceStatus {
     Fail,
     Unknown,
     Stale,
+}
+
+impl EvidenceStatus {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Unknown => "UNKNOWN",
+            Self::Stale => "STALE",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -981,6 +1012,10 @@ fn parse_manifest_text(raw: &str) -> Result<CompatibilityManifest, BoxError> {
         .map_err(|error| format!("compatibility manifest: invalid TOML: {error}"))?;
     validate_manifest(&manifest)?;
     Ok(manifest)
+}
+
+pub(super) fn validate_manifest_text(raw: &str) -> Result<(), BoxError> {
+    parse_manifest_text(raw).map(|_| ())
 }
 
 fn load_recipes_with_pinned_manifest(
@@ -2076,7 +2111,7 @@ fn stage_candidate(
     })
 }
 
-fn repository_root(path: &Path) -> Option<PathBuf> {
+pub(super) fn repository_root(path: &Path) -> Option<PathBuf> {
     let start = if path.is_dir() { path } else { path.parent()? };
     start
         .ancestors()
@@ -3472,8 +3507,148 @@ async fn run_command(args: RunArgs) -> Result<(), BoxError> {
     }
 }
 
-fn resolve_command(args: ResolveArgs) -> Result<(), BoxError> {
-    let (recipes, _pinned) = load_recipes_with_pinned_manifest(&args.recipes)?;
+fn snapshot_resolution_executable(
+    path: &Path,
+    label: &str,
+) -> Result<
+    (
+        PathBuf,
+        compatibility_resolution::ExecutableIdentity,
+        compatibility_resolution::ProtectedFileInput,
+    ),
+    BoxError,
+> {
+    let snapshot = local_file::read_regular_file_bounded(path, label, MAX_EXECUTABLE_BYTES)?;
+    let byte_length = u64::try_from(snapshot.bytes.len())
+        .map_err(|_| format!("compatibility resolve: {label} length does not fit u64"))?;
+    if byte_length == 0 {
+        return Err(format!("compatibility resolve: {label} must not be empty").into());
+    }
+    let canonical_path = snapshot.canonical_path.clone();
+    let canonical_path_text = artifact_safe_path(label, &canonical_path)?;
+    let identity = compatibility_resolution::ExecutableIdentity {
+        canonical_path: canonical_path_text,
+        sha256: snapshot.sha256.clone(),
+        byte_length,
+    };
+    let protected = compatibility_resolution::ProtectedFileInput {
+        canonical_path: canonical_path.clone(),
+        sha256: snapshot.sha256,
+        max_bytes: MAX_EXECUTABLE_BYTES,
+    };
+    Ok((canonical_path, identity, protected))
+}
+
+fn find_resolution_executable(
+    command: &str,
+    label: &str,
+) -> Result<
+    (
+        PathBuf,
+        compatibility_resolution::ExecutableIdentity,
+        compatibility_resolution::ProtectedFileInput,
+    ),
+    BoxError,
+> {
+    let path = crate::doctor::resolved_executable_impl(command).ok_or_else(|| {
+        format!("compatibility resolve: required {label} {command:?} is not executable on PATH")
+    })?;
+    snapshot_resolution_executable(&path, label)
+}
+
+fn closed_resolution_path(paths: &[&Path]) -> Result<OsString, BoxError> {
+    let mut directories = BTreeSet::new();
+    for path in paths {
+        let parent = path
+            .parent()
+            .ok_or("compatibility resolve: resolved tool has no parent directory")?;
+        directories.insert(parent.to_path_buf());
+    }
+    for system in [PathBuf::from("/usr/bin"), PathBuf::from("/bin")] {
+        if system.is_dir() {
+            directories.insert(system);
+        }
+    }
+    std::env::join_paths(directories)
+        .map_err(|_| "compatibility resolve: cannot construct the closed resolver PATH".into())
+}
+
+fn protect_resolution_file(
+    path: &Path,
+    protected: &mut Vec<compatibility_resolution::ProtectedFileInput>,
+) -> Result<(), BoxError> {
+    let snapshot = local_file::read_regular_file_bounded(
+        path,
+        "compatibility protected repository input",
+        MAX_AGGREGATE_BYTES,
+    )?;
+    protected.push(compatibility_resolution::ProtectedFileInput {
+        canonical_path: snapshot.canonical_path,
+        sha256: snapshot.sha256,
+        max_bytes: MAX_AGGREGATE_BYTES,
+    });
+    Ok(())
+}
+
+fn protected_repository_inputs(
+    production_manifest: &Path,
+) -> Result<Vec<compatibility_resolution::ProtectedFileInput>, BoxError> {
+    let Some(root) = repository_root(production_manifest) else {
+        return Ok(Vec::new());
+    };
+    let mut protected = Vec::new();
+    for relative in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "compatibility/baselines/pinned.json",
+        "docs/compatibility.md",
+        "CHANGELOG.md",
+    ] {
+        let path = root.join(relative);
+        if path.is_file() {
+            protect_resolution_file(&path, &mut protected)?;
+        }
+    }
+    let configs_directory = root.join("compatibility/configs");
+    if configs_directory.is_dir() {
+        let mut configs = Vec::new();
+        for entry in std::fs::read_dir(&configs_directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(OsStr::to_str) == Some("toml") && path.is_file() {
+                configs.push(path);
+            }
+        }
+        configs.sort();
+        for path in configs {
+            protect_resolution_file(&path, &mut protected)?;
+        }
+    }
+    let container_directory = root.join("deploy/containers");
+    if container_directory.is_dir() {
+        let mut containerfiles = Vec::new();
+        for entry in std::fs::read_dir(&container_directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.ends_with(".Containerfile"))
+                && path.is_file()
+            {
+                containerfiles.push(path);
+            }
+        }
+        containerfiles.sort();
+        for path in containerfiles {
+            protect_resolution_file(&path, &mut protected)?;
+        }
+    }
+    Ok(protected)
+}
+
+async fn resolve_command(args: ResolveArgs) -> Result<(), BoxError> {
+    let (recipes, pinned) = load_recipes_with_pinned_manifest(&args.recipes)?;
     let available: BTreeSet<_> = recipes
         .recipes
         .cases
@@ -3491,19 +3666,156 @@ fn resolve_command(args: ResolveArgs) -> Result<(), BoxError> {
     if args.all && available.is_empty() {
         return Err("compatibility resolve: explicit selection resolved to zero cases".into());
     }
-    // Contract slice: prove the complete authority barrier and schemas before any writable executor
-    // exists. These values are parsed now so later effect code cannot widen the CLI unnoticed.
-    let _contract_binding = (
-        &args.environment_owner,
-        args.runtime,
-        &args.out,
-        &recipes.canonical_path_text,
-        &recipes.sha256,
-    );
-    Err(
-        "compatibility resolve: materialization is not implemented in the R3c contract slice"
-            .into(),
-    )
+    let requested: BTreeSet<_> = args.cases.iter().map(String::as_str).collect();
+    let selected_recipes: Vec<_> = recipes
+        .recipes
+        .cases
+        .iter()
+        .filter(|case| args.all || requested.contains(case.id.as_str()))
+        .cloned()
+        .collect();
+    if selected_recipes.is_empty() {
+        return Err("compatibility resolve: explicit selection resolved to zero cases".into());
+    }
+
+    let mut case_inputs = Vec::with_capacity(selected_recipes.len());
+    for recipe in selected_recipes {
+        let baseline = pinned
+            .manifest
+            .cases
+            .iter()
+            .find(|case| case.id == recipe.baseline_case)
+            .expect("recipe/pinned validation checked every baseline mapping");
+        if baseline.environment_owner != args.environment_owner {
+            return Err(format!(
+                "compatibility resolve: baseline {:?} environment owner mismatch",
+                baseline.id
+            )
+            .into());
+        }
+        if baseline.os != std::env::consts::OS || baseline.architecture != std::env::consts::ARCH {
+            return Err(format!(
+                "compatibility resolve: baseline {:?} platform does not match this resolver host",
+                baseline.id
+            )
+            .into());
+        }
+        let pins = baseline
+            .pins
+            .as_ref()
+            .expect("pinned manifest validation requires baseline pins");
+        let config_path = resolve_case_path(&pinned.canonical_path, &baseline.config);
+        let config = local_file::read_regular_file_bounded(
+            &config_path,
+            "compatibility resolution baseline config",
+            MAX_MANIFEST_BYTES,
+        )?;
+        if config.sha256 != pins.config_sha256 {
+            return Err(format!(
+                "compatibility resolve: baseline {:?} config pin mismatch",
+                baseline.id
+            )
+            .into());
+        }
+        case_inputs.push(compatibility_resolution::ResolutionCaseInput {
+            recipe,
+            evidence_path: baseline.evidence_path.wire().into(),
+            execution_mode: baseline.execution_mode.wire().into(),
+            os: baseline.os.clone(),
+            architecture: baseline.architecture.clone(),
+            environment_owner: baseline.environment_owner.clone(),
+            agent: baseline.agent.clone(),
+            model: baseline.model.clone(),
+            effort: baseline.effort.clone(),
+            mode: baseline.mode.clone(),
+            session_cwd: baseline.session_cwd.clone(),
+            auth_path: baseline.auth_path.wire().into(),
+            credential_env: baseline.credential_env.clone(),
+            required_env: baseline
+                .required_env
+                .iter()
+                .map(
+                    |required| compatibility_resolution::ResolutionRequiredEnvironmentInput {
+                        name: required.name.clone(),
+                        one_of: required.one_of.clone(),
+                    },
+                )
+                .collect(),
+            probe: baseline.probe.wire().into(),
+            billable: baseline.billable,
+            timeout_secs: baseline.timeout_secs,
+            max_tokens: baseline.max_tokens,
+            max_cost_usd: baseline.max_cost_usd,
+            retry_cap: baseline.retry_cap,
+            expected_status: baseline.expected_status.wire().into(),
+            artifact: compatibility_resolution::ResolutionArtifactInput {
+                retention_days: baseline.artifact.retention_days,
+            },
+            baseline_config: compatibility_resolution::BaselineConfigInput {
+                canonical_path: config.canonical_path,
+                sha256: config.sha256,
+                bytes: config.bytes,
+            },
+            component_pins: pins.components.clone(),
+        });
+    }
+
+    let current_executable = std::env::current_exe().map_err(|error| {
+        format!("compatibility resolve: cannot locate candidate binary: {error}")
+    })?;
+    let (_, candidate, _) =
+        snapshot_resolution_executable(&current_executable, "compatibility candidate binary")?;
+    let (runtime_path, runtime_executable, _) =
+        find_resolution_executable(args.runtime.wire(), "container runtime")?;
+    let (npm_path, _, npm_protected) = find_resolution_executable("npm", "npm executable")?;
+    let (node_path, _, node_protected) = find_resolution_executable("node", "node executable")?;
+    let (base_resolver_executable, base_resolver_protected) = match args.runtime {
+        RuntimeKind::Docker => (runtime_path.clone(), None),
+        RuntimeKind::Podman => {
+            let (path, _, protected) =
+                find_resolution_executable("skopeo", "raw registry manifest resolver")?;
+            (path, Some(protected))
+        }
+    };
+    let safe_path = closed_resolution_path(&[
+        &runtime_path,
+        &base_resolver_executable,
+        &npm_path,
+        &node_path,
+    ])?;
+    let mut protected = protected_repository_inputs(&pinned.canonical_path)?;
+    protected.push(npm_protected);
+    protected.push(node_protected);
+    if let Some(base_resolver_protected) = base_resolver_protected {
+        protected.push(base_resolver_protected);
+    }
+    let request = compatibility_resolution::ProviderFreeResolutionRequest {
+        output: args.out,
+        recipes,
+        production_manifest: compatibility_resolution::VersionedArtifactIdentity {
+            schema_version: 1,
+            canonical_path: pinned.canonical_path_text,
+            sha256: pinned.sha256,
+        },
+        candidate,
+        environment_owner: args.environment_owner,
+        os: std::env::consts::OS.into(),
+        architecture: std::env::consts::ARCH.into(),
+        runtime: args.runtime,
+        runtime_executable,
+        base_resolver_executable,
+        npm_executable: npm_path,
+        safe_path,
+        budget: compatibility_resolution::ResolutionBudgetInput {
+            timeout_secs: pinned.manifest.budget.timeout_secs,
+            max_tokens: pinned.manifest.budget.max_tokens,
+            max_cost_usd: pinned.manifest.budget.max_cost_usd,
+        },
+        cases: case_inputs,
+        protected_inputs: protected,
+    };
+    compatibility_resolution::resolve_provider_free(request).await?;
+    Ok(())
 }
 
 fn compare_command(args: CompareArgs) -> Result<(), BoxError> {
@@ -3570,7 +3882,7 @@ pub(crate) async fn compatibility_cmd(args: &[String]) -> Result<(), BoxError> {
             }
             Ok(())
         }
-        "resolve" => resolve_command(parse_resolve_args(&args[1..])?),
+        "resolve" => resolve_command(parse_resolve_args(&args[1..])?).await,
         "run" => run_command(parse_run_args(&args[1..])?).await,
         "compare" => compare_command(parse_compare_args(&args[1..])?),
         other => Err(format!(

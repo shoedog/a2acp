@@ -119,9 +119,29 @@ fn write_pinned_manifest(dir: &Path, config_sha256: &str) -> PathBuf {
 }
 
 fn write_recipes(dir: &Path) -> PathBuf {
+    let compatibility = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compatibility");
+    let manifest = fs::read_to_string(compatibility.join("manifest.toml"))
+        .unwrap()
+        .replacen(
+            "os = \"macos\"",
+            &format!("os = {:?}", std::env::consts::OS),
+            1,
+        )
+        .replacen(
+            "architecture = \"aarch64\"",
+            &format!("architecture = {:?}", std::env::consts::ARCH),
+            1,
+        )
+        .replacen(
+            "environment_owner = \"wesley-macbook\"",
+            "environment_owner = \"fixture-owner\"",
+            1,
+        );
+    fs::write(dir.join("manifest.toml"), manifest).unwrap();
+    fs::create_dir(dir.join("configs")).unwrap();
     fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compatibility/manifest.toml"),
-        dir.join("manifest.toml"),
+        compatibility.join("configs/codex-host.toml"),
+        dir.join("configs/codex-host.toml"),
     )
     .unwrap();
     let recipes = dir.join("floating-current.toml");
@@ -301,6 +321,7 @@ fn resolve_acknowledgement_wins_before_recipe_or_output_access() {
     let out = dir.path().join("bundle");
 
     let output = compatibility_command()
+        .env("PATH", "")
         .arg("resolve")
         .arg("--recipes")
         .arg(&missing)
@@ -353,12 +374,13 @@ fn resolved_run_billing_acknowledgement_wins_before_resolution_or_output_access(
 }
 
 #[test]
-fn acknowledged_resolve_validates_contract_but_has_no_effect_executor_yet() {
+fn acknowledged_resolve_rejects_owner_mismatch_before_tool_or_output_effects() {
     let dir = tempfile::tempdir().unwrap();
     let recipes = write_recipes(dir.path());
     let out = dir.path().join("bundle");
 
     let output = compatibility_command()
+        .env("PATH", "")
         .arg("resolve")
         .arg("--recipes")
         .arg(&recipes)
@@ -376,9 +398,43 @@ fn acknowledged_resolve_validates_contract_but_has_no_effect_executor_yet() {
 
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("contract slice"),
+        String::from_utf8_lossy(&output.stderr).contains("environment owner mismatch"),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!out.exists());
+}
+
+#[test]
+fn acknowledged_resolve_rejects_missing_runtime_before_output_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let recipes = write_recipes(dir.path());
+    let out = dir.path().join("bundle");
+
+    let output = compatibility_command()
+        .env("PATH", "")
+        .arg("resolve")
+        .arg("--recipes")
+        .arg(&recipes)
+        .arg("--case")
+        .arg("codex-host-floating-current")
+        .arg("--environment-owner")
+        .arg("fixture-owner")
+        .arg("--runtime")
+        .arg("docker")
+        .arg("--acknowledge-resolution-effects")
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("required container runtime")
+            && stderr.contains("docker")
+            && stderr.contains("is not executable on PATH"),
+        "stderr: {stderr}"
     );
     assert!(!out.exists());
 }

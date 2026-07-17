@@ -148,6 +148,35 @@ pub struct InstalledPackage {
     bin_warning: Option<String>,
 }
 
+impl InstalledPackage {
+    /// Resolve the adapter executable only through this package's bounded `bin` metadata. This is
+    /// shared with R3c disposable-tree resolution so it never guesses a `.bin` shim path.
+    pub(crate) fn sole_owned_executable(&self) -> Result<PathBuf, String> {
+        if let Some(warning) = &self.bin_warning {
+            return Err(format!(
+                "adapter executable ownership unavailable: {warning}"
+            ));
+        }
+        let [target] = self.bin_targets.as_slice() else {
+            return Err("adapter package must expose exactly one bounded bin target".into());
+        };
+        let package_root = std::fs::canonicalize(&self.package_root)
+            .map_err(|_| "adapter package root is unavailable".to_string())?;
+        let executable = std::fs::canonicalize(self.package_root.join(target))
+            .map_err(|_| "adapter package bin target is unavailable".to_string())?;
+        if !executable.starts_with(&package_root) || !is_executable_file(&executable) {
+            return Err(
+                "adapter package bin target escapes its package or is not executable".into(),
+            );
+        }
+        Ok(executable)
+    }
+
+    pub(crate) fn bundled_cli_version(&self) -> Option<&str> {
+        self.bundled_cli_version.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledAgentCli {
     pub name: String,
@@ -287,7 +316,7 @@ fn is_executable_file(p: &Path) -> bool {
     p.is_file()
 }
 
-fn resolved_executable_impl(cmd: &str) -> Option<PathBuf> {
+pub(crate) fn resolved_executable_impl(cmd: &str) -> Option<PathBuf> {
     if cmd.is_empty() {
         return None;
     }
@@ -441,7 +470,7 @@ fn package_bin_targets(value: &serde_json::Value) -> (Vec<PathBuf>, Option<Strin
     (targets, None)
 }
 
-fn read_installed_package(manifest_path: &Path) -> Result<InstalledPackage, String> {
+pub(crate) fn read_installed_package(manifest_path: &Path) -> Result<InstalledPackage, String> {
     let bytes = bounded_regular_file(manifest_path)?;
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("malformed package.json: {e}"))?;
@@ -527,7 +556,7 @@ fn node_package_path(base: &Path, package_name: &str) -> PathBuf {
         .join("package.json")
 }
 
-fn resolve_installed_dependency(
+pub(crate) fn resolve_installed_dependency(
     adapter: &InstalledPackage,
     expected_name: &str,
 ) -> Result<InstalledPackage, String> {
@@ -4541,6 +4570,57 @@ mod tests {
             denied_error.contains("metadata unreadable"),
             "{denied_error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_package_helper_resolves_only_one_owned_executable_from_bin_metadata() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("adapter");
+        std::fs::create_dir_all(package.join("dist")).unwrap();
+        let executable = package.join("dist/index.js");
+        std::fs::write(&executable, "#!/usr/bin/env node\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let manifest = package.join("package.json");
+        std::fs::write(
+            &manifest,
+            r#"{"name":"@agentclientprotocol/codex-acp","version":"1.2.3","bin":{"codex-acp":"dist/index.js"}}"#,
+        )
+        .unwrap();
+        let installed = read_installed_package(&manifest).unwrap();
+        assert_eq!(
+            installed.sole_owned_executable().unwrap(),
+            std::fs::canonicalize(&executable).unwrap()
+        );
+
+        std::fs::write(
+            &manifest,
+            r#"{"name":"@agentclientprotocol/codex-acp","version":"1.2.3","bin":{"one":"dist/index.js","two":"dist/index.js"}}"#,
+        )
+        .unwrap();
+        assert!(read_installed_package(&manifest)
+            .unwrap()
+            .sole_owned_executable()
+            .unwrap_err()
+            .contains("exactly one"));
+
+        let outside = temp.path().join("outside");
+        std::fs::write(&outside, "#!/usr/bin/env node\n").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let escape = package.join("dist/escape");
+        symlink(&outside, &escape).unwrap();
+        std::fs::write(
+            &manifest,
+            r#"{"name":"@agentclientprotocol/codex-acp","version":"1.2.3","bin":{"codex-acp":"dist/escape"}}"#,
+        )
+        .unwrap();
+        assert!(read_installed_package(&manifest)
+            .unwrap()
+            .sole_owned_executable()
+            .unwrap_err()
+            .contains("escapes"));
     }
 
     #[cfg(unix)]

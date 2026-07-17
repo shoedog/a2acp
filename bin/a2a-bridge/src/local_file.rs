@@ -487,6 +487,16 @@ impl PinnedDirectory {
         self.acp_session_cwd.clone()
     }
 
+    pub(crate) fn canonical_path(&self) -> PathBuf {
+        PathBuf::from(self.canonical_cwd.as_str())
+    }
+
+    pub(crate) fn sync(&self) -> Result<(), BoxError> {
+        self.file
+            .sync_all()
+            .map_err(|error| format!("pinned directory: cannot sync: {error}").into())
+    }
+
     pub(crate) fn retain_descriptor_after_exec(&self) -> bool {
         self.retain_descriptor_after_exec
     }
