@@ -778,7 +778,7 @@ owner/platform/prerequisites, and aggregate time/token/cost headroom. Never re-r
 
 Aggregate schema additions are optional/backward-compatible:
 
-- a resolution binding with resolution id plus artifact/recipe hashes;
+- a resolution binding with resolution id plus artifact, recipe, and production-manifest hashes;
 - per-floating-case `baseline_case_id` and `candidate_outcome`;
 - a summary count of `candidate_pass`, `candidate_fail`, and `candidate_unknown`.
 
@@ -947,8 +947,9 @@ operator-reviewed cleanup proves no running container uses them. Automated reten
 scheduler deadlines, termination escalation, quarantine, and concurrency remain R3d. Promotion, production
 pins/baselines, support wording, release integration, and rollback exercises remain R4.
 
-**Restart point:** continue from `57e63a0` on `agent/reliability-r3c-floating-lane`. The deterministic host
-and Linux closure inventory above is green. Run the fresh Sol/xhigh adversarial full-branch correctness
+**Restart point:** continue from the current tip of `agent/reliability-r3c-floating-lane`; `57e63a0` is the
+historical implementation head under the recorded deterministic gate, not the branch tip. The deterministic
+host and Linux closure inventory above is green. Run the fresh Sol/xhigh adversarial full-branch correctness
 review, fold and reverify every `WRONG`, and only after that review is green run the release/compatibility
 lens. Keep the pinned manifest/baseline and every protected production/support input unchanged. Do not run a
 real compatibility resolution, bridge runtime/container, model discovery, provider turn beyond the two

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::{compatibility, local_file, BoxError};
 
@@ -40,6 +40,9 @@ const MAX_FILES: u64 = 500_000;
 const MAX_RETENTION_DAYS: u16 = 90;
 const NODE_READER_BASE: &str = "docker.io/library/node:24-slim";
 const NPM_REGISTRY: &str = "https://registry.npmjs.org/";
+const NPM_REGISTRY_AUTHORITY: &str = "registry.npmjs.org:443";
+const MAX_PROXY_HEADER_BYTES: usize = 16 * 1024;
+const MAX_NPM_PROXY_CONNECTIONS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -1649,7 +1652,7 @@ enum ResolutionCommandKind {
     InspectImage,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct ResolutionCommandSpec {
     family: ResolutionCommandFamily,
     kind: ResolutionCommandKind,
@@ -1659,6 +1662,8 @@ struct ResolutionCommandSpec {
     env: BTreeMap<OsString, OsString>,
     timeout: Duration,
     max_output_bytes: usize,
+    npm_limits: Option<ResolutionLimits>,
+    npm_download_remaining: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl ResolutionCommandSpec {
@@ -1679,6 +1684,9 @@ impl ResolutionCommandSpec {
             (ResolutionCommandFamily::Npm, CommandFailure::OutputUnreadable) => {
                 ResolutionFailureCode::NpmOutputUnreadable
             }
+            (ResolutionCommandFamily::Npm, CommandFailure::ResourceLimit) => {
+                ResolutionFailureCode::NpmDownloadBudgetExceeded
+            }
             (ResolutionCommandFamily::Runtime, CommandFailure::Spawn) => {
                 ResolutionFailureCode::RuntimeSpawnFailed
             }
@@ -1694,6 +1702,9 @@ impl ResolutionCommandSpec {
             (ResolutionCommandFamily::Runtime, CommandFailure::OutputUnreadable) => {
                 ResolutionFailureCode::RuntimeOutputUnreadable
             }
+            (ResolutionCommandFamily::Runtime, CommandFailure::ResourceLimit) => {
+                ResolutionFailureCode::RuntimeNonzero
+            }
         }
     }
 }
@@ -1705,6 +1716,7 @@ enum CommandFailure {
     Nonzero,
     OutputTooLarge,
     OutputUnreadable,
+    ResourceLimit,
 }
 
 #[async_trait]
@@ -1748,16 +1760,398 @@ async fn read_bounded_stdout(
     }
 }
 
+#[derive(Clone)]
+struct RegistryProxyConfig {
+    authority: String,
+    connect_address: String,
+}
+
+impl RegistryProxyConfig {
+    fn npmjs() -> Self {
+        Self {
+            authority: NPM_REGISTRY_AUTHORITY.into(),
+            connect_address: NPM_REGISTRY_AUTHORITY.into(),
+        }
+    }
+}
+
+fn valid_registry_connect_request(header: &[u8], authority: &str) -> bool {
+    let Ok(header) = std::str::from_utf8(header) else {
+        return false;
+    };
+    let mut lines = header.split("\r\n");
+    let Some(request) = lines.next() else {
+        return false;
+    };
+    let mut parts = request.split_ascii_whitespace();
+    if parts.next() != Some("CONNECT")
+        || !parts
+            .next()
+            .is_some_and(|value| value.eq_ignore_ascii_case(authority))
+        || !parts
+            .next()
+            .is_some_and(|value| matches!(value, "HTTP/1.0" | "HTTP/1.1"))
+        || parts.next().is_some()
+    {
+        return false;
+    }
+    !lines.any(|line| {
+        line.split_once(':').is_some_and(|(name, _)| {
+            matches!(
+                name.trim().to_ascii_lowercase().as_str(),
+                "authorization" | "proxy-authorization" | "cookie"
+            )
+        })
+    })
+}
+
+async fn read_proxy_header(stream: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut header = Vec::new();
+    let mut byte = [0_u8; 1];
+    while header.len() < MAX_PROXY_HEADER_BYTES {
+        if stream.read(&mut byte).await? == 0 {
+            break;
+        }
+        header.push(byte[0]);
+        if header.ends_with(b"\r\n\r\n") {
+            return Ok(header);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "invalid bounded proxy header",
+    ))
+}
+
+async fn copy_registry_response_bounded(
+    mut upstream: tokio::net::tcp::OwnedReadHalf,
+    mut client: tokio::net::tcp::OwnedWriteHalf,
+    remaining: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    budget_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering;
+
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let budget = budget_gate.lock().await;
+        let available = remaining.load(Ordering::Acquire);
+        if available == 0 {
+            drop(budget);
+            client.shutdown().await?;
+            return Ok(());
+        }
+        let reserved = available.min(buffer.len() as u64);
+        remaining.fetch_sub(reserved, Ordering::AcqRel);
+        drop(budget);
+        let read_limit = usize::try_from(reserved).unwrap();
+        let count = upstream.read(&mut buffer[..read_limit]).await?;
+        let unused = reserved.saturating_sub(count as u64);
+        if unused != 0 {
+            remaining.fetch_add(unused, Ordering::AcqRel);
+        }
+        if count == 0 {
+            client.shutdown().await?;
+            return Ok(());
+        }
+        client.write_all(&buffer[..count]).await?;
+    }
+}
+
+async fn serve_registry_tunnel(
+    mut client: tokio::net::TcpStream,
+    config: RegistryProxyConfig,
+    remaining: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    budget_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+) -> std::io::Result<()> {
+    let header = read_proxy_header(&mut client).await?;
+    if !valid_registry_connect_request(&header, &config.authority) {
+        client
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
+    let upstream = tokio::net::TcpStream::connect(&config.connect_address).await?;
+    client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await?;
+    let (client_read, client_write) = client.into_split();
+    let (upstream_read, mut upstream_write) = upstream.into_split();
+    let request = async move {
+        let mut client_read = client_read;
+        tokio::io::copy(&mut client_read, &mut upstream_write).await?;
+        upstream_write.shutdown().await
+    };
+    let response =
+        copy_registry_response_bounded(upstream_read, client_write, remaining, budget_gate);
+    let _ = tokio::try_join!(request, response)?;
+    Ok(())
+}
+
+struct RegistryProxyGuard {
+    address: std::net::SocketAddr,
+    remaining: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RegistryProxyGuard {
+    #[cfg(test)]
+    async fn start(max_bytes: u64, config: RegistryProxyConfig) -> std::io::Result<Self> {
+        Self::start_with_budget(
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(max_bytes)),
+            config,
+        )
+        .await
+    }
+
+    async fn start_with_budget(
+        remaining: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        config: RegistryProxyConfig,
+    ) -> std::io::Result<Self> {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let remaining_for_task = std::sync::Arc::clone(&remaining);
+        let task = tokio::spawn(async move {
+            let budget_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+            let connection_slots =
+                std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_NPM_PROXY_CONNECTIONS));
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((client, _)) = accepted else {
+                            break;
+                        };
+                        let Ok(slot) = std::sync::Arc::clone(&connection_slots).acquire_owned().await else {
+                            break;
+                        };
+                        let config = config.clone();
+                        let remaining = std::sync::Arc::clone(&remaining_for_task);
+                        let budget_gate = std::sync::Arc::clone(&budget_gate);
+                        connections.spawn(async move {
+                            let _slot = slot;
+                            serve_registry_tunnel(client, config, remaining, budget_gate).await
+                        });
+                    }
+                    Some(_) = connections.join_next(), if !connections.is_empty() => {}
+                }
+            }
+        });
+        Ok(Self {
+            address,
+            remaining,
+            task,
+        })
+    }
+
+    fn proxy_url(&self) -> OsString {
+        OsString::from(format!("http://{}", self.address))
+    }
+
+    fn limit_reached(&self) -> bool {
+        self.remaining.load(std::sync::atomic::Ordering::Acquire) == 0
+    }
+}
+
+impl Drop for RegistryProxyGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn npm_proxy_environment(proxy: &RegistryProxyGuard) -> BTreeMap<OsString, OsString> {
+    let proxy_url = proxy.proxy_url();
+    [
+        ("HTTP_PROXY", proxy_url.clone()),
+        ("HTTPS_PROXY", proxy_url.clone()),
+        ("ALL_PROXY", proxy_url.clone()),
+        ("http_proxy", proxy_url.clone()),
+        ("https_proxy", proxy_url.clone()),
+        ("all_proxy", proxy_url.clone()),
+        ("npm_config_proxy", proxy_url.clone()),
+        ("npm_config_https_proxy", proxy_url),
+        ("npm_config_maxsockets", OsString::from("1")),
+        ("GIT_CONFIG_COUNT", OsString::from("2")),
+        ("GIT_CONFIG_KEY_0", OsString::from("protocol.allow")),
+        ("GIT_CONFIG_VALUE_0", OsString::from("never")),
+        ("GIT_CONFIG_KEY_1", OsString::from("protocol.https.allow")),
+        ("GIT_CONFIG_VALUE_1", OsString::from("always")),
+    ]
+    .into_iter()
+    .map(|(key, value)| (OsString::from(key), value))
+    .collect()
+}
+
+fn directory_budget_exceeded(root: &Path, max_bytes: u64, max_files: u64) -> bool {
+    let mut pending = vec![root.to_path_buf()];
+    let mut bytes = 0_u64;
+    let mut files = 0_u64;
+    while let Some(directory) = pending.pop() {
+        let Ok(children) = fs::read_dir(directory) else {
+            return true;
+        };
+        for child in children {
+            let Ok(child) = child else {
+                return true;
+            };
+            files = files.saturating_add(1);
+            if files > max_files {
+                return true;
+            }
+            let Ok(metadata) = fs::symlink_metadata(child.path()) else {
+                // npm uses atomic temporary renames; a vanished entry is safe to re-evaluate on
+                // the next pass instead of turning that normal race into a false budget failure.
+                continue;
+            };
+            if metadata.is_dir() {
+                pending.push(child.path());
+            } else if metadata.is_file() {
+                bytes = bytes.saturating_add(metadata.len());
+                if bytes > max_bytes {
+                    return true;
+                }
+            } else if !metadata.file_type().is_symlink() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn npm_budget_failure(spec: &ResolutionCommandSpec) -> Option<ResolutionFailureCode> {
+    let limits = spec.npm_limits.as_ref()?;
+    if directory_budget_exceeded(
+        &spec.cwd.join("cache"),
+        limits.max_download_bytes,
+        limits.max_files,
+    ) {
+        return Some(ResolutionFailureCode::NpmDownloadBudgetExceeded);
+    }
+    if spec.kind == ResolutionCommandKind::NpmMaterialize
+        && directory_budget_exceeded(
+            &spec.cwd.join("tree"),
+            limits.max_unpacked_bytes,
+            limits.max_files,
+        )
+    {
+        return Some(ResolutionFailureCode::PackageTreeDrift);
+    }
+    None
+}
+
 #[cfg(unix)]
-async fn terminate_command_process_group(child: &mut tokio::process::Child, process_group: u32) {
-    if let Ok(process_group) = libc::pid_t::try_from(process_group) {
+fn status_hit_file_size_limit(status: &std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal() == Some(libc::SIGXFSZ)
+        || status.code() == Some(128_i32.saturating_add(libc::SIGXFSZ))
+}
+
+struct NpmBudgetWatchGuard {
+    task: tokio::task::JoinHandle<ResolutionFailureCode>,
+}
+
+impl NpmBudgetWatchGuard {
+    fn start(spec: ResolutionCommandSpec) -> Self {
+        let task = tokio::spawn(async move {
+            loop {
+                if let Some(failure) = npm_budget_failure(&spec) {
+                    return failure;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        Self { task }
+    }
+
+    async fn wait(&mut self) -> ResolutionFailureCode {
+        (&mut self.task)
+            .await
+            .unwrap_or(ResolutionFailureCode::NpmDownloadBudgetExceeded)
+    }
+}
+
+impl Drop for NpmBudgetWatchGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[cfg(unix)]
+fn set_child_file_size_limit(command: &mut std::process::Command, max_bytes: u64) {
+    use std::os::unix::process::CommandExt as _;
+
+    let requested = max_bytes as libc::rlim_t;
+    // SAFETY: the closure performs only async-signal-safe libc resource-limit calls in the child
+    // immediately before exec. It captures one already-converted integer.
+    unsafe {
+        command.pre_exec(move || {
+            let mut inherited = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            if libc::getrlimit(libc::RLIMIT_FSIZE, inherited.as_mut_ptr()) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let inherited = inherited.assume_init();
+            let limit = requested.min(inherited.rlim_max);
+            let value = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &value) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(unix)]
+struct CommandProcessGroupGuard {
+    process_group: Option<libc::pid_t>,
+}
+
+#[cfg(unix)]
+impl CommandProcessGroupGuard {
+    fn new(process_group: u32) -> Result<Self, ()> {
+        let process_group = libc::pid_t::try_from(process_group).map_err(|_| ())?;
+        if process_group <= 0 {
+            return Err(());
+        }
+        Ok(Self {
+            process_group: Some(process_group),
+        })
+    }
+
+    fn kill(&self) {
+        let Some(process_group) = self.process_group else {
+            return;
+        };
         // SAFETY: every real resolver command is placed in a fresh group whose id is its child pid.
         // Negating that positive pid targets only the resolver-owned group.
         unsafe {
             libc::kill(-process_group, libc::SIGKILL);
         }
     }
+
+    fn disarm(&mut self) {
+        self.process_group = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CommandProcessGroupGuard {
+    fn drop(&mut self) {
+        // Async cancellation drops this guard. Killing the resolver-owned group synchronously here
+        // prevents grandchildren from surviving while Child::kill_on_drop handles the direct child.
+        self.kill();
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_command_process_group(
+    child: &mut tokio::process::Child,
+    process_group: &mut CommandProcessGroupGuard,
+) {
+    process_group.kill();
     let _ = child.wait().await;
+    process_group.disarm();
 }
 
 async fn execute_bounded_command(
@@ -1771,23 +2165,52 @@ async fn execute_bounded_command(
     {
         use std::os::unix::process::CommandExt as _;
 
+        let registry_proxy = if spec.npm_limits.is_some() {
+            let remaining = spec
+                .npm_download_remaining
+                .as_ref()
+                .ok_or_else(|| spec.failure_code(CommandFailure::Spawn))?;
+            Some(
+                RegistryProxyGuard::start_with_budget(
+                    std::sync::Arc::clone(remaining),
+                    RegistryProxyConfig::npmjs(),
+                )
+                .await
+                .map_err(|_| spec.failure_code(CommandFailure::Spawn))?,
+            )
+        } else {
+            None
+        };
+        let mut environment = spec.env.clone();
+        if let Some(proxy) = &registry_proxy {
+            environment.extend(npm_proxy_environment(proxy));
+        }
         let mut command = tokio::process::Command::new(&spec.program);
         command
             .args(&spec.args)
             .current_dir(&spec.cwd)
             .env_clear()
-            .envs(spec.env.iter())
+            .envs(environment.iter())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
+        if let Some(limits) = &spec.npm_limits {
+            set_child_file_size_limit(command.as_std_mut(), limits.max_unpacked_bytes);
+        }
         command.as_std_mut().process_group(0);
+        let mut budget_watch = spec
+            .npm_limits
+            .as_ref()
+            .map(|_| NpmBudgetWatchGuard::start(spec.clone()));
         let mut child = command
             .spawn()
             .map_err(|_| spec.failure_code(CommandFailure::Spawn))?;
         let process_group = child
             .id()
             .ok_or_else(|| spec.failure_code(CommandFailure::Spawn))?;
+        let mut process_group = CommandProcessGroupGuard::new(process_group)
+            .map_err(|()| spec.failure_code(CommandFailure::Spawn))?;
         let stdout = child
             .stdout
             .take()
@@ -1799,6 +2222,7 @@ async fn execute_bounded_command(
             Read(Result<Vec<u8>, CommandFailure>),
             Wait(std::io::Result<std::process::ExitStatus>),
             Timeout,
+            Resource(ResolutionFailureCode),
         }
         let first = tokio::select! {
             read = &mut read_task => First::Read(
@@ -1806,41 +2230,80 @@ async fn execute_bounded_command(
             ),
             status = child.wait() => First::Wait(status),
             () = tokio::time::sleep_until(deadline) => First::Timeout,
+            failure = async {
+                match &mut budget_watch {
+                    Some(watch) => watch.wait().await,
+                    None => std::future::pending().await,
+                }
+            } => First::Resource(failure),
         };
 
         match first {
             First::Timeout => {
                 read_task.abort();
-                terminate_command_process_group(&mut child, process_group).await;
+                terminate_command_process_group(&mut child, &mut process_group).await;
                 Err(spec.failure_code(CommandFailure::Timeout))
             }
             First::Read(Err(failure)) => {
-                terminate_command_process_group(&mut child, process_group).await;
+                terminate_command_process_group(&mut child, &mut process_group).await;
                 Err(spec.failure_code(failure))
+            }
+            First::Resource(failure) => {
+                read_task.abort();
+                terminate_command_process_group(&mut child, &mut process_group).await;
+                Err(failure)
             }
             First::Read(Ok(output)) => {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                let status = match tokio::time::timeout(remaining, child.wait()).await {
-                    Ok(Ok(status)) => status,
-                    Ok(Err(_)) => {
-                        terminate_command_process_group(&mut child, process_group).await;
+                enum Completion {
+                    Status(std::io::Result<std::process::ExitStatus>),
+                    Timeout,
+                    Resource(ResolutionFailureCode),
+                }
+                let completion = tokio::select! {
+                    status = child.wait() => Completion::Status(status),
+                    () = tokio::time::sleep(remaining) => Completion::Timeout,
+                    failure = async {
+                        match &mut budget_watch {
+                            Some(watch) => watch.wait().await,
+                            None => std::future::pending().await,
+                        }
+                    } => Completion::Resource(failure),
+                };
+                let status = match completion {
+                    Completion::Status(Ok(status)) => status,
+                    Completion::Status(Err(_)) => {
+                        terminate_command_process_group(&mut child, &mut process_group).await;
                         return Err(spec.failure_code(CommandFailure::Nonzero));
                     }
-                    Err(_) => {
-                        terminate_command_process_group(&mut child, process_group).await;
+                    Completion::Timeout => {
+                        terminate_command_process_group(&mut child, &mut process_group).await;
                         return Err(spec.failure_code(CommandFailure::Timeout));
                     }
+                    Completion::Resource(failure) => {
+                        terminate_command_process_group(&mut child, &mut process_group).await;
+                        return Err(failure);
+                    }
                 };
-                terminate_command_process_group(&mut child, process_group).await;
+                terminate_command_process_group(&mut child, &mut process_group).await;
+                if let Some(failure) = npm_budget_failure(spec) {
+                    return Err(failure);
+                }
                 if status.success() {
                     Ok(output)
+                } else if status_hit_file_size_limit(&status)
+                    || registry_proxy
+                        .as_ref()
+                        .is_some_and(RegistryProxyGuard::limit_reached)
+                {
+                    Err(spec.failure_code(CommandFailure::ResourceLimit))
                 } else {
                     Err(spec.failure_code(CommandFailure::Nonzero))
                 }
             }
             First::Wait(Err(_)) => {
                 read_task.abort();
-                terminate_command_process_group(&mut child, process_group).await;
+                terminate_command_process_group(&mut child, &mut process_group).await;
                 Err(spec.failure_code(CommandFailure::Nonzero))
             }
             First::Wait(Ok(status)) => {
@@ -1848,22 +2311,31 @@ async fn execute_bounded_command(
                 let output = match tokio::time::timeout(remaining, &mut read_task).await {
                     Ok(Ok(Ok(output))) => output,
                     Ok(Ok(Err(failure))) => {
-                        terminate_command_process_group(&mut child, process_group).await;
+                        terminate_command_process_group(&mut child, &mut process_group).await;
                         return Err(spec.failure_code(failure));
                     }
                     Ok(Err(_)) => {
-                        terminate_command_process_group(&mut child, process_group).await;
+                        terminate_command_process_group(&mut child, &mut process_group).await;
                         return Err(spec.failure_code(CommandFailure::OutputUnreadable));
                     }
                     Err(_) => {
                         read_task.abort();
-                        terminate_command_process_group(&mut child, process_group).await;
+                        terminate_command_process_group(&mut child, &mut process_group).await;
                         return Err(spec.failure_code(CommandFailure::Timeout));
                     }
                 };
-                terminate_command_process_group(&mut child, process_group).await;
+                terminate_command_process_group(&mut child, &mut process_group).await;
+                if let Some(failure) = npm_budget_failure(spec) {
+                    return Err(failure);
+                }
                 if status.success() {
                     Ok(output)
+                } else if status_hit_file_size_limit(&status)
+                    || registry_proxy
+                        .as_ref()
+                        .is_some_and(RegistryProxyGuard::limit_reached)
+                {
+                    Err(spec.failure_code(CommandFailure::ResourceLimit))
                 } else {
                     Err(spec.failure_code(CommandFailure::Nonzero))
                 }
@@ -1895,6 +2367,8 @@ fn npm_command(
     safe_path: OsString,
     cwd: PathBuf,
     timeout: Duration,
+    limits: &ResolutionLimits,
+    download_remaining: std::sync::Arc<std::sync::atomic::AtomicU64>,
     materialize: bool,
 ) -> ResolutionCommandSpec {
     let (kind, verb) = if materialize {
@@ -1929,6 +2403,8 @@ fn npm_command(
         env,
         timeout,
         max_output_bytes: MAX_COMMAND_OUTPUT_BYTES,
+        npm_limits: Some(limits.clone()),
+        npm_download_remaining: Some(download_remaining),
     }
 }
 
@@ -2186,6 +2662,9 @@ struct InventoryEntry {
     path: String,
     kind: InventoryEntryKind,
     executable: bool,
+    mode: u32,
+    uid: u32,
+    gid: u32,
     byte_length: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     sha256: Option<String>,
@@ -2197,6 +2676,9 @@ struct InventoryEntry {
 #[serde(deny_unknown_fields)]
 struct PackageInventory {
     schema_version: u16,
+    root_mode: u32,
+    root_uid: u32,
+    root_gid: u32,
     entries: Vec<InventoryEntry>,
 }
 
@@ -2218,6 +2700,17 @@ fn executable_and_single_link(metadata: &fs::Metadata) -> Result<bool, String> {
     Ok(metadata.permissions().mode() & 0o111 != 0)
 }
 
+#[cfg(unix)]
+fn inventory_security(metadata: &fs::Metadata) -> (u32, u32, u32) {
+    use std::os::unix::fs::MetadataExt as _;
+    (metadata.mode() & 0o7777, metadata.uid(), metadata.gid())
+}
+
+#[cfg(not(unix))]
+fn inventory_security(_metadata: &fs::Metadata) -> (u32, u32, u32) {
+    (0, 0, 0)
+}
+
 #[cfg(not(unix))]
 fn executable_and_single_link(_metadata: &fs::Metadata) -> Result<bool, String> {
     Ok(false)
@@ -2226,9 +2719,12 @@ fn executable_and_single_link(_metadata: &fs::Metadata) -> Result<bool, String> 
 fn inspect_package_tree(root: &Path, limits: &ResolutionLimits) -> Result<InspectedTree, String> {
     let canonical_root =
         fs::canonicalize(root).map_err(|_| "package tree root is unavailable".to_string())?;
-    if !fs::metadata(&canonical_root).is_ok_and(|metadata| metadata.is_dir()) {
+    let root_metadata = fs::symlink_metadata(&canonical_root)
+        .map_err(|_| "package tree root is unavailable".to_string())?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
         return Err("package tree root must be a directory".into());
     }
+    let (root_mode, root_uid, root_gid) = inventory_security(&root_metadata);
     let mut pending = vec![root.to_path_buf()];
     let mut entries = Vec::new();
     let mut file_count = 0_u64;
@@ -2265,6 +2761,7 @@ fn inspect_package_tree(root: &Path, limits: &ResolutionLimits) -> Result<Inspec
             let metadata = fs::symlink_metadata(&path)
                 .map_err(|_| "package tree entry metadata is unavailable")?;
             let executable = executable_and_single_link(&metadata)?;
+            let (mode, uid, gid) = inventory_security(&metadata);
             let file_type = metadata.file_type();
             let entry = if file_type.is_dir() {
                 pending.push(path);
@@ -2272,6 +2769,9 @@ fn inspect_package_tree(root: &Path, limits: &ResolutionLimits) -> Result<Inspec
                     path: relative,
                     kind: InventoryEntryKind::Directory,
                     executable,
+                    mode,
+                    uid,
+                    gid,
                     byte_length: 0,
                     sha256: None,
                     symlink_target: None,
@@ -2296,6 +2796,9 @@ fn inspect_package_tree(root: &Path, limits: &ResolutionLimits) -> Result<Inspec
                     path: relative,
                     kind: InventoryEntryKind::File,
                     executable,
+                    mode,
+                    uid,
+                    gid,
                     byte_length: metadata.len(),
                     sha256: Some(snapshot.sha256),
                     symlink_target: None,
@@ -2316,6 +2819,9 @@ fn inspect_package_tree(root: &Path, limits: &ResolutionLimits) -> Result<Inspec
                     path: relative,
                     kind: InventoryEntryKind::Symlink,
                     executable: false,
+                    mode,
+                    uid,
+                    gid,
                     byte_length: target_text.len() as u64,
                     sha256: None,
                     symlink_target: Some(target_text.to_owned()),
@@ -2329,6 +2835,9 @@ fn inspect_package_tree(root: &Path, limits: &ResolutionLimits) -> Result<Inspec
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     let inventory = PackageInventory {
         schema_version: 1,
+        root_mode,
+        root_uid,
+        root_gid,
         entries,
     };
     let inventory_bytes = serde_json::to_vec(&inventory)
@@ -2349,6 +2858,53 @@ fn inspect_package_tree(root: &Path, limits: &ResolutionLimits) -> Result<Inspec
         file_count,
         byte_count,
     })
+}
+
+fn same_inventory_payload(left: &PackageInventory, right: &PackageInventory) -> bool {
+    left.entries.len() == right.entries.len()
+        && left
+            .entries
+            .iter()
+            .zip(&right.entries)
+            .all(|(left, right)| {
+                left.path == right.path
+                    && left.kind == right.kind
+                    && left.executable == right.executable
+                    && left.byte_length == right.byte_length
+                    && left.sha256 == right.sha256
+                    && left.symlink_target == right.symlink_target
+            })
+}
+
+#[cfg(unix)]
+fn validate_sealed_inventory(inventory: &PackageInventory) -> Result<(), String> {
+    // SAFETY: geteuid/getegid have no preconditions and only read process credentials.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    if inventory.root_mode != 0o500 || inventory.root_uid != uid || inventory.root_gid != gid {
+        return Err("sealed package tree root mode or ownership changed".into());
+    }
+    for entry in &inventory.entries {
+        if entry.uid != uid || entry.gid != gid {
+            return Err("sealed package tree entry ownership changed".into());
+        }
+        let expected_mode = match entry.kind {
+            InventoryEntryKind::Directory => Some(0o500),
+            InventoryEntryKind::File if entry.executable => Some(0o500),
+            InventoryEntryKind::File => Some(0o400),
+            // chmod on symlinks is not portable. Their lstat mode is still bound exactly in the
+            // inventory hash, while their owner and in-tree target are validated here.
+            InventoryEntryKind::Symlink => None,
+        };
+        if expected_mode.is_some_and(|expected| entry.mode != expected) {
+            return Err("sealed package tree entry mode changed".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_sealed_inventory(_inventory: &PackageInventory) -> Result<(), String> {
+    Err("sealed package tree mode and ownership validation is unsupported".into())
 }
 
 fn enforce_npm_download_budget(
@@ -2544,12 +3100,16 @@ async fn materialize_package_set(
     .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
 
     let timeout = Duration::from_secs(limits.timeout_secs);
+    let download_remaining =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(limits.max_download_bytes));
     executor
         .execute(&npm_command(
             &tooling.npm_executable,
             tooling.safe_path.clone(),
             package_directory.acp_session_cwd(),
             timeout,
+            limits,
+            std::sync::Arc::clone(&download_remaining),
             false,
         ))
         .await?;
@@ -2605,6 +3165,8 @@ async fn materialize_package_set(
             tooling.safe_path.clone(),
             package_directory.acp_session_cwd(),
             timeout,
+            limits,
+            download_remaining,
             true,
         ))
         .await?;
@@ -2653,8 +3215,10 @@ async fn materialize_package_set(
     seal_package_tree(&tree_path).map_err(|_| ResolutionFailureCode::PackageTreeDrift)?;
     let sealed = inspect_package_tree(&tree_path, limits)
         .map_err(|_| ResolutionFailureCode::PackageTreeDrift)?;
-    if inspected.inventory_sha256 != sealed.inventory_sha256
-        || inspected.tree_sha256 != sealed.tree_sha256
+    if !same_inventory_payload(&inspected.inventory, &sealed.inventory)
+        || inspected.file_count != sealed.file_count
+        || inspected.byte_count != sealed.byte_count
+        || validate_sealed_inventory(&sealed.inventory).is_err()
     {
         return Err(ResolutionFailureCode::PackageTreeDrift);
     }
@@ -3220,6 +3784,8 @@ fn resolve_base_command(
         env,
         timeout,
         max_output_bytes: MAX_COMMAND_OUTPUT_BYTES,
+        npm_limits: None,
+        npm_download_remaining: None,
     }
 }
 
@@ -3251,6 +3817,8 @@ fn image_tag_absence_command(
         env,
         timeout,
         max_output_bytes: MAX_COMMAND_OUTPUT_BYTES,
+        npm_limits: None,
+        npm_download_remaining: None,
     }
 }
 
@@ -3348,7 +3916,9 @@ fn image_build_command(input: ImageBuildCommand<'_>) -> ResolutionCommandSpec {
             args.push(OsString::from("--pull=false"));
         }
         RuntimeKind::Podman => {
-            args.push(OsString::from("--pull=never"));
+            // Skopeo resolution does not populate containers/storage. Pull an absent base by its
+            // already-resolved immutable digest while retaining the local copy when it exists.
+            args.push(OsString::from("--pull=missing"));
         }
     }
     args.extend([
@@ -3374,6 +3944,8 @@ fn image_build_command(input: ImageBuildCommand<'_>) -> ResolutionCommandSpec {
         env,
         timeout: input.timeout,
         max_output_bytes: MAX_COMMAND_OUTPUT_BYTES,
+        npm_limits: None,
+        npm_download_remaining: None,
     }
 }
 
@@ -3525,6 +4097,8 @@ fn image_inspect_command(
         env,
         timeout,
         max_output_bytes: MAX_COMMAND_OUTPUT_BYTES,
+        npm_limits: None,
+        npm_download_remaining: None,
     }
 }
 
@@ -5658,6 +6232,8 @@ image = "reader-current"
             OsString::from("/trusted/bin:/usr/bin"),
             PathBuf::from("/private/bundle/packages/codex"),
             Duration::from_secs(30),
+            &tree_limits(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1024)),
             false,
         );
         assert_eq!(lock.kind, ResolutionCommandKind::NpmLock);
@@ -5712,6 +6288,8 @@ image = "reader-current"
             OsString::from("/trusted/bin:/usr/bin"),
             PathBuf::from("/private/bundle/packages/codex"),
             Duration::from_secs(30),
+            &tree_limits(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1024)),
             true,
         );
         assert_eq!(materialize.kind, ResolutionCommandKind::NpmMaterialize);
@@ -5720,6 +6298,200 @@ image = "reader-current"
             .args
             .iter()
             .any(|arg| arg == "--package-lock-only"));
+    }
+
+    #[tokio::test]
+    async fn npm_registry_proxy_rejects_other_authorities_and_caps_allowed_response_bytes() {
+        let upstream = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let proxy = RegistryProxyGuard::start(
+            4,
+            RegistryProxyConfig {
+                authority: "registry.test:443".into(),
+                connect_address: upstream_address.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut denied = tokio::net::TcpStream::connect(proxy.address).await.unwrap();
+        denied
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        denied.shutdown().await.unwrap();
+        let mut denied_response = Vec::new();
+        denied.read_to_end(&mut denied_response).await.unwrap();
+        assert!(denied_response.starts_with(b"HTTP/1.1 403"));
+
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            stream.write_all(b"abcdefgh").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let mut allowed = tokio::net::TcpStream::connect(proxy.address).await.unwrap();
+        allowed
+            .write_all(b"CONNECT registry.test:443 HTTP/1.1\r\nHost: registry.test\r\n\r\n")
+            .await
+            .unwrap();
+        allowed.shutdown().await.unwrap();
+        let mut allowed_response = Vec::new();
+        allowed.read_to_end(&mut allowed_response).await.unwrap();
+        upstream_task.await.unwrap();
+        assert!(allowed_response.starts_with(b"HTTP/1.1 200"));
+        assert!(allowed_response.ends_with(b"abcd"));
+        assert!(!allowed_response.ends_with(b"abcde"));
+        assert!(proxy.limit_reached());
+
+        assert!(!valid_registry_connect_request(
+            b"CONNECT registry.test:443 HTTP/1.1\r\nAuthorization: secret\r\n\r\n",
+            "registry.test:443",
+        ));
+        let proxy_environment = npm_proxy_environment(&proxy);
+        assert_eq!(
+            proxy_environment.get(OsStr::new("GIT_CONFIG_VALUE_0")),
+            Some(&OsString::from("never"))
+        );
+        assert_eq!(
+            proxy_environment.get(OsStr::new("npm_config_maxsockets")),
+            Some(&OsString::from("1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn npm_registry_byte_budget_is_shared_across_lock_and_materialize_proxies() {
+        async fn transfer(
+            remaining: std::sync::Arc<std::sync::atomic::AtomicU64>,
+            payload: &'static [u8],
+        ) -> Vec<u8> {
+            let upstream = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let upstream_address = upstream.local_addr().unwrap();
+            let proxy = RegistryProxyGuard::start_with_budget(
+                remaining,
+                RegistryProxyConfig {
+                    authority: "registry.test:443".into(),
+                    connect_address: upstream_address.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+            let upstream_task = tokio::spawn(async move {
+                let (mut stream, _) = upstream.accept().await.unwrap();
+                let _ = stream.write_all(payload).await;
+                let _ = stream.shutdown().await;
+            });
+            let mut client = tokio::net::TcpStream::connect(proxy.address).await.unwrap();
+            client
+                .write_all(b"CONNECT registry.test:443 HTTP/1.1\r\nHost: registry.test\r\n\r\n")
+                .await
+                .unwrap();
+            client.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            upstream_task.await.unwrap();
+            response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|offset| response.split_off(offset + 4))
+                .unwrap()
+        }
+
+        let remaining = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(5));
+        assert_eq!(
+            transfer(std::sync::Arc::clone(&remaining), b"abc").await,
+            b"abc"
+        );
+        assert_eq!(remaining.load(std::sync::atomic::Ordering::Acquire), 2);
+        assert_eq!(
+            transfer(std::sync::Arc::clone(&remaining), b"def").await,
+            b"de"
+        );
+        assert_eq!(remaining.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn npm_executor_enforces_file_size_and_file_count_while_the_child_is_running() {
+        fn command(cwd: &Path, script: &str, limits: ResolutionLimits) -> ResolutionCommandSpec {
+            ResolutionCommandSpec {
+                family: ResolutionCommandFamily::Npm,
+                kind: ResolutionCommandKind::NpmMaterialize,
+                program: PathBuf::from("/bin/sh"),
+                args: ["-c", script].into_iter().map(OsString::from).collect(),
+                cwd: cwd.to_path_buf(),
+                env: BTreeMap::new(),
+                timeout: Duration::from_secs(2),
+                max_output_bytes: 1024,
+                npm_limits: Some(limits),
+                npm_download_remaining: Some(std::sync::Arc::new(
+                    std::sync::atomic::AtomicU64::new(1024),
+                )),
+            }
+        }
+
+        let exact = tempfile::tempdir().unwrap();
+        fs::create_dir(exact.path().join("cache")).unwrap();
+        fs::create_dir(exact.path().join("tree")).unwrap();
+        let limits = ResolutionLimits {
+            timeout_secs: 2,
+            max_download_bytes: 1024,
+            max_unpacked_bytes: 1024,
+            max_files: 10,
+        };
+        ProcessResolutionExecutor
+            .execute(&command(
+                exact.path(),
+                "printf '%1024s' x > tree/exact",
+                limits.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::metadata(exact.path().join("tree/exact")).unwrap().len(),
+            1024
+        );
+
+        let oversized = tempfile::tempdir().unwrap();
+        fs::create_dir(oversized.path().join("cache")).unwrap();
+        fs::create_dir(oversized.path().join("tree")).unwrap();
+        assert_eq!(
+            ProcessResolutionExecutor
+                .execute(&command(
+                    oversized.path(),
+                    "printf '%2048s' x > tree/oversized; sleep 1",
+                    limits.clone(),
+                ))
+                .await
+                .unwrap_err(),
+            ResolutionFailureCode::NpmDownloadBudgetExceeded
+        );
+        assert!(
+            fs::metadata(oversized.path().join("tree/oversized"))
+                .unwrap()
+                .len()
+                <= limits.max_unpacked_bytes
+        );
+
+        let too_many = tempfile::tempdir().unwrap();
+        fs::create_dir(too_many.path().join("cache")).unwrap();
+        fs::create_dir(too_many.path().join("tree")).unwrap();
+        let mut file_limits = limits;
+        file_limits.max_files = 2;
+        assert_eq!(
+            ProcessResolutionExecutor
+                .execute(&command(
+                    too_many.path(),
+                    ": > tree/one; : > tree/two; : > tree/three; sleep 1",
+                    file_limits,
+                ))
+                .await
+                .unwrap_err(),
+            ResolutionFailureCode::PackageTreeDrift
+        );
     }
 
     fn base_manifest() -> Vec<u8> {
@@ -5814,7 +6586,8 @@ image = "reader-current"
             tag: &tag,
             labels: &labels,
         });
-        assert!(podman.args.iter().any(|arg| arg == "--pull=never"));
+        assert!(podman.args.iter().any(|arg| arg == "--pull=missing"));
+        assert!(podman.args.iter().all(|arg| arg != "--pull=never"));
 
         let resolve = resolve_base_command(
             RuntimeKind::Docker,
@@ -5950,6 +6723,35 @@ image = "reader-current"
         assert!(inspect_package_tree(&tree, &tree_limits())
             .unwrap_err()
             .contains("exactly one link"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_tree_inventory_binds_normalized_modes_and_ownership() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(tree.join("nested")).unwrap();
+        let file = tree.join("nested/file");
+        fs::write(&file, b"content").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+
+        seal_package_tree(&tree).unwrap();
+        let sealed = inspect_package_tree(&tree, &tree_limits()).unwrap();
+        validate_sealed_inventory(&sealed.inventory).unwrap();
+
+        fs::set_permissions(&tree, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(tree.join("nested"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        let writable = inspect_package_tree(&tree, &tree_limits()).unwrap();
+        assert_ne!(writable.inventory_sha256, sealed.inventory_sha256);
+        assert_ne!(writable.tree_sha256, sealed.tree_sha256);
+        assert!(validate_sealed_inventory(&writable.inventory).is_err());
+
+        let mut wrong_owner = sealed.inventory;
+        wrong_owner.entries[0].uid = wrong_owner.entries[0].uid.saturating_add(1);
+        assert!(validate_sealed_inventory(&wrong_owner).is_err());
     }
 
     #[test]
@@ -6684,6 +7486,8 @@ addr = "127.0.0.1:8080"
             env: BTreeMap::new(),
             timeout,
             max_output_bytes: 1024,
+            npm_limits: None,
+            npm_download_remaining: None,
         }
     }
 
@@ -6777,5 +7581,41 @@ addr = "127.0.0.1:8080"
                 "a detached descendant survived a completed resolver command"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_executor_kills_descendants_when_execution_is_cancelled() {
+        let directory = tempfile::tempdir().unwrap();
+        let started_marker = directory.path().join("started");
+        let survivor_marker = directory.path().join("survivor");
+        let command = command_for_test(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                ": > \"$1\"; (/bin/sleep 0.2; : > \"$2\") >/dev/null 2>&1 & /bin/sleep 5",
+                "resolver-cancellation-test",
+                started_marker.to_str().unwrap(),
+                survivor_marker.to_str().unwrap(),
+            ],
+            Duration::from_secs(10),
+        );
+        let execution =
+            tokio::spawn(async move { ProcessResolutionExecutor.execute(&command).await });
+        for _ in 0..100 {
+            if started_marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started_marker.exists(), "resolver command never started");
+
+        execution.abort();
+        assert!(execution.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !survivor_marker.exists(),
+            "a resolver descendant survived execution cancellation"
+        );
     }
 }

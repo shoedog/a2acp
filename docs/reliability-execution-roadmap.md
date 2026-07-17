@@ -5,7 +5,9 @@
 - **Completed through:** R3b **MERGED** at `504c1e43`; R2e remains deferred and off the critical path
 - **Active slice:** R3c floating-current lane **IN PROGRESS** on
   `agent/reliability-r3c-floating-lane`
-- **Current R3c deterministic gate:** exact local head `57e63a0` completes all four implementation slices.
+- **Current R3c deterministic gate:** tested implementation head `57e63a0` completes all four implementation
+  slices. Later branch commits record evidence and review folds, so restart from the tip of the named branch
+  rather than treating this historical implementation hash as the branch tip.
   Focused gates pass resolution **32 / 0**, compatibility unit **53 / 0**, compatibility CLI **20 / 0**,
   plus ACP catalog, smoke catalog, and additive fallback controls **1 / 0** each. The host workspace passes
   **2,135 / 0 / 12 ignored** across **70** test/doc-test executables. Linux/Rust 1.94.0 passes the full

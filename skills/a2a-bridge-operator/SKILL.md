@@ -204,7 +204,7 @@ created the bundle:
 ```bash
 ./target/release/a2a-bridge compatibility run \
   --resolution "$evidence_root/resolution/resolution.json" \
-  --case <exact-floating-case-id> \
+  --all-resolved \
   --environment-owner <exact-owner-id> \
   --acknowledge-billable \
   --out "$evidence_root/floating-aggregate.json"
@@ -222,7 +222,8 @@ catalog. Definite completed smoke failure is `candidate_fail`; missing/unsafe ev
 budget exhaustion, or infrastructure/publication failure is `candidate_unknown`. Either makes the aggregate
 unsuccessful.
 
-Comparison reports adapter, nested CLI, base/image, catalog additions/removals/current/configurable values,
+Comparison first requires the baseline's pinned-manifest identity to match the resolution-bound production
+manifest, then reports adapter, nested CLI, base/image, catalog additions/removals/current/configurable values,
 outcome, auth, capability, phase, terminal, and diagnostic dimensions independently. It never writes the
 pinned manifest/baseline, production configs/locks/Containerfiles, support docs, or the running operator.
 Retain complete bundles and their unique tags until an operator proves that no running container uses them;

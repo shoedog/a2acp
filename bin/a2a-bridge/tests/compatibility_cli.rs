@@ -1158,7 +1158,8 @@ fn floating_compare_requires_resolution_binding_and_emits_dimensioned_json() {
         "resolution": {
             "resolution_id": "resolution-1",
             "artifact_sha256": digest('d'),
-            "recipe_sha256": digest('e')
+            "recipe_sha256": digest('e'),
+            "production_manifest_sha256": digest('b')
         },
         "floating_summary": {
             "candidate_pass": 1,
@@ -1292,6 +1293,33 @@ fn floating_compare_requires_resolution_binding_and_emits_dimensioned_json() {
     assert!(dimensions
         .iter()
         .any(|value| value == "catalog.models_added"));
+
+    let mut unrelated_baseline: serde_json::Value =
+        serde_json::from_slice(&fs::read(&baseline).unwrap()).unwrap();
+    unrelated_baseline["manifest_sha256"] = serde_json::Value::String(digest('c'));
+    fs::write(
+        &baseline,
+        serde_json::to_vec_pretty(&unrelated_baseline).unwrap(),
+    )
+    .unwrap();
+    let rejected = compatibility_command()
+        .arg("compare")
+        .arg("--mode")
+        .arg("floating-to-pinned")
+        .arg("--current")
+        .arg(&current)
+        .arg("--baseline")
+        .arg(&baseline)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("pinned manifest identity mismatch"));
+    unrelated_baseline["manifest_sha256"] = serde_json::Value::String(digest('b'));
+    fs::write(
+        &baseline,
+        serde_json::to_vec_pretty(&unrelated_baseline).unwrap(),
+    )
+    .unwrap();
 
     let mut unbound = aggregate;
     unbound.as_object_mut().unwrap().remove("resolution");

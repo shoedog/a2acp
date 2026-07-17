@@ -250,7 +250,7 @@ for the exact resolution id, unchanged candidate binary, selected cases, owner, 
 ```bash
 ./target/release/a2a-bridge compatibility run \
   --resolution "$evidence_root/resolution/resolution.json" \
-  --case <exact-floating-case-id> \
+  --all-resolved \
   --environment-owner <exact-owner-id> \
   --acknowledge-billable \
   --out "$evidence_root/floating-aggregate.json"
@@ -264,7 +264,9 @@ Use `--all` and `--all-resolved` only as explicit authorizations. The run revali
 immediately before provider spawn and captures the bounded catalog from that same one-prompt session.
 `candidate_pass`, `candidate_fail`, and `candidate_unknown` are advisory canary outcomes; none promotes or
 rewrites production pins, baselines, configs, support docs, or the running operator. Retain the private
-bundle and unique tag until operator-reviewed cleanup proves that no running container uses them.
+bundle and unique tag until operator-reviewed cleanup proves that no running container uses them. Floating
+comparison rejects a baseline whose pinned-manifest identity differs from the resolution-bound production
+manifest.
 
 ## 4e. Plan an explicit host verification after classified container degradation
 

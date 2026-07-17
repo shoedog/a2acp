@@ -1594,6 +1594,7 @@ struct ResolutionBindingRecord {
     resolution_id: String,
     artifact_sha256: String,
     recipe_sha256: String,
+    production_manifest_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2548,7 +2549,7 @@ fn valid_available_catalog_for(
         || configurable && models.is_empty()
         || current_model.is_some_and(|current| !models.contains(&current))
         || current_mode.is_some_and(|current| !modes.contains(&current))
-        || configurable && (!models.contains(&model) || current_model != Some(model))
+        || current_model != Some(model)
         || effort.is_some_and(|effort| !efforts.contains(&effort))
         || mode.is_some_and(|mode| !modes.contains(&mode) || current_mode != Some(mode))
     {
@@ -2588,6 +2589,46 @@ fn valid_floating_success_contract(smoke: &Value) -> bool {
         && smoke.pointer("/cleanup/cancel").and_then(Value::as_str) == Some("not_needed")
         && smoke.pointer("/cleanup/release").and_then(Value::as_str) == Some("completed")
         && smoke.pointer("/cleanup/retire").and_then(Value::as_str) == Some("completed")
+}
+
+fn valid_floating_failure_contract_for(
+    smoke: &Value,
+    model: &str,
+    effort: Option<&str>,
+    mode: Option<&str>,
+) -> bool {
+    let failure = smoke.pointer("/diagnostics/failure");
+    smoke.get("success").and_then(Value::as_bool) == Some(false)
+        && smoke.pointer("/attempt/timed_out").and_then(Value::as_bool) == Some(false)
+        && smoke.pointer("/turn/prompt_calls").and_then(Value::as_u64) == Some(1)
+        && failure
+            .and_then(|failure| failure.get("class"))
+            .and_then(Value::as_str)
+            .is_some_and(|class| matches!(class, "config" | "model" | "protocol"))
+        && failure
+            .and_then(|failure| failure.get("disposition"))
+            .and_then(Value::as_str)
+            == Some("fatal")
+        && failure
+            .and_then(|failure| failure.get("prompt_may_have_been_accepted"))
+            .and_then(Value::as_bool)
+            .is_some()
+        && valid_available_catalog_for(smoke, model, effort, mode)
+        && smoke
+            .pointer("/cleanup/cancel")
+            .and_then(Value::as_str)
+            .is_some_and(|state| matches!(state, "not_needed" | "completed"))
+        && smoke.pointer("/cleanup/release").and_then(Value::as_str) == Some("completed")
+        && smoke.pointer("/cleanup/retire").and_then(Value::as_str) == Some("completed")
+}
+
+fn valid_floating_failure_contract(smoke: &Value, case: &CompatibilityCase) -> bool {
+    valid_floating_failure_contract_for(
+        smoke,
+        &case.model,
+        case.effort.as_deref(),
+        case.mode.as_deref(),
+    )
 }
 
 fn provenance_detail<'a>(smoke: &'a Value, agent: &str, component: &str) -> Option<&'a str> {
@@ -3175,12 +3216,16 @@ async fn build_aggregate<I: SmokeInvoker>(
             EvidenceStatus::Fail
         };
         let mut drift = drift_for(case, &smoke);
-        if case.lane == Lane::FloatingCurrent && smoke_success {
-            if !valid_floating_success_contract(&smoke) {
+        if case.lane == Lane::FloatingCurrent {
+            if smoke_success {
+                if !valid_floating_success_contract(&smoke) {
+                    drift.push("outcome.smoke_contract".into());
+                }
+                if !valid_available_catalog(&smoke, case) {
+                    drift.push("capability.model_catalog".into());
+                }
+            } else if !valid_floating_failure_contract(&smoke, case) {
                 drift.push("outcome.smoke_contract".into());
-            }
-            if !valid_available_catalog(&smoke, case) {
-                drift.push("capability.model_catalog".into());
             }
         }
         let mut budget_violations = Vec::new();
@@ -3267,6 +3312,30 @@ async fn build_aggregate<I: SmokeInvoker>(
         budget.exhausted = true;
     }
 
+    let cancelled = cancellation_requested.load(std::sync::atomic::Ordering::Acquire);
+    if cancelled {
+        // A signal observed while or immediately after the active smoke makes that observation
+        // incomplete evidence. Preserve earlier completed rows, but never leave the most recent
+        // floating observation as a definitive pass/fail under aggregate cancellation.
+        if let Some(active) = results
+            .iter_mut()
+            .rev()
+            .find(|result| result.execution == ExecutionState::Completed)
+        {
+            if active.lane == Lane::FloatingCurrent {
+                if !active
+                    .drift
+                    .iter()
+                    .any(|dimension| dimension == "outcome.cancellation")
+                {
+                    active.drift.push("outcome.cancellation".into());
+                }
+                active.expectation_met = false;
+                active.candidate_outcome = Some(CandidateOutcome::Unknown);
+            }
+        }
+    }
+
     let runner_failed = results
         .iter()
         .any(|result| result.execution == ExecutionState::RunnerFailure);
@@ -3291,12 +3360,12 @@ async fn build_aggregate<I: SmokeInvoker>(
         environment_owner: environment_owner.into(),
         started_at_ms,
         ended_at_ms: diagnostic_timestamp_ms(),
-        cancelled: cancellation_requested.load(std::sync::atomic::Ordering::Acquire),
+        cancelled,
         success: !runner_failed
             && !pinned_failed
             && !floating_not_pass
             && !budget.exhausted
-            && !cancellation_requested.load(std::sync::atomic::Ordering::Acquire),
+            && !cancelled,
         budget,
         resolution: loaded.resolution_binding.clone(),
         floating_summary: floating_summary(&results),
@@ -3407,6 +3476,7 @@ fn baseline_from_result(result: &CaseResult) -> CaseBaseline {
         capability: json!({
             "request": object_subset(request, &["model", "effort", "mode"]),
             "effective": session.get("effective_request").cloned().unwrap_or(Value::Null),
+            "model_catalog": target.get("model_catalog").cloned().unwrap_or(Value::Null),
         }),
         authentication: target.get("authentication").cloned().unwrap_or(Value::Null),
         phase: failure.get("failed_phase").cloned().unwrap_or(Value::Null),
@@ -3736,7 +3806,16 @@ fn recompute_candidate_outcome(result: &CaseResult) -> CandidateOutcome {
     };
     match result.actual_status {
         EvidenceStatus::Fail if smoke.get("success").and_then(Value::as_bool) == Some(false) => {
-            CandidateOutcome::Fail
+            let Some(model) = smoke.pointer("/request/model").and_then(Value::as_str) else {
+                return CandidateOutcome::Unknown;
+            };
+            let effort = smoke.pointer("/request/effort").and_then(Value::as_str);
+            let mode = smoke.pointer("/request/mode").and_then(Value::as_str);
+            if valid_floating_failure_contract_for(smoke, model, effort, mode) {
+                CandidateOutcome::Fail
+            } else {
+                CandidateOutcome::Unknown
+            }
         }
         EvidenceStatus::Pass => {
             let Some(model) = smoke.pointer("/request/model").and_then(Value::as_str) else {
@@ -3788,7 +3867,11 @@ fn validate_floating_aggregate(current: &AggregateArtifact) -> Result<(), BoxErr
         "floating aggregate resolution id",
         &resolution.resolution_id,
     )?;
-    for digest in [&resolution.artifact_sha256, &resolution.recipe_sha256] {
+    for digest in [
+        &resolution.artifact_sha256,
+        &resolution.recipe_sha256,
+        &resolution.production_manifest_sha256,
+    ] {
         if !local_file::valid_sha256(digest) || digest != &digest.to_ascii_lowercase() {
             return Err("compatibility floating aggregate: invalid resolution binding".into());
         }
@@ -3853,8 +3936,15 @@ fn compare_floating_to_pinned(
     baseline: &BaselineArtifact,
 ) -> Result<ComparisonReport, BoxError> {
     validate_floating_aggregate(current)?;
-    if baseline.schema_version != 1 {
-        return Err("compatibility baseline: schema_version must be 1".into());
+    let resolution = current
+        .resolution
+        .as_ref()
+        .expect("floating aggregate validation requires a resolution binding");
+    if baseline.schema_version != 1
+        || baseline.manifest_schema_version != 1
+        || baseline.manifest_sha256 != resolution.production_manifest_sha256
+    {
+        return Err("compatibility baseline: pinned manifest identity mismatch".into());
     }
     let mut baseline_cases = BTreeMap::new();
     for case in &baseline.cases {
@@ -3863,6 +3953,28 @@ fn compare_floating_to_pinned(
         }
     }
     let mut changes = Vec::new();
+    let current_aggregate = baseline_from_aggregate(current);
+    let mut aggregate_dimensions = Vec::new();
+    if baseline.aggregate.success != current_aggregate.success {
+        aggregate_dimensions.push("success".into());
+    }
+    if baseline.aggregate.cancelled != current_aggregate.cancelled {
+        aggregate_dimensions.push("cancelled".into());
+    }
+    if baseline.aggregate.budget_exhausted != current_aggregate.budget_exhausted
+        || baseline.aggregate.token_observation_missing_cases
+            != current_aggregate.token_observation_missing_cases
+        || baseline.aggregate.cost_observation_missing_cases
+            != current_aggregate.cost_observation_missing_cases
+    {
+        aggregate_dimensions.push("budget".into());
+    }
+    if !aggregate_dimensions.is_empty() {
+        changes.push(ComparisonChange {
+            case_id: "__aggregate__".into(),
+            dimensions: aggregate_dimensions,
+        });
+    }
     for result in &current.results {
         let baseline_id = result.baseline_case_id.as_deref().expect("validated above");
         let Some(before) = baseline_cases.get(baseline_id) else {
@@ -3920,7 +4032,15 @@ fn compare_floating_to_pinned(
         if before.authentication != after.authentication {
             dimensions.push("authentication".into());
         }
-        if before.capability != after.capability {
+        let mut before_capability = before.capability.clone();
+        let mut after_capability = after.capability.clone();
+        if let Some(before) = before_capability.as_object_mut() {
+            before.remove("model_catalog");
+        }
+        if let Some(after) = after_capability.as_object_mut() {
+            after.remove("model_catalog");
+        }
+        if before_capability != after_capability {
             dimensions.push("capability".into());
         }
         if before.phase != after.phase {
@@ -4114,6 +4234,7 @@ fn load_bound_execution(
         resolution_id: resolution.artifact.resolution_id.clone(),
         artifact_sha256: resolution.sha256.clone(),
         recipe_sha256: resolution.artifact.recipes.sha256.clone(),
+        production_manifest_sha256: resolution.artifact.production_manifest.sha256.clone(),
     });
     Ok((resolution, execution))
 }
@@ -5022,6 +5143,20 @@ mod tests {
         })
     }
 
+    fn definitive_failure(case: &CompatibilityCase, tokens: Option<u64>) -> Value {
+        let mut artifact = smoke(case, true, tokens);
+        artifact["success"] = json!(false);
+        artifact["turn"]["exact_pong"] = json!(false);
+        artifact["diagnostics"]["failure"] = json!({
+            "failed_phase": "prompt_finish",
+            "class": "protocol",
+            "disposition": "fatal",
+            "code": "smoke.not_exact_pong",
+            "prompt_may_have_been_accepted": true
+        });
+        artifact
+    }
+
     struct FakeInvoker {
         calls: Mutex<Vec<String>>,
         results: Mutex<VecDeque<InvocationResult>>,
@@ -5651,7 +5786,7 @@ agent_cli = "@openai/codex=0.144.1"
         let first = case("first", EvidenceStatus::Fail);
         let second = case("second", EvidenceStatus::Pass);
         let invoker = FakeInvoker::new(vec![
-            invocation(smoke(&first, false, Some(1))),
+            invocation(definitive_failure(&first, Some(1))),
             invocation(smoke(&second, true, Some(2))),
         ]);
         let loaded = loaded(dir.path(), vec![first, second]);
@@ -5708,6 +5843,68 @@ agent_cli = "@openai/codex=0.144.1"
     }
 
     #[tokio::test]
+    async fn floating_infrastructure_or_incomplete_failure_evidence_is_candidate_unknown() {
+        for mutation in [
+            "timeout",
+            "authentication",
+            "container_runtime",
+            "missing_catalog",
+            "cleanup_failed",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let case = case("only", EvidenceStatus::Fail);
+            let mut artifact = definitive_failure(&case, Some(1));
+            match mutation {
+                "timeout" => {
+                    artifact["attempt"]["timed_out"] = json!(true);
+                    artifact["diagnostics"]["failure"]["class"] = json!("timeout");
+                }
+                "authentication" => {
+                    artifact["diagnostics"]["failure"]["class"] = json!("authentication");
+                }
+                "container_runtime" => {
+                    artifact["diagnostics"]["failure"]["class"] = json!("container_runtime");
+                }
+                "missing_catalog" => {
+                    artifact["target"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("model_catalog");
+                }
+                "cleanup_failed" => artifact["cleanup"]["release"] = json!("failed"),
+                _ => unreachable!(),
+            }
+            let invoker = FakeInvoker::new(vec![invocation(artifact)]);
+            let loaded = loaded(dir.path(), vec![case]);
+            let cancelled = AtomicBool::new(false);
+            let aggregate = build_aggregate(
+                AggregateInputs {
+                    loaded: &loaded,
+                    candidate: &candidate_identity(),
+                    selection: &selection(),
+                    selected_indices: &[0],
+                    environment_owner: "test-runner",
+                    scratch: dir.path(),
+                    cancellation_requested: &cancelled,
+                },
+                &invoker,
+            )
+            .await;
+
+            assert_eq!(
+                aggregate.results[0].candidate_outcome,
+                Some(CandidateOutcome::Unknown),
+                "{mutation} must not be classified as a definitive compatibility failure"
+            );
+            assert!(aggregate.results[0]
+                .drift
+                .iter()
+                .any(|dimension| dimension == "outcome.smoke_contract"));
+            assert!(!aggregate.success);
+        }
+    }
+
+    #[tokio::test]
     async fn every_bound_drift_family_is_candidate_unknown_before_fake_spawn() {
         for reason in [
             "candidate_binary_changed",
@@ -5758,6 +5955,11 @@ agent_cli = "@openai/codex=0.144.1"
         for (mutation, expected_drift) in [
             ("missing_catalog", "capability.model_catalog"),
             ("rejected_catalog", "capability.model_catalog"),
+            ("nonconfigurable_wrong_current", "capability.model_catalog"),
+            (
+                "nonconfigurable_missing_current",
+                "capability.model_catalog",
+            ),
             ("non_exact_terminal", "outcome.smoke_contract"),
         ] {
             let dir = tempfile::tempdir().unwrap();
@@ -5775,6 +5977,19 @@ agent_cli = "@openai/codex=0.144.1"
                         "state": "rejected",
                         "code": "catalog_unavailable"
                     });
+                }
+                "nonconfigurable_wrong_current" => {
+                    artifact["target"]["model_catalog"]["model_configurable"] = json!(false);
+                    artifact["target"]["model_catalog"]["current_model"] = json!("other-model");
+                    artifact["target"]["model_catalog"]["models"] =
+                        json!(["test-model", "other-model"]);
+                }
+                "nonconfigurable_missing_current" => {
+                    artifact["target"]["model_catalog"]["model_configurable"] = json!(false);
+                    artifact["target"]["model_catalog"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("current_model");
                 }
                 "non_exact_terminal" => artifact["turn"]["exact_pong"] = json!(false),
                 _ => unreachable!(),
@@ -6553,6 +6768,14 @@ agent_cli = "@openai/codex=0.144.1"
 
         assert_eq!(&*invoker.calls.lock().unwrap(), &["first"]);
         assert_eq!(aggregate.results[0].execution, ExecutionState::Completed);
+        assert_eq!(
+            aggregate.results[0].candidate_outcome,
+            Some(CandidateOutcome::Unknown)
+        );
+        assert!(aggregate.results[0]
+            .drift
+            .iter()
+            .any(|dimension| dimension == "outcome.cancellation"));
         assert_eq!(aggregate.results[1].execution, ExecutionState::NotRun);
         assert_eq!(
             aggregate.results[1].not_run_reason.as_deref(),
@@ -7047,9 +7270,49 @@ agent_cli = "@openai/codex=0.144.1"
             resolution_id: "resolution-1".into(),
             artifact_sha256: "d".repeat(64),
             recipe_sha256: "e".repeat(64),
+            production_manifest_sha256: "a".repeat(64),
         });
-        let mut before = baseline_from_result(&current.results[0]);
-        before.case_id = "baseline-only".into();
+        let mut clean_before = baseline_from_result(&current.results[0]);
+        clean_before.case_id = "baseline-only".into();
+        let clean_baseline = BaselineArtifact {
+            schema_version: 1,
+            manifest_schema_version: 1,
+            manifest_sha256: "a".repeat(64),
+            aggregate: baseline_from_aggregate(&current),
+            cases: vec![clean_before.clone()],
+        };
+        let unchanged = compare_floating_to_pinned(&current, &clean_baseline).unwrap();
+        assert!(
+            unchanged.equal,
+            "identical same-session catalog and aggregate evidence must compare cleanly: {:?}",
+            unchanged.changes
+        );
+
+        let mut cancelled = current.clone();
+        cancelled.cancelled = true;
+        cancelled.success = false;
+        let cancelled_report = compare_floating_to_pinned(&cancelled, &clean_baseline).unwrap();
+        assert!(cancelled_report.changes.iter().any(|change| {
+            change.case_id == "__aggregate__"
+                && change
+                    .dimensions
+                    .iter()
+                    .any(|dimension| dimension == "cancelled")
+        }));
+
+        let mut exhausted = current.clone();
+        exhausted.budget.exhausted = true;
+        exhausted.success = false;
+        let exhausted_report = compare_floating_to_pinned(&exhausted, &clean_baseline).unwrap();
+        assert!(exhausted_report.changes.iter().any(|change| {
+            change.case_id == "__aggregate__"
+                && change
+                    .dimensions
+                    .iter()
+                    .any(|dimension| dimension == "budget")
+        }));
+
+        let mut before = clean_before;
         before.status = EvidenceStatus::Fail;
         before.provenance = json!([
             {
@@ -7122,6 +7385,19 @@ agent_cli = "@openai/codex=0.144.1"
         partial_selection.selection.all = false;
         partial_selection.selection.cases = vec!["only".into()];
         assert!(compare_floating_to_pinned(&partial_selection, &baseline).is_err());
+        let mut malformed_binding = current.clone();
+        malformed_binding
+            .resolution
+            .as_mut()
+            .unwrap()
+            .production_manifest_sha256 = "not-a-digest".into();
+        assert!(compare_floating_to_pinned(&malformed_binding, &baseline).is_err());
+        let mut unrelated_baseline = baseline.clone();
+        unrelated_baseline.manifest_sha256 = "b".repeat(64);
+        assert!(compare_floating_to_pinned(&current, &unrelated_baseline)
+            .unwrap_err()
+            .to_string()
+            .contains("pinned manifest identity mismatch"));
         let mut mixed_lane = current;
         mixed_lane.results[0].lane = Lane::Pinned;
         assert!(compare_floating_to_pinned(&mixed_lane, &baseline).is_err());
