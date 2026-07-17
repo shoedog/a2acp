@@ -577,7 +577,9 @@ mod tests {
         let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&runtime, permissions).unwrap();
-        let probe = production_start_probe(Duration::from_millis(200));
+        // Match the production bound for ordinary exact-status observations. The separate hung-runtime
+        // control below keeps its deliberately short timeout and proves cancellation independently.
+        let probe = production_start_probe(CONTAINER_START_PROBE_TIMEOUT);
         let runtime = runtime.to_string_lossy().into_owned();
 
         assert_eq!(

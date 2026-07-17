@@ -72,7 +72,7 @@ use bridge_core::process::{
 };
 use bridge_core::provider::{classify_acp_error_data, ProviderEvidence};
 use bridge_core::reaper::{
-    production_reap_fn, spawn_detached, ContainerStartState, ReapController, ReapFailure, ReapFn,
+    production_reap_fn, ContainerStartState, ReapController, ReapFailure, ReapFn,
 };
 
 /// Default bound on the `initialize` handshake. A real agent that connects its
@@ -1184,12 +1184,68 @@ async fn await_container_start(
     }
 }
 
-async fn cleanup_unpublished_container(
-    supervised: Supervised,
-    controller: ReapController,
-) -> Option<ReapFailure> {
-    supervised.terminate(TERMINATE_GRACE).await;
-    controller.reap_observed().await.err()
+/// One runtime-independent cleanup flight. The thread owns both resources; this handle remains in the
+/// initializer across its async wait, so cancellation or runtime shutdown joins the same flight in Drop.
+struct UnpublishedContainerCleanup {
+    worker: Option<std::thread::JoinHandle<Option<ReapFailure>>>,
+    settled: Option<tokio::sync::oneshot::Receiver<Option<ReapFailure>>>,
+}
+
+impl UnpublishedContainerCleanup {
+    fn start(supervised: Supervised, controller: ReapController) -> Result<Self, ReapFailure> {
+        let (settled_tx, settled) = tokio::sync::oneshot::channel();
+        let worker = std::thread::Builder::new()
+            .name("a2a-unpublished-container-cleanup".to_owned())
+            .spawn(move || {
+                supervised.terminate_blocking(TERMINATE_GRACE);
+                let result = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(controller.reap_observed()).err(),
+                    Err(_) => Some(ReapFailure::Spawn),
+                };
+                let _ = settled_tx.send(result);
+                result
+            })
+            .map_err(|_| ReapFailure::Spawn)?;
+        Ok(Self {
+            worker: Some(worker),
+            settled: Some(settled),
+        })
+    }
+
+    async fn wait(mut self) -> Option<ReapFailure> {
+        let settled = self
+            .settled
+            .take()
+            .expect("unpublished cleanup receiver must remain owned");
+        let _ = settled.await;
+        self.join_worker()
+    }
+
+    fn join(mut self) -> Option<ReapFailure> {
+        self.join_worker()
+    }
+
+    fn join_worker(&mut self) -> Option<ReapFailure> {
+        let worker = self
+            .worker
+            .take()
+            .expect("unpublished cleanup worker must remain owned");
+        match worker.join() {
+            Ok(result) => result,
+            Err(_) => Some(ReapFailure::WorkerPanicked),
+        }
+    }
+}
+
+impl Drop for UnpublishedContainerCleanup {
+    fn drop(&mut self) {
+        if self.worker.is_some() {
+            let _ = self.join_worker();
+        }
+    }
 }
 
 /// Own the local runtime client and exact named-container cleanup from the instant process spawn
@@ -1239,9 +1295,9 @@ impl UnpublishedContainerSpawn {
             controller.reap_detached();
             return None;
         }
-        match tokio::spawn(cleanup_unpublished_container(supervised, controller)).await {
-            Ok(failure) => failure,
-            Err(_) => Some(ReapFailure::WorkerPanicked),
+        match UnpublishedContainerCleanup::start(supervised, controller) {
+            Ok(cleanup) => cleanup.wait().await,
+            Err(failure) => Some(failure),
         }
     }
 }
@@ -1260,9 +1316,11 @@ impl Drop for UnpublishedContainerSpawn {
             controller.reap_detached();
             return;
         }
-        spawn_detached(async move {
-            let _ = cleanup_unpublished_container(supervised, controller).await;
-        });
+        // A Drop can run inside Tokio's shutdown context, where spawning on the current handle loses the
+        // new task. Settle on a fresh OS thread/runtime and join it before returning from Drop.
+        if let Ok(cleanup) = UnpublishedContainerCleanup::start(supervised, controller) {
+            let _ = cleanup.join();
+        }
     }
 }
 
@@ -6259,14 +6317,20 @@ mod tests {
                 Box::pin(async move { Ok(()) })
             })
         };
-        let probe: ContainerStartProbeFn =
-            Arc::new(|_runtime, _name| Box::pin(async move { ContainerStartState::Unknown }));
+        let probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe: ContainerStartProbeFn = {
+            let probe_calls = Arc::clone(&probe_calls);
+            Arc::new(move |_runtime, _name| {
+                probe_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { ContainerStartState::Unknown })
+            })
+        };
         let controller =
             ReapController::new("docker", "a2a-ro-start-unknown", attempt).with_start_probe(probe);
         let observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
         let config = AcpConfig {
             cwd: std::env::temp_dir(),
-            handshake_timeout: Duration::from_millis(100),
+            handshake_timeout: Duration::from_millis(350),
             ..AcpConfig::default()
         };
 
@@ -6300,6 +6364,10 @@ mod tests {
         assert_eq!(diagnostic.code().as_str(), "acp.initialize.timeout");
         assert_eq!(controller.result(), Some(Ok(())));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            probe_calls.load(Ordering::SeqCst) >= 2,
+            "the lifecycle control must preserve its diagnosis across repeated unknown observations"
+        );
         let events = observer.snapshot().await;
         assert_eq!(events.len(), 4);
         assert_eq!(events[0].transition().phase(), DiagnosticPhase::Spawn);
@@ -6495,6 +6563,182 @@ mod tests {
             .await
             .expect("the canceled initializer must permit one clean successor");
         assert_eq!(successor_calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(pid_path);
+    }
+
+    #[test]
+    fn runtime_shutdown_after_not_started_observation_still_settles_exact_cleanup() {
+        static PATH_NONCE: AtomicU64 = AtomicU64::new(0);
+        let pid_path = std::env::temp_dir().join(format!(
+            "a2a-bridge-acp-runtime-shutdown-{}-{}.pid",
+            std::process::id(),
+            PATH_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&pid_path);
+        let observed = Arc::new(tokio::sync::Notify::new());
+        let (settled_tx, settled_rx) = std::sync::mpsc::sync_channel(1);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempt: ReapAttemptFn = {
+            let calls = Arc::clone(&calls);
+            let pid_path = pid_path.clone();
+            Arc::new(move |_runtime, _name| {
+                let calls = Arc::clone(&calls);
+                let pid_path = pid_path.clone();
+                let settled_tx = settled_tx.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let pid = std::fs::read_to_string(pid_path)
+                        .ok()
+                        .and_then(|value| value.parse::<i32>().ok());
+                    let stopped = pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == -1);
+                    let _ = settled_tx.send(stopped);
+                    Ok(())
+                })
+            })
+        };
+        let probe: ContainerStartProbeFn = {
+            let observed = Arc::clone(&observed);
+            let pid_path = pid_path.clone();
+            Arc::new(move |_runtime, _name| {
+                let observed = Arc::clone(&observed);
+                let pid_path = pid_path.clone();
+                Box::pin(async move {
+                    while !pid_path.exists() {
+                        tokio::task::yield_now().await;
+                    }
+                    observed.notify_one();
+                    ContainerStartState::NotStarted
+                })
+            })
+        };
+        let controller = ReapController::new("docker", "a2a-ro-runtime-shutdown", attempt)
+            .with_start_probe(probe);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let observed_wait = Arc::clone(&observed);
+        let pid_arg = pid_path.to_string_lossy().into_owned();
+        let controller_for_spawn = controller.clone();
+        let task = runtime.spawn(async move {
+            let args = [
+                "-c",
+                "trap '' TERM; printf '%s' $$ > \"$1\"; while :; do sleep 1; done",
+                "a2a-test",
+                pid_arg.as_str(),
+            ];
+            AcpBackend::spawn_observed_with_container_controller(
+                "/bin/sh",
+                &args,
+                AcpConfig {
+                    cwd: std::env::temp_dir(),
+                    handshake_timeout: Duration::from_secs(5),
+                    ..AcpConfig::default()
+                },
+                Arc::new(InMemoryDiagnosticObserver::new(8).unwrap()),
+                Some(controller_for_spawn),
+            )
+            .await
+        });
+        runtime.block_on(async move {
+            tokio::time::timeout(Duration::from_secs(2), observed_wait.notified())
+                .await
+                .expect("the private runtime must reach a positive pre-start observation");
+        });
+
+        drop(runtime);
+        drop(task);
+        let stopped = settled_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("runtime shutdown must still settle the exact named reap");
+        assert!(
+            stopped,
+            "the exact client must exit before shutdown-time reap"
+        );
+        assert_eq!(controller.result(), Some(Ok(())));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(pid_path);
+    }
+
+    #[test]
+    fn runtime_shutdown_during_error_settlement_still_settles_exact_cleanup() {
+        static PATH_NONCE: AtomicU64 = AtomicU64::new(0);
+        let pid_path = std::env::temp_dir().join(format!(
+            "a2a-bridge-acp-settlement-shutdown-{}-{}.pid",
+            std::process::id(),
+            PATH_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&pid_path);
+        let (settled_tx, settled_rx) = std::sync::mpsc::sync_channel(1);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempt: ReapAttemptFn = {
+            let calls = Arc::clone(&calls);
+            let pid_path = pid_path.clone();
+            Arc::new(move |_runtime, _name| {
+                let calls = Arc::clone(&calls);
+                let pid_path = pid_path.clone();
+                let settled_tx = settled_tx.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let pid = std::fs::read_to_string(pid_path)
+                        .ok()
+                        .and_then(|value| value.parse::<i32>().ok());
+                    let stopped = pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == -1);
+                    let _ = settled_tx.send(stopped);
+                    Ok(())
+                })
+            })
+        };
+        let probe: ContainerStartProbeFn =
+            Arc::new(|_runtime, _name| Box::pin(async move { ContainerStartState::NotStarted }));
+        let controller = ReapController::new("docker", "a2a-ro-settlement-shutdown", attempt)
+            .with_start_probe(probe);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pid_arg = pid_path.to_string_lossy().into_owned();
+        let controller_for_spawn = controller.clone();
+        let task = runtime.spawn(async move {
+            let args = [
+                "-c",
+                "trap '' TERM; printf '%s' $$ > \"$1\"; while :; do sleep 1; done",
+                "a2a-test",
+                pid_arg.as_str(),
+            ];
+            AcpBackend::spawn_observed_with_container_controller(
+                "/bin/sh",
+                &args,
+                AcpConfig {
+                    cwd: std::env::temp_dir(),
+                    handshake_timeout: Duration::from_millis(50),
+                    ..AcpConfig::default()
+                },
+                Arc::new(InMemoryDiagnosticObserver::new(8).unwrap()),
+                Some(controller_for_spawn),
+            )
+            .await
+        });
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !pid_path.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the private runtime must publish the supervised client pid");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        assert_eq!(controller.result(), None);
+        drop(runtime);
+        drop(task);
+        let stopped = settled_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime shutdown during settlement must still run the exact named reap");
+        assert!(stopped, "the exact client must exit before settlement reap");
+        assert_eq!(controller.result(), Some(Ok(())));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_file(pid_path);
     }
 

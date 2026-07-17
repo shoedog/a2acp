@@ -12,6 +12,8 @@ use crate::diagnostics::DiagnosticRedactor;
 
 const STDERR_RING_CAPACITY: usize = 32;
 const STDERR_LINE_MAX_BYTES: usize = 512;
+const BLOCKING_TERMINATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+const BLOCKING_TERMINATE_REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessStderrCursor(u64);
@@ -353,6 +355,59 @@ impl Supervised {
         }
         // Always reap to prevent zombies.
         let _ = self.child.wait().await;
+    }
+
+    /// Runtime-independent bounded termination for an owner dropped while its Tokio runtime is
+    /// shutting down. This uses only process-group signals and synchronous `try_wait`, so the caller
+    /// may run it on a dedicated OS thread after the source reactor has disappeared.
+    #[doc(hidden)]
+    pub fn terminate_blocking(mut self, grace: std::time::Duration) {
+        let pgid = self.pid as i32;
+        // SAFETY: kill(-pgid, sig) sends a signal to the process group created and owned by this
+        // supervisor (`pgid == child pid`).
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+        }
+        let grace_deadline = std::time::Instant::now()
+            .checked_add(grace)
+            .unwrap_or_else(std::time::Instant::now);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Err(_) => break,
+                Ok(None) => {}
+            }
+            let now = std::time::Instant::now();
+            if now >= grace_deadline {
+                break;
+            }
+            std::thread::sleep(std::cmp::min(
+                BLOCKING_TERMINATE_POLL_INTERVAL,
+                grace_deadline.saturating_duration_since(now),
+            ));
+        }
+
+        // SAFETY: same owned process group as above. SIGKILL cannot be ignored.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+        let reap_deadline = std::time::Instant::now()
+            .checked_add(BLOCKING_TERMINATE_REAP_BOUND)
+            .unwrap_or_else(std::time::Instant::now);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => {}
+            }
+            let now = std::time::Instant::now();
+            if now >= reap_deadline {
+                return;
+            }
+            std::thread::sleep(std::cmp::min(
+                BLOCKING_TERMINATE_POLL_INTERVAL,
+                reap_deadline.saturating_duration_since(now),
+            ));
+        }
     }
 }
 
@@ -934,6 +989,32 @@ mod tests {
             None => {} // reaped, good
             Some(s) => assert!(!s.starts_with('Z'), "left a zombie: {s}"),
         }
+    }
+
+    #[test]
+    fn blocking_terminate_reaps_after_source_runtime_shutdown() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let child = runtime.block_on(async {
+            Supervised::spawn(
+                "/bin/sh",
+                &["-c", "trap '' TERM; while :; do sleep 1; done"],
+                None,
+            )
+            .unwrap()
+        });
+        let pid = child.pid();
+        drop(runtime);
+
+        child.terminate_blocking(Duration::from_millis(50));
+
+        assert_eq!(
+            proc_state(pid),
+            None,
+            "runtime-independent termination must reap the exact child"
+        );
     }
 
     #[tokio::test]

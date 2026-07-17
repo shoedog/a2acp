@@ -25,7 +25,9 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
   state from an ACP initialization failure. The bridge reports that condition as a typed container-runtime
   fallback candidate, terminates the exact supervised runtime client before one named-container reap, and
   arms that ordered cleanup before the first cancellable post-spawn await so an initializing task cancelled
-  before failure classification cannot strand the named container. Legacy reap callbacks remain detached.
+  before failure classification cannot strand the named container. Cancellation or ordinary-error
+  settlement during Tokio runtime shutdown retains the same independent joined thread/runtime cleanup
+  owner instead of handing either flight back to the shutting reactor. Legacy reap callbacks remain detached.
 - Compatibility canaries now reject additional credential-shaped prerequisite names, surface
   negative/non-finite reported costs as sticky blocking observations across later usage snapshots, and
   directly cover final-sibling same-name replacement before aggregate publication. Ambiguous duplicate

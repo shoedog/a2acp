@@ -125,11 +125,12 @@ start boundary only inside production container spawn. A runtime-observed pre-st
 `container.runtime.start_timeout`; unknown state preserves the prior ACP diagnosis, and a started object
 preserves ordinary initialize behavior. On bridge-owned production paths, an unpublished-spawn guard owns
 the exact client and named removal before the first cancellable post-spawn await; ordinary errors join its
-terminate-then-reap flight and cancellation detaches it. The new typed never-started failure retains a cleanup
-code in its primary causes if removal fails. Public legacy callbacks remain detached fire-and-forget. No
-additional compatibility turn is authorized by this hardening or by its deterministic tests/reviews. The post-incident provider-unexercised
-release binary is 23,075,312 bytes at SHA-256
-`25e5f00c7838081d14528118cfdb39a7ecf94b1e33f220fc6417255855069866`; it has not replaced or replayed
+terminate-then-reap flight. One RAII-held independent OS thread/runtime owns that same order through caller
+cancellation or source-runtime shutdown before or during ordinary-error settlement. The new typed failure retains a
+cleanup code in its primary causes if removal fails. Public legacy callbacks remain detached fire-and-forget.
+No additional compatibility turn is authorized by this hardening or by its deterministic tests/reviews. The
+post-incident provider-unexercised release binary is 22,984,800 bytes at SHA-256
+`7c6cf5407fecb114c51ff211d8526df96c084d07217dc03f2913583c2481093d`; it has not replaced or replayed
 attempt 2's exact `323b4e21...a079` live artifact.
 
 ## Resolved incident: Fable over Claude ACP

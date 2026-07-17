@@ -62,7 +62,8 @@ runtime-confirmed pre-start object fails in `Spawn` as `container.runtime.start_
 `ContainerRuntime` with `ContainerFallbackCandidate` and a false replay barrier; started or unknown state
 cannot be relabeled as that failure. Bridge-owned production spawn arms one cancellation-safe cleanup owner
 immediately after process creation; success transfers it to the backend, ordinary error joins exact-client
-termination then exact named-container removal, and pre-publication cancellation detaches the same order.
+termination then exact named-container removal, and one independent joined thread/runtime owns that order
+through pre-publication cancellation or shutdown during ordinary-error settlement.
 Public legacy reap callbacks retain their detached fire-and-forget contract. This active boundary
 runs only after an operator-selected container path is actually spawned; it does not make doctor mutating or
 billable.
