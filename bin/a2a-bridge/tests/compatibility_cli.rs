@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -86,7 +88,6 @@ fn write_unresolved_manifest(dir: &Path) -> PathBuf {
     manifest
 }
 
-#[cfg(target_os = "linux")]
 fn sha256_hex(bytes: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, bytes)
         .as_ref()
@@ -178,6 +179,227 @@ config_template = "codex-host-read-only-v1"
     )
     .unwrap();
     recipes
+}
+
+fn write_bound_host_resolution(dir: &Path) -> (PathBuf, PathBuf) {
+    let recipes_path = write_recipes(dir);
+    let production_path = dir.join("manifest.toml");
+    let production_raw = fs::read_to_string(&production_path).unwrap();
+    let production: toml::Value = toml::from_str(&production_raw).unwrap();
+    let budget = production.get("budget").unwrap().clone();
+    let baseline = production
+        .get("cases")
+        .and_then(toml::Value::as_array)
+        .unwrap()
+        .iter()
+        .find(|case| {
+            case.get("id").and_then(toml::Value::as_str) == Some("codex-host-bridge-gpt56-sol")
+        })
+        .unwrap()
+        .as_table()
+        .unwrap()
+        .clone();
+    let pins = baseline
+        .get("pins")
+        .and_then(toml::Value::as_table)
+        .unwrap();
+    let adapter = pins.get("adapter").and_then(toml::Value::as_str).unwrap();
+    let agent_cli = pins.get("agent_cli").and_then(toml::Value::as_str).unwrap();
+    let (adapter_name, adapter_version) = adapter.split_once('=').unwrap();
+    let (agent_cli_name, agent_cli_version) = agent_cli.split_once('=').unwrap();
+
+    let bundle = dir.join("bundle");
+    fs::create_dir(&bundle).unwrap();
+    fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(bundle.join("configs")).unwrap();
+    let generated_config = bundle.join("configs/codex-host-floating-current.toml");
+    fs::write(&generated_config, b"generated config before drift\n").unwrap();
+    let config_sha256 = sha256_hex(&fs::read(&generated_config).unwrap());
+    let recipe_sha256 = sha256_hex(&fs::read(&recipes_path).unwrap());
+    let production_sha256 = sha256_hex(production_raw.as_bytes());
+    let resolution_id = "resolution-cli-1";
+    let inventory_sha256 = "1".repeat(64);
+    let tree_sha256 = "2".repeat(64);
+
+    let mut generated = baseline.clone();
+    generated.insert(
+        "id".into(),
+        toml::Value::String("codex-host-floating-current".into()),
+    );
+    generated.insert(
+        "lane".into(),
+        toml::Value::String("floating-current".into()),
+    );
+    generated.insert(
+        "classification".into(),
+        toml::Value::String("canary".into()),
+    );
+    generated.insert(
+        "baseline_case".into(),
+        toml::Value::String("codex-host-bridge-gpt56-sol".into()),
+    );
+    generated.insert(
+        "config".into(),
+        toml::Value::String("configs/codex-host-floating-current.toml".into()),
+    );
+    generated.remove("pins");
+    generated.insert(
+        "resolved".into(),
+        toml::Value::Table(toml::map::Map::from_iter([
+            (
+                "resolution_id".into(),
+                toml::Value::String(resolution_id.into()),
+            ),
+            (
+                "recipe_sha256".into(),
+                toml::Value::String(recipe_sha256.clone()),
+            ),
+            (
+                "config_sha256".into(),
+                toml::Value::String(config_sha256.clone()),
+            ),
+            ("adapter".into(), toml::Value::String(adapter.into())),
+            ("agent_cli".into(), toml::Value::String(agent_cli.into())),
+            (
+                "package_inventory_sha256".into(),
+                toml::Value::String(inventory_sha256.clone()),
+            ),
+            (
+                "package_tree_sha256".into(),
+                toml::Value::String(tree_sha256.clone()),
+            ),
+        ])),
+    );
+    let execution = toml::Value::Table(toml::map::Map::from_iter([
+        ("schema_version".into(), toml::Value::Integer(1)),
+        ("budget".into(), budget),
+        (
+            "cases".into(),
+            toml::Value::Array(vec![toml::Value::Table(generated)]),
+        ),
+    ]));
+    let execution_path = bundle.join("execution-manifest.toml");
+    fs::write(&execution_path, toml::to_string_pretty(&execution).unwrap()).unwrap();
+    let execution_sha256 = sha256_hex(&fs::read(&execution_path).unwrap());
+
+    let candidate = fs::canonicalize(env!("CARGO_BIN_EXE_a2a-bridge")).unwrap();
+    let candidate_bytes = fs::read(&candidate).unwrap();
+    let candidate_sha256 = sha256_hex(&candidate_bytes);
+    let canonical_bundle = fs::canonicalize(&bundle).unwrap();
+    let canonical_recipes = fs::canonicalize(&recipes_path).unwrap();
+    let canonical_production = fs::canonicalize(&production_path).unwrap();
+    let canonical_execution = fs::canonicalize(&execution_path).unwrap();
+    let canonical_config = fs::canonicalize(&generated_config).unwrap();
+    let prerequisites: Vec<_> = baseline
+        .get("required_env")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|required| {
+            serde_json::json!({
+                "name": required.get("name").and_then(toml::Value::as_str).unwrap()
+            })
+        })
+        .collect();
+    let integrity = format!("sha512-{}==", "A".repeat(86));
+    let resolution = serde_json::json!({
+        "schema_version": 1,
+        "state": "complete",
+        "resolution_id": resolution_id,
+        "recipes": {
+            "schema_version": 1,
+            "canonical_path": canonical_recipes,
+            "sha256": recipe_sha256
+        },
+        "production_manifest": {
+            "schema_version": 1,
+            "canonical_path": canonical_production,
+            "sha256": production_sha256
+        },
+        "candidate": {
+            "canonical_path": candidate,
+            "sha256": candidate_sha256,
+            "byte_length": candidate_bytes.len()
+        },
+        "environment": {
+            "environment_owner": "fixture-owner",
+            "os": std::env::consts::OS,
+            "architecture": std::env::consts::ARCH,
+            "runtime": "docker",
+            "runtime_executable": {
+                "canonical_path": candidate,
+                "sha256": candidate_sha256,
+                "byte_length": candidate_bytes.len()
+            }
+        },
+        "limits": {
+            "timeout_secs": 900,
+            "max_download_bytes": 536870912_u64,
+            "max_unpacked_bytes": 1073741824_u64,
+            "max_files": 100000_u64
+        },
+        "execution_manifest": {
+            "schema_version": 1,
+            "canonical_path": canonical_execution,
+            "sha256": execution_sha256
+        },
+        "packages": [{
+            "id": "codex-current",
+            "requested": {
+                "adapter": adapter_name,
+                "adapter_selector": "latest",
+                "agent_cli": agent_cli_name
+            },
+            "adapter": {"name": adapter_name, "version": adapter_version, "integrity": integrity},
+            "agent_cli": {"name": agent_cli_name, "version": agent_cli_version, "integrity": integrity},
+            "resolution_lock_sha256": "3".repeat(64),
+            "inventory_sha256": inventory_sha256,
+            "tree_sha256": tree_sha256,
+            "adapter_executable": {
+                "canonical_path": canonical_bundle.join("packages/codex-current/tree/adapter"),
+                "sha256": "4".repeat(64)
+            },
+            "adapter_executable_relative": "adapter"
+        }],
+        "images": [],
+        "cases": [{
+            "id": "codex-host-floating-current",
+            "baseline_case": "codex-host-bridge-gpt56-sol",
+            "package_set": "codex-current",
+            "model": baseline.get("model").and_then(toml::Value::as_str).unwrap(),
+            "effort": baseline.get("effort").and_then(toml::Value::as_str),
+            "mode": baseline.get("mode").and_then(toml::Value::as_str),
+            "prerequisites": prerequisites,
+            "generated_config": {
+                "canonical_path": canonical_config,
+                "sha256": config_sha256
+            },
+            "binding": {
+                "resolution_id": resolution_id,
+                "recipe_sha256": recipe_sha256,
+                "config_sha256": config_sha256,
+                "adapter": adapter,
+                "agent_cli": agent_cli,
+                "package_inventory_sha256": inventory_sha256,
+                "package_tree_sha256": tree_sha256
+            }
+        }],
+        "model_catalog": {"state": "deferred_to_authorized_smoke"},
+        "protected_inputs": [{
+            "path": canonical_production,
+            "before_sha256": production_sha256,
+            "after_sha256": production_sha256
+        }],
+        "owned_resources": [{"kind": "bundle", "identity": canonical_bundle}]
+    });
+    let resolution_path = bundle.join("resolution.json");
+    fs::write(
+        &resolution_path,
+        serde_json::to_vec_pretty(&resolution).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&resolution_path, fs::Permissions::from_mode(0o600)).unwrap();
+    (resolution_path, generated_config)
 }
 
 fn compatibility_command() -> Command {
@@ -371,6 +593,42 @@ fn resolved_run_billing_acknowledgement_wins_before_resolution_or_output_access(
     );
     assert!(!stderr.contains("cannot open"), "stderr: {stderr}");
     assert!(!out.exists());
+}
+
+#[test]
+fn resolved_run_revalidates_generated_config_before_any_provider_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (resolution, generated_config) = write_bound_host_resolution(dir.path());
+    fs::write(&generated_config, b"drifted after resolution\n").unwrap();
+    let out = dir.path().join("aggregate.json");
+
+    let output = compatibility_command()
+        .arg("run")
+        .arg("--resolution")
+        .arg(&resolution)
+        .arg("--all-resolved")
+        .arg("--environment-owner")
+        .arg("fixture-owner")
+        .arg("--acknowledge-billable")
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        out.exists(),
+        "drift must remain explicit aggregate evidence"
+    );
+    let aggregate: serde_json::Value = serde_json::from_slice(&fs::read(&out).unwrap()).unwrap();
+    assert_eq!(aggregate["success"], false);
+    assert_eq!(aggregate["results"][0]["execution"], "not_run");
+    assert_eq!(
+        aggregate["results"][0]["not_run_reason"],
+        "resolution_generated_config_changed"
+    );
+    assert_eq!(aggregate["results"][0]["smoke"], serde_json::Value::Null);
+    assert_eq!(aggregate["resolution"]["resolution_id"], "resolution-cli-1");
 }
 
 #[test]
@@ -862,4 +1120,192 @@ fn compare_is_non_billable_and_reports_manifest_drift_as_json() {
         report["changes"][0]["dimensions"],
         serde_json::json!(["manifest"])
     );
+}
+
+#[test]
+fn floating_compare_requires_resolution_binding_and_emits_dimensioned_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let current = dir.path().join("floating-aggregate.json");
+    let baseline = dir.path().join("baseline.json");
+    let digest = |byte: char| byte.to_string().repeat(64);
+    let aggregate = serde_json::json!({
+        "schema_version": 1,
+        "candidate": {
+            "canonical_path": "/tmp/a2a-bridge",
+            "sha256": digest('c'),
+            "byte_length": 42
+        },
+        "manifest": {
+            "schema_version": 1,
+            "canonical_path": "/tmp/execution-manifest.toml",
+            "sha256": digest('a')
+        },
+        "selection": {"cases": [], "all": true},
+        "environment_owner": "test-runner",
+        "started_at_ms": 1,
+        "ended_at_ms": 2,
+        "cancelled": false,
+        "success": true,
+        "budget": {
+            "timeout_secs": 30,
+            "max_tokens": 100,
+            "observed_tokens": 1,
+            "observed_cost_usd": 0.0,
+            "token_observation_missing_cases": 0,
+            "cost_observation_missing_cases": 0,
+            "exhausted": false
+        },
+        "resolution": {
+            "resolution_id": "resolution-1",
+            "artifact_sha256": digest('d'),
+            "recipe_sha256": digest('e')
+        },
+        "floating_summary": {
+            "candidate_pass": 1,
+            "candidate_fail": 0,
+            "candidate_unknown": 0
+        },
+        "results": [{
+            "case_id": "floating-only",
+            "baseline_case_id": "baseline-only",
+            "lane": "floating-current",
+            "evidence_path": "bridge_smoke",
+            "probe": "minimal",
+            "billable": true,
+            "execution": "completed",
+            "expected_status": "PASS",
+            "actual_status": "PASS",
+            "expectation_met": true,
+            "classification": "canary",
+            "candidate_outcome": "candidate_pass",
+            "resolved": {
+                "resolution_id": "resolution-1",
+                "recipe_sha256": digest('e'),
+                "config_sha256": digest('f'),
+                "adapter": "@agentclientprotocol/codex-acp=1.2.3",
+                "agent_cli": "@openai/codex=0.150.0",
+                "package_inventory_sha256": digest('1'),
+                "package_tree_sha256": digest('2')
+            },
+            "artifact_policy": {"retention_days": 1, "redaction": "strict"},
+            "duration_ms": 1,
+            "drift": [],
+            "budget_violations": [],
+            "smoke": {
+                "schema_version": 2,
+                "success": true,
+                "attempt": {"id": "attempt-1", "timed_out": false},
+                "request": {"agent": "codex", "model": "m", "config_sha256": digest('f')},
+                "target": {
+                    "execution_mode": "host",
+                    "provenance": [
+                        {
+                            "check": "provenance:codex:adapter",
+                            "status": "ok",
+                            "detail": "package=@agentclientprotocol/codex-acp version=1.2.3"
+                        },
+                        {
+                            "check": "provenance:codex:agent-cli",
+                            "status": "ok",
+                            "detail": "package=@openai/codex version=0.150.0"
+                        }
+                    ],
+                    "authentication": {"path": "automatic"},
+                    "model_catalog": {
+                        "state": "available",
+                        "current_model": "m",
+                        "models": ["m"],
+                        "model_configurable": true,
+                        "effort_levels": [],
+                        "modes": []
+                    }
+                },
+                "session": {"effective_request": {"model": "m"}},
+                "turn": {
+                    "prompt": "Reply exactly PONG. Do not use tools.",
+                    "prompt_calls": 1,
+                    "terminal_state": "completed",
+                    "exact_pong": true
+                },
+                "diagnostics": {"failure": null},
+                "cleanup": {
+                    "cancel": "not_needed",
+                    "release": "completed",
+                    "retire": "completed"
+                }
+            }
+        }]
+    });
+    fs::write(&current, serde_json::to_vec_pretty(&aggregate).unwrap()).unwrap();
+    fs::write(
+        &baseline,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "manifest_schema_version": 1,
+            "manifest_sha256": digest('b'),
+            "aggregate": {
+                "success": true,
+                "cancelled": false,
+                "budget_exhausted": false,
+                "token_observation_missing_cases": 0,
+                "cost_observation_missing_cases": 0
+            },
+            "cases": [{
+                "case_id": "baseline-only",
+                "outcome": null,
+                "status": "PASS",
+                "execution_mode": null,
+                "provenance": [],
+                "capability": {},
+                "authentication": null,
+                "phase": null,
+                "terminal": null,
+                "diagnostic": null
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = compatibility_command()
+        .arg("compare")
+        .arg("--mode")
+        .arg("floating-to-pinned")
+        .arg("--current")
+        .arg(&current)
+        .arg("--baseline")
+        .arg(&baseline)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "floating differences are explicit"
+    );
+    assert!(
+        !output.stdout.is_empty(),
+        "comparison failed before emitting JSON: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let dimensions = report["changes"][0]["dimensions"].as_array().unwrap();
+    assert!(dimensions.iter().any(|value| value == "adapter"));
+    assert!(dimensions
+        .iter()
+        .any(|value| value == "catalog.models_added"));
+
+    let mut unbound = aggregate;
+    unbound.as_object_mut().unwrap().remove("resolution");
+    fs::write(&current, serde_json::to_vec_pretty(&unbound).unwrap()).unwrap();
+    let rejected = compatibility_command()
+        .arg("compare")
+        .arg("--mode")
+        .arg("floating-to-pinned")
+        .arg("--current")
+        .arg(&current)
+        .arg("--baseline")
+        .arg(&baseline)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("resolution binding"));
 }

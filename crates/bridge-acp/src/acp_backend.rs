@@ -1078,6 +1078,10 @@ pub struct AcpBackend {
     /// it is dropped before any `session/new` await so the mint of one session
     /// never blocks lookups of another.
     sessions: Arc<Mutex<HashMap<SessionId, Arc<AgentSession>>>>,
+    /// Bounded catalog snapshots captured from the exact live session/new surface after requested
+    /// model/effort/mode configuration settles. Kept separately so the synchronous backend port
+    /// never turns async session-map contention into a false "catalog unavailable" result.
+    session_catalogs: Arc<StdMutex<HashMap<SessionId, AgentCaps>>>,
     /// Per-bridge-session spec stash (Increment 3b/session-cwd). Dispatch (T10)
     /// calls [`Self::configure_session`] to insert the `SessionSpec` (effective
     /// `model`/`effort`/`mode` + `cwd`) for a session BEFORE its first prompt;
@@ -2628,6 +2632,7 @@ impl AcpBackend {
             unavailable: Arc::new(AtomicBool::new(false)),
             dispatch_gate: Arc::new(StdMutex::new(())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
             policy,
@@ -3095,6 +3100,8 @@ impl AcpBackend {
         // shields the ACP request and its lifecycle grammar from cancellation of
         // the caller that happened to win the race to initialize.
         let cwd_for_mint = desired_cwd.clone();
+        let key_for_mint = key.clone();
+        let catalogs_for_mint = Arc::clone(&self.session_catalogs);
         // MCP servers to offer at session/new (ADR-0028). Static per agent (the entry's `mcp`);
         // `{cwd}` is substituted with `cwd_for_mint` inside `new_session_request`. Empty for
         // non-Acp delivery (codex/kiro get MCP via their native channel, not this param).
@@ -3186,6 +3193,7 @@ impl AcpBackend {
                         };
                         let id = resp.session_id;
                         let opts0 = resp.config_options.unwrap_or_default();
+                        let modes0 = resp.modes;
                         lifecycle
                             .record(
                                 DiagnosticPhase::SessionCreate,
@@ -3360,6 +3368,20 @@ impl AcpBackend {
                         *entry.config_surface.lock().expect("config_surface lock") =
                             Some(refreshed_surface);
 
+                        let mut session_catalog = caps_from_config_options(
+                            &entry
+                                .config_surface
+                                .lock()
+                                .expect("config_surface lock")
+                                .as_ref()
+                                .expect("mint stored its config surface")
+                                .opts,
+                        );
+                        Self::merge_session_modes(&mut session_catalog, modes0);
+                        if let Some(mode) = mode.as_ref() {
+                            session_catalog.current_mode = Some(mode.clone());
+                        }
+
                         // (5) Record the cwd that was actually used to mint this session so
                         // the immutability guard below can compare future requests against
                         // what the agent was ACTUALLY given at session/new (ACP §11A).
@@ -3370,6 +3392,10 @@ impl AcpBackend {
                             .agent_id
                             .set(id.clone())
                             .map_err(|_| BridgeError::InvalidStateTransition)?;
+                        catalogs_for_mint
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(key_for_mint, session_catalog);
                         process_evidence.commit();
 
                         // Publish the id before draining the cancel latch. A racing
@@ -3787,6 +3813,10 @@ impl AcpBackend {
             }
             sessions.remove(session);
         }
+        self.session_catalogs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session);
         if let Ok(mut configs) = self.session_cfg.lock() {
             configs.remove(session);
         }
@@ -4865,6 +4895,14 @@ impl AgentBackend for AcpBackend {
         Ok(())
     }
 
+    fn session_catalog(&self, session: &SessionId) -> Option<AgentCaps> {
+        self.session_catalogs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session)
+            .cloned()
+    }
+
     /// Drop the per-session config stash entry when a task/session ends (T11
     /// inbound-binding eviction). A no-op if `session` was never configured. We
     /// intentionally do NOT touch the agent-side `sessions` map here: the ACP
@@ -4959,6 +4997,16 @@ impl AgentBackend for AcpBackend {
         .await
         {
             Ok((refreshed, _)) => {
+                let mut catalog = caps_from_config_options(&refreshed.opts);
+                let mut catalogs = self
+                    .session_catalogs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(previous) = catalogs.get(session) {
+                    catalog.modes = previous.modes.clone();
+                    catalog.current_mode = previous.current_mode.clone();
+                }
+                catalogs.insert(session.clone(), catalog);
                 *entry.config_surface.lock().expect("config_surface lock") = Some(refreshed);
                 Ok(ReconcileOutcome::Applied)
             }
@@ -7176,6 +7224,7 @@ mod tests {
             unavailable: Arc::new(AtomicBool::new(false)),
             dispatch_gate: Arc::new(StdMutex::new(())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
             policy: Arc::new(StdMutex::new(
@@ -9553,6 +9602,7 @@ mod tests {
             unavailable: Arc::new(AtomicBool::new(false)),
             dispatch_gate: Arc::new(StdMutex::new(())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
             policy: Arc::new(StdMutex::new(
@@ -12092,6 +12142,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_session_catalog_preserves_configured_surface_until_release() {
+        let rec = Recorder::new("agent-sess-CATALOG");
+        *rec.session_modes.lock().await = Some(SessionModeState::new(
+            "default",
+            vec![
+                SessionMode::new("default", "Default"),
+                SessionMode::new("x", "X"),
+                SessionMode::new("plan", "Plan"),
+            ],
+        ));
+        let backend = connect_recording(rec.clone()).await;
+        let session = bkey("bridge-CATALOG");
+        backend
+            .configure_session(
+                &session,
+                &SessionSpec::from_config(EffectiveConfig {
+                    model: Some("m".to_string()),
+                    effort: Some(Effort::High),
+                    mode: Some("x".to_string()),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut stream = backend.prompt(&session, Vec::new()).await.unwrap();
+        while let Some(update) = stream.next().await {
+            if matches!(update.unwrap(), Update::Done { .. }) {
+                break;
+            }
+        }
+
+        let catalog = backend
+            .session_catalog(&session)
+            .expect("the exact live session retains its catalog");
+        assert_eq!(catalog.current_model.as_deref(), Some("m"));
+        assert_eq!(
+            catalog.models,
+            vec!["default", "m", "a", "b", "gpt-x", "haiku"]
+        );
+        assert_eq!(
+            catalog.effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(catalog.current_mode.as_deref(), Some("x"));
+        assert_eq!(catalog.modes, vec!["default", "x", "plan"]);
+        assert_eq!(rec.new_session_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.prompt_log.lock().await.as_slice(), &["start", "end"]);
+
+        backend.release_session_checked(&session).await.unwrap();
+        assert_eq!(backend.session_catalog(&session), None);
+    }
+
+    #[tokio::test]
     async fn describe_options_reads_advertised_config_options() {
         // The default recording agent advertises a model select + an effort select at session/new.
         // describe_options reads them into AgentCaps WITHOUT sending a prompt or configuring anything.
@@ -12296,6 +12399,7 @@ mod tests {
             unavailable: Arc::new(AtomicBool::new(false)),
             dispatch_gate: Arc::new(StdMutex::new(())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
             policy: Arc::new(StdMutex::new(
@@ -13487,6 +13591,7 @@ mod tests {
             unavailable: Arc::new(AtomicBool::new(false)),
             dispatch_gate: Arc::new(StdMutex::new(())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
             policy: Arc::new(StdMutex::new(

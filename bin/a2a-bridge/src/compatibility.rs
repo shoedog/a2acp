@@ -1,4 +1,4 @@
-//! Versioned compatibility manifests and bounded canary execution (R3a).
+//! Versioned compatibility manifests, provider-free floating resolution, and bounded canary execution.
 //!
 //! The runner deliberately shells back into this exact candidate binary's R2c `smoke` command. It
 //! does not own a second prompt path, retry policy, or provider fallback. Selected eligible cases get
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::compatibility_resolution::{
-    self, FloatingTarget, LoadedRecipes, ResolutionState, ResolvedBinding, RuntimeKind,
+    self, FloatingTarget, LoadedRecipes, ResolvedBinding, RuntimeKind,
 };
 use crate::{local_file, BoxError};
 
@@ -31,6 +31,9 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EMBEDDED_SMOKE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_CATALOG_ENTRIES: usize = 128;
+const MAX_CATALOG_VALUE_BYTES: usize = 256;
+const MAX_CATALOG_TOTAL_BYTES: usize = 64 * 1024;
 const MAX_CASES: usize = 128;
 const MAX_ID_BYTES: usize = 128;
 const MAX_TEXT_BYTES: usize = 4096;
@@ -60,11 +63,13 @@ usage: a2a-bridge compatibility validate
               [--baseline <pinned.json>] [--mode pinned|floating-to-pinned]
 
 `validate` is local and non-billable. `resolve` is non-billable but requires explicit acknowledgement
-before registry/image effects. `run` requires both an explicit selection and billing acknowledgement before
-it reads a manifest or resolution. Direct unresolved floating execution is refused. Every eligible selected
-case invokes this exact binary's fixed-prompt R2c smoke once, with no retry or fallback. Child stdout/stderr
-is discarded; one owner-only aggregate JSON artifact is written to --out. `compare` reports pinned
-case/aggregate outcome, provenance, capability, auth, phase, terminal, and diagnostic drift independently.";
+before registry/image effects. It retains its private bundle and uniquely tagged image; it never starts an
+agent session or mutates production pins. `run` requires both an explicit selection and billing
+acknowledgement before it reads a manifest or resolution. Direct unresolved floating execution is refused.
+Every eligible selected case invokes this exact binary's fixed-prompt R2c smoke once, with no retry or
+fallback. Child stdout/stderr is discarded; one owner-only aggregate JSON artifact is written to --out.
+`compare` reports pinned drift or independent floating candidate/provenance/catalog dimensions without
+promoting either lane.";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
@@ -199,14 +204,14 @@ enum RedactionPolicy {
     Strict,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ArtifactPolicy {
     retention_days: u16,
     redaction: RedactionPolicy,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct ManifestBudget {
     timeout_secs: u64,
@@ -230,7 +235,7 @@ struct PinSet {
     components: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct RequiredEnvironment {
     name: String,
@@ -296,6 +301,7 @@ struct LoadedManifest {
     canonical_path: PathBuf,
     canonical_path_text: String,
     sha256: String,
+    resolution_binding: Option<ResolutionBindingRecord>,
 }
 
 fn bounded_text(label: &str, value: &str, max: usize) -> Result<(), BoxError> {
@@ -1001,6 +1007,7 @@ fn load_manifest(path: &Path) -> Result<LoadedManifest, BoxError> {
         canonical_path: snapshot.canonical_path,
         canonical_path_text,
         sha256: snapshot.sha256,
+        resolution_binding: None,
     })
 }
 
@@ -1581,6 +1588,14 @@ struct FloatingSummary {
     candidate_unknown: u32,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ResolutionBindingRecord {
+    resolution_id: String,
+    artifact_sha256: String,
+    recipe_sha256: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CaseResult {
@@ -1598,6 +1613,8 @@ struct CaseResult {
     classification: Classification,
     #[serde(skip_serializing_if = "Option::is_none")]
     candidate_outcome: Option<CandidateOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolved: Option<ResolvedBinding>,
     artifact_policy: ArtifactPolicy,
     duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1624,6 +1641,8 @@ struct AggregateArtifact {
     success: bool,
     budget: BudgetOutcome,
     results: Vec<CaseResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolution: Option<ResolutionBindingRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     floating_summary: Option<FloatingSummary>,
 }
@@ -1713,6 +1732,10 @@ impl SpawnAdmission<'_> {
 
 #[async_trait]
 trait SmokeInvoker: Send + Sync {
+    async fn revalidate(&self, _case: &CompatibilityCase) -> Result<(), &'static str> {
+        Ok(())
+    }
+
     async fn invoke(
         &self,
         request: &SmokeRequest,
@@ -1732,6 +1755,33 @@ struct ProcessSmokeInvoker<'a> {
     executable: StagedExecutable,
     artifact_directory: &'a local_file::PinnedDirectory,
     expected_sha256: String,
+}
+
+struct ResolutionSmokeInvoker<'a> {
+    inner: ProcessSmokeInvoker<'a>,
+    resolution: &'a compatibility_resolution::LoadedResolution,
+    environment_owner: &'a str,
+}
+
+#[async_trait]
+impl SmokeInvoker for ResolutionSmokeInvoker<'_> {
+    async fn revalidate(&self, case: &CompatibilityCase) -> Result<(), &'static str> {
+        compatibility_resolution::revalidate_resolution_case(
+            self.resolution,
+            self.environment_owner,
+            &case.id,
+        )
+        .await
+        .map_err(compatibility_resolution::RevalidationFailure::wire)
+    }
+
+    async fn invoke(
+        &self,
+        request: &SmokeRequest,
+        admission: &SpawnAdmission<'_>,
+    ) -> InvocationResult {
+        self.inner.invoke(request, admission).await
+    }
 }
 
 #[async_trait]
@@ -2411,6 +2461,135 @@ fn valid_smoke_shape(value: &Value, case: &CompatibilityCase) -> bool {
         && value.get("cleanup").is_some_and(Value::is_object)
 }
 
+fn valid_catalog_value(value: &str, total_bytes: &mut usize) -> bool {
+    if value.is_empty()
+        || value.trim() != value
+        || value.len() > MAX_CATALOG_VALUE_BYTES
+        || value.chars().any(char::is_control)
+        || looks_like_secret(value)
+    {
+        return false;
+    }
+    let Some(total) = total_bytes.checked_add(value.len()) else {
+        return false;
+    };
+    if total > MAX_CATALOG_TOTAL_BYTES {
+        return false;
+    }
+    *total_bytes = total;
+    true
+}
+
+fn catalog_strings<'a>(
+    catalog: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Option<Vec<&'a str>> {
+    catalog
+        .get(field)?
+        .as_array()?
+        .iter()
+        .map(Value::as_str)
+        .collect()
+}
+
+fn valid_available_catalog_for(
+    smoke: &Value,
+    model: &str,
+    effort: Option<&str>,
+    mode: Option<&str>,
+) -> bool {
+    let Some(catalog) = smoke
+        .pointer("/target/model_catalog")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let allowed = BTreeSet::from([
+        "state",
+        "current_model",
+        "models",
+        "model_configurable",
+        "effort_levels",
+        "modes",
+        "current_mode",
+    ]);
+    if catalog.keys().any(|key| !allowed.contains(key.as_str()))
+        || catalog.get("state").and_then(Value::as_str) != Some("available")
+    {
+        return false;
+    }
+    let Some(models) = catalog_strings(catalog, "models") else {
+        return false;
+    };
+    let Some(efforts) = catalog_strings(catalog, "effort_levels") else {
+        return false;
+    };
+    let Some(modes) = catalog_strings(catalog, "modes") else {
+        return false;
+    };
+    let Some(configurable) = catalog.get("model_configurable").and_then(Value::as_bool) else {
+        return false;
+    };
+    let current_model = match catalog.get("current_model") {
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => return false,
+        None => None,
+    };
+    let current_mode = match catalog.get("current_mode") {
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => return false,
+        None => None,
+    };
+    if models
+        .len()
+        .saturating_add(efforts.len())
+        .saturating_add(modes.len())
+        > MAX_CATALOG_ENTRIES
+        || configurable && models.is_empty()
+        || current_model.is_some_and(|current| !models.contains(&current))
+        || current_mode.is_some_and(|current| !modes.contains(&current))
+        || configurable && (!models.contains(&model) || current_model != Some(model))
+        || effort.is_some_and(|effort| !efforts.contains(&effort))
+        || mode.is_some_and(|mode| !modes.contains(&mode) || current_mode != Some(mode))
+    {
+        return false;
+    }
+    let mut total_bytes = 0usize;
+    current_model
+        .into_iter()
+        .chain(models)
+        .chain(efforts)
+        .chain(modes)
+        .chain(current_mode)
+        .all(|value| valid_catalog_value(value, &mut total_bytes))
+}
+
+fn valid_available_catalog(smoke: &Value, case: &CompatibilityCase) -> bool {
+    valid_available_catalog_for(
+        smoke,
+        &case.model,
+        case.effort.as_deref(),
+        case.mode.as_deref(),
+    )
+}
+
+fn valid_floating_success_contract(smoke: &Value) -> bool {
+    smoke.get("success").and_then(Value::as_bool) == Some(true)
+        && smoke.pointer("/attempt/timed_out").and_then(Value::as_bool) == Some(false)
+        && smoke.pointer("/turn/prompt_calls").and_then(Value::as_u64) == Some(1)
+        && smoke
+            .pointer("/turn/terminal_state")
+            .and_then(Value::as_str)
+            == Some("completed")
+        && smoke.pointer("/turn/exact_pong").and_then(Value::as_bool) == Some(true)
+        && smoke
+            .pointer("/diagnostics/failure")
+            .is_none_or(Value::is_null)
+        && smoke.pointer("/cleanup/cancel").and_then(Value::as_str) == Some("not_needed")
+        && smoke.pointer("/cleanup/release").and_then(Value::as_str) == Some("completed")
+        && smoke.pointer("/cleanup/retire").and_then(Value::as_str) == Some("completed")
+}
+
 fn provenance_detail<'a>(smoke: &'a Value, agent: &str, component: &str) -> Option<&'a str> {
     let expected_check = format!("provenance:{agent}:{component}");
     let mut matches = smoke
@@ -2574,6 +2753,28 @@ fn drift_for(case: &CompatibilityCase, smoke: &Value) -> Vec<String> {
             }
         }
     }
+    if let Some(resolved) = &case.resolved {
+        if smoke
+            .pointer("/request/config_sha256")
+            .and_then(Value::as_str)
+            != Some(resolved.config_sha256.as_str())
+        {
+            drift.push("resolution.config_sha256".into());
+        }
+        if success || smoke.get("target").is_some_and(|value| !value.is_null()) {
+            if !provenance_package_matches(smoke, &case.agent, "adapter", &resolved.adapter) {
+                drift.push("resolution.adapter".into());
+            }
+            if !provenance_package_matches(smoke, &case.agent, "agent-cli", &resolved.agent_cli) {
+                drift.push("resolution.agent_cli".into());
+            }
+            if resolved.image_digest.as_ref().is_some_and(|expected| {
+                !provenance_field_matches(smoke, &case.agent, "image", "immutable_id", expected)
+            }) {
+                drift.push("resolution.image".into());
+            }
+        }
+    }
     drift
 }
 
@@ -2634,6 +2835,7 @@ fn not_run_result(case: &CompatibilityCase, reason: &str) -> CaseResult {
         classification: case.classification,
         candidate_outcome: (case.lane == Lane::FloatingCurrent)
             .then_some(CandidateOutcome::Unknown),
+        resolved: case.resolved.clone(),
         artifact_policy: case.artifact.clone(),
         duration_ms: 0,
         not_run_reason: Some(reason.into()),
@@ -2659,6 +2861,7 @@ fn runner_failure_result(case: &CompatibilityCase, duration: Duration, code: &st
         classification: case.classification,
         candidate_outcome: (case.lane == Lane::FloatingCurrent)
             .then_some(CandidateOutcome::Unknown),
+        resolved: case.resolved.clone(),
         artifact_policy: case.artifact.clone(),
         duration_ms: duration.as_millis().try_into().unwrap_or(u64::MAX),
         not_run_reason: None,
@@ -2789,6 +2992,7 @@ fn setup_incomplete_aggregate(
         cancelled: false,
         success: false,
         budget: initial_budget(&loaded.manifest.budget),
+        resolution: loaded.resolution_binding.clone(),
         floating_summary: floating_summary(&results),
         results,
     }
@@ -2861,6 +3065,10 @@ async fn build_aggregate<I: SmokeInvoker>(
         {
             budget.exhausted = true;
             results.push(not_run_result(case, "total_budget_insufficient_for_case"));
+            continue;
+        }
+        if let Err(reason) = invoker.revalidate(case).await {
+            results.push(not_run_result(case, reason));
             continue;
         }
         let artifact_path = scratch.join(format!("case-{ordinal:03}.json"));
@@ -2966,7 +3174,15 @@ async fn build_aggregate<I: SmokeInvoker>(
         } else {
             EvidenceStatus::Fail
         };
-        let drift = drift_for(case, &smoke);
+        let mut drift = drift_for(case, &smoke);
+        if case.lane == Lane::FloatingCurrent && smoke_success {
+            if !valid_floating_success_contract(&smoke) {
+                drift.push("outcome.smoke_contract".into());
+            }
+            if !valid_available_catalog(&smoke, case) {
+                drift.push("capability.model_catalog".into());
+            }
+        }
         let mut budget_violations = Vec::new();
         match observed_tokens(&smoke) {
             Some(tokens) => {
@@ -3036,6 +3252,7 @@ async fn build_aggregate<I: SmokeInvoker>(
             expectation_met,
             classification: case.classification,
             candidate_outcome,
+            resolved: case.resolved.clone(),
             artifact_policy: case.artifact.clone(),
             duration_ms: duration.as_millis().try_into().unwrap_or(u64::MAX),
             not_run_reason: None,
@@ -3081,6 +3298,7 @@ async fn build_aggregate<I: SmokeInvoker>(
             && !budget.exhausted
             && !cancellation_requested.load(std::sync::atomic::Ordering::Acquire),
         budget,
+        resolution: loaded.resolution_binding.clone(),
         floating_summary: floating_summary(&results),
         results,
     }
@@ -3393,54 +3611,534 @@ fn compare_artifacts(
     })
 }
 
+fn provenance_package_identity(provenance: &Value, component: &str) -> Option<String> {
+    let suffix = format!(":{component}");
+    let mut matches = provenance.as_array()?.iter().filter(|row| {
+        row.get("check")
+            .and_then(Value::as_str)
+            .is_some_and(|check| check.ends_with(&suffix))
+            && row.get("status").and_then(Value::as_str) == Some("ok")
+    });
+    let detail = matches.next()?.get("detail")?.as_str()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    let package = unique_detail_field(detail, "package")?;
+    let version = unique_detail_field(detail, "version")?;
+    Some(format!("{package}={version}"))
+}
+
+fn provenance_component_field<'a>(
+    provenance: &'a Value,
+    component: &str,
+    field: &str,
+) -> Option<&'a str> {
+    let suffix = format!(":{component}");
+    let mut matches = provenance.as_array()?.iter().filter(|row| {
+        row.get("check")
+            .and_then(Value::as_str)
+            .is_some_and(|check| check.ends_with(&suffix))
+            && row.get("status").and_then(Value::as_str) == Some("ok")
+    });
+    let detail = matches.next()?.get("detail")?.as_str()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    unique_detail_field(detail, field)
+}
+
+#[derive(Default)]
+struct CatalogProjection {
+    available: bool,
+    models: BTreeSet<String>,
+    current_model: Option<String>,
+    model_configurable: Option<bool>,
+    efforts: BTreeSet<String>,
+    modes: BTreeSet<String>,
+    current_mode: Option<String>,
+}
+
+fn catalog_projection(value: &Value) -> CatalogProjection {
+    let Some(catalog) = value.as_object() else {
+        return CatalogProjection::default();
+    };
+    let strings = |field: &str| {
+        catalog
+            .get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    };
+    CatalogProjection {
+        available: catalog.get("state").and_then(Value::as_str) == Some("available"),
+        models: strings("models"),
+        current_model: catalog
+            .get("current_model")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        model_configurable: catalog.get("model_configurable").and_then(Value::as_bool),
+        efforts: strings("effort_levels"),
+        modes: strings("modes"),
+        current_mode: catalog
+            .get("current_mode")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
+}
+
+fn compare_catalogs(before: &Value, after: &Value, dimensions: &mut Vec<String>) {
+    let before = catalog_projection(before);
+    let after = catalog_projection(after);
+    if !after.available {
+        dimensions.push("catalog.unavailable".into());
+    }
+    if after.models.difference(&before.models).next().is_some() {
+        dimensions.push("catalog.models_added".into());
+    }
+    if before.models.difference(&after.models).next().is_some() {
+        dimensions.push("catalog.models_removed".into());
+    }
+    if before.current_model != after.current_model {
+        dimensions.push("catalog.current_model".into());
+    }
+    if before.model_configurable != after.model_configurable {
+        dimensions.push("catalog.model_configurable".into());
+    }
+    if after.efforts.difference(&before.efforts).next().is_some() {
+        dimensions.push("catalog.efforts_added".into());
+    }
+    if before.efforts.difference(&after.efforts).next().is_some() {
+        dimensions.push("catalog.efforts_removed".into());
+    }
+    if after.modes.difference(&before.modes).next().is_some() {
+        dimensions.push("catalog.modes_added".into());
+    }
+    if before.modes.difference(&after.modes).next().is_some() {
+        dimensions.push("catalog.modes_removed".into());
+    }
+    if before.current_mode != after.current_mode {
+        dimensions.push("catalog.current_mode".into());
+    }
+}
+
+fn recompute_candidate_outcome(result: &CaseResult) -> CandidateOutcome {
+    if result.execution != ExecutionState::Completed
+        || !result.drift.is_empty()
+        || !result.budget_violations.is_empty()
+    {
+        return CandidateOutcome::Unknown;
+    }
+    let Some(smoke) = result.smoke.as_ref() else {
+        return CandidateOutcome::Unknown;
+    };
+    match result.actual_status {
+        EvidenceStatus::Fail if smoke.get("success").and_then(Value::as_bool) == Some(false) => {
+            CandidateOutcome::Fail
+        }
+        EvidenceStatus::Pass => {
+            let Some(model) = smoke.pointer("/request/model").and_then(Value::as_str) else {
+                return CandidateOutcome::Unknown;
+            };
+            let effort = smoke.pointer("/request/effort").and_then(Value::as_str);
+            let mode = smoke.pointer("/request/mode").and_then(Value::as_str);
+            let Some(resolved) = result.resolved.as_ref() else {
+                return CandidateOutcome::Unknown;
+            };
+            let agent = smoke.pointer("/request/agent").and_then(Value::as_str);
+            let resolved_matches = smoke
+                .pointer("/request/config_sha256")
+                .and_then(Value::as_str)
+                == Some(resolved.config_sha256.as_str())
+                && agent.is_some_and(|agent| {
+                    provenance_package_matches(smoke, agent, "adapter", &resolved.adapter)
+                        && provenance_package_matches(
+                            smoke,
+                            agent,
+                            "agent-cli",
+                            &resolved.agent_cli,
+                        )
+                        && resolved.image_digest.as_ref().is_none_or(|image| {
+                            provenance_field_matches(smoke, agent, "image", "immutable_id", image)
+                        })
+                });
+            if valid_floating_success_contract(smoke)
+                && valid_available_catalog_for(smoke, model, effort, mode)
+                && resolved_matches
+            {
+                CandidateOutcome::Pass
+            } else {
+                CandidateOutcome::Unknown
+            }
+        }
+        EvidenceStatus::Unknown | EvidenceStatus::Stale | EvidenceStatus::Fail => {
+            CandidateOutcome::Unknown
+        }
+    }
+}
+
+fn validate_floating_aggregate(current: &AggregateArtifact) -> Result<(), BoxError> {
+    let resolution = current
+        .resolution
+        .as_ref()
+        .ok_or("compatibility floating aggregate: completed resolution binding is required")?;
+    stable_id(
+        "floating aggregate resolution id",
+        &resolution.resolution_id,
+    )?;
+    for digest in [&resolution.artifact_sha256, &resolution.recipe_sha256] {
+        if !local_file::valid_sha256(digest) || digest != &digest.to_ascii_lowercase() {
+            return Err("compatibility floating aggregate: invalid resolution binding".into());
+        }
+    }
+    if current.schema_version != 1
+        || !local_file::valid_sha256(&current.candidate.sha256)
+        || current.candidate.sha256 != current.candidate.sha256.to_ascii_lowercase()
+        || current.candidate.byte_length == 0
+        || current.manifest.schema_version != 1
+        || !local_file::valid_sha256(&current.manifest.sha256)
+        || current.manifest.sha256 != current.manifest.sha256.to_ascii_lowercase()
+        || current.results.is_empty()
+        || !current.selection.all
+        || current.selection.lane.is_some()
+        || !current.selection.cases.is_empty()
+        || current.results.iter().any(|result| {
+            result.lane != Lane::FloatingCurrent
+                || result.baseline_case_id.is_none()
+                || result.candidate_outcome.is_none()
+                || result.resolved.is_none()
+        })
+        || current.floating_summary != floating_summary(&current.results)
+    {
+        return Err(
+            "compatibility floating aggregate: all-resolved floating evidence is required".into(),
+        );
+    }
+    let mut case_ids = BTreeSet::new();
+    let mut baseline_ids = BTreeSet::new();
+    for result in &current.results {
+        if !case_ids.insert(result.case_id.as_str())
+            || !baseline_ids.insert(result.baseline_case_id.as_deref().expect("checked above"))
+        {
+            return Err("compatibility floating aggregate: duplicate case mapping".into());
+        }
+        let resolved = result.resolved.as_ref().expect("checked above");
+        compatibility_resolution::validate_resolved_binding(
+            resolved,
+            resolved.image_digest.is_some(),
+            resolved.image_digest.as_deref(),
+        )
+        .map_err(|_| "compatibility floating aggregate: invalid resolved binding")?;
+        if resolved.resolution_id != resolution.resolution_id
+            || resolved.recipe_sha256 != resolution.recipe_sha256
+            || result.candidate_outcome != Some(recompute_candidate_outcome(result))
+        {
+            return Err("compatibility floating aggregate: resolved binding mismatch".into());
+        }
+    }
+    let all_pass = current
+        .results
+        .iter()
+        .all(|result| result.candidate_outcome == Some(CandidateOutcome::Pass));
+    if current.success != (all_pass && !current.cancelled && !current.budget.exhausted) {
+        return Err("compatibility floating aggregate: success summary mismatch".into());
+    }
+    Ok(())
+}
+
+fn compare_floating_to_pinned(
+    current: &AggregateArtifact,
+    baseline: &BaselineArtifact,
+) -> Result<ComparisonReport, BoxError> {
+    validate_floating_aggregate(current)?;
+    if baseline.schema_version != 1 {
+        return Err("compatibility baseline: schema_version must be 1".into());
+    }
+    let mut baseline_cases = BTreeMap::new();
+    for case in &baseline.cases {
+        if baseline_cases.insert(case.case_id.as_str(), case).is_some() {
+            return Err("compatibility baseline: duplicate case id".into());
+        }
+    }
+    let mut changes = Vec::new();
+    for result in &current.results {
+        let baseline_id = result.baseline_case_id.as_deref().expect("validated above");
+        let Some(before) = baseline_cases.get(baseline_id) else {
+            changes.push(ComparisonChange {
+                case_id: result.case_id.clone(),
+                dimensions: vec!["baseline_case_missing".into()],
+            });
+            continue;
+        };
+        let after = baseline_from_result(result);
+        let resolved = result.resolved.as_ref().expect("validated above");
+        let mut dimensions = Vec::new();
+        if provenance_package_identity(&before.provenance, "adapter").as_deref()
+            != Some(resolved.adapter.as_str())
+        {
+            dimensions.push("adapter".into());
+        }
+        if provenance_package_identity(&before.provenance, "agent-cli").as_deref()
+            != Some(resolved.agent_cli.as_str())
+        {
+            dimensions.push("agent_cli".into());
+        }
+        if resolved
+            .base_image_digest
+            .as_ref()
+            .is_some_and(|current_base| {
+                provenance_component_field(&before.provenance, "image", "base_image_digest")
+                    != Some(current_base.as_str())
+            })
+        {
+            dimensions.push("base_image".into());
+        }
+        if resolved.image_digest.as_ref().is_some_and(|current_image| {
+            provenance_component_field(&before.provenance, "image", "immutable_id")
+                != Some(current_image.as_str())
+        }) {
+            dimensions.push("image".into());
+        }
+        let before_catalog = before
+            .capability
+            .get("model_catalog")
+            .unwrap_or(&Value::Null);
+        let after_catalog = result
+            .smoke
+            .as_ref()
+            .and_then(|smoke| smoke.pointer("/target/model_catalog"))
+            .unwrap_or(&Value::Null);
+        compare_catalogs(before_catalog, after_catalog, &mut dimensions);
+        if before.outcome != after.outcome
+            || before.status != after.status
+            || result.candidate_outcome != Some(CandidateOutcome::Pass)
+        {
+            dimensions.push("outcome".into());
+        }
+        if before.authentication != after.authentication {
+            dimensions.push("authentication".into());
+        }
+        if before.capability != after.capability {
+            dimensions.push("capability".into());
+        }
+        if before.phase != after.phase {
+            dimensions.push("phase".into());
+        }
+        if before.terminal != after.terminal {
+            dimensions.push("terminal".into());
+        }
+        if before.diagnostic != after.diagnostic {
+            dimensions.push("diagnostic".into());
+        }
+        dimensions.sort();
+        dimensions.dedup();
+        if !dimensions.is_empty() {
+            changes.push(ComparisonChange {
+                case_id: result.case_id.clone(),
+                dimensions,
+            });
+        }
+    }
+    Ok(ComparisonReport {
+        schema_version: 1,
+        equal: changes.is_empty(),
+        changes,
+    })
+}
+
+fn resolution_binding_mismatch() -> BoxError {
+    "compatibility run: resolution_binding_mismatch".into()
+}
+
+fn validate_bound_execution(
+    resolution: &compatibility_resolution::LoadedResolution,
+    recipes: &LoadedRecipes,
+    production: &LoadedManifest,
+    execution: &LoadedManifest,
+) -> Result<(), BoxError> {
+    let artifact = &resolution.artifact;
+    if artifact.recipes.canonical_path != recipes.canonical_path_text
+        || artifact.recipes.sha256 != recipes.sha256
+        || artifact.production_manifest.canonical_path != production.canonical_path_text
+        || artifact.production_manifest.sha256 != production.sha256
+        || artifact.limits != recipes.recipes.limits
+        || execution.manifest.budget != production.manifest.budget
+    {
+        return Err(resolution_binding_mismatch());
+    }
+    let Some(execution_identity) = artifact.execution_manifest.as_ref() else {
+        return Err(resolution_binding_mismatch());
+    };
+    if execution_identity.canonical_path != execution.canonical_path_text
+        || execution_identity.sha256 != execution.sha256
+        || execution.manifest.cases.len() != artifact.cases.len()
+    {
+        return Err(resolution_binding_mismatch());
+    }
+
+    for package in &artifact.packages {
+        let recipe = recipes
+            .recipes
+            .package_sets
+            .iter()
+            .find(|recipe| recipe.id == package.id)
+            .ok_or_else(resolution_binding_mismatch)?;
+        if package.requested.adapter != recipe.adapter
+            || package.requested.adapter_selector != recipe.adapter_selector
+            || package.requested.agent_cli != recipe.agent_cli
+        {
+            return Err(resolution_binding_mismatch());
+        }
+    }
+    for image in &artifact.images {
+        let recipe = recipes
+            .recipes
+            .images
+            .iter()
+            .find(|recipe| recipe.id == image.id)
+            .ok_or_else(resolution_binding_mismatch)?;
+        if image.requested_base != recipe.base || image.package_sets != recipe.package_sets {
+            return Err(resolution_binding_mismatch());
+        }
+    }
+
+    for resolved_case in &artifact.cases {
+        let recipe = recipes
+            .recipes
+            .cases
+            .iter()
+            .find(|recipe| recipe.id == resolved_case.id)
+            .ok_or_else(resolution_binding_mismatch)?;
+        let baseline = production
+            .manifest
+            .cases
+            .iter()
+            .find(|case| case.id == resolved_case.baseline_case)
+            .ok_or_else(resolution_binding_mismatch)?;
+        let generated = execution
+            .manifest
+            .cases
+            .iter()
+            .find(|case| case.id == resolved_case.id)
+            .ok_or_else(resolution_binding_mismatch)?;
+        let image = resolved_case
+            .image
+            .as_ref()
+            .and_then(|id| artifact.images.iter().find(|image| &image.id == id));
+        let expected_config = PathBuf::from("configs").join(format!("{}.toml", resolved_case.id));
+        let expected_prerequisites: Vec<_> = baseline
+            .required_env
+            .iter()
+            .map(|required| compatibility_resolution::NonSecretPrerequisite {
+                name: required.name.clone(),
+                destination: None,
+            })
+            .chain(
+                baseline
+                    .pins
+                    .as_ref()
+                    .and_then(|pins| pins.components.get("fable-settings"))
+                    .map(|_| compatibility_resolution::NonSecretPrerequisite {
+                        name: "fable-settings".into(),
+                        destination: Some("/root/.claude/settings.json".into()),
+                    }),
+            )
+            .collect();
+        if recipe.baseline_case != resolved_case.baseline_case
+            || recipe.package_set != resolved_case.package_set
+            || recipe.image != resolved_case.image
+            || resolved_case.model != baseline.model
+            || resolved_case.effort != baseline.effort
+            || resolved_case.mode != baseline.mode
+            || resolved_case.prerequisites != expected_prerequisites
+            || artifact.environment.environment_owner != baseline.environment_owner
+            || artifact.environment.os != baseline.os
+            || artifact.environment.architecture != baseline.architecture
+            || generated.lane != Lane::FloatingCurrent
+            || generated.evidence_path != baseline.evidence_path
+            || generated.execution_mode != baseline.execution_mode
+            || generated.os != baseline.os
+            || generated.architecture != baseline.architecture
+            || generated.environment_owner != baseline.environment_owner
+            || generated.expected_image_digest.as_deref()
+                != image.map(|image| image.final_image_id.as_str())
+            || generated.config != expected_config
+            || resolve_case_path(&execution.canonical_path, &generated.config)
+                != PathBuf::from(&resolved_case.generated_config.canonical_path)
+            || generated.agent != baseline.agent
+            || generated.model != baseline.model
+            || generated.effort != baseline.effort
+            || generated.mode != baseline.mode
+            || generated.session_cwd != baseline.session_cwd
+            || generated.auth_path != baseline.auth_path
+            || generated.credential_env != baseline.credential_env
+            || generated.required_env != baseline.required_env
+            || generated.probe != baseline.probe
+            || generated.billable != baseline.billable
+            || generated.timeout_secs != baseline.timeout_secs
+            || generated.max_tokens != baseline.max_tokens
+            || generated.max_cost_usd != baseline.max_cost_usd
+            || generated.retry_cap != baseline.retry_cap
+            || generated.expected_status != baseline.expected_status
+            || generated.classification != Classification::Canary
+            || generated.baseline_case.as_deref() != Some(baseline.id.as_str())
+            || generated.artifact != baseline.artifact
+            || generated.pins.is_some()
+            || generated.resolved.as_ref() != Some(&resolved_case.binding)
+        {
+            return Err(resolution_binding_mismatch());
+        }
+    }
+    Ok(())
+}
+
+fn load_bound_execution(
+    path: &Path,
+    environment_owner: &str,
+) -> Result<(compatibility_resolution::LoadedResolution, LoadedManifest), BoxError> {
+    let resolution = compatibility_resolution::load_resolution(path)?;
+    compatibility_resolution::revalidate_resolution_global(&resolution, environment_owner)
+        .map_err(|failure| format!("compatibility run: {}", failure.wire()))?;
+    let (recipes, production) =
+        load_recipes_with_pinned_manifest(Path::new(&resolution.artifact.recipes.canonical_path))?;
+    let execution_identity = resolution
+        .artifact
+        .execution_manifest
+        .as_ref()
+        .ok_or_else(resolution_binding_mismatch)?;
+    let mut execution = load_manifest(Path::new(&execution_identity.canonical_path))?;
+    validate_bound_execution(&resolution, &recipes, &production, &execution)?;
+    execution.resolution_binding = Some(ResolutionBindingRecord {
+        resolution_id: resolution.artifact.resolution_id.clone(),
+        artifact_sha256: resolution.sha256.clone(),
+        recipe_sha256: resolution.artifact.recipes.sha256.clone(),
+    });
+    Ok((resolution, execution))
+}
+
 async fn run_command(args: RunArgs) -> Result<(), BoxError> {
-    let loaded = match &args.source {
-        RunSource::Manifest(path) => load_manifest(path)?,
+    let (loaded, resolution) = match &args.source {
+        RunSource::Manifest(path) => (load_manifest(path)?, None),
         RunSource::Resolution(path) => {
-            let resolution = compatibility_resolution::load_resolution(path)?;
-            let _resolution_identity = (
-                &resolution.canonical_path,
-                &resolution.canonical_path_text,
-                &resolution.sha256,
-            );
-            if resolution.artifact.state != ResolutionState::Complete {
-                return Err(
-                    "compatibility run: resolution must have state complete before execution"
-                        .into(),
-                );
-            }
-            if resolution.artifact.environment.environment_owner != args.environment_owner {
-                return Err("compatibility run: resolution environment owner mismatch".into());
-            }
-            let available: BTreeSet<_> = resolution
-                .artifact
-                .cases
-                .iter()
-                .map(|case| case.id.as_str())
-                .collect();
-            for requested in &args.selection.cases {
-                if !available.contains(requested.as_str()) {
-                    return Err(format!(
-                        "compatibility run: selected case {requested:?} is not in the resolution"
-                    )
-                    .into());
-                }
-            }
-            if resolution.artifact.cases.is_empty() {
-                return Err("compatibility run: completed resolution contains no cases".into());
-            }
-            return Err(
-                "compatibility run: resolved execution is not implemented in the R3c contract slice"
-                    .into(),
-            );
+            let (resolution, execution) = load_bound_execution(path, &args.environment_owner)?;
+            (execution, Some(resolution))
         }
     };
     let selected = select_case_indices(&loaded.manifest, &args.selection)?;
-    if selected
+    let selected_has_floating = selected
         .iter()
-        .any(|index| loaded.manifest.cases[*index].lane == Lane::FloatingCurrent)
-    {
+        .any(|index| loaded.manifest.cases[*index].lane == Lane::FloatingCurrent);
+    if resolution.is_none() && selected_has_floating {
         return Err("compatibility run: floating_resolution_required; use --resolution".into());
+    }
+    if resolution.is_some()
+        && selected
+            .iter()
+            .any(|index| loaded.manifest.cases[*index].lane != Lane::FloatingCurrent)
+    {
+        return Err(resolution_binding_mismatch());
     }
     let output_directory = ensure_output_outside_repositories(&args.out)?;
     let executable = std::env::current_exe()
@@ -3459,6 +4157,13 @@ async fn run_command(args: RunArgs) -> Result<(), BoxError> {
         byte_length: u64::try_from(executable.bytes.len())
             .map_err(|_| "compatibility run: candidate binary length does not fit u64")?,
     };
+    if resolution.as_ref().is_some_and(|resolution| {
+        resolution.artifact.candidate.canonical_path != candidate.canonical_path
+            || resolution.artifact.candidate.sha256 != candidate.sha256
+            || resolution.artifact.candidate.byte_length != candidate.byte_length
+    }) {
+        return Err("compatibility run: candidate_binary_changed".into());
+    }
     let setup_evidence = setup_incomplete_aggregate(
         &loaded,
         &candidate,
@@ -3470,7 +4175,7 @@ async fn run_command(args: RunArgs) -> Result<(), BoxError> {
     let scratch = output_directory.create_scratch()?;
     let staged_executable = stage_candidate(&executable, &scratch)?;
     drop(executable);
-    let invoker = ProcessSmokeInvoker {
+    let process_invoker = ProcessSmokeInvoker {
         executable: staged_executable,
         artifact_directory: &scratch.pin,
         expected_sha256: candidate.sha256.clone(),
@@ -3484,19 +4189,25 @@ async fn run_command(args: RunArgs) -> Result<(), BoxError> {
             cancellation_for_signal.store(true, std::sync::atomic::Ordering::Release);
         }
     });
-    let aggregate = build_aggregate(
-        AggregateInputs {
-            loaded: &loaded,
-            candidate: &candidate,
-            selection: &args.selection,
-            selected_indices: &selected,
+    let aggregate_inputs = || AggregateInputs {
+        loaded: &loaded,
+        candidate: &candidate,
+        selection: &args.selection,
+        selected_indices: &selected,
+        environment_owner: &args.environment_owner,
+        scratch: &scratch.path,
+        cancellation_requested: &cancellation_requested,
+    };
+    let aggregate = if let Some(resolution) = resolution.as_ref() {
+        let invoker = ResolutionSmokeInvoker {
+            inner: process_invoker,
+            resolution,
             environment_owner: &args.environment_owner,
-            scratch: &scratch.path,
-            cancellation_requested: &cancellation_requested,
-        },
-        &invoker,
-    )
-    .await;
+        };
+        build_aggregate(aggregate_inputs(), &invoker).await
+    } else {
+        build_aggregate(aggregate_inputs(), &process_invoker).await
+    };
     signal_task.abort();
     let success = aggregate.success;
     output_directory.replace_setup_with_final(&output, &setup_evidence, &aggregate)?;
@@ -3819,15 +4530,12 @@ async fn resolve_command(args: ResolveArgs) -> Result<(), BoxError> {
 }
 
 fn compare_command(args: CompareArgs) -> Result<(), BoxError> {
-    if matches!(args.mode, ComparisonMode::FloatingToPinned) {
-        return Err(
-            "compatibility compare: floating-to-pinned is not implemented in the R3c contract slice"
-                .into(),
-        );
-    }
     let current: AggregateArtifact = load_json(&args.current, "compatibility current aggregate")?;
     let baseline: BaselineArtifact = load_json(&args.baseline, "compatibility pinned baseline")?;
-    let report = compare_artifacts(&current, &baseline)?;
+    let report = match args.mode {
+        ComparisonMode::Pinned => compare_artifacts(&current, &baseline)?,
+        ComparisonMode::FloatingToPinned => compare_floating_to_pinned(&current, &baseline)?,
+    };
     let equal = report.equal;
     serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
     println!();
@@ -4022,15 +4730,254 @@ mod tests {
             canonical_path_text: canonical_path.to_str().unwrap().into(),
             canonical_path,
             sha256: "a".repeat(64),
+            resolution_binding: None,
         }
     }
 
+    fn bound_execution_fixture(
+        dir: &Path,
+    ) -> (
+        compatibility_resolution::LoadedResolution,
+        LoadedRecipes,
+        LoadedManifest,
+        LoadedManifest,
+    ) {
+        let root = dir.join("bundle");
+        let recipe_path = dir.join("floating-current.toml");
+        let production_path = dir.join("manifest.toml");
+        let execution_path = root.join("execution-manifest.toml");
+        let config_path = root.join("configs/floating-only.toml");
+        let adapter = "@agentclientprotocol/codex-acp=1.2.3";
+        let agent_cli = "@openai/codex=0.150.0";
+        let binding = ResolvedBinding {
+            resolution_id: "resolution-1".into(),
+            recipe_sha256: "e".repeat(64),
+            config_sha256: "f".repeat(64),
+            adapter: adapter.into(),
+            agent_cli: agent_cli.into(),
+            package_inventory_sha256: "a".repeat(64),
+            package_tree_sha256: "b".repeat(64),
+            image_digest: None,
+            base_image_digest: None,
+        };
+        let mut baseline = case("baseline-only", EvidenceStatus::Pass);
+        baseline.lane = Lane::Pinned;
+        baseline.classification = Classification::Support;
+        baseline.baseline_case = None;
+        baseline.config = PathBuf::from("baseline.toml");
+        baseline.resolved = None;
+        baseline.pins = Some(PinSet {
+            config_sha256: "1".repeat(64),
+            model: baseline.model.clone(),
+            adapter: Some(adapter.into()),
+            agent_cli: Some(agent_cli.into()),
+            image_digest: None,
+            components: BTreeMap::new(),
+        });
+        let mut generated = baseline.clone();
+        generated.id = "floating-only".into();
+        generated.lane = Lane::FloatingCurrent;
+        generated.classification = Classification::Canary;
+        generated.baseline_case = Some(baseline.id.clone());
+        generated.config = PathBuf::from("configs/floating-only.toml");
+        generated.pins = None;
+        generated.resolved = Some(binding.clone());
+        let production = LoadedManifest {
+            manifest: manifest(vec![baseline.clone()]),
+            canonical_path: production_path.clone(),
+            canonical_path_text: production_path.to_string_lossy().into_owned(),
+            sha256: "c".repeat(64),
+            resolution_binding: None,
+        };
+        let execution = LoadedManifest {
+            manifest: manifest(vec![generated]),
+            canonical_path: execution_path.clone(),
+            canonical_path_text: execution_path.to_string_lossy().into_owned(),
+            sha256: "d".repeat(64),
+            resolution_binding: None,
+        };
+        let limits = compatibility_resolution::ResolutionLimits {
+            timeout_secs: 900,
+            max_download_bytes: 536_870_912,
+            max_unpacked_bytes: 1_073_741_824,
+            max_files: 100_000,
+        };
+        let recipes = LoadedRecipes {
+            recipes: compatibility_resolution::FloatingRecipeManifest {
+                schema_version: 1,
+                production_manifest: PathBuf::from("manifest.toml"),
+                limits: limits.clone(),
+                artifact: compatibility_resolution::ResolutionArtifactPolicy {
+                    retention_days: 30,
+                    redaction: compatibility_resolution::ResolutionRedactionPolicy::Strict,
+                },
+                package_sets: vec![compatibility_resolution::PackageSetRecipe {
+                    id: "codex-current".into(),
+                    ecosystem: compatibility_resolution::RecipeEcosystem::Npm,
+                    registry: compatibility_resolution::RecipeRegistry::Npmjs,
+                    adapter: "@agentclientprotocol/codex-acp".into(),
+                    adapter_selector: "latest".into(),
+                    agent_cli: "@openai/codex".into(),
+                }],
+                images: Vec::new(),
+                cases: vec![compatibility_resolution::FloatingCaseRecipe {
+                    id: "floating-only".into(),
+                    baseline_case: "baseline-only".into(),
+                    package_set: "codex-current".into(),
+                    target: FloatingTarget::HostPackageTree,
+                    config_template: compatibility_resolution::ConfigTemplate::CodexHostReadOnlyV1,
+                    image: None,
+                }],
+            },
+            canonical_path: recipe_path.clone(),
+            canonical_path_text: recipe_path.to_string_lossy().into_owned(),
+            sha256: "e".repeat(64),
+        };
+        let package = compatibility_resolution::ResolvedPackageSet {
+            id: "codex-current".into(),
+            requested: compatibility_resolution::RequestedPackageSet {
+                adapter: "@agentclientprotocol/codex-acp".into(),
+                adapter_selector: "latest".into(),
+                agent_cli: "@openai/codex".into(),
+            },
+            adapter: compatibility_resolution::ExactNpmPackage {
+                name: "@agentclientprotocol/codex-acp".into(),
+                version: "1.2.3".into(),
+                integrity: "sha512-YWJj".into(),
+            },
+            agent_cli: compatibility_resolution::ExactNpmPackage {
+                name: "@openai/codex".into(),
+                version: "0.150.0".into(),
+                integrity: "sha512-ZGVm".into(),
+            },
+            bundled_cli_version: None,
+            resolution_lock_sha256: "2".repeat(64),
+            inventory_sha256: "a".repeat(64),
+            tree_sha256: "b".repeat(64),
+            adapter_executable: compatibility_resolution::ArtifactIdentity {
+                canonical_path: root
+                    .join("packages/codex-current/tree/adapter")
+                    .to_string_lossy()
+                    .into_owned(),
+                sha256: "3".repeat(64),
+            },
+            adapter_executable_relative: "adapter".into(),
+        };
+        let resolution = compatibility_resolution::LoadedResolution {
+            artifact: compatibility_resolution::ResolutionArtifact {
+                schema_version: 1,
+                state: compatibility_resolution::ResolutionState::Complete,
+                resolution_id: "resolution-1".into(),
+                recipes: compatibility_resolution::VersionedArtifactIdentity {
+                    schema_version: 1,
+                    canonical_path: recipe_path.to_string_lossy().into_owned(),
+                    sha256: "e".repeat(64),
+                },
+                production_manifest: compatibility_resolution::VersionedArtifactIdentity {
+                    schema_version: 1,
+                    canonical_path: production_path.to_string_lossy().into_owned(),
+                    sha256: "c".repeat(64),
+                },
+                candidate: compatibility_resolution::ExecutableIdentity {
+                    canonical_path: dir.join("candidate").to_string_lossy().into_owned(),
+                    sha256: "4".repeat(64),
+                    byte_length: 42,
+                },
+                environment: compatibility_resolution::ResolutionEnvironment {
+                    environment_owner: "test-runner".into(),
+                    os: std::env::consts::OS.into(),
+                    architecture: std::env::consts::ARCH.into(),
+                    runtime: RuntimeKind::Docker,
+                    runtime_executable: compatibility_resolution::ExecutableIdentity {
+                        canonical_path: dir.join("runtime").to_string_lossy().into_owned(),
+                        sha256: "5".repeat(64),
+                        byte_length: 42,
+                    },
+                },
+                limits,
+                execution_manifest: Some(compatibility_resolution::VersionedArtifactIdentity {
+                    schema_version: 1,
+                    canonical_path: execution_path.to_string_lossy().into_owned(),
+                    sha256: "d".repeat(64),
+                }),
+                packages: vec![package],
+                images: Vec::new(),
+                cases: vec![compatibility_resolution::ResolvedCase {
+                    id: "floating-only".into(),
+                    baseline_case: "baseline-only".into(),
+                    package_set: "codex-current".into(),
+                    image: None,
+                    model: baseline.model,
+                    effort: baseline.effort,
+                    mode: baseline.mode,
+                    prerequisites: Vec::new(),
+                    generated_config: compatibility_resolution::ArtifactIdentity {
+                        canonical_path: config_path.to_string_lossy().into_owned(),
+                        sha256: "f".repeat(64),
+                    },
+                    binding,
+                }],
+                model_catalog: compatibility_resolution::ModelCatalogResolution {
+                    state:
+                        compatibility_resolution::CatalogResolutionState::DeferredToAuthorizedSmoke,
+                },
+                protected_inputs: vec![compatibility_resolution::ProtectedInput {
+                    path: production_path.to_string_lossy().into_owned(),
+                    before_sha256: "c".repeat(64),
+                    after_sha256: "c".repeat(64),
+                }],
+                failure: None,
+                owned_resources: vec![compatibility_resolution::OwnedResource {
+                    kind: compatibility_resolution::OwnedResourceKind::Bundle,
+                    identity: root.to_string_lossy().into_owned(),
+                }],
+            },
+            canonical_path: root.join("resolution.json"),
+            canonical_path_text: root.join("resolution.json").to_string_lossy().into_owned(),
+            sha256: "6".repeat(64),
+        };
+        (resolution, recipes, production, execution)
+    }
+
     fn smoke(case: &CompatibilityCase, success: bool, tokens: Option<u64>) -> Value {
+        let mut provenance = Vec::new();
+        if let Some(resolved) = &case.resolved {
+            for (component, exact) in [
+                ("adapter", resolved.adapter.as_str()),
+                ("agent-cli", resolved.agent_cli.as_str()),
+            ] {
+                let (package, version) = exact.split_once('=').unwrap();
+                provenance.push(json!({
+                    "check": format!("provenance:{}:{component}", case.agent),
+                    "status": "ok",
+                    "detail": format!("package={package} version={version}")
+                }));
+            }
+            if let Some(image) = &resolved.image_digest {
+                provenance.push(json!({
+                    "check": format!("provenance:{}:image", case.agent),
+                    "status": "ok",
+                    "detail": format!("immutable_id={image}")
+                }));
+            }
+        }
+        let mut model_catalog = json!({
+            "state": "available",
+            "current_model": case.model,
+            "models": [case.model.clone()],
+            "model_configurable": true,
+            "effort_levels": case.effort.iter().cloned().collect::<Vec<_>>(),
+            "modes": case.mode.iter().cloned().collect::<Vec<_>>(),
+        });
+        if let Some(mode) = &case.mode {
+            model_catalog["current_mode"] = Value::String(mode.clone());
+        }
         let target = success.then(|| {
             json!({
                 "execution_mode": "host",
-                "provenance": [],
-                "authentication": {"path": "automatic"}
+                "provenance": provenance,
+                "authentication": {"path": "automatic"},
+                "model_catalog": model_catalog
             })
         });
         let failure = (!success).then(|| {
@@ -4046,23 +4993,32 @@ mod tests {
             "schema_version": 2,
             "success": success,
             "bridge": {"package_version": "0.2.1"},
-            "attempt": {"id": format!("attempt-{}", case.id)},
+            "attempt": {
+                "id": format!("attempt-{}", case.id),
+                "timed_out": false,
+            },
             "request": {
                 "agent": case.agent,
                 "model": case.model,
-                "config_sha256": Value::Null
+                "config_sha256": case.resolved.as_ref().map(|resolved| &resolved.config_sha256)
             },
             "target": target,
             "session": {"effective_request": {"model": case.model}},
             "turn": {
                 "prompt": crate::smoke::FIXED_PROMPT,
+                "prompt_calls": 1,
                 "terminal_state": if success { "completed" } else { "not_started" },
                 "stop_reason": if success { Value::String("end_turn".into()) } else { Value::Null },
                 "exact_pong": success,
                 "usage": tokens.map(|used| json!({"used": used}))
             },
             "diagnostics": {"failure": failure},
-            "cleanup": {}
+            "cleanup": {
+                "cancel": "not_needed",
+                "release": "completed",
+                "retire": "completed",
+                "run_scoped_backstop": "not_needed"
+            }
         })
     }
 
@@ -4071,12 +5027,35 @@ mod tests {
         results: Mutex<VecDeque<InvocationResult>>,
     }
 
+    struct RejectingRevalidationInvoker {
+        reason: &'static str,
+        revalidations: Mutex<Vec<String>>,
+        calls: Mutex<Vec<String>>,
+    }
+
     impl FakeInvoker {
         fn new(results: Vec<InvocationResult>) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
                 results: Mutex::new(results.into()),
             }
+        }
+    }
+
+    #[async_trait]
+    impl SmokeInvoker for RejectingRevalidationInvoker {
+        async fn revalidate(&self, case: &CompatibilityCase) -> Result<(), &'static str> {
+            self.revalidations.lock().unwrap().push(case.id.clone());
+            Err(self.reason)
+        }
+
+        async fn invoke(
+            &self,
+            request: &SmokeRequest,
+            _admission: &SpawnAdmission<'_>,
+        ) -> InvocationResult {
+            self.calls.lock().unwrap().push(request.agent.clone());
+            panic!("a rejected resolution revalidation must prevent provider spawn")
         }
     }
 
@@ -4240,6 +5219,7 @@ mod tests {
                 cost_observation_missing_cases: 0,
                 exhausted: false,
             },
+            resolution: None,
             floating_summary: floating_summary(&results),
             results,
         }
@@ -4637,6 +5617,34 @@ agent_cli = "@openai/codex=0.144.1"
         );
     }
 
+    #[test]
+    fn bound_execution_crosslinks_recipe_resolution_manifest_and_baseline_literally() {
+        let dir = tempfile::tempdir().unwrap();
+        let (resolution, recipes, production, execution) = bound_execution_fixture(dir.path());
+        validate_bound_execution(&resolution, &recipes, &production, &execution).unwrap();
+
+        let (resolution, recipes, production, mut execution) = bound_execution_fixture(dir.path());
+        execution.manifest.cases[0].model = "different-model".into();
+        assert!(validate_bound_execution(&resolution, &recipes, &production, &execution).is_err());
+
+        let (resolution, mut recipes, production, execution) = bound_execution_fixture(dir.path());
+        recipes.recipes.package_sets[0].adapter = "@agentclientprotocol/claude-agent-acp".into();
+        assert!(validate_bound_execution(&resolution, &recipes, &production, &execution).is_err());
+
+        let (mut resolution, recipes, production, execution) = bound_execution_fixture(dir.path());
+        resolution.artifact.cases[0].prerequisites.push(
+            compatibility_resolution::NonSecretPrerequisite {
+                name: "unexpected".into(),
+                destination: None,
+            },
+        );
+        assert!(validate_bound_execution(&resolution, &recipes, &production, &execution).is_err());
+
+        let (resolution, recipes, mut production, execution) = bound_execution_fixture(dir.path());
+        production.manifest.budget.max_tokens += 1;
+        assert!(validate_bound_execution(&resolution, &recipes, &production, &execution).is_err());
+    }
+
     #[tokio::test]
     async fn floating_failure_is_blocking_while_selected_cases_still_invoke_once_without_retry() {
         let dir = tempfile::tempdir().unwrap();
@@ -4672,10 +5680,14 @@ agent_cli = "@openai/codex=0.144.1"
             .results
             .iter()
             .all(|result| result.execution == ExecutionState::Completed));
-        assert!(aggregate
-            .results
-            .iter()
-            .all(|result| result.expectation_met));
+        assert!(
+            aggregate
+                .results
+                .iter()
+                .all(|result| result.expectation_met),
+            "results: {:?}",
+            aggregate.results
+        );
         assert_eq!(
             aggregate.results[0].candidate_outcome,
             Some(CandidateOutcome::Fail)
@@ -4693,6 +5705,108 @@ agent_cli = "@openai/codex=0.144.1"
             })
         );
         assert!(!aggregate.success);
+    }
+
+    #[tokio::test]
+    async fn every_bound_drift_family_is_candidate_unknown_before_fake_spawn() {
+        for reason in [
+            "candidate_binary_changed",
+            "resolution_artifact_changed",
+            "resolution_generated_config_changed",
+            "resolution_package_tree_changed",
+            "resolution_adapter_executable_changed",
+            "resolution_image_changed",
+            "resolution_environment_owner_changed",
+            "resolution_prerequisite_changed",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let loaded = loaded(dir.path(), vec![case("only", EvidenceStatus::Pass)]);
+            let invoker = RejectingRevalidationInvoker {
+                reason,
+                revalidations: Mutex::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
+            };
+            let cancelled = AtomicBool::new(false);
+            let aggregate = build_aggregate(
+                AggregateInputs {
+                    loaded: &loaded,
+                    candidate: &candidate_identity(),
+                    selection: &selection(),
+                    selected_indices: &[0],
+                    environment_owner: "test-runner",
+                    scratch: dir.path(),
+                    cancellation_requested: &cancelled,
+                },
+                &invoker,
+            )
+            .await;
+
+            assert_eq!(&*invoker.revalidations.lock().unwrap(), &["only"]);
+            assert!(invoker.calls.lock().unwrap().is_empty());
+            assert_eq!(aggregate.results[0].execution, ExecutionState::NotRun);
+            assert_eq!(aggregate.results[0].not_run_reason.as_deref(), Some(reason));
+            assert_eq!(
+                aggregate.results[0].candidate_outcome,
+                Some(CandidateOutcome::Unknown)
+            );
+            assert!(!aggregate.success);
+        }
+    }
+
+    #[tokio::test]
+    async fn floating_pass_requires_exact_terminal_and_available_same_session_catalog() {
+        for (mutation, expected_drift) in [
+            ("missing_catalog", "capability.model_catalog"),
+            ("rejected_catalog", "capability.model_catalog"),
+            ("non_exact_terminal", "outcome.smoke_contract"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let case = case("only", EvidenceStatus::Pass);
+            let mut artifact = smoke(&case, true, Some(1));
+            match mutation {
+                "missing_catalog" => {
+                    artifact["target"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("model_catalog");
+                }
+                "rejected_catalog" => {
+                    artifact["target"]["model_catalog"] = json!({
+                        "state": "rejected",
+                        "code": "catalog_unavailable"
+                    });
+                }
+                "non_exact_terminal" => artifact["turn"]["exact_pong"] = json!(false),
+                _ => unreachable!(),
+            }
+            let invoker = FakeInvoker::new(vec![invocation(artifact)]);
+            let loaded = loaded(dir.path(), vec![case]);
+            let cancelled = AtomicBool::new(false);
+            let aggregate = build_aggregate(
+                AggregateInputs {
+                    loaded: &loaded,
+                    candidate: &candidate_identity(),
+                    selection: &selection(),
+                    selected_indices: &[0],
+                    environment_owner: "test-runner",
+                    scratch: dir.path(),
+                    cancellation_requested: &cancelled,
+                },
+                &invoker,
+            )
+            .await;
+
+            assert_eq!(&*invoker.calls.lock().unwrap(), &["only"]);
+            assert_eq!(
+                aggregate.results[0].candidate_outcome,
+                Some(CandidateOutcome::Unknown)
+            );
+            assert!(aggregate.results[0]
+                .drift
+                .iter()
+                .any(|dimension| dimension == expected_drift));
+            assert!(!aggregate.success);
+        }
     }
 
     #[test]
@@ -5657,6 +6771,7 @@ agent_cli = "@openai/codex=0.144.1"
     #[test]
     fn pinned_drift_requires_exact_agent_rows_and_all_requested_capabilities() {
         let mut case = case("codex", EvidenceStatus::Pass);
+        case.resolved = None;
         case.effort = Some("xhigh".into());
         case.mode = Some("read-only".into());
         case.pins = Some(PinSet {
@@ -5705,6 +6820,7 @@ agent_cli = "@openai/codex=0.144.1"
     #[test]
     fn claude_pins_require_exact_ok_adapter_and_sdk_rows() {
         let mut case = case("claude", EvidenceStatus::Pass);
+        case.resolved = None;
         case.pins = Some(PinSet {
             config_sha256: "a".repeat(64),
             model: case.model.clone(),
@@ -5790,6 +6906,7 @@ agent_cli = "@openai/codex=0.144.1"
     #[test]
     fn container_drift_requires_the_exact_immutable_image_identity() {
         let mut case = case("reader", EvidenceStatus::Pass);
+        case.resolved = None;
         case.execution_mode = ExecutionMode::ContainerRo;
         case.expected_image_digest = Some(format!("sha256:{}", "b".repeat(64)));
         let mut artifact = smoke(&case, true, Some(1));
@@ -5826,6 +6943,7 @@ agent_cli = "@openai/codex=0.144.1"
             expectation_met: true,
             classification: Classification::Support,
             candidate_outcome: None,
+            resolved: None,
             artifact_policy: case.artifact,
             duration_ms: 1,
             not_run_reason: None,
@@ -5867,6 +6985,7 @@ agent_cli = "@openai/codex=0.144.1"
                 cost_observation_missing_cases: 1,
                 exhausted: false,
             },
+            resolution: None,
             floating_summary: None,
             results: vec![result],
         };
@@ -5904,6 +7023,110 @@ agent_cli = "@openai/codex=0.144.1"
             .contains("invalid manifest identity"));
     }
 
+    #[tokio::test]
+    async fn floating_compare_requires_resolution_and_reports_independent_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let case = case("only", EvidenceStatus::Pass);
+        let invoker = FakeInvoker::new(vec![invocation(smoke(&case, true, Some(1)))]);
+        let loaded = loaded(dir.path(), vec![case]);
+        let cancelled = AtomicBool::new(false);
+        let mut current = build_aggregate(
+            AggregateInputs {
+                loaded: &loaded,
+                candidate: &candidate_identity(),
+                selection: &selection(),
+                selected_indices: &[0],
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &invoker,
+        )
+        .await;
+        current.resolution = Some(ResolutionBindingRecord {
+            resolution_id: "resolution-1".into(),
+            artifact_sha256: "d".repeat(64),
+            recipe_sha256: "e".repeat(64),
+        });
+        let mut before = baseline_from_result(&current.results[0]);
+        before.case_id = "baseline-only".into();
+        before.status = EvidenceStatus::Fail;
+        before.provenance = json!([
+            {
+                "check": "provenance:only:adapter",
+                "status": "ok",
+                "detail": "package=@agentclientprotocol/codex-acp version=1.0.0"
+            },
+            {
+                "check": "provenance:only:agent-cli",
+                "status": "ok",
+                "detail": "package=@openai/codex version=0.140.0"
+            }
+        ]);
+        before.authentication = json!({"path": "configured_method"});
+        before.capability = json!({"request": {"model": "old-model"}});
+        before.phase = json!("old-phase");
+        before.terminal = json!({"old": true});
+        before.diagnostic = json!({"old": true});
+        let baseline = BaselineArtifact {
+            schema_version: 1,
+            manifest_schema_version: 1,
+            manifest_sha256: "a".repeat(64),
+            aggregate: baseline_from_aggregate(&current),
+            cases: vec![before],
+        };
+        let resolved = current.results[0].resolved.as_mut().unwrap();
+        resolved.image_digest = Some(format!("sha256:{}", "8".repeat(64)));
+        resolved.base_image_digest = Some(format!("sha256:{}", "9".repeat(64)));
+        current.results[0].smoke.as_mut().unwrap()["target"]["provenance"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "check": "provenance:only:image",
+                "status": "ok",
+                "detail": format!("immutable_id=sha256:{}", "8".repeat(64))
+            }));
+
+        let report = compare_floating_to_pinned(&current, &baseline).unwrap();
+        assert!(!report.equal);
+        let dimensions: BTreeSet<_> = report.changes[0]
+            .dimensions
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for expected in [
+            "adapter",
+            "agent_cli",
+            "base_image",
+            "image",
+            "catalog.models_added",
+            "catalog.current_model",
+            "catalog.model_configurable",
+            "authentication",
+            "capability",
+            "outcome",
+            "phase",
+            "terminal",
+            "diagnostic",
+        ] {
+            assert!(
+                dimensions.contains(expected),
+                "missing {expected:?} in {dimensions:?}"
+            );
+        }
+
+        let mut missing_resolution = current.clone();
+        missing_resolution.resolution = None;
+        assert!(compare_floating_to_pinned(&missing_resolution, &baseline).is_err());
+        let mut partial_selection = current.clone();
+        partial_selection.selection.all = false;
+        partial_selection.selection.cases = vec!["only".into()];
+        assert!(compare_floating_to_pinned(&partial_selection, &baseline).is_err());
+        let mut mixed_lane = current;
+        mixed_lane.results[0].lane = Lane::Pinned;
+        assert!(compare_floating_to_pinned(&mixed_lane, &baseline).is_err());
+    }
+
     #[test]
     fn comparison_keeps_prompt_count_lifecycle_drops_and_retry_metadata() {
         let mut case = case("pinned", EvidenceStatus::Fail);
@@ -5928,6 +7151,7 @@ agent_cli = "@openai/codex=0.144.1"
             expectation_met: true,
             classification: Classification::Support,
             candidate_outcome: None,
+            resolved: None,
             artifact_policy: case.artifact,
             duration_ms: 1,
             not_run_reason: None,
@@ -5967,6 +7191,7 @@ agent_cli = "@openai/codex=0.144.1"
                 cost_observation_missing_cases: 1,
                 exhausted: false,
             },
+            resolution: None,
             floating_summary: None,
             results: vec![changed],
         };
@@ -6001,6 +7226,7 @@ agent_cli = "@openai/codex=0.144.1"
             expectation_met: true,
             classification: Classification::Support,
             candidate_outcome: None,
+            resolved: None,
             artifact_policy: case.artifact.clone(),
             duration_ms: 1,
             not_run_reason: None,
@@ -6075,6 +7301,7 @@ agent_cli = "@openai/codex=0.144.1"
             expectation_met: true,
             classification: Classification::Support,
             candidate_outcome: None,
+            resolved: None,
             artifact_policy: case.artifact,
             duration_ms: 1,
             not_run_reason: None,
@@ -6108,6 +7335,7 @@ agent_cli = "@openai/codex=0.144.1"
                 cost_observation_missing_cases: 1,
                 exhausted: false,
             },
+            resolution: None,
             floating_summary: None,
             results: vec![result],
         };

@@ -133,6 +133,11 @@ pub trait AgentBackend: Send + Sync {
     ) -> Result<(), BridgeError> {
         Ok(())
     }
+    /// Return the bounded model/effort/mode surface retained from this exact live session.
+    /// Backends that do not expose a session catalog remain source-compatible and report none.
+    fn session_catalog(&self, _session: &SessionId) -> Option<crate::catalog::AgentCaps> {
+        None
+    }
     /// Drop per-session state (config stash, etc.) when a task/session ends. Default: no-op.
     /// MUST be a trait method — the inbound binding eviction (T11) calls it through `Arc<dyn AgentBackend>`.
     async fn forget_session(&self, _session: &SessionId) {}

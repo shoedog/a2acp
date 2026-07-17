@@ -22,6 +22,7 @@ pub(super) const DEFAULT_RECIPES: &str = "compatibility/floating-current.toml";
 const MAX_RECIPE_BYTES: u64 = 1024 * 1024;
 const MAX_RESOLUTION_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LOCK_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 128;
@@ -229,7 +230,7 @@ pub(super) struct ProviderFreeResolutionRequest {
     pub(super) protected_inputs: Vec<ProtectedFileInput>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ResolvedBinding {
     pub(super) resolution_id: String,
@@ -277,14 +278,14 @@ impl RuntimeKind {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ArtifactIdentity {
     pub(super) canonical_path: String,
     pub(super) sha256: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct VersionedArtifactIdentity {
     pub(super) schema_version: u16,
@@ -292,7 +293,7 @@ pub(super) struct VersionedArtifactIdentity {
     pub(super) sha256: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ExecutableIdentity {
     pub(super) canonical_path: String,
@@ -300,7 +301,7 @@ pub(super) struct ExecutableIdentity {
     pub(super) byte_length: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ResolutionEnvironment {
     pub(super) environment_owner: String,
@@ -310,7 +311,7 @@ pub(super) struct ResolutionEnvironment {
     pub(super) runtime_executable: ExecutableIdentity,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RequestedPackageSet {
     pub(super) adapter: String,
@@ -326,7 +327,7 @@ pub(super) struct ExactNpmPackage {
     pub(super) integrity: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ResolvedPackageSet {
     pub(super) id: String,
@@ -342,7 +343,7 @@ pub(super) struct ResolvedPackageSet {
     pub(super) adapter_executable_relative: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ResolvedImage {
     pub(super) id: String,
@@ -356,7 +357,7 @@ pub(super) struct ResolvedImage {
     pub(super) labels: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct NonSecretPrerequisite {
     pub(super) name: String,
@@ -364,7 +365,7 @@ pub(super) struct NonSecretPrerequisite {
     pub(super) destination: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ResolvedCase {
     pub(super) id: String,
@@ -979,8 +980,10 @@ fn validate_executable_identity(label: &str, identity: &ExecutableIdentity) -> R
         MAX_TEXT_BYTES,
     )?;
     validate_sha256(&format!("{label} sha256"), &identity.sha256)?;
-    if identity.byte_length == 0 {
-        return Err(format!("{label} byte_length must be positive"));
+    if identity.byte_length == 0 || identity.byte_length > MAX_EXECUTABLE_BYTES {
+        return Err(format!(
+            "{label} byte_length must be positive and at most {MAX_EXECUTABLE_BYTES} bytes"
+        ));
     }
     Ok(())
 }
@@ -2658,6 +2661,9 @@ async fn materialize_package_set(
     let mut inventory_bytes = serde_json::to_vec_pretty(&sealed.inventory)
         .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
     inventory_bytes.push(b'\n');
+    if inventory_bytes.len() as u64 > MAX_RESOLUTION_BYTES {
+        return Err(ResolutionFailureCode::PackageTreeDrift);
+    }
     create_synced_file(
         &package_directory,
         OsStr::new("inventory.json"),
@@ -3555,6 +3561,423 @@ fn parse_image_inspect(
         return Err("image inspect labels do not match exact resolution provenance".into());
     }
     Ok(id.to_owned())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RevalidationFailure {
+    ResolutionArtifactChanged,
+    RecipeChanged,
+    ProductionManifestChanged,
+    ExecutionManifestChanged,
+    CandidateBinaryChanged,
+    RuntimeExecutableChanged,
+    ProtectedInputChanged,
+    GeneratedConfigChanged,
+    PackageLockChanged,
+    PackageTreeChanged,
+    AdapterExecutableChanged,
+    ImageChanged,
+    EnvironmentOwnerChanged,
+    PlatformChanged,
+    PrerequisiteChanged,
+    BindingChanged,
+}
+
+impl RevalidationFailure {
+    pub(super) fn wire(self) -> &'static str {
+        match self {
+            Self::ResolutionArtifactChanged => "resolution_artifact_changed",
+            Self::RecipeChanged => "resolution_recipe_changed",
+            Self::ProductionManifestChanged => "resolution_production_manifest_changed",
+            Self::ExecutionManifestChanged => "resolution_execution_manifest_changed",
+            Self::CandidateBinaryChanged => "candidate_binary_changed",
+            Self::RuntimeExecutableChanged => "resolution_runtime_executable_changed",
+            Self::ProtectedInputChanged => "resolution_protected_input_changed",
+            Self::GeneratedConfigChanged => "resolution_generated_config_changed",
+            Self::PackageLockChanged => "resolution_package_lock_changed",
+            Self::PackageTreeChanged => "resolution_package_tree_changed",
+            Self::AdapterExecutableChanged => "resolution_adapter_executable_changed",
+            Self::ImageChanged => "resolution_image_changed",
+            Self::EnvironmentOwnerChanged => "resolution_environment_owner_changed",
+            Self::PlatformChanged => "resolution_platform_changed",
+            Self::PrerequisiteChanged => "resolution_prerequisite_changed",
+            Self::BindingChanged => "resolution_binding_changed",
+        }
+    }
+}
+
+fn revalidate_regular_file(
+    canonical_path: &str,
+    expected_sha256: &str,
+    max_bytes: u64,
+    failure: RevalidationFailure,
+) -> Result<local_file::LocalFileSnapshot, RevalidationFailure> {
+    let snapshot = local_file::read_regular_file_bounded(
+        Path::new(canonical_path),
+        "compatibility resolution revalidation",
+        max_bytes,
+    )
+    .map_err(|_| failure)?;
+    if snapshot.canonical_path.to_str() != Some(canonical_path)
+        || snapshot.sha256 != expected_sha256
+    {
+        return Err(failure);
+    }
+    Ok(snapshot)
+}
+
+fn revalidate_executable(
+    identity: &ExecutableIdentity,
+    failure: RevalidationFailure,
+) -> Result<(), RevalidationFailure> {
+    let snapshot = revalidate_regular_file(
+        &identity.canonical_path,
+        &identity.sha256,
+        MAX_EXECUTABLE_BYTES,
+        failure,
+    )?;
+    if snapshot.bytes.len() as u64 != identity.byte_length {
+        return Err(failure);
+    }
+    Ok(())
+}
+
+fn resolution_bundle_root(loaded: &LoadedResolution) -> Result<PathBuf, RevalidationFailure> {
+    let root = loaded
+        .canonical_path
+        .parent()
+        .ok_or(RevalidationFailure::ResolutionArtifactChanged)?;
+    let canonical_root =
+        fs::canonicalize(root).map_err(|_| RevalidationFailure::ResolutionArtifactChanged)?;
+    if canonical_root != root
+        || loaded.canonical_path != canonical_root.join("resolution.json")
+        || loaded.canonical_path.to_str() != Some(loaded.canonical_path_text.as_str())
+        || !loaded.artifact.owned_resources.iter().any(|resource| {
+            resource.kind == OwnedResourceKind::Bundle
+                && Path::new(&resource.identity) == canonical_root
+        })
+    {
+        return Err(RevalidationFailure::ResolutionArtifactChanged);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = fs::symlink_metadata(&canonical_root)
+            .map_err(|_| RevalidationFailure::ResolutionArtifactChanged)?;
+        // SAFETY: geteuid has no preconditions and only reads the process credential.
+        let owner = unsafe { libc::geteuid() };
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != owner
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(RevalidationFailure::ResolutionArtifactChanged);
+        }
+    }
+    Ok(canonical_root)
+}
+
+pub(super) fn revalidate_resolution_global(
+    loaded: &LoadedResolution,
+    environment_owner: &str,
+) -> Result<(), RevalidationFailure> {
+    if loaded.artifact.state != ResolutionState::Complete {
+        return Err(RevalidationFailure::ResolutionArtifactChanged);
+    }
+    let root = resolution_bundle_root(loaded)?;
+    let resolution_path = loaded
+        .canonical_path
+        .to_str()
+        .ok_or(RevalidationFailure::ResolutionArtifactChanged)?;
+    revalidate_regular_file(
+        resolution_path,
+        &loaded.sha256,
+        MAX_RESOLUTION_BYTES,
+        RevalidationFailure::ResolutionArtifactChanged,
+    )?;
+    if loaded.artifact.environment.environment_owner != environment_owner {
+        return Err(RevalidationFailure::EnvironmentOwnerChanged);
+    }
+    if loaded.artifact.environment.os != std::env::consts::OS
+        || loaded.artifact.environment.architecture != std::env::consts::ARCH
+    {
+        return Err(RevalidationFailure::PlatformChanged);
+    }
+    revalidate_regular_file(
+        &loaded.artifact.recipes.canonical_path,
+        &loaded.artifact.recipes.sha256,
+        MAX_RECIPE_BYTES,
+        RevalidationFailure::RecipeChanged,
+    )?;
+    revalidate_regular_file(
+        &loaded.artifact.production_manifest.canonical_path,
+        &loaded.artifact.production_manifest.sha256,
+        MAX_RECIPE_BYTES,
+        RevalidationFailure::ProductionManifestChanged,
+    )?;
+    let execution_manifest = loaded
+        .artifact
+        .execution_manifest
+        .as_ref()
+        .ok_or(RevalidationFailure::ExecutionManifestChanged)?;
+    if Path::new(&execution_manifest.canonical_path) != root.join("execution-manifest.toml") {
+        return Err(RevalidationFailure::ExecutionManifestChanged);
+    }
+    revalidate_regular_file(
+        &execution_manifest.canonical_path,
+        &execution_manifest.sha256,
+        MAX_RECIPE_BYTES,
+        RevalidationFailure::ExecutionManifestChanged,
+    )?;
+    revalidate_executable(
+        &loaded.artifact.candidate,
+        RevalidationFailure::CandidateBinaryChanged,
+    )?;
+    revalidate_executable(
+        &loaded.artifact.environment.runtime_executable,
+        RevalidationFailure::RuntimeExecutableChanged,
+    )?;
+    for input in &loaded.artifact.protected_inputs {
+        revalidate_regular_file(
+            &input.path,
+            &input.after_sha256,
+            MAX_EXECUTABLE_BYTES,
+            RevalidationFailure::ProtectedInputChanged,
+        )?;
+    }
+    Ok(())
+}
+
+fn revalidate_package(
+    loaded: &LoadedResolution,
+    package: &ResolvedPackageSet,
+) -> Result<(), RevalidationFailure> {
+    let root = resolution_bundle_root(loaded)?;
+    let package_root = root.join("packages").join(&package.id);
+    let lock = local_file::read_regular_file_bounded(
+        &package_root.join("package-lock.json"),
+        "compatibility resolved package lock revalidation",
+        MAX_LOCK_BYTES,
+    )
+    .map_err(|_| RevalidationFailure::PackageLockChanged)?;
+    if lock.canonical_path != package_root.join("package-lock.json")
+        || lock.sha256 != package.resolution_lock_sha256
+    {
+        return Err(RevalidationFailure::PackageLockChanged);
+    }
+    let parsed = parse_package_lock(
+        &lock.bytes,
+        &package.requested.adapter,
+        &package.requested.agent_cli,
+        loaded.artifact.limits.max_files,
+    )
+    .map_err(|_| RevalidationFailure::PackageLockChanged)?;
+    if parsed.adapter != package.adapter || parsed.agent_cli != package.agent_cli {
+        return Err(RevalidationFailure::PackageLockChanged);
+    }
+
+    let tree = package_root.join("tree");
+    let tree_metadata =
+        fs::symlink_metadata(&tree).map_err(|_| RevalidationFailure::PackageTreeChanged)?;
+    let canonical_tree =
+        fs::canonicalize(&tree).map_err(|_| RevalidationFailure::PackageTreeChanged)?;
+    if !tree_metadata.is_dir() || tree_metadata.file_type().is_symlink() || canonical_tree != tree {
+        return Err(RevalidationFailure::PackageTreeChanged);
+    }
+    let adapter = crate::doctor::read_installed_package(&node_package_manifest(
+        &tree,
+        &package.requested.adapter,
+    ))
+    .map_err(|_| RevalidationFailure::AdapterExecutableChanged)?;
+    let cli = crate::doctor::resolve_installed_dependency(&adapter, &package.requested.agent_cli)
+        .map_err(|_| RevalidationFailure::AdapterExecutableChanged)?;
+    if adapter.name != package.adapter.name
+        || adapter.version != package.adapter.version
+        || cli.name != package.agent_cli.name
+        || cli.version != package.agent_cli.version
+        || cli.bundled_cli_version() != package.bundled_cli_version.as_deref()
+    {
+        return Err(RevalidationFailure::AdapterExecutableChanged);
+    }
+    let executable = adapter
+        .sole_owned_executable()
+        .map_err(|_| RevalidationFailure::AdapterExecutableChanged)?;
+    let expected_executable = tree.join(&package.adapter_executable_relative);
+    let executable_snapshot = local_file::read_regular_file_bounded(
+        &executable,
+        "compatibility adapter executable revalidation",
+        MAX_RESOLUTION_BYTES,
+    )
+    .map_err(|_| RevalidationFailure::AdapterExecutableChanged)?;
+    if executable != expected_executable
+        || executable_snapshot.canonical_path != expected_executable
+        || executable_snapshot.canonical_path.to_str()
+            != Some(package.adapter_executable.canonical_path.as_str())
+        || executable_snapshot.sha256 != package.adapter_executable.sha256
+    {
+        return Err(RevalidationFailure::AdapterExecutableChanged);
+    }
+    let inspected = inspect_package_tree(&tree, &loaded.artifact.limits)
+        .map_err(|_| RevalidationFailure::PackageTreeChanged)?;
+    if inspected.inventory_sha256 != package.inventory_sha256
+        || inspected.tree_sha256 != package.tree_sha256
+    {
+        return Err(RevalidationFailure::PackageTreeChanged);
+    }
+    let mut expected_inventory = serde_json::to_vec_pretty(&inspected.inventory)
+        .map_err(|_| RevalidationFailure::PackageTreeChanged)?;
+    expected_inventory.push(b'\n');
+    let inventory = local_file::read_regular_file_bounded(
+        &package_root.join("inventory.json"),
+        "compatibility package inventory revalidation",
+        MAX_RESOLUTION_BYTES,
+    )
+    .map_err(|_| RevalidationFailure::PackageTreeChanged)?;
+    if inventory.canonical_path != package_root.join("inventory.json")
+        || inventory.bytes != expected_inventory
+    {
+        return Err(RevalidationFailure::PackageTreeChanged);
+    }
+    Ok(())
+}
+
+fn revalidate_generated_prerequisites(
+    loaded: &LoadedResolution,
+    case: &ResolvedCase,
+) -> Result<(), RevalidationFailure> {
+    let root = resolution_bundle_root(loaded)?;
+    for prerequisite in &case.prerequisites {
+        if prerequisite.destination.as_deref() != Some("/root/.claude/settings.json") {
+            continue;
+        }
+        if prerequisite.name != "fable-settings" {
+            return Err(RevalidationFailure::PrerequisiteChanged);
+        }
+        let snapshot = local_file::read_regular_file_bounded(
+            &root.join("prerequisites/fable-settings.json"),
+            "compatibility generated prerequisite revalidation",
+            MAX_SETTINGS_BYTES,
+        )
+        .map_err(|_| RevalidationFailure::PrerequisiteChanged)?;
+        if snapshot.canonical_path != root.join("prerequisites/fable-settings.json")
+            || !loaded
+                .artifact
+                .protected_inputs
+                .iter()
+                .any(|input| input.after_sha256 == snapshot.sha256)
+        {
+            return Err(RevalidationFailure::PrerequisiteChanged);
+        }
+        let raw = std::str::from_utf8(&snapshot.bytes)
+            .map_err(|_| RevalidationFailure::PrerequisiteChanged)?;
+        secret_free_raw("compatibility generated prerequisite", raw)
+            .map_err(|_| RevalidationFailure::PrerequisiteChanged)?;
+        serde_json::from_slice::<serde_json::Value>(&snapshot.bytes)
+            .map_err(|_| RevalidationFailure::PrerequisiteChanged)?;
+    }
+    Ok(())
+}
+
+async fn revalidate_resolution_case_with_executor(
+    loaded: &LoadedResolution,
+    environment_owner: &str,
+    case_id: &str,
+    executor: &dyn ResolutionExecutor,
+) -> Result<(), RevalidationFailure> {
+    revalidate_resolution_global(loaded, environment_owner)?;
+    let root = resolution_bundle_root(loaded)?;
+    let case = loaded
+        .artifact
+        .cases
+        .iter()
+        .find(|case| case.id == case_id)
+        .ok_or(RevalidationFailure::BindingChanged)?;
+    let expected_config = root.join("configs").join(format!("{}.toml", case.id));
+    if Path::new(&case.generated_config.canonical_path) != expected_config {
+        return Err(RevalidationFailure::GeneratedConfigChanged);
+    }
+    revalidate_regular_file(
+        &case.generated_config.canonical_path,
+        &case.generated_config.sha256,
+        MAX_RECIPE_BYTES,
+        RevalidationFailure::GeneratedConfigChanged,
+    )?;
+    let package = loaded
+        .artifact
+        .packages
+        .iter()
+        .find(|package| package.id == case.package_set)
+        .ok_or(RevalidationFailure::BindingChanged)?;
+    revalidate_package(loaded, package)?;
+    revalidate_generated_prerequisites(loaded, case)?;
+
+    if let Some(image_id) = &case.image {
+        let image = loaded
+            .artifact
+            .images
+            .iter()
+            .find(|image| &image.id == image_id)
+            .ok_or(RevalidationFailure::BindingChanged)?;
+        let containerfile = local_file::read_regular_file_bounded(
+            &root.join("images").join(&image.id).join("Containerfile"),
+            "compatibility generated image template revalidation",
+            MAX_RECIPE_BYTES,
+        )
+        .map_err(|_| RevalidationFailure::ImageChanged)?;
+        if containerfile.canonical_path != root.join("images").join(&image.id).join("Containerfile")
+            || containerfile.sha256 != image.build_template_sha256
+        {
+            return Err(RevalidationFailure::ImageChanged);
+        }
+        let runtime_path = Path::new(
+            &loaded
+                .artifact
+                .environment
+                .runtime_executable
+                .canonical_path,
+        );
+        let safe_path = std::env::join_paths(
+            [
+                runtime_path.parent(),
+                Some(Path::new("/usr/bin")),
+                Some(Path::new("/bin")),
+            ]
+            .into_iter()
+            .flatten(),
+        )
+        .map_err(|_| RevalidationFailure::RuntimeExecutableChanged)?;
+        let inspected = executor
+            .execute(&image_inspect_command(
+                runtime_path,
+                safe_path,
+                root,
+                Duration::from_secs(loaded.artifact.limits.timeout_secs),
+                &image.owned_tag,
+            ))
+            .await
+            .map_err(|_| RevalidationFailure::ImageChanged)?;
+        let immutable_id = parse_image_inspect(&inspected, &image.labels)
+            .map_err(|_| RevalidationFailure::ImageChanged)?;
+        if immutable_id != image.final_image_id {
+            return Err(RevalidationFailure::ImageChanged);
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn revalidate_resolution_case(
+    loaded: &LoadedResolution,
+    environment_owner: &str,
+    case_id: &str,
+) -> Result<(), RevalidationFailure> {
+    revalidate_resolution_case_with_executor(
+        loaded,
+        environment_owner,
+        case_id,
+        &ProcessResolutionExecutor,
+    )
+    .await
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -5886,6 +6309,247 @@ addr = "127.0.0.1:8080"
         assert!(reader.contains("/opt/a2a/packages/codex-current/"));
         assert!(reader.contains(&format!("sha256:{}", "d".repeat(64))));
         assert!(!output.join("packages/codex-current/cache").exists());
+    }
+
+    struct ImageRevalidationExecutor {
+        id: String,
+        labels: BTreeMap<String, String>,
+    }
+
+    #[async_trait]
+    impl ResolutionExecutor for ImageRevalidationExecutor {
+        async fn execute(
+            &self,
+            command: &ResolutionCommandSpec,
+        ) -> Result<Vec<u8>, ResolutionFailureCode> {
+            assert_eq!(command.kind, ResolutionCommandKind::InspectImage);
+            Ok(serde_json::to_vec(&serde_json::json!([{
+                "Id": self.id,
+                "Config": {"Labels": self.labels}
+            }]))
+            .unwrap())
+        }
+    }
+
+    #[cfg(unix)]
+    fn overwrite_test_file(path: &Path, bytes: &[u8], mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_revalidation_detects_each_file_owner_and_image_drift_family() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        #[derive(Clone, Copy)]
+        enum Drift {
+            Resolution,
+            Recipe,
+            Candidate,
+            Runtime,
+            Config,
+            Lock,
+            Tree,
+            Executable,
+            Owner,
+        }
+        for (drift, expected) in [
+            (
+                Drift::Resolution,
+                RevalidationFailure::ResolutionArtifactChanged,
+            ),
+            (Drift::Recipe, RevalidationFailure::RecipeChanged),
+            (
+                Drift::Candidate,
+                RevalidationFailure::CandidateBinaryChanged,
+            ),
+            (
+                Drift::Runtime,
+                RevalidationFailure::RuntimeExecutableChanged,
+            ),
+            (Drift::Config, RevalidationFailure::GeneratedConfigChanged),
+            (Drift::Lock, RevalidationFailure::PackageLockChanged),
+            (Drift::Tree, RevalidationFailure::PackageTreeChanged),
+            (
+                Drift::Executable,
+                RevalidationFailure::AdapterExecutableChanged,
+            ),
+            (Drift::Owner, RevalidationFailure::EnvironmentOwnerChanged),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let request = provider_free_request(parent.path(), false);
+            let output = request.output.clone();
+            let executor = ResolutionFakeExecutor {
+                calls: std::sync::Mutex::new(Vec::new()),
+                labels: std::sync::Mutex::new(BTreeMap::new()),
+                tag_exists: false,
+                tag_query_fails: false,
+                mutate_path: None,
+            };
+            resolve_with_executor(request, &executor).await.unwrap();
+            let loaded = load_resolution(&output.join("resolution.json")).unwrap();
+            revalidate_resolution_case_with_executor(
+                &loaded,
+                "test-runner",
+                "codex-host-floating-current",
+                &executor,
+            )
+            .await
+            .unwrap();
+
+            match drift {
+                Drift::Resolution => overwrite_test_file(&loaded.canonical_path, b"{}\n", 0o600),
+                Drift::Recipe => overwrite_test_file(
+                    Path::new(&loaded.artifact.recipes.canonical_path),
+                    b"schema_version = 1\n",
+                    0o600,
+                ),
+                Drift::Candidate => overwrite_test_file(
+                    Path::new(&loaded.artifact.candidate.canonical_path),
+                    b"changed candidate",
+                    0o700,
+                ),
+                Drift::Runtime => overwrite_test_file(
+                    Path::new(
+                        &loaded
+                            .artifact
+                            .environment
+                            .runtime_executable
+                            .canonical_path,
+                    ),
+                    b"changed runtime",
+                    0o700,
+                ),
+                Drift::Config => overwrite_test_file(
+                    Path::new(&loaded.artifact.cases[0].generated_config.canonical_path),
+                    b"changed config",
+                    0o600,
+                ),
+                Drift::Lock => overwrite_test_file(
+                    &output.join("packages/codex-current/package-lock.json"),
+                    b"{}\n",
+                    0o600,
+                ),
+                Drift::Tree => overwrite_test_file(
+                    &output.join("packages/codex-current/tree/package.json"),
+                    br#"{"name":"changed-materialization-root"}"#,
+                    0o400,
+                ),
+                Drift::Executable => overwrite_test_file(
+                    Path::new(
+                        &loaded.artifact.packages[0]
+                            .adapter_executable
+                            .canonical_path,
+                    ),
+                    b"#!/usr/bin/env node\n// changed\n",
+                    0o500,
+                ),
+                Drift::Owner => {}
+            }
+            let owner = if matches!(drift, Drift::Owner) {
+                "different-owner"
+            } else {
+                "test-runner"
+            };
+            let error = revalidate_resolution_case_with_executor(
+                &loaded,
+                owner,
+                "codex-host-floating-current",
+                &executor,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error, expected,
+                "unexpected classification for drift family"
+            );
+
+            // Keep TempDir cleanup reliable after deliberately making package files read-only.
+            if output.exists() {
+                let _ = fs::set_permissions(&output, fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        let parent = tempfile::tempdir().unwrap();
+        let request = provider_free_request(parent.path(), true);
+        let output = request.output.clone();
+        let executor = ResolutionFakeExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            labels: std::sync::Mutex::new(BTreeMap::new()),
+            tag_exists: false,
+            tag_query_fails: false,
+            mutate_path: None,
+        };
+        resolve_with_executor(request, &executor).await.unwrap();
+        let loaded = load_resolution(&output.join("resolution.json")).unwrap();
+        let image = &loaded.artifact.images[0];
+        let wrong_image = ImageRevalidationExecutor {
+            id: format!("sha256:{}", "e".repeat(64)),
+            labels: image.labels.clone(),
+        };
+        assert_eq!(
+            revalidate_resolution_case_with_executor(
+                &loaded,
+                "test-runner",
+                "codex-reader-floating-current",
+                &wrong_image,
+            )
+            .await
+            .unwrap_err(),
+            RevalidationFailure::ImageChanged
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generated_prerequisite_is_hash_bound_and_drift_is_rejected() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().unwrap();
+        let request = provider_free_request(parent.path(), false);
+        let output = request.output.clone();
+        let executor = ResolutionFakeExecutor {
+            calls: std::sync::Mutex::new(Vec::new()),
+            labels: std::sync::Mutex::new(BTreeMap::new()),
+            tag_exists: false,
+            tag_query_fails: false,
+            mutate_path: None,
+        };
+        resolve_with_executor(request, &executor).await.unwrap();
+        let mut loaded = load_resolution(&output.join("resolution.json")).unwrap();
+        let directory = output.join("prerequisites");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("fable-settings.json");
+        fs::write(&path, b"{}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let snapshot = local_file::read_regular_file_bounded(
+            &path,
+            "test generated prerequisite",
+            MAX_SETTINGS_BYTES,
+        )
+        .unwrap();
+        loaded.artifact.protected_inputs.push(ProtectedInput {
+            path: snapshot.canonical_path.to_string_lossy().into_owned(),
+            before_sha256: snapshot.sha256.clone(),
+            after_sha256: snapshot.sha256,
+        });
+        let mut case = loaded.artifact.cases[0].clone();
+        case.prerequisites.push(NonSecretPrerequisite {
+            name: "fable-settings".into(),
+            destination: Some("/root/.claude/settings.json".into()),
+        });
+        revalidate_generated_prerequisites(&loaded, &case).unwrap();
+
+        fs::write(&path, b"{\"changed\":true}\n").unwrap();
+        assert_eq!(
+            revalidate_generated_prerequisites(&loaded, &case).unwrap_err(),
+            RevalidationFailure::PrerequisiteChanged
+        );
     }
 
     #[tokio::test]

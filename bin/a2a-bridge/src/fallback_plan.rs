@@ -233,6 +233,8 @@ struct SmokeTarget {
     execution_mode: String,
     provenance: Vec<SmokeProvenanceRow>,
     authentication: SmokeAuthentication,
+    #[serde(default, rename = "model_catalog")]
+    _model_catalog: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
