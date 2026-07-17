@@ -1,8 +1,8 @@
 # R3 — Compatibility manifest and canary implementation plan
 
 - **Status:** overall R3 **IN REVIEW**; R3a **MERGED** at `3927df3f` by PR #31; R3b
-  **APPROVED / PENDING MERGE** on
-  `agent/reliability-r3b-pinned-lane`. Nine pinned rows are implemented. Exact
+  **MERGED** at `504c1e43` by PR #32; R3c **IN PROGRESS** on
+  `agent/reliability-r3c-floating-lane`. Nine pinned rows are implemented. Exact
   `c458045cf3d0923457519e253d22dd545363f98d` Sol/xhigh review approved the pre-incident deterministic
   tree. Authorized attempt 1 remains non-promotable stale-auth evidence; authorized attempt 2 passed both
   host paths and failed both reader paths before prompt acceptance when their runtime objects never started.
@@ -23,7 +23,8 @@
   independently found no `WRONG`, reported five nonblocking `SMELL`s, returned release verdict `READY`, and
   ended `GATE: APPROVE`. This docs fold closes its non-USD cost wording gap; all other verification/fault
   boundaries remain accepted/nonblocking. No Fable re-review will run.
-- **Prerequisite:** R2c/R2d merged (`a6fec94c`, PR #29); R3a merged (`3927df3f`, PR #31)
+- **Prerequisite:** R2c/R2d merged (`a6fec94c`, PR #29); R3a merged (`3927df3f`, PR #31);
+  R3b merged (`504c1e43`, PR #32)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Completion shape:** R3a local manifest/runner, R3b pinned lane, R3c floating lane, R3d scheduling,
@@ -494,7 +495,7 @@ and binary tests pass **395 / 0**. No additional compatibility/model smoke ran; 
 ran. Exact `a1641d0` and `d0be430` reviews returned `REVISE`; exact `87c8f4e` returned `APPROVE` with no new
 `WRONG` and two accepted nonblocking fault-boundary `SMELL`s. The one clean-room Fable/xhigh/plan review of
 exact `a0c2c4c` independently found no `WRONG`, returned `READY`, and ended `GATE: APPROVE`; its nonblocking
-findings are recorded above. R3b is **APPROVED / PENDING MERGE**, with no Fable re-review.
+findings are recorded above. R3b is **MERGED** at `504c1e43` by PR #32, with no Fable re-review.
 
 Seed rows for every currently claimed path or control in `docs/compatibility.md`:
 
@@ -540,15 +541,372 @@ updates `docs/compatibility.md` and the changelog when release-relevant.
 ## R3c — floating-current lane
 
 - **Branch:** `agent/reliability-r3c-floating-lane`
+- **State:** **IN PROGRESS** from clean base
+  `504c1e434fd5845bc6745e0b0a0aae95427afbdd`
+- **Design evidence:** one bridge-mediated clean-room Sol/xhigh read-only design pass inspected exact
+  `504c1e43`. It ran no provider turn, package resolution, container action, build, test, or nested agent.
+  The design turn is architecture evidence, not compatibility evidence.
 
-- Resolve candidates without changing production pins.
-- Capture exact resolved adapter, nested CLI/SDK, image/base, model catalog, and auth prerequisites.
-- Run the same minimal case shape and compare to pinned.
-- Classify results as candidate pass/fail/unknown; never claim support solely from catalog discovery.
-- A floating success becomes production only through R4's reviewed promotion process.
+### Core decision
 
-Tests prove a floating result cannot mutate config, Containerfiles, lockfiles, baseline, or compatibility
-docs.
+R3c has three deliberately separate evidence levels:
+
+1. A checked-in floating recipe manifest describes what “current” means.
+2. `compatibility resolve` turns explicitly selected recipes into a private, exact, provider-free
+   candidate bundle.
+3. `compatibility run --resolution …` performs the existing one-prompt smoke only after a separate
+   billable acknowledgement and records the actual session catalog and outcome.
+
+A selector such as npm `latest` is a request, never resolved evidence. A successful floating run is only
+`candidate_pass`; it is not support, promotion, a baseline update, or a production pin. Resolve and run
+must remain separate commands: registry/image effects do not authorize a prompt, and a completed
+resolution does not authorize all resolved cases.
+
+Initial scope is exactly the four R3b supported bridge-smoke shapes: Codex host, Codex reader, Claude host,
+and Claude reader. Historic direct CLI/ACP controls, Kiro, representative workflows, OpenRouter, and
+OpenCode remain outside R3c.
+
+### Authority and mutation boundaries
+
+| Owner | May do | Must not do |
+|---|---|---|
+| Recipe author | Select reviewed package/config/image template enums, map one floating case to one pinned support case, and request a bounded selector | Supply commands, scripts, registry URLs, output paths, credentials, resolved identities, or support state |
+| Resolver operator | Authorize registry traffic, private bundle writes, and uniquely named disposable image construction | Authorize a prompt, provider session, production mutation, shared-tag replacement, or operator-service action |
+| Resolver | Write only below one retained output-directory capability plus runtime-owned unique image/cache state | Spawn an adapter, call a provider, read/copy credentials, use global npm state, execute lifecycle scripts, or write in a repository |
+| Smoke operator | Authorize one exact resolution id, candidate binary, case set, owner, and budget | Implicitly authorize retries, fallback, re-resolution, promotion, or another candidate |
+| Smoke runner | Revalidate the bundle and invoke the existing fixed-PONG smoke once per selected case | Repair drift, rebuild images, rewrite configs, open a second catalog session, or mutate production state |
+| R4 promoter | Review and deliberately create production pins/baselines later | Be called by any R3c command |
+
+Keep all of these byte-for-byte outside R3c's write authority:
+
+- `compatibility/manifest.toml` and `compatibility/baselines/pinned.json`;
+- `compatibility/configs/**`;
+- `Cargo.toml` and `Cargo.lock`;
+- `deploy/containers/*.Containerfile`;
+- `docs/compatibility.md` and the support matrix/changelog;
+- any selected running-operator config, tag, image, process, session, or service.
+
+The resolver records and rechecks protected-input identities/hashes before publication. Any difference is
+`protected_state_changed`. This is defense in depth: the primary proof is that no writable API or command
+receives a protected path. Tests use sentinel files and injected escape attempts to prove the boundary.
+
+### Checked-in recipe ownership
+
+Add `compatibility/floating-current.toml`. It owns only:
+
+- stable floating ids and one-to-one `baseline_case` mappings;
+- closed npm package-set, config-template, and image-template enums;
+- deliberately floating source selectors;
+- fixed registry/runtime resource limits;
+- artifact retention and strict-redaction policy.
+
+It must not contain resolved versions/digests, generated paths, package inventories, model catalogs,
+credentials, results, pins, or support claims. Validation rejects unknown fields, duplicate mappings,
+unsupported or non-support baselines, direct/representative paths, writable execution, arbitrary registry
+or path selectors, unknown templates, dependency cycles, and any command/script fragment.
+
+The initial recipe set is:
+
+- `codex-current`: `@agentclientprotocol/codex-acp@latest` plus its exact resolved
+  `@openai/codex` dependency;
+- `claude-current`: `@agentclientprotocol/claude-agent-acp@latest` plus its exact resolved
+  `@anthropic-ai/claude-agent-sdk` dependency;
+- one reviewed `node-acp-reader-v1` image template with a requested Node 24 slim base;
+- four floating cases mapped to the four R3b support cases.
+
+### CLI contract
+
+Existing pinned commands retain their current behavior.
+
+```text
+a2a-bridge compatibility validate
+    [--manifest <pinned-manifest> | --recipes <floating-recipes>]
+
+a2a-bridge compatibility resolve
+    [--recipes <path>]
+    (--case <id>... | --all)
+    --environment-owner <id>
+    --runtime docker|podman
+    --acknowledge-resolution-effects
+    --out <new-directory>
+
+a2a-bridge compatibility run
+    --resolution <resolution.json>
+    (--case <id>... | --all-resolved)
+    --environment-owner <id>
+    --acknowledge-billable
+    --out <new-aggregate.json>
+
+a2a-bridge compatibility compare
+    --current <aggregate.json>
+    [--baseline <pinned.json>]
+    [--mode pinned|floating-to-pinned]
+```
+
+Admission rules:
+
+- `resolve` is non-billable but requires effect acknowledgement before recipe access, output creation,
+  registry/runtime calls, or scratch effects.
+- `run` requires billing acknowledgement before resolution access, output creation, config inspection,
+  runtime probing, adapter resolution, or provider spawn.
+- Both commands require explicit selection. `--all` / `--all-resolved` are explicit opt-ins.
+- Output must not exist, must be outside normal or bare Git repositories, and must have a
+  descriptor-pinnable parent.
+- Direct `run --lane floating-current` is rejected as `floating_resolution_required`; a hand-authored
+  floating row cannot bypass resolution.
+- `--manifest` and `--resolution` are mutually exclusive.
+- `floating-to-pinned` accepts only an all-floating aggregate with a valid completed resolution binding.
+
+### Resolution bundle
+
+A successful owner-private bundle contains:
+
+```text
+<out>/
+  resolution.json
+  execution-manifest.toml
+  configs/<case>.toml
+  packages/<set>/package.json
+  packages/<set>/package-lock.json
+  packages/<set>/inventory.json
+  packages/<set>/tree/...
+  prerequisites/fable-settings.json
+```
+
+`resolution.json` schema version 1 records:
+
+- `state = setup_incomplete | complete | failed` and a unique `resolution_id`;
+- recipe and pinned-manifest canonical identities, schema versions, and SHA-256 values;
+- candidate bridge canonical identity, SHA-256, and byte length;
+- owner, OS, architecture, runtime executable identity, and fixed resolution limits;
+- requested selectors separately from exact resolved adapter/nested CLI names, versions, integrity values,
+  lock hash, sorted inventory hash, and bounded tree Merkle hash;
+- requested base tag separately from exact registry/index and platform-manifest digests, generated template
+  hash, final immutable image id, unique resolution-owned tag, and exact package labels;
+- each generated config path/hash, baseline mapping, raw model/effort/mode copied from the pinned case,
+  non-secret auth prerequisite names/destinations, and exact resolved bindings;
+- `model_catalog.state = deferred_to_authorized_smoke`;
+- protected-state before/after proof and a typed failure plus partial owned-resource inventory on failure.
+
+Every resolved field rejects `latest`, ranges, aliases, mutable tags, missing integrity, or incomplete
+versions. Generated execution cases remain `lane = "floating-current"`, use
+`classification = "canary"`, and carry a `resolved` table. `pins` remains forbidden on floating cases;
+`resolved` is forbidden on pinned cases. This keeps candidate evidence structurally distinct from
+production policy.
+
+The generated case copies its pinned counterpart's evidence path, probe, model, effort, mode, cwd, auth
+path, prerequisites, budgets, and artifact policy. Only lane/classification, generated agent/config
+materialization, exact package bindings, and image identity may differ.
+
+### Provider-free resolution
+
+Use a closed internal command enum, direct argv, bounded output, process-group timeout/cleanup, and a fake
+executor for tests. Recipe text never becomes an executable, shell, Dockerfile fragment, registry URL, or
+runtime subcommand.
+
+For npm:
+
+- create package metadata, `HOME`, npm cache/prefix/temp/user-config, and the materialized tree only below
+  the bundle capability;
+- use only the fixed npmjs registry;
+- resolve with `--package-lock-only`, then materialize with
+  `npm ci --ignore-scripts --no-audit --no-fund`;
+- strip provider and credential variables from the child environment;
+- reject install hooks, git/file/path dependencies, missing integrity, escaping symlinks, devices,
+  sockets, duplicates, excessive files/bytes, and lock/tree mismatch;
+- find the adapter executable through the package's bounded `bin` map, not guessed `.bin` paths;
+- reuse a typed package-identity helper extracted from doctor provenance, never parse human
+  `CheckResult.detail` strings.
+
+For images:
+
+- resolve the reviewed base tag to exact index/platform digests and generate the fixed
+  `node-acp-reader-v1` build file internally;
+- build from the digest and copy only the disposable package tree/lock plus non-secret settings;
+- mount no credentials and pass no provider variables during build;
+- use one resolution-unique tag and exact provenance labels;
+- inspect and bind the immutable final id; generated configs reference only that id;
+- never stop/restart/remove a container, replace a shared tag, or address the operator service.
+
+The engine's pull/build cache is an acknowledged resolver effect. Successful unique tags and bundles are
+retained as explicitly owned disposable resources; R3c does not implement broad or automatic cleanup.
+
+### Same-session model catalog evidence
+
+`resolve` must not call `models` or `describe_options`: ACP discovery starts an adapter/session and is not
+provider-free. Instead:
+
+- add a source-compatible default `AgentBackend::session_catalog(&SessionId) -> Option<AgentCaps>`;
+- retain the initial bounded session/new model/effort/mode surface in `AcpBackend`'s live session;
+- after lazy session minting and before smoke cleanup removes the session, add that catalog to the
+  smoke-v2 target evidence;
+- preserve one session and one prompt; never create a catalog-only session;
+- preserve raw advertised order/current selections, but bound counts, field sizes, cumulative size,
+  controls, and secret-shaped/exact-secret values before serialization;
+- emit only a static rejection code for unsafe/missing catalog data and classify the floating result
+  `candidate_unknown`;
+- keep old smoke-v2 artifacts accepted; the R2d fallback parser accepts and ignores the additive field.
+
+Catalog discovery alone is never a pass. A pass also requires exact PONG, clean terminal/cleanup evidence,
+resolved provenance/config/image agreement, and no budget violation.
+
+### Run binding, state machine, and outcomes
+
+```text
+RecipeValidated
+  -> ResolutionAuthorized
+  -> PackagesAndBaseResolved
+  -> TreeAndImageMaterialized
+  -> ConfigsRendered
+  -> ProtectedStateRechecked
+  -> Resolved
+
+Resolved
+  -> BillableAuthorizationRequired
+  -> ResolutionRevalidated
+  -> CandidateStaged
+  -> CaseAdmitted
+  -> OneSmokeRunning
+  -> Observed
+  -> ComparedToPinned
+```
+
+Immediately before any provider process, revalidate candidate binary, resolution/recipe identities,
+generated manifest/config hashes, package inventory/tree/executable ownership, immutable image id/labels,
+owner/platform/prerequisites, and aggregate time/token/cost headroom. Never re-resolve or repair. Drift is
+`candidate_unknown`.
+
+Aggregate schema additions are optional/backward-compatible:
+
+- a resolution binding with resolution id plus artifact/recipe hashes;
+- per-floating-case `baseline_case_id` and `candidate_outcome`;
+- a summary count of `candidate_pass`, `candidate_fail`, and `candidate_unknown`.
+
+Outcome truth table:
+
+- `candidate_pass`: completed valid smoke, exact PONG, valid same-session catalog, all resolved bindings
+  match, no drift, and no budget violation;
+- `candidate_fail`: a valid smoke completed and definitively reported failure;
+- `candidate_unknown`: unrun, runner/infrastructure/publication failure, invalid or missing evidence,
+  catalog unavailable, binding drift, cancellation, or exhausted budget.
+
+Floating failures and unknowns make the floating aggregate unsuccessful. They do not change the pinned
+baseline comparison path or release support state. `floating-to-pinned` reports adapter, nested CLI, base,
+image, catalog additions/removals/current selection, auth, capability, phase, terminal, and diagnostic
+differences independently.
+
+### Code ownership
+
+- New `bin/a2a-bridge/src/compatibility_resolution.rs`: recipe/resolution DTOs, validators, typed executor,
+  package inventory/tree hashing, config/image templates, protected-state guard, and atomic bundle
+  publisher.
+- `compatibility.rs`: CLI parsing, `Classification::Canary`, resolved bindings, run admission/revalidation,
+  candidate outcomes, floating summary/comparison, and unchanged pinned behavior.
+- `doctor.rs`: extract typed installed-package identity/provenance helpers for disposable trees.
+- `bridge-core/src/ports.rs` and `bridge-acp/src/acp_backend.rs`: source-compatible same-session catalog
+  access and teardown.
+- `smoke.rs`: optional bounded catalog evidence captured before cleanup.
+- `fallback_plan.rs`: old schema remains valid; accept/ignore the additive catalog.
+- `bin/a2a-bridge/tests/compatibility_cli.rs` plus focused unit tests: CLI, effect barriers, atomicity,
+  exact binding, classification, and no-mutation proof.
+- `compatibility/floating-current.toml`: four recipes only.
+
+### Atomicity, redaction, and failures
+
+- Bundle directory mode `0700`; evidence/config/lock files `0600`; materialized package files become
+  non-writable and executable entries owner-executable only.
+- Publish valid `setup_incomplete` evidence first. Create children descriptor-relative with one link,
+  reject symlink/name replacements, sync resources, and atomically replace with `complete` or `failed`.
+- On post-rename directory-sync failure, restore the separately synced blocking setup copy, matching R3a.
+- Preserve partial owned-resource inventory on failure; never emit raw npm/runtime stdout or stderr.
+- Copy no credential values/files into the bundle or image. Record names and mount destinations only, and
+  scan artifacts against exact present credential values plus the existing secret-shape backstop.
+
+Static failure families include `recipe_invalid`, `resolution_ack_missing`, `npm_timeout`,
+`base_digest_unavailable`, `package_identity_mismatch`, `package_tree_drift`, `image_label_mismatch`,
+`protected_state_changed`, `write_scope_escape`, publication rollback failures,
+`catalog_unavailable`, existing budget/cancellation reasons, and valid smoke failure. Dynamic subprocess
+text is excluded.
+
+### Red-before-green and mutation gates
+
+Record these five exact pre-change reds on `504c1e43` before green implementation:
+
+1. `compatibility resolve` is unknown.
+2. A hand-authored floating row can reach `run` without a resolution.
+3. A floating case has no mandatory generated-config hash.
+4. A completed floating smoke failure can leave aggregate `success = true`.
+5. Smoke does not retain the actual session catalog.
+
+Every new path needs a pre-change-failing regression or exact removed-check mutation plus a negative/edge
+control. Focused coverage must include:
+
+- recipe duplicates/cycles/unknown templates/unsupported baselines/writable targets/path or registry
+  escape;
+- requested-selector versus exact-resolved grammar;
+- direct-argv/no-shell safety and metacharacter controls;
+- npm lifecycle-script suppression, isolated environment, credential stripping, integrity, tree bounds,
+  and escaping symlinks;
+- image digest/platform/label/shared-tag/id drift and runtime timeout/nonzero/oversized-output cases;
+- byte-identical protected sentinels and rejected injected external writes;
+- setup/resource/final/rename/directory-sync/rollback-name atomic failures;
+- candidate, resolution, config, tree, executable, image, owner, and prerequisite drift before fake spawn;
+- both acknowledgement barriers with zero reads/effects/calls when absent;
+- one ACP session/new and one prompt, exact catalog order/current/options, and unsafe/missing/post-cleanup
+  catalog controls;
+- old/additive smoke-v2 fallback compatibility;
+- complete pass/fail/unknown truth table and independent floating comparison dimensions;
+- one smoke per selected case, zero retry/fallback, and stop-before-next cancellation/runner-failure paths.
+
+### Implementation slices and commit order
+
+1. **Contract and red tests:** recipe/resolution DTOs and validators, CLI skeleton, unresolved-floating
+   refusal, candidate-outcome truth table, and the five pre-change reds. No external resolver effects.
+2. **Provider-free resolution:** typed executor, isolated npm resolution/materialization, exact inventory
+   and tree evidence, internal image/config rendering, protected-state guard, and atomic bundle. All package,
+   image, effect, and failure-injection tests stay provider-free.
+3. **Bound execution and observation:** `run --resolution` revalidation, same-session catalog capture,
+   floating classification/summary/comparison, and R2d additive-schema compatibility.
+4. **Checked-in recipes and operator docs:** four recipes, stable CLI/help/runbook, final handoff and gate
+   evidence. Do not change the pinned manifest/baseline, production configs/locks/Containerfiles, support
+   matrix, or changelog.
+
+Each commit must build and keep existing pinned behavior green. Focused tests run first; final closure runs
+format/diff, workspace check, warnings-denied all-target Clippy, the full workspace suite with exact totals,
+locked release build, hygiene, pinned-manifest validation, floating-recipe validation, and Linux/Rust 1.94
+coverage for modes, descriptor publication, candidate execution, and strict parsing.
+
+Before merge require one fresh Sol/xhigh adversarial full-branch correctness review and, only after that is
+green, one release/compatibility review focused on credentials, registry authority, mutable tags, cost,
+mutation proof, artifact rollback, and non-promotion. Tag every finding `WRONG` or `SMELL` and adjudicate
+inherited findings first. No review turn is compatibility evidence.
+
+### Live gates and restart handoff
+
+No live prompt or real registry/image resolution is needed for deterministic implementation closure.
+Neither is authorized by the current session.
+
+After deterministic gates and reviews:
+
+1. Obtain explicit authorization for registry/image effects against one exact recipe SHA and case set.
+2. Run one `compatibility resolve` and inspect the owner-private artifact/configs/package/base/image proof.
+3. Run non-billable validation and doctor on generated configs. Do not call `models`.
+4. Obtain separate authorization for one exact resolution id, candidate binary, case set, and budget.
+5. Run one `compatibility run --resolution … --acknowledge-billable` with no retry/fallback.
+6. Preserve failures as evidence and compare `floating-to-pinned` without updating the baseline or support
+   docs.
+
+Reader/Fable live cases also require recovered container starts and fresh green Claude credential doctors.
+Those are environment prerequisites, not reasons to change R3c code.
+
+Rollback is a normal revert of the R3c commits. Retain exact successful bundles and unique image tags until
+operator-reviewed cleanup proves no running container uses them. Automated retention/disposal, parent-owned
+scheduler deadlines, termination escalation, quarantine, and concurrency remain R3d. Promotion, production
+pins/baselines, support wording, release integration, and rollback exercises remain R4.
+
+**Restart point:** start from `504c1e43` and implement slice 1 only. Keep the pinned manifest and baseline
+unchanged. Do not add registry, runtime, or provider effects until contract tests prove a floating case
+cannot run without one completed exact resolution.
 
 ## R3d — scheduling and evidence retention
 

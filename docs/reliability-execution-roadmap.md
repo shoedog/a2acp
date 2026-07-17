@@ -1,10 +1,11 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main base:** `origin/main` at `3927df3f` on 2026-07-16 (PR #31 merged R3a)
-- **Completed through:** R3a **MERGED** at `3927df3f`; R2e remains deferred and off the critical path
-- **Active slice:** R3b pinned lane **APPROVED / PENDING MERGE** on `agent/reliability-r3b-pinned-lane`
-- **Current R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
+- **Current main base:** `origin/main` at `504c1e43` on 2026-07-16 (PR #32 merged R3b)
+- **Completed through:** R3b **MERGED** at `504c1e43`; R2e remains deferred and off the critical path
+- **Active slice:** R3c floating-current lane **IN PROGRESS** on
+  `agent/reliability-r3c-floating-lane`
+- **Last merged R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-incident
   container-start fold passes binary **395 / 0 / 0**, affected bridge-core/ACP **514 / 0**, and the full
   serial workspace **2,085 / 0 / 12 ignored** across **70** test/doc-test executables. Exact mutations prove
@@ -36,8 +37,8 @@
   returned release verdict `READY`, and ended `GATE: APPROVE`. This docs fold closes its non-USD cost wording
   gap; the external-provider truthiness verification boundary, thread/runtime resource exhaustion,
   pathological post-SIGKILL ceiling, and fail-closed policy/Podman coverage edges remain
-  accepted/nonblocking. R3b is **APPROVED / PENDING MERGE**. No baseline promotion has run.
-- **Current R3b live gate:** authorized attempt 2 ran once with zero retry/fallback against candidate
+  accepted/nonblocking. R3b is **MERGED** at `504c1e43` by PR #32. No baseline promotion has run.
+- **Last R3b live gate:** authorized attempt 2 ran once with zero retry/fallback against candidate
   SHA-256 `323b4e21...a079` and the same exact manifest. Codex and Fable host passed exact `PONG`; both
   readers failed before prompt acceptance after their named containers remained only `created` and ACP
   initialize timed out. The aggregate is retained at
@@ -161,10 +162,11 @@
   `a0c2c4c5a526f99603702f826d5401aa39864d4d` independently found no `WRONG`, reported five nonblocking
   `SMELL`s, returned `READY`, and ended `GATE: APPROVE`. Its non-USD cost wording gap is fixed in this docs
   fold; its other verification/fault-boundary items remain accepted/nonblocking. R3b is
-  **APPROVED / PENDING MERGE**. Reviews are not compatibility evidence.
-- **Last merged full workspace gate:** R2d host serial **1,985 / 0 / 12 ignored** across 69 executables;
-  format/diff, all-target check, warnings-denied Clippy, release build, repository hygiene **37/7**, and
-  PR #29 Build/Lint/Coverage plus CLA were green
+  **MERGED** at `504c1e43` by PR #32. Reviews are not compatibility evidence.
+- **Last merged full workspace gate:** R3b host serial **2,085 / 0 / 12 ignored** across **70**
+  test/doc-test executables; affected bridge-core/ACP **514 / 0** and binary **395 / 0 / 0**.
+  Format/diff, all-target check, warnings-denied Clippy, locked release build, repository hygiene
+  **37/7**, and PR #32 Build/Lint/Coverage plus CLA were green.
 - **Current execution boundary:** R3b has four minimal bridge-smoke support cases (Codex host,
   Codex reader, Claude 0.44 host, Claude 0.55 Fable reader) and five explicit non-goal/unrun historical
   rows (Claude direct CLI, Claude 0.55 host ACP, managed-no-egress negative, Kiro host, Kiro reader).
@@ -172,13 +174,16 @@
   failed aggregate do not authorize partial baseline promotion. Selection and billing acknowledgement
   remain mandatory. The checked-in baseline has the new manifest
   identity but intentionally has no promoted case summaries until separately authorized exact-candidate
-  live artifacts are reviewed. Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** commit this Fable-approval recording fold, publish a non-draft PR, and merge after required
-  CI is green; no Fable re-review. After merge, advance the durable cursor to R3c. Do not request another live
-  aggregate until a non-provider start control proves the local runtime recovered, both Claude doctors are
-  green, the exact new candidate is bound, and the operator separately authorizes one new four-case run.
-  Do not rebuild or swap the running operator; OpenRouter/OpenCode remain R3e/R3f after the R3 core and
-  before R4.
+  live artifacts are reviewed. R3c adds a separate checked-in recipe, provider-free exact resolution
+  bundle, and independently authorized `run --resolution` boundary. Direct floating execution is refused;
+  resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
+  the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
+  Review turns and deterministic doctor/tests are not compatibility evidence.
+- **Next action:** implement R3c slice 1 from clean `504c1e43`: separate floating recipe/resolution schemas,
+  CLI skeleton, unresolved-floating refusal, candidate-outcome truth table, and the five recorded pre-change
+  reds. Keep the pinned manifest/baseline byte-identical and add no registry/runtime/provider effects until
+  those contracts are green. No live resolution, model discovery, compatibility aggregate, operator rebuild,
+  or operator swap is authorized. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**
@@ -204,7 +209,7 @@ R2a provenance (MERGED)
   -> R2c explicit one-turn billable smoke (MERGED)
        -> R2d local non-billable fallback plan (MERGED)
             -> R3 compatibility manifest + pinned/floating canaries + OpenRouter/OpenCode
-               (IN REVIEW: R3a MERGED; R3b APPROVED / PENDING MERGE)
+               (IN REVIEW: R3a/R3b MERGED; R3c IN PROGRESS)
                  -> R4 reproducible dependency/image pins + release promotion gate
 
 R2e authenticated in-process fallback is DEFERRED and off the critical path.
@@ -229,7 +234,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **APPROVED / PENDING MERGE**. Attempts 1 and 2 remain non-promotable failure evidence. Exact `a1641d0` and `d0be430` reviews returned `REVISE`; exact `87c8f4e` Sol closure review adjudicated both inherited items fixed, found no new `WRONG`, and returned `APPROVE`. The one clean-room Fable/xhigh review of exact `a0c2c4c` independently found no `WRONG`, returned release verdict `READY`, and ended `GATE: APPROVE` with nonblocking smells recorded. No Fable re-review. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane approved/pending merge; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **IN PROGRESS**. Attempts 1 and 2 remain non-promotable failure evidence. Exact `a1641d0` and `d0be430` reviews returned `REVISE`; exact `87c8f4e` Sol closure review adjudicated both inherited items fixed, found no new `WRONG`, and returned `APPROVE`. The one clean-room Fable/xhigh review of exact `a0c2c4c` independently found no `WRONG`, returned release verdict `READY`, and ended `GATE: APPROVE` with nonblocking smells recorded. No Fable re-review. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner and R3b pinned lane merged; R3c owns provider-free floating resolution plus bound execution; then R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -478,8 +483,9 @@ Next action:
 
 ## Current handoff
 
-- R3a merged through PR #31 at `3927df3f1dce03fde50b7754151a718017f45815`. R3b is
-  **APPROVED / PENDING MERGE** on `agent/reliability-r3b-pinned-lane`, based directly on that merge. The
+- R3a merged through PR #31 at `3927df3f1dce03fde50b7754151a718017f45815`. R3b merged through PR #32
+  at `504c1e434fd5845bc6745e0b0a0aae95427afbdd`. R3c is **IN PROGRESS** on
+  `agent/reliability-r3c-floating-lane`, based directly on that merge. The
   manifest now contains nine
   exact pinned rows: four release-blocking minimal bridge-smoke support cases and five explicit
   historical/non-goal controls. Every config is checked in and SHA-bound before provider spawn. The two
@@ -534,7 +540,18 @@ Next action:
   no `WRONG`, returned release verdict `READY`, and ended `GATE: APPROVE`. This docs fold closes its non-USD
   cost wording `SMELL`; its external-provider truthiness verification boundary, two inherited fault
   boundaries, and fail-closed policy/Podman coverage edges remain accepted/nonblocking. R3b is
-  **APPROVED / PENDING MERGE**; no Fable re-review will run.
+  **MERGED** at `504c1e43` by PR #32; no Fable re-review will run.
+- One bridge-mediated clean-room Sol/xhigh design pass inspected exact clean `504c1e43` and closed the
+  R3c architecture around three evidence levels: a checked-in floating recipe, an explicitly authorized
+  provider-free exact resolution bundle, and a separately billable `run --resolution` using the existing
+  one-prompt smoke. Resolution never calls `models` or creates an ACP session; the actual bounded catalog
+  is captured from the authorized smoke's one session. Direct unresolved floating execution is refused.
+  Candidate pass/fail/unknown is advisory and cannot write the pinned manifest/baseline, production configs,
+  Cargo locks, Containerfiles, compatibility/support docs, shared tags, or the running operator. The pass
+  ran no provider, package resolution, container, build, or test action and is design evidence only.
+  Implementation starts with contract/red tests and no external effects; the complete restart contract,
+  schemas, failure taxonomy, mutation matrix, commit order, live authorization gates, rollback, and deferrals
+  are in the active R3 plan.
 - Authorized attempt 2 is retained at
   `/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json`, SHA-256 `319b3cf4...a9b3e`. Its exact
   `323b4e21...a079` candidate passed both host cases and failed both reader cases before prompt acceptance
