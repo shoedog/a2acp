@@ -6,7 +6,7 @@
 - **Active slice:** R3c floating-current lane **IN PROGRESS** on
   `agent/reliability-r3c-floating-lane`
 - **Current R3c deterministic gate:** code head
-  `4bd63f3f129a08586742c3c3e946fecfa02839ba` completes all four implementation slices and six
+  `4bd63f3f129a08586742c3c3e946fecfa02839ba` completes all four implementation slices and seven
   adversarial-review rounds. The initial Sol/xhigh review of exact `a5dfef8` returned nine `WRONG`, no
   `SMELL`, and `GATE: REVISE`; `e3459a5` closes all nine, and `d86e418` adds the missing pre-fix-red
   catalog-only comparison regression. Closure review of exact `646d61b` left transient aggregate
@@ -36,7 +36,9 @@
   **61 / 0**. Exact-`4bd63f3` host gates pass **2,165 / 0 / 12 ignored** across **70** test/doc-test
   executables. Format/diff, all-target workspace check, warnings-denied all-target Clippy, locked release,
   hygiene **37/7**, pinned manifest **9 cases**, floating recipe **4 cases**, protected-input identity, and
-  dependency policy are green; fresh correctness re-review remains pending. During this fold, a grouped
+  dependency policy are green. Fresh Sol/xhigh closure review of exact docs head `0567381` adjudicated all
+  15 inherited findings **FIXED**, found no new `WRONG` or `SMELL`, and returned `GATE: APPROVE`; the one
+  clean-room release/compatibility lens remains. During this fold, a grouped
   focused run again reported the unrelated cancellation-descendant assertion failed **0 / 1** after **59**
   other tests passed; its immediate isolated rerun passed **1 / 0**, and three subsequent full-workspace runs
   passed it. This recurring timing-sensitive signal remains reported and unmodified rather than rebaselined.
@@ -226,9 +228,8 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** run a fresh Sol/xhigh closure review of the exact branch tip, adjudicating every inherited
-  `WRONG` from all six prior R3c correctness reviews first; fold/reverify any remaining
-  `WRONG`, then run the separate release/compatibility lens only after correctness is green. No exact-current
+- **Next action:** record the exact-`0567381` Sol/xhigh correctness approval, rerun the docs-head deterministic
+  gates, then run the one clean-room release/compatibility lens. No exact-current
   live resolution, model discovery, compatibility aggregate, operator rebuild, or operator swap is
   authorized. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
 - **Design of record:**
@@ -281,7 +282,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **IN PROGRESS** at code head `4bd63f3`. R3b attempts 1 and 2 remain non-promotable failure evidence. R3b exact `87c8f4e` Sol closure review approved and the one clean-room Fable/xhigh review of exact `a0c2c4c` returned release verdict `READY` and `GATE: APPROVE`; no Fable re-review. R3c Sol reviews of exact `a5dfef8`, `646d61b`, `5facc9c`, `260e4a6`, `af69806`, and `9d9f713` returned `REVISE`; the last review fixed all 14 inherited findings but found an unbounded hidden tar-metadata allocation `WRONG`. `4bd63f3` closes it in code. Exact-head full/release/policy gates are green; fresh correctness re-review is pending. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner and R3b pinned lane merged; R3c owns provider-free floating resolution plus bound execution; then R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **IN PROGRESS** at code head `4bd63f3`. R3b attempts 1 and 2 remain non-promotable failure evidence. R3b exact `87c8f4e` Sol closure review approved and the one clean-room Fable/xhigh review of exact `a0c2c4c` returned release verdict `READY` and `GATE: APPROVE`; no Fable re-review. R3c Sol reviews of exact `a5dfef8`, `646d61b`, `5facc9c`, `260e4a6`, `af69806`, and `9d9f713` returned `REVISE`; `4bd63f3` closes the last hidden tar-metadata allocation `WRONG`. Exact-`0567381` Sol/xhigh closure review fixed all 15 inherited findings, found no new `WRONG` or `SMELL`, and returned `GATE: APPROVE`. Exact-head full/release/policy gates are green; one release/compatibility lens remains. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner and R3b pinned lane merged; R3c owns provider-free floating resolution plus bound execution; then R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -645,7 +646,9 @@ Next action:
   red-first controls failed **0 / 1** each; focused resolution tests now pass **61 / 0** and the exact-head
   host suite passes **2,165 / 0 / 12 ignored** across **70** executables. Format/diff, all-target check,
   warnings-denied Clippy, locked release, hygiene **37/7**, both manifests, protected inputs, and dependency
-  policy are green; fresh correctness re-review remains. Explicitly authorized provider-free host
+  policy are green. Exact-`0567381` Sol/xhigh closure review adjudicated all 15 inherited findings fixed,
+  found no new `WRONG` or `SMELL`, and returned `GATE: APPROVE`; one release/compatibility lens remains.
+  Explicitly authorized provider-free host
   diagnostics resolved current Codex and Claude package trees and produced green generated-config doctors,
   but the retained bundles predate `f15ae88`, `b3793e8`, `4621ab5`, `dd99267`, and `4bd63f3` and are
   diagnostic rather than exact-current compatibility evidence. Linux/Rust 1.94 remains green only on

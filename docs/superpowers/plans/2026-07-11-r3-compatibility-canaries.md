@@ -544,9 +544,12 @@ updates `docs/compatibility.md` and the changelog when release-relevant.
 - **State:** **IN PROGRESS** from clean base
   `504c1e434fd5845bc6745e0b0a0aae95427afbdd`
 - **Current code head:** `4bd63f3f129a08586742c3c3e946fecfa02839ba`; deterministic full-branch
-  gates are green and fresh exact-head correctness re-review remains pending. Sol/xhigh review of exact
+  gates are green. Sol/xhigh review of exact
   docs head `9d9f713d1ba72763efc67243c77da9e4425a4893` adjudicated all 14 inherited findings **FIXED**, reported no
   `SMELL`, and returned `GATE: REVISE` on one new archive-metadata allocation `WRONG`; `4bd63f3` closes it.
+  Fresh Sol/xhigh closure review of exact docs head `056738111075317d3e7bcb3784491975e138e771`
+  adjudicated all 15 inherited findings **FIXED**, found no new `WRONG` or `SMELL`, and returned
+  `GATE: APPROVE`; one release/compatibility lens remains.
 - **Design evidence:** one bridge-mediated clean-room Sol/xhigh read-only design pass inspected exact
   `504c1e43`. Beyond that review turn, it ran no provider compatibility prompt, package resolution,
   container action, build, test, or nested agent. The design turn is architecture evidence, not
@@ -905,7 +908,7 @@ control. Focused coverage must include:
    evidence. Do not change the pinned manifest/baseline, production configs/locks/Containerfiles, support
    matrix, or changelog.
 
-Implementation cursor on 2026-07-17: all four implementation slices and six adversarial-review rounds are
+Implementation cursor on 2026-07-17: all four implementation slices and seven adversarial-review rounds are
 complete through the latest code fix. `1c1115cb` defines the strict recipe/resolution contracts and the five
 recorded red-before-green boundaries; `0c25686c` adds the provider-free typed package/image/config
 materializer and atomic private bundle; `e159915` adds exact pre-provider revalidation, same-session bounded catalog evidence,
@@ -983,7 +986,10 @@ identity, and dependency policy are green. During this fold, a grouped focused r
 unrelated existing cancellation-descendant assertion failed **0 / 1** after **59** other tests passed; its
 immediate isolated rerun passed **1 / 0**, and three subsequent full-workspace runs passed it. This recurring
 timing-sensitive signal remains reported and unmodified rather than rebaselined. Fresh exact-head
-correctness re-review remains pending.
+Sol/xhigh closure review of exact `056738111075317d3e7bcb3784491975e138e771` adjudicated all 15 inherited
+findings **FIXED**, found no new `WRONG` or `SMELL`, and returned `GATE: APPROVE`; the reviewer accepted the
+supplied gates and ran no builds, tests, containers, registries, providers, or network services. One
+release/compatibility lens remains.
 Prior removed-check mutations produce these exact reds: unauthorized CONNECT admission wedged the negative
 proxy test until bounded termination; a per-proxy counter left shared budget **5** instead of **2**; removing
 RLIMIT plus the watcher returned late `PackageTreeDrift` instead of immediate `NpmDownloadBudgetExceeded`;
@@ -1027,8 +1033,8 @@ format/diff, workspace check, warnings-denied all-target Clippy, the full worksp
 locked release build, hygiene, pinned-manifest validation, floating-recipe validation, and Linux/Rust 1.94
 coverage for modes, descriptor publication, candidate execution, and strict parsing.
 
-Before merge require one fresh Sol/xhigh adversarial full-branch correctness review and, only after that is
-green, one release/compatibility review focused on credentials, registry authority, mutable tags, cost,
+The fresh Sol/xhigh adversarial full-branch correctness requirement is satisfied at exact `0567381`. Before
+merge require one release/compatibility review focused on credentials, registry authority, mutable tags, cost,
 mutation proof, artifact rollback, and non-promotion. Tag every finding `WRONG` or `SMELL` and adjudicate
 inherited findings first. No review turn is compatibility evidence.
 
@@ -1072,15 +1078,14 @@ pins/baselines, support wording, release integration, and rollback exercises rem
 **Restart point:** continue from the current tip of `agent/reliability-r3c-floating-lane`;
 `4bd63f3f129a08586742c3c3e946fecfa02839ba` is the current code head. Focused resolution tests pass
 **61 / 0**; full host **2,165 / 0 / 12 ignored** across **70** groups, release, hygiene, manifest/recipe,
-protected-input, and dependency-policy gates are green; fresh exact-head correctness review remains.
-Linux/Rust 1.94 is green only on historical `57e63a0`
-until an image pull is separately authorized. Run a fresh Sol/xhigh closure review that first adjudicates all
-inherited findings from the `a5dfef8`, `646d61b`, `5facc9c`, `260e4a6`, `af69806`, and `9d9f713` reviews;
-fold and reverify every unresolved `WRONG`, and only after correctness is green run the release/compatibility
-lens. Keep the pinned manifest/baseline and every protected production/support input unchanged. Do not run an
-exact-current compatibility
-resolution, bridge runtime/container, model discovery, any provider turn outside the authorized review
-sequence, operator rebuild, or operator swap without the separate authorizations described under live gates.
+protected-input, and dependency-policy gates are green. Exact-`0567381` Sol/xhigh closure review approved all
+15 inherited findings with no new `WRONG` or `SMELL`; one release/compatibility lens remains. Linux/Rust 1.94
+is green only on historical `57e63a0` until an image pull is separately authorized. Record the approval,
+verify the docs-only fold, and run the one clean-room release/compatibility lens. Keep the pinned
+manifest/baseline and every protected production/support input unchanged. Do not run an exact-current
+compatibility resolution, bridge runtime/container, model discovery, any provider turn outside the
+authorized review sequence, operator rebuild, or operator swap without the separate authorizations described
+under live gates.
 
 ## R3d — scheduling and evidence retention
 
