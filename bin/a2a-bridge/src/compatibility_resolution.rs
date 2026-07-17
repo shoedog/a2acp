@@ -3053,6 +3053,16 @@ fn normalized_package_bin_target(target: &Path) -> Result<PathBuf, String> {
     Ok(normalized)
 }
 
+fn portable_tree_path_key(label: &str, path: &Path) -> Result<String, String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| format!("{label} must use the portable ASCII namespace"))?;
+    if !text.is_ascii() {
+        return Err(format!("{label} must use the portable ASCII namespace"));
+    }
+    Ok(text.to_ascii_lowercase())
+}
+
 fn package_archive_plan(
     archive: &File,
     package: &LockedPackage,
@@ -3088,8 +3098,9 @@ fn package_archive_plan(
             }
             continue;
         };
-        if seen.contains(&relative_path) {
-            return Err("package archive contains duplicate paths".into());
+        let portable_key = portable_tree_path_key("package archive path", &relative_path)?;
+        if seen.contains(&portable_key) {
+            return Err("package archive contains duplicate or portable-equivalent paths".into());
         }
         let entry_count = u64::try_from(seen.len())
             .ok()
@@ -3098,7 +3109,7 @@ fn package_archive_plan(
         if entry_count > limits.max_files {
             return Err("package archive exceeds its entry-count limit".into());
         }
-        seen.insert(relative_path.clone());
+        seen.insert(portable_key);
         let entry_type = entry.header().entry_type();
         let kind = if entry_type.is_dir() {
             ArchiveEntryKind::Directory
@@ -3149,6 +3160,7 @@ fn package_archive_plan(
                 target_text,
                 MAX_TEXT_BYTES,
             )?;
+            portable_tree_path_key("package archive symlink target", &target)?;
             if !symlink_target_stays_in_package(&relative_path, &target) {
                 return Err("package archive symlink escapes its package".into());
             }
@@ -3192,12 +3204,14 @@ fn package_archive_plan(
     }
     for target in bin_targets {
         let target = normalized_package_bin_target(&target)?;
-        if let Some(entry) = plan.iter_mut().find(|entry| entry.relative_path == target) {
-            let ArchiveEntryKind::File { executable, .. } = &mut entry.kind else {
-                return Err("package archive package.json bin target is not a regular file".into());
-            };
-            *executable = true;
-        }
+        let entry = plan
+            .iter_mut()
+            .find(|entry| entry.relative_path == target)
+            .ok_or("package archive package.json bin target is missing")?;
+        let ArchiveEntryKind::File { executable, .. } = &mut entry.kind else {
+            return Err("package archive package.json bin target is not a regular file".into());
+        };
+        *executable = true;
     }
     if plan.is_empty() {
         return Err("package archive contains no materializable entries".into());
@@ -3336,8 +3350,8 @@ fn package_archive_layout(
 }
 
 struct CompleteTreeReservation {
-    directories: BTreeSet<PathBuf>,
-    occupied: BTreeSet<PathBuf>,
+    directories: BTreeMap<String, PathBuf>,
+    occupied: BTreeMap<String, PathBuf>,
     base_file_count: u64,
     base_byte_count: u64,
     new_entries: u64,
@@ -3345,15 +3359,31 @@ struct CompleteTreeReservation {
 }
 
 impl CompleteTreeReservation {
-    fn new(state: &TreeMaterializationState) -> Self {
-        Self {
-            directories: state.directories.clone(),
-            occupied: state.occupied.clone(),
+    fn new(state: &TreeMaterializationState) -> Result<Self, ResolutionFailureCode> {
+        let mut directories = BTreeMap::new();
+        for path in &state.directories {
+            let key = portable_tree_path_key("package tree directory", path)
+                .map_err(|_| ResolutionFailureCode::PackageTreeDrift)?;
+            if directories.insert(key, path.clone()).is_some() {
+                return Err(ResolutionFailureCode::PackageTreeDrift);
+            }
+        }
+        let mut occupied = BTreeMap::new();
+        for path in &state.occupied {
+            let key = portable_tree_path_key("package tree leaf", path)
+                .map_err(|_| ResolutionFailureCode::PackageTreeDrift)?;
+            if directories.contains_key(&key) || occupied.insert(key, path.clone()).is_some() {
+                return Err(ResolutionFailureCode::PackageTreeDrift);
+            }
+        }
+        Ok(Self {
+            directories,
+            occupied,
             base_file_count: state.file_count,
             base_byte_count: state.byte_count,
             new_entries: 0,
             new_bytes: 0,
-        }
+        })
     }
 
     fn add(
@@ -3364,10 +3394,17 @@ impl CompleteTreeReservation {
     ) -> Result<(), ResolutionFailureCode> {
         let layout = package_archive_layout(package, plan)?;
         for directory in &layout.required_directories {
-            if self.occupied.contains(directory) {
+            let key = portable_tree_path_key("package tree directory", directory)
+                .map_err(|_| ResolutionFailureCode::PackageTreeDrift)?;
+            if self.occupied.contains_key(&key) {
                 return Err(ResolutionFailureCode::PackageTreeDrift);
             }
-            if self.directories.insert(directory.clone()) {
+            if let Some(existing) = self.directories.get(&key) {
+                if existing != directory {
+                    return Err(ResolutionFailureCode::PackageTreeDrift);
+                }
+            } else {
+                self.directories.insert(key, directory.clone());
                 self.new_entries = self
                     .new_entries
                     .checked_add(1)
@@ -3375,7 +3412,11 @@ impl CompleteTreeReservation {
             }
         }
         for path in &layout.leaf_paths {
-            if self.directories.contains(path) || !self.occupied.insert(path.clone()) {
+            let key = portable_tree_path_key("package tree leaf", path)
+                .map_err(|_| ResolutionFailureCode::PackageTreeDrift)?;
+            if self.directories.contains_key(&key)
+                || self.occupied.insert(key, path.clone()).is_some()
+            {
                 return Err(ResolutionFailureCode::PackageTreeDrift);
             }
             self.new_entries = self
@@ -3416,7 +3457,7 @@ fn reserve_complete_package_tree<'a>(
     state: &mut TreeMaterializationState,
     limits: &ResolutionLimits,
 ) -> Result<(), ResolutionFailureCode> {
-    let mut reservation = CompleteTreeReservation::new(state);
+    let mut reservation = CompleteTreeReservation::new(state)?;
     for (package, plan) in packages {
         reservation.add(package, plan, limits)?;
     }
@@ -3577,7 +3618,7 @@ async fn materialize_locked_package_tree_inner(
     let packages = selected_locked_packages(request.lock)
         .map_err(|_| ResolutionFailureCode::PackageIdentityMismatch)?;
     let mut state = TreeMaterializationState::new(request.tree, request.limits)?;
-    let mut reservation = CompleteTreeReservation::new(&state);
+    let mut reservation = CompleteTreeReservation::new(&state)?;
     let mut prepared = Vec::with_capacity(packages.len());
     for (index, package) in packages.into_iter().enumerate() {
         if std::time::Instant::now() >= deadline {
@@ -7475,6 +7516,120 @@ image = "reader-current"
         assert!(
             package_archive_plan(&exact, &expected, test_archive_deadline(), &tree_limits())
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn package_archive_rejects_a_missing_declared_bin_target() {
+        let archive = test_package_archive(&[TestArchiveEntry::File(
+            "package.json",
+            br#"{"name":"test","version":"1.0.0","bin":{"tool":"dist/missing.js"}}"#,
+            0o644,
+        )]);
+        let package = locked_package_for_test("node_modules/test");
+        assert!(
+            package_archive_plan(&archive, &package, test_archive_deadline(), &tree_limits())
+                .unwrap_err()
+                .contains("bin target is missing"),
+            "every declared bin target must name a planned regular file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_tree_preflight_rejects_portable_case_collisions_before_writes() {
+        let parent = tempfile::tempdir().unwrap();
+        let output = parent.path().join("bundle");
+        let publisher =
+            BundlePublisher::create_with_setup(&output, |path| Ok(setup_resolution(path))).unwrap();
+        let tree = publisher
+            .create_directory(OsStr::new("tree"), "test package tree")
+            .unwrap();
+        create_synced_file(
+            &tree,
+            OsStr::new("package.json"),
+            0o600,
+            b"x",
+            "test package metadata",
+        )
+        .unwrap();
+        create_synced_file(
+            &tree,
+            OsStr::new("package-lock.json"),
+            0o600,
+            b"y",
+            "test package lock",
+        )
+        .unwrap();
+        let package = locked_package_for_test("node_modules/test");
+        let archive = test_named_package_archive(
+            "test",
+            "1.0.0",
+            &[
+                TestArchiveEntry::File("Foo/one", b"one", 0o600),
+                TestArchiveEntry::File("foo/two", b"two", 0o600),
+            ],
+        );
+        let limits = tree_limits();
+        let plan =
+            package_archive_plan(&archive, &package, test_archive_deadline(), &limits).unwrap();
+        let mut state = TreeMaterializationState::new(&tree, &limits).unwrap();
+
+        assert_eq!(
+            reserve_complete_package_tree([(&package, plan.as_slice())], &mut state, &limits)
+                .unwrap_err(),
+            ResolutionFailureCode::PackageTreeDrift
+        );
+        assert!(
+            !tree.canonical_path().join("node_modules").exists(),
+            "portable-equivalent directory spellings must fail before package writes"
+        );
+    }
+
+    #[test]
+    fn package_archive_rejects_non_ascii_tree_paths_before_writes() {
+        let archive = test_named_package_archive(
+            "test",
+            "1.0.0",
+            &[TestArchiveEntry::File("café", b"body", 0o600)],
+        );
+        let package = locked_package_for_test("node_modules/test");
+        assert!(
+            package_archive_plan(&archive, &package, test_archive_deadline(), &tree_limits())
+                .unwrap_err()
+                .contains("portable ASCII namespace")
+        );
+
+        let non_ascii_target = test_named_package_archive(
+            "test",
+            "1.0.0",
+            &[TestArchiveEntry::Symlink("link", "café")],
+        );
+        assert!(package_archive_plan(
+            &non_ascii_target,
+            &package,
+            test_archive_deadline(),
+            &tree_limits(),
+        )
+        .unwrap_err()
+        .contains("portable ASCII namespace"));
+    }
+
+    #[test]
+    fn package_archive_rejects_portable_equivalent_leaf_paths() {
+        let archive = test_named_package_archive(
+            "test",
+            "1.0.0",
+            &[
+                TestArchiveEntry::File("Foo", b"one", 0o600),
+                TestArchiveEntry::File("foo", b"two", 0o600),
+            ],
+        );
+        let package = locked_package_for_test("node_modules/test");
+        assert!(
+            package_archive_plan(&archive, &package, test_archive_deadline(), &tree_limits())
+                .unwrap_err()
+                .contains("portable-equivalent paths")
         );
     }
 
