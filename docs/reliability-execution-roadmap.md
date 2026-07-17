@@ -27,8 +27,12 @@
   compatibility `SMELL`s. Exact `d0be430` closure review fixed that live-runtime schedule and legacy
   compatibility, kept repeated-`Unknown` coverage `PARTIAL`, and returned `REVISE` on a new runtime-shutdown
   cleanup `WRONG`. The current fold counts repeated unknown observations and keeps one runtime-independent
-  cleanup owner across cancellation and ordinary-error settlement; it awaits exact-candidate Sol closure
-  re-review. No baseline promotion has run.
+  cleanup owner across cancellation and ordinary-error settlement. Fresh Sol/xhigh closure review of exact
+  `87c8f4e096fbcd255bf97664cf6605cfb14c9e77` adjudicated both inherited items `FIXED`, found no new
+  `WRONG`, and returned `APPROVE`. Its resource-exhaustion and pathological post-SIGKILL ceiling `SMELL`s
+  are accepted/nonblocking and explicitly unverified; its stale next-action wording `SMELL` is fixed in the
+  current docs fold. One clean-room Fable/xhigh adversarial implementation plus release/compatibility review
+  remains required. No baseline promotion has run.
 - **Current R3b live gate:** authorized attempt 2 ran once with zero retry/fallback against candidate
   SHA-256 `323b4e21...a079` and the same exact manifest. Codex and Fable host passed exact `PONG`; both
   readers failed before prompt acceptance after their named containers remained only `created` and ACP
@@ -144,9 +148,14 @@
   runtime-independent process-group termination plus shared-reaper flight on a fresh joined thread/runtime.
   The two controls prove exact client exit before one reap when shutdown occurs either before failure
   classification or during settlement, and the lifecycle control counts at least two `Unknown` observations
-  before the preserved initialize timeout. It remains **IN REVIEW** pending exact-candidate Sol closure
-  re-review.
-  Reviews are not compatibility evidence.
+  before the preserved initialize timeout. Fresh Sol/xhigh closure review of exact
+  `87c8f4e096fbcd255bf97664cf6605cfb14c9e77` marked the runtime-shutdown `WRONG` and repeated-`Unknown`
+  `SMELL` fixed, found no new `WRONG`, and returned `APPROVE`. Two fault-boundary `SMELL`s remain
+  accepted/nonblocking: OS-thread/fresh-runtime creation was not fault-injected, and the five-second
+  post-SIGKILL `try_wait` ceiling cannot prove exit under a pathological OS state. The review also identified
+  the stale next-action wording fixed below. R3b remains **IN REVIEW** pending the one authorized clean-room
+  Fable/xhigh adversarial implementation plus release/compatibility review. Reviews are not compatibility
+  evidence.
 - **Last merged full workspace gate:** R2d host serial **1,985 / 0 / 12 ignored** across 69 executables;
   format/diff, all-target check, warnings-denied Clippy, release build, repository hygiene **37/7**, and
   PR #29 Build/Lint/Coverage plus CLA were green
@@ -158,9 +167,8 @@
   remain mandatory. The checked-in baseline has the new manifest
   identity but intentionally has no promoted case summaries until separately authorized exact-candidate
   live artifacts are reviewed. Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** commit the full-gate-green Sol review fold and run one exact-candidate Sol/xhigh closure
-  re-review. Use one clean-room Fable/xhigh adversarial implementation plus
-  release/compatibility lens only after Sol approval; no Fable re-review. Do not request another live
+- **Next action:** commit this Sol-approval recording fold, then run one clean-room Fable/xhigh adversarial
+  implementation plus release/compatibility review; no Fable re-review. Do not request another live
   aggregate until a non-provider start control proves the local runtime recovered, both Claude doctors are
   green, the exact new candidate is bound, and the operator separately authorizes one new four-case run.
   Do not rebuild or swap the running operator; OpenRouter/OpenCode remain R3e/R3f after the R3 core and
@@ -215,7 +223,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE**. Attempt 1 is non-promotable stale-auth evidence. Attempt 2 passed both host paths and failed both readers before prompt acceptance when their runtime objects never started; it also is non-promotable. The pre-incident exact `c458045` tree was Sol-approved. Exact `a1641d0` review returned `REVISE`; exact `d0be430` closure review fixed its live-runtime ownership and legacy findings but returned `REVISE` on runtime-shutdown cleanup plus partial repeated-`Unknown` coverage. Both are folded with red-before-green evidence and await Sol closure re-review. Only after approval run one Fable adversarial implementation plus release/compatibility review. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane and deliberate promotion active; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **ACTIVE**. Attempt 1 is non-promotable stale-auth evidence. Attempt 2 passed both host paths and failed both readers before prompt acceptance when their runtime objects never started; it also is non-promotable. The pre-incident exact `c458045` tree was Sol-approved. Exact `a1641d0` and `d0be430` reviews returned `REVISE`; exact `87c8f4e` closure review adjudicated both inherited items fixed, found no new `WRONG`, and returned `APPROVE` with two accepted nonblocking fault-boundary `SMELL`s. One clean-room Fable adversarial implementation plus release/compatibility review remains; no Fable re-review. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane and deliberate promotion active; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -512,7 +520,10 @@ Next action:
   returned `REVISE`; exact `d0be430` closure review marked its live-runtime ownership and legacy items fixed
   but returned `REVISE` on runtime-shutdown cleanup and partial repeated-`Unknown` coverage. The current fold
   closes both with two red-before-green source-runtime-shutdown regressions and an explicit repeated-probe
-  count, and requires exact-candidate closure re-review.
+  count. Fresh Sol/xhigh closure review of exact `87c8f4e096fbcd255bf97664cf6605cfb14c9e77`
+  adjudicated both inherited items `FIXED`, found no new `WRONG`, and returned `APPROVE`. Its two
+  resource/pathological-OS `SMELL`s remain accepted/nonblocking and unverified; its stale cursor `SMELL` is
+  fixed in this docs fold. One clean-room Fable/xhigh implementation plus release/compatibility review remains.
 - Authorized attempt 2 is retained at
   `/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json`, SHA-256 `319b3cf4...a9b3e`. Its exact
   `323b4e21...a079` candidate passed both host cases and failed both reader cases before prompt acceptance

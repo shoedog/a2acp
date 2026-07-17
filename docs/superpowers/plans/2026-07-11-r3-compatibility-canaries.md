@@ -15,8 +15,11 @@
   local new-container starts remained degraded. Exact `a1641d0` Sol/xhigh review returned `REVISE` on
   pre-settlement cancellation ownership plus lifecycle-negative and legacy-compatibility coverage. Exact
   `d0be430` closure review fixed the live-runtime ownership and legacy findings, but returned `REVISE` on
-  runtime-shutdown cleanup plus partial repeated-`Unknown` coverage. The current fold closes both with
-  red-before-green evidence and awaits exact-candidate closure re-review.
+  runtime-shutdown cleanup plus partial repeated-`Unknown` coverage. Exact `87c8f4e` closure review
+  adjudicated both inherited items `FIXED`, found no new `WRONG`, and returned `APPROVE`; two
+  resource/pathological-OS fault-boundary `SMELL`s remain accepted/nonblocking and unverified. The stale
+  next-action wording it identified is fixed in the current docs fold. One clean-room Fable/xhigh adversarial
+  implementation plus release/compatibility review remains; no Fable re-review.
 - **Prerequisite:** R2c/R2d merged (`a6fec94c`, PR #29); R3a merged (`3927df3f`, PR #31)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -358,7 +361,7 @@ await starts terminate-then-reap. The corrected regression uses Tokio `OnceCell`
 exit before one reap, and permits one clean successor. The lifecycle-coverage `SMELL` is closed by direct
 `container.runtime.start_failed`, repeated-`Unknown`, and synchronous/asynchronous probe-panic controls.
 The compatibility `SMELL` is closed by proving a blocking conforming legacy `ReapFn` still runs detached and
-does not delay the original spawn error. Exact-candidate Sol closure re-review remains required.
+does not delay the original spawn error. That fold then required exact-candidate Sol closure re-review.
 
 Fresh Sol/xhigh closure review of exact `d0be43075e2ba9792bf9e47e5e3631ecf0d22b8b` marked the inherited
 live-runtime cancellation `WRONG` and legacy compatibility `SMELL` fixed. It kept the repeated-`Unknown`
@@ -375,6 +378,14 @@ at least two observations before preserving the initialize timeout. A combined a
 exact-status timeout under post-compile load (**259 / 1** in bridge-core); default and all-feature isolated
 controls passed, so the ordinary-status fixture now uses the production 1 s bound while the independent
 20 ms hung-command cancellation control remains unchanged.
+
+Fresh Sol/xhigh closure review of exact `87c8f4e096fbcd255bf97664cf6605cfb14c9e77` adjudicated the
+runtime-shutdown `WRONG` and repeated-`Unknown` `SMELL` `FIXED`, confirmed the previously closed live-runtime
+and legacy schedules remained fixed, found no new `WRONG`, and returned `APPROVE`. It accepted two
+nonblocking fault-boundary `SMELL`s: OS-thread/fresh-runtime creation failure was not fault-injected, and the
+five-second post-SIGKILL `try_wait` ceiling cannot prove exit under a pathological OS state. Its third
+`SMELL` was the roadmap's stale “commit the fold” next action, fixed in this approval-recording docs fold.
+The reviewer accepted the supplied gates without rerunning them and performed no container/provider action.
 
 The initial fresh one-shot Sol/xhigh review of exact `57f3ee8` returned `REVISE` with two `WRONG`
 findings and three `SMELL`s. The branch now keeps invalid negative/non-finite cost history sticky across
@@ -457,10 +468,10 @@ regressions are deterministic. The pre-settlement cancellation and both source-r
 each failed **0 / 1** with zero reaps; the deadline-first regression failed **0 / 1** with two runtime probes;
 the original three mutations also fail under their exact pre-fix behavior. The full host suite passes
 **2,085 / 0 / 12 ignored** across **70** test/doc-test executables; affected core/ACP tests pass **514 / 0**,
-and binary tests pass **395 / 0**. No additional compatibility/model smoke ran; two source-only Sol reviews
-ran. Exact `a1641d0` and `d0be430` reviews returned `REVISE`; this fold
-requires Sol closure approval before one clean-room Fable/xhigh adversarial implementation plus
-release/compatibility lens, with no Fable re-review.
+and binary tests pass **395 / 0**. No additional compatibility/model smoke ran; three source-only Sol reviews
+ran. Exact `a1641d0` and `d0be430` reviews returned `REVISE`; exact `87c8f4e` returned `APPROVE` with no new
+`WRONG` and two accepted nonblocking fault-boundary `SMELL`s. One clean-room Fable/xhigh adversarial
+implementation plus release/compatibility review remains, with no Fable re-review.
 
 Seed rows for every currently claimed path or control in `docs/compatibility.md`:
 
