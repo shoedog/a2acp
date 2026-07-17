@@ -315,7 +315,7 @@ pub(crate) struct DirectorySnapshot {
 /// process lifetime. The parent descriptor remains close-on-exec; the forked
 /// child binds its cwd with `fchdir` and may retain only its copy when the OS
 /// stable absolute path is descriptor-backed.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PinnedDirectory {
     file: Arc<File>,
     canonical_cwd: SessionCwd,
@@ -487,6 +487,16 @@ impl PinnedDirectory {
         self.acp_session_cwd.clone()
     }
 
+    pub(crate) fn canonical_path(&self) -> PathBuf {
+        PathBuf::from(self.canonical_cwd.as_str())
+    }
+
+    pub(crate) fn sync(&self) -> Result<(), BoxError> {
+        self.file
+            .sync_all()
+            .map_err(|error| format!("pinned directory: cannot sync: {error}").into())
+    }
+
     pub(crate) fn retain_descriptor_after_exec(&self) -> bool {
         self.retain_descriptor_after_exec
     }
@@ -537,6 +547,14 @@ impl PinnedDirectory {
             }
             // SAFETY: `fd` was returned uniquely by openat above.
             let file = unsafe { File::from_raw_fd(fd) };
+            if let Err(error) = set_effective_owner(&file, label) {
+                drop(file);
+                // SAFETY: the same retained parent/name pair identifies the just-created entry.
+                unsafe {
+                    libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0);
+                }
+                return Err(error);
+            }
             // SAFETY: `file` owns a live descriptor and `mode` is a normal permission mask.
             if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } == -1 {
                 let error = std::io::Error::last_os_error();
@@ -565,6 +583,64 @@ impl PinnedDirectory {
         {
             let _ = (name, mode);
             Err(format!("{label}: descriptor-relative file creation is unsupported").into())
+        }
+    }
+
+    /// Create one symbolic link relative to the retained directory object. Callers remain
+    /// responsible for proving that the target resolves within their owned capability.
+    pub(crate) fn create_symlink(
+        &self,
+        name: &OsStr,
+        target: &OsStr,
+        label: &str,
+    ) -> Result<(), BoxError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::ffi::OsStrExt as _;
+
+            let name = child_name_cstring(name, label)?;
+            let target = std::ffi::CString::new(target.as_bytes())
+                .map_err(|_| format!("{label}: symlink target contains NUL"))?;
+            if target.as_bytes().is_empty() {
+                return Err(format!("{label}: symlink target must not be empty").into());
+            }
+            // SAFETY: the retained parent descriptor and both NUL-terminated strings are live for
+            // this call. The caller has already validated the target lexically within its root.
+            if unsafe { libc::symlinkat(target.as_ptr(), self.file.as_raw_fd(), name.as_ptr()) }
+                == -1
+            {
+                return Err(format!(
+                    "{label}: cannot create descriptor-relative symlink: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            // SAFETY: the retained parent/name pair identifies the new link, and
+            // AT_SYMLINK_NOFOLLOW applies ownership to the link rather than its target.
+            if unsafe {
+                libc::fchownat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::geteuid(),
+                    libc::getegid(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == -1
+            {
+                let error = std::io::Error::last_os_error();
+                // SAFETY: best-effort cleanup uses the same retained parent/name pair.
+                unsafe {
+                    libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0);
+                }
+                return Err(format!("{label}: cannot bind symlink ownership: {error}").into());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (name, target);
+            Err(format!("{label}: descriptor-relative symlink creation is unsupported").into())
         }
     }
 
@@ -606,6 +682,59 @@ impl PinnedDirectory {
         {
             let _ = name;
             Err(format!("{label}: descriptor-relative file opening is unsupported").into())
+        }
+    }
+
+    /// Reopen one existing child directory relative to the retained parent object. Each path
+    /// component is therefore traversed without following a replacement symlink.
+    pub(crate) fn open_child_directory(&self, name: &OsStr, label: &str) -> Result<Self, BoxError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+            let c_name = child_name_cstring(name, label)?;
+            // SAFETY: the retained parent descriptor and single-component name are live; the
+            // returned descriptor is uniquely adopted by File and O_NOFOLLOW rejects a link.
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                )
+            };
+            if fd == -1 {
+                return Err(format!(
+                    "{label}: cannot open descriptor-relative directory: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            // SAFETY: `fd` was returned uniquely by openat above.
+            let file = unsafe { File::from_raw_fd(fd) };
+            let metadata = file
+                .metadata()
+                .map_err(|error| format!("{label}: cannot inspect child directory: {error}"))?;
+            if !metadata.is_dir() {
+                return Err(format!("{label}: child entry is not a directory").into());
+            }
+            let identity = DirectoryIdentity::from_open_directory(&file, &metadata, label)?;
+            let (acp_session_cwd, retain_descriptor_after_exec) =
+                stable_directory_path(&file, &identity, label)?;
+            let canonical_child = Path::new(self.canonical_cwd.as_str()).join(name);
+            let canonical_cwd = SessionCwd::parse(&canonical_child.to_string_lossy())
+                .map_err(|_| format!("{label}: child directory is not a valid session cwd"))?;
+            Ok(Self {
+                file: Arc::new(file),
+                canonical_cwd,
+                identity,
+                acp_session_cwd,
+                retain_descriptor_after_exec,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            Err(format!("{label}: descriptor-relative directory opening is unsupported").into())
         }
     }
 
@@ -651,6 +780,14 @@ impl PinnedDirectory {
             }
             // SAFETY: `fd` was returned uniquely by openat above.
             let file = unsafe { File::from_raw_fd(fd) };
+            if let Err(error) = set_effective_owner(&file, label) {
+                drop(file);
+                // SAFETY: best-effort cleanup uses the same retained parent/name pair.
+                unsafe {
+                    libc::unlinkat(self.file.as_raw_fd(), c_name.as_ptr(), libc::AT_REMOVEDIR);
+                }
+                return Err(error);
+            }
             // SAFETY: `file` owns a live descriptor and `mode` is a normal permission mask.
             if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } == -1 {
                 return Err(format!(
@@ -841,6 +978,22 @@ impl PinnedDirectory {
             Err(format!("{label}: atomic descriptor-relative replacement is unsupported").into())
         }
     }
+}
+
+#[cfg(unix)]
+fn set_effective_owner(file: &File, label: &str) -> Result<(), BoxError> {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: `file` owns a live descriptor; geteuid/getegid have no preconditions; and fchown
+    // applies only to that retained object rather than re-resolving a path.
+    if unsafe { libc::fchown(file.as_raw_fd(), libc::geteuid(), libc::getegid()) } == -1 {
+        return Err(format!(
+            "{label}: cannot bind effective ownership: {}",
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

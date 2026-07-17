@@ -234,6 +234,35 @@ fn eligible_plan_is_local_non_billable_and_emits_separate_rerun() {
 }
 
 #[test]
+fn old_and_additive_smoke_v2_catalog_shapes_are_both_accepted() {
+    let (_dir, marker, config, source) = fixture();
+    let old = fallback_command(&config, &source)
+        .arg("--confirm-trusted-own-repo-read-only")
+        .output()
+        .unwrap();
+    assert_eq!(read_plan(&old)["eligible"], true);
+
+    let mut additive: serde_json::Value =
+        serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+    additive["target"]["model_catalog"] = serde_json::json!({
+        "state": "available",
+        "current_model": "model-b",
+        "models": ["model-a", "model-b"],
+        "model_configurable": true,
+        "effort_levels": ["low", "high"],
+        "modes": ["default", "plan"],
+        "current_mode": "plan"
+    });
+    write_json(&source, &additive);
+    let new = fallback_command(&config, &source)
+        .arg("--confirm-trusted-own-repo-read-only")
+        .output()
+        .unwrap();
+    assert_eq!(read_plan(&new)["eligible"], true);
+    assert!(!marker.exists());
+}
+
+#[test]
 fn production_smoke_preflight_artifact_is_eligible_without_hand_built_lifecycle() {
     let (dir, marker, _fixture_config, _source) = fixture();
     let adapter = marker.with_file_name("codex-acp");

@@ -1,10 +1,61 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main base:** `origin/main` at `3927df3f` on 2026-07-16 (PR #31 merged R3a)
-- **Completed through:** R3a **MERGED** at `3927df3f`; R2e remains deferred and off the critical path
-- **Active slice:** R3b pinned lane **APPROVED / PENDING MERGE** on `agent/reliability-r3b-pinned-lane`
-- **Current R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
+- **Current main base:** `origin/main` at `504c1e43` on 2026-07-16 (PR #32 merged R3b)
+- **Completed through:** R3b **MERGED** at `504c1e43`; R2e remains deferred and off the critical path
+- **Active slice:** R3c floating-current lane **APPROVED / PENDING MERGE** on
+  `agent/reliability-r3c-floating-lane`
+- **Current R3c deterministic gate:** code head
+  `4bd63f3f129a08586742c3c3e946fecfa02839ba` completes all four implementation slices and seven
+  adversarial-review rounds. The initial Sol/xhigh review of exact `a5dfef8` returned nine `WRONG`, no
+  `SMELL`, and `GATE: REVISE`; `e3459a5` closes all nine, and `d86e418` adds the missing pre-fix-red
+  catalog-only comparison regression. Closure review of exact `646d61b` left transient aggregate
+  tree-resource overshoot unresolved and found process-group reuse; `f15ae88` moves materialization behind a
+  bridge-owned hard reservation, avoids retained per-directory descriptors, and keeps a trusted
+  group-leader anchor through kill/reap. Sol/xhigh review of exact `5facc9c` fixed inherited findings 1 and
+  3-10, left finding 2 partial because package reservation remained sequential, and found transitive archive
+  identity unbound. `b3793e8` preflights all selected archives, commits one complete-tree reservation before
+  package writes, and binds each archive name/version to its lock entry. Sol/xhigh review of exact `260e4a6`
+  adjudicated all 11 inherited findings **FIXED**, found no `SMELL`, but returned `GATE: REVISE` on two new
+  `WRONG` items: missing declared npm bin targets were silently accepted, and byte-sensitive virtual paths
+  could collide only after writes on a case-insensitive destination. `4621ab5` now requires every declared
+  bin target to name a planned regular file and applies one fail-closed, case-insensitive portable ASCII
+  namespace to archive entries, symlink targets, implicit directories, and cumulative leaves before the
+  reservation commits. Sol/xhigh review of exact `af69806` adjudicated all 13 inherited findings **FIXED**,
+  found no `SMELL`, but returned `GATE: REVISE` on one new `WRONG`: a symlink target could use spelling that
+  resolved only on the case-insensitive macOS host and became dangling in the Linux reader image.
+  `dd99267` normalizes each in-package target and rejects it before writes when its portable-equivalent
+  planned path has different spelling, while retaining an exact-spelling positive control. Sol/xhigh review
+  of exact docs head `9d9f713d1ba72763efc67243c77da9e4425a4893` adjudicated all 14 inherited
+  findings **FIXED**, found no `SMELL`, and returned `GATE: REVISE` on one new `WRONG`: non-raw tar parsing
+  buffered GNU long-name/long-link and local PAX bodies before bridge limits, allowing a highly compressed
+  oversized extension to allocate outside those bounds. `4bd63f3` raw-preflights all four GNU/PAX metadata
+  types against a 1 MiB per-record cap before both non-raw passes, accounts PAX-effective file sizes, and
+  rejects effective-size drift before output-file creation. The metadata-bound and PAX-size red-first
+  controls each failed **0 / 1** against the reviewed production tree; current focused resolution gates pass
+  **61 / 0**. Exact-`4bd63f3` host gates pass **2,165 / 0 / 12 ignored** across **70** test/doc-test
+  executables. Format/diff, all-target workspace check, warnings-denied all-target Clippy, locked release,
+  hygiene **37/7**, pinned manifest **9 cases**, floating recipe **4 cases**, protected-input identity, and
+  dependency policy are green. Fresh Sol/xhigh closure review of exact docs head `0567381` adjudicated all
+  15 inherited findings **FIXED**, found no new `WRONG` or `SMELL`, and returned `GATE: APPROVE`. The
+  separate Opus 4.8/xhigh release/compatibility lens of exact clean `6637c13` found no `WRONG` or `SMELL`,
+  returned release determination `READY`, and ended `GATE: APPROVE`. During this fold, a grouped
+  focused run again reported the unrelated cancellation-descendant assertion failed **0 / 1** after **59**
+  other tests passed; its immediate isolated rerun passed **1 / 0**, and three subsequent full-workspace runs
+  passed it. This recurring timing-sensitive signal remains reported and unmodified rather than rebaselined.
+  The provider-unexercised release binary is 24,673,456 bytes at SHA-256
+  `be83cb71834051c5ae2f5a9ce590377061de086187e5069f8c44001b2c71aa7c`. The earlier `57e63a0`
+  Linux/Rust 1.94.0 gate
+  remains green at full package **508 / 0 / 11 ignored** across **16** groups (binary **434 / 0**,
+  compatibility CLI **21 / 0**, smoke CLI **15 / 0**) plus ACP catalog **1 / 0**; it was not rerun for
+  `4bd63f3` because cleanup removed the local Rust image and no new image pull was authorized. Explicitly
+  authorized provider-free host diagnostics resolved Codex and Claude package trees; generated-config
+  doctors passed **10/0/0** and **11/0/0** respectively, but the retained bundles predate `f15ae88`,
+  `b3793e8`, `4621ab5`, `dd99267`, and `4bd63f3` and are
+  diagnostic rather than exact-current compatibility evidence. No compatibility/provider smoke turn, model
+  discovery, image resolution/build, compatibility aggregate, operator rebuild, or operator swap ran; the
+  recorded review turns are review evidence only.
+- **Last merged R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-incident
   container-start fold passes binary **395 / 0 / 0**, affected bridge-core/ACP **514 / 0**, and the full
   serial workspace **2,085 / 0 / 12 ignored** across **70** test/doc-test executables. Exact mutations prove
@@ -36,8 +87,8 @@
   returned release verdict `READY`, and ended `GATE: APPROVE`. This docs fold closes its non-USD cost wording
   gap; the external-provider truthiness verification boundary, thread/runtime resource exhaustion,
   pathological post-SIGKILL ceiling, and fail-closed policy/Podman coverage edges remain
-  accepted/nonblocking. R3b is **APPROVED / PENDING MERGE**. No baseline promotion has run.
-- **Current R3b live gate:** authorized attempt 2 ran once with zero retry/fallback against candidate
+  accepted/nonblocking. R3b is **MERGED** at `504c1e43` by PR #32. No baseline promotion has run.
+- **Last R3b live gate:** authorized attempt 2 ran once with zero retry/fallback against candidate
   SHA-256 `323b4e21...a079` and the same exact manifest. Codex and Fable host passed exact `PONG`; both
   readers failed before prompt acceptance after their named containers remained only `created` and ACP
   initialize timed out. The aggregate is retained at
@@ -161,10 +212,11 @@
   `a0c2c4c5a526f99603702f826d5401aa39864d4d` independently found no `WRONG`, reported five nonblocking
   `SMELL`s, returned `READY`, and ended `GATE: APPROVE`. Its non-USD cost wording gap is fixed in this docs
   fold; its other verification/fault-boundary items remain accepted/nonblocking. R3b is
-  **APPROVED / PENDING MERGE**. Reviews are not compatibility evidence.
-- **Last merged full workspace gate:** R2d host serial **1,985 / 0 / 12 ignored** across 69 executables;
-  format/diff, all-target check, warnings-denied Clippy, release build, repository hygiene **37/7**, and
-  PR #29 Build/Lint/Coverage plus CLA were green
+  **MERGED** at `504c1e43` by PR #32. Reviews are not compatibility evidence.
+- **Last merged full workspace gate:** R3b host serial **2,085 / 0 / 12 ignored** across **70**
+  test/doc-test executables; affected bridge-core/ACP **514 / 0** and binary **395 / 0 / 0**.
+  Format/diff, all-target check, warnings-denied Clippy, locked release build, repository hygiene
+  **37/7**, and PR #32 Build/Lint/Coverage plus CLA were green.
 - **Current execution boundary:** R3b has four minimal bridge-smoke support cases (Codex host,
   Codex reader, Claude 0.44 host, Claude 0.55 Fable reader) and five explicit non-goal/unrun historical
   rows (Claude direct CLI, Claude 0.55 host ACP, managed-no-egress negative, Kiro host, Kiro reader).
@@ -172,13 +224,14 @@
   failed aggregate do not authorize partial baseline promotion. Selection and billing acknowledgement
   remain mandatory. The checked-in baseline has the new manifest
   identity but intentionally has no promoted case summaries until separately authorized exact-candidate
-  live artifacts are reviewed. Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** commit this Fable-approval recording fold, publish a non-draft PR, and merge after required
-  CI is green; no Fable re-review. After merge, advance the durable cursor to R3c. Do not request another live
-  aggregate until a non-provider start control proves the local runtime recovered, both Claude doctors are
-  green, the exact new candidate is bound, and the operator separately authorizes one new four-case run.
-  Do not rebuild or swap the running operator; OpenRouter/OpenCode remain R3e/R3f after the R3 core and
-  before R4.
+  live artifacts are reviewed. R3c adds a separate checked-in recipe, provider-free exact resolution
+  bundle, and independently authorized `run --resolution` boundary. Direct floating execution is refused;
+  resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
+  the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
+  Review turns and deterministic doctor/tests are not compatibility evidence.
+- **Next action:** publish the exact gate-green R3c approval fold as a non-draft PR. No exact-current
+  live resolution, model discovery, compatibility aggregate, operator rebuild, or operator swap is
+  authorized. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**
@@ -204,7 +257,7 @@ R2a provenance (MERGED)
   -> R2c explicit one-turn billable smoke (MERGED)
        -> R2d local non-billable fallback plan (MERGED)
             -> R3 compatibility manifest + pinned/floating canaries + OpenRouter/OpenCode
-               (IN REVIEW: R3a MERGED; R3b APPROVED / PENDING MERGE)
+               (IN REVIEW: R3a/R3b MERGED; R3c APPROVED / PENDING MERGE)
                  -> R4 reproducible dependency/image pins + release promotion gate
 
 R2e authenticated in-process fallback is DEFERRED and off the critical path.
@@ -229,7 +282,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **APPROVED / PENDING MERGE**. Attempts 1 and 2 remain non-promotable failure evidence. Exact `a1641d0` and `d0be430` reviews returned `REVISE`; exact `87c8f4e` Sol closure review adjudicated both inherited items fixed, found no new `WRONG`, and returned `APPROVE`. The one clean-room Fable/xhigh review of exact `a0c2c4c` independently found no `WRONG`, returned release verdict `READY`, and ended `GATE: APPROVE` with nonblocking smells recorded. No Fable re-review. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner merged; R3b pinned lane approved/pending merge; then R3c floating, R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **APPROVED / PENDING MERGE** at code head `4bd63f3`. R3b attempts 1 and 2 remain non-promotable failure evidence. R3b exact `87c8f4e` Sol closure review approved and the one clean-room Fable/xhigh review of exact `a0c2c4c` returned release verdict `READY` and `GATE: APPROVE`; no Fable re-review. R3c Sol reviews of exact `a5dfef8`, `646d61b`, `5facc9c`, `260e4a6`, `af69806`, and `9d9f713` returned `REVISE`; `4bd63f3` closes the last hidden tar-metadata allocation `WRONG`. Exact-`0567381` Sol/xhigh closure review fixed all 15 inherited findings, found no new `WRONG` or `SMELL`, and returned `GATE: APPROVE`. Exact-`6637c13` Opus 4.8/xhigh release/compatibility review found no `WRONG` or `SMELL`, returned `READY`, and ended `GATE: APPROVE`; exact-head full/release/policy gates are green. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner and R3b pinned lane merged; R3c owns provider-free floating resolution plus bound execution; then R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -268,6 +321,26 @@ serve-only session/configuration defect. Source inspection confirms `session/new
 model/effort `session/set_config_option` rejection can both map to `AgentCrashed` before a turn-log row.
 Carry the missing structured failure projection and stale-shared-state recovery question into R2f/R3d;
 do not replay automatically or use this review as compatibility evidence.
+
+### Deferred incident: long-lived operator accumulated unreleased ACP sessions
+
+`INC-SHARED-SESSION-CAPACITY-2026-07-17` extends the earlier shared-warm crash evidence. The long-lived
+operator on port 18080 returned two immediate Codex `AgentCrashed` failures before any provider turn while
+its bridge, codex-acp, and Codex app-server processes remained alive. An isolated operator on port 18081 then
+completed the same selected package/model/effort/mode and review shape. The old Codex app-server had observed
+15 distinct session thread ids and no close notifications; bridge release removed its local session entry
+without sending ACP `session/close`, while codex-acp retains sessions until such a close.
+
+The leading hypothesis is leaked or exhausted agent-session capacity, but root cause remains **unknown**:
+the evidence has not yet separated a capacity ceiling from a poisoned long-lived transport. General package,
+model, auth, and cwd incompatibility predict failure in the isolated operator and are falsified by its green
+turn. A transport-specific fault predicts old-only failure without requiring a particular session count and
+remains viable. No operator process, warm session, or active turn was stopped or restarted.
+
+Carry this into R2f/R3d as structured pre-turn ACP error retention, backend/session-capacity health,
+capability-gated close semantics, dead-backend detection, a deterministic threshold regression, and a
+non-disruptive drain/rotate design that never interrupts running turns or warm sessions. Do not automatically
+replay the failed request or treat the isolated review as compatibility evidence.
 
 ### Resolved incident: synchronized but expired Claude OAuth reached billable prompt
 
@@ -478,8 +551,9 @@ Next action:
 
 ## Current handoff
 
-- R3a merged through PR #31 at `3927df3f1dce03fde50b7754151a718017f45815`. R3b is
-  **APPROVED / PENDING MERGE** on `agent/reliability-r3b-pinned-lane`, based directly on that merge. The
+- R3a merged through PR #31 at `3927df3f1dce03fde50b7754151a718017f45815`. R3b merged through PR #32
+  at `504c1e434fd5845bc6745e0b0a0aae95427afbdd`. R3c is **APPROVED / PENDING MERGE** on
+  `agent/reliability-r3c-floating-lane`, based directly on that merge. The
   manifest now contains nine
   exact pinned rows: four release-blocking minimal bridge-smoke support cases and five explicit
   historical/non-goal controls. Every config is checked in and SHA-bound before provider spawn. The two
@@ -534,7 +608,64 @@ Next action:
   no `WRONG`, returned release verdict `READY`, and ended `GATE: APPROVE`. This docs fold closes its non-USD
   cost wording `SMELL`; its external-provider truthiness verification boundary, two inherited fault
   boundaries, and fail-closed policy/Podman coverage edges remain accepted/nonblocking. R3b is
-  **APPROVED / PENDING MERGE**; no Fable re-review will run.
+  **MERGED** at `504c1e43` by PR #32; no Fable re-review will run.
+- One bridge-mediated clean-room Sol/xhigh design pass inspected exact clean `504c1e43` and closed the
+  R3c architecture around three evidence levels: a checked-in floating recipe, an explicitly authorized
+  provider-free exact resolution bundle, and a separately billable `run --resolution` using the existing
+  one-prompt smoke. Resolution never calls `models` or creates an ACP session; the actual bounded catalog
+  is captured from the authorized smoke's one session. Direct unresolved floating execution is refused.
+  Candidate pass/fail/unknown is advisory and cannot write the pinned manifest/baseline, production configs,
+  Cargo locks, Containerfiles, compatibility/support docs, shared tags, or the running operator. The pass
+  ran no provider, package resolution, container, build, or test action and is design evidence only.
+  Implementation slices 1-3 are committed as `1c1115cb`, `0c25686c`, and `e159915`. They cover strict
+  contracts and recorded pre-change reds; provider-free package/image/config materialization and atomic
+  private publication; exact pre-provider drift revalidation; one-session catalog capture; floating
+  pass/fail/unknown truth; independent floating comparison dimensions; and old/additive smoke-v2 fallback
+  compatibility. `356092f` completes slice 4 with the four-case recipe and stable runbook; `57e63a0` closes
+  the warnings-denied lint gate without changing behavior. The first Sol/xhigh review of exact `a5dfef8`
+  returned nine `WRONG`, no `SMELL`, and `GATE: REVISE`. `e3459a5` closes registry authority/shared-budget,
+  in-flight resource, definitive-failure/cancellation, descendant-cleanup, inventory-security,
+  production-manifest baseline, catalog-projection, aggregate-comparison, and cursor defects. `d86e418`
+  adds the catalog-only pre-fix-red regression. Closure review of exact `646d61b` fixed eight inherited
+  items but returned `REVISE` on transient aggregate resource overshoot and process-group reuse. `f15ae88`
+  moved exact integrity-bound tree materialization behind a bridge-owned hard reservation, avoided retained
+  per-directory descriptors, and retained a trusted process-group leader until cleanup. Sol/xhigh review of
+  exact `5facc9c` fixed inherited findings 1 and 3-10, left finding 2 partial because package reservation was
+  still sequential, found ordinary transitive archive identity unbound, reported no `SMELL`, and returned
+  `GATE: REVISE`. `b3793e8` preflights all selected archives, reserves the whole tree once before any
+  package-entry write, and binds archive name/version to the lock entry. Sol/xhigh review of exact `260e4a6`
+  adjudicated all 11 inherited findings fixed, then returned `REVISE` on missing declared bin targets and
+  filesystem-equivalent paths reaching writes. `4621ab5` requires each bin target to be a planned regular
+  file and uses a fail-closed portable ASCII/case-insensitive namespace across archive and cumulative-tree
+  checks. Sol/xhigh review of exact `af69806` fixed all 13 inherited findings, then returned `REVISE` on a
+  symlink target whose host-only case spelling could become dangling in the Linux reader. `dd99267` binds
+  portable-equivalent symlink targets to planned exact spelling. Sol/xhigh review of exact `9d9f713`
+  adjudicated all 14 inherited findings fixed, then returned `REVISE` on unbounded hidden GNU/PAX metadata
+  allocation before bridge limits. Current code head `4bd63f3` bounds all four extension types before both
+  non-raw passes, accounts PAX-effective sizes, and rejects size drift before file creation. Its two
+  red-first controls failed **0 / 1** each; focused resolution tests now pass **61 / 0** and the exact-head
+  host suite passes **2,165 / 0 / 12 ignored** across **70** executables. Format/diff, all-target check,
+  warnings-denied Clippy, locked release, hygiene **37/7**, both manifests, protected inputs, and dependency
+  policy are green. Exact-`0567381` Sol/xhigh closure review adjudicated all 15 inherited findings fixed,
+  found no new `WRONG` or `SMELL`, and returned `GATE: APPROVE`. A separate clean-room Opus 4.8/xhigh
+  release/compatibility lens inspected exact clean `6637c13b7e3f82dde4f59790c40d8e0eded47aa6`, found no
+  `WRONG` or `SMELL`, returned release determination `READY`, and ended `GATE: APPROVE`. Three preceding
+  Claude diagnostic requests (Fable on the operator, Fable on a fresh isolated ACP process, and Opus on
+  the operator) incorrectly supplied `a2a-bridge.mode=read-only` to the Tier 0 prompt-only Claude agent.
+  Each was rejected before model configuration in about 0.5-0.6 seconds with no review output or usage;
+  they are neither reviews nor evidence of Fable/Opus model degradation. Omitting only `mode` produced
+  `acp.config_resolved` and the completed Opus review, ruling out stale warm-session state and confirming
+  the controller-request mismatch. The corrected Opus turn is the single policy-limited second opinion
+  after Sol approval; no Opus re-review is required.
+  Explicitly authorized provider-free host
+  diagnostics resolved current Codex and Claude package trees and produced green generated-config doctors,
+  but the retained bundles predate `f15ae88`, `b3793e8`, `4621ab5`, `dd99267`, and `4bd63f3` and are
+  diagnostic rather than exact-current compatibility evidence. Linux/Rust 1.94 remains green only on
+  historical implementation head `57e63a0`; no local image remains and no pull was authorized. No
+  compatibility/provider smoke turn, model discovery, image resolution/build, compatibility aggregate,
+  operator rebuild, or operator swap ran; the recorded review turns are review evidence only. The complete
+  restart contract, schemas, failure taxonomy, mutation matrix, live authorization gates, rollback, and
+  deferrals remain in the active R3 plan.
 - Authorized attempt 2 is retained at
   `/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json`, SHA-256 `319b3cf4...a9b3e`. Its exact
   `323b4e21...a079` candidate passed both host cases and failed both reader cases before prompt acceptance

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bridge_core::catalog::is_blocked_model_id;
+use bridge_core::catalog::{is_blocked_model_id, AgentCaps};
 use bridge_core::diagnostics::{
     diagnostic_timestamp_ms, DiagnosticFailureClass, DiagnosticPhase, DiagnosticRedactor,
     FailureDiagnostic, FailureDiagnosticInput, FailureDisposition, InMemoryDiagnosticObserver,
@@ -49,6 +49,9 @@ const DIAGNOSTIC_CAPACITY: usize = 128;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ARTIFACT_TEXT_BYTES: usize = 16 * 1024;
+const MAX_CATALOG_ENTRIES: usize = 128;
+const MAX_CATALOG_VALUE_BYTES: usize = 256;
+const MAX_CATALOG_TOTAL_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FallbackSmokeGuard {
@@ -501,6 +504,102 @@ struct TargetRecord {
     execution_mode: &'static str,
     provenance: Vec<doctor::CheckResult>,
     authentication: AuthenticationRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_catalog: Option<ModelCatalogRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum ModelCatalogRecord {
+    Available {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current_model: Option<String>,
+        models: Vec<String>,
+        model_configurable: bool,
+        effort_levels: Vec<String>,
+        modes: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current_mode: Option<String>,
+    },
+    Rejected {
+        code: &'static str,
+    },
+}
+
+fn catalog_value_is_safe(
+    value: &str,
+    redactor: &DiagnosticRedactor,
+    total_bytes: &mut usize,
+) -> bool {
+    if value.is_empty()
+        || value.trim() != value
+        || value.len() > MAX_CATALOG_VALUE_BYTES
+        || value.chars().any(char::is_control)
+        || crate::compatibility::looks_like_secret(value)
+        || redactor.sanitize_stderr_line(value, MAX_CATALOG_VALUE_BYTES) != value
+    {
+        return false;
+    }
+    let Some(total) = total_bytes.checked_add(value.len()) else {
+        return false;
+    };
+    if total > MAX_CATALOG_TOTAL_BYTES {
+        return false;
+    }
+    *total_bytes = total;
+    true
+}
+
+fn model_catalog_record(
+    catalog: Option<AgentCaps>,
+    redactor: &DiagnosticRedactor,
+) -> ModelCatalogRecord {
+    let rejected = || ModelCatalogRecord::Rejected {
+        code: "catalog_unavailable",
+    };
+    let Some(catalog) = catalog else {
+        return rejected();
+    };
+    let entry_count = catalog
+        .models
+        .len()
+        .saturating_add(catalog.effort_levels.len())
+        .saturating_add(catalog.modes.len());
+    if entry_count > MAX_CATALOG_ENTRIES
+        || catalog.model_configurable && catalog.models.is_empty()
+        || catalog
+            .current_model
+            .as_ref()
+            .is_some_and(|current| !catalog.models.contains(current))
+        || catalog
+            .current_mode
+            .as_ref()
+            .is_some_and(|current| !catalog.modes.contains(current))
+    {
+        return rejected();
+    }
+    let mut total_bytes = 0usize;
+    let values = catalog
+        .current_model
+        .iter()
+        .chain(catalog.models.iter())
+        .chain(catalog.effort_levels.iter())
+        .chain(catalog.modes.iter())
+        .chain(catalog.current_mode.iter());
+    if !values
+        .into_iter()
+        .all(|value| catalog_value_is_safe(value, redactor, &mut total_bytes))
+    {
+        return rejected();
+    }
+    ModelCatalogRecord::Available {
+        current_model: catalog.current_model,
+        models: catalog.models,
+        model_configurable: catalog.model_configurable,
+        effort_levels: catalog.effort_levels,
+        modes: catalog.modes,
+        current_mode: catalog.current_mode,
+    }
 }
 
 #[derive(Serialize)]
@@ -1847,6 +1946,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         execution_mode: execution_mode(&entry),
         provenance,
         authentication: authentication(&entry, &artifact_redactor),
+        model_catalog: None,
     });
     if stale_oauth {
         state.fail_static(
@@ -2002,6 +2102,12 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     )
     .await;
     let failed = apply_execute_result(&mut state, result);
+    if let Some(target) = state.artifact.target.as_mut() {
+        target.model_catalog = Some(model_catalog_record(
+            backend.session_catalog(&session),
+            &artifact_redactor,
+        ));
+    }
 
     let cleanup = cleanup_backend(
         backend,
@@ -2207,6 +2313,7 @@ mod tests {
         configure_block: Option<Duration>,
         prompt_block: Option<Duration>,
         prompts: Mutex<Vec<String>>,
+        catalog: Mutex<Option<AgentCaps>>,
         cwd_swap: Mutex<Option<(PathBuf, PathBuf, PathBuf)>>,
     }
 
@@ -2225,6 +2332,7 @@ mod tests {
                 configure_block: None,
                 prompt_block: None,
                 prompts: Mutex::new(Vec::new()),
+                catalog: Mutex::new(None),
                 cwd_swap: Mutex::new(None),
             }
         }
@@ -2247,6 +2355,11 @@ mod tests {
 
         fn with_blocking_prompt(mut self, duration: Duration) -> Self {
             self.prompt_block = Some(duration);
+            self
+        }
+
+        fn with_catalog(self, catalog: AgentCaps) -> Self {
+            *self.catalog.lock().unwrap() = Some(catalog);
             self
         }
 
@@ -2440,6 +2553,7 @@ mod tests {
             _observer: Arc<dyn bridge_core::ports::DiagnosticObserver>,
         ) -> Result<(), BridgeError> {
             self.release_calls.fetch_add(1, Ordering::SeqCst);
+            self.catalog.lock().unwrap().take();
             if self.hanging_release {
                 futures::future::pending::<()>().await;
             }
@@ -2480,6 +2594,15 @@ mod tests {
                 Ok(())
             }
         }
+
+        fn session_catalog(&self, _session: &SessionId) -> Option<AgentCaps> {
+            self.catalog.lock().unwrap().clone()
+        }
+
+        async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.catalog.lock().unwrap().take();
+            Ok(())
+        }
     }
 
     fn args() -> SmokeArgs {
@@ -2513,6 +2636,76 @@ mod tests {
 
     fn observer() -> Arc<InMemoryDiagnosticObserver> {
         Arc::new(InMemoryDiagnosticObserver::new(16).unwrap())
+    }
+
+    fn safe_catalog() -> AgentCaps {
+        AgentCaps {
+            current_model: Some("model-b".into()),
+            models: vec!["model-a".into(), "model-b".into()],
+            model_configurable: true,
+            effort_levels: vec!["low".into(), "high".into()],
+            modes: vec!["default".into(), "plan".into()],
+            current_mode: Some("plan".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn same_session_catalog_evidence_is_bounded_static_and_captured_before_cleanup() {
+        let session = SessionId::parse("smoke-catalog").unwrap();
+        let backend = FakeBackend::new(Behavior::Exact).with_catalog(safe_catalog());
+        let redactor = DiagnosticRedactor::new(["exact-secret"]);
+        assert_eq!(
+            model_catalog_record(backend.session_catalog(&session), &redactor),
+            ModelCatalogRecord::Available {
+                current_model: Some("model-b".into()),
+                models: vec!["model-a".into(), "model-b".into()],
+                model_configurable: true,
+                effort_levels: vec!["low".into(), "high".into()],
+                modes: vec!["default".into(), "plan".into()],
+                current_mode: Some("plan".into()),
+            }
+        );
+
+        backend
+            .release_session_observed(&session, observer())
+            .await
+            .unwrap();
+        assert_eq!(
+            model_catalog_record(backend.session_catalog(&session), &redactor),
+            ModelCatalogRecord::Rejected {
+                code: "catalog_unavailable"
+            }
+        );
+
+        let mut unsafe_catalog = safe_catalog();
+        unsafe_catalog.models.push("exact-secret".into());
+        assert!(matches!(
+            model_catalog_record(Some(unsafe_catalog), &redactor),
+            ModelCatalogRecord::Rejected {
+                code: "catalog_unavailable"
+            }
+        ));
+
+        let mut controlled = safe_catalog();
+        controlled.modes.push("unsafe\nmode".into());
+        assert!(matches!(
+            model_catalog_record(Some(controlled), &redactor),
+            ModelCatalogRecord::Rejected {
+                code: "catalog_unavailable"
+            }
+        ));
+
+        let mut oversized = safe_catalog();
+        oversized.models = (0..=MAX_CATALOG_ENTRIES)
+            .map(|index| format!("model-{index}"))
+            .collect();
+        oversized.current_model = Some("model-0".into());
+        assert!(matches!(
+            model_catalog_record(Some(oversized), &redactor),
+            ModelCatalogRecord::Rejected {
+                code: "catalog_unavailable"
+            }
+        ));
     }
 
     async fn execute(behavior: Behavior, timeout: Duration) -> (Arc<FakeBackend>, DrainResult) {

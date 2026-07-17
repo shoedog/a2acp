@@ -222,6 +222,61 @@ from separately authorized exact-candidate evidence. Read
 [`docs/compatibility.md`](docs/compatibility.md) and the current
 [`reliability roadmap`](docs/reliability-execution-roadmap.md) before spending a live turn.
 
+Floating-current canaries require two independent authorizations. First validate the request without
+effects, then authorize its exact registry/image effects and a new private output directory outside every
+Git repository:
+
+```bash
+./target/release/a2a-bridge compatibility validate \
+  --recipes compatibility/floating-current.toml
+
+evidence_root="$(mktemp -d /private/tmp/a2a-bridge-floating.XXXXXX)"
+chmod 700 "$evidence_root"
+./target/release/a2a-bridge compatibility resolve \
+  --recipes compatibility/floating-current.toml \
+  --case <exact-floating-case-id> \
+  --environment-owner <exact-owner-id> \
+  --runtime docker \
+  --acknowledge-resolution-effects \
+  --out "$evidence_root/resolution"
+```
+
+The recipe's selectors are requests, not compatibility evidence. Resolution may use the npm registry,
+runtime cache, and one unique disposable image tag, but it starts no adapter/provider session, calls no
+`models`, copies no credentials, replaces no shared tag, and grants no billing permission. The npm
+subprocess may create only the exact lock through the bridge's fixed npmjs CONNECT proxy; it never receives
+tree-write authority.
+The bridge downloads the exact integrity-bound npmjs HTTPS archives, requires matching package identity and
+present declared bin targets, and preflights paths/types in a case-insensitive portable ASCII namespace. It
+raw-preflights every GNU long-name/long-link and local/global PAX metadata record against a 1 MiB cap before
+tar preprocessing in both planning and materialization, accounts PAX-effective file sizes, binds symlink
+targets to the exact spelling of portable-equivalent planned paths, reserves the entire aggregate entry/byte
+budget before the first package entry write, and materializes the private tree descriptor-relatively.
+Inspect the complete `resolution.json`, validate and doctor its generated configs, then obtain separate
+authorization
+for the exact resolution id, unchanged candidate binary, selected cases, owner, and budget:
+
+```bash
+./target/release/a2a-bridge compatibility run \
+  --resolution "$evidence_root/resolution/resolution.json" \
+  --all-resolved \
+  --environment-owner <exact-owner-id> \
+  --acknowledge-billable \
+  --out "$evidence_root/floating-aggregate.json"
+
+./target/release/a2a-bridge compatibility compare \
+  --current "$evidence_root/floating-aggregate.json" \
+  --mode floating-to-pinned
+```
+
+Use `--all` and `--all-resolved` only as explicit authorizations. The run revalidates every bound artifact
+immediately before provider spawn and captures the bounded catalog from that same one-prompt session.
+`candidate_pass`, `candidate_fail`, and `candidate_unknown` are advisory canary outcomes; none promotes or
+rewrites production pins, baselines, configs, support docs, or the running operator. Retain the private
+bundle and unique tag until operator-reviewed cleanup proves that no running container uses them. Floating
+comparison rejects a baseline whose pinned-manifest identity differs from the resolution-bound production
+manifest.
+
 ## 4e. Plan an explicit host verification after classified container degradation
 
 Current slice status, review evidence, sequencing, and handoff are owned solely by

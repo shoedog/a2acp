@@ -1,4 +1,4 @@
-//! Versioned compatibility manifests and bounded canary execution (R3a).
+//! Versioned compatibility manifests, provider-free floating resolution, and bounded canary execution.
 //!
 //! The runner deliberately shells back into this exact candidate binary's R2c `smoke` command. It
 //! does not own a second prompt path, retry policy, or provider fallback. Selected eligible cases get
@@ -20,6 +20,9 @@ use bridge_core::domain::Effort;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::compatibility_resolution::{
+    self, FloatingTarget, LoadedRecipes, ResolvedBinding, RuntimeKind,
+};
 use crate::{local_file, BoxError};
 
 const DEFAULT_MANIFEST: &str = "compatibility/manifest.toml";
@@ -28,6 +31,9 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EMBEDDED_SMOKE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_CATALOG_ENTRIES: usize = 128;
+const MAX_CATALOG_VALUE_BYTES: usize = 256;
+const MAX_CATALOG_TOTAL_BYTES: usize = 64 * 1024;
 const MAX_CASES: usize = 128;
 const MAX_ID_BYTES: usize = 128;
 const MAX_TEXT_BYTES: usize = 4096;
@@ -41,18 +47,29 @@ const INHERITED_EXECUTABLE_FD_ENV: &str = "_A2A_BRIDGE_INTERNAL_COMPAT_EXECUTABL
 const INHERITED_SCRATCH_FD_ENV: &str = "_A2A_BRIDGE_INTERNAL_COMPAT_SCRATCH_FD";
 
 pub(crate) const USAGE: &str = "\
-usage: a2a-bridge compatibility validate [--manifest <path>]
+usage: a2a-bridge compatibility validate
+              [--manifest <path> | --recipes <path>]
+       a2a-bridge compatibility resolve [--recipes <path>]
+              (--case <id>... | --all)
+              --environment-owner <id> --runtime docker|podman
+              --acknowledge-resolution-effects --out <new-directory>
        a2a-bridge compatibility run [--manifest <path>]
               (--lane pinned|floating-current | --case <id>... | --all)
               --environment-owner <id> --acknowledge-billable --out <path>
+       a2a-bridge compatibility run --resolution <resolution.json>
+              (--case <id>... | --all-resolved)
+              --environment-owner <id> --acknowledge-billable --out <path>
        a2a-bridge compatibility compare --current <aggregate.json>
-              [--baseline <pinned.json>]
+              [--baseline <pinned.json>] [--mode pinned|floating-to-pinned]
 
-`validate` is local and non-billable. `run` requires both an explicit selection and the billing
-acknowledgement before it reads the manifest. Every eligible selected case invokes this exact binary's
-fixed-prompt R2c smoke once, with no retry or fallback. Child stdout/stderr is discarded; one owner-only
-aggregate JSON artifact is written to --out. `compare` reports pinned case/aggregate outcome,
-provenance, capability, auth, phase, terminal, and diagnostic drift independently.";
+`validate` is local and non-billable. `resolve` is non-billable but requires explicit acknowledgement
+before registry/image effects. It retains its private bundle and uniquely tagged image; it never starts an
+agent session or mutates production pins. `run` requires both an explicit selection and billing
+acknowledgement before it reads a manifest or resolution. Direct unresolved floating execution is refused.
+Every eligible selected case invokes this exact binary's fixed-prompt R2c smoke once, with no retry or
+fallback. Child stdout/stderr is discarded; one owner-only aggregate JSON artifact is written to --out.
+`compare` reports pinned drift or independent floating candidate/provenance/catalog dimensions without
+promoting either lane.";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
@@ -87,6 +104,17 @@ enum EvidencePath {
     DirectAcp,
     BridgeSmoke,
     BridgeWorkflow,
+}
+
+impl EvidencePath {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::DirectCli => "direct_cli",
+            Self::DirectAcp => "direct_acp",
+            Self::BridgeSmoke => "bridge_smoke",
+            Self::BridgeWorkflow => "bridge_workflow",
+        }
+    }
 }
 
 impl ExecutionMode {
@@ -133,6 +161,15 @@ enum ProbeType {
     Representative,
 }
 
+impl ProbeType {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Representative => "representative",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum EvidenceStatus {
@@ -142,11 +179,23 @@ enum EvidenceStatus {
     Stale,
 }
 
+impl EvidenceStatus {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Unknown => "UNKNOWN",
+            Self::Stale => "STALE",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum Classification {
     Support,
     NonGoal,
+    Canary,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -155,14 +204,14 @@ enum RedactionPolicy {
     Strict,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ArtifactPolicy {
     retention_days: u16,
     redaction: RedactionPolicy,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct ManifestBudget {
     timeout_secs: u64,
@@ -186,7 +235,7 @@ struct PinSet {
     components: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct RequiredEnvironment {
     name: String,
@@ -229,9 +278,13 @@ struct CompatibilityCase {
     retry_cap: u8,
     expected_status: EvidenceStatus,
     classification: Classification,
+    #[serde(default)]
+    baseline_case: Option<String>,
     artifact: ArtifactPolicy,
     #[serde(default)]
     pins: Option<PinSet>,
+    #[serde(default)]
+    resolved: Option<ResolvedBinding>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -248,6 +301,7 @@ struct LoadedManifest {
     canonical_path: PathBuf,
     canonical_path_text: String,
     sha256: String,
+    resolution_binding: Option<ResolutionBindingRecord>,
 }
 
 fn bounded_text(label: &str, value: &str, max: usize) -> Result<(), BoxError> {
@@ -320,24 +374,39 @@ fn credential_shaped_env_name(value: &str) -> bool {
     })
 }
 
-fn looks_like_secret(value: &str) -> bool {
+pub(super) fn looks_like_secret(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    value.starts_with("sk-")
-        || value.starts_with("sk_")
-        || value.starts_with("ghp_")
-        || value.starts_with("github_pat_")
-        || value.starts_with("xoxb-")
-        || value.starts_with("xoxp-")
-        || (value.starts_with("AKIA") && value.len() >= 16)
-        || lower.starts_with("bearer ")
-        || lower.starts_with("basic ")
+    secret_shaped_tokens(value)
+        || lower.contains("bearer ")
+        || lower.contains("basic ")
         || lower.contains("api_key=")
         || lower.contains("apikey=")
         || lower.contains("token=")
         || lower.contains("password=")
         || lower.contains("secret=")
         || value.contains("-----BEGIN PRIVATE KEY-----")
-        || looks_like_jwt(value)
+}
+
+fn secret_shaped_tokens(value: &str) -> bool {
+    value
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '"' | '\'' | '=' | ':' | ',' | '[' | ']' | '{' | '}' | '(' | ')' | '#'
+                )
+        })
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            token.starts_with("sk-")
+                || token.starts_with("sk_")
+                || token.starts_with("ghp_")
+                || token.starts_with("github_pat_")
+                || token.starts_with("xoxb-")
+                || token.starts_with("xoxp-")
+                || (token.starts_with("AKIA") && token.len() >= 16)
+                || looks_like_jwt(token)
+        })
 }
 
 fn looks_like_jwt(value: &str) -> bool {
@@ -659,24 +728,93 @@ fn validate_case(case: &CompatibilityCase, budget: &ManifestBudget) -> Result<()
         )
         .into());
     }
+    match (case.lane, case.baseline_case.as_deref()) {
+        (Lane::Pinned, None) => {}
+        (Lane::Pinned, Some(_)) => {
+            return Err(format!(
+                "compatibility manifest: pinned case {:?} must not declare baseline_case",
+                case.id
+            )
+            .into())
+        }
+        (Lane::FloatingCurrent, Some(baseline)) => {
+            stable_id("floating baseline case id", baseline)?;
+        }
+        (Lane::FloatingCurrent, None) => {
+            return Err(format!(
+                "compatibility manifest: floating-current case {:?} requires baseline_case",
+                case.id
+            )
+            .into())
+        }
+    }
 
-    match (case.lane, &case.pins) {
-        (Lane::Pinned, None) => {
+    match (case.lane, &case.pins, &case.resolved) {
+        (Lane::Pinned, None, _) => {
             return Err(format!(
                 "compatibility manifest: pinned case {:?} is missing exact pins",
                 case.id
             )
             .into())
         }
-        (Lane::FloatingCurrent, Some(_)) => {
+        (Lane::Pinned, Some(_), Some(_)) => {
+            return Err(format!(
+                "compatibility manifest: pinned case {:?} must not declare candidate resolution evidence",
+                case.id
+            )
+            .into())
+        }
+        (Lane::FloatingCurrent, Some(_), _) => {
             return Err(format!(
             "compatibility manifest: floating-current case {:?} must not declare production pins",
             case.id
         )
             .into())
         }
-        (Lane::FloatingCurrent, None) => {}
-        (Lane::Pinned, Some(pins)) => {
+        (Lane::FloatingCurrent, None, None) => {
+            return Err(format!(
+                "compatibility manifest: floating-current case {:?} requires exact candidate resolution evidence",
+                case.id
+            )
+            .into())
+        }
+        (Lane::FloatingCurrent, None, Some(resolved)) => {
+            if case.classification != Classification::Canary {
+                return Err(format!(
+                    "compatibility manifest: floating-current case {:?} classification must be canary",
+                    case.id
+                )
+                .into());
+            }
+            if case.evidence_path != EvidencePath::BridgeSmoke
+                || case.probe != ProbeType::Minimal
+                || !matches!(
+                    case.execution_mode,
+                    ExecutionMode::Host | ExecutionMode::ContainerRo
+                )
+                || case.expected_status != EvidenceStatus::Pass
+            {
+                return Err(format!(
+                    "compatibility manifest: floating-current case {:?} must be a minimal host/container-ro bridge-smoke canary expecting PASS",
+                    case.id
+                )
+                .into());
+            }
+            compatibility_resolution::validate_resolved_binding(
+                resolved,
+                case.execution_mode.is_container(),
+                case.expected_image_digest.as_deref(),
+            )
+            .map_err(|error| format!("compatibility manifest: case {:?}: {error}", case.id))?;
+        }
+        (Lane::Pinned, Some(pins), None) => {
+            if case.classification == Classification::Canary {
+                return Err(format!(
+                    "compatibility manifest: pinned case {:?} must not use canary classification",
+                    case.id
+                )
+                .into());
+            }
             if !local_file::valid_sha256(&pins.config_sha256)
                 || pins.config_sha256 != pins.config_sha256.to_ascii_lowercase()
             {
@@ -833,10 +971,24 @@ fn validate_manifest(manifest: &CompatibilityManifest) -> Result<(), BoxError> {
         );
     }
     let mut ids = BTreeSet::new();
+    let mut floating_baselines = BTreeSet::new();
     for case in &manifest.cases {
         validate_case(case, &manifest.budget)?;
         if !ids.insert(&case.id) {
             return Err(format!("compatibility manifest: duplicate case id {:?}", case.id).into());
+        }
+        if case.lane == Lane::FloatingCurrent
+            && !floating_baselines.insert(
+                case.baseline_case
+                    .as_deref()
+                    .expect("floating validation requires baseline_case"),
+            )
+        {
+            return Err(format!(
+                "compatibility manifest: duplicate floating baseline mapping {:?}",
+                case.baseline_case.as_deref().unwrap_or_default()
+            )
+            .into());
         }
     }
     Ok(())
@@ -855,6 +1007,7 @@ fn load_manifest(path: &Path) -> Result<LoadedManifest, BoxError> {
         canonical_path: snapshot.canonical_path,
         canonical_path_text,
         sha256: snapshot.sha256,
+        resolution_binding: None,
     })
 }
 
@@ -868,13 +1021,100 @@ fn parse_manifest_text(raw: &str) -> Result<CompatibilityManifest, BoxError> {
     Ok(manifest)
 }
 
+pub(super) fn validate_manifest_text(raw: &str) -> Result<(), BoxError> {
+    parse_manifest_text(raw).map(|_| ())
+}
+
+fn load_recipes_with_pinned_manifest(
+    path: &Path,
+) -> Result<(LoadedRecipes, LoadedManifest), BoxError> {
+    let recipes = compatibility_resolution::load_recipes(path)?;
+    let manifest = load_manifest(&compatibility_resolution::production_manifest_path(
+        &recipes,
+    ))?;
+    let package_sets: BTreeMap<_, _> = recipes
+        .recipes
+        .package_sets
+        .iter()
+        .map(|package| (package.id.as_str(), package))
+        .collect();
+    for recipe_case in &recipes.recipes.cases {
+        let baseline = manifest
+            .manifest
+            .cases
+            .iter()
+            .find(|case| case.id == recipe_case.baseline_case)
+            .ok_or_else(|| {
+                format!(
+                    "floating recipes: case {:?} maps to missing pinned case {:?}",
+                    recipe_case.id, recipe_case.baseline_case
+                )
+            })?;
+        if baseline.lane != Lane::Pinned
+            || baseline.classification != Classification::Support
+            || baseline.evidence_path != EvidencePath::BridgeSmoke
+            || baseline.probe != ProbeType::Minimal
+        {
+            return Err(format!(
+                "floating recipes: baseline {:?} must be a pinned minimal bridge-smoke support case",
+                baseline.id
+            )
+            .into());
+        }
+        let execution_matches = matches!(
+            (recipe_case.target, baseline.execution_mode),
+            (FloatingTarget::HostPackageTree, ExecutionMode::Host)
+                | (FloatingTarget::ContainerRoImage, ExecutionMode::ContainerRo)
+        );
+        if !execution_matches {
+            return Err(format!(
+                "floating recipes: case {:?} target does not match baseline execution mode",
+                recipe_case.id
+            )
+            .into());
+        }
+        let package = package_sets
+            .get(recipe_case.package_set.as_str())
+            .expect("recipe validator checked package-set references");
+        let pins = baseline
+            .pins
+            .as_ref()
+            .expect("pinned manifest validation requires pins");
+        let adapter_matches = pins
+            .adapter
+            .as_deref()
+            .and_then(|value| value.split_once('='))
+            .is_some_and(|(name, _)| name == package.adapter);
+        let cli_matches = pins
+            .agent_cli
+            .as_deref()
+            .and_then(|value| value.split_once('='))
+            .is_some_and(|(name, _)| name == package.agent_cli);
+        if !adapter_matches || !cli_matches {
+            return Err(format!(
+                "floating recipes: case {:?} package pair does not match its pinned baseline",
+                recipe_case.id
+            )
+            .into());
+        }
+    }
+    Ok((recipes, manifest))
+}
+
+#[derive(Debug)]
+enum ValidateSource {
+    Manifest(PathBuf),
+    Recipes(PathBuf),
+}
+
 #[derive(Debug)]
 struct ValidateArgs {
-    manifest: PathBuf,
+    source: ValidateSource,
 }
 
 fn parse_validate_args(args: &[String]) -> Result<ValidateArgs, BoxError> {
     let mut manifest = None;
+    let mut recipes = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -887,6 +1127,15 @@ fn parse_validate_args(args: &[String]) -> Result<ValidateArgs, BoxError> {
                         .ok_or("compatibility validate: --manifest requires a path")?,
                 ));
             }
+            "--recipes" if recipes.is_some() => {
+                return Err("compatibility validate: duplicate --recipes".into())
+            }
+            "--recipes" => {
+                recipes = Some(PathBuf::from(
+                    it.next()
+                        .ok_or("compatibility validate: --recipes requires a path")?,
+                ));
+            }
             other => {
                 return Err(
                     format!("compatibility validate: unknown argument {other:?}\n{USAGE}").into(),
@@ -894,11 +1143,142 @@ fn parse_validate_args(args: &[String]) -> Result<ValidateArgs, BoxError> {
             }
         }
     }
+    if manifest.is_some() && recipes.is_some() {
+        return Err(
+            "compatibility validate: --manifest and --recipes are mutually exclusive".into(),
+        );
+    }
+    if let Some(recipes) = recipes {
+        if recipes.as_os_str().is_empty() {
+            return Err("compatibility validate: --recipes must be non-empty".into());
+        }
+        return Ok(ValidateArgs {
+            source: ValidateSource::Recipes(recipes),
+        });
+    }
     let manifest = manifest.unwrap_or_else(|| PathBuf::from(DEFAULT_MANIFEST));
     if manifest.as_os_str().is_empty() {
         return Err("compatibility validate: --manifest must be non-empty".into());
     }
-    Ok(ValidateArgs { manifest })
+    Ok(ValidateArgs {
+        source: ValidateSource::Manifest(manifest),
+    })
+}
+
+#[derive(Debug)]
+struct ResolveArgs {
+    recipes: PathBuf,
+    cases: Vec<String>,
+    all: bool,
+    environment_owner: String,
+    runtime: RuntimeKind,
+    out: PathBuf,
+}
+
+fn parse_resolve_args(args: &[String]) -> Result<ResolveArgs, BoxError> {
+    // Resolution is non-billable but it has registry, package-tree, and image-cache effects. The
+    // acknowledgement therefore wins before recipe reads, output effects, or runtime lookup.
+    if !args
+        .iter()
+        .any(|arg| arg == "--acknowledge-resolution-effects")
+    {
+        return Err(format!(
+            "compatibility resolve: refusing registry/image effects without --acknowledge-resolution-effects\n{USAGE}"
+        )
+        .into());
+    }
+
+    let mut recipes = None;
+    let mut cases = Vec::new();
+    let mut all = false;
+    let mut environment_owner = None;
+    let mut runtime = None;
+    let mut out = None;
+    let mut acknowledged = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let value = |it: &mut std::slice::Iter<'_, String>, flag: &str| {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("compatibility resolve: {flag} requires a value"))
+        };
+        match arg.as_str() {
+            "--acknowledge-resolution-effects" if acknowledged => {
+                return Err(
+                    "compatibility resolve: duplicate --acknowledge-resolution-effects".into(),
+                )
+            }
+            "--acknowledge-resolution-effects" => acknowledged = true,
+            "--recipes" if recipes.is_some() => {
+                return Err("compatibility resolve: duplicate --recipes".into())
+            }
+            "--recipes" => recipes = Some(PathBuf::from(value(&mut it, "--recipes")?)),
+            "--case" => cases.push(value(&mut it, "--case")?),
+            "--all" if all => return Err("compatibility resolve: duplicate --all".into()),
+            "--all" => all = true,
+            "--environment-owner" if environment_owner.is_some() => {
+                return Err("compatibility resolve: duplicate --environment-owner".into())
+            }
+            "--environment-owner" => {
+                environment_owner = Some(value(&mut it, "--environment-owner")?)
+            }
+            "--runtime" if runtime.is_some() => {
+                return Err("compatibility resolve: duplicate --runtime".into())
+            }
+            "--runtime" => runtime = Some(RuntimeKind::parse(&value(&mut it, "--runtime")?)?),
+            "--out" if out.is_some() => return Err("compatibility resolve: duplicate --out".into()),
+            "--out" => out = Some(PathBuf::from(value(&mut it, "--out")?)),
+            other => {
+                return Err(
+                    format!("compatibility resolve: unknown argument {other:?}\n{USAGE}").into(),
+                )
+            }
+        }
+    }
+    if !acknowledged {
+        return Err(format!(
+            "compatibility resolve: refusing registry/image effects without --acknowledge-resolution-effects\n{USAGE}"
+        )
+        .into());
+    }
+    if all && !cases.is_empty() {
+        return Err("compatibility resolve: --all cannot be combined with --case".into());
+    }
+    if !all && cases.is_empty() {
+        return Err(
+            "compatibility resolve: explicit selection is required (--case or --all)".into(),
+        );
+    }
+    let mut seen = BTreeSet::new();
+    for case in &cases {
+        stable_id("selected floating case id", case)?;
+        if !seen.insert(case) {
+            return Err(format!("compatibility resolve: duplicate --case {case:?}").into());
+        }
+    }
+    let recipes =
+        recipes.unwrap_or_else(|| PathBuf::from(compatibility_resolution::DEFAULT_RECIPES));
+    if recipes.as_os_str().is_empty() {
+        return Err("compatibility resolve: --recipes must be non-empty".into());
+    }
+    let environment_owner =
+        environment_owner.ok_or("compatibility resolve: --environment-owner is required")?;
+    stable_id("environment owner", &environment_owner)?;
+    let runtime = runtime.ok_or("compatibility resolve: --runtime is required")?;
+    let out = out.ok_or("compatibility resolve: --out is required")?;
+    if out.as_os_str().is_empty() || out == Path::new("-") {
+        return Err(
+            "compatibility resolve: --out requires an explicit non-empty directory path".into(),
+        );
+    }
+    Ok(ResolveArgs {
+        recipes,
+        cases,
+        all,
+        environment_owner,
+        runtime,
+        out,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -911,8 +1291,14 @@ struct SelectionRecord {
 }
 
 #[derive(Debug)]
+enum RunSource {
+    Manifest(PathBuf),
+    Resolution(PathBuf),
+}
+
+#[derive(Debug)]
 struct RunArgs {
-    manifest: PathBuf,
+    source: RunSource,
     selection: SelectionRecord,
     environment_owner: String,
     out: PathBuf,
@@ -929,9 +1315,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, BoxError> {
     }
 
     let mut manifest = None;
+    let mut resolution = None;
     let mut lane = None;
     let mut cases = Vec::new();
     let mut all = false;
+    let mut all_resolved = false;
     let mut environment_owner = None;
     let mut out = None;
     let mut acknowledged = false;
@@ -951,11 +1339,19 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, BoxError> {
                 return Err("compatibility run: duplicate --manifest".into())
             }
             "--manifest" => manifest = Some(PathBuf::from(value(&mut it, "--manifest")?)),
+            "--resolution" if resolution.is_some() => {
+                return Err("compatibility run: duplicate --resolution".into())
+            }
+            "--resolution" => resolution = Some(PathBuf::from(value(&mut it, "--resolution")?)),
             "--lane" if lane.is_some() => return Err("compatibility run: duplicate --lane".into()),
             "--lane" => lane = Some(Lane::parse(&value(&mut it, "--lane")?)?),
             "--case" => cases.push(value(&mut it, "--case")?),
             "--all" if all => return Err("compatibility run: duplicate --all".into()),
             "--all" => all = true,
+            "--all-resolved" if all_resolved => {
+                return Err("compatibility run: duplicate --all-resolved".into())
+            }
+            "--all-resolved" => all_resolved = true,
             "--environment-owner" if environment_owner.is_some() => {
                 return Err("compatibility run: duplicate --environment-owner".into())
             }
@@ -977,16 +1373,44 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, BoxError> {
         )
         .into());
     }
-    if all && (lane.is_some() || !cases.is_empty()) {
+    if manifest.is_some() && resolution.is_some() {
+        return Err("compatibility run: --manifest and --resolution are mutually exclusive".into());
+    }
+    if all && (lane.is_some() || !cases.is_empty() || all_resolved) {
         return Err("compatibility run: --all cannot be combined with --lane or --case".into());
     }
     if lane.is_some() && !cases.is_empty() {
         return Err("compatibility run: --lane cannot be combined with --case".into());
     }
-    if !all && lane.is_none() && cases.is_empty() {
-        return Err(
-            "compatibility run: explicit selection is required (--lane, --case, or --all)".into(),
-        );
+    if resolution.is_some() {
+        if manifest.is_some() || lane.is_some() || all {
+            return Err(
+                "compatibility run: --resolution cannot be combined with --manifest, --lane, or --all"
+                    .into(),
+            );
+        }
+        if all_resolved && !cases.is_empty() {
+            return Err("compatibility run: --all-resolved cannot be combined with --case".into());
+        }
+        if !all_resolved && cases.is_empty() {
+            return Err(
+                "compatibility run: explicit resolved selection is required (--case or --all-resolved)"
+                    .into(),
+            );
+        }
+    } else {
+        if all_resolved {
+            return Err("compatibility run: --all-resolved requires --resolution".into());
+        }
+        if !all && lane.is_none() && cases.is_empty() {
+            return Err(
+                "compatibility run: explicit selection is required (--lane, --case, or --all)"
+                    .into(),
+            );
+        }
+        if lane == Some(Lane::FloatingCurrent) {
+            return Err("compatibility run: floating_resolution_required; use --resolution".into());
+        }
     }
     let mut seen = BTreeSet::new();
     for case in &cases {
@@ -1002,27 +1426,50 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, BoxError> {
     if out.as_os_str().is_empty() || out == Path::new("-") {
         return Err("compatibility run: --out requires an explicit non-empty file path".into());
     }
-    let manifest = manifest.unwrap_or_else(|| PathBuf::from(DEFAULT_MANIFEST));
-    if manifest.as_os_str().is_empty() {
-        return Err("compatibility run: --manifest must be non-empty".into());
-    }
+    let source = match resolution {
+        Some(path) => {
+            if path.as_os_str().is_empty() {
+                return Err("compatibility run: --resolution must be non-empty".into());
+            }
+            RunSource::Resolution(path)
+        }
+        None => {
+            let manifest = manifest.unwrap_or_else(|| PathBuf::from(DEFAULT_MANIFEST));
+            if manifest.as_os_str().is_empty() {
+                return Err("compatibility run: --manifest must be non-empty".into());
+            }
+            RunSource::Manifest(manifest)
+        }
+    };
     Ok(RunArgs {
-        manifest,
-        selection: SelectionRecord { lane, cases, all },
+        source,
+        selection: SelectionRecord {
+            lane,
+            cases,
+            all: all || all_resolved,
+        },
         environment_owner,
         out,
     })
 }
 
 #[derive(Debug)]
+enum ComparisonMode {
+    Pinned,
+    FloatingToPinned,
+}
+
+#[derive(Debug)]
 struct CompareArgs {
     current: PathBuf,
     baseline: PathBuf,
+    mode: ComparisonMode,
 }
 
 fn parse_compare_args(args: &[String]) -> Result<CompareArgs, BoxError> {
     let mut current = None;
     let mut baseline = None;
+    let mut mode = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -1044,6 +1491,25 @@ fn parse_compare_args(args: &[String]) -> Result<CompareArgs, BoxError> {
                         .ok_or("compatibility compare: --baseline requires a path")?,
                 ));
             }
+            "--mode" if mode.is_some() => {
+                return Err("compatibility compare: duplicate --mode".into())
+            }
+            "--mode" => {
+                mode = Some(
+                    match it
+                        .next()
+                        .ok_or("compatibility compare: --mode requires a value")?
+                        .as_str()
+                    {
+                        "pinned" => ComparisonMode::Pinned,
+                        "floating-to-pinned" => ComparisonMode::FloatingToPinned,
+                        _ => return Err(
+                            "compatibility compare: --mode must be pinned or floating-to-pinned"
+                                .into(),
+                        ),
+                    },
+                );
+            }
             other => {
                 return Err(
                     format!("compatibility compare: unknown argument {other:?}\n{USAGE}").into(),
@@ -1059,7 +1525,11 @@ fn parse_compare_args(args: &[String]) -> Result<CompareArgs, BoxError> {
     if baseline.as_os_str().is_empty() {
         return Err("compatibility compare: --baseline must be non-empty".into());
     }
-    Ok(CompareArgs { current, baseline })
+    Ok(CompareArgs {
+        current,
+        baseline,
+        mode: mode.unwrap_or(ComparisonMode::Pinned),
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1100,10 +1570,39 @@ enum ExecutionState {
     RunnerFailure,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+enum CandidateOutcome {
+    #[serde(rename = "candidate_pass")]
+    Pass,
+    #[serde(rename = "candidate_fail")]
+    Fail,
+    #[serde(rename = "candidate_unknown")]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct FloatingSummary {
+    candidate_pass: u32,
+    candidate_fail: u32,
+    candidate_unknown: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ResolutionBindingRecord {
+    resolution_id: String,
+    artifact_sha256: String,
+    recipe_sha256: String,
+    production_manifest_sha256: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CaseResult {
     case_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_case_id: Option<String>,
     lane: Lane,
     evidence_path: EvidencePath,
     probe: ProbeType,
@@ -1113,6 +1612,10 @@ struct CaseResult {
     actual_status: EvidenceStatus,
     expectation_met: bool,
     classification: Classification,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_outcome: Option<CandidateOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolved: Option<ResolvedBinding>,
     artifact_policy: ArtifactPolicy,
     duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1139,6 +1642,37 @@ struct AggregateArtifact {
     success: bool,
     budget: BudgetOutcome,
     results: Vec<CaseResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolution: Option<ResolutionBindingRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    floating_summary: Option<FloatingSummary>,
+}
+
+fn floating_summary(results: &[CaseResult]) -> Option<FloatingSummary> {
+    let mut summary = FloatingSummary {
+        candidate_pass: 0,
+        candidate_fail: 0,
+        candidate_unknown: 0,
+    };
+    let mut any = false;
+    for result in results {
+        match result.candidate_outcome {
+            Some(CandidateOutcome::Pass) => {
+                any = true;
+                summary.candidate_pass += 1;
+            }
+            Some(CandidateOutcome::Fail) => {
+                any = true;
+                summary.candidate_fail += 1;
+            }
+            Some(CandidateOutcome::Unknown) => {
+                any = true;
+                summary.candidate_unknown += 1;
+            }
+            None => {}
+        }
+    }
+    any.then_some(summary)
 }
 
 #[derive(Clone, Debug)]
@@ -1199,6 +1733,10 @@ impl SpawnAdmission<'_> {
 
 #[async_trait]
 trait SmokeInvoker: Send + Sync {
+    async fn revalidate(&self, _case: &CompatibilityCase) -> Result<(), &'static str> {
+        Ok(())
+    }
+
     async fn invoke(
         &self,
         request: &SmokeRequest,
@@ -1218,6 +1756,33 @@ struct ProcessSmokeInvoker<'a> {
     executable: StagedExecutable,
     artifact_directory: &'a local_file::PinnedDirectory,
     expected_sha256: String,
+}
+
+struct ResolutionSmokeInvoker<'a> {
+    inner: ProcessSmokeInvoker<'a>,
+    resolution: &'a compatibility_resolution::LoadedResolution,
+    environment_owner: &'a str,
+}
+
+#[async_trait]
+impl SmokeInvoker for ResolutionSmokeInvoker<'_> {
+    async fn revalidate(&self, case: &CompatibilityCase) -> Result<(), &'static str> {
+        compatibility_resolution::revalidate_resolution_case(
+            self.resolution,
+            self.environment_owner,
+            &case.id,
+        )
+        .await
+        .map_err(compatibility_resolution::RevalidationFailure::wire)
+    }
+
+    async fn invoke(
+        &self,
+        request: &SmokeRequest,
+        admission: &SpawnAdmission<'_>,
+    ) -> InvocationResult {
+        self.inner.invoke(request, admission).await
+    }
 }
 
 #[async_trait]
@@ -1597,7 +2162,7 @@ fn stage_candidate(
     })
 }
 
-fn repository_root(path: &Path) -> Option<PathBuf> {
+pub(super) fn repository_root(path: &Path) -> Option<PathBuf> {
     let start = if path.is_dir() { path } else { path.parent()? };
     start
         .ancestors()
@@ -1897,6 +2462,175 @@ fn valid_smoke_shape(value: &Value, case: &CompatibilityCase) -> bool {
         && value.get("cleanup").is_some_and(Value::is_object)
 }
 
+fn valid_catalog_value(value: &str, total_bytes: &mut usize) -> bool {
+    if value.is_empty()
+        || value.trim() != value
+        || value.len() > MAX_CATALOG_VALUE_BYTES
+        || value.chars().any(char::is_control)
+        || looks_like_secret(value)
+    {
+        return false;
+    }
+    let Some(total) = total_bytes.checked_add(value.len()) else {
+        return false;
+    };
+    if total > MAX_CATALOG_TOTAL_BYTES {
+        return false;
+    }
+    *total_bytes = total;
+    true
+}
+
+fn catalog_strings<'a>(
+    catalog: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Option<Vec<&'a str>> {
+    catalog
+        .get(field)?
+        .as_array()?
+        .iter()
+        .map(Value::as_str)
+        .collect()
+}
+
+fn valid_available_catalog_for(
+    smoke: &Value,
+    model: &str,
+    effort: Option<&str>,
+    mode: Option<&str>,
+) -> bool {
+    let Some(catalog) = smoke
+        .pointer("/target/model_catalog")
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let allowed = BTreeSet::from([
+        "state",
+        "current_model",
+        "models",
+        "model_configurable",
+        "effort_levels",
+        "modes",
+        "current_mode",
+    ]);
+    if catalog.keys().any(|key| !allowed.contains(key.as_str()))
+        || catalog.get("state").and_then(Value::as_str) != Some("available")
+    {
+        return false;
+    }
+    let Some(models) = catalog_strings(catalog, "models") else {
+        return false;
+    };
+    let Some(efforts) = catalog_strings(catalog, "effort_levels") else {
+        return false;
+    };
+    let Some(modes) = catalog_strings(catalog, "modes") else {
+        return false;
+    };
+    let Some(configurable) = catalog.get("model_configurable").and_then(Value::as_bool) else {
+        return false;
+    };
+    let current_model = match catalog.get("current_model") {
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => return false,
+        None => None,
+    };
+    let current_mode = match catalog.get("current_mode") {
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => return false,
+        None => None,
+    };
+    if models
+        .len()
+        .saturating_add(efforts.len())
+        .saturating_add(modes.len())
+        > MAX_CATALOG_ENTRIES
+        || configurable && models.is_empty()
+        || current_model.is_some_and(|current| !models.contains(&current))
+        || current_mode.is_some_and(|current| !modes.contains(&current))
+        || current_model != Some(model)
+        || effort.is_some_and(|effort| !efforts.contains(&effort))
+        || mode.is_some_and(|mode| !modes.contains(&mode) || current_mode != Some(mode))
+    {
+        return false;
+    }
+    let mut total_bytes = 0usize;
+    current_model
+        .into_iter()
+        .chain(models)
+        .chain(efforts)
+        .chain(modes)
+        .chain(current_mode)
+        .all(|value| valid_catalog_value(value, &mut total_bytes))
+}
+
+fn valid_available_catalog(smoke: &Value, case: &CompatibilityCase) -> bool {
+    valid_available_catalog_for(
+        smoke,
+        &case.model,
+        case.effort.as_deref(),
+        case.mode.as_deref(),
+    )
+}
+
+fn valid_floating_success_contract(smoke: &Value) -> bool {
+    smoke.get("success").and_then(Value::as_bool) == Some(true)
+        && smoke.pointer("/attempt/timed_out").and_then(Value::as_bool) == Some(false)
+        && smoke.pointer("/turn/prompt_calls").and_then(Value::as_u64) == Some(1)
+        && smoke
+            .pointer("/turn/terminal_state")
+            .and_then(Value::as_str)
+            == Some("completed")
+        && smoke.pointer("/turn/exact_pong").and_then(Value::as_bool) == Some(true)
+        && smoke
+            .pointer("/diagnostics/failure")
+            .is_none_or(Value::is_null)
+        && smoke.pointer("/cleanup/cancel").and_then(Value::as_str) == Some("not_needed")
+        && smoke.pointer("/cleanup/release").and_then(Value::as_str) == Some("completed")
+        && smoke.pointer("/cleanup/retire").and_then(Value::as_str) == Some("completed")
+}
+
+fn valid_floating_failure_contract_for(
+    smoke: &Value,
+    model: &str,
+    effort: Option<&str>,
+    mode: Option<&str>,
+) -> bool {
+    let failure = smoke.pointer("/diagnostics/failure");
+    smoke.get("success").and_then(Value::as_bool) == Some(false)
+        && smoke.pointer("/attempt/timed_out").and_then(Value::as_bool) == Some(false)
+        && smoke.pointer("/turn/prompt_calls").and_then(Value::as_u64) == Some(1)
+        && failure
+            .and_then(|failure| failure.get("class"))
+            .and_then(Value::as_str)
+            .is_some_and(|class| matches!(class, "config" | "model" | "protocol"))
+        && failure
+            .and_then(|failure| failure.get("disposition"))
+            .and_then(Value::as_str)
+            == Some("fatal")
+        && failure
+            .and_then(|failure| failure.get("prompt_may_have_been_accepted"))
+            .and_then(Value::as_bool)
+            .is_some()
+        && valid_available_catalog_for(smoke, model, effort, mode)
+        && smoke
+            .pointer("/cleanup/cancel")
+            .and_then(Value::as_str)
+            .is_some_and(|state| matches!(state, "not_needed" | "completed"))
+        && smoke.pointer("/cleanup/release").and_then(Value::as_str) == Some("completed")
+        && smoke.pointer("/cleanup/retire").and_then(Value::as_str) == Some("completed")
+}
+
+fn valid_floating_failure_contract(smoke: &Value, case: &CompatibilityCase) -> bool {
+    valid_floating_failure_contract_for(
+        smoke,
+        &case.model,
+        case.effort.as_deref(),
+        case.mode.as_deref(),
+    )
+}
+
 fn provenance_detail<'a>(smoke: &'a Value, agent: &str, component: &str) -> Option<&'a str> {
     let expected_check = format!("provenance:{agent}:{component}");
     let mut matches = smoke
@@ -2060,6 +2794,28 @@ fn drift_for(case: &CompatibilityCase, smoke: &Value) -> Vec<String> {
             }
         }
     }
+    if let Some(resolved) = &case.resolved {
+        if smoke
+            .pointer("/request/config_sha256")
+            .and_then(Value::as_str)
+            != Some(resolved.config_sha256.as_str())
+        {
+            drift.push("resolution.config_sha256".into());
+        }
+        if success || smoke.get("target").is_some_and(|value| !value.is_null()) {
+            if !provenance_package_matches(smoke, &case.agent, "adapter", &resolved.adapter) {
+                drift.push("resolution.adapter".into());
+            }
+            if !provenance_package_matches(smoke, &case.agent, "agent-cli", &resolved.agent_cli) {
+                drift.push("resolution.agent_cli".into());
+            }
+            if resolved.image_digest.as_ref().is_some_and(|expected| {
+                !provenance_field_matches(smoke, &case.agent, "image", "immutable_id", expected)
+            }) {
+                drift.push("resolution.image".into());
+            }
+        }
+    }
     drift
 }
 
@@ -2108,6 +2864,7 @@ fn not_run_result(case: &CompatibilityCase, reason: &str) -> CaseResult {
     };
     CaseResult {
         case_id: case.id.clone(),
+        baseline_case_id: case.baseline_case.clone(),
         lane: case.lane,
         evidence_path: case.evidence_path,
         probe: case.probe,
@@ -2117,6 +2874,9 @@ fn not_run_result(case: &CompatibilityCase, reason: &str) -> CaseResult {
         actual_status,
         expectation_met: actual_status == case.expected_status,
         classification: case.classification,
+        candidate_outcome: (case.lane == Lane::FloatingCurrent)
+            .then_some(CandidateOutcome::Unknown),
+        resolved: case.resolved.clone(),
         artifact_policy: case.artifact.clone(),
         duration_ms: 0,
         not_run_reason: Some(reason.into()),
@@ -2130,6 +2890,7 @@ fn not_run_result(case: &CompatibilityCase, reason: &str) -> CaseResult {
 fn runner_failure_result(case: &CompatibilityCase, duration: Duration, code: &str) -> CaseResult {
     CaseResult {
         case_id: case.id.clone(),
+        baseline_case_id: case.baseline_case.clone(),
         lane: case.lane,
         evidence_path: case.evidence_path,
         probe: case.probe,
@@ -2139,6 +2900,9 @@ fn runner_failure_result(case: &CompatibilityCase, duration: Duration, code: &st
         actual_status: EvidenceStatus::Unknown,
         expectation_met: false,
         classification: case.classification,
+        candidate_outcome: (case.lane == Lane::FloatingCurrent)
+            .then_some(CandidateOutcome::Unknown),
+        resolved: case.resolved.clone(),
         artifact_policy: case.artifact.clone(),
         duration_ms: duration.as_millis().try_into().unwrap_or(u64::MAX),
         not_run_reason: None,
@@ -2269,6 +3033,8 @@ fn setup_incomplete_aggregate(
         cancelled: false,
         success: false,
         budget: initial_budget(&loaded.manifest.budget),
+        resolution: loaded.resolution_binding.clone(),
+        floating_summary: floating_summary(&results),
         results,
     }
 }
@@ -2340,6 +3106,10 @@ async fn build_aggregate<I: SmokeInvoker>(
         {
             budget.exhausted = true;
             results.push(not_run_result(case, "total_budget_insufficient_for_case"));
+            continue;
+        }
+        if let Err(reason) = invoker.revalidate(case).await {
+            results.push(not_run_result(case, reason));
             continue;
         }
         let artifact_path = scratch.join(format!("case-{ordinal:03}.json"));
@@ -2445,7 +3215,19 @@ async fn build_aggregate<I: SmokeInvoker>(
         } else {
             EvidenceStatus::Fail
         };
-        let drift = drift_for(case, &smoke);
+        let mut drift = drift_for(case, &smoke);
+        if case.lane == Lane::FloatingCurrent {
+            if smoke_success {
+                if !valid_floating_success_contract(&smoke) {
+                    drift.push("outcome.smoke_contract".into());
+                }
+                if !valid_available_catalog(&smoke, case) {
+                    drift.push("capability.model_catalog".into());
+                }
+            } else if !valid_floating_failure_contract(&smoke, case) {
+                drift.push("outcome.smoke_contract".into());
+            }
+        }
         let mut budget_violations = Vec::new();
         match observed_tokens(&smoke) {
             Some(tokens) => {
@@ -2491,8 +3273,20 @@ async fn build_aggregate<I: SmokeInvoker>(
         let expectation_met = actual_status == case.expected_status
             && drift.is_empty()
             && budget_violations.is_empty();
+        let candidate_outcome = (case.lane == Lane::FloatingCurrent).then(|| {
+            if !drift.is_empty() || !budget_violations.is_empty() {
+                CandidateOutcome::Unknown
+            } else if actual_status == EvidenceStatus::Pass {
+                CandidateOutcome::Pass
+            } else if actual_status == EvidenceStatus::Fail {
+                CandidateOutcome::Fail
+            } else {
+                CandidateOutcome::Unknown
+            }
+        });
         results.push(CaseResult {
             case_id: case.id.clone(),
+            baseline_case_id: case.baseline_case.clone(),
             lane: case.lane,
             evidence_path: case.evidence_path,
             probe: case.probe,
@@ -2502,6 +3296,8 @@ async fn build_aggregate<I: SmokeInvoker>(
             actual_status,
             expectation_met,
             classification: case.classification,
+            candidate_outcome,
+            resolved: case.resolved.clone(),
             artifact_policy: case.artifact.clone(),
             duration_ms: duration.as_millis().try_into().unwrap_or(u64::MAX),
             not_run_reason: None,
@@ -2516,6 +3312,30 @@ async fn build_aggregate<I: SmokeInvoker>(
         budget.exhausted = true;
     }
 
+    let cancelled = cancellation_requested.load(std::sync::atomic::Ordering::Acquire);
+    if cancelled {
+        // A signal observed while or immediately after the active smoke makes that observation
+        // incomplete evidence. Preserve earlier completed rows, but never leave the most recent
+        // floating observation as a definitive pass/fail under aggregate cancellation.
+        if let Some(active) = results
+            .iter_mut()
+            .rev()
+            .find(|result| result.execution == ExecutionState::Completed)
+        {
+            if active.lane == Lane::FloatingCurrent {
+                if !active
+                    .drift
+                    .iter()
+                    .any(|dimension| dimension == "outcome.cancellation")
+                {
+                    active.drift.push("outcome.cancellation".into());
+                }
+                active.expectation_met = false;
+                active.candidate_outcome = Some(CandidateOutcome::Unknown);
+            }
+        }
+    }
+
     let runner_failed = results
         .iter()
         .any(|result| result.execution == ExecutionState::RunnerFailure);
@@ -2523,6 +3343,10 @@ async fn build_aggregate<I: SmokeInvoker>(
         result.lane == Lane::Pinned
             && result.classification == Classification::Support
             && (result.execution != ExecutionState::Completed || !result.expectation_met)
+    });
+    let floating_not_pass = results.iter().any(|result| {
+        result.lane == Lane::FloatingCurrent
+            && result.candidate_outcome != Some(CandidateOutcome::Pass)
     });
     AggregateArtifact {
         schema_version: 1,
@@ -2536,12 +3360,15 @@ async fn build_aggregate<I: SmokeInvoker>(
         environment_owner: environment_owner.into(),
         started_at_ms,
         ended_at_ms: diagnostic_timestamp_ms(),
-        cancelled: cancellation_requested.load(std::sync::atomic::Ordering::Acquire),
+        cancelled,
         success: !runner_failed
             && !pinned_failed
+            && !floating_not_pass
             && !budget.exhausted
-            && !cancellation_requested.load(std::sync::atomic::Ordering::Acquire),
+            && !cancelled,
         budget,
+        resolution: loaded.resolution_binding.clone(),
+        floating_summary: floating_summary(&results),
         results,
     }
 }
@@ -2649,6 +3476,7 @@ fn baseline_from_result(result: &CaseResult) -> CaseBaseline {
         capability: json!({
             "request": object_subset(request, &["model", "effort", "mode"]),
             "effective": session.get("effective_request").cloned().unwrap_or(Value::Null),
+            "model_catalog": target.get("model_catalog").cloned().unwrap_or(Value::Null),
         }),
         authentication: target.get("authentication").cloned().unwrap_or(Value::Null),
         phase: failure.get("failed_phase").cloned().unwrap_or(Value::Null),
@@ -2853,9 +3681,586 @@ fn compare_artifacts(
     })
 }
 
+fn provenance_package_identity(provenance: &Value, component: &str) -> Option<String> {
+    let suffix = format!(":{component}");
+    let mut matches = provenance.as_array()?.iter().filter(|row| {
+        row.get("check")
+            .and_then(Value::as_str)
+            .is_some_and(|check| check.ends_with(&suffix))
+            && row.get("status").and_then(Value::as_str) == Some("ok")
+    });
+    let detail = matches.next()?.get("detail")?.as_str()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    let package = unique_detail_field(detail, "package")?;
+    let version = unique_detail_field(detail, "version")?;
+    Some(format!("{package}={version}"))
+}
+
+fn provenance_component_field<'a>(
+    provenance: &'a Value,
+    component: &str,
+    field: &str,
+) -> Option<&'a str> {
+    let suffix = format!(":{component}");
+    let mut matches = provenance.as_array()?.iter().filter(|row| {
+        row.get("check")
+            .and_then(Value::as_str)
+            .is_some_and(|check| check.ends_with(&suffix))
+            && row.get("status").and_then(Value::as_str) == Some("ok")
+    });
+    let detail = matches.next()?.get("detail")?.as_str()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    unique_detail_field(detail, field)
+}
+
+#[derive(Default)]
+struct CatalogProjection {
+    available: bool,
+    models: BTreeSet<String>,
+    current_model: Option<String>,
+    model_configurable: Option<bool>,
+    efforts: BTreeSet<String>,
+    modes: BTreeSet<String>,
+    current_mode: Option<String>,
+}
+
+fn catalog_projection(value: &Value) -> CatalogProjection {
+    let Some(catalog) = value.as_object() else {
+        return CatalogProjection::default();
+    };
+    let strings = |field: &str| {
+        catalog
+            .get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    };
+    CatalogProjection {
+        available: catalog.get("state").and_then(Value::as_str) == Some("available"),
+        models: strings("models"),
+        current_model: catalog
+            .get("current_model")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        model_configurable: catalog.get("model_configurable").and_then(Value::as_bool),
+        efforts: strings("effort_levels"),
+        modes: strings("modes"),
+        current_mode: catalog
+            .get("current_mode")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
+}
+
+fn compare_catalogs(before: &Value, after: &Value, dimensions: &mut Vec<String>) {
+    let before = catalog_projection(before);
+    let after = catalog_projection(after);
+    if !after.available {
+        dimensions.push("catalog.unavailable".into());
+    }
+    if after.models.difference(&before.models).next().is_some() {
+        dimensions.push("catalog.models_added".into());
+    }
+    if before.models.difference(&after.models).next().is_some() {
+        dimensions.push("catalog.models_removed".into());
+    }
+    if before.current_model != after.current_model {
+        dimensions.push("catalog.current_model".into());
+    }
+    if before.model_configurable != after.model_configurable {
+        dimensions.push("catalog.model_configurable".into());
+    }
+    if after.efforts.difference(&before.efforts).next().is_some() {
+        dimensions.push("catalog.efforts_added".into());
+    }
+    if before.efforts.difference(&after.efforts).next().is_some() {
+        dimensions.push("catalog.efforts_removed".into());
+    }
+    if after.modes.difference(&before.modes).next().is_some() {
+        dimensions.push("catalog.modes_added".into());
+    }
+    if before.modes.difference(&after.modes).next().is_some() {
+        dimensions.push("catalog.modes_removed".into());
+    }
+    if before.current_mode != after.current_mode {
+        dimensions.push("catalog.current_mode".into());
+    }
+}
+
+fn recompute_candidate_outcome(result: &CaseResult) -> CandidateOutcome {
+    if result.execution != ExecutionState::Completed
+        || !result.drift.is_empty()
+        || !result.budget_violations.is_empty()
+    {
+        return CandidateOutcome::Unknown;
+    }
+    let Some(smoke) = result.smoke.as_ref() else {
+        return CandidateOutcome::Unknown;
+    };
+    match result.actual_status {
+        EvidenceStatus::Fail if smoke.get("success").and_then(Value::as_bool) == Some(false) => {
+            let Some(model) = smoke.pointer("/request/model").and_then(Value::as_str) else {
+                return CandidateOutcome::Unknown;
+            };
+            let effort = smoke.pointer("/request/effort").and_then(Value::as_str);
+            let mode = smoke.pointer("/request/mode").and_then(Value::as_str);
+            if valid_floating_failure_contract_for(smoke, model, effort, mode) {
+                CandidateOutcome::Fail
+            } else {
+                CandidateOutcome::Unknown
+            }
+        }
+        EvidenceStatus::Pass => {
+            let Some(model) = smoke.pointer("/request/model").and_then(Value::as_str) else {
+                return CandidateOutcome::Unknown;
+            };
+            let effort = smoke.pointer("/request/effort").and_then(Value::as_str);
+            let mode = smoke.pointer("/request/mode").and_then(Value::as_str);
+            let Some(resolved) = result.resolved.as_ref() else {
+                return CandidateOutcome::Unknown;
+            };
+            let agent = smoke.pointer("/request/agent").and_then(Value::as_str);
+            let resolved_matches = smoke
+                .pointer("/request/config_sha256")
+                .and_then(Value::as_str)
+                == Some(resolved.config_sha256.as_str())
+                && agent.is_some_and(|agent| {
+                    provenance_package_matches(smoke, agent, "adapter", &resolved.adapter)
+                        && provenance_package_matches(
+                            smoke,
+                            agent,
+                            "agent-cli",
+                            &resolved.agent_cli,
+                        )
+                        && resolved.image_digest.as_ref().is_none_or(|image| {
+                            provenance_field_matches(smoke, agent, "image", "immutable_id", image)
+                        })
+                });
+            if valid_floating_success_contract(smoke)
+                && valid_available_catalog_for(smoke, model, effort, mode)
+                && resolved_matches
+            {
+                CandidateOutcome::Pass
+            } else {
+                CandidateOutcome::Unknown
+            }
+        }
+        EvidenceStatus::Unknown | EvidenceStatus::Stale | EvidenceStatus::Fail => {
+            CandidateOutcome::Unknown
+        }
+    }
+}
+
+fn validate_floating_aggregate(current: &AggregateArtifact) -> Result<(), BoxError> {
+    let resolution = current
+        .resolution
+        .as_ref()
+        .ok_or("compatibility floating aggregate: completed resolution binding is required")?;
+    stable_id(
+        "floating aggregate resolution id",
+        &resolution.resolution_id,
+    )?;
+    for digest in [
+        &resolution.artifact_sha256,
+        &resolution.recipe_sha256,
+        &resolution.production_manifest_sha256,
+    ] {
+        if !local_file::valid_sha256(digest) || digest != &digest.to_ascii_lowercase() {
+            return Err("compatibility floating aggregate: invalid resolution binding".into());
+        }
+    }
+    if current.schema_version != 1
+        || !local_file::valid_sha256(&current.candidate.sha256)
+        || current.candidate.sha256 != current.candidate.sha256.to_ascii_lowercase()
+        || current.candidate.byte_length == 0
+        || current.manifest.schema_version != 1
+        || !local_file::valid_sha256(&current.manifest.sha256)
+        || current.manifest.sha256 != current.manifest.sha256.to_ascii_lowercase()
+        || current.results.is_empty()
+        || !current.selection.all
+        || current.selection.lane.is_some()
+        || !current.selection.cases.is_empty()
+        || current.results.iter().any(|result| {
+            result.lane != Lane::FloatingCurrent
+                || result.baseline_case_id.is_none()
+                || result.candidate_outcome.is_none()
+                || result.resolved.is_none()
+        })
+        || current.floating_summary != floating_summary(&current.results)
+    {
+        return Err(
+            "compatibility floating aggregate: all-resolved floating evidence is required".into(),
+        );
+    }
+    let mut case_ids = BTreeSet::new();
+    let mut baseline_ids = BTreeSet::new();
+    for result in &current.results {
+        if !case_ids.insert(result.case_id.as_str())
+            || !baseline_ids.insert(result.baseline_case_id.as_deref().expect("checked above"))
+        {
+            return Err("compatibility floating aggregate: duplicate case mapping".into());
+        }
+        let resolved = result.resolved.as_ref().expect("checked above");
+        compatibility_resolution::validate_resolved_binding(
+            resolved,
+            resolved.image_digest.is_some(),
+            resolved.image_digest.as_deref(),
+        )
+        .map_err(|_| "compatibility floating aggregate: invalid resolved binding")?;
+        if resolved.resolution_id != resolution.resolution_id
+            || resolved.recipe_sha256 != resolution.recipe_sha256
+            || result.candidate_outcome != Some(recompute_candidate_outcome(result))
+        {
+            return Err("compatibility floating aggregate: resolved binding mismatch".into());
+        }
+    }
+    let all_pass = current
+        .results
+        .iter()
+        .all(|result| result.candidate_outcome == Some(CandidateOutcome::Pass));
+    if current.success != (all_pass && !current.cancelled && !current.budget.exhausted) {
+        return Err("compatibility floating aggregate: success summary mismatch".into());
+    }
+    Ok(())
+}
+
+fn compare_floating_to_pinned(
+    current: &AggregateArtifact,
+    baseline: &BaselineArtifact,
+) -> Result<ComparisonReport, BoxError> {
+    validate_floating_aggregate(current)?;
+    let resolution = current
+        .resolution
+        .as_ref()
+        .expect("floating aggregate validation requires a resolution binding");
+    if baseline.schema_version != 1
+        || baseline.manifest_schema_version != 1
+        || baseline.manifest_sha256 != resolution.production_manifest_sha256
+    {
+        return Err("compatibility baseline: pinned manifest identity mismatch".into());
+    }
+    let mut baseline_cases = BTreeMap::new();
+    for case in &baseline.cases {
+        if baseline_cases.insert(case.case_id.as_str(), case).is_some() {
+            return Err("compatibility baseline: duplicate case id".into());
+        }
+    }
+    let mut changes = Vec::new();
+    let current_aggregate = baseline_from_aggregate(current);
+    let mut aggregate_dimensions = Vec::new();
+    if baseline.aggregate.success != current_aggregate.success {
+        aggregate_dimensions.push("success".into());
+    }
+    if baseline.aggregate.cancelled != current_aggregate.cancelled {
+        aggregate_dimensions.push("cancelled".into());
+    }
+    if baseline.aggregate.budget_exhausted != current_aggregate.budget_exhausted
+        || baseline.aggregate.token_observation_missing_cases
+            != current_aggregate.token_observation_missing_cases
+        || baseline.aggregate.cost_observation_missing_cases
+            != current_aggregate.cost_observation_missing_cases
+    {
+        aggregate_dimensions.push("budget".into());
+    }
+    if !aggregate_dimensions.is_empty() {
+        changes.push(ComparisonChange {
+            case_id: "__aggregate__".into(),
+            dimensions: aggregate_dimensions,
+        });
+    }
+    for result in &current.results {
+        let baseline_id = result.baseline_case_id.as_deref().expect("validated above");
+        let Some(before) = baseline_cases.get(baseline_id) else {
+            changes.push(ComparisonChange {
+                case_id: result.case_id.clone(),
+                dimensions: vec!["baseline_case_missing".into()],
+            });
+            continue;
+        };
+        let after = baseline_from_result(result);
+        let resolved = result.resolved.as_ref().expect("validated above");
+        let mut dimensions = Vec::new();
+        if provenance_package_identity(&before.provenance, "adapter").as_deref()
+            != Some(resolved.adapter.as_str())
+        {
+            dimensions.push("adapter".into());
+        }
+        if provenance_package_identity(&before.provenance, "agent-cli").as_deref()
+            != Some(resolved.agent_cli.as_str())
+        {
+            dimensions.push("agent_cli".into());
+        }
+        if resolved
+            .base_image_digest
+            .as_ref()
+            .is_some_and(|current_base| {
+                provenance_component_field(&before.provenance, "image", "base_image_digest")
+                    != Some(current_base.as_str())
+            })
+        {
+            dimensions.push("base_image".into());
+        }
+        if resolved.image_digest.as_ref().is_some_and(|current_image| {
+            provenance_component_field(&before.provenance, "image", "immutable_id")
+                != Some(current_image.as_str())
+        }) {
+            dimensions.push("image".into());
+        }
+        let before_catalog = before
+            .capability
+            .get("model_catalog")
+            .unwrap_or(&Value::Null);
+        let after_catalog = result
+            .smoke
+            .as_ref()
+            .and_then(|smoke| smoke.pointer("/target/model_catalog"))
+            .unwrap_or(&Value::Null);
+        compare_catalogs(before_catalog, after_catalog, &mut dimensions);
+        if before.outcome != after.outcome
+            || before.status != after.status
+            || result.candidate_outcome != Some(CandidateOutcome::Pass)
+        {
+            dimensions.push("outcome".into());
+        }
+        if before.authentication != after.authentication {
+            dimensions.push("authentication".into());
+        }
+        let mut before_capability = before.capability.clone();
+        let mut after_capability = after.capability.clone();
+        if let Some(before) = before_capability.as_object_mut() {
+            before.remove("model_catalog");
+        }
+        if let Some(after) = after_capability.as_object_mut() {
+            after.remove("model_catalog");
+        }
+        if before_capability != after_capability {
+            dimensions.push("capability".into());
+        }
+        if before.phase != after.phase {
+            dimensions.push("phase".into());
+        }
+        if before.terminal != after.terminal {
+            dimensions.push("terminal".into());
+        }
+        if before.diagnostic != after.diagnostic {
+            dimensions.push("diagnostic".into());
+        }
+        dimensions.sort();
+        dimensions.dedup();
+        if !dimensions.is_empty() {
+            changes.push(ComparisonChange {
+                case_id: result.case_id.clone(),
+                dimensions,
+            });
+        }
+    }
+    Ok(ComparisonReport {
+        schema_version: 1,
+        equal: changes.is_empty(),
+        changes,
+    })
+}
+
+fn resolution_binding_mismatch() -> BoxError {
+    "compatibility run: resolution_binding_mismatch".into()
+}
+
+fn validate_bound_execution(
+    resolution: &compatibility_resolution::LoadedResolution,
+    recipes: &LoadedRecipes,
+    production: &LoadedManifest,
+    execution: &LoadedManifest,
+) -> Result<(), BoxError> {
+    let artifact = &resolution.artifact;
+    if artifact.recipes.canonical_path != recipes.canonical_path_text
+        || artifact.recipes.sha256 != recipes.sha256
+        || artifact.production_manifest.canonical_path != production.canonical_path_text
+        || artifact.production_manifest.sha256 != production.sha256
+        || artifact.limits != recipes.recipes.limits
+        || execution.manifest.budget != production.manifest.budget
+    {
+        return Err(resolution_binding_mismatch());
+    }
+    let Some(execution_identity) = artifact.execution_manifest.as_ref() else {
+        return Err(resolution_binding_mismatch());
+    };
+    if execution_identity.canonical_path != execution.canonical_path_text
+        || execution_identity.sha256 != execution.sha256
+        || execution.manifest.cases.len() != artifact.cases.len()
+    {
+        return Err(resolution_binding_mismatch());
+    }
+
+    for package in &artifact.packages {
+        let recipe = recipes
+            .recipes
+            .package_sets
+            .iter()
+            .find(|recipe| recipe.id == package.id)
+            .ok_or_else(resolution_binding_mismatch)?;
+        if package.requested.adapter != recipe.adapter
+            || package.requested.adapter_selector != recipe.adapter_selector
+            || package.requested.agent_cli != recipe.agent_cli
+        {
+            return Err(resolution_binding_mismatch());
+        }
+    }
+    for image in &artifact.images {
+        let recipe = recipes
+            .recipes
+            .images
+            .iter()
+            .find(|recipe| recipe.id == image.id)
+            .ok_or_else(resolution_binding_mismatch)?;
+        if image.requested_base != recipe.base || image.package_sets != recipe.package_sets {
+            return Err(resolution_binding_mismatch());
+        }
+    }
+
+    for resolved_case in &artifact.cases {
+        let recipe = recipes
+            .recipes
+            .cases
+            .iter()
+            .find(|recipe| recipe.id == resolved_case.id)
+            .ok_or_else(resolution_binding_mismatch)?;
+        let baseline = production
+            .manifest
+            .cases
+            .iter()
+            .find(|case| case.id == resolved_case.baseline_case)
+            .ok_or_else(resolution_binding_mismatch)?;
+        let generated = execution
+            .manifest
+            .cases
+            .iter()
+            .find(|case| case.id == resolved_case.id)
+            .ok_or_else(resolution_binding_mismatch)?;
+        let image = resolved_case
+            .image
+            .as_ref()
+            .and_then(|id| artifact.images.iter().find(|image| &image.id == id));
+        let expected_config = PathBuf::from("configs").join(format!("{}.toml", resolved_case.id));
+        let expected_prerequisites: Vec<_> = baseline
+            .required_env
+            .iter()
+            .map(|required| compatibility_resolution::NonSecretPrerequisite {
+                name: required.name.clone(),
+                destination: None,
+            })
+            .chain(
+                baseline
+                    .pins
+                    .as_ref()
+                    .and_then(|pins| pins.components.get("fable-settings"))
+                    .map(|_| compatibility_resolution::NonSecretPrerequisite {
+                        name: "fable-settings".into(),
+                        destination: Some("/root/.claude/settings.json".into()),
+                    }),
+            )
+            .collect();
+        if recipe.baseline_case != resolved_case.baseline_case
+            || recipe.package_set != resolved_case.package_set
+            || recipe.image != resolved_case.image
+            || resolved_case.model != baseline.model
+            || resolved_case.effort != baseline.effort
+            || resolved_case.mode != baseline.mode
+            || resolved_case.prerequisites != expected_prerequisites
+            || artifact.environment.environment_owner != baseline.environment_owner
+            || artifact.environment.os != baseline.os
+            || artifact.environment.architecture != baseline.architecture
+            || generated.lane != Lane::FloatingCurrent
+            || generated.evidence_path != baseline.evidence_path
+            || generated.execution_mode != baseline.execution_mode
+            || generated.os != baseline.os
+            || generated.architecture != baseline.architecture
+            || generated.environment_owner != baseline.environment_owner
+            || generated.expected_image_digest.as_deref()
+                != image.map(|image| image.final_image_id.as_str())
+            || generated.config != expected_config
+            || resolve_case_path(&execution.canonical_path, &generated.config)
+                != Path::new(&resolved_case.generated_config.canonical_path)
+            || generated.agent != baseline.agent
+            || generated.model != baseline.model
+            || generated.effort != baseline.effort
+            || generated.mode != baseline.mode
+            || generated.session_cwd != baseline.session_cwd
+            || generated.auth_path != baseline.auth_path
+            || generated.credential_env != baseline.credential_env
+            || generated.required_env != baseline.required_env
+            || generated.probe != baseline.probe
+            || generated.billable != baseline.billable
+            || generated.timeout_secs != baseline.timeout_secs
+            || generated.max_tokens != baseline.max_tokens
+            || generated.max_cost_usd != baseline.max_cost_usd
+            || generated.retry_cap != baseline.retry_cap
+            || generated.expected_status != baseline.expected_status
+            || generated.classification != Classification::Canary
+            || generated.baseline_case.as_deref() != Some(baseline.id.as_str())
+            || generated.artifact != baseline.artifact
+            || generated.pins.is_some()
+            || generated.resolved.as_ref() != Some(&resolved_case.binding)
+        {
+            return Err(resolution_binding_mismatch());
+        }
+    }
+    Ok(())
+}
+
+fn load_bound_execution(
+    path: &Path,
+    environment_owner: &str,
+) -> Result<(compatibility_resolution::LoadedResolution, LoadedManifest), BoxError> {
+    let resolution = compatibility_resolution::load_resolution(path)?;
+    compatibility_resolution::revalidate_resolution_global(&resolution, environment_owner)
+        .map_err(|failure| format!("compatibility run: {}", failure.wire()))?;
+    let (recipes, production) =
+        load_recipes_with_pinned_manifest(Path::new(&resolution.artifact.recipes.canonical_path))?;
+    let execution_identity = resolution
+        .artifact
+        .execution_manifest
+        .as_ref()
+        .ok_or_else(resolution_binding_mismatch)?;
+    let mut execution = load_manifest(Path::new(&execution_identity.canonical_path))?;
+    validate_bound_execution(&resolution, &recipes, &production, &execution)?;
+    execution.resolution_binding = Some(ResolutionBindingRecord {
+        resolution_id: resolution.artifact.resolution_id.clone(),
+        artifact_sha256: resolution.sha256.clone(),
+        recipe_sha256: resolution.artifact.recipes.sha256.clone(),
+        production_manifest_sha256: resolution.artifact.production_manifest.sha256.clone(),
+    });
+    Ok((resolution, execution))
+}
+
 async fn run_command(args: RunArgs) -> Result<(), BoxError> {
-    let loaded = load_manifest(&args.manifest)?;
+    let (loaded, resolution) = match &args.source {
+        RunSource::Manifest(path) => (load_manifest(path)?, None),
+        RunSource::Resolution(path) => {
+            let (resolution, execution) = load_bound_execution(path, &args.environment_owner)?;
+            (execution, Some(resolution))
+        }
+    };
     let selected = select_case_indices(&loaded.manifest, &args.selection)?;
+    let selected_has_floating = selected
+        .iter()
+        .any(|index| loaded.manifest.cases[*index].lane == Lane::FloatingCurrent);
+    if resolution.is_none() && selected_has_floating {
+        return Err("compatibility run: floating_resolution_required; use --resolution".into());
+    }
+    if resolution.is_some()
+        && selected
+            .iter()
+            .any(|index| loaded.manifest.cases[*index].lane != Lane::FloatingCurrent)
+    {
+        return Err(resolution_binding_mismatch());
+    }
     let output_directory = ensure_output_outside_repositories(&args.out)?;
     let executable = std::env::current_exe()
         .map_err(|error| format!("compatibility run: cannot resolve candidate binary: {error}"))?;
@@ -2873,6 +4278,13 @@ async fn run_command(args: RunArgs) -> Result<(), BoxError> {
         byte_length: u64::try_from(executable.bytes.len())
             .map_err(|_| "compatibility run: candidate binary length does not fit u64")?,
     };
+    if resolution.as_ref().is_some_and(|resolution| {
+        resolution.artifact.candidate.canonical_path != candidate.canonical_path
+            || resolution.artifact.candidate.sha256 != candidate.sha256
+            || resolution.artifact.candidate.byte_length != candidate.byte_length
+    }) {
+        return Err("compatibility run: candidate_binary_changed".into());
+    }
     let setup_evidence = setup_incomplete_aggregate(
         &loaded,
         &candidate,
@@ -2884,7 +4296,7 @@ async fn run_command(args: RunArgs) -> Result<(), BoxError> {
     let scratch = output_directory.create_scratch()?;
     let staged_executable = stage_candidate(&executable, &scratch)?;
     drop(executable);
-    let invoker = ProcessSmokeInvoker {
+    let process_invoker = ProcessSmokeInvoker {
         executable: staged_executable,
         artifact_directory: &scratch.pin,
         expected_sha256: candidate.sha256.clone(),
@@ -2898,19 +4310,25 @@ async fn run_command(args: RunArgs) -> Result<(), BoxError> {
             cancellation_for_signal.store(true, std::sync::atomic::Ordering::Release);
         }
     });
-    let aggregate = build_aggregate(
-        AggregateInputs {
-            loaded: &loaded,
-            candidate: &candidate,
-            selection: &args.selection,
-            selected_indices: &selected,
+    let aggregate_inputs = || AggregateInputs {
+        loaded: &loaded,
+        candidate: &candidate,
+        selection: &args.selection,
+        selected_indices: &selected,
+        environment_owner: &args.environment_owner,
+        scratch: &scratch.path,
+        cancellation_requested: &cancellation_requested,
+    };
+    let aggregate = if let Some(resolution) = resolution.as_ref() {
+        let invoker = ResolutionSmokeInvoker {
+            inner: process_invoker,
+            resolution,
             environment_owner: &args.environment_owner,
-            scratch: &scratch.path,
-            cancellation_requested: &cancellation_requested,
-        },
-        &invoker,
-    )
-    .await;
+        };
+        build_aggregate(aggregate_inputs(), &invoker).await
+    } else {
+        build_aggregate(aggregate_inputs(), &process_invoker).await
+    };
     signal_task.abort();
     let success = aggregate.success;
     output_directory.replace_setup_with_final(&output, &setup_evidence, &aggregate)?;
@@ -2921,10 +4339,324 @@ async fn run_command(args: RunArgs) -> Result<(), BoxError> {
     }
 }
 
+fn snapshot_resolution_executable(
+    path: &Path,
+    label: &str,
+) -> Result<
+    (
+        PathBuf,
+        compatibility_resolution::ExecutableIdentity,
+        compatibility_resolution::ProtectedFileInput,
+    ),
+    BoxError,
+> {
+    let snapshot = local_file::read_regular_file_bounded(path, label, MAX_EXECUTABLE_BYTES)?;
+    let byte_length = u64::try_from(snapshot.bytes.len())
+        .map_err(|_| format!("compatibility resolve: {label} length does not fit u64"))?;
+    if byte_length == 0 {
+        return Err(format!("compatibility resolve: {label} must not be empty").into());
+    }
+    let canonical_path = snapshot.canonical_path.clone();
+    let canonical_path_text = artifact_safe_path(label, &canonical_path)?;
+    let identity = compatibility_resolution::ExecutableIdentity {
+        canonical_path: canonical_path_text,
+        sha256: snapshot.sha256.clone(),
+        byte_length,
+    };
+    let protected = compatibility_resolution::ProtectedFileInput {
+        canonical_path: canonical_path.clone(),
+        sha256: snapshot.sha256,
+        max_bytes: MAX_EXECUTABLE_BYTES,
+    };
+    Ok((canonical_path, identity, protected))
+}
+
+fn find_resolution_executable(
+    command: &str,
+    label: &str,
+) -> Result<
+    (
+        PathBuf,
+        compatibility_resolution::ExecutableIdentity,
+        compatibility_resolution::ProtectedFileInput,
+    ),
+    BoxError,
+> {
+    let path = crate::doctor::resolved_executable_impl(command).ok_or_else(|| {
+        format!("compatibility resolve: required {label} {command:?} is not executable on PATH")
+    })?;
+    snapshot_resolution_executable(&path, label)
+}
+
+fn closed_resolution_path(paths: &[&Path]) -> Result<OsString, BoxError> {
+    let mut directories = BTreeSet::new();
+    for path in paths {
+        let parent = path
+            .parent()
+            .ok_or("compatibility resolve: resolved tool has no parent directory")?;
+        directories.insert(parent.to_path_buf());
+    }
+    for system in [PathBuf::from("/usr/bin"), PathBuf::from("/bin")] {
+        if system.is_dir() {
+            directories.insert(system);
+        }
+    }
+    std::env::join_paths(directories)
+        .map_err(|_| "compatibility resolve: cannot construct the closed resolver PATH".into())
+}
+
+fn protect_resolution_file(
+    path: &Path,
+    protected: &mut Vec<compatibility_resolution::ProtectedFileInput>,
+) -> Result<(), BoxError> {
+    let snapshot = local_file::read_regular_file_bounded(
+        path,
+        "compatibility protected repository input",
+        MAX_AGGREGATE_BYTES,
+    )?;
+    protected.push(compatibility_resolution::ProtectedFileInput {
+        canonical_path: snapshot.canonical_path,
+        sha256: snapshot.sha256,
+        max_bytes: MAX_AGGREGATE_BYTES,
+    });
+    Ok(())
+}
+
+fn protected_repository_inputs(
+    production_manifest: &Path,
+) -> Result<Vec<compatibility_resolution::ProtectedFileInput>, BoxError> {
+    let Some(root) = repository_root(production_manifest) else {
+        return Ok(Vec::new());
+    };
+    let mut protected = Vec::new();
+    for relative in [
+        "Cargo.toml",
+        "Cargo.lock",
+        "compatibility/baselines/pinned.json",
+        "docs/compatibility.md",
+        "CHANGELOG.md",
+    ] {
+        let path = root.join(relative);
+        if path.is_file() {
+            protect_resolution_file(&path, &mut protected)?;
+        }
+    }
+    let configs_directory = root.join("compatibility/configs");
+    if configs_directory.is_dir() {
+        let mut configs = Vec::new();
+        for entry in std::fs::read_dir(&configs_directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(OsStr::to_str) == Some("toml") && path.is_file() {
+                configs.push(path);
+            }
+        }
+        configs.sort();
+        for path in configs {
+            protect_resolution_file(&path, &mut protected)?;
+        }
+    }
+    let container_directory = root.join("deploy/containers");
+    if container_directory.is_dir() {
+        let mut containerfiles = Vec::new();
+        for entry in std::fs::read_dir(&container_directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.ends_with(".Containerfile"))
+                && path.is_file()
+            {
+                containerfiles.push(path);
+            }
+        }
+        containerfiles.sort();
+        for path in containerfiles {
+            protect_resolution_file(&path, &mut protected)?;
+        }
+    }
+    Ok(protected)
+}
+
+async fn resolve_command(args: ResolveArgs) -> Result<(), BoxError> {
+    let (recipes, pinned) = load_recipes_with_pinned_manifest(&args.recipes)?;
+    let available: BTreeSet<_> = recipes
+        .recipes
+        .cases
+        .iter()
+        .map(|case| case.id.as_str())
+        .collect();
+    for requested in &args.cases {
+        if !available.contains(requested.as_str()) {
+            return Err(format!(
+                "compatibility resolve: selected case {requested:?} is not in the recipes"
+            )
+            .into());
+        }
+    }
+    if args.all && available.is_empty() {
+        return Err("compatibility resolve: explicit selection resolved to zero cases".into());
+    }
+    let requested: BTreeSet<_> = args.cases.iter().map(String::as_str).collect();
+    let selected_recipes: Vec<_> = recipes
+        .recipes
+        .cases
+        .iter()
+        .filter(|case| args.all || requested.contains(case.id.as_str()))
+        .cloned()
+        .collect();
+    if selected_recipes.is_empty() {
+        return Err("compatibility resolve: explicit selection resolved to zero cases".into());
+    }
+
+    let mut case_inputs = Vec::with_capacity(selected_recipes.len());
+    for recipe in selected_recipes {
+        let baseline = pinned
+            .manifest
+            .cases
+            .iter()
+            .find(|case| case.id == recipe.baseline_case)
+            .expect("recipe/pinned validation checked every baseline mapping");
+        if baseline.environment_owner != args.environment_owner {
+            return Err(format!(
+                "compatibility resolve: baseline {:?} environment owner mismatch",
+                baseline.id
+            )
+            .into());
+        }
+        if baseline.os != std::env::consts::OS || baseline.architecture != std::env::consts::ARCH {
+            return Err(format!(
+                "compatibility resolve: baseline {:?} platform does not match this resolver host",
+                baseline.id
+            )
+            .into());
+        }
+        let pins = baseline
+            .pins
+            .as_ref()
+            .expect("pinned manifest validation requires baseline pins");
+        let config_path = resolve_case_path(&pinned.canonical_path, &baseline.config);
+        let config = local_file::read_regular_file_bounded(
+            &config_path,
+            "compatibility resolution baseline config",
+            MAX_MANIFEST_BYTES,
+        )?;
+        if config.sha256 != pins.config_sha256 {
+            return Err(format!(
+                "compatibility resolve: baseline {:?} config pin mismatch",
+                baseline.id
+            )
+            .into());
+        }
+        case_inputs.push(compatibility_resolution::ResolutionCaseInput {
+            recipe,
+            evidence_path: baseline.evidence_path.wire().into(),
+            execution_mode: baseline.execution_mode.wire().into(),
+            os: baseline.os.clone(),
+            architecture: baseline.architecture.clone(),
+            environment_owner: baseline.environment_owner.clone(),
+            agent: baseline.agent.clone(),
+            model: baseline.model.clone(),
+            effort: baseline.effort.clone(),
+            mode: baseline.mode.clone(),
+            session_cwd: baseline.session_cwd.clone(),
+            auth_path: baseline.auth_path.wire().into(),
+            credential_env: baseline.credential_env.clone(),
+            required_env: baseline
+                .required_env
+                .iter()
+                .map(
+                    |required| compatibility_resolution::ResolutionRequiredEnvironmentInput {
+                        name: required.name.clone(),
+                        one_of: required.one_of.clone(),
+                    },
+                )
+                .collect(),
+            probe: baseline.probe.wire().into(),
+            billable: baseline.billable,
+            timeout_secs: baseline.timeout_secs,
+            max_tokens: baseline.max_tokens,
+            max_cost_usd: baseline.max_cost_usd,
+            retry_cap: baseline.retry_cap,
+            expected_status: baseline.expected_status.wire().into(),
+            artifact: compatibility_resolution::ResolutionArtifactInput {
+                retention_days: baseline.artifact.retention_days,
+            },
+            baseline_config: compatibility_resolution::BaselineConfigInput {
+                canonical_path: config.canonical_path,
+                sha256: config.sha256,
+                bytes: config.bytes,
+            },
+            component_pins: pins.components.clone(),
+        });
+    }
+
+    let current_executable = std::env::current_exe().map_err(|error| {
+        format!("compatibility resolve: cannot locate candidate binary: {error}")
+    })?;
+    let (_, candidate, _) =
+        snapshot_resolution_executable(&current_executable, "compatibility candidate binary")?;
+    let (runtime_path, runtime_executable, _) =
+        find_resolution_executable(args.runtime.wire(), "container runtime")?;
+    let (npm_path, _, npm_protected) = find_resolution_executable("npm", "npm executable")?;
+    let (node_path, _, node_protected) = find_resolution_executable("node", "node executable")?;
+    let (base_resolver_executable, base_resolver_protected) = match args.runtime {
+        RuntimeKind::Docker => (runtime_path.clone(), None),
+        RuntimeKind::Podman => {
+            let (path, _, protected) =
+                find_resolution_executable("skopeo", "raw registry manifest resolver")?;
+            (path, Some(protected))
+        }
+    };
+    let safe_path = closed_resolution_path(&[
+        &runtime_path,
+        &base_resolver_executable,
+        &npm_path,
+        &node_path,
+    ])?;
+    let mut protected = protected_repository_inputs(&pinned.canonical_path)?;
+    protected.push(npm_protected);
+    protected.push(node_protected);
+    if let Some(base_resolver_protected) = base_resolver_protected {
+        protected.push(base_resolver_protected);
+    }
+    let request = compatibility_resolution::ProviderFreeResolutionRequest {
+        output: args.out,
+        recipes,
+        production_manifest: compatibility_resolution::VersionedArtifactIdentity {
+            schema_version: 1,
+            canonical_path: pinned.canonical_path_text,
+            sha256: pinned.sha256,
+        },
+        candidate,
+        environment_owner: args.environment_owner,
+        os: std::env::consts::OS.into(),
+        architecture: std::env::consts::ARCH.into(),
+        runtime: args.runtime,
+        runtime_executable,
+        base_resolver_executable,
+        npm_executable: npm_path,
+        safe_path,
+        budget: compatibility_resolution::ResolutionBudgetInput {
+            timeout_secs: pinned.manifest.budget.timeout_secs,
+            max_tokens: pinned.manifest.budget.max_tokens,
+            max_cost_usd: pinned.manifest.budget.max_cost_usd,
+        },
+        cases: case_inputs,
+        protected_inputs: protected,
+    };
+    compatibility_resolution::resolve_provider_free(request).await?;
+    Ok(())
+}
+
 fn compare_command(args: CompareArgs) -> Result<(), BoxError> {
     let current: AggregateArtifact = load_json(&args.current, "compatibility current aggregate")?;
     let baseline: BaselineArtifact = load_json(&args.baseline, "compatibility pinned baseline")?;
-    let report = compare_artifacts(&current, &baseline)?;
+    let report = match args.mode {
+        ComparisonMode::Pinned => compare_artifacts(&current, &baseline)?,
+        ComparisonMode::FloatingToPinned => compare_floating_to_pinned(&current, &baseline)?,
+    };
     let equal = report.equal;
     serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
     println!();
@@ -2949,23 +4681,41 @@ pub(crate) async fn compatibility_cmd(args: &[String]) -> Result<(), BoxError> {
     match subcommand {
         "validate" => {
             let args = parse_validate_args(&args[1..])?;
-            let loaded = load_manifest(&args.manifest)?;
-            println!(
-                "compatibility manifest valid: {} case{} (sha256 {})",
-                loaded.manifest.cases.len(),
-                if loaded.manifest.cases.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                },
-                loaded.sha256
-            );
+            match args.source {
+                ValidateSource::Manifest(path) => {
+                    let loaded = load_manifest(&path)?;
+                    println!(
+                        "compatibility manifest valid: {} case{} (sha256 {})",
+                        loaded.manifest.cases.len(),
+                        if loaded.manifest.cases.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        loaded.sha256
+                    );
+                }
+                ValidateSource::Recipes(path) => {
+                    let (loaded, _) = load_recipes_with_pinned_manifest(&path)?;
+                    println!(
+                        "floating recipes valid: {} case{} (sha256 {})",
+                        loaded.recipes.cases.len(),
+                        if loaded.recipes.cases.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        loaded.sha256
+                    );
+                }
+            }
             Ok(())
         }
+        "resolve" => resolve_command(parse_resolve_args(&args[1..])?).await,
         "run" => run_command(parse_run_args(&args[1..])?).await,
         "compare" => compare_command(parse_compare_args(&args[1..])?),
         other => Err(format!(
-            "compatibility: unknown subcommand {other:?} (expected validate | run | compare)\n{USAGE}"
+            "compatibility: unknown subcommand {other:?} (expected validate | resolve | run | compare)\n{USAGE}"
         )
         .into()),
     }
@@ -3061,12 +4811,24 @@ mod tests {
             max_cost_usd: Some(0.5),
             retry_cap: 0,
             expected_status,
-            classification: Classification::NonGoal,
+            classification: Classification::Canary,
+            baseline_case: Some(format!("baseline-{id}")),
             artifact: ArtifactPolicy {
                 retention_days: 1,
                 redaction: RedactionPolicy::Strict,
             },
             pins: None,
+            resolved: Some(ResolvedBinding {
+                resolution_id: "resolution-1".into(),
+                recipe_sha256: "e".repeat(64),
+                config_sha256: "f".repeat(64),
+                adapter: "@agentclientprotocol/codex-acp=1.2.3".into(),
+                agent_cli: "@openai/codex=0.150.0".into(),
+                package_inventory_sha256: "a".repeat(64),
+                package_tree_sha256: "b".repeat(64),
+                image_digest: None,
+                base_image_digest: None,
+            }),
         }
     }
 
@@ -3089,15 +4851,254 @@ mod tests {
             canonical_path_text: canonical_path.to_str().unwrap().into(),
             canonical_path,
             sha256: "a".repeat(64),
+            resolution_binding: None,
         }
     }
 
+    fn bound_execution_fixture(
+        dir: &Path,
+    ) -> (
+        compatibility_resolution::LoadedResolution,
+        LoadedRecipes,
+        LoadedManifest,
+        LoadedManifest,
+    ) {
+        let root = dir.join("bundle");
+        let recipe_path = dir.join("floating-current.toml");
+        let production_path = dir.join("manifest.toml");
+        let execution_path = root.join("execution-manifest.toml");
+        let config_path = root.join("configs/floating-only.toml");
+        let adapter = "@agentclientprotocol/codex-acp=1.2.3";
+        let agent_cli = "@openai/codex=0.150.0";
+        let binding = ResolvedBinding {
+            resolution_id: "resolution-1".into(),
+            recipe_sha256: "e".repeat(64),
+            config_sha256: "f".repeat(64),
+            adapter: adapter.into(),
+            agent_cli: agent_cli.into(),
+            package_inventory_sha256: "a".repeat(64),
+            package_tree_sha256: "b".repeat(64),
+            image_digest: None,
+            base_image_digest: None,
+        };
+        let mut baseline = case("baseline-only", EvidenceStatus::Pass);
+        baseline.lane = Lane::Pinned;
+        baseline.classification = Classification::Support;
+        baseline.baseline_case = None;
+        baseline.config = PathBuf::from("baseline.toml");
+        baseline.resolved = None;
+        baseline.pins = Some(PinSet {
+            config_sha256: "1".repeat(64),
+            model: baseline.model.clone(),
+            adapter: Some(adapter.into()),
+            agent_cli: Some(agent_cli.into()),
+            image_digest: None,
+            components: BTreeMap::new(),
+        });
+        let mut generated = baseline.clone();
+        generated.id = "floating-only".into();
+        generated.lane = Lane::FloatingCurrent;
+        generated.classification = Classification::Canary;
+        generated.baseline_case = Some(baseline.id.clone());
+        generated.config = PathBuf::from("configs/floating-only.toml");
+        generated.pins = None;
+        generated.resolved = Some(binding.clone());
+        let production = LoadedManifest {
+            manifest: manifest(vec![baseline.clone()]),
+            canonical_path: production_path.clone(),
+            canonical_path_text: production_path.to_string_lossy().into_owned(),
+            sha256: "c".repeat(64),
+            resolution_binding: None,
+        };
+        let execution = LoadedManifest {
+            manifest: manifest(vec![generated]),
+            canonical_path: execution_path.clone(),
+            canonical_path_text: execution_path.to_string_lossy().into_owned(),
+            sha256: "d".repeat(64),
+            resolution_binding: None,
+        };
+        let limits = compatibility_resolution::ResolutionLimits {
+            timeout_secs: 900,
+            max_download_bytes: 536_870_912,
+            max_unpacked_bytes: 1_073_741_824,
+            max_files: 100_000,
+        };
+        let recipes = LoadedRecipes {
+            recipes: compatibility_resolution::FloatingRecipeManifest {
+                schema_version: 1,
+                production_manifest: PathBuf::from("manifest.toml"),
+                limits: limits.clone(),
+                artifact: compatibility_resolution::ResolutionArtifactPolicy {
+                    retention_days: 30,
+                    redaction: compatibility_resolution::ResolutionRedactionPolicy::Strict,
+                },
+                package_sets: vec![compatibility_resolution::PackageSetRecipe {
+                    id: "codex-current".into(),
+                    ecosystem: compatibility_resolution::RecipeEcosystem::Npm,
+                    registry: compatibility_resolution::RecipeRegistry::Npmjs,
+                    adapter: "@agentclientprotocol/codex-acp".into(),
+                    adapter_selector: "latest".into(),
+                    agent_cli: "@openai/codex".into(),
+                }],
+                images: Vec::new(),
+                cases: vec![compatibility_resolution::FloatingCaseRecipe {
+                    id: "floating-only".into(),
+                    baseline_case: "baseline-only".into(),
+                    package_set: "codex-current".into(),
+                    target: FloatingTarget::HostPackageTree,
+                    config_template: compatibility_resolution::ConfigTemplate::CodexHostReadOnlyV1,
+                    image: None,
+                }],
+            },
+            canonical_path: recipe_path.clone(),
+            canonical_path_text: recipe_path.to_string_lossy().into_owned(),
+            sha256: "e".repeat(64),
+        };
+        let package = compatibility_resolution::ResolvedPackageSet {
+            id: "codex-current".into(),
+            requested: compatibility_resolution::RequestedPackageSet {
+                adapter: "@agentclientprotocol/codex-acp".into(),
+                adapter_selector: "latest".into(),
+                agent_cli: "@openai/codex".into(),
+            },
+            adapter: compatibility_resolution::ExactNpmPackage {
+                name: "@agentclientprotocol/codex-acp".into(),
+                version: "1.2.3".into(),
+                integrity: "sha512-YWJj".into(),
+            },
+            agent_cli: compatibility_resolution::ExactNpmPackage {
+                name: "@openai/codex".into(),
+                version: "0.150.0".into(),
+                integrity: "sha512-ZGVm".into(),
+            },
+            bundled_cli_version: None,
+            resolution_lock_sha256: "2".repeat(64),
+            inventory_sha256: "a".repeat(64),
+            tree_sha256: "b".repeat(64),
+            adapter_executable: compatibility_resolution::ArtifactIdentity {
+                canonical_path: root
+                    .join("packages/codex-current/tree/adapter")
+                    .to_string_lossy()
+                    .into_owned(),
+                sha256: "3".repeat(64),
+            },
+            adapter_executable_relative: "adapter".into(),
+        };
+        let resolution = compatibility_resolution::LoadedResolution {
+            artifact: compatibility_resolution::ResolutionArtifact {
+                schema_version: 1,
+                state: compatibility_resolution::ResolutionState::Complete,
+                resolution_id: "resolution-1".into(),
+                recipes: compatibility_resolution::VersionedArtifactIdentity {
+                    schema_version: 1,
+                    canonical_path: recipe_path.to_string_lossy().into_owned(),
+                    sha256: "e".repeat(64),
+                },
+                production_manifest: compatibility_resolution::VersionedArtifactIdentity {
+                    schema_version: 1,
+                    canonical_path: production_path.to_string_lossy().into_owned(),
+                    sha256: "c".repeat(64),
+                },
+                candidate: compatibility_resolution::ExecutableIdentity {
+                    canonical_path: dir.join("candidate").to_string_lossy().into_owned(),
+                    sha256: "4".repeat(64),
+                    byte_length: 42,
+                },
+                environment: compatibility_resolution::ResolutionEnvironment {
+                    environment_owner: "test-runner".into(),
+                    os: std::env::consts::OS.into(),
+                    architecture: std::env::consts::ARCH.into(),
+                    runtime: RuntimeKind::Docker,
+                    runtime_executable: compatibility_resolution::ExecutableIdentity {
+                        canonical_path: dir.join("runtime").to_string_lossy().into_owned(),
+                        sha256: "5".repeat(64),
+                        byte_length: 42,
+                    },
+                },
+                limits,
+                execution_manifest: Some(compatibility_resolution::VersionedArtifactIdentity {
+                    schema_version: 1,
+                    canonical_path: execution_path.to_string_lossy().into_owned(),
+                    sha256: "d".repeat(64),
+                }),
+                packages: vec![package],
+                images: Vec::new(),
+                cases: vec![compatibility_resolution::ResolvedCase {
+                    id: "floating-only".into(),
+                    baseline_case: "baseline-only".into(),
+                    package_set: "codex-current".into(),
+                    image: None,
+                    model: baseline.model,
+                    effort: baseline.effort,
+                    mode: baseline.mode,
+                    prerequisites: Vec::new(),
+                    generated_config: compatibility_resolution::ArtifactIdentity {
+                        canonical_path: config_path.to_string_lossy().into_owned(),
+                        sha256: "f".repeat(64),
+                    },
+                    binding,
+                }],
+                model_catalog: compatibility_resolution::ModelCatalogResolution {
+                    state:
+                        compatibility_resolution::CatalogResolutionState::DeferredToAuthorizedSmoke,
+                },
+                protected_inputs: vec![compatibility_resolution::ProtectedInput {
+                    path: production_path.to_string_lossy().into_owned(),
+                    before_sha256: "c".repeat(64),
+                    after_sha256: "c".repeat(64),
+                }],
+                failure: None,
+                owned_resources: vec![compatibility_resolution::OwnedResource {
+                    kind: compatibility_resolution::OwnedResourceKind::Bundle,
+                    identity: root.to_string_lossy().into_owned(),
+                }],
+            },
+            canonical_path: root.join("resolution.json"),
+            canonical_path_text: root.join("resolution.json").to_string_lossy().into_owned(),
+            sha256: "6".repeat(64),
+        };
+        (resolution, recipes, production, execution)
+    }
+
     fn smoke(case: &CompatibilityCase, success: bool, tokens: Option<u64>) -> Value {
+        let mut provenance = Vec::new();
+        if let Some(resolved) = &case.resolved {
+            for (component, exact) in [
+                ("adapter", resolved.adapter.as_str()),
+                ("agent-cli", resolved.agent_cli.as_str()),
+            ] {
+                let (package, version) = exact.split_once('=').unwrap();
+                provenance.push(json!({
+                    "check": format!("provenance:{}:{component}", case.agent),
+                    "status": "ok",
+                    "detail": format!("package={package} version={version}")
+                }));
+            }
+            if let Some(image) = &resolved.image_digest {
+                provenance.push(json!({
+                    "check": format!("provenance:{}:image", case.agent),
+                    "status": "ok",
+                    "detail": format!("immutable_id={image}")
+                }));
+            }
+        }
+        let mut model_catalog = json!({
+            "state": "available",
+            "current_model": case.model,
+            "models": [case.model.clone()],
+            "model_configurable": true,
+            "effort_levels": case.effort.iter().cloned().collect::<Vec<_>>(),
+            "modes": case.mode.iter().cloned().collect::<Vec<_>>(),
+        });
+        if let Some(mode) = &case.mode {
+            model_catalog["current_mode"] = Value::String(mode.clone());
+        }
         let target = success.then(|| {
             json!({
                 "execution_mode": "host",
-                "provenance": [],
-                "authentication": {"path": "automatic"}
+                "provenance": provenance,
+                "authentication": {"path": "automatic"},
+                "model_catalog": model_catalog
             })
         });
         let failure = (!success).then(|| {
@@ -3113,29 +5114,58 @@ mod tests {
             "schema_version": 2,
             "success": success,
             "bridge": {"package_version": "0.2.1"},
-            "attempt": {"id": format!("attempt-{}", case.id)},
+            "attempt": {
+                "id": format!("attempt-{}", case.id),
+                "timed_out": false,
+            },
             "request": {
                 "agent": case.agent,
                 "model": case.model,
-                "config_sha256": Value::Null
+                "config_sha256": case.resolved.as_ref().map(|resolved| &resolved.config_sha256)
             },
             "target": target,
             "session": {"effective_request": {"model": case.model}},
             "turn": {
                 "prompt": crate::smoke::FIXED_PROMPT,
+                "prompt_calls": 1,
                 "terminal_state": if success { "completed" } else { "not_started" },
                 "stop_reason": if success { Value::String("end_turn".into()) } else { Value::Null },
                 "exact_pong": success,
                 "usage": tokens.map(|used| json!({"used": used}))
             },
             "diagnostics": {"failure": failure},
-            "cleanup": {}
+            "cleanup": {
+                "cancel": "not_needed",
+                "release": "completed",
+                "retire": "completed",
+                "run_scoped_backstop": "not_needed"
+            }
         })
+    }
+
+    fn definitive_failure(case: &CompatibilityCase, tokens: Option<u64>) -> Value {
+        let mut artifact = smoke(case, true, tokens);
+        artifact["success"] = json!(false);
+        artifact["turn"]["exact_pong"] = json!(false);
+        artifact["diagnostics"]["failure"] = json!({
+            "failed_phase": "prompt_finish",
+            "class": "protocol",
+            "disposition": "fatal",
+            "code": "smoke.not_exact_pong",
+            "prompt_may_have_been_accepted": true
+        });
+        artifact
     }
 
     struct FakeInvoker {
         calls: Mutex<Vec<String>>,
         results: Mutex<VecDeque<InvocationResult>>,
+    }
+
+    struct RejectingRevalidationInvoker {
+        reason: &'static str,
+        revalidations: Mutex<Vec<String>>,
+        calls: Mutex<Vec<String>>,
     }
 
     impl FakeInvoker {
@@ -3144,6 +5174,23 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 results: Mutex::new(results.into()),
             }
+        }
+    }
+
+    #[async_trait]
+    impl SmokeInvoker for RejectingRevalidationInvoker {
+        async fn revalidate(&self, case: &CompatibilityCase) -> Result<(), &'static str> {
+            self.revalidations.lock().unwrap().push(case.id.clone());
+            Err(self.reason)
+        }
+
+        async fn invoke(
+            &self,
+            request: &SmokeRequest,
+            _admission: &SpawnAdmission<'_>,
+        ) -> InvocationResult {
+            self.calls.lock().unwrap().push(request.agent.clone());
+            panic!("a rejected resolution revalidation must prevent provider spawn")
         }
     }
 
@@ -3307,6 +5354,8 @@ mod tests {
                 cost_observation_missing_cases: 0,
                 exhausted: false,
             },
+            resolution: None,
+            floating_summary: floating_summary(&results),
             results,
         }
     }
@@ -3428,6 +5477,16 @@ agent_cli = "@openai/codex=0.144.1"
         assert!(parse_and_validate(&secret_comment)
             .unwrap_err()
             .contains("secret-shaped"));
+
+        for embedded_secret in [
+            "# AKIA1234567890ABCDEF\n",
+            "# eyJheader.payload.signature\n",
+        ] {
+            let secret_comment = format!("{embedded_secret}{}", valid_pinned_toml());
+            assert!(parse_and_validate(&secret_comment)
+                .unwrap_err()
+                .contains("secret-shaped"));
+        }
 
         let floating_model = valid_pinned_toml().replace("gpt-5.6-sol", "latest");
         assert!(parse_and_validate(&floating_model)
@@ -3605,11 +5664,19 @@ agent_cli = "@openai/codex=0.144.1"
 
         let invalid = api.replace(
             "required_env = []",
-            "credential_env = \"sk-ant-not-a-name\"\nrequired_env = []",
+            "credential_env = \"not-a-valid-env-name\"\nrequired_env = []",
         );
         assert!(parse_and_validate(&invalid)
             .unwrap_err()
             .contains("requires a valid credential_env name"));
+
+        let secret = api.replace(
+            "required_env = []",
+            "credential_env = \"sk-ant-not-a-name\"\nrequired_env = []",
+        );
+        assert!(parse_and_validate(&secret)
+            .unwrap_err()
+            .contains("secret-shaped"));
 
         let valid = api.replace(
             "required_env = []",
@@ -3685,13 +5752,41 @@ agent_cli = "@openai/codex=0.144.1"
         );
     }
 
+    #[test]
+    fn bound_execution_crosslinks_recipe_resolution_manifest_and_baseline_literally() {
+        let dir = tempfile::tempdir().unwrap();
+        let (resolution, recipes, production, execution) = bound_execution_fixture(dir.path());
+        validate_bound_execution(&resolution, &recipes, &production, &execution).unwrap();
+
+        let (resolution, recipes, production, mut execution) = bound_execution_fixture(dir.path());
+        execution.manifest.cases[0].model = "different-model".into();
+        assert!(validate_bound_execution(&resolution, &recipes, &production, &execution).is_err());
+
+        let (resolution, mut recipes, production, execution) = bound_execution_fixture(dir.path());
+        recipes.recipes.package_sets[0].adapter = "@agentclientprotocol/claude-agent-acp".into();
+        assert!(validate_bound_execution(&resolution, &recipes, &production, &execution).is_err());
+
+        let (mut resolution, recipes, production, execution) = bound_execution_fixture(dir.path());
+        resolution.artifact.cases[0].prerequisites.push(
+            compatibility_resolution::NonSecretPrerequisite {
+                name: "unexpected".into(),
+                destination: None,
+            },
+        );
+        assert!(validate_bound_execution(&resolution, &recipes, &production, &execution).is_err());
+
+        let (resolution, recipes, mut production, execution) = bound_execution_fixture(dir.path());
+        production.manifest.budget.max_tokens += 1;
+        assert!(validate_bound_execution(&resolution, &recipes, &production, &execution).is_err());
+    }
+
     #[tokio::test]
-    async fn selected_cases_invoke_once_each_and_failures_are_not_retried() {
+    async fn floating_failure_is_blocking_while_selected_cases_still_invoke_once_without_retry() {
         let dir = tempfile::tempdir().unwrap();
         let first = case("first", EvidenceStatus::Fail);
         let second = case("second", EvidenceStatus::Pass);
         let invoker = FakeInvoker::new(vec![
-            invocation(smoke(&first, false, Some(1))),
+            invocation(definitive_failure(&first, Some(1))),
             invocation(smoke(&second, true, Some(2))),
         ]);
         let loaded = loaded(dir.path(), vec![first, second]);
@@ -3720,11 +5815,213 @@ agent_cli = "@openai/codex=0.144.1"
             .results
             .iter()
             .all(|result| result.execution == ExecutionState::Completed));
-        assert!(aggregate
-            .results
-            .iter()
-            .all(|result| result.expectation_met));
-        assert!(aggregate.success);
+        assert!(
+            aggregate
+                .results
+                .iter()
+                .all(|result| result.expectation_met),
+            "results: {:?}",
+            aggregate.results
+        );
+        assert_eq!(
+            aggregate.results[0].candidate_outcome,
+            Some(CandidateOutcome::Fail)
+        );
+        assert_eq!(
+            aggregate.results[1].candidate_outcome,
+            Some(CandidateOutcome::Pass)
+        );
+        assert_eq!(
+            aggregate.floating_summary,
+            Some(FloatingSummary {
+                candidate_pass: 1,
+                candidate_fail: 1,
+                candidate_unknown: 0,
+            })
+        );
+        assert!(!aggregate.success);
+    }
+
+    #[tokio::test]
+    async fn floating_infrastructure_or_incomplete_failure_evidence_is_candidate_unknown() {
+        for mutation in [
+            "timeout",
+            "authentication",
+            "container_runtime",
+            "missing_catalog",
+            "cleanup_failed",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let case = case("only", EvidenceStatus::Fail);
+            let mut artifact = definitive_failure(&case, Some(1));
+            match mutation {
+                "timeout" => {
+                    artifact["attempt"]["timed_out"] = json!(true);
+                    artifact["diagnostics"]["failure"]["class"] = json!("timeout");
+                }
+                "authentication" => {
+                    artifact["diagnostics"]["failure"]["class"] = json!("authentication");
+                }
+                "container_runtime" => {
+                    artifact["diagnostics"]["failure"]["class"] = json!("container_runtime");
+                }
+                "missing_catalog" => {
+                    artifact["target"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("model_catalog");
+                }
+                "cleanup_failed" => artifact["cleanup"]["release"] = json!("failed"),
+                _ => unreachable!(),
+            }
+            let invoker = FakeInvoker::new(vec![invocation(artifact)]);
+            let loaded = loaded(dir.path(), vec![case]);
+            let cancelled = AtomicBool::new(false);
+            let aggregate = build_aggregate(
+                AggregateInputs {
+                    loaded: &loaded,
+                    candidate: &candidate_identity(),
+                    selection: &selection(),
+                    selected_indices: &[0],
+                    environment_owner: "test-runner",
+                    scratch: dir.path(),
+                    cancellation_requested: &cancelled,
+                },
+                &invoker,
+            )
+            .await;
+
+            assert_eq!(
+                aggregate.results[0].candidate_outcome,
+                Some(CandidateOutcome::Unknown),
+                "{mutation} must not be classified as a definitive compatibility failure"
+            );
+            assert!(aggregate.results[0]
+                .drift
+                .iter()
+                .any(|dimension| dimension == "outcome.smoke_contract"));
+            assert!(!aggregate.success);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_bound_drift_family_is_candidate_unknown_before_fake_spawn() {
+        for reason in [
+            "candidate_binary_changed",
+            "resolution_artifact_changed",
+            "resolution_generated_config_changed",
+            "resolution_package_tree_changed",
+            "resolution_adapter_executable_changed",
+            "resolution_image_changed",
+            "resolution_environment_owner_changed",
+            "resolution_prerequisite_changed",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let loaded = loaded(dir.path(), vec![case("only", EvidenceStatus::Pass)]);
+            let invoker = RejectingRevalidationInvoker {
+                reason,
+                revalidations: Mutex::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
+            };
+            let cancelled = AtomicBool::new(false);
+            let aggregate = build_aggregate(
+                AggregateInputs {
+                    loaded: &loaded,
+                    candidate: &candidate_identity(),
+                    selection: &selection(),
+                    selected_indices: &[0],
+                    environment_owner: "test-runner",
+                    scratch: dir.path(),
+                    cancellation_requested: &cancelled,
+                },
+                &invoker,
+            )
+            .await;
+
+            assert_eq!(&*invoker.revalidations.lock().unwrap(), &["only"]);
+            assert!(invoker.calls.lock().unwrap().is_empty());
+            assert_eq!(aggregate.results[0].execution, ExecutionState::NotRun);
+            assert_eq!(aggregate.results[0].not_run_reason.as_deref(), Some(reason));
+            assert_eq!(
+                aggregate.results[0].candidate_outcome,
+                Some(CandidateOutcome::Unknown)
+            );
+            assert!(!aggregate.success);
+        }
+    }
+
+    #[tokio::test]
+    async fn floating_pass_requires_exact_terminal_and_available_same_session_catalog() {
+        for (mutation, expected_drift) in [
+            ("missing_catalog", "capability.model_catalog"),
+            ("rejected_catalog", "capability.model_catalog"),
+            ("nonconfigurable_wrong_current", "capability.model_catalog"),
+            (
+                "nonconfigurable_missing_current",
+                "capability.model_catalog",
+            ),
+            ("non_exact_terminal", "outcome.smoke_contract"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let case = case("only", EvidenceStatus::Pass);
+            let mut artifact = smoke(&case, true, Some(1));
+            match mutation {
+                "missing_catalog" => {
+                    artifact["target"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("model_catalog");
+                }
+                "rejected_catalog" => {
+                    artifact["target"]["model_catalog"] = json!({
+                        "state": "rejected",
+                        "code": "catalog_unavailable"
+                    });
+                }
+                "nonconfigurable_wrong_current" => {
+                    artifact["target"]["model_catalog"]["model_configurable"] = json!(false);
+                    artifact["target"]["model_catalog"]["current_model"] = json!("other-model");
+                    artifact["target"]["model_catalog"]["models"] =
+                        json!(["test-model", "other-model"]);
+                }
+                "nonconfigurable_missing_current" => {
+                    artifact["target"]["model_catalog"]["model_configurable"] = json!(false);
+                    artifact["target"]["model_catalog"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("current_model");
+                }
+                "non_exact_terminal" => artifact["turn"]["exact_pong"] = json!(false),
+                _ => unreachable!(),
+            }
+            let invoker = FakeInvoker::new(vec![invocation(artifact)]);
+            let loaded = loaded(dir.path(), vec![case]);
+            let cancelled = AtomicBool::new(false);
+            let aggregate = build_aggregate(
+                AggregateInputs {
+                    loaded: &loaded,
+                    candidate: &candidate_identity(),
+                    selection: &selection(),
+                    selected_indices: &[0],
+                    environment_owner: "test-runner",
+                    scratch: dir.path(),
+                    cancellation_requested: &cancelled,
+                },
+                &invoker,
+            )
+            .await;
+
+            assert_eq!(&*invoker.calls.lock().unwrap(), &["only"]);
+            assert_eq!(
+                aggregate.results[0].candidate_outcome,
+                Some(CandidateOutcome::Unknown)
+            );
+            assert!(aggregate.results[0]
+                .drift
+                .iter()
+                .any(|dimension| dimension == expected_drift));
+            assert!(!aggregate.success);
+        }
     }
 
     #[test]
@@ -3821,6 +6118,18 @@ agent_cli = "@openai/codex=0.144.1"
         assert_eq!(
             aggregate.results[1].not_run_reason.as_deref(),
             Some("prior_runner_failure")
+        );
+        assert!(aggregate
+            .results
+            .iter()
+            .all(|result| { result.candidate_outcome == Some(CandidateOutcome::Unknown) }));
+        assert_eq!(
+            aggregate.floating_summary,
+            Some(FloatingSummary {
+                candidate_pass: 0,
+                candidate_fail: 0,
+                candidate_unknown: 2,
+            })
         );
         assert!(!aggregate.success);
     }
@@ -3922,6 +6231,10 @@ agent_cli = "@openai/codex=0.144.1"
         assert_eq!(
             aggregate.results[0].budget_violations,
             ["case_token_cap_exceeded"]
+        );
+        assert_eq!(
+            aggregate.results[0].candidate_outcome,
+            Some(CandidateOutcome::Unknown)
         );
         assert_eq!(aggregate.results[1].execution, ExecutionState::NotRun);
         assert_eq!(
@@ -4157,8 +6470,11 @@ agent_cli = "@openai/codex=0.144.1"
         let mut first = case("first", EvidenceStatus::Pass);
         first.max_tokens = 5;
         let mut unsupported = case("unsupported", EvidenceStatus::Stale);
+        unsupported.lane = Lane::Pinned;
         unsupported.evidence_path = EvidencePath::DirectCli;
         unsupported.classification = Classification::NonGoal;
+        unsupported.baseline_case = None;
+        unsupported.resolved = None;
         unsupported.max_tokens = 7;
         let invoker = FakeInvoker::new(vec![invocation(smoke(&first, true, Some(4)))]);
         let mut loaded = loaded(dir.path(), vec![first, unsupported]);
@@ -4452,6 +6768,14 @@ agent_cli = "@openai/codex=0.144.1"
 
         assert_eq!(&*invoker.calls.lock().unwrap(), &["first"]);
         assert_eq!(aggregate.results[0].execution, ExecutionState::Completed);
+        assert_eq!(
+            aggregate.results[0].candidate_outcome,
+            Some(CandidateOutcome::Unknown)
+        );
+        assert!(aggregate.results[0]
+            .drift
+            .iter()
+            .any(|dimension| dimension == "outcome.cancellation"));
         assert_eq!(aggregate.results[1].execution, ExecutionState::NotRun);
         assert_eq!(
             aggregate.results[1].not_run_reason.as_deref(),
@@ -4670,6 +6994,7 @@ agent_cli = "@openai/codex=0.144.1"
     #[test]
     fn pinned_drift_requires_exact_agent_rows_and_all_requested_capabilities() {
         let mut case = case("codex", EvidenceStatus::Pass);
+        case.resolved = None;
         case.effort = Some("xhigh".into());
         case.mode = Some("read-only".into());
         case.pins = Some(PinSet {
@@ -4718,6 +7043,7 @@ agent_cli = "@openai/codex=0.144.1"
     #[test]
     fn claude_pins_require_exact_ok_adapter_and_sdk_rows() {
         let mut case = case("claude", EvidenceStatus::Pass);
+        case.resolved = None;
         case.pins = Some(PinSet {
             config_sha256: "a".repeat(64),
             model: case.model.clone(),
@@ -4803,6 +7129,7 @@ agent_cli = "@openai/codex=0.144.1"
     #[test]
     fn container_drift_requires_the_exact_immutable_image_identity() {
         let mut case = case("reader", EvidenceStatus::Pass);
+        case.resolved = None;
         case.execution_mode = ExecutionMode::ContainerRo;
         case.expected_image_digest = Some(format!("sha256:{}", "b".repeat(64)));
         let mut artifact = smoke(&case, true, Some(1));
@@ -4828,6 +7155,7 @@ agent_cli = "@openai/codex=0.144.1"
         let smoke = smoke(&case, true, Some(1));
         let result = CaseResult {
             case_id: case.id.clone(),
+            baseline_case_id: None,
             lane: Lane::Pinned,
             evidence_path: EvidencePath::BridgeSmoke,
             probe: ProbeType::Minimal,
@@ -4837,6 +7165,8 @@ agent_cli = "@openai/codex=0.144.1"
             actual_status: EvidenceStatus::Pass,
             expectation_met: true,
             classification: Classification::Support,
+            candidate_outcome: None,
+            resolved: None,
             artifact_policy: case.artifact,
             duration_ms: 1,
             not_run_reason: None,
@@ -4878,6 +7208,8 @@ agent_cli = "@openai/codex=0.144.1"
                 cost_observation_missing_cases: 1,
                 exhausted: false,
             },
+            resolution: None,
+            floating_summary: None,
             results: vec![result],
         };
         let baseline = BaselineArtifact {
@@ -4914,6 +7246,175 @@ agent_cli = "@openai/codex=0.144.1"
             .contains("invalid manifest identity"));
     }
 
+    #[tokio::test]
+    async fn floating_compare_requires_resolution_and_reports_independent_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let case = case("only", EvidenceStatus::Pass);
+        let invoker = FakeInvoker::new(vec![invocation(smoke(&case, true, Some(1)))]);
+        let loaded = loaded(dir.path(), vec![case]);
+        let cancelled = AtomicBool::new(false);
+        let mut current = build_aggregate(
+            AggregateInputs {
+                loaded: &loaded,
+                candidate: &candidate_identity(),
+                selection: &selection(),
+                selected_indices: &[0],
+                environment_owner: "test-runner",
+                scratch: dir.path(),
+                cancellation_requested: &cancelled,
+            },
+            &invoker,
+        )
+        .await;
+        current.resolution = Some(ResolutionBindingRecord {
+            resolution_id: "resolution-1".into(),
+            artifact_sha256: "d".repeat(64),
+            recipe_sha256: "e".repeat(64),
+            production_manifest_sha256: "a".repeat(64),
+        });
+        let mut clean_before = baseline_from_result(&current.results[0]);
+        clean_before.case_id = "baseline-only".into();
+        let clean_baseline = BaselineArtifact {
+            schema_version: 1,
+            manifest_schema_version: 1,
+            manifest_sha256: "a".repeat(64),
+            aggregate: baseline_from_aggregate(&current),
+            cases: vec![clean_before.clone()],
+        };
+        let unchanged = compare_floating_to_pinned(&current, &clean_baseline).unwrap();
+        assert!(
+            unchanged.equal,
+            "identical same-session catalog and aggregate evidence must compare cleanly: {:?}",
+            unchanged.changes
+        );
+
+        let mut catalog_only_baseline = clean_baseline.clone();
+        catalog_only_baseline.cases[0].capability["model_catalog"]["current_model"] =
+            Value::String("different-model".into());
+        let catalog_only = compare_floating_to_pinned(&current, &catalog_only_baseline).unwrap();
+        assert_eq!(catalog_only.changes.len(), 1);
+        assert_eq!(catalog_only.changes[0].case_id, "only");
+        assert_eq!(
+            catalog_only.changes[0].dimensions,
+            ["catalog.current_model"],
+            "catalog-only drift must not be duplicated as generic capability drift"
+        );
+
+        let mut cancelled = current.clone();
+        cancelled.cancelled = true;
+        cancelled.success = false;
+        let cancelled_report = compare_floating_to_pinned(&cancelled, &clean_baseline).unwrap();
+        assert!(cancelled_report.changes.iter().any(|change| {
+            change.case_id == "__aggregate__"
+                && change
+                    .dimensions
+                    .iter()
+                    .any(|dimension| dimension == "cancelled")
+        }));
+
+        let mut exhausted = current.clone();
+        exhausted.budget.exhausted = true;
+        exhausted.success = false;
+        let exhausted_report = compare_floating_to_pinned(&exhausted, &clean_baseline).unwrap();
+        assert!(exhausted_report.changes.iter().any(|change| {
+            change.case_id == "__aggregate__"
+                && change
+                    .dimensions
+                    .iter()
+                    .any(|dimension| dimension == "budget")
+        }));
+
+        let mut before = clean_before;
+        before.status = EvidenceStatus::Fail;
+        before.provenance = json!([
+            {
+                "check": "provenance:only:adapter",
+                "status": "ok",
+                "detail": "package=@agentclientprotocol/codex-acp version=1.0.0"
+            },
+            {
+                "check": "provenance:only:agent-cli",
+                "status": "ok",
+                "detail": "package=@openai/codex version=0.140.0"
+            }
+        ]);
+        before.authentication = json!({"path": "configured_method"});
+        before.capability = json!({"request": {"model": "old-model"}});
+        before.phase = json!("old-phase");
+        before.terminal = json!({"old": true});
+        before.diagnostic = json!({"old": true});
+        let baseline = BaselineArtifact {
+            schema_version: 1,
+            manifest_schema_version: 1,
+            manifest_sha256: "a".repeat(64),
+            aggregate: baseline_from_aggregate(&current),
+            cases: vec![before],
+        };
+        let resolved = current.results[0].resolved.as_mut().unwrap();
+        resolved.image_digest = Some(format!("sha256:{}", "8".repeat(64)));
+        resolved.base_image_digest = Some(format!("sha256:{}", "9".repeat(64)));
+        current.results[0].smoke.as_mut().unwrap()["target"]["provenance"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "check": "provenance:only:image",
+                "status": "ok",
+                "detail": format!("immutable_id=sha256:{}", "8".repeat(64))
+            }));
+
+        let report = compare_floating_to_pinned(&current, &baseline).unwrap();
+        assert!(!report.equal);
+        let dimensions: BTreeSet<_> = report.changes[0]
+            .dimensions
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for expected in [
+            "adapter",
+            "agent_cli",
+            "base_image",
+            "image",
+            "catalog.models_added",
+            "catalog.current_model",
+            "catalog.model_configurable",
+            "authentication",
+            "capability",
+            "outcome",
+            "phase",
+            "terminal",
+            "diagnostic",
+        ] {
+            assert!(
+                dimensions.contains(expected),
+                "missing {expected:?} in {dimensions:?}"
+            );
+        }
+
+        let mut missing_resolution = current.clone();
+        missing_resolution.resolution = None;
+        assert!(compare_floating_to_pinned(&missing_resolution, &baseline).is_err());
+        let mut partial_selection = current.clone();
+        partial_selection.selection.all = false;
+        partial_selection.selection.cases = vec!["only".into()];
+        assert!(compare_floating_to_pinned(&partial_selection, &baseline).is_err());
+        let mut malformed_binding = current.clone();
+        malformed_binding
+            .resolution
+            .as_mut()
+            .unwrap()
+            .production_manifest_sha256 = "not-a-digest".into();
+        assert!(compare_floating_to_pinned(&malformed_binding, &baseline).is_err());
+        let mut unrelated_baseline = baseline.clone();
+        unrelated_baseline.manifest_sha256 = "b".repeat(64);
+        assert!(compare_floating_to_pinned(&current, &unrelated_baseline)
+            .unwrap_err()
+            .to_string()
+            .contains("pinned manifest identity mismatch"));
+        let mut mixed_lane = current;
+        mixed_lane.results[0].lane = Lane::Pinned;
+        assert!(compare_floating_to_pinned(&mixed_lane, &baseline).is_err());
+    }
+
     #[test]
     fn comparison_keeps_prompt_count_lifecycle_drops_and_retry_metadata() {
         let mut case = case("pinned", EvidenceStatus::Fail);
@@ -4927,6 +7428,7 @@ agent_cli = "@openai/codex=0.144.1"
         }]);
         let result = CaseResult {
             case_id: case.id.clone(),
+            baseline_case_id: None,
             lane: Lane::Pinned,
             evidence_path: EvidencePath::BridgeSmoke,
             probe: ProbeType::Minimal,
@@ -4936,6 +7438,8 @@ agent_cli = "@openai/codex=0.144.1"
             actual_status: EvidenceStatus::Fail,
             expectation_met: true,
             classification: Classification::Support,
+            candidate_outcome: None,
+            resolved: None,
             artifact_policy: case.artifact,
             duration_ms: 1,
             not_run_reason: None,
@@ -4975,6 +7479,8 @@ agent_cli = "@openai/codex=0.144.1"
                 cost_observation_missing_cases: 1,
                 exhausted: false,
             },
+            resolution: None,
+            floating_summary: None,
             results: vec![changed],
         };
         let baseline = BaselineArtifact {
@@ -4997,6 +7503,7 @@ agent_cli = "@openai/codex=0.144.1"
         case.classification = Classification::Support;
         let accepted = CaseResult {
             case_id: case.id.clone(),
+            baseline_case_id: None,
             lane: Lane::Pinned,
             evidence_path: EvidencePath::BridgeSmoke,
             probe: ProbeType::Minimal,
@@ -5006,6 +7513,8 @@ agent_cli = "@openai/codex=0.144.1"
             actual_status: EvidenceStatus::Pass,
             expectation_met: true,
             classification: Classification::Support,
+            candidate_outcome: None,
+            resolved: None,
             artifact_policy: case.artifact.clone(),
             duration_ms: 1,
             not_run_reason: None,
@@ -5069,6 +7578,7 @@ agent_cli = "@openai/codex=0.144.1"
         }]);
         let result = CaseResult {
             case_id: case.id.clone(),
+            baseline_case_id: None,
             lane: Lane::Pinned,
             evidence_path: EvidencePath::BridgeSmoke,
             probe: ProbeType::Minimal,
@@ -5078,6 +7588,8 @@ agent_cli = "@openai/codex=0.144.1"
             actual_status: EvidenceStatus::Fail,
             expectation_met: true,
             classification: Classification::Support,
+            candidate_outcome: None,
+            resolved: None,
             artifact_policy: case.artifact,
             duration_ms: 1,
             not_run_reason: None,
@@ -5111,6 +7623,8 @@ agent_cli = "@openai/codex=0.144.1"
                 cost_observation_missing_cases: 1,
                 exhausted: false,
             },
+            resolution: None,
+            floating_summary: None,
             results: vec![result],
         };
         let baseline = BaselineArtifact {
@@ -5137,6 +7651,9 @@ agent_cli = "@openai/codex=0.144.1"
         let dir = tempfile::tempdir().unwrap();
         let mut pinned = case("pinned-auto", EvidenceStatus::Pass);
         pinned.lane = Lane::Pinned;
+        pinned.classification = Classification::Support;
+        pinned.baseline_case = None;
+        pinned.resolved = None;
         pinned.model = "auto".into();
         pinned.pins = Some(PinSet {
             model: "auto".into(),
