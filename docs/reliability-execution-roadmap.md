@@ -5,19 +5,26 @@
 - **Completed through:** R3b **MERGED** at `504c1e43`; R2e remains deferred and off the critical path
 - **Active slice:** R3c floating-current lane **IN PROGRESS** on
   `agent/reliability-r3c-floating-lane`
-- **Current R3c deterministic gate:** tested implementation head `57e63a0` completes all four implementation
-  slices. Later branch commits record evidence and review folds, so restart from the tip of the named branch
-  rather than treating this historical implementation hash as the branch tip.
-  Focused gates pass resolution **32 / 0**, compatibility unit **53 / 0**, compatibility CLI **20 / 0**,
-  plus ACP catalog, smoke catalog, and additive fallback controls **1 / 0** each. The host workspace passes
-  **2,135 / 0 / 12 ignored** across **70** test/doc-test executables. Linux/Rust 1.94.0 passes the full
-  `a2a-bridge` package **508 / 0 / 11 ignored** across **16** groups (binary **434 / 0**, compatibility CLI
-  **21 / 0**, smoke CLI **15 / 0**) plus ACP catalog **1 / 0**. Format/diff, all-target workspace check,
-  warnings-denied all-target Clippy, locked release, hygiene **37/7**, protected-input identity, pinned
-  manifest, four-case recipe, and dependency policy are green. The provider-unexercised candidate is
-  24,230,192 bytes at SHA-256 `6209ceb9d99d654715aa37f485dc3d251ad3fd29c25bb16739219e8f2a39e51a`;
-  recipe SHA-256 is `11d8f50de5515b2f6703741c9a00980e1dc96f766e6370677fd654a0968f0160`.
-  No compatibility resolution, model discovery, provider aggregate, operator rebuild, or operator swap ran.
+- **Current R3c deterministic gate:** tested code head `d86e418` completes all four implementation slices
+  and the first adversarial-review fold. The initial Sol/xhigh review of exact `a5dfef8` returned nine
+  `WRONG`, no `SMELL`, and `GATE: REVISE`; `e3459a5` closes all nine, and `d86e418` adds the missing
+  pre-fix-red catalog-only comparison regression. Later branch commits record evidence and review folds, so
+  restart from the tip of the named branch rather than treating this tested hash as the branch tip.
+  Focused gates pass resolution **37 / 0**, compatibility unit **54 / 0**, compatibility CLI **20 / 0**,
+  plus ACP catalog, smoke catalog, and additive fallback controls **1 / 0** each. The exact-head host
+  workspace passes **2,141 / 0 / 12 ignored** across **70** test/doc-test executables. Format/diff,
+  all-target workspace check, warnings-denied all-target/all-feature Clippy, locked release, hygiene
+  **37/7**, protected-input identity, pinned manifest, four-case recipe, and dependency policy are green.
+  Exact removed-check mutations turn red for registry authority, shared download budget, in-flight resource
+  limits, cancellation classification and descendant cleanup, mode/ownership binding, production-manifest
+  baseline identity, catalog-only projection, and aggregate cancellation/budget dimensions. The earlier
+  `57e63a0` Linux/Rust 1.94.0 gate remains green at full package **508 / 0 / 11 ignored** across **16**
+  groups (binary **434 / 0**, compatibility CLI **21 / 0**, smoke CLI **15 / 0**) plus ACP catalog **1 / 0**;
+  it was not rerun for `d86e418` because cleanup removed the local Rust image and a new registry pull was
+  not authorized. The provider-unexercised candidate is 24,432,672 bytes at SHA-256
+  `48ecafdf3d22c91b635a83b91ddc62726f389eb6541f423c34e6933932ac871e`; recipe SHA-256 is
+  `11d8f50de5515b2f6703741c9a00980e1dc96f766e6370677fd654a0968f0160`. No compatibility resolution,
+  model discovery, provider aggregate, operator rebuild, or operator swap ran.
 - **Last merged R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-incident
   container-start fold passes binary **395 / 0 / 0**, affected bridge-core/ACP **514 / 0**, and the full
@@ -192,10 +199,11 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** run the fresh Sol/xhigh adversarial full-branch correctness review of exact deterministic
-  head, fold/reverify any `WRONG`, then run the separate release/compatibility lens only after correctness is
-  green. No live resolution, model discovery, compatibility aggregate, operator rebuild, or operator swap is
-  authorized. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
+- **Next action:** run a fresh Sol/xhigh closure review of exact branch tip, adjudicating the nine inherited
+  `WRONG` findings first; fold/reverify any remaining `WRONG`, then run the separate release/compatibility
+  lens only after correctness is green. No live resolution, model discovery, compatibility aggregate,
+  operator rebuild, or operator swap is authorized. OpenRouter/OpenCode remain R3e/R3f after the R3 core and
+  before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**
@@ -566,12 +574,18 @@ Next action:
   private publication; exact pre-provider drift revalidation; one-session catalog capture; floating
   pass/fail/unknown truth; independent floating comparison dimensions; and old/additive smoke-v2 fallback
   compatibility. `356092f` completes slice 4 with the four-case recipe and stable runbook; `57e63a0` closes
-  the warnings-denied lint gate without changing behavior. Focused, full host, Linux/Rust 1.94.0, release,
-  hygiene, protected-input, manifest/recipe, and dependency-policy gates are green at the exact totals in
-  the top cursor. Correctness and release/compatibility reviews remain. No provider, package-registry
-  resolution, bridge runtime/container, model-discovery, compatibility aggregate, operator rebuild, or
-  operator swap ran; the complete restart contract, schemas, failure taxonomy, mutation matrix, live
-  authorization gates, rollback, and deferrals remain in the active R3 plan.
+  the warnings-denied lint gate without changing behavior. The first Sol/xhigh review of exact `a5dfef8`
+  returned nine `WRONG`, no `SMELL`, and `GATE: REVISE`. `e3459a5` closes registry authority/shared-budget,
+  in-flight resource, definitive-failure/cancellation, descendant-cleanup, inventory-security,
+  production-manifest baseline, catalog-projection, aggregate-comparison, and cursor defects. `d86e418`
+  adds the catalog-only pre-fix-red regression. Focused, full-host, release, hygiene, protected-input,
+  manifest/recipe, dependency-policy, and removed-check mutation gates are green at the exact totals in the
+  top cursor. Linux/Rust 1.94 remains green on historical implementation head `57e63a0`, not rerun on the
+  reviewed fold because no local image remained and no pull was authorized. Correctness closure and
+  release/compatibility reviews remain. No provider, package-registry resolution, bridge runtime/container,
+  model-discovery, compatibility aggregate, operator rebuild, or operator swap ran; the complete restart
+  contract, schemas, failure taxonomy, mutation matrix, live authorization gates, rollback, and deferrals
+  remain in the active R3 plan.
 - Authorized attempt 2 is retained at
   `/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json`, SHA-256 `319b3cf4...a9b3e`. Its exact
   `323b4e21...a079` candidate passed both host cases and failed both reader cases before prompt acceptance

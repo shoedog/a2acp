@@ -890,25 +890,41 @@ control. Focused coverage must include:
    evidence. Do not change the pinned manifest/baseline, production configs/locks/Containerfiles, support
    matrix, or changelog.
 
-Implementation cursor on 2026-07-16: all four implementation slices are complete. `1c1115cb` defines the strict
-recipe/resolution contracts and the five recorded red-before-green boundaries; `0c25686c` adds the
-provider-free typed package/image/config materializer and atomic private bundle; `e159915` adds exact
-pre-provider revalidation, same-session bounded catalog evidence, floating pass/fail/unknown truth, and
-independent floating-to-pinned comparison while preserving old smoke-v2 fallback compatibility. `356092f`
-adds the four-case recipe and stable operator runbook; `57e63a0` is a lint-only fold that removes one owned
-path comparison and documents the deliberately uniform internal drift taxonomy. Latest focused gates are resolution
-**32 / 0**, compatibility unit **53 / 0**, compatibility CLI **20 / 0**, ACP same-session catalog **1 / 0**,
-smoke catalog **1 / 0**, and additive fallback schema **1 / 0**. The full host workspace is **2,135 passed /
-0 failed / 12 ignored** across **70** test/doc-test executables. Linux/Rust 1.94.0 passes the complete
-`a2a-bridge` package **508 / 0 / 11 ignored** across **16** groups, including binary **434 / 0**,
-compatibility CLI **21 / 0**, smoke CLI **15 / 0**, plus ACP catalog **1 / 0**. The first two Linux harness
-attempts were invalid before a green gate: a login shell omitted Cargo, then a macOS bind-mounted target and
-missing absolute worktree gitdir caused cache/repository-discovery failures. The final run used a fresh
-Docker volume plus the exact read-only source/common-git paths, and all temporary image/volume/target evidence
-was removed afterward. Format/diff, workspace all-target check, warnings-denied all-target Clippy, locked
-release, hygiene **37/7**, pinned manifest, four-case recipe, protected-input identity, and dependency policy
-are green. The provider-unexercised release candidate is 24,230,192 bytes at SHA-256
-`6209ceb9d99d654715aa37f485dc3d251ad3fd29c25bb16739219e8f2a39e51a`; the recipe SHA-256 is
+Implementation cursor on 2026-07-17: all four implementation slices and the first adversarial-review fold
+are complete. `1c1115cb` defines the strict recipe/resolution contracts and the five recorded
+red-before-green boundaries; `0c25686c` adds the provider-free typed package/image/config materializer and
+atomic private bundle; `e159915` adds exact pre-provider revalidation, same-session bounded catalog evidence,
+floating pass/fail/unknown truth, and independent floating-to-pinned comparison while preserving old
+smoke-v2 fallback compatibility. `356092f` adds the four-case recipe and stable operator runbook; `57e63a0`
+is the lint-only original implementation head. The first Sol/xhigh review of exact `a5dfef8` returned nine
+`WRONG`, no `SMELL`, and `GATE: REVISE`: npm could contact non-npmjs URLs before validation; resource bounds
+were post-effect; infrastructure failure/cancellation could remain definitive; resolver cancellation could
+orphan descendants; inventory omitted mode/owner; unrelated baselines were accepted; catalog-only drift
+leaked into generic capability; aggregate cancellation/budget was omitted; and the cursor overstated the
+reviewed head. `e3459a5` closes all nine. `d86e418` adds the missing catalog-only regression after an exact
+old-code mutation proved the broader test was vacuous for that behavior.
+
+Latest focused gates are resolution **37 / 0**, compatibility unit **54 / 0**, compatibility CLI **20 / 0**,
+ACP same-session catalog **1 / 0**, smoke catalog **1 / 0**, and additive fallback schema **1 / 0**. The
+exact-head host workspace passes **2,141 / 0 / 12 ignored** across **70** test/doc-test executables.
+Format/diff, workspace all-target check, warnings-denied all-target/all-feature Clippy, locked release,
+hygiene **37/7**, pinned manifest, four-case recipe, protected-input identity, and dependency policy are
+green. Removed-check mutations produce these exact reds: unauthorized CONNECT admission wedged the negative
+proxy test until bounded termination; a per-proxy counter left shared budget **5** instead of **2**; removing
+RLIMIT plus the watcher returned late `PackageTreeDrift` instead of immediate `NpmDownloadBudgetExceeded`;
+authentication became `Fail` instead of `Unknown`; cancelled active evidence stayed `Pass` instead of
+`Unknown`; a resolver descendant survived cancellation; erased security metadata rejected the sealed-tree
+positive control; an unrelated pinned hash returned `Ok`; aggregate cancellation emitted no
+`__aggregate__` change; and old catalog comparison emitted both `capability` and `catalog.current_model`
+instead of only the latter. Each green test retains its exact-bound, valid-definitive, direct-child,
+same-content, malformed-binding, identical-catalog, or unchanged-aggregate control as applicable.
+
+The earlier `57e63a0` Linux/Rust 1.94.0 run passes complete `a2a-bridge` package **508 / 0 / 11 ignored**
+across **16** groups, including binary **434 / 0**, compatibility CLI **21 / 0**, smoke CLI **15 / 0**, plus
+ACP catalog **1 / 0**. It is historical evidence, not an exact-`d86e418` rerun: cleanup removed the local
+Rust image, Docker has no equivalent cached image, and no new registry pull was authorized. The
+provider-unexercised release candidate is 24,432,672 bytes at SHA-256
+`48ecafdf3d22c91b635a83b91ddc62726f389eb6541f423c34e6933932ac871e`; the recipe SHA-256 is
 `11d8f50de5515b2f6703741c9a00980e1dc96f766e6370677fd654a0968f0160`. The pinned manifest/baseline,
 production configs/Cargo inputs/Containerfiles, compatibility matrix, support matrix, and changelog remain
 byte-identical to `504c1e43`. No provider, package-registry resolution, bridge runtime/container,
@@ -947,14 +963,14 @@ operator-reviewed cleanup proves no running container uses them. Automated reten
 scheduler deadlines, termination escalation, quarantine, and concurrency remain R3d. Promotion, production
 pins/baselines, support wording, release integration, and rollback exercises remain R4.
 
-**Restart point:** continue from the current tip of `agent/reliability-r3c-floating-lane`; `57e63a0` is the
-historical implementation head under the recorded deterministic gate, not the branch tip. The deterministic
-host and Linux closure inventory above is green. Run the fresh Sol/xhigh adversarial full-branch correctness
-review, fold and reverify every `WRONG`, and only after that review is green run the release/compatibility
-lens. Keep the pinned manifest/baseline and every protected production/support input unchanged. Do not run a
-real compatibility resolution, bridge runtime/container, model discovery, provider turn beyond the two
-authorized reviews, operator rebuild, or operator swap without the separate authorizations described under
-live gates.
+**Restart point:** continue from the current tip of `agent/reliability-r3c-floating-lane`; `d86e418` is the
+tested code head and the later docs commit records its evidence. Exact-head host and mutation gates are
+green; Linux/Rust 1.94 is green only on historical `57e63a0` until an image pull is separately authorized.
+Run the fresh Sol/xhigh closure review, adjudicating the nine inherited `WRONG` findings first; fold and
+reverify every unresolved `WRONG`, and only after correctness is green run the release/compatibility lens.
+Keep the pinned manifest/baseline and every protected production/support input unchanged. Do not run a real
+compatibility resolution, bridge runtime/container, model discovery, provider turn beyond the two authorized
+reviews, operator rebuild, or operator swap without the separate authorizations described under live gates.
 
 ## R3d — scheduling and evidence retention
 
