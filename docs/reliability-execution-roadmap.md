@@ -6,38 +6,42 @@
 - **Active slice:** R3c floating-current lane **IN PROGRESS** on
   `agent/reliability-r3c-floating-lane`
 - **Current R3c deterministic gate:** code head
-  `b3793e834056d8c9d58a1cae815e463aa124d72b` completes all four implementation slices and three
+  `4621ab5cd01612db2f72fae8b9b9b467def5fb93` completes all four implementation slices and four
   adversarial-review rounds. The initial Sol/xhigh review of exact `a5dfef8` returned nine `WRONG`, no
   `SMELL`, and `GATE: REVISE`; `e3459a5` closes all nine, and `d86e418` adds the missing pre-fix-red
-  catalog-only comparison regression. Closure review of exact `646d61b` adjudicated inherited findings 1
-  and 3-9 fixed but left transient aggregate tree-resource overshoot unresolved and found a process-group
-  reuse `WRONG`. `f15ae88` removes npm tree-write authority, uses bridge-owned archive materialization,
-  avoids retained per-directory descriptors, and retains a trusted group-leader anchor through final group
-  kill/reap. The next Sol/xhigh review of exact `5facc9c` adjudicated inherited findings 1 and 3-10
-  **FIXED**, but finding 2 **PARTIAL** because packages were still reserved and written sequentially; it
-  also found a new `WRONG` because ordinary transitive archives were not bound to their lock-entry name and
-  version. `b3793e8` downloads, verifies, and preflights every selected archive; reserves the complete
-  selected tree once before the first package-entry write; then reopens, materializes, and removes one
-  archive at a time. It also requires every archive `package.json` identity to match the lock entry,
-  including explicit npm-alias names. With the two closure regressions applied to the pre-fix code, the
-  focused gate failed **47 / 2**; current focused resolution gates pass **50 / 0**. The exact `646d61b`
-  pre-hardening workspace passed **2,141 / 0 / 12 ignored** across **70**
-  test/doc-test executables, with compatibility unit **54 / 0**, compatibility CLI **20 / 0**, and ACP
-  catalog, smoke catalog, and additive fallback controls **1 / 0** each. Exact-`b3793e8` host gates pass
-  **2,154 / 0 / 12 ignored** across **70** test/doc-test executables. Format/diff, all-target workspace
-  check, warnings-denied all-target/all-feature Clippy, locked release, hygiene **37/7**, pinned manifest
-  **9 cases**, floating recipe **4 cases**, protected-input identity, and dependency policy are green; fresh
-  correctness re-review remains pending. The provider-unexercised release binary is 24,690,400 bytes at
-  SHA-256 `2a156b9f0f2e5814408a8e674cb237d0b3a3e4c38f4b7f562792b454404328e6`. The earlier `57e63a0`
+  catalog-only comparison regression. Closure review of exact `646d61b` left transient aggregate
+  tree-resource overshoot unresolved and found process-group reuse; `f15ae88` moves materialization behind a
+  bridge-owned hard reservation, avoids retained per-directory descriptors, and keeps a trusted
+  group-leader anchor through kill/reap. Sol/xhigh review of exact `5facc9c` fixed inherited findings 1 and
+  3-10, left finding 2 partial because package reservation remained sequential, and found transitive archive
+  identity unbound. `b3793e8` preflights all selected archives, commits one complete-tree reservation before
+  package writes, and binds each archive name/version to its lock entry. Sol/xhigh review of exact `260e4a6`
+  adjudicated all 11 inherited findings **FIXED**, found no `SMELL`, but returned `GATE: REVISE` on two new
+  `WRONG` items: missing declared npm bin targets were silently accepted, and byte-sensitive virtual paths
+  could collide only after writes on a case-insensitive destination. `4621ab5` now requires every declared
+  bin target to name a planned regular file and applies one fail-closed, case-insensitive portable ASCII
+  namespace to archive entries, symlink targets, implicit directories, and cumulative leaves before the
+  reservation commits. The three red-first closure controls failed **50 / 3** on missing bin, portable case
+  collision, and non-ASCII namespace acceptance; current focused resolution gates pass **54 / 0**.
+  Exact-`4621ab5` host gates pass **2,158 / 0 / 12 ignored** across **70** test/doc-test executables.
+  Format/diff, all-target workspace check, warnings-denied all-target/all-feature Clippy, locked release,
+  hygiene **37/7**, pinned manifest **9 cases**, floating recipe **4 cases**, protected-input identity, and
+  dependency policy are green; fresh correctness re-review remains pending. One first post-fix grouped
+  focused run reported the existing cancellation-descendant test failed **0 / 1**; its immediate isolated
+  rerun passed **1 / 0**, the complete focused reruns passed **53 / 0** then **54 / 0**, and the full suite
+  passed it. This non-reproduced timing signal is reported, not rebaselined. The provider-unexercised release
+  binary is 24,692,192 bytes at SHA-256
+  `59c1ddcec5f386bdb954aae46f57e9e6b25e8259218b25014abb6216bf7eaaeb`. The earlier `57e63a0`
   Linux/Rust 1.94.0 gate
   remains green at full package **508 / 0 / 11 ignored** across **16** groups (binary **434 / 0**,
   compatibility CLI **21 / 0**, smoke CLI **15 / 0**) plus ACP catalog **1 / 0**; it was not rerun for
-  `b3793e8` because cleanup removed the local Rust image and no new image pull was authorized. Explicitly
+  `4621ab5` because cleanup removed the local Rust image and no new image pull was authorized. Explicitly
   authorized provider-free host diagnostics resolved Codex and Claude package trees; generated-config
-  doctors passed **10/0/0** and **11/0/0** respectively, but the retained bundles predate both `f15ae88`
-  and `b3793e8` and are
-  diagnostic rather than exact-current compatibility evidence. No provider turn, model discovery, image
-  resolution/build, compatibility aggregate, operator rebuild, or operator swap ran.
+  doctors passed **10/0/0** and **11/0/0** respectively, but the retained bundles predate `f15ae88`,
+  `b3793e8`, and `4621ab5` and are
+  diagnostic rather than exact-current compatibility evidence. No compatibility/provider smoke turn, model
+  discovery, image resolution/build, compatibility aggregate, operator rebuild, or operator swap ran; the
+  recorded review turns are review evidence only.
 - **Last merged R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-incident
   container-start fold passes binary **395 / 0 / 0**, affected bridge-core/ACP **514 / 0**, and the full
@@ -267,7 +271,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **IN PROGRESS** at code head `b3793e8`. R3b attempts 1 and 2 remain non-promotable failure evidence. R3b exact `87c8f4e` Sol closure review approved and the one clean-room Fable/xhigh review of exact `a0c2c4c` returned release verdict `READY` and `GATE: APPROVE`; no Fable re-review. R3c's initial `a5dfef8`, closure `646d61b`, and exact-`5facc9c` Sol reviews returned `REVISE`; `b3793e8` closes in code the last review's complete-selected-tree and transitive-archive-identity findings. Exact-head full/release/policy gates are green; fresh correctness re-review is pending. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner and R3b pinned lane merged; R3c owns provider-free floating resolution plus bound execution; then R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **IN PROGRESS** at code head `4621ab5`. R3b attempts 1 and 2 remain non-promotable failure evidence. R3b exact `87c8f4e` Sol closure review approved and the one clean-room Fable/xhigh review of exact `a0c2c4c` returned release verdict `READY` and `GATE: APPROVE`; no Fable re-review. R3c Sol reviews of exact `a5dfef8`, `646d61b`, `5facc9c`, and `260e4a6` returned `REVISE`; the last review fixed all 11 inherited findings but found missing-bin and filesystem-equivalence `WRONG`s. `4621ab5` closes both in code. Exact-head full/release/policy gates are green; fresh correctness re-review is pending. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner and R3b pinned lane merged; R3c owns provider-free floating resolution plus bound execution; then R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -617,19 +621,24 @@ Next action:
   per-directory descriptors, and retained a trusted process-group leader until cleanup. Sol/xhigh review of
   exact `5facc9c` fixed inherited findings 1 and 3-10, left finding 2 partial because package reservation was
   still sequential, found ordinary transitive archive identity unbound, reported no `SMELL`, and returned
-  `GATE: REVISE`. Current code head `b3793e8` preflights all selected archives, reserves the whole tree once
-  before any package-entry write, and binds archive name/version to the lock entry. The two pre-fix
-  regressions failed **47 / 2**; focused resolution tests now pass **50 / 0** and the exact-head host suite
-  passes **2,154 / 0 / 12 ignored** across **70** executables. Format/diff, all-target check, warnings-denied
+  `GATE: REVISE`. `b3793e8` preflights all selected archives, reserves the whole tree once before any
+  package-entry write, and binds archive name/version to the lock entry. Sol/xhigh review of exact `260e4a6`
+  adjudicated all 11 inherited findings fixed, then returned `REVISE` on missing declared bin targets and
+  filesystem-equivalent paths reaching writes. Current code head `4621ab5` requires each bin target to be a
+  planned regular file and uses a fail-closed portable ASCII/case-insensitive namespace across archive and
+  cumulative-tree checks. The three red-first regressions failed **50 / 3**; focused resolution tests now
+  pass **54 / 0** and the exact-head host suite passes **2,158 / 0 / 12 ignored** across **70** executables.
+  Format/diff, all-target check, warnings-denied
   all-feature Clippy, locked release, hygiene **37/7**, both manifests, protected inputs, and dependency
   policy are green; fresh correctness re-review remains. Explicitly authorized provider-free host
   diagnostics resolved current Codex and Claude package trees and produced green generated-config doctors,
-  but the retained bundles predate both `f15ae88` and `b3793e8` and are
+  but the retained bundles predate `f15ae88`, `b3793e8`, and `4621ab5` and are
   diagnostic rather than exact-current compatibility evidence. Linux/Rust 1.94 remains green only on
-  historical implementation head `57e63a0`; no local image remains and no pull was authorized. No provider
-  turn, model discovery, image resolution/build, compatibility aggregate, operator rebuild, or operator swap
-  ran; the complete restart contract, schemas, failure taxonomy, mutation matrix, live authorization gates,
-  rollback, and deferrals remain in the active R3 plan.
+  historical implementation head `57e63a0`; no local image remains and no pull was authorized. No
+  compatibility/provider smoke turn, model discovery, image resolution/build, compatibility aggregate,
+  operator rebuild, or operator swap ran; the recorded review turns are review evidence only. The complete
+  restart contract, schemas, failure taxonomy, mutation matrix, live authorization gates, rollback, and
+  deferrals remain in the active R3 plan.
 - Authorized attempt 2 is retained at
   `/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json`, SHA-256 `319b3cf4...a9b3e`. Its exact
   `323b4e21...a079` candidate passed both host cases and failed both reader cases before prompt acceptance
