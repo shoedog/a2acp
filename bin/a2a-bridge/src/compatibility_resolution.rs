@@ -1,13 +1,12 @@
 //! R3c floating-current recipe and exact resolution contracts.
 //!
-//! This module intentionally owns no subprocess or filesystem-write implementation yet. The contract
-//! slice makes recipe and completed-resolution evidence strict before a later slice is allowed to add
-//! registry, package-tree, or container-runtime effects.
+//! Recipe validation, provider-free package/image resolution, exact evidence publication, and
+//! pre-provider revalidation live together here so floating selectors never become production pins.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::Write as _;
+use std::io::{Seek as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -1645,11 +1644,22 @@ enum ResolutionCommandFamily {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResolutionCommandKind {
     NpmLock,
-    NpmMaterialize,
     ResolveBase,
     EnsureImageTagAbsent,
     BuildImage,
     InspectImage,
+}
+
+impl ResolutionCommandKind {
+    fn family(self) -> ResolutionCommandFamily {
+        match self {
+            Self::NpmLock => ResolutionCommandFamily::Npm,
+            Self::ResolveBase
+            | Self::EnsureImageTagAbsent
+            | Self::BuildImage
+            | Self::InspectImage => ResolutionCommandFamily::Runtime,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1725,6 +1735,22 @@ trait ResolutionExecutor: Send + Sync {
         &self,
         command: &ResolutionCommandSpec,
     ) -> Result<Vec<u8>, ResolutionFailureCode>;
+
+    async fn materialize_package_tree(
+        &self,
+        _request: &PackageTreeMaterialization<'_>,
+    ) -> Result<(), ResolutionFailureCode> {
+        Err(ResolutionFailureCode::PackageTreeDrift)
+    }
+}
+
+struct PackageTreeMaterialization<'a> {
+    lock: &'a ParsedPackageLock,
+    tree: &'a local_file::PinnedDirectory,
+    archives: &'a local_file::PinnedDirectory,
+    limits: &'a ResolutionLimits,
+    download_remaining: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    timeout: Duration,
 }
 
 struct ProcessResolutionExecutor;
@@ -1736,6 +1762,13 @@ impl ResolutionExecutor for ProcessResolutionExecutor {
         command: &ResolutionCommandSpec,
     ) -> Result<Vec<u8>, ResolutionFailureCode> {
         execute_bounded_command(command).await
+    }
+
+    async fn materialize_package_tree(
+        &self,
+        request: &PackageTreeMaterialization<'_>,
+    ) -> Result<(), ResolutionFailureCode> {
+        materialize_locked_package_tree(request).await
     }
 }
 
@@ -2026,15 +2059,6 @@ fn npm_budget_failure(spec: &ResolutionCommandSpec) -> Option<ResolutionFailureC
     ) {
         return Some(ResolutionFailureCode::NpmDownloadBudgetExceeded);
     }
-    if spec.kind == ResolutionCommandKind::NpmMaterialize
-        && directory_budget_exceeded(
-            &spec.cwd.join("tree"),
-            limits.max_unpacked_bytes,
-            limits.max_files,
-        )
-    {
-        return Some(ResolutionFailureCode::PackageTreeDrift);
-    }
     None
 }
 
@@ -2105,32 +2129,64 @@ fn set_child_file_size_limit(command: &mut std::process::Command, max_bytes: u64
 #[cfg(unix)]
 struct CommandProcessGroupGuard {
     process_group: Option<libc::pid_t>,
+    anchor: Option<tokio::process::Child>,
+    anchor_stdin: Option<tokio::process::ChildStdin>,
 }
 
 #[cfg(unix)]
 impl CommandProcessGroupGuard {
-    fn new(process_group: u32) -> Result<Self, ()> {
+    fn start() -> Result<Self, ()> {
+        use std::os::unix::process::CommandExt as _;
+
+        // A live, bridge-owned leader keeps the process-group identity allocated until cleanup.
+        // Without it, reaping a short-lived resolver can free the PGID before the later group kill,
+        // allowing that kill to hit an unrelated resolver that received the recycled identity.
+        let mut command = tokio::process::Command::new("/bin/cat");
+        command
+            .current_dir("/")
+            .env_clear()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        command.as_std_mut().process_group(0);
+        let mut anchor = command.spawn().map_err(|_| ())?;
+        let process_group = anchor.id().ok_or(())?;
         let process_group = libc::pid_t::try_from(process_group).map_err(|_| ())?;
         if process_group <= 0 {
             return Err(());
         }
+        let anchor_stdin = anchor.stdin.take().ok_or(())?;
         Ok(Self {
             process_group: Some(process_group),
+            anchor: Some(anchor),
+            anchor_stdin: Some(anchor_stdin),
         })
+    }
+
+    fn id(&self) -> Result<libc::pid_t, ()> {
+        self.process_group.ok_or(())
     }
 
     fn kill(&self) {
         let Some(process_group) = self.process_group else {
             return;
         };
-        // SAFETY: every real resolver command is placed in a fresh group whose id is its child pid.
-        // Negating that positive pid targets only the resolver-owned group.
+        // SAFETY: every real resolver command joins the fresh group led by the retained anchor.
+        // Negating that positive anchor pid targets only the resolver-owned group.
         unsafe {
             libc::kill(-process_group, libc::SIGKILL);
         }
     }
 
-    fn disarm(&mut self) {
+    async fn settle(&mut self) {
+        // Keep the anchor alive while targeting the group, then reap it before releasing the PGID.
+        // Closing stdin is also sufficient if the signal raced with anchor startup.
+        self.kill();
+        self.anchor_stdin.take();
+        if let Some(mut anchor) = self.anchor.take() {
+            let _ = anchor.wait().await;
+        }
         self.process_group = None;
     }
 }
@@ -2151,12 +2207,15 @@ async fn terminate_command_process_group(
 ) {
     process_group.kill();
     let _ = child.wait().await;
-    process_group.disarm();
+    process_group.settle().await;
 }
 
 async fn execute_bounded_command(
     spec: &ResolutionCommandSpec,
 ) -> Result<Vec<u8>, ResolutionFailureCode> {
+    if spec.kind.family() != spec.family {
+        return Err(spec.failure_code(CommandFailure::Spawn));
+    }
     #[cfg(not(unix))]
     {
         return Err(spec.failure_code(CommandFailure::Spawn));
@@ -2196,21 +2255,22 @@ async fn execute_bounded_command(
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
         if let Some(limits) = &spec.npm_limits {
-            set_child_file_size_limit(command.as_std_mut(), limits.max_unpacked_bytes);
+            set_child_file_size_limit(command.as_std_mut(), limits.max_download_bytes);
         }
-        command.as_std_mut().process_group(0);
         let mut budget_watch = spec
             .npm_limits
             .as_ref()
             .map(|_| NpmBudgetWatchGuard::start(spec.clone()));
+        let mut process_group = CommandProcessGroupGuard::start()
+            .map_err(|()| spec.failure_code(CommandFailure::Spawn))?;
+        command.as_std_mut().process_group(
+            process_group
+                .id()
+                .map_err(|()| spec.failure_code(CommandFailure::Spawn))?,
+        );
         let mut child = command
             .spawn()
             .map_err(|_| spec.failure_code(CommandFailure::Spawn))?;
-        let process_group = child
-            .id()
-            .ok_or_else(|| spec.failure_code(CommandFailure::Spawn))?;
-        let mut process_group = CommandProcessGroupGuard::new(process_group)
-            .map_err(|()| spec.failure_code(CommandFailure::Spawn))?;
         let stdout = child
             .stdout
             .take()
@@ -2362,26 +2422,18 @@ fn isolated_npm_env(path: OsString, cwd: &Path) -> BTreeMap<OsString, OsString> 
     .collect()
 }
 
-fn npm_command(
+fn npm_lock_command(
     npm: &Path,
     safe_path: OsString,
     cwd: PathBuf,
     timeout: Duration,
     limits: &ResolutionLimits,
     download_remaining: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    materialize: bool,
 ) -> ResolutionCommandSpec {
-    let (kind, verb) = if materialize {
-        (ResolutionCommandKind::NpmMaterialize, "ci")
-    } else {
-        (ResolutionCommandKind::NpmLock, "install")
-    };
-    let mut args = vec![OsString::from(verb)];
-    if !materialize {
-        args.push(OsString::from("--package-lock-only"));
-    } else {
-        args.push(OsString::from("--prefix=tree"));
-    }
+    let mut args = vec![
+        OsString::from("install"),
+        OsString::from("--package-lock-only"),
+    ];
     args.extend(
         [
             "--ignore-scripts",
@@ -2396,7 +2448,7 @@ fn npm_command(
     let env = isolated_npm_env(safe_path, &cwd);
     ResolutionCommandSpec {
         family: ResolutionCommandFamily::Npm,
-        kind,
+        kind: ResolutionCommandKind::NpmLock,
         program: npm.to_path_buf(),
         args,
         cwd,
@@ -2412,7 +2464,19 @@ fn npm_command(
 struct ParsedPackageLock {
     adapter: ExactNpmPackage,
     agent_cli: ExactNpmPackage,
+    installations: Vec<LockedPackage>,
     sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LockedPackage {
+    install_path: PathBuf,
+    resolved: String,
+    integrity: String,
+    os: Vec<String>,
+    cpu: Vec<String>,
+    libc: Vec<String>,
+    optional: bool,
 }
 
 fn package_name_from_lock_path(path: &str) -> Option<&str> {
@@ -2429,6 +2493,32 @@ fn package_name_from_lock_path(path: &str) -> Option<&str> {
     }
 }
 
+fn exact_npm_alias(spec: &str) -> bool {
+    let Some(alias) = spec.strip_prefix("npm:") else {
+        return false;
+    };
+    let Some((name, version)) = alias.rsplit_once('@') else {
+        return false;
+    };
+    let valid_segment = |segment: &str| {
+        !segment.is_empty()
+            && segment.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
+            })
+    };
+    let valid_name = if let Some(scoped) = name.strip_prefix('@') {
+        scoped
+            .split_once('/')
+            .is_some_and(|(scope, package)| valid_segment(scope) && valid_segment(package))
+    } else {
+        valid_segment(name)
+    };
+    if !valid_name {
+        return false;
+    }
+    semver::Version::parse(version).is_ok()
+}
+
 fn dependency_spec_is_external(spec: &str) -> bool {
     let lower = spec.to_ascii_lowercase();
     lower.starts_with("file:")
@@ -2439,11 +2529,12 @@ fn dependency_spec_is_external(spec: &str) -> bool {
         || lower.starts_with("github:")
         || lower.starts_with("http:")
         || lower.starts_with("https:")
-        || lower.starts_with("npm:")
+        || (lower.starts_with("npm:") && !exact_npm_alias(spec))
         || lower.starts_with('/')
         || lower.starts_with("../")
         || lower.starts_with("./")
-        || lower.starts_with('~')
+        || lower.starts_with("~/")
+        || lower.starts_with("~\\")
 }
 
 fn validate_dependency_specs(
@@ -2513,6 +2604,47 @@ fn parse_exact_locked_package(
     Ok(exact)
 }
 
+fn parse_platform_selector(
+    package: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Vec<String>, String> {
+    let Some(values) = package.get(field) else {
+        return Ok(Vec::new());
+    };
+    let values = values
+        .as_array()
+        .ok_or_else(|| format!("package lock {field} selector must be an array"))?;
+    if values.is_empty() || values.len() > 32 {
+        return Err(format!(
+            "package lock {field} selector must contain 1..=32 values"
+        ));
+    }
+    values
+        .iter()
+        .map(|value| {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("package lock {field} selector must contain strings"))?;
+            bounded_text(
+                &format!("package lock {field} selector"),
+                value,
+                MAX_TEXT_BYTES,
+            )?;
+            let bare = value.strip_prefix('!').unwrap_or(value);
+            if bare.is_empty()
+                || !bare
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err(format!(
+                    "package lock {field} selector contains an unsupported value"
+                ));
+            }
+            Ok(value.to_owned())
+        })
+        .collect()
+}
+
 fn parse_package_lock(
     bytes: &[u8],
     expected_adapter: &str,
@@ -2565,6 +2697,7 @@ fn parse_package_lock(
 
     let mut adapter = None;
     let mut agent_cli = None;
+    let mut installations = Vec::with_capacity(packages.len().saturating_sub(1));
     for (path, package) in packages {
         if path.is_empty() {
             continue;
@@ -2611,6 +2744,18 @@ fn parse_package_lock(
             integrity: integrity.to_owned(),
         };
         validate_exact_npm_package("package lock entry", &package_identity)?;
+        installations.push(LockedPackage {
+            install_path: PathBuf::from(path),
+            resolved: resolved.to_owned(),
+            integrity: integrity.to_owned(),
+            os: parse_platform_selector(package, "os")?,
+            cpu: parse_platform_selector(package, "cpu")?,
+            libc: parse_platform_selector(package, "libc")?,
+            optional: package
+                .get("optional")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        });
 
         if package_identity.name == expected_adapter {
             if adapter.is_some() {
@@ -2644,8 +2789,724 @@ fn parse_package_lock(
     Ok(ParsedPackageLock {
         adapter: adapter.ok_or("package lock is missing the reviewed adapter")?,
         agent_cli: agent_cli.ok_or("package lock is missing the reviewed nested CLI/SDK")?,
+        installations,
         sha256: local_file::sha256_hex(bytes),
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NpmPlatform {
+    os: String,
+    cpu: String,
+    libc: Option<String>,
+}
+
+fn npm_platform(os: &str, architecture: &str, libc: Option<&str>) -> Result<NpmPlatform, String> {
+    let os = match os {
+        "macos" => "darwin",
+        "linux" => "linux",
+        value => value,
+    };
+    let cpu = match architecture {
+        "aarch64" | "arm64" => "arm64",
+        "x86_64" | "amd64" | "x64" => "x64",
+        value => value,
+    };
+    for (label, value) in [("npm operating system", os), ("npm CPU", cpu)] {
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(format!("{label} is unsupported"));
+        }
+    }
+    Ok(NpmPlatform {
+        os: os.to_owned(),
+        cpu: cpu.to_owned(),
+        libc: libc.map(str::to_owned),
+    })
+}
+
+fn npm_selector_matches(values: &[String], target: Option<&str>) -> bool {
+    let mut has_positive = false;
+    let mut positive_match = false;
+    for value in values {
+        if let Some(negative) = value.strip_prefix('!') {
+            if target == Some(negative) {
+                return false;
+            }
+        } else {
+            has_positive = true;
+            positive_match |= target == Some(value.as_str());
+        }
+    }
+    !has_positive || positive_match
+}
+
+fn locked_package_matches_platform(package: &LockedPackage, platform: &NpmPlatform) -> bool {
+    npm_selector_matches(&package.os, Some(&platform.os))
+        && npm_selector_matches(&package.cpu, Some(&platform.cpu))
+        && npm_selector_matches(&package.libc, platform.libc.as_deref())
+}
+
+fn selected_locked_packages(lock: &ParsedPackageLock) -> Result<Vec<&LockedPackage>, String> {
+    let host_libc = if std::env::consts::OS == "linux" {
+        Some(if cfg!(target_env = "musl") {
+            "musl"
+        } else {
+            "glibc"
+        })
+    } else {
+        None
+    };
+    let host = npm_platform(std::env::consts::OS, std::env::consts::ARCH, host_libc)?;
+    let reader = npm_platform("linux", std::env::consts::ARCH, Some("glibc"))?;
+    let mut selected = Vec::new();
+    for package in &lock.installations {
+        if locked_package_matches_platform(package, &host)
+            || locked_package_matches_platform(package, &reader)
+        {
+            selected.push(package);
+        } else if !package.optional {
+            return Err(format!(
+                "required package {:?} does not support the host or reader platform",
+                package.install_path
+            ));
+        }
+    }
+    selected.sort_by(|left, right| {
+        left.install_path
+            .components()
+            .count()
+            .cmp(&right.install_path.components().count())
+            .then_with(|| left.install_path.cmp(&right.install_path))
+    });
+    Ok(selected)
+}
+
+fn reserve_download_bytes(
+    remaining: &std::sync::atomic::AtomicU64,
+    amount: u64,
+) -> Result<(), ResolutionFailureCode> {
+    use std::sync::atomic::Ordering;
+
+    remaining
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+            available.checked_sub(amount)
+        })
+        .map(|_| ())
+        .map_err(|_| ResolutionFailureCode::NpmDownloadBudgetExceeded)
+}
+
+struct DeadlineReader<R> {
+    inner: R,
+    deadline: std::time::Instant,
+}
+
+impl<R: std::io::Read> std::io::Read for DeadlineReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "package archive materialization deadline elapsed",
+            ));
+        }
+        self.inner.read(buffer)
+    }
+}
+
+async fn download_locked_archive(
+    client: &reqwest::Client,
+    package: &LockedPackage,
+    archives: &local_file::PinnedDirectory,
+    archive_name: &OsStr,
+    remaining: &std::sync::atomic::AtomicU64,
+) -> Result<File, ResolutionFailureCode> {
+    use base64::Engine as _;
+    use futures::StreamExt as _;
+
+    let response = client
+        .get(&package.resolved)
+        .send()
+        .await
+        .map_err(|_| ResolutionFailureCode::NpmNonzero)?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(ResolutionFailureCode::NpmNonzero);
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > remaining.load(std::sync::atomic::Ordering::Acquire))
+    {
+        return Err(ResolutionFailureCode::NpmDownloadBudgetExceeded);
+    }
+    let archive = archives
+        .create_new_file(
+            archive_name,
+            0o600,
+            "compatibility downloaded package archive",
+        )
+        .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
+    let mut archive = tokio::fs::File::from_std(archive);
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA512);
+    let mut body = response.bytes_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|_| ResolutionFailureCode::NpmNonzero)?;
+        let length = u64::try_from(chunk.len())
+            .map_err(|_| ResolutionFailureCode::NpmDownloadBudgetExceeded)?;
+        reserve_download_bytes(remaining, length)?;
+        digest.update(&chunk);
+        archive
+            .write_all(&chunk)
+            .await
+            .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
+    }
+    archive
+        .sync_all()
+        .await
+        .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
+    let actual = format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(digest.finish().as_ref())
+    );
+    if actual != package.integrity {
+        return Err(ResolutionFailureCode::PackageIdentityMismatch);
+    }
+    drop(archive.into_std().await);
+    archives
+        .sync()
+        .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
+    archives
+        .open_regular_file(archive_name, "compatibility downloaded package archive")
+        .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ArchiveEntryKind {
+    Directory,
+    File { size: u64, executable: bool },
+    Symlink { target: PathBuf },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArchiveEntryPlan {
+    relative_path: PathBuf,
+    kind: ArchiveEntryKind,
+}
+
+fn package_archive_relative_path(path: &Path) -> Result<Option<PathBuf>, String> {
+    let mut components = path.components();
+    if components.next() != Some(Component::Normal(OsStr::new("package"))) {
+        return Err("package archive entries must live below the package/ root".into());
+    }
+    let relative: PathBuf = components.collect();
+    if relative.as_os_str().is_empty() {
+        Ok(None)
+    } else {
+        validate_safe_relative_path("package archive entry", &relative)?;
+        Ok(Some(relative))
+    }
+}
+
+fn symlink_target_stays_in_package(link: &Path, target: &Path) -> bool {
+    if target.is_absolute() {
+        return false;
+    }
+    let mut depth = link
+        .parent()
+        .map_or(0, |parent| parent.components().count());
+    for component in target.components() {
+        match component {
+            Component::Normal(_) => depth = depth.saturating_add(1),
+            Component::CurDir => {}
+            Component::ParentDir if depth != 0 => depth -= 1,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
+}
+
+fn normalized_package_bin_target(target: &Path) -> Result<PathBuf, String> {
+    let mut normalized = PathBuf::new();
+    for component in target.components() {
+        match component {
+            Component::Normal(name) => normalized.push(name),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(
+                    "package archive package.json bin target escapes the package root".into(),
+                );
+            }
+        }
+    }
+    validate_safe_relative_path("package archive package.json bin target", &normalized)?;
+    Ok(normalized)
+}
+
+fn package_archive_plan(
+    archive: &File,
+    deadline: std::time::Instant,
+    limits: &ResolutionLimits,
+) -> Result<Vec<ArchiveEntryPlan>, String> {
+    let mut archive_file = archive
+        .try_clone()
+        .map_err(|_| "package archive cannot be reopened")?;
+    archive_file
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|_| "package archive cannot be rewound")?;
+    let decoder = flate2::read::GzDecoder::new(DeadlineReader {
+        inner: archive_file,
+        deadline,
+    });
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|_| "package archive is not a readable tarball")?;
+    let mut seen = BTreeSet::new();
+    let mut plan = Vec::new();
+    let mut package_manifest = None;
+    let mut planned_bytes = 0_u64;
+    for entry in entries {
+        let mut entry = entry.map_err(|_| "package archive entry is unreadable")?;
+        let path = entry
+            .path()
+            .map_err(|_| "package archive path is malformed")?;
+        let Some(relative_path) = package_archive_relative_path(&path)? else {
+            if !entry.header().entry_type().is_dir() {
+                return Err("package archive root entry must be a directory".into());
+            }
+            continue;
+        };
+        if seen.contains(&relative_path) {
+            return Err("package archive contains duplicate paths".into());
+        }
+        let entry_count = u64::try_from(seen.len())
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .ok_or("package archive entry count overflowed")?;
+        if entry_count > limits.max_files {
+            return Err("package archive exceeds its entry-count limit".into());
+        }
+        seen.insert(relative_path.clone());
+        let entry_type = entry.header().entry_type();
+        let kind = if entry_type.is_dir() {
+            ArchiveEntryKind::Directory
+        } else if entry_type.is_file() {
+            let size = entry
+                .header()
+                .size()
+                .map_err(|_| "package archive file size is malformed")?;
+            planned_bytes = planned_bytes
+                .checked_add(size)
+                .ok_or("package archive declared-byte count overflowed")?;
+            if planned_bytes > limits.max_unpacked_bytes {
+                return Err("package archive exceeds its declared-byte limit".into());
+            }
+            let mode = entry
+                .header()
+                .mode()
+                .map_err(|_| "package archive file mode is malformed")?;
+            if relative_path == Path::new("package.json") {
+                if size > MAX_SETTINGS_BYTES {
+                    return Err("package archive package.json exceeds its byte limit".into());
+                }
+                let capacity = usize::try_from(size)
+                    .map_err(|_| "package archive package.json size does not fit memory")?;
+                let mut bytes = Vec::with_capacity(capacity);
+                std::io::Read::read_to_end(&mut entry, &mut bytes)
+                    .map_err(|_| "package archive package.json is unreadable")?;
+                if bytes.len() as u64 != size {
+                    return Err("package archive package.json size changed during read".into());
+                }
+                package_manifest = Some(bytes);
+            }
+            ArchiveEntryKind::File {
+                size,
+                executable: mode & 0o111 != 0,
+            }
+        } else if entry_type.is_symlink() {
+            let target = entry
+                .link_name()
+                .map_err(|_| "package archive symlink target is malformed")?
+                .ok_or("package archive symlink target is missing")?
+                .into_owned();
+            let target_text = target
+                .to_str()
+                .ok_or("package archive symlink target must be UTF-8")?;
+            bounded_text(
+                "package archive symlink target",
+                target_text,
+                MAX_TEXT_BYTES,
+            )?;
+            if !symlink_target_stays_in_package(&relative_path, &target) {
+                return Err("package archive symlink escapes its package".into());
+            }
+            ArchiveEntryKind::Symlink { target }
+        } else {
+            return Err("package archive contains a hard link or special file".into());
+        };
+        plan.push(ArchiveEntryPlan {
+            relative_path,
+            kind,
+        });
+    }
+    if let Some(package_manifest) = package_manifest {
+        let value: serde_json::Value = serde_json::from_slice(&package_manifest)
+            .map_err(|_| "package archive package.json is malformed")?;
+        let (bin_targets, warning) = crate::doctor::package_bin_targets(&value);
+        if let Some(warning) = warning {
+            return Err(format!(
+                "package archive package.json bin mapping is invalid: {warning}"
+            ));
+        }
+        for target in bin_targets {
+            let target = normalized_package_bin_target(&target)?;
+            if let Some(entry) = plan.iter_mut().find(|entry| entry.relative_path == target) {
+                let ArchiveEntryKind::File { executable, .. } = &mut entry.kind else {
+                    return Err(
+                        "package archive package.json bin target is not a regular file".into(),
+                    );
+                };
+                *executable = true;
+            }
+        }
+    }
+    if plan.is_empty() {
+        return Err("package archive contains no materializable entries".into());
+    }
+    Ok(plan)
+}
+
+struct TreeMaterializationState {
+    root: local_file::PinnedDirectory,
+    directories: BTreeSet<PathBuf>,
+    occupied: BTreeSet<PathBuf>,
+    file_count: u64,
+    byte_count: u64,
+}
+
+impl TreeMaterializationState {
+    fn new(
+        tree: &local_file::PinnedDirectory,
+        limits: &ResolutionLimits,
+    ) -> Result<Self, ResolutionFailureCode> {
+        let inspected = inspect_package_tree(&tree.canonical_path(), limits)
+            .map_err(|_| ResolutionFailureCode::PackageTreeDrift)?;
+        let mut occupied = BTreeSet::new();
+        let directories = BTreeSet::from([PathBuf::new()]);
+        for entry in &inspected.inventory.entries {
+            let path = PathBuf::from(&entry.path);
+            match entry.kind {
+                InventoryEntryKind::Directory => {
+                    // The bridge creates only the two root metadata files before materialization.
+                    // Refuse an unexpected pre-existing directory rather than reopening by path.
+                    return Err(ResolutionFailureCode::PackageTreeDrift);
+                }
+                InventoryEntryKind::File | InventoryEntryKind::Symlink => {
+                    occupied.insert(path);
+                }
+            }
+        }
+        Ok(Self {
+            root: tree.clone(),
+            directories,
+            occupied,
+            file_count: inspected.file_count,
+            byte_count: inspected.byte_count,
+        })
+    }
+
+    fn reserve(
+        &mut self,
+        entries: u64,
+        bytes: u64,
+        limits: &ResolutionLimits,
+    ) -> Result<(), ResolutionFailureCode> {
+        let file_count = self
+            .file_count
+            .checked_add(entries)
+            .ok_or(ResolutionFailureCode::PackageTreeDrift)?;
+        let byte_count = self
+            .byte_count
+            .checked_add(bytes)
+            .ok_or(ResolutionFailureCode::PackageTreeDrift)?;
+        if file_count > limits.max_files || byte_count > limits.max_unpacked_bytes {
+            return Err(ResolutionFailureCode::PackageTreeDrift);
+        }
+        self.file_count = file_count;
+        self.byte_count = byte_count;
+        Ok(())
+    }
+}
+
+fn open_materialized_directory(
+    root: &local_file::PinnedDirectory,
+    relative: &Path,
+) -> Result<local_file::PinnedDirectory, ResolutionFailureCode> {
+    let mut directory = root.clone();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(ResolutionFailureCode::PackageTreeDrift);
+        };
+        directory = directory
+            .open_child_directory(name, "compatibility package archive parent")
+            .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
+    }
+    Ok(directory)
+}
+
+fn path_ancestors_inclusive(path: &Path, output: &mut BTreeSet<PathBuf>) {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        output.insert(current.clone());
+    }
+}
+
+fn materialize_package_archive(
+    archive: &File,
+    package: &LockedPackage,
+    plan: &[ArchiveEntryPlan],
+    state: &mut TreeMaterializationState,
+    limits: &ResolutionLimits,
+    deadline: std::time::Instant,
+) -> Result<(), ResolutionFailureCode> {
+    let mut required_directories = BTreeSet::new();
+    path_ancestors_inclusive(&package.install_path, &mut required_directories);
+    let mut new_entries = 0_u64;
+    let mut new_bytes = 0_u64;
+    let mut planned_leaf_paths = BTreeSet::new();
+    for entry in plan {
+        let full_path = package.install_path.join(&entry.relative_path);
+        match &entry.kind {
+            ArchiveEntryKind::Directory => {
+                path_ancestors_inclusive(&full_path, &mut required_directories);
+            }
+            ArchiveEntryKind::File { size, .. } => {
+                if let Some(parent) = full_path.parent() {
+                    path_ancestors_inclusive(parent, &mut required_directories);
+                }
+                new_bytes = new_bytes
+                    .checked_add(*size)
+                    .ok_or(ResolutionFailureCode::PackageTreeDrift)?;
+                planned_leaf_paths.insert(full_path);
+            }
+            ArchiveEntryKind::Symlink { .. } => {
+                if let Some(parent) = full_path.parent() {
+                    path_ancestors_inclusive(parent, &mut required_directories);
+                }
+                planned_leaf_paths.insert(full_path);
+            }
+        }
+    }
+    for directory in &required_directories {
+        if state.occupied.contains(directory) {
+            return Err(ResolutionFailureCode::PackageTreeDrift);
+        }
+        if !state.directories.contains(directory) {
+            new_entries = new_entries
+                .checked_add(1)
+                .ok_or(ResolutionFailureCode::PackageTreeDrift)?;
+        }
+    }
+    for path in &planned_leaf_paths {
+        if required_directories.contains(path)
+            || state.occupied.contains(path)
+            || state.directories.contains(path)
+        {
+            return Err(ResolutionFailureCode::PackageTreeDrift);
+        }
+        new_entries = new_entries
+            .checked_add(1)
+            .ok_or(ResolutionFailureCode::PackageTreeDrift)?;
+    }
+    state.reserve(new_entries, new_bytes, limits)?;
+
+    let mut directories: Vec<_> = required_directories.into_iter().collect();
+    directories.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    for path in directories {
+        if state.directories.contains(&path) {
+            continue;
+        }
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        let name = path
+            .file_name()
+            .ok_or(ResolutionFailureCode::PackageTreeDrift)?;
+        if !state.directories.contains(parent) {
+            return Err(ResolutionFailureCode::PackageTreeDrift);
+        }
+        let parent = open_materialized_directory(&state.root, parent)?;
+        let directory = parent
+            .create_child_directory(name, 0o700, "compatibility package archive directory")
+            .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
+        parent
+            .sync()
+            .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
+        drop(directory);
+        state.directories.insert(path);
+    }
+
+    let mut archive_file = archive
+        .try_clone()
+        .map_err(|_| ResolutionFailureCode::PackageTreeDrift)?;
+    archive_file
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|_| ResolutionFailureCode::PackageTreeDrift)?;
+    let decoder = flate2::read::GzDecoder::new(DeadlineReader {
+        inner: archive_file,
+        deadline,
+    });
+    let mut tarball = tar::Archive::new(decoder);
+    let mut planned: BTreeMap<_, _> = plan
+        .iter()
+        .map(|entry| (entry.relative_path.clone(), &entry.kind))
+        .collect();
+    let entries = tarball
+        .entries()
+        .map_err(|_| ResolutionFailureCode::PackageTreeDrift)?;
+    for entry in entries {
+        let mut entry = entry.map_err(|_| ResolutionFailureCode::PackageTreeDrift)?;
+        let path = entry
+            .path()
+            .map_err(|_| ResolutionFailureCode::PackageTreeDrift)?;
+        let Some(relative_path) = package_archive_relative_path(&path)
+            .map_err(|_| ResolutionFailureCode::PackageTreeDrift)?
+        else {
+            continue;
+        };
+        let kind = planned
+            .remove(&relative_path)
+            .ok_or(ResolutionFailureCode::PackageTreeDrift)?;
+        let full_path = package.install_path.join(&relative_path);
+        let parent = full_path.parent().unwrap_or_else(|| Path::new(""));
+        let name = full_path
+            .file_name()
+            .ok_or(ResolutionFailureCode::PackageTreeDrift)?;
+        if !state.directories.contains(parent) {
+            return Err(ResolutionFailureCode::PackageTreeDrift);
+        }
+        let parent = open_materialized_directory(&state.root, parent)?;
+        match kind {
+            ArchiveEntryKind::Directory => {}
+            ArchiveEntryKind::File { size, executable } => {
+                let mode = if *executable { 0o700 } else { 0o600 };
+                let mut output = parent
+                    .create_new_file(name, mode, "compatibility package archive file")
+                    .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
+                let written = std::io::copy(&mut entry, &mut output)
+                    .map_err(|_| ResolutionFailureCode::PackageTreeDrift)?;
+                if written != *size {
+                    return Err(ResolutionFailureCode::PackageTreeDrift);
+                }
+                output
+                    .sync_all()
+                    .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
+                parent
+                    .sync()
+                    .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
+                state.occupied.insert(full_path);
+            }
+            ArchiveEntryKind::Symlink { target } => {
+                parent
+                    .create_symlink(
+                        name,
+                        target.as_os_str(),
+                        "compatibility package archive link",
+                    )
+                    .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
+                parent
+                    .sync()
+                    .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
+                state.occupied.insert(full_path);
+            }
+        }
+    }
+    if !planned.is_empty() {
+        return Err(ResolutionFailureCode::PackageTreeDrift);
+    }
+    Ok(())
+}
+
+async fn materialize_locked_package_tree_inner(
+    request: &PackageTreeMaterialization<'_>,
+) -> Result<(), ResolutionFailureCode> {
+    let deadline = std::time::Instant::now()
+        .checked_add(request.timeout)
+        .ok_or(ResolutionFailureCode::NpmTimeout)?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .https_only(true)
+        .timeout(request.timeout)
+        .build()
+        .map_err(|_| ResolutionFailureCode::NpmSpawnFailed)?;
+    let packages = selected_locked_packages(request.lock)
+        .map_err(|_| ResolutionFailureCode::PackageIdentityMismatch)?;
+    let mut state = TreeMaterializationState::new(request.tree, request.limits)?;
+    for (index, package) in packages.into_iter().enumerate() {
+        if std::time::Instant::now() >= deadline {
+            return Err(ResolutionFailureCode::NpmTimeout);
+        }
+        let archive_name = OsString::from(format!("{index:06}.tgz"));
+        let archive = download_locked_archive(
+            &client,
+            package,
+            request.archives,
+            &archive_name,
+            &request.download_remaining,
+        )
+        .await?;
+        let plan = package_archive_plan(&archive, deadline, request.limits).map_err(|_| {
+            if std::time::Instant::now() >= deadline {
+                ResolutionFailureCode::NpmTimeout
+            } else {
+                ResolutionFailureCode::PackageTreeDrift
+            }
+        })?;
+        if let Err(failure) = materialize_package_archive(
+            &archive,
+            package,
+            &plan,
+            &mut state,
+            request.limits,
+            deadline,
+        ) {
+            return Err(if std::time::Instant::now() >= deadline {
+                ResolutionFailureCode::NpmTimeout
+            } else {
+                failure
+            });
+        }
+        drop(archive);
+        request
+            .archives
+            .remove_child(
+                &archive_name,
+                false,
+                "compatibility downloaded package archive cleanup",
+            )
+            .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
+    }
+    request
+        .tree
+        .sync()
+        .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)
+}
+
+async fn materialize_locked_package_tree(
+    request: &PackageTreeMaterialization<'_>,
+) -> Result<(), ResolutionFailureCode> {
+    tokio::time::timeout(
+        request.timeout,
+        materialize_locked_package_tree_inner(request),
+    )
+    .await
+    .map_err(|_| ResolutionFailureCode::NpmTimeout)?
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -3103,14 +3964,13 @@ async fn materialize_package_set(
     let download_remaining =
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(limits.max_download_bytes));
     executor
-        .execute(&npm_command(
+        .execute(&npm_lock_command(
             &tooling.npm_executable,
             tooling.safe_path.clone(),
             package_directory.acp_session_cwd(),
             timeout,
             limits,
             std::sync::Arc::clone(&download_remaining),
-            false,
         ))
         .await?;
     let cache_directory = isolated_directories
@@ -3159,16 +4019,22 @@ async fn materialize_package_set(
         "compatibility materialized package lock",
     )
     .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
+    let archive_directory = cache_directory
+        .create_child_directory(
+            OsStr::new("archives"),
+            0o700,
+            "compatibility downloaded package archives",
+        )
+        .map_err(|_| ResolutionFailureCode::PublicationResourceFailed)?;
     executor
-        .execute(&npm_command(
-            &tooling.npm_executable,
-            tooling.safe_path.clone(),
-            package_directory.acp_session_cwd(),
-            timeout,
+        .materialize_package_tree(&PackageTreeMaterialization {
+            lock: &parsed_lock,
+            tree: &tree_directory,
+            archives: &archive_directory,
             limits,
             download_remaining,
-            true,
-        ))
+            timeout,
+        })
         .await?;
     enforce_npm_download_budget(cache_directory, limits)?;
 
@@ -5222,6 +6088,12 @@ pub(super) async fn resolve_provider_free(
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ObservedResolutionEffect {
+        Command(ResolutionCommandKind),
+        PackageMaterialize,
+    }
+
     fn valid_recipes() -> String {
         r#"schema_version = 1
 production_manifest = "manifest.toml"
@@ -5694,6 +6566,48 @@ image = "reader-current"
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn descriptor_relative_bundle_writes_normalize_private_tmp_group_ownership() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let parent = tempfile::Builder::new()
+            .prefix("a2a-r3c-owner-test-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        // Darwin inherits a new child's group from the parent directory. This is the production
+        // shape that exposed wheel-group package trees under /private/tmp.
+        assert_ne!(
+            fs::metadata(parent.path()).unwrap().gid(),
+            // SAFETY: getegid has no preconditions and reads process credentials.
+            unsafe { libc::getegid() }
+        );
+        let output = parent.path().join("bundle");
+        let publisher =
+            BundlePublisher::create_with_setup(&output, |path| Ok(setup_resolution(path))).unwrap();
+        let tree = publisher
+            .create_directory(OsStr::new("tree"), "test normalized tree")
+            .unwrap();
+        create_synced_file(
+            &tree,
+            OsStr::new("file"),
+            0o600,
+            b"owned",
+            "test normalized file",
+        )
+        .unwrap();
+        // SAFETY: geteuid/getegid have no preconditions and read process credentials.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        for path in [
+            output,
+            tree.canonical_path(),
+            tree.canonical_path().join("file"),
+        ] {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            assert_eq!((metadata.uid(), metadata.gid()), (uid, gid));
+        }
+    }
+
     #[test]
     fn bundle_publisher_rejects_existing_repo_and_invalid_setup_without_residue() {
         let parent = tempfile::tempdir().unwrap();
@@ -5799,6 +6713,49 @@ image = "reader-current"
         assert_eq!(lock.agent_cli.version, "0.150.1");
         assert_eq!(lock.sha256.len(), 64);
 
+        let tilde_range = String::from_utf8(valid_package_lock())
+            .unwrap()
+            .replace("\"^0.150.0\"", "\"~0.150.0\"");
+        parse_package_lock(
+            tilde_range.as_bytes(),
+            "@agentclientprotocol/codex-acp",
+            "@openai/codex",
+            100,
+        )
+        .unwrap();
+        let home_path = tilde_range.replace("\"~0.150.0\"", "\"~/escape\"");
+        assert!(parse_package_lock(
+            home_path.as_bytes(),
+            "@agentclientprotocol/codex-acp",
+            "@openai/codex",
+            100,
+        )
+        .unwrap_err()
+        .contains("forbidden external"));
+
+        let exact_alias = String::from_utf8(valid_package_lock()).unwrap().replace(
+            "\"dependencies\": {\n        \"@openai/codex\": \"^0.150.0\"\n      }",
+            "\"dependencies\": {\n        \"@openai/codex\": \"npm:@openai/codex@0.150.1\"\n      }",
+        );
+        parse_package_lock(
+            exact_alias.as_bytes(),
+            "@agentclientprotocol/codex-acp",
+            "@openai/codex",
+            100,
+        )
+        .unwrap();
+
+        let floating_alias =
+            exact_alias.replace("npm:@openai/codex@0.150.1", "npm:@openai/codex@latest");
+        assert!(parse_package_lock(
+            floating_alias.as_bytes(),
+            "@agentclientprotocol/codex-acp",
+            "@openai/codex",
+            100,
+        )
+        .unwrap_err()
+        .contains("forbidden external"));
+
         for (from, to, expected) in [
             (
                 "https://registry.npmjs.org/@openai/codex/",
@@ -5874,9 +6831,575 @@ image = "reader-current"
         .contains("multiple nested"));
     }
 
+    enum TestArchiveEntry<'a> {
+        File(&'a str, &'a [u8], u32),
+        Symlink(&'a str, &'a str),
+        HardLink(&'a str, &'a str),
+    }
+
+    fn test_package_archive(entries: &[TestArchiveEntry<'_>]) -> File {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for entry in entries {
+            let mut header = tar::Header::new_gnu();
+            match entry {
+                TestArchiveEntry::File(path, bytes, mode) => {
+                    header.set_size(bytes.len() as u64);
+                    header.set_mode(*mode);
+                    header.set_cksum();
+                    archive
+                        .append_data(&mut header, format!("package/{path}"), *bytes)
+                        .unwrap();
+                }
+                TestArchiveEntry::Symlink(path, target) => {
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    header.set_size(0);
+                    header.set_mode(0o777);
+                    header.set_link_name(target).unwrap();
+                    header.set_cksum();
+                    archive
+                        .append_data(&mut header, format!("package/{path}"), std::io::empty())
+                        .unwrap();
+                }
+                TestArchiveEntry::HardLink(path, target) => {
+                    header.set_entry_type(tar::EntryType::Link);
+                    header.set_size(0);
+                    header.set_mode(0o600);
+                    header.set_link_name(target).unwrap();
+                    header.set_cksum();
+                    archive
+                        .append_data(&mut header, format!("package/{path}"), std::io::empty())
+                        .unwrap();
+                }
+            }
+        }
+        let encoder = archive.into_inner().unwrap();
+        let bytes = encoder.finish().unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&bytes).unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file
+    }
+
+    fn test_wide_package_archive(directory_count: usize) -> File {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for index in 0..directory_count {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o600);
+            header.set_cksum();
+            archive
+                .append_data(
+                    &mut header,
+                    format!("package/directory-{index:04}/file"),
+                    &b"x"[..],
+                )
+                .unwrap();
+        }
+        let encoder = archive.into_inner().unwrap();
+        let bytes = encoder.finish().unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&bytes).unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        file
+    }
+
+    fn test_archive_deadline() -> std::time::Instant {
+        std::time::Instant::now() + Duration::from_secs(30)
+    }
+
+    fn locked_package_for_test(path: &str) -> LockedPackage {
+        LockedPackage {
+            install_path: PathBuf::from(path),
+            resolved: "https://registry.npmjs.org/test/-/test-1.0.0.tgz".into(),
+            integrity: canonical_integrity('A'),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+        }
+    }
+
+    #[test]
+    fn locked_package_selection_includes_host_and_linux_reader_platforms() {
+        let host = npm_platform(
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            (std::env::consts::OS == "linux").then_some(if cfg!(target_env = "musl") {
+                "musl"
+            } else {
+                "glibc"
+            }),
+        )
+        .unwrap();
+        let reader = npm_platform("linux", std::env::consts::ARCH, Some("glibc")).unwrap();
+        let mut host_package = locked_package_for_test("node_modules/host");
+        host_package.os = vec![host.os.clone()];
+        host_package.cpu = vec![host.cpu.clone()];
+        host_package.libc = host.libc.clone().into_iter().collect();
+        host_package.optional = true;
+        let mut reader_package = locked_package_for_test("node_modules/reader");
+        reader_package.os = vec![reader.os.clone()];
+        reader_package.cpu = vec![reader.cpu.clone()];
+        reader_package.libc = reader.libc.clone().into_iter().collect();
+        reader_package.optional = true;
+        let mut rejected = locked_package_for_test("node_modules/rejected");
+        rejected.os = vec![format!("!{}", host.os), format!("!{}", reader.os)];
+        rejected.optional = true;
+        let lock = ParsedPackageLock {
+            adapter: ExactNpmPackage {
+                name: "adapter".into(),
+                version: "1.0.0".into(),
+                integrity: canonical_integrity('A'),
+            },
+            agent_cli: ExactNpmPackage {
+                name: "cli".into(),
+                version: "1.0.0".into(),
+                integrity: canonical_integrity('B'),
+            },
+            installations: vec![host_package, reader_package, rejected],
+            sha256: "a".repeat(64),
+        };
+
+        let selected: BTreeSet<_> = selected_locked_packages(&lock)
+            .unwrap()
+            .into_iter()
+            .map(|package| package.install_path.as_path())
+            .collect();
+        assert!(selected.contains(Path::new("node_modules/host")));
+        assert!(selected.contains(Path::new("node_modules/reader")));
+        assert!(!selected.contains(Path::new("node_modules/rejected")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_owned_archive_materialization_reserves_hard_tree_bounds_before_writes() {
+        let parent = tempfile::tempdir().unwrap();
+        let output = parent.path().join("bundle");
+        let publisher =
+            BundlePublisher::create_with_setup(&output, |path| Ok(setup_resolution(path))).unwrap();
+        let tree = publisher
+            .create_directory(OsStr::new("tree"), "test package tree")
+            .unwrap();
+        create_synced_file(
+            &tree,
+            OsStr::new("package.json"),
+            0o600,
+            b"x",
+            "test package metadata",
+        )
+        .unwrap();
+        create_synced_file(
+            &tree,
+            OsStr::new("package-lock.json"),
+            0o600,
+            b"y",
+            "test package lock",
+        )
+        .unwrap();
+        let archive = test_package_archive(&[
+            TestArchiveEntry::File("one", b"1234", 0o600),
+            TestArchiveEntry::File("bin/two", b"5678", 0o755),
+            TestArchiveEntry::Symlink("one-link", "one"),
+        ]);
+        let plan = package_archive_plan(&archive, test_archive_deadline(), &tree_limits()).unwrap();
+        let package = locked_package_for_test("node_modules/test-package");
+        let base_limits = ResolutionLimits {
+            timeout_secs: 1,
+            max_download_bytes: 1024,
+            max_unpacked_bytes: 10,
+            max_files: 8,
+        };
+        let mut state = TreeMaterializationState::new(&tree, &base_limits).unwrap();
+
+        let mut count_too_small = base_limits.clone();
+        count_too_small.max_files = 7;
+        assert_eq!(
+            materialize_package_archive(
+                &archive,
+                &package,
+                &plan,
+                &mut state,
+                &count_too_small,
+                test_archive_deadline(),
+            )
+            .unwrap_err(),
+            ResolutionFailureCode::PackageTreeDrift
+        );
+        assert!(!tree.canonical_path().join("node_modules").exists());
+
+        let mut bytes_too_small = base_limits.clone();
+        bytes_too_small.max_unpacked_bytes = 9;
+        assert_eq!(
+            materialize_package_archive(
+                &archive,
+                &package,
+                &plan,
+                &mut state,
+                &bytes_too_small,
+                test_archive_deadline(),
+            )
+            .unwrap_err(),
+            ResolutionFailureCode::PackageTreeDrift
+        );
+        assert!(!tree.canonical_path().join("node_modules").exists());
+
+        materialize_package_archive(
+            &archive,
+            &package,
+            &plan,
+            &mut state,
+            &base_limits,
+            test_archive_deadline(),
+        )
+        .unwrap();
+        let package_root = tree.canonical_path().join("node_modules/test-package");
+        assert_eq!(fs::read(package_root.join("one")).unwrap(), b"1234");
+        assert_eq!(fs::read(package_root.join("bin/two")).unwrap(), b"5678");
+        assert_eq!(
+            fs::read_link(package_root.join("one-link")).unwrap(),
+            Path::new("one")
+        );
+        assert_eq!(state.file_count, base_limits.max_files);
+        assert_eq!(state.byte_count, base_limits.max_unpacked_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_archive_makes_declared_npm_bin_target_executable_without_a_shim() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let manifest =
+            br#"{"name":"test-package","version":"1.0.0","bin":{"test-package":"./dist/index.js"}}"#;
+        let archive = test_package_archive(&[
+            TestArchiveEntry::File("package.json", manifest, 0o644),
+            TestArchiveEntry::File("dist/index.js", b"#!/usr/bin/env node\n", 0o644),
+        ]);
+        let plan = package_archive_plan(&archive, test_archive_deadline(), &tree_limits()).unwrap();
+        assert!(plan.iter().any(|entry| {
+            entry.relative_path == Path::new("dist/index.js")
+                && matches!(
+                    entry.kind,
+                    ArchiveEntryKind::File {
+                        executable: true,
+                        ..
+                    }
+                )
+        }));
+
+        let parent = tempfile::tempdir().unwrap();
+        let output = parent.path().join("bundle");
+        let publisher =
+            BundlePublisher::create_with_setup(&output, |path| Ok(setup_resolution(path))).unwrap();
+        let tree = publisher
+            .create_directory(OsStr::new("tree"), "test package tree")
+            .unwrap();
+        create_synced_file(
+            &tree,
+            OsStr::new("package.json"),
+            0o600,
+            b"x",
+            "test package metadata",
+        )
+        .unwrap();
+        create_synced_file(
+            &tree,
+            OsStr::new("package-lock.json"),
+            0o600,
+            b"y",
+            "test package lock",
+        )
+        .unwrap();
+        let limits = ResolutionLimits {
+            timeout_secs: 30,
+            max_download_bytes: 1024 * 1024,
+            max_unpacked_bytes: 1024 * 1024,
+            max_files: 32,
+        };
+        let mut state = TreeMaterializationState::new(&tree, &limits).unwrap();
+        materialize_package_archive(
+            &archive,
+            &locked_package_for_test("node_modules/test-package"),
+            &plan,
+            &mut state,
+            &limits,
+            test_archive_deadline(),
+        )
+        .unwrap();
+
+        let package_root = tree.canonical_path().join("node_modules/test-package");
+        assert_eq!(
+            fs::metadata(package_root.join("dist/index.js"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(!tree.canonical_path().join("node_modules/.bin").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_owned_materialization_does_not_retain_one_descriptor_per_directory() {
+        const DIRECTORY_COUNT: usize = 300;
+
+        let parent = tempfile::tempdir().unwrap();
+        let output = parent.path().join("bundle");
+        let publisher =
+            BundlePublisher::create_with_setup(&output, |path| Ok(setup_resolution(path))).unwrap();
+        let tree = publisher
+            .create_directory(OsStr::new("tree"), "test package tree")
+            .unwrap();
+        create_synced_file(
+            &tree,
+            OsStr::new("package.json"),
+            0o600,
+            b"x",
+            "test package metadata",
+        )
+        .unwrap();
+        create_synced_file(
+            &tree,
+            OsStr::new("package-lock.json"),
+            0o600,
+            b"y",
+            "test package lock",
+        )
+        .unwrap();
+        let archive = test_wide_package_archive(DIRECTORY_COUNT);
+        let package = locked_package_for_test("node_modules/wide-package");
+        let limits = ResolutionLimits {
+            timeout_secs: 30,
+            max_download_bytes: 1024 * 1024,
+            max_unpacked_bytes: 302,
+            max_files: 604,
+        };
+        let plan = package_archive_plan(&archive, test_archive_deadline(), &limits).unwrap();
+        let mut state = TreeMaterializationState::new(&tree, &limits).unwrap();
+
+        materialize_package_archive(
+            &archive,
+            &package,
+            &plan,
+            &mut state,
+            &limits,
+            test_archive_deadline(),
+        )
+        .unwrap();
+
+        let package_root = tree.canonical_path().join("node_modules/wide-package");
+        assert_eq!(
+            fs::read(package_root.join("directory-0000/file")).unwrap(),
+            b"x"
+        );
+        assert_eq!(
+            fs::read(package_root.join("directory-0299/file")).unwrap(),
+            b"x"
+        );
+        assert_eq!(state.file_count, limits.max_files);
+        assert_eq!(state.byte_count, limits.max_unpacked_bytes);
+    }
+
+    #[test]
+    fn package_archive_rejects_escaping_links_and_hard_links() {
+        let escaping = test_package_archive(&[TestArchiveEntry::Symlink(
+            "nested/escape",
+            "../../../outside",
+        )]);
+        assert!(
+            package_archive_plan(&escaping, test_archive_deadline(), &tree_limits())
+                .unwrap_err()
+                .contains("escapes")
+        );
+
+        let hard_link = test_package_archive(&[TestArchiveEntry::HardLink("copy", "package/one")]);
+        assert!(
+            package_archive_plan(&hard_link, test_archive_deadline(), &tree_limits())
+                .unwrap_err()
+                .contains("hard link or special")
+        );
+
+        let escaping_bin = test_package_archive(&[TestArchiveEntry::File(
+            "package.json",
+            br#"{"name":"unsafe","version":"1.0.0","bin":"../outside"}"#,
+            0o644,
+        )]);
+        assert!(
+            package_archive_plan(&escaping_bin, test_archive_deadline(), &tree_limits())
+                .unwrap_err()
+                .contains("bin target escapes the package root")
+        );
+    }
+
+    #[test]
+    fn package_archive_plan_enforces_entry_and_declared_byte_limits_at_the_exact_edge() {
+        let archive = test_package_archive(&[
+            TestArchiveEntry::File("one", b"1234", 0o600),
+            TestArchiveEntry::File("two", b"5678", 0o600),
+        ]);
+        let exact = ResolutionLimits {
+            timeout_secs: 30,
+            max_download_bytes: 8,
+            max_unpacked_bytes: 8,
+            max_files: 2,
+        };
+        assert_eq!(
+            package_archive_plan(&archive, test_archive_deadline(), &exact)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let mut one_entry_short = exact.clone();
+        one_entry_short.max_files = 1;
+        assert!(
+            package_archive_plan(&archive, test_archive_deadline(), &one_entry_short)
+                .unwrap_err()
+                .contains("entry-count limit")
+        );
+
+        let mut one_byte_short = exact;
+        one_byte_short.max_unpacked_bytes = 7;
+        assert!(
+            package_archive_plan(&archive, test_archive_deadline(), &one_byte_short)
+                .unwrap_err()
+                .contains("declared-byte limit")
+        );
+    }
+
+    #[test]
+    fn download_budget_reservation_accepts_the_exact_edge_and_rejects_one_more_byte() {
+        let remaining = std::sync::atomic::AtomicU64::new(4);
+        reserve_download_bytes(&remaining, 4).unwrap();
+        assert_eq!(remaining.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(
+            reserve_download_bytes(&remaining, 1).unwrap_err(),
+            ResolutionFailureCode::NpmDownloadBudgetExceeded
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_download_streams_exact_bytes_and_rejects_budget_or_integrity_drift() {
+        use base64::Engine as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let archive = test_package_archive(&[TestArchiveEntry::File("file", b"body", 0o600)]);
+        let mut archive_reader = archive.try_clone().unwrap();
+        archive_reader.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut archive_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut archive_reader, &mut archive_bytes).unwrap();
+        let integrity = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD
+                .encode(ring::digest::digest(&ring::digest::SHA512, &archive_bytes).as_ref())
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/archive.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive_bytes.clone()))
+            .mount(&server)
+            .await;
+        let parent = tempfile::tempdir().unwrap();
+        let output = parent.path().join("bundle");
+        let publisher =
+            BundlePublisher::create_with_setup(&output, |path| Ok(setup_resolution(path))).unwrap();
+        let archives = publisher
+            .create_directory(OsStr::new("archives"), "test package archives")
+            .unwrap();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .unwrap();
+        let mut package = locked_package_for_test("node_modules/test");
+        package.resolved = format!("{}/archive.tgz", server.uri());
+        package.integrity = integrity;
+        let remaining = std::sync::atomic::AtomicU64::new(archive_bytes.len() as u64);
+        let mut downloaded = download_locked_archive(
+            &client,
+            &package,
+            &archives,
+            OsStr::new("good.tgz"),
+            &remaining,
+        )
+        .await
+        .unwrap();
+        let mut downloaded_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut downloaded, &mut downloaded_bytes).unwrap();
+        assert_eq!(downloaded_bytes, archive_bytes);
+        assert_eq!(remaining.load(std::sync::atomic::Ordering::Acquire), 0);
+
+        package.integrity = canonical_integrity('A');
+        let remaining = std::sync::atomic::AtomicU64::new(archive_bytes.len() as u64);
+        assert_eq!(
+            download_locked_archive(
+                &client,
+                &package,
+                &archives,
+                OsStr::new("bad-integrity.tgz"),
+                &remaining,
+            )
+            .await
+            .unwrap_err(),
+            ResolutionFailureCode::PackageIdentityMismatch
+        );
+
+        let remaining = std::sync::atomic::AtomicU64::new(archive_bytes.len() as u64 - 1);
+        assert_eq!(
+            download_locked_archive(
+                &client,
+                &package,
+                &archives,
+                OsStr::new("over-budget.tgz"),
+                &remaining,
+            )
+            .await
+            .unwrap_err(),
+            ResolutionFailureCode::NpmDownloadBudgetExceeded
+        );
+        assert!(!archives.canonical_path().join("over-budget.tgz").exists());
+    }
+
+    #[test]
+    fn archive_reader_refuses_reads_after_the_resolution_deadline() {
+        let mut reader = DeadlineReader {
+            inner: std::io::Cursor::new(b"archive"),
+            deadline: std::time::Instant::now() - Duration::from_millis(1),
+        };
+        let mut byte = [0_u8; 1];
+        let error = std::io::Read::read(&mut reader, &mut byte).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(unix)]
+    fn write_fake_package_tree(tree: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let adapter = tree.join("node_modules/@agentclientprotocol/codex-acp");
+        let cli = tree.join("node_modules/@openai/codex");
+        fs::create_dir_all(adapter.join("dist")).unwrap();
+        fs::create_dir_all(&cli).unwrap();
+        let executable = adapter.join("dist/index.js");
+        fs::write(&executable, b"#!/usr/bin/env node\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::write(
+            adapter.join("package.json"),
+            br#"{"name":"@agentclientprotocol/codex-acp","version":"1.2.3","bin":{"codex-acp":"dist/index.js"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            cli.join("package.json"),
+            br#"{"name":"@openai/codex","version":"0.150.1"}"#,
+        )
+        .unwrap();
+    }
+
     #[cfg(unix)]
     struct PackageFakeExecutor {
-        calls: std::sync::Mutex<Vec<ResolutionCommandKind>>,
+        calls: std::sync::Mutex<Vec<ObservedResolutionEffect>>,
         cache_payload_bytes: usize,
     }
 
@@ -5887,7 +7410,10 @@ image = "reader-current"
             &self,
             command: &ResolutionCommandSpec,
         ) -> Result<Vec<u8>, ResolutionFailureCode> {
-            self.calls.lock().unwrap().push(command.kind);
+            self.calls
+                .lock()
+                .unwrap()
+                .push(ObservedResolutionEffect::Command(command.kind));
             match command.kind {
                 ResolutionCommandKind::NpmLock => {
                     fs::write(command.cwd.join("package-lock.json"), valid_package_lock()).unwrap();
@@ -5899,38 +7425,27 @@ image = "reader-current"
                         .unwrap();
                     }
                 }
-                ResolutionCommandKind::NpmMaterialize => {
-                    use std::os::unix::fs::PermissionsExt as _;
-
-                    let adapter = command
-                        .cwd
-                        .join("tree/node_modules/@agentclientprotocol/codex-acp");
-                    let cli = command.cwd.join("tree/node_modules/@openai/codex");
-                    fs::create_dir_all(adapter.join("dist")).unwrap();
-                    fs::create_dir_all(&cli).unwrap();
-                    let executable = adapter.join("dist/index.js");
-                    fs::write(&executable, b"#!/usr/bin/env node\n").unwrap();
-                    fs::set_permissions(&executable, fs::Permissions::from_mode(0o500)).unwrap();
-                    fs::write(
-                        adapter.join("package.json"),
-                        br#"{"name":"@agentclientprotocol/codex-acp","version":"1.2.3","bin":{"codex-acp":"dist/index.js"}}"#,
-                    )
-                    .unwrap();
-                    fs::write(
-                        cli.join("package.json"),
-                        br#"{"name":"@openai/codex","version":"0.150.1"}"#,
-                    )
-                    .unwrap();
-                }
                 _ => panic!("unexpected package fake command: {:?}", command.kind),
             }
             Ok(Vec::new())
+        }
+
+        async fn materialize_package_tree(
+            &self,
+            request: &PackageTreeMaterialization<'_>,
+        ) -> Result<(), ResolutionFailureCode> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(ObservedResolutionEffect::PackageMaterialize);
+            write_fake_package_tree(&request.tree.canonical_path());
+            Ok(())
         }
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn package_materializer_uses_lock_then_ci_and_emits_sealed_exact_evidence() {
+    async fn package_materializer_uses_lock_then_bridge_owned_tree_and_emits_exact_evidence() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let parent = tempfile::tempdir().unwrap();
@@ -5962,8 +7477,8 @@ image = "reader-current"
         assert_eq!(
             &*executor.calls.lock().unwrap(),
             &[
-                ResolutionCommandKind::NpmLock,
-                ResolutionCommandKind::NpmMaterialize
+                ObservedResolutionEffect::Command(ResolutionCommandKind::NpmLock),
+                ObservedResolutionEffect::PackageMaterialize,
             ]
         );
         assert_eq!(resolved.adapter.version, "1.2.3");
@@ -5987,7 +7502,7 @@ image = "reader-current"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn package_materializer_stops_before_ci_when_download_budget_is_exceeded() {
+    async fn package_materializer_stops_before_archive_download_when_lock_cache_exceeds_budget() {
         let parent = tempfile::tempdir().unwrap();
         let output = parent.path().join("bundle");
         let publisher =
@@ -6022,7 +7537,9 @@ image = "reader-current"
         );
         assert_eq!(
             &*executor.calls.lock().unwrap(),
-            &[ResolutionCommandKind::NpmLock],
+            &[ObservedResolutionEffect::Command(
+                ResolutionCommandKind::NpmLock
+            )],
             "materialization must not begin after the download bound is exhausted"
         );
     }
@@ -6227,14 +7744,13 @@ image = "reader-current"
 
     #[test]
     fn npm_commands_are_closed_direct_argv_with_an_isolated_environment() {
-        let lock = npm_command(
+        let lock = npm_lock_command(
             Path::new("/trusted/bin/npm"),
             OsString::from("/trusted/bin:/usr/bin"),
             PathBuf::from("/private/bundle/packages/codex"),
             Duration::from_secs(30),
             &tree_limits(),
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1024)),
-            false,
         );
         assert_eq!(lock.kind, ResolutionCommandKind::NpmLock);
         assert_eq!(lock.program, Path::new("/trusted/bin/npm"));
@@ -6283,21 +7799,8 @@ image = "reader-current"
             "/private/bundle/packages/codex/npmrc"
         );
 
-        let materialize = npm_command(
-            Path::new("/trusted/bin/npm"),
-            OsString::from("/trusted/bin:/usr/bin"),
-            PathBuf::from("/private/bundle/packages/codex"),
-            Duration::from_secs(30),
-            &tree_limits(),
-            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1024)),
-            true,
-        );
-        assert_eq!(materialize.kind, ResolutionCommandKind::NpmMaterialize);
-        assert_eq!(materialize.args[0], "ci");
-        assert!(!materialize
-            .args
-            .iter()
-            .any(|arg| arg == "--package-lock-only"));
+        assert!(lock.args.iter().all(|arg| arg != "ci"));
+        assert!(lock.args.iter().all(|arg| arg != "--prefix=tree"));
     }
 
     #[tokio::test]
@@ -6361,7 +7864,7 @@ image = "reader-current"
     }
 
     #[tokio::test]
-    async fn npm_registry_byte_budget_is_shared_across_lock_and_materialize_proxies() {
+    async fn npm_registry_byte_budget_is_shared_across_sequential_lock_connections() {
         async fn transfer(
             remaining: std::sync::Arc<std::sync::atomic::AtomicU64>,
             payload: &'static [u8],
@@ -6411,87 +7914,6 @@ image = "reader-current"
             b"de"
         );
         assert_eq!(remaining.load(std::sync::atomic::Ordering::Acquire), 0);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn npm_executor_enforces_file_size_and_file_count_while_the_child_is_running() {
-        fn command(cwd: &Path, script: &str, limits: ResolutionLimits) -> ResolutionCommandSpec {
-            ResolutionCommandSpec {
-                family: ResolutionCommandFamily::Npm,
-                kind: ResolutionCommandKind::NpmMaterialize,
-                program: PathBuf::from("/bin/sh"),
-                args: ["-c", script].into_iter().map(OsString::from).collect(),
-                cwd: cwd.to_path_buf(),
-                env: BTreeMap::new(),
-                timeout: Duration::from_secs(2),
-                max_output_bytes: 1024,
-                npm_limits: Some(limits),
-                npm_download_remaining: Some(std::sync::Arc::new(
-                    std::sync::atomic::AtomicU64::new(1024),
-                )),
-            }
-        }
-
-        let exact = tempfile::tempdir().unwrap();
-        fs::create_dir(exact.path().join("cache")).unwrap();
-        fs::create_dir(exact.path().join("tree")).unwrap();
-        let limits = ResolutionLimits {
-            timeout_secs: 2,
-            max_download_bytes: 1024,
-            max_unpacked_bytes: 1024,
-            max_files: 10,
-        };
-        ProcessResolutionExecutor
-            .execute(&command(
-                exact.path(),
-                "printf '%1024s' x > tree/exact",
-                limits.clone(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            fs::metadata(exact.path().join("tree/exact")).unwrap().len(),
-            1024
-        );
-
-        let oversized = tempfile::tempdir().unwrap();
-        fs::create_dir(oversized.path().join("cache")).unwrap();
-        fs::create_dir(oversized.path().join("tree")).unwrap();
-        assert_eq!(
-            ProcessResolutionExecutor
-                .execute(&command(
-                    oversized.path(),
-                    "printf '%2048s' x > tree/oversized; sleep 1",
-                    limits.clone(),
-                ))
-                .await
-                .unwrap_err(),
-            ResolutionFailureCode::NpmDownloadBudgetExceeded
-        );
-        assert!(
-            fs::metadata(oversized.path().join("tree/oversized"))
-                .unwrap()
-                .len()
-                <= limits.max_unpacked_bytes
-        );
-
-        let too_many = tempfile::tempdir().unwrap();
-        fs::create_dir(too_many.path().join("cache")).unwrap();
-        fs::create_dir(too_many.path().join("tree")).unwrap();
-        let mut file_limits = limits;
-        file_limits.max_files = 2;
-        assert_eq!(
-            ProcessResolutionExecutor
-                .execute(&command(
-                    too_many.path(),
-                    ": > tree/one; : > tree/two; : > tree/three; sleep 1",
-                    file_limits,
-                ))
-                .await
-                .unwrap_err(),
-            ResolutionFailureCode::PackageTreeDrift
-        );
     }
 
     fn base_manifest() -> Vec<u8> {
@@ -6775,7 +8197,7 @@ image = "reader-current"
     }
 
     struct ResolutionFakeExecutor {
-        calls: std::sync::Mutex<Vec<ResolutionCommandKind>>,
+        calls: std::sync::Mutex<Vec<ObservedResolutionEffect>>,
         labels: std::sync::Mutex<BTreeMap<String, String>>,
         tag_exists: bool,
         tag_query_fails: bool,
@@ -6788,40 +8210,15 @@ image = "reader-current"
             &self,
             command: &ResolutionCommandSpec,
         ) -> Result<Vec<u8>, ResolutionFailureCode> {
-            self.calls.lock().unwrap().push(command.kind);
+            self.calls
+                .lock()
+                .unwrap()
+                .push(ObservedResolutionEffect::Command(command.kind));
             match command.kind {
                 ResolutionCommandKind::NpmLock => {
                     fs::write(command.cwd.join("package-lock.json"), valid_package_lock()).unwrap();
                     if let Some(path) = &self.mutate_path {
                         fs::write(path, b"mutated protected input").unwrap();
-                    }
-                    Ok(Vec::new())
-                }
-                ResolutionCommandKind::NpmMaterialize => {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt as _;
-
-                        let adapter = command
-                            .cwd
-                            .join("tree/node_modules/@agentclientprotocol/codex-acp");
-                        let cli = command.cwd.join("tree/node_modules/@openai/codex");
-                        fs::create_dir_all(adapter.join("dist")).unwrap();
-                        fs::create_dir_all(&cli).unwrap();
-                        let executable = adapter.join("dist/index.js");
-                        fs::write(&executable, b"#!/usr/bin/env node\n").unwrap();
-                        fs::set_permissions(&executable, fs::Permissions::from_mode(0o500))
-                            .unwrap();
-                        fs::write(
-                            adapter.join("package.json"),
-                            br#"{"name":"@agentclientprotocol/codex-acp","version":"1.2.3","bin":{"codex-acp":"dist/index.js"}}"#,
-                        )
-                        .unwrap();
-                        fs::write(
-                            cli.join("package.json"),
-                            br#"{"name":"@openai/codex","version":"0.150.1"}"#,
-                        )
-                        .unwrap();
                     }
                     Ok(Vec::new())
                 }
@@ -6873,6 +8270,21 @@ image = "reader-current"
                     .unwrap())
                 }
             }
+        }
+
+        async fn materialize_package_tree(
+            &self,
+            request: &PackageTreeMaterialization<'_>,
+        ) -> Result<(), ResolutionFailureCode> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(ObservedResolutionEffect::PackageMaterialize);
+            #[cfg(unix)]
+            write_fake_package_tree(&request.tree.canonical_path());
+            #[cfg(not(unix))]
+            return Err(ResolutionFailureCode::PackageTreeDrift);
+            Ok(())
         }
     }
 
@@ -7094,12 +8506,12 @@ addr = "127.0.0.1:8080"
         assert_eq!(
             &*executor.calls.lock().unwrap(),
             &[
-                ResolutionCommandKind::NpmLock,
-                ResolutionCommandKind::NpmMaterialize,
-                ResolutionCommandKind::ResolveBase,
-                ResolutionCommandKind::EnsureImageTagAbsent,
-                ResolutionCommandKind::BuildImage,
-                ResolutionCommandKind::InspectImage,
+                ObservedResolutionEffect::Command(ResolutionCommandKind::NpmLock),
+                ObservedResolutionEffect::PackageMaterialize,
+                ObservedResolutionEffect::Command(ResolutionCommandKind::ResolveBase),
+                ObservedResolutionEffect::Command(ResolutionCommandKind::EnsureImageTagAbsent,),
+                ObservedResolutionEffect::Command(ResolutionCommandKind::BuildImage),
+                ObservedResolutionEffect::Command(ResolutionCommandKind::InspectImage),
             ]
         );
         let loaded = load_resolution(&output.join("resolution.json")).unwrap();
@@ -7381,7 +8793,9 @@ addr = "127.0.0.1:8080"
             .calls
             .lock()
             .unwrap()
-            .contains(&ResolutionCommandKind::BuildImage));
+            .contains(&ObservedResolutionEffect::Command(
+                ResolutionCommandKind::BuildImage,
+            )));
     }
 
     #[tokio::test]
@@ -7408,7 +8822,9 @@ addr = "127.0.0.1:8080"
             .calls
             .lock()
             .unwrap()
-            .contains(&ResolutionCommandKind::BuildImage));
+            .contains(&ObservedResolutionEffect::Command(
+                ResolutionCommandKind::BuildImage,
+            )));
     }
 
     #[tokio::test]
@@ -7519,6 +8935,24 @@ addr = "127.0.0.1:8080"
             executor.execute(&command).await.unwrap_err(),
             ResolutionFailureCode::RuntimeTimeout
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_group_identity_remains_owned_after_the_resolver_leader_is_reaped() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut guard = CommandProcessGroupGuard::start().unwrap();
+        let process_group = guard.id().unwrap();
+        let mut command = tokio::process::Command::new("/usr/bin/true");
+        command.as_std_mut().process_group(process_group);
+        let mut child = command.spawn().unwrap();
+        assert!(child.wait().await.unwrap().success());
+
+        // SAFETY: signal zero only probes whether the positive process-group identity is still
+        // occupied; it does not deliver a signal.
+        assert_eq!(unsafe { libc::kill(-process_group, 0) }, 0);
+        guard.settle().await;
     }
 
     #[cfg(unix)]

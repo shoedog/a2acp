@@ -408,7 +408,7 @@ fn optional_bounded_package_field(
     Ok(Some(value.to_string()))
 }
 
-fn package_bin_targets(value: &serde_json::Value) -> (Vec<PathBuf>, Option<String>) {
+pub(crate) fn package_bin_targets(value: &serde_json::Value) -> (Vec<PathBuf>, Option<String>) {
     let Some(bin) = value.get("bin") else {
         return (Vec::new(), None);
     };

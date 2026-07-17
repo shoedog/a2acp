@@ -50,6 +50,9 @@ serde_json = { workspace = true }
 libc = { workspace = true }
 ring = { workspace = true }
 semver = { workspace = true }
+base64 = "0.22"
+flate2 = "1"
+tar = "0.4"
 a2a.workspace = true
 
 [dev-dependencies]
