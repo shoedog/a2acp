@@ -179,11 +179,11 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** implement R3c slice 1 from clean `504c1e43`: separate floating recipe/resolution schemas,
-  CLI skeleton, unresolved-floating refusal, candidate-outcome truth table, and the five recorded pre-change
-  reds. Keep the pinned manifest/baseline byte-identical and add no registry/runtime/provider effects until
-  those contracts are green. No live resolution, model discovery, compatibility aggregate, operator rebuild,
-  or operator swap is authorized. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
+- **Next action:** finish R3c slice 4 from `e159915`: validate and commit the four-case floating recipe and
+  stable operator runbook, then run full host/Linux gates and the ordered Sol/xhigh correctness plus
+  release/compatibility reviews. Slices 1-3 are implemented with provider-free fakes and focused gates
+  green. No live resolution, model discovery, compatibility aggregate, operator rebuild, or operator swap
+  is authorized. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**
@@ -549,9 +549,16 @@ Next action:
   Candidate pass/fail/unknown is advisory and cannot write the pinned manifest/baseline, production configs,
   Cargo locks, Containerfiles, compatibility/support docs, shared tags, or the running operator. The pass
   ran no provider, package resolution, container, build, or test action and is design evidence only.
-  Implementation starts with contract/red tests and no external effects; the complete restart contract,
-  schemas, failure taxonomy, mutation matrix, commit order, live authorization gates, rollback, and deferrals
-  are in the active R3 plan.
+  Implementation slices 1-3 are now committed as `1c1115cb`, `0c25686c`, and `e159915`. They cover strict
+  contracts and recorded pre-change reds; provider-free package/image/config materialization and atomic
+  private publication; exact pre-provider drift revalidation; one-session catalog capture; floating
+  pass/fail/unknown truth; independent floating comparison dimensions; and old/additive smoke-v2 fallback
+  compatibility. Focused gates are resolution **32 / 0**, compatibility unit **53 / 0**, compatibility CLI
+  **20 / 0**, and one-test ACP, smoke, and fallback compatibility controls, with workspace all-target check
+  green. Slice 4 recipe/runbook work and full closure gates/reviews remain. No provider, registry, runtime,
+  container, model-discovery, or output-materialization effect ran; the complete restart contract, schemas,
+  failure taxonomy, mutation matrix, live authorization gates, rollback, and deferrals remain in the active
+  R3 plan.
 - Authorized attempt 2 is retained at
   `/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json`, SHA-256 `319b3cf4...a9b3e`. Its exact
   `323b4e21...a079` candidate passed both host cases and failed both reader cases before prompt acceptance

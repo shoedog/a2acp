@@ -890,13 +890,16 @@ control. Focused coverage must include:
    evidence. Do not change the pinned manifest/baseline, production configs/locks/Containerfiles, support
    matrix, or changelog.
 
-Implementation cursor on 2026-07-16: slice 1 is implemented on this branch. It adds strict recipe,
-resolution, resolved-binding, canary-outcome, acknowledgement, and unresolved-floating admission
-contracts, but deliberately has no registry/runtime/materialization executor. Focused gates are **7 / 0**
-resolution-contract tests, **17 / 0** compatibility CLI tests, and **49 / 0** compatibility unit tests;
-the complete `a2a-bridge` package gate is **470 passed / 0 failed / 11 ignored** across 16 groups, and
-warnings-denied all-target Clippy is green. The ignored tests are the pre-existing explicitly live Kiro and
-multi-bridge cases. No provider, registry, runtime, container, or output-materialization effect ran.
+Implementation cursor on 2026-07-16: slices 1-3 are implemented. `1c1115cb` defines the strict
+recipe/resolution contracts and the five recorded red-before-green boundaries; `0c25686c` adds the
+provider-free typed package/image/config materializer and atomic private bundle; `e159915` adds exact
+pre-provider revalidation, same-session bounded catalog evidence, floating pass/fail/unknown truth, and
+independent floating-to-pinned comparison while preserving old smoke-v2 fallback compatibility. Slice 4 is
+in progress with the four-case recipe and stable operator runbook. Latest focused gates are resolution
+**32 / 0**, compatibility unit **53 / 0**, compatibility CLI **20 / 0**, ACP same-session catalog **1 / 0**,
+smoke catalog **1 / 0**, and additive fallback schema **1 / 0**; workspace all-target check is green. The
+current full package/workspace, Clippy, release, hygiene, Linux/Rust 1.94, and review closure gates remain to
+run. No provider, registry, runtime, container, model-discovery, or output-materialization effect ran.
 
 Each commit must build and keep existing pinned behavior green. Focused tests run first; final closure runs
 format/diff, workspace check, warnings-denied all-target Clippy, the full workspace suite with exact totals,
@@ -931,11 +934,11 @@ operator-reviewed cleanup proves no running container uses them. Automated reten
 scheduler deadlines, termination escalation, quarantine, and concurrency remain R3d. Promotion, production
 pins/baselines, support wording, release integration, and rollback exercises remain R4.
 
-**Restart point:** continue from the latest commit on `agent/reliability-r3c-floating-lane`; slice 1 is the
-effect-free contract commit and its gates are recorded above. Implement slice 2 next with only fake
-executors and provider-free package/image/materialization tests. Keep the pinned manifest and baseline
-unchanged, and do not run a real registry, runtime, container, or provider operation without the separate
-authorization described under live gates.
+**Restart point:** continue from `e159915` on `agent/reliability-r3c-floating-lane`. Finish slice 4 by
+validating and committing the four-case recipe plus stable CLI/runbook surfaces, then run the complete host
+and Linux closure inventories and the two ordered reviews. Keep the pinned manifest/baseline and every
+protected production/support input unchanged. Do not run a real registry, runtime, container, model
+discovery, or provider operation without the separate authorizations described under live gates.
 
 ## R3d — scheduling and evidence retention
 

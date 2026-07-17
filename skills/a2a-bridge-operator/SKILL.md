@@ -158,6 +158,76 @@ effective identity is exactly the requested pin. The candidate
 path, digest, and byte length are recorded in each aggregate for release review; they are not normalized
 away or treated as a baseline-owned provider pin.
 
+### Resolve, then separately run, the floating-current canary
+
+Floating-current work has three distinct evidence levels: the checked-in recipe is a request, a complete
+private resolution bundle is exact provider-free evidence, and a separately authorized aggregate is
+billable compatibility evidence. Never collapse those levels or treat `latest` as an observed version.
+
+Recipe validation is local and effect-free:
+
+```bash
+./target/release/a2a-bridge compatibility validate \
+  --recipes compatibility/floating-current.toml
+```
+
+Resolution can contact the npm registry, inspect the requested base image, populate package/runtime caches,
+build one uniquely tagged disposable image, and write a private bundle. It does not start an adapter or
+provider session, call `models`, read/copy credentials, replace a shared tag, or authorize a later prompt.
+Require explicit operator authorization for those exact registry/image effects, selected cases, recipe
+bytes, owner, runtime, candidate binary, and a new output directory outside every normal or bare Git
+repository:
+
+```bash
+evidence_root="$(mktemp -d /private/tmp/a2a-bridge-floating.XXXXXX)"
+chmod 700 "$evidence_root"
+
+./target/release/a2a-bridge compatibility resolve \
+  --recipes compatibility/floating-current.toml \
+  --case <exact-floating-case-id> \
+  --environment-owner <exact-owner-id> \
+  --runtime docker \
+  --acknowledge-resolution-effects \
+  --out "$evidence_root/resolution"
+```
+
+`--all` is an explicit effect authorization, not a convenience default. The resolver publishes
+`resolution.json` plus an execution manifest, generated configs, exact package lock/tree/inventory evidence,
+and image provenance. Inspect that bundle and run non-billable config validation and `doctor` on the
+generated configs. Do not run `models`: the actual bounded model/effort/mode catalog is captured from the
+same authorized smoke session as its one prompt.
+
+The billable boundary requires a new, separate authorization for the exact completed resolution id,
+unchanged candidate binary, case set, owner, and aggregate budget. Invoke the same candidate bytes that
+created the bundle:
+
+```bash
+./target/release/a2a-bridge compatibility run \
+  --resolution "$evidence_root/resolution/resolution.json" \
+  --case <exact-floating-case-id> \
+  --environment-owner <exact-owner-id> \
+  --acknowledge-billable \
+  --out "$evidence_root/floating-aggregate.json"
+
+./target/release/a2a-bridge compatibility compare \
+  --current "$evidence_root/floating-aggregate.json" \
+  --mode floating-to-pinned
+```
+
+`--all-resolved` is likewise an explicit billable selection. Immediately before each provider process,
+the runner revalidates the recipe, resolution, execution manifest, candidate/config/package/image identities,
+owner/platform/prerequisites, and remaining budget. It never repairs or re-resolves drift. A floating pass
+requires exact `PONG`, clean terminal and cleanup evidence, intact resolved bindings, and a safe same-session
+catalog. Definite completed smoke failure is `candidate_fail`; missing/unsafe evidence, drift, cancellation,
+budget exhaustion, or infrastructure/publication failure is `candidate_unknown`. Either makes the aggregate
+unsuccessful.
+
+Comparison reports adapter, nested CLI, base/image, catalog additions/removals/current/configurable values,
+outcome, auth, capability, phase, terminal, and diagnostic dimensions independently. It never writes the
+pinned manifest/baseline, production configs/locks/Containerfiles, support docs, or the running operator.
+Retain complete bundles and their unique tags until an operator proves that no running container uses them;
+R3c has no automatic or broad cleanup command.
+
 ### Plan, then explicitly run, a trusted host verification
 
 After a failed read-only container smoke, use the local planner only when its artifact is complete schema
