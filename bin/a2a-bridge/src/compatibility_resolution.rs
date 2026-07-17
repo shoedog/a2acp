@@ -23,6 +23,7 @@ const MAX_RESOLUTION_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LOCK_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
+const MAX_ARCHIVE_METADATA_EXTENSION_BYTES: u64 = MAX_SETTINGS_BYTES;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 128;
 const MAX_TEXT_BYTES: usize = 4096;
@@ -3061,12 +3062,47 @@ fn portable_tree_path_key(label: &str, path: &Path) -> Result<String, String> {
     Ok(text.to_ascii_lowercase())
 }
 
+fn preflight_package_archive_metadata(
+    archive: &File,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    let mut archive_file = archive
+        .try_clone()
+        .map_err(|_| "package archive cannot be reopened")?;
+    archive_file
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|_| "package archive cannot be rewound")?;
+    let decoder = flate2::read::GzDecoder::new(DeadlineReader {
+        inner: archive_file,
+        deadline,
+    });
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive
+        .entries()
+        .map_err(|_| "package archive is not a readable tarball")?
+        .raw(true);
+    for entry in entries {
+        let entry = entry.map_err(|_| "package archive entry is unreadable")?;
+        let entry_type = entry.header().entry_type();
+        if (entry_type.is_gnu_longname()
+            || entry_type.is_gnu_longlink()
+            || entry_type.is_pax_local_extensions()
+            || entry_type.is_pax_global_extensions())
+            && entry.size() > MAX_ARCHIVE_METADATA_EXTENSION_BYTES
+        {
+            return Err("package archive metadata extension exceeds its byte limit".into());
+        }
+    }
+    Ok(())
+}
+
 fn package_archive_plan(
     archive: &File,
     package: &LockedPackage,
     deadline: std::time::Instant,
     limits: &ResolutionLimits,
 ) -> Result<Vec<ArchiveEntryPlan>, String> {
+    preflight_package_archive_metadata(archive, deadline)?;
     let mut archive_file = archive
         .try_clone()
         .map_err(|_| "package archive cannot be reopened")?;
@@ -3112,10 +3148,7 @@ fn package_archive_plan(
         let kind = if entry_type.is_dir() {
             ArchiveEntryKind::Directory
         } else if entry_type.is_file() {
-            let size = entry
-                .header()
-                .size()
-                .map_err(|_| "package archive file size is malformed")?;
+            let size = entry.size();
             planned_bytes = planned_bytes
                 .checked_add(size)
                 .ok_or("package archive declared-byte count overflowed")?;
@@ -3494,6 +3527,8 @@ fn materialize_package_archive(
     state: &mut TreeMaterializationState,
     deadline: std::time::Instant,
 ) -> Result<(), ResolutionFailureCode> {
+    preflight_package_archive_metadata(archive, deadline)
+        .map_err(|_| ResolutionFailureCode::PackageTreeDrift)?;
     let layout = package_archive_layout(package, plan)?;
     for directory in &layout.required_directories {
         if state.occupied.contains(directory) {
@@ -3581,6 +3616,9 @@ fn materialize_package_archive(
         match kind {
             ArchiveEntryKind::Directory => {}
             ArchiveEntryKind::File { size, executable } => {
+                if entry.size() != *size {
+                    return Err(ResolutionFailureCode::PackageTreeDrift);
+                }
                 let mode = if *executable { 0o700 } else { 0o600 };
                 let mut output = parent
                     .create_new_file(name, mode, "compatibility package archive file")
@@ -7080,6 +7118,10 @@ image = "reader-current"
         File(&'a str, &'a [u8], u32),
         Symlink(&'a str, &'a str),
         HardLink(&'a str, &'a str),
+        GnuLongName(&'a [u8]),
+        GnuLongLink(&'a [u8]),
+        PaxLocal(&'a [u8]),
+        PaxGlobal(&'a [u8]),
     }
 
     fn test_package_archive(entries: &[TestArchiveEntry<'_>]) -> File {
@@ -7139,6 +7181,42 @@ image = "reader-current"
                     header.set_cksum();
                     archive
                         .append_data(&mut header, format!("package/{path}"), std::io::empty())
+                        .unwrap();
+                }
+                TestArchiveEntry::GnuLongName(bytes) => {
+                    header.set_entry_type(tar::EntryType::new(b'L'));
+                    header.set_size(bytes.len() as u64);
+                    header.set_mode(0o600);
+                    header.set_cksum();
+                    archive
+                        .append_data(&mut header, "././@LongLink", *bytes)
+                        .unwrap();
+                }
+                TestArchiveEntry::GnuLongLink(bytes) => {
+                    header.set_entry_type(tar::EntryType::new(b'K'));
+                    header.set_size(bytes.len() as u64);
+                    header.set_mode(0o600);
+                    header.set_cksum();
+                    archive
+                        .append_data(&mut header, "././@LongLink", *bytes)
+                        .unwrap();
+                }
+                TestArchiveEntry::PaxLocal(bytes) => {
+                    header.set_entry_type(tar::EntryType::new(b'x'));
+                    header.set_size(bytes.len() as u64);
+                    header.set_mode(0o600);
+                    header.set_cksum();
+                    archive
+                        .append_data(&mut header, "PaxHeaders/current", *bytes)
+                        .unwrap();
+                }
+                TestArchiveEntry::PaxGlobal(bytes) => {
+                    header.set_entry_type(tar::EntryType::new(b'g'));
+                    header.set_size(bytes.len() as u64);
+                    header.set_mode(0o600);
+                    header.set_cksum();
+                    archive
+                        .append_data(&mut header, "GlobalPaxHeaders/current", *bytes)
                         .unwrap();
                 }
             }
@@ -7930,6 +8008,210 @@ image = "reader-current"
             package_archive_plan(&archive, &package, test_archive_deadline(), &one_byte_short,)
                 .unwrap_err()
                 .contains("declared-byte limit")
+        );
+    }
+
+    #[test]
+    fn package_archive_metadata_extensions_are_bounded_before_non_raw_parse() {
+        let package = locked_package_for_test("node_modules/test");
+        let oversized = vec![b'a'; MAX_SETTINGS_BYTES as usize + 1];
+        let oversized_archive = test_named_package_archive(
+            "test",
+            "1.0.0",
+            &[
+                TestArchiveEntry::GnuLongName(&oversized),
+                TestArchiveEntry::File("file", b"body", 0o600),
+            ],
+        );
+        assert!(
+            package_archive_plan(
+                &oversized_archive,
+                &package,
+                test_archive_deadline(),
+                &tree_limits(),
+            )
+            .unwrap_err()
+            .contains("metadata extension exceeds its byte limit"),
+            "oversized hidden metadata must be rejected before non-raw parsing"
+        );
+    }
+
+    #[test]
+    fn package_archive_metadata_extension_limit_accepts_exact_edge() {
+        let exact = vec![b'a'; MAX_ARCHIVE_METADATA_EXTENSION_BYTES as usize];
+        for extension in [
+            TestArchiveEntry::GnuLongName(&exact),
+            TestArchiveEntry::GnuLongLink(&exact),
+            TestArchiveEntry::PaxLocal(&exact),
+            TestArchiveEntry::PaxGlobal(&exact),
+        ] {
+            let archive = test_named_package_archive(
+                "test",
+                "1.0.0",
+                &[extension, TestArchiveEntry::File("file", b"body", 0o600)],
+            );
+            preflight_package_archive_metadata(&archive, test_archive_deadline()).unwrap();
+        }
+    }
+
+    #[test]
+    fn package_archive_metadata_extension_limit_rejects_each_type_one_over() {
+        let oversized = vec![b'a'; MAX_ARCHIVE_METADATA_EXTENSION_BYTES as usize + 1];
+        for extension in [
+            TestArchiveEntry::GnuLongName(&oversized),
+            TestArchiveEntry::GnuLongLink(&oversized),
+            TestArchiveEntry::PaxLocal(&oversized),
+            TestArchiveEntry::PaxGlobal(&oversized),
+        ] {
+            let archive = test_named_package_archive(
+                "test",
+                "1.0.0",
+                &[extension, TestArchiveEntry::File("file", b"body", 0o600)],
+            );
+            assert_eq!(
+                preflight_package_archive_metadata(&archive, test_archive_deadline()).unwrap_err(),
+                "package archive metadata extension exceeds its byte limit"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_archive_materialization_rechecks_metadata_bound_before_writes() {
+        let parent = tempfile::tempdir().unwrap();
+        let output = parent.path().join("bundle");
+        let publisher =
+            BundlePublisher::create_with_setup(&output, |path| Ok(setup_resolution(path))).unwrap();
+        let tree = publisher
+            .create_directory(OsStr::new("tree"), "test package tree")
+            .unwrap();
+        create_synced_file(
+            &tree,
+            OsStr::new("package.json"),
+            0o600,
+            b"x",
+            "test package metadata",
+        )
+        .unwrap();
+        create_synced_file(
+            &tree,
+            OsStr::new("package-lock.json"),
+            0o600,
+            b"y",
+            "test package lock",
+        )
+        .unwrap();
+        let limits = tree_limits();
+        let mut state = TreeMaterializationState::new(&tree, &limits).unwrap();
+        let package = locked_package_for_test("node_modules/test");
+        let plan = vec![ArchiveEntryPlan {
+            relative_path: PathBuf::from("file"),
+            kind: ArchiveEntryKind::File {
+                size: 4,
+                executable: false,
+            },
+        }];
+        let oversized = vec![b'a'; MAX_ARCHIVE_METADATA_EXTENSION_BYTES as usize + 1];
+        let archive = test_named_package_archive(
+            "test",
+            "1.0.0",
+            &[
+                TestArchiveEntry::GnuLongName(&oversized),
+                TestArchiveEntry::File("file", b"body", 0o600),
+            ],
+        );
+
+        assert_eq!(
+            materialize_package_archive(
+                &archive,
+                &package,
+                &plan,
+                &mut state,
+                test_archive_deadline(),
+            )
+            .unwrap_err(),
+            ResolutionFailureCode::PackageTreeDrift
+        );
+        assert!(!tree.canonical_path().join("node_modules").exists());
+    }
+
+    #[test]
+    fn package_archive_uses_pax_effective_file_size() {
+        let package = locked_package_for_test("node_modules/test");
+        let pax_archive = test_named_package_archive(
+            "test",
+            "1.0.0",
+            &[
+                TestArchiveEntry::PaxLocal(b"10 size=4\n"),
+                TestArchiveEntry::File("file", b"12345678", 0o600),
+            ],
+        );
+        let plan = package_archive_plan(
+            &pax_archive,
+            &package,
+            test_archive_deadline(),
+            &tree_limits(),
+        )
+        .unwrap();
+        assert!(plan.iter().any(|entry| {
+            entry.relative_path == Path::new("file")
+                && matches!(entry.kind, ArchiveEntryKind::File { size: 4, .. })
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_archive_materializes_only_the_pax_effective_file_size() {
+        let parent = tempfile::tempdir().unwrap();
+        let output = parent.path().join("bundle");
+        let publisher =
+            BundlePublisher::create_with_setup(&output, |path| Ok(setup_resolution(path))).unwrap();
+        let tree = publisher
+            .create_directory(OsStr::new("tree"), "test package tree")
+            .unwrap();
+        create_synced_file(
+            &tree,
+            OsStr::new("package.json"),
+            0o600,
+            b"x",
+            "test package metadata",
+        )
+        .unwrap();
+        create_synced_file(
+            &tree,
+            OsStr::new("package-lock.json"),
+            0o600,
+            b"y",
+            "test package lock",
+        )
+        .unwrap();
+        let archive = test_named_package_archive(
+            "test",
+            "1.0.0",
+            &[
+                TestArchiveEntry::PaxLocal(b"10 size=4\n"),
+                TestArchiveEntry::File("file", b"12345678", 0o600),
+            ],
+        );
+        let package = locked_package_for_test("node_modules/test");
+        let limits = tree_limits();
+        let plan =
+            package_archive_plan(&archive, &package, test_archive_deadline(), &limits).unwrap();
+        let mut state = TreeMaterializationState::new(&tree, &limits).unwrap();
+        reserve_complete_package_tree([(&package, plan.as_slice())], &mut state, &limits).unwrap();
+
+        materialize_package_archive(
+            &archive,
+            &package,
+            &plan,
+            &mut state,
+            test_archive_deadline(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(tree.canonical_path().join("node_modules/test/file")).unwrap(),
+            b"1234"
         );
     }
 
