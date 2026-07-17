@@ -4066,7 +4066,7 @@ fn validate_bound_execution(
                 != image.map(|image| image.final_image_id.as_str())
             || generated.config != expected_config
             || resolve_case_path(&execution.canonical_path, &generated.config)
-                != PathBuf::from(&resolved_case.generated_config.canonical_path)
+                != Path::new(&resolved_case.generated_config.canonical_path)
             || generated.agent != baseline.agent
             || generated.model != baseline.model
             || generated.effort != baseline.effort

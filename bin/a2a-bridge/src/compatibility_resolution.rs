@@ -3564,6 +3564,9 @@ fn parse_image_inspect(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// The repeated suffix is deliberate operator vocabulary: every variant identifies the exact identity
+// that changed, while `wire` preserves a distinct stable admission code for that drift family.
+#[allow(clippy::enum_variant_names)]
 pub(super) enum RevalidationFailure {
     ResolutionArtifactChanged,
     RecipeChanged,
