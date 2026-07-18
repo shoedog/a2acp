@@ -303,6 +303,10 @@ running on supplied warm sessions — gives one resume story and kills a large d
 *Value:* removes the biggest structural fork in the codebase. *Design:* big and risky (rated "L5", codex
 confidence 93 that it's viable); needs its own spec → dual-review → live-gate loop; do it only after the warm
 pool (H2-2) and controller cleanup (H0-2) stabilize the pieces it would unify.
+See the runtime-workflows + Agent/Provider-split RFC ([`rfc-agents-workflows.md`](rfc-agents-workflows.md),
+[diagram](rfc-agents-workflows-diagram.html), and [Part II — memory/delegation](rfc-agents-workflows-part2-memory-delegation.md)),
+which concludes those capability shifts are **orthogonal to L5** and can land first; it also surfaced a
+Phase-0 registry defect ([issue #35](https://github.com/shoedog/a2acp/issues/35)).
 
 ### H3-2 ★★ A2A federation v1 (L1)
 Signed Agent Cards, per-caller identity (not just a forwarded bearer), TLS/authz, multi-tenancy. Called out
