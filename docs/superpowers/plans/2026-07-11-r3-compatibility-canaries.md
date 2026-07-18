@@ -1106,7 +1106,7 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 
 - **Branch:** `agent/reliability-r3d-scheduled-canaries`
 - **Base:** merged R3c main `983398427c9f04861a2f1da501a7650c4a1cdd80`
-- **Status:** design of record revised from owner decisions and seven exact-commit Sol reviews;
+- **Status:** design of record revised from owner decisions and eight exact-commit Sol reviews;
   implementation not started; fresh Sol/xhigh closure review pending
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
@@ -1170,6 +1170,13 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   SHA-256 `b6f300b6598d38cebeab50d4b8ef9d4a45bad854e14bd53ab0344ab7f965d7a2`. This revision keeps a
   first transient failure `in_progress` and terminalizes the same check only on immutable failure or the
   separately authorized confirmation's pass/second identical failure.
+- **Seventh closure review:** one fresh one-node bridge-mediated Sol/xhigh/read-only review of exact
+  `e0cc7dca4f5738d8f717921fcaba4eda86b6fd22` marked the transient-confirmation mechanism `PARTIAL`,
+  found no new `WRONG` or other regression, then returned one multi-case convergence `SMELL` and
+  `R3D DESIGN: REVISE`. Its fixed output is
+  `/private/tmp/a2a-bridge-r3d-sol-closure-e0cc7dc.T4ns7v/review.md`, mode `0600`, 11,693 bytes,
+  SHA-256 `de6fa68c1e893e4a02376581dcabb8b9302b2a36e3ed4ec01e3cfeacdd6936ea`. This revision adds the
+  complete ordered due-set reducer and pass/pass, pass/fail, crash, and SHA-regeneration fixtures.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
 standing authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
@@ -1780,6 +1787,13 @@ R3d's atomic guard is the required context on that result:
    terminal pass may satisfy, terminal failure fails, and confirmation-due/unknown/blocked/expired/invalid-
    evidence stays pending. Publication durably creates the one terminal GitHub-consumption record under the
    then-current policy, authority, and freshness bucket before posting.
+
+   Multiple due cases use one deterministic reducer over the complete ordered due-set vector. Success waits
+   until every case is terminal pass. Any typed immutable or confirmed terminal case failure fails fast;
+   remaining unstarted confirmations become `not_run(aggregate_terminal)` and consume no nonce, attempt, or
+   budget. Otherwise the aggregate remains `in_progress`, including when one case has recovered but another
+   remains `confirmation_due`, blocked, or unknown. The one terminal consumption binds the due-set vector,
+   every attempt/evidence record present at the decision, and every explicit not-run reason.
 6. Immediately before consumption and publication, the publisher re-fetches PR metadata and the canonical
    test-merge ref plus the exact active branch-protection/ruleset state. In one guarded observation it proves
    the SHA, base, head, ordered parents, and tree still match; strict mode remains enabled; the dedicated
@@ -1815,6 +1829,12 @@ the publisher prepares one terminal success consumption referencing the complete
 the same check-run id. If the identical complete failure repeats, it prepares terminal failure and PATCHes
 that id. A typed immutable failure may terminalize immediately. If the test-merge identity changes first,
 the old confirmation state becomes historical and cannot authorize work for the replacement SHA.
+
+With multiple confirmation-due cases, each confirmed pass is journaled without preparing terminal success
+until the reducer sees all passes. Crash/restart resumes the remaining ordered set without duplicating the
+resolved case. A terminal failure stops later admissions under the fail-fast rule above. Test-merge
+regeneration historicalizes the entire partial vector and leaves the old check nonterminal; no unresolved
+case or nonce transfers to the replacement SHA.
 
 Recovery never replays provider work or creates another consumption. Before any retry it GETs the persisted
 check-run id. An exact terminal match is confirmed without another write. An exact `in_progress` result may
@@ -1997,6 +2017,14 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   separately authorized confirmation pass terminalizes the same check as success, while a second identical
   complete failure suppresses and terminalizes it as failure. Authority/quarantine/budget states never enter
   the waste machine or terminalize the check.
+- Multi-case confirmation fakes put two ordered cases in `confirmation_due`. Pass/pass resolves in both
+  orders; a crash after the first pass preserves `in_progress`, no terminal consumption, the resolved case,
+  and the one still-unused nonce/charge, then the second pass creates exactly one success consumption binding
+  all four attempts. Pass/identical-second-failure resolves in both orders: pass-first binds all four attempts
+  at the later failure, while failure-first terminalizes immediately and proves the other confirmation is
+  `not_run(aggregate_terminal)` with zero second nonce/charge. Regeneration after one pass historicalizes the
+  entire old vector, leaves its check nonterminal, and transfers no case/nonce to the new SHA. Member/order,
+  crash, duplicate-attempt, and incomplete-vector mutations never prepare success or lose a pending case.
 - Fake-clock tests cover DST, sleep/missed window, no catch-up, duplicate tick, debounce, coalesced commits,
   test-merge-ref creation/deletion/regeneration, changed base or head, the contained-base/stable-head
   change-then-revert construction, unavailable local scheduler, required-check timeout, and a complete
@@ -2109,17 +2137,18 @@ rollback target. Any code revert is a normal reviewed PR.
 
 **Restart point:** work from branch `agent/reliability-r3d-scheduled-canaries` based on merged main
 `98339842`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
-exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, and exact-`c241087` Sol reviews are retained at the
-paths/hashes above.
+exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, and exact-`e0cc7dc` Sol reviews are
+retained at the paths/hashes above.
 The Fable six `WRONG`/thirteen `SMELL`; first-Sol four `WRONG`/seven `SMELL`; first-closure three
 `WRONG`/three `SMELL`; second-closure two `WRONG`/three `SMELL`; third-closure two `WRONG`/zero new
-`SMELL`; fourth-closure one `WRONG`/one `SMELL`; fifth-closure zero `WRONG`/one `SMELL`; and sixth-closure
-one `WRONG`/zero new `SMELL` sets are folded into D1-D10 and the slices/gates above. The sixth closure marked
-the inherited outbox finding fixed before finding the transient-confirmation regression. All D1-D10 owner
+`SMELL`; fourth-closure one `WRONG`/one `SMELL`; fifth-closure zero `WRONG`/one `SMELL`; sixth-closure
+one `WRONG`/zero new `SMELL`; and seventh-closure zero new `WRONG`/one `SMELL` sets are folded into D1-D10
+and the slices/gates above. The seventh closure found only the missing multi-case convergence proof. All
+D1-D10 owner
 decisions were approved on 2026-07-17. No implementation, schema, timer, private authority, live
 characterization, model discovery, registry/image effect, compatibility provider turn, GitHub check
 mutation, or production-operator action has been performed by this design fold; the only new provider
-activity was the seven recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
+activity was the eight recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
 this exact committed revision. If approved, publish the non-draft docs PR and start R3d0 only after merge.
 Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 
