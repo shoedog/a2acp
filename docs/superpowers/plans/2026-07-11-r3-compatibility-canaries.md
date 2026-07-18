@@ -4,8 +4,9 @@
   **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at
   `983398427c9f04861a2f1da501a7650c4a1cdd80` by PR #33; R3d design is **APPROVED / MERGED**
   at exact design head `b54840a017b87521677f1f95c3f7be69de55361d` by PR #37, merge
-  `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is **REMEDIATED / CLOSURE REVIEW PENDING** on
-  `agent/reliability-r3d0-foundation`; no live/timer/operator effect is in scope. Nine pinned rows are
+  `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is **REMEDIATED AGAIN / SECOND CLOSURE REVIEW
+  PENDING** on `agent/reliability-r3d0-foundation` at exact code/foundation-doc commit
+  `e3321db5c052d7f8a9d549b23cea6aa9a7df3784`; no live/timer/operator effect is in scope. Nine pinned rows are
   implemented. Exact
   `c458045cf3d0923457519e253d22dd545363f98d` Sol/xhigh review approved the pre-incident deterministic
   tree. Authorized attempt 1 remains non-promotable stale-auth evidence; authorized attempt 2 passed both
@@ -1112,7 +1113,8 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 - **Base:** merged R3d design main `6eeea6ce553b792dc92cef95ee45f2234f7afe4e` (PR #37)
 - **Status:** design of record **APPROVED / MERGED** at exact design head
   `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 default-off policy/schema implementation is
-  **REMEDIATED / CLOSURE REVIEW PENDING** with no live/timer/operator effects
+  **REMEDIATED AGAIN / SECOND CLOSURE REVIEW PENDING** at exact code/foundation-doc commit
+  `e3321db5c052d7f8a9d549b23cea6aa9a7df3784`, with no live/timer/operator effects
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
   `/Users/wesleyjinks/.claude/plans/r3d-clean-room-adversarial-deep-hollerith.md`, mode `0644`, 40,180
@@ -1239,6 +1241,28 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   SHA-256 `4eba120a5cecce94c4afca10d5e9ecd4da4047136a8f638d927675aa4328c249`. This exact commit is
   the approved design-of-record boundary; the following status-only fold records that verdict without changing
   a mechanism, schema contract, slice, test obligation, or live gate.
+- **Initial R3d0 implementation review:** one fresh bridge-mediated Sol/xhigh/read-only review of exact
+  implementation commit `e7e5fa14da127511c080e802625afbcc455d94e1` returned eleven `WRONG`, two
+  `SMELL`, and `R3D0 IMPLEMENTATION: REVISE`. Its retained output is
+  `/private/tmp/a2a-bridge-r3d0-sol-review-e7e5fa1/review.md`, mode `0644`, 23,542 bytes, SHA-256
+  `ad2c5207b654269b2599b360aa88067521ef83abc9e09843a88bee5e9de57de5`. Exact remediation
+  commit `f4f242fdc48827cb56d511e1037fe2ec46d9d4fd` was the first remediation attempt against those
+  thirteen findings.
+- **First R3d0 implementation closure review:** one fresh bridge-mediated Sol/xhigh/read-only review of exact
+  `f4f242fdc48827cb56d511e1037fe2ec46d9d4fd` marked six inherited items `FIXED`, seven `PARTIAL`,
+  found two new `WRONG` and two new `SMELL`, and returned `R3D0 IMPLEMENTATION: REVISE`. Its retained
+  output is `/private/tmp/a2a-bridge-r3d0-sol-closure-f4f242f/review.md`, mode `0644`, 25,322 bytes,
+  SHA-256 `110b9d2841c4f077a0b96fac19d7ece5cf07bad850714bbd787597fa330ba90c`.
+  Exact code/foundation-doc commit `e3321db5c052d7f8a9d549b23cea6aa9a7df3784` folds all seven required
+  remediation families: repository-wide nonnull Git object format; structured secret and exact config/effect
+  semantics; status/hold/evidence coherence; file-object generation identity; reviewed characterization
+  provenance; immutable chained publication identity; and versioned hash domains with targeted regressions
+  and reconciled docs.
+  Focused gates are **6/0** foundation, **22/0** schema, and **21/0** R3d0 CLI; the serial workspace is
+  **2,214/0/12 ignored** across **55** reported test binaries. Check, warnings-denied Clippy, locked release,
+  dependency policy, hygiene **37/7**, pinned-manifest **9**, floating-recipe **4**, and schedule-foundation
+  validation are green. The next action is a fresh Sol/xhigh closure review of the exact cursor-fold head;
+  the one Opus release/compatibility lens remains gated on Sol approval.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
 tagged effect authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
@@ -2525,17 +2549,21 @@ identity and inert record schemas/validators, plus routing/foundation docs. Exac
 `e7e5fa1` received a bridge-mediated Sol/xhigh/read-only review with eleven `WRONG`, two `SMELL`, and
 `R3D0 IMPLEMENTATION: REVISE`; its retained report is
 `/private/tmp/a2a-bridge-r3d0-sol-review-e7e5fa1/review.md`, SHA-256
-`ad2c5207b654269b2599b360aa88067521ef83abc9e09843a88bee5e9de57de5`. The current remediation closes
-all finding families and passes foundation units **3/0**, schema units **21/0**, R3d0 CLI integration
-**19/0**, and the full serial workspace **2,208/0/12 ignored** across **55** reported test binaries;
-workspace check, warnings-denied Clippy, locked release build, repository hygiene, and all three compatibility
-validators are green. The current bundle SHA-256 is
-`7f05ae73d34381814afce2ce21c561a19df145bcb1916f47cfc957d293e8a8fa`. No timer, private authority
+`ad2c5207b654269b2599b360aa88067521ef83abc9e09843a88bee5e9de57de5`. Exact-`f4f242f` closure
+review marked six inherited items `FIXED`, seven `PARTIAL`, found two new `WRONG` and two `SMELL`, and
+returned `REVISE`; its retained report is `/private/tmp/a2a-bridge-r3d0-sol-closure-f4f242f/review.md`,
+SHA-256 `110b9d2841c4f077a0b96fac19d7ece5cf07bad850714bbd787597fa330ba90c`. Exact
+code/foundation-doc commit `e3321db5c052d7f8a9d549b23cea6aa9a7df3784` folds all seven required
+remediation families and passes foundation units **6/0**, schema units **22/0**, R3d0 CLI integration
+**21/0**, and the full serial workspace **2,214/0/12 ignored** across **55** reported test binaries;
+workspace check, warnings-denied Clippy, locked release build, dependency policy, repository hygiene, and
+manifest/recipe/schedule-foundation validators are green. The current profile-policy bundle SHA-256 is
+`5e4b6bcc138d5304d6a0506f5ae3f35fad9c2c296e89ece78d141fa44d32ef69`. No timer, private authority
 issuance, live characterization, model discovery, credential access, registry/image effect, compatibility
-provider turn, GitHub check mutation, or production-operator action has been performed. Next: commit and
-freeze this remediated head for a fresh Sol/xhigh closure review; only after approval run one Opus release/
-compatibility lens, fold any findings, rerun the complete deterministic gates, and publish its non-draft PR.
-Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
+provider turn, GitHub check mutation, or production-operator action has been performed. Next: freeze this
+cursor fold and run a fresh Sol/xhigh closure review of its exact head; only after approval run one Opus
+release/compatibility lens, fold any findings, rerun the complete deterministic gates, and publish its non-
+draft PR. Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 
 ## R3e — OpenRouter provider expansion
 
