@@ -172,7 +172,9 @@ plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
   R3d does not claim GitHub can recheck local freshness or authority at the later merge click. Retain a
   coalesced main run as the integration backstop. Terminal publication updates one persisted, App-owned
   `in_progress` check run through a durable outbox; crash recovery observes that exact remote id before any
-  same-object update and never replays provider work or creates a second terminal check.
+  same-object update and never replays provider work or creates a second terminal check. A first transient
+  failure remains `in_progress`; only a typed immutable failure, the authorized confirmation's pass, or its
+  second identical complete failure terminalizes that same check.
 - Defer representative review scheduling until a separate owner-reviewed design defines a fixed Tier-2
   read-only fixture, prompt, scoring, caps, provider rotation, and evidence boundary. Review content is not
   compatibility or promotion evidence.

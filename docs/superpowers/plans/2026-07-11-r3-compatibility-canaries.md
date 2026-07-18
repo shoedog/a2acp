@@ -1106,7 +1106,7 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 
 - **Branch:** `agent/reliability-r3d-scheduled-canaries`
 - **Base:** merged R3c main `983398427c9f04861a2f1da501a7650c4a1cdd80`
-- **Status:** design of record revised from owner decisions and six exact-commit Sol reviews;
+- **Status:** design of record revised from owner decisions and seven exact-commit Sol reviews;
   implementation not started; fresh Sol/xhigh closure review pending
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
@@ -1162,6 +1162,14 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   SHA-256 `b3293a39c1c0af10b83080b55fe9e45c266873b01d26784d96fa2cad9d31a796`. This revision adds
   a single-check-run GitHub publication outbox with exact-id reconciliation and no provider, consumption,
   or terminal-check replay.
+- **Sixth closure review:** one fresh one-node bridge-mediated Sol/xhigh/read-only review of exact
+  `c241087b02989e347a812c90b1ded1ff2f21aa01` marked the inherited outbox finding `FIXED` and found no
+  new standalone `SMELL`, then found one transient-confirmation regression `WRONG` and returned
+  `R3D DESIGN: REVISE`. Its fixed output is
+  `/private/tmp/a2a-bridge-r3d-sol-closure-c241087.Z5Mfk3/review.md`, mode `0600`, 15,886 bytes,
+  SHA-256 `b6f300b6598d38cebeab50d4b8ef9d4a45bad854e14bd53ab0344ab7f965d7a2`. This revision keeps a
+  first transient failure `in_progress` and terminalizes the same check only on immutable failure or the
+  separately authorized confirmation's pass/second identical failure.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
 standing authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
@@ -1762,12 +1770,16 @@ R3d's atomic guard is the required context on that result:
    minimal low-cost substitute is allowed only for a classifier-proven provider-generic seam whose mutation
    tests demonstrate that model-specific behavior is unreachable.
 5. The publisher records evidence and posts the dedicated required conclusion only on that exact test-merge
-   SHA. `success` requires an executed passing due set or locally proved `not_applicable` classification;
-   `failure` means an executed support failure or invalid candidate; every other state remains
-   `in_progress/pending`. GitHub `neutral`/`skipped` never satisfies the contract. A consumed artifact counts
-   only when it proves the same test-merge SHA/fingerprint and equal-or-stronger purpose: pass may satisfy,
-   fail fails, and unknown/blocked/expired/invalid stays pending. Publication durably creates the terminal
-   GitHub-consumption record under the then-current policy, authority, and freshness bucket before posting.
+   SHA. `success` requires an executed passing due set or locally proved `not_applicable` classification.
+   `failure` requires a typed immutable/invalid-candidate failure or the second identical complete failure
+   from the one authorized confirmation. A first clean transient/untyped `candidate_fail` records its attempt,
+   evidence, charge, and `confirmation_due` state but leaves the single check run `in_progress`; it creates no
+   terminal GitHub-consumption record. Unknown, blocked, expired, invalid-evidence, and due-but-not-run states
+   likewise remain `in_progress/pending`. GitHub `neutral`/`skipped` never satisfies the contract. A consumed
+   artifact counts only when it proves the same test-merge SHA/fingerprint and equal-or-stronger purpose:
+   terminal pass may satisfy, terminal failure fails, and confirmation-due/unknown/blocked/expired/invalid-
+   evidence stays pending. Publication durably creates the one terminal GitHub-consumption record under the
+   then-current policy, authority, and freshness bucket before posting.
 6. Immediately before consumption and publication, the publisher re-fetches PR metadata and the canonical
    test-merge ref plus the exact active branch-protection/ruleset state. In one guarded observation it proves
    the SHA, base, head, ordered parents, and tree still match; strict mode remains enabled; the dedicated
@@ -1786,13 +1798,23 @@ safety hold and require explicit operator reconciliation; recovery never blindly
 
 Terminal publication uses a crash-consistent outbox under the publisher lock. Its durable lifecycle is
 `create_intent -> create_unknown|remote_pending -> prepared -> update_unknown -> remotely_observed ->
-confirmed`; `create_unknown` can move to `remote_pending` only after the unique remote match above. The key
-binds terminal consumption id, repository/PR/test-merge identity, check-run/external ids, context/App source,
-desired conclusion, evidence hash, and the final guarded observation/rule hashes. `prepared` means the
-terminal consumption and exact desired update are durable. The publisher then PATCHes that already-bound
-check-run id; it never creates a terminal check. A successful GET of that exact id showing the expected SHA/
+confirmed`; `create_unknown` can move to `remote_pending` only after the unique remote match above. The stable
+outbox identity binds repository/PR/test-merge identity, check-run/external ids, and context/App source.
+`prepared` atomically adds the terminal consumption id, desired conclusion, complete evidence set/hash, and
+final guarded observation/rule hashes, so the terminal consumption and exact desired update are durable.
+The publisher then PATCHes that already-bound check-run id; it never creates a terminal check. A successful
+GET of that exact id showing the expected SHA/
 name/App, external id, conclusion, and evidence details moves through `remotely_observed` to a durable local
 `confirmed` record.
+
+The confirmation lifecycle never replaces the remote check object. The first transient attempt leaves its
+outbox at `remote_pending` and its check `in_progress`; crash recovery restores `confirmation_due` from the
+durable attempt/evidence/ledger records without another provider call. A separately authorized later-window
+confirmation has its own attempt id, repeat nonce, and charge. If it passes and every other due case passes,
+the publisher prepares one terminal success consumption referencing the complete evidence set and PATCHes
+the same check-run id. If the identical complete failure repeats, it prepares terminal failure and PATCHes
+that id. A typed immutable failure may terminalize immediately. If the test-merge identity changes first,
+the old confirmation state becomes historical and cannot authorize work for the replacement SHA.
 
 Recovery never replays provider work or creates another consumption. Before any retry it GETs the persisted
 check-run id. An exact terminal match is confirmed without another write. An exact `in_progress` result may
@@ -1878,9 +1900,9 @@ and affected cases; complete deadline derivation; preflight results; admission l
 reservations/reconciliation; supervisor process identities/escalation/reap results; freshness observation;
 requested and characterized expected-effective identities plus the separately observed effective result;
 typed check scope (`test_merge_result`), required-rule/context/source hashes; publication-outbox id/state,
-terminal-consumption id, check-run/external ids, desired conclusion, remote-observation hash/attempts, and
-status publication result; plus evidence-index id. The dedicated context is invalid on a PR-head SHA by
-construction.
+check-run/external ids, optional terminal-consumption id and desired conclusion with typed absence before
+`prepared`, remote-observation hash/attempts, and status publication result; plus evidence-index id. The
+dedicated context is invalid on a PR-head SHA by construction.
 
 The parent publishes the sidecar even for a killed/setup-incomplete run and joins it to the runner artifact
 by run/window id and optional aggregate hash. New schedule readers validate the sidecar and unchanged
@@ -1969,9 +1991,12 @@ adversarial implementation/release lens is justified only after Sol is green, wi
 - Preflight fixtures cover OAuth runway, provider/model removal, config drift, storage pressure, runtime
   start degradation, stale price/ranking snapshot, container cleanup failure, and
   characterization/quarantine/hold states with zero provider calls.
-- Failure-disposition tests prove typed immutable failure suppresses immediately, first transient/untyped
-  `candidate_fail` becomes `confirmation_due`, a second identical complete failure suppresses, recovery
-  passes, and authority/quarantine/budget states never enter the waste machine.
+- Failure-disposition tests prove typed immutable failure suppresses and terminalizes immediately. A first
+  transient/untyped `candidate_fail` becomes `confirmation_due`, leaves the same remote check `in_progress`,
+  and creates no terminal GitHub consumption; crash/restart preserves that state without replay. One
+  separately authorized confirmation pass terminalizes the same check as success, while a second identical
+  complete failure suppresses and terminalizes it as failure. Authority/quarantine/budget states never enter
+  the waste machine or terminalize the check.
 - Fake-clock tests cover DST, sleep/missed window, no catch-up, duplicate tick, debounce, coalesced commits,
   test-merge-ref creation/deletion/regeneration, changed base or head, the contained-base/stable-head
   change-then-revert construction, unavailable local scheduler, required-check timeout, and a complete
@@ -1981,8 +2006,9 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   classifier mutations that attempt an unsafe low-cost substitution, forks/unknown authors, PR-supplied data
   that attempts to widen scope, and exact GitHub `success|failure|in_progress` mapping. Only proven
   no-impact may succeed without a provider case; every due-but-not-run fixture remains blocking. Consumed
-  exact-test-merge pass/fail/unknown fixtures map to success/failure/pending respectively; a check on a PR
-  head or superseded test-merge result never counts. Test-merge fixtures prove a base advance from `B0` to
+  exact-test-merge terminal-pass/typed-or-confirmed-terminal-fail/confirmation-due-or-unknown fixtures map to
+  success/failure/pending respectively; a check on a PR head or superseded test-merge result never counts.
+  Test-merge fixtures prove a base advance from `B0` to
   contained commit `C` with stable revert head `H` produces a distinct required result, refuse missing/
   unreadable/noncanonical refs and non-two-parent merges, and reject ref/API/base/head/parent/tree/observation
   races at final publication. A delete/recreate fixture begins with an already-published success and proves
@@ -2002,8 +2028,12 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   App/SHA/name/`external_id` and never blindly POSTs again. Lost-update recovery GETs the exact persisted id:
   matching terminal confirms without a write; matching `in_progress` reruns the full final guard before
   PATCHing that same id; absence, duplicates, wrong source/identity, conflicting terminal, malformed payload,
-  or unavailable reads stay pending with a safety hold. Tests prove no provider replay, second consumption,
-  second terminal check, conflicting conclusion, or local confirmed claim before exact remote observation.
+  or unavailable reads stay pending with a safety hold. Tests prove no recovery-triggered provider replay or
+  duplicate attempt consumption, no more than one terminal GitHub consumption, no second terminal check,
+  no conflicting conclusion, and no local confirmed claim before exact remote observation. A first transient plus
+  pass and first transient plus second identical failure both use one remote check across two explicitly
+  authorized attempts and one accepted terminal transition, with any lost-response retry targeting only the
+  same observed-`in_progress` check id.
   Crash/restart preserves the immutable-SHA success contract when the remote terminal preceded local
   confirmation.
 - GC tests cover open-reader/exclusive deletion, started-between-query-and-remove, stopped-container image
@@ -2079,16 +2109,17 @@ rollback target. Any code revert is a normal reviewed PR.
 
 **Restart point:** work from branch `agent/reliability-r3d-scheduled-canaries` based on merged main
 `98339842`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
-exact-`9414aa8`, exact-`6bc06fe`, and exact-`a7db6e7` Sol reviews are retained at the paths/hashes above.
+exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, and exact-`c241087` Sol reviews are retained at the
+paths/hashes above.
 The Fable six `WRONG`/thirteen `SMELL`; first-Sol four `WRONG`/seven `SMELL`; first-closure three
 `WRONG`/three `SMELL`; second-closure two `WRONG`/three `SMELL`; third-closure two `WRONG`/zero new
-`SMELL`; fourth-closure one `WRONG`/one `SMELL`; and fifth-closure zero `WRONG`/one `SMELL` sets are folded
-into D1-D10 and the slices/gates above. The fifth closure marked both inherited items fixed, found no
-regression, and found no new `WRONG`. All D1-D10 owner
+`SMELL`; fourth-closure one `WRONG`/one `SMELL`; fifth-closure zero `WRONG`/one `SMELL`; and sixth-closure
+one `WRONG`/zero new `SMELL` sets are folded into D1-D10 and the slices/gates above. The sixth closure marked
+the inherited outbox finding fixed before finding the transient-confirmation regression. All D1-D10 owner
 decisions were approved on 2026-07-17. No implementation, schema, timer, private authority, live
 characterization, model discovery, registry/image effect, compatibility provider turn, GitHub check
 mutation, or production-operator action has been performed by this design fold; the only new provider
-activity was the six recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
+activity was the seven recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
 this exact committed revision. If approved, publish the non-draft docs PR and start R3d0 only after merge.
 Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 
