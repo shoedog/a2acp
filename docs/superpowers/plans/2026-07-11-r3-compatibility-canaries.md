@@ -1,8 +1,9 @@
 # R3 — Compatibility manifest and canary implementation plan
 
-- **Status:** overall R3 **IN REVIEW**; R3a **MERGED** at `3927df3f` by PR #31; R3b
+- **Status:** overall R3 **ACTIVE**; R3a **MERGED** at `3927df3f` by PR #31; R3b
   **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at
-  `983398427c9f04861a2f1da501a7650c4a1cdd80` by PR #33; R3d design revision is active on
+  `983398427c9f04861a2f1da501a7650c4a1cdd80` by PR #33; R3d design is **APPROVED / PENDING
+  MERGE** at exact `b54840a017b87521677f1f95c3f7be69de55361d` on
   `agent/reliability-r3d-scheduled-canaries`. Nine pinned rows are implemented. Exact
   `c458045cf3d0923457519e253d22dd545363f98d` Sol/xhigh review approved the pre-incident deterministic
   tree. Authorized attempt 1 remains non-promotable stale-auth evidence; authorized attempt 2 passed both
@@ -1106,8 +1107,8 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 
 - **Branch:** `agent/reliability-r3d-scheduled-canaries`
 - **Base:** merged R3c main `983398427c9f04861a2f1da501a7650c4a1cdd80`
-- **Status:** design of record revised from owner decisions and fourteen exact-commit Sol reviews;
-  implementation not started; fresh Sol/xhigh closure review pending
+- **Status:** design of record **APPROVED** at exact `b54840a017b87521677f1f95c3f7be69de55361d`
+  after owner decisions and fifteen exact-commit Sol reviews; implementation not started; non-draft docs PR next
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
   `/Users/wesleyjinks/.claude/plans/r3d-clean-room-adversarial-deep-hollerith.md`, mode `0644`, 40,180
@@ -1226,6 +1227,14 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   SHA-256 `a5f656fcaee56e3882c7bc809f796e41eaa9afd61311f26a5f19594f5edf83d0`. This revision
   splits final admission into mutually exclusive persistent-envelope and one-run generic-manual transactions
   under the same lock/order and adds the absent-arms positive plus mixed-arm negatives.
+- **Fourteenth closure review and design approval:** one fresh one-node bridge-mediated Sol/xhigh/read-only
+  review of exact `b54840a017b87521677f1f95c3f7be69de55361d` marked the final generic-manual transaction
+  finding `FIXED`, found no regression and no new `WRONG` or `SMELL`, required no amendment, and returned
+  `R3D DESIGN: APPROVE`. Its fixed output is
+  `/private/tmp/a2a-bridge-r3d-sol-closure-b54840a.ObmMDa/review.md`, mode `0600`, 12,737 bytes,
+  SHA-256 `4eba120a5cecce94c4afca10d5e9ecd4da4047136a8f638d927675aa4328c249`. This exact commit is
+  the approved design-of-record boundary; the following status-only fold records that verdict without changing
+  a mechanism, schema contract, slice, test obligation, or live gate.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
 tagged effect authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
@@ -2495,7 +2504,7 @@ rollback target. Any code revert is a normal reviewed PR.
 **Restart point:** work from branch `agent/reliability-r3d-scheduled-canaries` based on merged main
 `98339842`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
 exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, exact-`c50811f`, and
-exact-`fb8a2f4`, exact-`ae9db39`, exact-`2eb242a`, exact-`8dc6054`, and exact-`cc01a52`
+exact-`fb8a2f4`, exact-`ae9db39`, exact-`2eb242a`, exact-`8dc6054`, exact-`cc01a52`, and exact-`b54840a`
 Sol reviews are retained at the paths/hashes above.
 The Fable six `WRONG`/thirteen `SMELL`; first-Sol four `WRONG`/seven `SMELL`; first-closure three
 `WRONG`/three `SMELL`; second-closure two `WRONG`/three `SMELL`; third-closure two `WRONG`/zero new
@@ -2503,15 +2512,14 @@ The Fable six `WRONG`/thirteen `SMELL`; first-Sol four `WRONG`/seven `SMELL`; fi
 one `WRONG`/zero new `SMELL`; seventh-closure zero new `WRONG`/one `SMELL`; and eighth-closure one
 `WRONG`/zero new `SMELL`; ninth-closure one `WRONG`/zero new `SMELL`; tenth-closure one `WRONG`/one
 `SMELL`; eleventh-closure two residual `WRONG`/one `SMELL`; twelfth-closure two new `WRONG`/one new
-`SMELL`; and thirteenth-closure one inherited `PARTIAL`/zero new findings are folded into D1-D10 and the slices/
-gates above. The thirteenth closure fixed the D7 profile-inventory, process-group-anchor, and rollback gaps but
-left manual admission partial because the earlier transaction still unconditionally required a persistent
-envelope arm. All D1-D10 owner
+`SMELL`; thirteenth-closure one inherited `PARTIAL`/zero new findings; and fourteenth-closure one inherited
+`FIXED`/zero new findings are folded into D1-D10 and the slices/gates above. The fourteenth closure found no
+regression, required no amendment, and returned `R3D DESIGN: APPROVE` at exact `b54840a`. All D1-D10 owner
 decisions were approved on 2026-07-17. No implementation, schema, timer, private authority, live
 characterization, model discovery, registry/image effect, compatibility provider turn, GitHub check
 mutation, or production-operator action has been performed by this design fold; the only new provider
-activity was the fourteen recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
-this exact committed revision. If approved, publish the non-draft docs PR and start R3d0 only after merge.
+activity was the fifteen recorded read-only Sol reviews. Next: publish the non-draft docs PR; start R3d0 only
+after that design PR merges.
 Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 
 ## R3e — OpenRouter provider expansion
