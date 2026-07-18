@@ -1106,7 +1106,7 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 
 - **Branch:** `agent/reliability-r3d-scheduled-canaries`
 - **Base:** merged R3c main `983398427c9f04861a2f1da501a7650c4a1cdd80`
-- **Status:** design of record revised from owner decisions and five exact-commit Sol reviews;
+- **Status:** design of record revised from owner decisions and six exact-commit Sol reviews;
   implementation not started; fresh Sol/xhigh closure review pending
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
@@ -1154,6 +1154,14 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   SHA-256 `1e8c35ce653ddbdb66c43ebe71a0cf49dc9eeed9decf1d4fcc87805a9e0b9317`. This revision
   makes a published success valid for its immutable SHA lifetime, removes the unenforceable same-SHA
   freshness promise, and adds action-time branch-rule/context/source revalidation.
+- **Fifth closure review:** one fresh one-node bridge-mediated Sol/xhigh/read-only review of exact
+  `a7db6e7037a3ad21e9db19ac529264977ffaaa10` marked both inherited items `FIXED`, found no
+  regression in any earlier fixed mechanism and no new `WRONG`, then returned one new `SMELL` and
+  `R3D DESIGN: REVISE`. Its fixed output is
+  `/private/tmp/a2a-bridge-r3d-sol-closure-a7db6e7.NiCZ9g/review.md`, mode `0600`, 15,561 bytes,
+  SHA-256 `b3293a39c1c0af10b83080b55fe9e45c266873b01d26784d96fa2cad9d31a796`. This revision adds
+  a single-check-run GitHub publication outbox with exact-id reconciliation and no provider, consumption,
+  or terminal-check replay.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
 standing authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
@@ -1769,6 +1777,34 @@ R3d's atomic guard is the required context on that result:
    A newly generated different SHA has no R3d context, so the required gate remains unsatisfied until new
    evidence exists.
 
+R3d publishes only through the Checks API as the expected GitHub App; commit-status publication is not an
+allowed implementation. Before any terminal conclusion, the publisher creates one `in_progress` check run
+for the exact SHA/context/source with a deterministic `external_id`, then durably binds the returned
+`check_run_id`. A create request whose response is lost enters `create_unknown`: recovery lists the exact
+SHA/name/App and accepts only one matching `external_id`. Zero or multiple matches remain pending under a
+safety hold and require explicit operator reconciliation; recovery never blindly creates a duplicate.
+
+Terminal publication uses a crash-consistent outbox under the publisher lock. Its durable lifecycle is
+`create_intent -> create_unknown|remote_pending -> prepared -> update_unknown -> remotely_observed ->
+confirmed`; `create_unknown` can move to `remote_pending` only after the unique remote match above. The key
+binds terminal consumption id, repository/PR/test-merge identity, check-run/external ids, context/App source,
+desired conclusion, evidence hash, and the final guarded observation/rule hashes. `prepared` means the
+terminal consumption and exact desired update are durable. The publisher then PATCHes that already-bound
+check-run id; it never creates a terminal check. A successful GET of that exact id showing the expected SHA/
+name/App, external id, conclusion, and evidence details moves through `remotely_observed` to a durable local
+`confirmed` record.
+
+Recovery never replays provider work or creates another consumption. Before any retry it GETs the persisted
+check-run id. An exact terminal match is confirmed without another write. An exact `in_progress` result may
+be PATCHed again only after the complete final guard is rerun; this updates the same remote object. A missing,
+multiple, wrong-source, wrong-SHA/context/external-id, conflicting-terminal, malformed, or unavailable result
+stays pending and creates a safety hold rather than posting another check or conclusion. A lost PATCH response
+therefore reconciles by observation first. GitHub may expose the exact terminal result before the local
+`confirmed` journal write when a response is lost; that distributed gap is safe because the terminal
+consumption and desired outbox entry were durable before PATCH. Local status remains `publication_unknown`
+until the exact remote terminal is observed and journaled; the design does not claim an atomic local/remote
+commit.
+
 The required test-merge context—not watcher timing—is the atomic merge guard. GitHub documents that
 `merge_commit_sha` names the current test merge before merge, `refs/pull/<n>/merge` represents what the
 repository would look like if merged now, a status on the test merge must pass, and checks from a previous SHA
@@ -1841,8 +1877,10 @@ window, attempt-idempotency, equivalent-work, consumption, and optional repeat i
 and affected cases; complete deadline derivation; preflight results; admission lock holder; budget
 reservations/reconciliation; supervisor process identities/escalation/reap results; freshness observation;
 requested and characterized expected-effective identities plus the separately observed effective result;
-typed check scope (`test_merge_result`), required-rule/context/source hashes; evidence-index id; and status
-publication result. The dedicated context is invalid on a PR-head SHA by construction.
+typed check scope (`test_merge_result`), required-rule/context/source hashes; publication-outbox id/state,
+terminal-consumption id, check-run/external ids, desired conclusion, remote-observation hash/attempts, and
+status publication result; plus evidence-index id. The dedicated context is invalid on a PR-head SHA by
+construction.
 
 The parent publishes the sidecar even for a killed/setup-incomplete run and joins it to the runner artifact
 by run/window id and optional aggregate hash. New schedule readers validate the sidecar and unchanged
@@ -1856,8 +1894,8 @@ unknown sidecar version fails schedule-specific consumption without making the u
    scheduling, provider-effect-grant, storage-consent, characterization, hold/quarantine, typed
    failure/suppression, impact, ledger,
    canonical case-execution fingerprint, equivalent-work/consumption, scheduled-case registry, strict
-   scheduled-execution-source, schedule-sidecar, evidence-index, status, and routing schemas plus validators
-   and docs. Add and review
+   scheduled-execution-source, schedule-sidecar, publication-outbox, evidence-index, status, and routing
+   schemas plus validators and docs. Add and review
    every exact provider-minimal advisory row/config intended for R3d5 characterization; keep it outside the
    protected support manifest and do not execute it. No timer, credential access, registry/runtime effect,
    or provider path.
@@ -1872,11 +1910,12 @@ unknown sidecar version fails schedule-specific consumption without making the u
    preflights.
 4. **R3d3 — evidence, status, and retention.** Add hot/cold stores, index, sealing, pins, tombstones, quotas,
    leases, bundle/image GC, local CLI/status/notifications, strict schedule-sidecar plus unchanged-aggregate
-   compatibility, explicit owner-iCloud upload/offload state plus rotating content verification, and incident
-   migration.
+   compatibility, crash-consistent publication-outbox journal storage, explicit owner-iCloud upload/offload
+   state plus rotating content verification, and incident migration.
 5. **R3d4 — launchd and trusted test-merge/main triggers.** Add dry-run/preflight-only modes, fake-clock
    timer, impact classifier, exact `merge_commit_sha` / `refs/pull/<n>/merge` watcher, local GitHub check
-   publisher including consumed-evidence mapping and changed-test-merge invalidation, coalescing,
+   publisher App including its single-check-run crash-recovery outbox, consumed-evidence mapping, and
+   changed-test-merge invalidation, coalescing,
    debounce, and the disabled-by-default launchd installation. Add a live validator for strict branch
    protection, the dedicated required context and expected source, canonical test-merge production, and the
    invariant that the context never exists on a PR head. No schedule or required check is enabled by merge.
@@ -1957,6 +1996,16 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   normalizing timeout to green. A rule/strict/context/source/head-status mutation between evidence completion
   and final publication also refuses. Post-publication administrative removal is classified as an explicit
   owner bypass, never as a canary success.
+- Publication-outbox fakes crash after durable create intent, after binding the remote pending check id,
+  after terminal consumption/`prepared`, after GitHub accepts the exact PATCH but before its response, and
+  after remote observation but before local confirmation. Lost-create recovery accepts exactly one matching
+  App/SHA/name/`external_id` and never blindly POSTs again. Lost-update recovery GETs the exact persisted id:
+  matching terminal confirms without a write; matching `in_progress` reruns the full final guard before
+  PATCHing that same id; absence, duplicates, wrong source/identity, conflicting terminal, malformed payload,
+  or unavailable reads stay pending with a safety hold. Tests prove no provider replay, second consumption,
+  second terminal check, conflicting conclusion, or local confirmed claim before exact remote observation.
+  Crash/restart preserves the immutable-SHA success contract when the remote terminal preceded local
+  confirmation.
 - GC tests cover open-reader/exclusive deletion, started-between-query-and-remove, stopped-container image
   reference, pin survival, manifest/class/pin retention precedence, hot-cache versus cold-full clocks,
   keep/age ordering, tombstone-before-unlink crash, iCloud symlink/hard-link/replacement/placeholder,
@@ -2012,7 +2061,9 @@ are green:
    context is absent from every PR head, current-result required-check wait, prior-result refusal, the
    contained-base/stable-head construction, pre/post-acceptance churn accounting, publication, missing or
    unmergeable-ref blocking, final branch-rule/context/source hash binding and drift refusal, immutable-SHA
-   success lifetime, timeout, and emergency/administrator bypass before leaving the rule enforced.
+   success lifetime, the single remote check-run/external-id and confirmed outbox record, timeout, and
+   emergency/administrator bypass before leaving the rule enforced. Publication crash points remain
+   fake-API-only during rollout; do not manufacture an ambiguous live GitHub write.
 9. Enable the low-use daily window. First post-enable red/unknown/blocked transitions are reviewed before
    the schedule is left unattended.
 
@@ -2028,16 +2079,16 @@ rollback target. Any code revert is a normal reviewed PR.
 
 **Restart point:** work from branch `agent/reliability-r3d-scheduled-canaries` based on merged main
 `98339842`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
-exact-`9414aa8`, and exact-`6bc06fe` Sol reviews are retained at the paths/hashes above. The Fable six
-`WRONG`/thirteen
-`SMELL`, first-Sol four `WRONG`/seven `SMELL`, first-closure three `WRONG`/three `SMELL`, second-closure
-two `WRONG`/three `SMELL`, third-closure two `WRONG`/zero new `SMELL`, and fourth-closure one `WRONG`/one
-`SMELL` sets are folded into D1-D10 and the slices/gates above; the fourth closure marked all four inherited
-items fixed and found no regression in earlier fixed mechanisms. All D1-D10 owner
+exact-`9414aa8`, exact-`6bc06fe`, and exact-`a7db6e7` Sol reviews are retained at the paths/hashes above.
+The Fable six `WRONG`/thirteen `SMELL`; first-Sol four `WRONG`/seven `SMELL`; first-closure three
+`WRONG`/three `SMELL`; second-closure two `WRONG`/three `SMELL`; third-closure two `WRONG`/zero new
+`SMELL`; fourth-closure one `WRONG`/one `SMELL`; and fifth-closure zero `WRONG`/one `SMELL` sets are folded
+into D1-D10 and the slices/gates above. The fifth closure marked both inherited items fixed, found no
+regression, and found no new `WRONG`. All D1-D10 owner
 decisions were approved on 2026-07-17. No implementation, schema, timer, private authority, live
 characterization, model discovery, registry/image effect, compatibility provider turn, GitHub check
 mutation, or production-operator action has been performed by this design fold; the only new provider
-activity was the five recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
+activity was the six recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
 this exact committed revision. If approved, publish the non-draft docs PR and start R3d0 only after merge.
 Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 
