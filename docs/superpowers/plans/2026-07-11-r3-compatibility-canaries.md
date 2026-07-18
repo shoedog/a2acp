@@ -1106,7 +1106,7 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 
 - **Branch:** `agent/reliability-r3d-scheduled-canaries`
 - **Base:** merged R3c main `983398427c9f04861a2f1da501a7650c4a1cdd80`
-- **Status:** design of record revised from owner decisions and thirteen exact-commit Sol reviews;
+- **Status:** design of record revised from owner decisions and fourteen exact-commit Sol reviews;
   implementation not started; fresh Sol/xhigh closure review pending
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
@@ -1217,6 +1217,15 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   SHA-256 `f680c3517af959f086d3e2fa1445b0e1fb329bba269db901e30a76b36949fc8f`. This revision
   gives generic manual work a one-run admission identity, stages every D7-reachable claimed-support profile,
   carries R3c's non-reusable process-group anchor into R3d1, and revokes live one-shot entries on rollback.
+- **Thirteenth closure review:** one fresh one-node bridge-mediated Sol/xhigh/read-only review of exact
+  `cc01a52aaf8279106f095182989ce15667f0cce2` marked the support-profile inventory, process-group anchor,
+  and rollback repairs `FIXED`, found no regression or new `WRONG`/`SMELL`, and left generic manual admission
+  `PARTIAL` because an earlier unqualified transaction still required a persistent envelope arm. It returned
+  `R3D DESIGN: REVISE`. Its fixed output is
+  `/private/tmp/a2a-bridge-r3d-sol-closure-cc01a52.Y6zfQO/review.md`, mode `0600`, 10,390 bytes,
+  SHA-256 `a5f656fcaee56e3882c7bc809f796e41eaa9afd61311f26a5f19594f5edf83d0`. This revision
+  splits final admission into mutually exclusive persistent-envelope and one-run generic-manual transactions
+  under the same lock/order and adds the absent-arms positive plus mixed-arm negatives.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
 tagged effect authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
@@ -1348,20 +1357,30 @@ authority. Exact
 dates and numerical caps are operator rollout values; one-shot characterization uses reviewed conservative
 caps, while standing-grant caps are derived from completed characterization. Neither auto-renews.
 
-Private-authority mutation and final admission share a short-lived authority-state lock distinct from the
-aggregate-wide admission lock. Under that lock, admission reopens the envelope, requires exactly one tagged
-provider-effect arm, validates it, proves `now + derived_terminal_deadline <= expires_at`, and atomically
-journals its complete tagged-arm identity, the authority-bound admission-attempt fingerprint, equivalent-work
-reservation, and budget reservation. A `characterization_once` commit also consumes that exact entry/nonce;
-crash or ambiguity after the commit may reconcile evidence and charge but can never restore or replay it. A
-`standing_grant` commit binds the exact completed characterization id/hash required by that arm. Admission
-always acquires the aggregate-wide lock before the authority-state lock; authority mutation takes only the
-latter, so no path reverses the order. That durable reservation commit is the authority linearization point:
-revocation or expiry before it refuses the attempt; revocation after it prevents later admissions but does not
-kill or replay the already-admitted bounded attempt. The operator CLI increments each record's revocation
-generation under the same lock. A launchd invocation must use `standing_grant` and match one exact allowed label
-and installed plist hash; the daily and test-merge-watcher labels are both bound explicitly rather than inferred
-from a singular name.
+Private-authority mutation and both final-admission paths share a short-lived authority-state lock distinct
+from the aggregate-wide admission lock. Under that lock exactly one path is valid:
+
+- **Persistent-envelope admission** reopens the envelope, requires exactly one tagged
+  `characterization_once` or `standing_grant` arm and canonical absence of every manual field, validates the
+  arm, and proves `now + derived_terminal_deadline <= expires_at`. A `characterization_once` commit also
+  consumes that exact entry/nonce; crash or ambiguity after commit may reconcile evidence and charge but can
+  never restore or replay it. A `standing_grant` commit binds the exact completed characterization id/hash
+  required by that arm.
+- **Generic-manual admission** requires canonical absence of both persistent arms, derives and validates
+  exactly one local `ManualAdmissionV1` plus its unique nonce from the direct CLI invocation, and proves the
+  same terminal-deadline containment against its one-run expiry. It never opens an envelope arm or treats the
+  manual record as persistent effect authority. Its reservation commit durably consumes the manual nonce.
+
+Both paths atomically journal their complete tagged admission identity, authority-bound admission-attempt
+fingerprint, equivalent-work reservation, and budget reservation. Mixed paths/fields, no path, or multiple
+identities refuse before effects. Admission always acquires the aggregate-wide lock before the authority-state
+lock; authority mutation takes only the latter, so no path reverses the order. That durable reservation commit
+is the admission linearization point. Persistent-arm revocation, or either path's expiry, before that commit
+refuses the attempt; revocation after a persistent reservation prevents later admissions but does not kill or
+replay the already-admitted bounded attempt. The operator CLI increments each persistent record's revocation
+generation under the same lock. A launchd invocation must use `standing_grant` and match one exact allowed
+label and installed plist hash; the daily and test-merge-watcher labels are both bound explicitly rather than
+inferred from a singular name.
 
 Cold archive publication has its own action-time consent fence under the authority-state lock. It revalidates
 the independently valid cold-storage-consent id/hash, owner/environment, time bounds, evidence class,
@@ -2269,8 +2288,11 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   `ManualAdmissionV1` identity without reading or inheriting `standing_grant`. Missing acknowledgement,
   caller-supplied/duplicate nonce, replay, stale binary/expiry, wrong source/case/profile/execution/purpose/
   freshness/cap/effect, `serve`/A2A/timer/watcher origin, post-seal mutation, use as characterization, and any
-  manual field in `ScheduledExecutionSourceV1` refuse before effects. A valid one-run record binds its own
-  admission fingerprint, reservation, ledger, consumption, and manual artifact.
+  manual field in `ScheduledExecutionSourceV1` refuse before effects. A direct state-machine positive proves a
+  valid generic manual record with canonical absence of both persistent arms reaches the shared durable
+  reservation. Mixing either persistent arm/field into that record, or a manual field into persistent-envelope
+  admission, refuses before effects. The valid one-run record binds its own admission fingerprint, reservation,
+  ledger, consumption, and manual artifact.
 - Fake children cover ignored TERM, SIGSTOP, exited runner with surviving descendant group, publication
   wedge, repeated cancellation, unproved exit, startup recovery, and unrelated-process survival. A direct
   recycled-PGID red mutation releases/reaps the anchor before final group signaling, reassigns the old numeric
@@ -2473,21 +2495,22 @@ rollback target. Any code revert is a normal reviewed PR.
 **Restart point:** work from branch `agent/reliability-r3d-scheduled-canaries` based on merged main
 `98339842`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
 exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, exact-`c50811f`, and
-exact-`fb8a2f4`, exact-`ae9db39`, exact-`2eb242a`, and exact-`8dc6054`
+exact-`fb8a2f4`, exact-`ae9db39`, exact-`2eb242a`, exact-`8dc6054`, and exact-`cc01a52`
 Sol reviews are retained at the paths/hashes above.
 The Fable six `WRONG`/thirteen `SMELL`; first-Sol four `WRONG`/seven `SMELL`; first-closure three
 `WRONG`/three `SMELL`; second-closure two `WRONG`/three `SMELL`; third-closure two `WRONG`/zero new
 `SMELL`; fourth-closure one `WRONG`/one `SMELL`; fifth-closure zero `WRONG`/one `SMELL`; sixth-closure
 one `WRONG`/zero new `SMELL`; seventh-closure zero new `WRONG`/one `SMELL`; and eighth-closure one
 `WRONG`/zero new `SMELL`; ninth-closure one `WRONG`/zero new `SMELL`; tenth-closure one `WRONG`/one
-`SMELL`; eleventh-closure two residual `WRONG`/one `SMELL`; and twelfth-closure two new `WRONG`/one new
-`SMELL` sets are folded into D1-D10 and the slices/gates above. The twelfth closure fixed the stable-bundle and
-overview repairs but left admission identity partial because generic manual work lacked a defined authority
-arm; it also found the D7 profile-inventory, process-group-anchor, and rollback gaps. All D1-D10 owner
+`SMELL`; eleventh-closure two residual `WRONG`/one `SMELL`; twelfth-closure two new `WRONG`/one new
+`SMELL`; and thirteenth-closure one inherited `PARTIAL`/zero new findings are folded into D1-D10 and the slices/
+gates above. The thirteenth closure fixed the D7 profile-inventory, process-group-anchor, and rollback gaps but
+left manual admission partial because the earlier transaction still unconditionally required a persistent
+envelope arm. All D1-D10 owner
 decisions were approved on 2026-07-17. No implementation, schema, timer, private authority, live
 characterization, model discovery, registry/image effect, compatibility provider turn, GitHub check
 mutation, or production-operator action has been performed by this design fold; the only new provider
-activity was the thirteen recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
+activity was the fourteen recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
 this exact committed revision. If approved, publish the non-draft docs PR and start R3d0 only after merge.
 Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 
