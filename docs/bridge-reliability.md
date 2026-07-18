@@ -130,10 +130,14 @@ missing Fable opt-in and missing reader settings prerequisite before a paid turn
 
 Exit: an operator can tell which boundary failed from one bounded run and its JSON artifact.
 
-Deferred R2f follow-up: phase-aware liveness and safe takeover after useful edits. The trigger is the
-operator-reported `INC-VERIFY-STALL-2026-07-11`, where a Luna run completed edits quickly and then parked
-in verification for nearly three hours. R2f must distinguish a silent healthy verifier from provider,
-adapter, child-process, or waiter failure before adding automated action; see the [R2f
+Deferred R2f follow-up: phase-aware liveness and safe takeover after useful edits, plus shared-operator
+session/backend health. The verification trigger is `INC-VERIFY-STALL-2026-07-11`, where a Luna run
+completed edits quickly and then parked in verification for nearly three hours. The shared-service triggers
+are `INC-SHARED-WARM-CRASH-2026-07-16` and `INC-SHARED-SESSION-CAPACITY-2026-07-17`, where the long-lived
+operator failed before observable prompt start while a fresh one-shot control succeeded. R2f must distinguish
+a silent healthy verifier from provider/adapter/child/waiter failure and distinguish poisoned transport from
+session-capacity debt before adding action. It owns capability-gated close and non-disruptive generation
+drain/rotation that preserves running turns and warm sessions; see the [R2f
 plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
 
 ### R3 — compatibility harness and canaries
@@ -149,11 +153,61 @@ plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
   and OpenCode as independent explicit provider increments before R4. Credentials remain environment-only;
   each integration must pass local fake/corpus gates before a separately authorized live smoke, and
   neither becomes an automatic fallback target.
-- Run a cheap minimal canary daily and a representative review workflow weekly.
-- Trigger both lanes on adapter, protocol-crate, agent-CLI, image, auth, or model-policy changes.
-- Persist machine-readable outcomes and diff them against the previous successful run.
-- Quarantine upstream/flaky failures with owner, expiry, cost cap, and retry limit; never normalize
-  them into green.
+- Bootstrap each fixed minimal effect profile under one exact, operator-issued, single-use characterization
+  entry; only after completed profile characterization may it run under a narrow private provider-effect
+  standing grant. Reject duplicate live entries for the same profile across authorization batches. Use the
+  lowest-cost
+  eligible model for a provider-generic adapter/capability probe. A model/effort/mode/alias/capability-
+  specific PR must exercise the exact affected claimed-support identity; a cheap substitute cannot green
+  that gate. Every D7-reachable production-support profile is inventoried and characterized through a strict
+  one-shot wrapper around the unchanged pinned runner before its impact class can be enabled. New provider-
+  minimal probes live in a separate non-support scheduled-case registry through
+  characterization; an R3d-only strict scheduled-execution source binds a stable characterization-profile
+  fingerprint, a distinct exact execution fingerprint, and exactly one tagged bootstrap or standing-grant arm.
+  A bootstrap arm cannot enter an unattended trigger, and a standing arm cannot exist without the exact
+  completed profile characterization. New test-merge/candidate/package/image identities under unchanged
+  profile constraints execute once with a new exact fingerprint and never reuse prior evidence. They remain advisory unless R4 promotes
+  them deliberately. Generic direct manual compatibility uses a non-reusable one-run local acknowledgement and
+  the same admission/deduplication/ledger boundary without inheriting standing authority. Scheduling uses fresh
+  one-shot processes, retains a bridge-owned process-group leader through final kill/reap, and never manipulates
+  the long-lived operator.
+- Require a trusted local affected-case canary on the exact current GitHub test-merge result SHA
+  (`merge_commit_sha` / `refs/pull/<n>/merge`) before merging a compatibility-impacting same-repo PR. GitHub
+  performs deterministic coordination/status only and never directly invokes credentialed work. Only an
+  executed pass or locally proved no-impact state can satisfy the test-merge compatibility conclusion; due-
+  but-not-run remains blocking. Characterization binds a stable provider/capability/model/environment/prompt/
+  template/maximum-cap effect profile; exact execution, reuse, consumption, and publication additionally bind
+  the current test-merge/base/head, manifest/case/pin/resolution, candidate, config, and actual-cap fingerprint.
+  A matching profile grants only bounded execution authority, never cross-fingerprint evidence reuse, and the
+  observed effective identity must match. The required
+  context is never posted to the PR head, so a regenerated test-merge SHA cannot fall back to old head
+  evidence. A published success is deliberately valid for the lifetime of that immutable test-merge SHA;
+  R3d does not claim GitHub can recheck local freshness or authority at the later merge click. Retain a
+  coalesced main run as the integration backstop. Terminal publication updates one persisted, App-owned
+  `in_progress` check run through a durable outbox; crash recovery observes that exact remote id before any
+  same-object update and never replays provider work or creates a second terminal check. A first transient
+  failure remains `in_progress`; only a typed immutable failure, the authorized confirmation's pass, or its
+  second identical complete failure terminalizes that same check. For multiple due cases, success waits for
+  every pass while any terminal case failure fails fast without spending unstarted confirmations. Repeated
+  non-waste unknowns only update audit and notification-dedup state; repetition alone never suppresses them.
+- Defer representative review scheduling until a separate owner-reviewed design defines a fixed Tier-2
+  read-only fixture, prompt, scoring, caps, provider rotation, and evidence boundary. Review content is not
+  compatibility or promotion evidence.
+- Persist the unchanged strict compatibility aggregate plus a separate versioned scheduling sidecar in
+  bounded private hot storage and the explicitly owner-authorized private iCloud cold tier. Case/class/pin
+  retention uses explicit extending precedence; cold files receive no-follow, single-link, owner-only
+  protections, local scan/seal before the first iCloud-visible byte, independent storage consent, and upload/
+  offload-aware revalidation before hot eviction and during retention. Raw evidence is never published to
+  GitHub. Fresh floating observations may reuse content-addressed bytes only when exact immutable identity is
+  unchanged.
+- Keep automatic safety holds, exact-execution-fingerprint waste suppression, and explicit operator quarantine
+  distinct. `candidate_fail` alone is not permanent: one typed transient confirmation is allowed before
+  suppression. Admission separately deduplicates equivalent work across R3d-aware trigger sources. Retained
+  pre-R3d compatibility commands do not participate in that lease and are prohibited while any R3d provider-
+  effect authority can admit; exact process detection holds and conservatively reconciles observed legacy
+  attempts without touching the legacy production `serve` process. Every future scheduled/advisory or D7
+  claimed-support compatibility profile is characterized before eligibility, and no skipped or unknown case is
+  normalized into green.
 
 Exit: upstream drift is found by the canary rather than an unrelated feature branch.
 

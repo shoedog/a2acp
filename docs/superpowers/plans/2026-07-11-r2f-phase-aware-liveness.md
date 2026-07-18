@@ -1,10 +1,11 @@
 # R2f — Phase-aware liveness and safe takeover plan
 
-- **Status:** DEFERRED; incident recorded, investigation not started
+- **Status:** DEFERRED; three incidents recorded, investigation not started
 - **Prerequisite:** R2b structured diagnostics merged; may proceed independently of R2c–R2e afterward
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
-- **Incident id:** `INC-VERIFY-STALL-2026-07-11`
+- **Incident ids:** `INC-VERIFY-STALL-2026-07-11`, `INC-SHARED-WARM-CRASH-2026-07-16`,
+  `INC-SHARED-SESSION-CAPACITY-2026-07-17`
 
 ## Incident evidence and limits
 
@@ -18,6 +19,20 @@ stall was in the provider, ACP adapter, agent runtime, verification command, chi
 orchestration waiter. File modification time alone is not a safe liveness signal: a legitimate long test
 can make no edits, while a wedged verifier can keep a process alive. R2f must collect the observations that
 separate those alternatives before changing timeout behavior.
+
+## Shared-operator evidence and limits
+
+The long-lived production operator returned immediate Codex `AgentCrashed` twice before observable prompt
+start while its bridge, ACP adapter, and Codex app-server processes remained alive. Fresh isolated one-shot
+operators completed the same package/model/effort/mode and review shape. The old app server had observed 15
+distinct session thread ids and no close notifications; bridge release removed its local session entry
+without sending a capability-gated ACP close, while codex-acp retained sessions until close.
+
+This rules out a general package/model/auth/cwd incompatibility for those incidents, but does not distinguish
+a capacity ceiling/session leak from a poisoned long-lived transport. Fifteen is evidence, not a threshold.
+No running turn, warm session, backend, image, or production operator was stopped or restarted, and no
+failed request was replayed. R2f owns this investigation and every lifecycle remedy. R3d only records that
+its fresh one-shot canary did not evaluate the shared operator.
 
 ## R2f0 — Reproduction and meaningful-progress vocabulary
 
@@ -56,7 +71,26 @@ separate those alternatives before changing timeout behavior.
   no automatic duplicate reviewer/model turn is started, and possibly accepted prompt work is never
   replayed silently.
 
-## R2f3 — Tests and dogfood
+## R2f3 — Shared backend/session health and non-disruptive rotation
+
+- Preserve structured pre-turn ACP errors instead of collapsing session creation, configuration, transport,
+  and capacity failures into generic `AgentCrashed`.
+- Track created, active, warm, released, close-attempted, closed, retained, and unknown session state per
+  exact backend generation. A local release cannot erase unresolved remote capacity debt.
+- Negotiate and use `session/close` only when the exact adapter capability/protocol proves it exists. If it
+  is absent or close fails, retain typed debt and use backend-generation ownership rather than inventing a
+  successful close.
+- Separate a poisoned transport from a capacity threshold with deterministic fake backends and bounded
+  health evidence. Never hard-code the observed count 15 as a limit.
+- Design rotation as side-by-side generations: new sessions select the new generation while every running
+  turn and warm session remains on its owning generation. No automatic replay, forced warm-session close,
+  broad process kill, or production restart is allowed.
+- Before implementation, run a focused owner design increment for warm-session definition/expiry,
+  generation retirement, health thresholds, operator authorization, and the exact non-disruptive swap
+  protocol. An indefinitely retained warm session must remain visible rather than being killed to make a
+  rotation appear complete.
+
+## R2f4 — Tests and dogfood
 
 - deterministic fake-clock tests for warning/hard thresholds and monotonic rollback immunity;
 - silent healthy child versus blocked child versus exited-child/wedged-waiter classification;
@@ -65,12 +99,20 @@ separate those alternatives before changing timeout behavior.
 - worktree edits survive termination and the takeover artifact names completed/pending gates exactly;
 - observer/store failure cannot trigger termination or erase the primary diagnostic;
 - no automatic retry, fallback, or second billable attempt;
+- structured session-new/configure/transport/capacity failures retain their exact phase and cause;
+- capability-present close success, capability-absent retention, close failure, duplicate close, and
+  concurrent release preserve exact session/generation ownership;
+- poisoned transport versus bounded fake capacity exhaustion are distinguishable without assuming a count;
+- generation rotation routes new sessions to the successor while running and warm sessions continue on the
+  predecessor, and an incomplete drain remains visible without interruption;
 - one opt-in dogfood run that intentionally wedges a disposable verifier and proves targeted takeover.
 
 ## Completion
 
-R2f is complete only after a reproduced failure has an evidence-backed root cause, the phase-aware
-watchdog distinguishes the negative controls, scoped termination preserves useful work, takeover is
-exercised end to end, and a fresh adversarial review approves the safety boundary. Until then the operator
-runbook permits evidence capture and targeted manual termination only; it must not claim automatic
-recovery.
+R2f is complete only after the verification stall and shared-operator alternatives have evidence-backed
+dispositions; the phase-aware watchdog distinguishes the negative controls; scoped termination preserves
+useful work; session/close and generation ownership are capability- and concurrency-safe; non-disruptive
+rotation preserves running turns and warm sessions; takeover is exercised end to end; and a fresh
+adversarial review approves the safety boundary. Until then the operator runbook permits evidence capture
+and targeted manual termination only; it must not claim automatic recovery, session-capacity repair, or
+safe rotation.
