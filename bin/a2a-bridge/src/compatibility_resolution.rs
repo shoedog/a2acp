@@ -152,6 +152,7 @@ pub(super) struct LoadedRecipes {
     pub(super) canonical_path: PathBuf,
     pub(super) canonical_path_text: String,
     pub(super) sha256: String,
+    pub(super) file_identity: Option<local_file::RegularFileIdentity>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -881,6 +882,7 @@ pub(super) fn load_recipes(path: &Path) -> Result<LoadedRecipes, BoxError> {
         canonical_path: snapshot.canonical_path,
         canonical_path_text,
         sha256: snapshot.sha256,
+        file_identity: Some(snapshot.identity),
     })
 }
 

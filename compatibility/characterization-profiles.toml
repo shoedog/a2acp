@@ -6,58 +6,58 @@ schema_version = 1
 id = "codex-host-luna-low"
 source_kind = "scheduled_advisory"
 source_id = "codex-host-luna-low"
-profile_sha256 = "e374f51eb914162b4424bf29b5d4106d3f8112d3a2c22befaac1e980fac5fa73"
+profile_sha256 = "b99b1de58b220232ac68227b45cd42abbebc67d025db3e6119cf194bda401699"
 
 [[profiles]]
 id = "codex-reader-luna-low"
 source_kind = "scheduled_advisory"
 source_id = "codex-reader-luna-low"
-profile_sha256 = "2d1c06def87ba62e8d84982a8ad25de877af8009d0d34aa9f4a3b676a6b59e3a"
+profile_sha256 = "06941f190762f1132a1f392b184ca6bdb81c09f8da70736b2f5c6ce0e7a9017e"
 
 [[profiles]]
 id = "claude-host-haiku-low"
 source_kind = "scheduled_advisory"
 source_id = "claude-host-haiku-low"
-profile_sha256 = "16d752beb9032ff23c0bfbaab2834c0927cad191cf252bbe222c2850a12644e9"
+profile_sha256 = "e3d11ec6f9629b75e00194857831cd87e5340be6779a3bd3cb12d01fcb37f965"
 
 [[profiles]]
 id = "claude-reader-haiku-low"
 source_kind = "scheduled_advisory"
 source_id = "claude-reader-haiku-low"
-profile_sha256 = "0bd3b4a82b85ee90acb9107b6a67b2945f675d3c3ffdfc9819ed1baf1d293841"
+profile_sha256 = "f784111f82a5c9ba88b0f390a44ca83eed183d215eac1d96928225c5ecca2e15"
 
 [[profiles]]
 id = "claude-host-sonnet-low-effort"
 source_kind = "scheduled_advisory"
 source_id = "claude-host-sonnet-low-effort"
-profile_sha256 = "6e805d9afe1944fc5486d3f5e1d185085371e9592199a8703c34dd7d167f8221"
+profile_sha256 = "8e59521d5a57cb6381fa70d17b077e1253730fd01ffec3442272a30235c4c487"
 
 [[profiles]]
 id = "ollama-local-qwen35-9b"
 source_kind = "scheduled_advisory"
 source_id = "ollama-local-qwen35-9b"
-profile_sha256 = "8c9ed0b1bf04affd229089b8fdb4eced2c07ae8fdd36a2e0f9762352abf5f47c"
+profile_sha256 = "93b03fc7cd05d56caf137aaa34c40911f2030f38aff9891b4fd497f1efd31049"
 
 [[profiles]]
 id = "codex-host-bridge-gpt56-sol"
 source_kind = "claimed_support_gate"
 source_id = "codex-host-bridge-gpt56-sol"
-profile_sha256 = "801fde1462f4a0c2ae31559b67da1fe25065638185d6e80d4c9d558a6b568832"
+profile_sha256 = "b7a7c6c66baa91d100f5cd24c1afeca1f4fe4cab8f23b5d318c49eedf35e9871"
 
 [[profiles]]
 id = "codex-reader-bridge-gpt56-sol"
 source_kind = "claimed_support_gate"
 source_id = "codex-reader-bridge-gpt56-sol"
-profile_sha256 = "04e6835565784da652dacdc859d794744fba6db918f5e949630764d0325be765"
+profile_sha256 = "6359429d12e757c84ff2c7cec6965b619dd7ce94273a699fc588cf5875defb0b"
 
 [[profiles]]
 id = "claude-host-acp-044-fable"
 source_kind = "claimed_support_gate"
 source_id = "claude-host-acp-044-fable"
-profile_sha256 = "fe4959f3a9daadf9accec3f267285cbba89469fc043dd64b719a55762bf5a3e8"
+profile_sha256 = "8ac7a2a5e4cc62257bd61e31e28d6b2c1b017adffd69502ff8c9bb068486a301"
 
 [[profiles]]
 id = "claude-reader-055-fable"
 source_kind = "claimed_support_gate"
 source_id = "claude-reader-055-fable"
-profile_sha256 = "0a2e8d212a1142fc75888af28e8a97281dd2290762f64bbf6cc56e34e3f1edaa"
+profile_sha256 = "741b34e13205714a1f6b6199f0faa87a808b855131f0780eab02ff9d66266313"

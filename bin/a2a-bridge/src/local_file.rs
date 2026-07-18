@@ -19,6 +19,58 @@ pub(crate) struct LocalFileSnapshot {
     pub(crate) canonical_path: PathBuf,
     pub(crate) bytes: Vec<u8>,
     pub(crate) sha256: String,
+    pub(crate) identity: RegularFileIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RegularFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    length: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+    #[cfg(not(unix))]
+    created: Option<std::time::SystemTime>,
+}
+
+impl RegularFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                length: metadata.len(),
+                modified_seconds: metadata.mtime(),
+                modified_nanoseconds: metadata.mtime_nsec(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                length: metadata.len(),
+                modified: metadata.modified().ok(),
+                created: metadata.created().ok(),
+            }
+        }
+    }
+
+    pub(crate) fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
+        self == &Self::from_metadata(metadata)
+    }
 }
 
 #[derive(Debug)]
@@ -1155,6 +1207,7 @@ where
         .into());
     }
 
+    let identity = RegularFileIdentity::from_metadata(&descriptor_metadata);
     let canonical_path = std::fs::canonicalize(path)
         .map_err(|error| format!("{label}: cannot resolve {}: {error}", path.display()))?;
     let path_metadata = std::fs::metadata(&canonical_path).map_err(|error| {
@@ -1175,11 +1228,27 @@ where
     if bytes.len() as u64 > max_bytes {
         return Err(format!("{label}: content exceeds the {max_bytes}-byte limit").into());
     }
+    let final_descriptor_metadata = file
+        .metadata()
+        .map_err(|error| format!("{label}: cannot reinspect {}: {error}", path.display()))?;
+    let final_path_metadata = std::fs::metadata(&canonical_path).map_err(|error| {
+        format!(
+            "{label}: cannot reinspect resolved path {}: {error}",
+            canonical_path.display()
+        )
+    })?;
+    if !identity.matches_metadata(&final_descriptor_metadata)
+        || !identity.matches_metadata(&final_path_metadata)
+        || !same_file(&final_descriptor_metadata, &final_path_metadata)
+    {
+        return Err(format!("{label}: file changed while it was being read").into());
+    }
     let sha256 = sha256_hex(&bytes);
     Ok(LocalFileSnapshot {
         canonical_path,
         bytes,
         sha256,
+        identity,
     })
 }
 

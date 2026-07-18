@@ -471,6 +471,9 @@ pub(super) struct SafetyHoldV1 {
 pub(super) enum HoldLifecycleV1 {
     Active,
     Cleared {
+        opening_sha256: String,
+        clearance_action_id: String,
+        clearance_action_sha256: String,
         cleared_at_ms: i64,
         operator: String,
         reason: String,
@@ -667,11 +670,27 @@ pub(super) struct ConsumptionRecordV1 {
     pub(super) evidence_sha256: String,
     pub(super) requested_purpose: EvidencePurposeV1,
     pub(super) satisfied_purpose: EvidencePurposeV1,
+    pub(super) provenance: ConsumptionEvidenceProvenanceV1,
     pub(super) characterization_profile: FingerprintV1,
     pub(super) case_execution: FingerprintV1,
     pub(super) admission_attempt: FingerprintV1,
     pub(super) authority: AdmissionAuthorityV1,
     pub(super) consumed_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ConsumptionEvidenceProvenanceV1 {
+    Ordinary,
+    ReviewedCharacterization {
+        characterization_id: String,
+        characterization_record_sha256: String,
+        freshness_bucket: String,
+        freshness_observation_sha256: String,
+        terminal_at_ms: i64,
+        reviewed_at_ms: i64,
+        reviewer: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -818,6 +837,8 @@ pub(super) enum OptionalCheckConclusionV1 {
 pub(super) struct PublicationOutboxV1 {
     pub(super) schema_version: u16,
     pub(super) outbox_id: String,
+    pub(super) immutable_identity: FingerprintV1,
+    pub(super) previous_record: OptionalSha256V1,
     pub(super) state: PublicationOutboxStateV1,
     pub(super) repository: String,
     pub(super) pull_request: u64,
@@ -826,6 +847,7 @@ pub(super) struct PublicationOutboxV1 {
     pub(super) app_id: String,
     pub(super) external_id: String,
     pub(super) check_run: OptionalCheckRunIdV1,
+    pub(super) check_run_binding: OptionalSha256V1,
     pub(super) terminal_consumption: OptionalStableIdV1,
     pub(super) desired_conclusion: OptionalCheckConclusionV1,
     pub(super) evidence_set: OptionalSha256V1,
@@ -1131,6 +1153,7 @@ fn git_oid(label: &str, value: &GitObjectIdV1) -> Result<(), BoxError> {
             .hex
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || value.hex.bytes().all(|byte| byte == b'0')
     {
         return Err(format!(
             "schedule schema: {label} must be a lowercase {}-character {:?} Git object id",
@@ -1141,9 +1164,22 @@ fn git_oid(label: &str, value: &GitObjectIdV1) -> Result<(), BoxError> {
     Ok(())
 }
 
-fn optional_git_oid(label: &str, value: &OptionalGitObjectIdV1) -> Result<(), BoxError> {
-    if let OptionalGitObjectIdV1::ObjectId { value } = value {
+fn git_oid_set<'a>(
+    label: &str,
+    values: impl IntoIterator<Item = &'a GitObjectIdV1>,
+) -> Result<(), BoxError> {
+    let mut algorithm = None;
+    for value in values {
         git_oid(label, value)?;
+        if algorithm
+            .replace(value.algorithm)
+            .is_some_and(|seen| seen != value.algorithm)
+        {
+            return Err(format!(
+                "schedule schema: {label} mixes Git object algorithms within one repository target"
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -1181,9 +1217,90 @@ fn effective_identity(label: &str, value: &EffectiveIdentityV1) -> Result<(), Bo
 }
 
 fn canonical_input_sha256<T: Serialize>(label: &str, value: &T) -> Result<String, BoxError> {
-    let bytes = serde_json::to_vec(value)
+    let canonical = serde_json::to_vec(value)
         .map_err(|error| format!("schedule schema: cannot canonicalize {label}: {error}"))?;
-    Ok(local_file::sha256_hex(&bytes))
+    let mut domain_separated = format!("a2a-bridge:r3d0:{label}:v1\0").into_bytes();
+    domain_separated.extend_from_slice(&canonical);
+    Ok(local_file::sha256_hex(&domain_separated))
+}
+
+#[derive(Serialize)]
+struct SafetyHoldOpeningIdentityV1<'a> {
+    schema_version: u16,
+    hold_id: &'a str,
+    characterization_profile: &'a FingerprintV1,
+    case_execution: &'a FingerprintV1,
+    reason: HoldReasonV1,
+    created_at_ms: i64,
+}
+
+fn safety_hold_opening_sha256(value: &SafetyHoldV1) -> Result<String, BoxError> {
+    canonical_input_sha256(
+        "safety-hold opening",
+        &SafetyHoldOpeningIdentityV1 {
+            schema_version: value.schema_version,
+            hold_id: &value.hold_id,
+            characterization_profile: &value.characterization_profile,
+            case_execution: &value.case_execution,
+            reason: value.reason,
+            created_at_ms: value.created_at_ms,
+        },
+    )
+}
+
+#[derive(Serialize)]
+struct SafetyHoldClearanceIdentityV1<'a> {
+    schema_version: u16,
+    opening_sha256: &'a str,
+    clearance_action_id: &'a str,
+    cleared_at_ms: i64,
+    operator: &'a str,
+    reason: &'a str,
+}
+
+#[derive(Serialize)]
+struct PublicationOutboxIdentityInputV1<'a> {
+    schema_version: u16,
+    repository: &'a str,
+    pull_request: u64,
+    test_merge_oid: &'a GitObjectIdV1,
+    context: &'a str,
+    app_id: &'a str,
+    external_id: &'a str,
+}
+
+fn publication_outbox_identity_sha256(value: &PublicationOutboxV1) -> Result<String, BoxError> {
+    canonical_input_sha256(
+        "publication-outbox immutable identity",
+        &PublicationOutboxIdentityInputV1 {
+            schema_version: value.schema_version,
+            repository: &value.repository,
+            pull_request: value.pull_request,
+            test_merge_oid: &value.test_merge_oid,
+            context: &value.context,
+            app_id: &value.app_id,
+            external_id: &value.external_id,
+        },
+    )
+}
+
+#[derive(Serialize)]
+struct PublicationCheckRunBindingInputV1<'a> {
+    immutable_identity: &'a FingerprintV1,
+    check_run_id: u64,
+}
+
+fn publication_check_run_binding_sha256(
+    immutable_identity: &FingerprintV1,
+    check_run_id: u64,
+) -> Result<String, BoxError> {
+    canonical_input_sha256(
+        "publication-outbox check-run binding",
+        &PublicationCheckRunBindingInputV1 {
+            immutable_identity,
+            check_run_id,
+        },
+    )
 }
 
 fn validate_execution_target(target: &ExactExecutionTargetV1) -> Result<(), BoxError> {
@@ -1195,9 +1312,11 @@ fn validate_execution_target(target: &ExactExecutionTargetV1) -> Result<(), BoxE
             range_start_exclusive,
         } => {
             bounded_text("execution repository", repository)?;
-            git_oid("execution head", head_oid)?;
-            git_oid("execution tree", tree_oid)?;
-            optional_git_oid("execution range start", range_start_exclusive)
+            let mut object_ids = vec![head_oid, tree_oid];
+            if let OptionalGitObjectIdV1::ObjectId { value } = range_start_exclusive {
+                object_ids.push(value);
+            }
+            git_oid_set("repository-snapshot object ids", object_ids)
         }
         ExactExecutionTargetV1::TestMerge {
             repository,
@@ -1210,14 +1329,12 @@ fn validate_execution_target(target: &ExactExecutionTargetV1) -> Result<(), BoxE
             ordered_parents,
         } => {
             bounded_text("test-merge repository", repository)?;
-            for (label, value) in [
-                ("test-merge base", base_oid),
-                ("test-merge head", head_oid),
-                ("test-merge result", merge_oid),
-                ("test-merge tree", tree_oid),
-            ] {
-                git_oid(label, value)?;
-            }
+            git_oid_set(
+                "test-merge object ids",
+                [base_oid, head_oid, merge_oid, tree_oid]
+                    .into_iter()
+                    .chain(ordered_parents.iter()),
+            )?;
             if *pull_request == 0
                 || merge_ref != &format!("refs/pull/{pull_request}/merge")
                 || ordered_parents != &[base_oid.clone(), head_oid.clone()]
@@ -1918,12 +2035,42 @@ impl ValidateRecord for SafetyHoldV1 {
         match &self.lifecycle {
             HoldLifecycleV1::Active => Ok(()),
             HoldLifecycleV1::Cleared {
+                opening_sha256,
+                clearance_action_id,
+                clearance_action_sha256,
                 cleared_at_ms,
                 operator,
                 reason,
             } if *cleared_at_ms >= self.created_at_ms => {
+                sha256("hold opening", opening_sha256)?;
+                stable_id("hold clearance action id", clearance_action_id)?;
+                sha256("hold clearance action", clearance_action_sha256)?;
                 bounded_text("hold clearance operator", operator)?;
-                bounded_text("hold clearance reason", reason)
+                bounded_text("hold clearance reason", reason)?;
+                let expected_opening = safety_hold_opening_sha256(self)?;
+                if opening_sha256 != &expected_opening {
+                    return Err(
+                        "schedule schema: hold clearance does not bind the canonical opening record"
+                            .into(),
+                    );
+                }
+                let expected_clearance = canonical_input_sha256(
+                    "safety-hold clearance action",
+                    &SafetyHoldClearanceIdentityV1 {
+                        schema_version: 1,
+                        opening_sha256,
+                        clearance_action_id,
+                        cleared_at_ms: *cleared_at_ms,
+                        operator,
+                        reason,
+                    },
+                )?;
+                if clearance_action_sha256 != &expected_clearance {
+                    return Err(
+                        "schedule schema: hold clearance action fingerprint does not match".into(),
+                    );
+                }
+                Ok(())
             }
             HoldLifecycleV1::Cleared { .. } => {
                 Err("schedule schema: hold clearance predates the hold".into())
@@ -2038,14 +2185,17 @@ fn validate_test_merge(target: &TestMergeIdentityV1) -> Result<(), BoxError> {
     {
         return Err("schedule schema: test-merge identity is not canonical".into());
     }
-    for (label, value) in [
-        ("base", &target.base_oid),
-        ("head", &target.head_oid),
-        ("merge", &target.merge_oid),
-        ("tree", &target.tree_oid),
-    ] {
-        git_oid(label, value)?;
-    }
+    git_oid_set(
+        "test-merge object ids",
+        [
+            &target.base_oid,
+            &target.head_oid,
+            &target.merge_oid,
+            &target.tree_oid,
+        ]
+        .into_iter()
+        .chain(target.ordered_parents.iter()),
+    )?;
     if target.ordered_parents != [target.base_oid.clone(), target.head_oid.clone()] {
         return Err("schedule schema: test-merge ordered parents must be base then head".into());
     }
@@ -2276,9 +2426,48 @@ impl ValidateRecord for ConsumptionRecordV1 {
         fingerprint("consumed execution", &self.case_execution)?;
         fingerprint("consumption admission", &self.admission_attempt)?;
         validate_authority(&self.authority)?;
-        let purpose_allowed = self.requested_purpose == self.satisfied_purpose
-            || (self.requested_purpose == EvidencePurposeV1::ProviderPathAdvisory
-                && self.satisfied_purpose == EvidencePurposeV1::ClaimedSupportGate);
+        let purpose_allowed = match &self.provenance {
+            ConsumptionEvidenceProvenanceV1::Ordinary => {
+                self.requested_purpose == self.satisfied_purpose
+                    || (self.requested_purpose == EvidencePurposeV1::ProviderPathAdvisory
+                        && self.satisfied_purpose == EvidencePurposeV1::ClaimedSupportGate)
+            }
+            ConsumptionEvidenceProvenanceV1::ReviewedCharacterization {
+                characterization_id,
+                characterization_record_sha256,
+                freshness_bucket,
+                freshness_observation_sha256,
+                terminal_at_ms,
+                reviewed_at_ms,
+                reviewer,
+            } => {
+                stable_id("consumed characterization id", characterization_id)?;
+                sha256(
+                    "consumed characterization record",
+                    characterization_record_sha256,
+                )?;
+                stable_id(
+                    "consumed characterization freshness bucket",
+                    freshness_bucket,
+                )?;
+                sha256(
+                    "consumed characterization freshness observation",
+                    freshness_observation_sha256,
+                )?;
+                bounded_text("consumed characterization reviewer", reviewer)?;
+                if *terminal_at_ms <= 0
+                    || *reviewed_at_ms < *terminal_at_ms
+                    || self.consumed_at_ms < *reviewed_at_ms
+                {
+                    return Err(
+                        "schedule schema: reviewed characterization provenance times are invalid"
+                            .into(),
+                    );
+                }
+                self.requested_purpose == EvidencePurposeV1::ProviderPathAdvisory
+                    && self.satisfied_purpose == EvidencePurposeV1::Characterization
+            }
+        };
         if !purpose_allowed || self.requested_purpose == EvidencePurposeV1::Characterization {
             return Err("schedule schema: evidence-purpose reuse is not equal-or-stronger".into());
         }
@@ -2543,11 +2732,29 @@ impl ValidateRecord for PublicationOutboxV1 {
             return Err("schedule schema: publication outbox must be version 1 with a PR".into());
         }
         stable_id("outbox id", &self.outbox_id)?;
+        fingerprint("outbox immutable identity", &self.immutable_identity)?;
+        optional_sha256("outbox previous record", &self.previous_record)?;
         bounded_text("outbox repository", &self.repository)?;
         git_oid("outbox test merge", &self.test_merge_oid)?;
         bounded_text("check context", &self.context)?;
         stable_id("App id", &self.app_id)?;
         stable_id("external id", &self.external_id)?;
+        let expected_identity = publication_outbox_identity_sha256(self)?;
+        if self.immutable_identity.sha256 != expected_identity
+            || self.outbox_id != format!("outbox:{expected_identity}")
+        {
+            return Err(
+                "schedule schema: outbox id does not bind its canonical immutable remote identity"
+                    .into(),
+            );
+        }
+        let has_previous = matches!(self.previous_record, OptionalSha256V1::Sha256 { .. });
+        if (self.state == PublicationOutboxStateV1::CreateIntent) == has_previous {
+            return Err(
+                "schedule schema: only create-intent may omit the previous outbox record hash"
+                    .into(),
+            );
+        }
         let terminal = matches!(
             self.state,
             PublicationOutboxStateV1::Prepared
@@ -2575,13 +2782,14 @@ impl ValidateRecord for PublicationOutboxV1 {
                     .into(),
             );
         }
-        let check_run_bound = match &self.check_run {
-            OptionalCheckRunIdV1::Absent => false,
-            OptionalCheckRunIdV1::CheckRun { id } if *id > 0 => true,
+        let check_run_id = match &self.check_run {
+            OptionalCheckRunIdV1::Absent => None,
+            OptionalCheckRunIdV1::CheckRun { id } if *id > 0 => Some(*id),
             OptionalCheckRunIdV1::CheckRun { .. } => {
                 return Err("schedule schema: check_run id must be positive".into())
             }
         };
+        let check_run_bound = check_run_id.is_some();
         let check_run_state_matches = match self.state {
             PublicationOutboxStateV1::CreateIntent | PublicationOutboxStateV1::CreateUnknown => {
                 !check_run_bound
@@ -2592,6 +2800,25 @@ impl ValidateRecord for PublicationOutboxV1 {
             return Err(
                 "schedule schema: check_run binding disagrees with publication outbox state".into(),
             );
+        }
+        match (check_run_id, &self.check_run_binding) {
+            (None, OptionalSha256V1::Absent) => {}
+            (Some(id), OptionalSha256V1::Sha256 { value }) => {
+                sha256("outbox check-run binding", value)?;
+                let expected = publication_check_run_binding_sha256(&self.immutable_identity, id)?;
+                if value != &expected {
+                    return Err(
+                        "schedule schema: check-run id is not bound to the immutable outbox identity"
+                            .into(),
+                    );
+                }
+            }
+            _ => {
+                return Err(
+                    "schedule schema: check-run binding presence disagrees with the remote id"
+                        .into(),
+                )
+            }
         }
         let remotely_observed = matches!(
             self.state,
@@ -2634,7 +2861,12 @@ fn portable_path_component(label: &str, value: &str) -> Result<(), BoxError> {
         || (stem.len() == 4
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
             && matches!(stem.as_bytes()[3], b'1'..=b'9'));
-    if value == "." || value == ".." || value.ends_with([' ', '.']) || invalid_character || reserved
+    if !value.is_ascii()
+        || value == "."
+        || value == ".."
+        || value.ends_with([' ', '.'])
+        || invalid_character
+        || reserved
     {
         return Err(format!(
             "schedule schema: {label} must be one normalized portable relative-path component"
@@ -2642,6 +2874,15 @@ fn portable_path_component(label: &str, value: &str) -> Result<(), BoxError> {
         .into());
     }
     Ok(())
+}
+
+fn portable_evidence_path_key(value: &RelativeEvidencePathV1) -> String {
+    value
+        .components
+        .iter()
+        .map(|component| component.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn relative_evidence_path(label: &str, value: &RelativeEvidencePathV1) -> Result<(), BoxError> {
@@ -2686,14 +2927,25 @@ impl ValidateRecord for EvidenceIndexV1 {
             "evidence id",
             self.entries.iter().map(|entry| entry.evidence_id.as_str()),
         )?;
+        let mut hot_paths = BTreeSet::new();
+        let mut cold_paths = BTreeSet::new();
         for entry in &self.entries {
             sha256("full evidence", &entry.full_evidence_sha256)?;
             sha256("compact evidence", &entry.compact_record_sha256)?;
             relative_evidence_path("hot evidence path", &entry.hot_path)?;
+            if !hot_paths.insert(portable_evidence_path_key(&entry.hot_path)) {
+                return Err(
+                    "schedule schema: hot evidence paths must be unique in the portable namespace"
+                        .into(),
+                );
+            }
             match &entry.cold_path {
                 OptionalRelativeEvidencePathV1::Absent => {}
                 OptionalRelativeEvidencePathV1::RelativePath { value } if cold_enabled => {
                     relative_evidence_path("cold evidence path", value)?;
+                    if !cold_paths.insert(portable_evidence_path_key(value)) {
+                        return Err("schedule schema: cold evidence paths must be unique in the portable namespace".into());
+                    }
                 }
                 OptionalRelativeEvidencePathV1::RelativePath { .. } => {
                     return Err(
@@ -2748,9 +3000,11 @@ fn optional_authority_status(
             );
         }
         let expired = *expires_at_ms <= generated_at_ms;
-        if (*state == AuthorityStateV1::Expired) != expired {
+        if (*state == AuthorityStateV1::Active && expired)
+            || (*state == AuthorityStateV1::Expired && !expired)
+        {
             return Err(format!(
-                "schedule schema: {label} expiry time and closed authority state disagree"
+                "schedule schema: {label} expiry time and authority state disagree"
             )
             .into());
         }
@@ -2768,6 +3022,26 @@ impl ValidateRecord for ScheduleStatusV1 {
         sha256("status policy", &self.policy_sha256)?;
         optional_window("last window", &self.last_window)?;
         optional_window("next window", &self.next_window)?;
+        if let OptionalWindowV1::Window {
+            scheduled_at_ms, ..
+        } = &self.last_window
+        {
+            if *scheduled_at_ms > self.generated_at_ms {
+                return Err(
+                    "schedule schema: last window cannot follow status generation time".into(),
+                );
+            }
+        }
+        if let OptionalWindowV1::Window {
+            scheduled_at_ms, ..
+        } = &self.next_window
+        {
+            if *scheduled_at_ms <= self.generated_at_ms {
+                return Err(
+                    "schedule schema: next window must follow status generation time".into(),
+                );
+            }
+        }
         if let (
             OptionalWindowV1::Window {
                 scheduled_at_ms: last,
@@ -2789,6 +3063,41 @@ impl ValidateRecord for ScheduleStatusV1 {
             &self.storage_consent,
             self.generated_at_ms,
         )?;
+        let provider_grant_active = matches!(
+            &self.provider_grant,
+            OptionalAuthorityStatusV1::Authority {
+                state: AuthorityStateV1::Active,
+                expires_at_ms,
+                ..
+            } if *expires_at_ms > self.generated_at_ms
+        );
+        let storage_consent_present = matches!(
+            &self.storage_consent,
+            OptionalAuthorityStatusV1::Authority { .. }
+        );
+        let storage_consent_active = matches!(
+            &self.storage_consent,
+            OptionalAuthorityStatusV1::Authority {
+                state: AuthorityStateV1::Active,
+                expires_at_ms,
+                ..
+            } if *expires_at_ms > self.generated_at_ms
+        );
+        if matches!(
+            self.storage_state,
+            StorageStateV1::ColdEligible | StorageStateV1::Archiving
+        ) && !storage_consent_active
+        {
+            return Err(
+                "schedule schema: cold-eligible or archiving storage requires active consent"
+                    .into(),
+            );
+        }
+        if self.storage_state == StorageStateV1::Synchronized && !storage_consent_present {
+            return Err(
+                "schedule schema: synchronized storage requires a durable consent reference".into(),
+            );
+        }
         sha256("ledger headroom", &self.ledger_headroom_sha256)?;
         unique_ids(
             "status case id",
@@ -2824,6 +3133,22 @@ impl ValidateRecord for ScheduleStatusV1 {
                         .into(),
                 );
             }
+        }
+        let has_active_scheduled_case = self.cases.iter().any(|case| {
+            matches!(
+                case.lifecycle,
+                ScheduleCaseLifecycleV1::ScheduledActive
+                    | ScheduleCaseLifecycleV1::RequiredGateActive
+            )
+        });
+        if has_active_scheduled_case
+            && (!provider_grant_active
+                || !matches!(&self.next_window, OptionalWindowV1::Window { .. }))
+        {
+            return Err(
+                "schedule schema: active scheduled cases require an active grant and next window"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -3024,6 +3349,13 @@ mod tests {
         GitObjectIdV1 {
             algorithm: GitObjectAlgorithmV1::Sha1,
             hex: ch.to_string().repeat(40),
+        }
+    }
+
+    fn sha256_git(ch: char) -> GitObjectIdV1 {
+        GitObjectIdV1 {
+            algorithm: GitObjectAlgorithmV1::Sha256,
+            hex: ch.to_string().repeat(64),
         }
     }
 
@@ -3241,9 +3573,11 @@ mod tests {
     }
 
     fn publication_outbox() -> PublicationOutboxV1 {
-        PublicationOutboxV1 {
+        let mut outbox = PublicationOutboxV1 {
             schema_version: 1,
-            outbox_id: "outbox-1".into(),
+            outbox_id: "outbox:placeholder".into(),
+            immutable_identity: fingerprint_value('0'),
+            previous_record: OptionalSha256V1::Sha256 { value: digest('9') },
             state: PublicationOutboxStateV1::RemotePending,
             repository: "shoedog/a2acp".into(),
             pull_request: 37,
@@ -3252,13 +3586,21 @@ mod tests {
             app_id: "app-1".into(),
             external_id: "external-1".into(),
             check_run: OptionalCheckRunIdV1::CheckRun { id: 1 },
+            check_run_binding: OptionalSha256V1::Absent,
             terminal_consumption: OptionalStableIdV1::Absent,
             desired_conclusion: OptionalCheckConclusionV1::Absent,
             evidence_set: OptionalSha256V1::Absent,
             final_guard: OptionalSha256V1::Absent,
             remote_observation: OptionalSha256V1::Absent,
             remote_observation_attempts: 0,
-        }
+        };
+        let identity = publication_outbox_identity_sha256(&outbox).unwrap();
+        outbox.outbox_id = format!("outbox:{identity}");
+        outbox.immutable_identity.sha256 = identity;
+        outbox.check_run_binding = OptionalSha256V1::Sha256 {
+            value: publication_check_run_binding_sha256(&outbox.immutable_identity, 1).unwrap(),
+        };
+        outbox
     }
 
     fn execution_record(
@@ -3299,7 +3641,7 @@ mod tests {
             expected_effective_identity: identity,
             actual_caps: caps,
         };
-        let sha256 = canonical_input_sha256("test execution", &input).unwrap();
+        let sha256 = canonical_input_sha256("case-execution input", &input).unwrap();
         CaseExecutionFingerprintRecordV1 {
             schema_version: 1,
             input,
@@ -3331,7 +3673,7 @@ mod tests {
                 repeat_nonce: OptionalStableIdV1::Absent,
             },
         };
-        let sha256 = canonical_input_sha256("test admission", &input).unwrap();
+        let sha256 = canonical_input_sha256("admission-attempt input", &input).unwrap();
         AdmissionAttemptFingerprintRecordV1 {
             schema_version: 1,
             input,
@@ -3362,7 +3704,7 @@ mod tests {
     }
 
     #[test]
-    fn git_object_ids_accept_real_sha1_and_reject_algorithm_length_mismatch() {
+    fn git_object_ids_require_nonnull_repository_wide_sha1_or_sha256() {
         let target = ExactExecutionTargetV1::RepositorySnapshot {
             repository: "shoedog/a2acp".into(),
             head_oid: GitObjectIdV1 {
@@ -3373,6 +3715,33 @@ mod tests {
             range_start_exclusive: OptionalGitObjectIdV1::ObjectId { value: sha1('b') },
         };
         validate_execution_target(&target).unwrap();
+
+        let sha256_target = ExactExecutionTargetV1::RepositorySnapshot {
+            repository: "sha256/repository".into(),
+            head_oid: sha256_git('a'),
+            tree_oid: sha256_git('b'),
+            range_start_exclusive: OptionalGitObjectIdV1::ObjectId {
+                value: sha256_git('c'),
+            },
+        };
+        validate_execution_target(&sha256_target).unwrap();
+
+        let mixed_target = ExactExecutionTargetV1::RepositorySnapshot {
+            repository: "mixed/repository".into(),
+            head_oid: sha1('a'),
+            tree_oid: sha256_git('b'),
+            range_start_exclusive: OptionalGitObjectIdV1::Absent,
+        };
+        assert!(validate_execution_target(&mixed_target)
+            .unwrap_err()
+            .to_string()
+            .contains("mixes Git object algorithms"));
+
+        let null = GitObjectIdV1 {
+            algorithm: GitObjectAlgorithmV1::Sha1,
+            hex: "0".repeat(40),
+        };
+        assert!(git_oid("null oid", &null).is_err());
 
         let mut invalid = sha1('c');
         invalid.algorithm = GitObjectAlgorithmV1::Sha256;
@@ -3615,12 +3984,47 @@ mod tests {
             lifecycle: HoldLifecycleV1::Active,
         };
         hold.validate().unwrap();
+        let opening_sha256 = safety_hold_opening_sha256(&hold).unwrap();
+        let clearance_action_id = "clearance-1".to_owned();
+        let cleared_at_ms = 3;
+        let operator = "Wesley Jinks".to_owned();
+        let reason = "process exit proved".to_owned();
+        let clearance_action_sha256 = canonical_input_sha256(
+            "safety-hold clearance action",
+            &SafetyHoldClearanceIdentityV1 {
+                schema_version: 1,
+                opening_sha256: &opening_sha256,
+                clearance_action_id: &clearance_action_id,
+                cleared_at_ms,
+                operator: &operator,
+                reason: &reason,
+            },
+        )
+        .unwrap();
         hold.lifecycle = HoldLifecycleV1::Cleared {
-            cleared_at_ms: 3,
-            operator: "Wesley Jinks".into(),
-            reason: "process exit proved".into(),
+            opening_sha256,
+            clearance_action_id,
+            clearance_action_sha256,
+            cleared_at_ms,
+            operator,
+            reason,
         };
         hold.validate().unwrap();
+        let valid_clearance = hold.lifecycle.clone();
+        if let HoldLifecycleV1::Cleared { opening_sha256, .. } = &mut hold.lifecycle {
+            *opening_sha256 = digest('a');
+        }
+        assert!(hold.validate().is_err());
+        hold.lifecycle = valid_clearance.clone();
+        if let HoldLifecycleV1::Cleared {
+            clearance_action_sha256,
+            ..
+        } = &mut hold.lifecycle
+        {
+            *clearance_action_sha256 = digest('b');
+        }
+        assert!(hold.validate().is_err());
+        hold.lifecycle = valid_clearance;
         if let HoldLifecycleV1::Cleared { cleared_at_ms, .. } = &mut hold.lifecycle {
             *cleared_at_ms = 1;
         }
@@ -3791,6 +4195,7 @@ mod tests {
             evidence_sha256: digest('1'),
             requested_purpose: EvidencePurposeV1::ProviderPathAdvisory,
             satisfied_purpose: EvidencePurposeV1::ClaimedSupportGate,
+            provenance: ConsumptionEvidenceProvenanceV1::Ordinary,
             characterization_profile: fingerprint_value('2'),
             case_execution: fingerprint_value('3'),
             admission_attempt: fingerprint_value('4'),
@@ -3799,6 +4204,34 @@ mod tests {
         };
         consumption.validate().unwrap();
         consumption.requested_purpose = EvidencePurposeV1::ManualDiagnostic;
+        assert!(consumption.validate().is_err());
+
+        consumption.requested_purpose = EvidencePurposeV1::ProviderPathAdvisory;
+        consumption.satisfied_purpose = EvidencePurposeV1::Characterization;
+        consumption.consumed_at_ms = 30;
+        consumption.provenance = ConsumptionEvidenceProvenanceV1::ReviewedCharacterization {
+            characterization_id: "characterization-1".into(),
+            characterization_record_sha256: digest('5'),
+            freshness_bucket: "policy-window-1".into(),
+            freshness_observation_sha256: digest('6'),
+            terminal_at_ms: 10,
+            reviewed_at_ms: 20,
+            reviewer: "Wesley Jinks".into(),
+        };
+        consumption.validate().unwrap();
+
+        let mut unreviewed = consumption.clone();
+        unreviewed.provenance = ConsumptionEvidenceProvenanceV1::Ordinary;
+        assert!(unreviewed.validate().is_err());
+
+        let ConsumptionEvidenceProvenanceV1::ReviewedCharacterization {
+            freshness_observation_sha256,
+            ..
+        } = &mut consumption.provenance
+        else {
+            unreachable!()
+        };
+        *freshness_observation_sha256 = "not-a-digest".into();
         assert!(consumption.validate().is_err());
     }
 
@@ -4127,6 +4560,39 @@ mod tests {
     }
 
     #[test]
+    fn publication_outbox_binds_immutable_remote_identity_and_transition_chain() {
+        let outbox = publication_outbox();
+        outbox.validate().unwrap();
+
+        let mut changed_repository = outbox.clone();
+        changed_repository.repository = "shoedog/another-repository".into();
+        assert!(changed_repository
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("immutable remote identity"));
+
+        let mut changed_check_run = outbox.clone();
+        changed_check_run.check_run = OptionalCheckRunIdV1::CheckRun { id: 2 };
+        assert!(changed_check_run
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("check-run id"));
+
+        let mut unchained = outbox.clone();
+        unchained.previous_record = OptionalSha256V1::Absent;
+        assert!(unchained.validate().is_err());
+
+        let mut create_intent = outbox;
+        create_intent.state = PublicationOutboxStateV1::CreateIntent;
+        create_intent.previous_record = OptionalSha256V1::Absent;
+        create_intent.check_run = OptionalCheckRunIdV1::Absent;
+        create_intent.check_run_binding = OptionalSha256V1::Absent;
+        create_intent.validate().unwrap();
+    }
+
+    #[test]
     fn evidence_paths_are_root_bound_normalized_and_portable() {
         let entry = EvidenceIndexEntryV1 {
             evidence_id: "evidence-1".into(),
@@ -4170,6 +4636,32 @@ mod tests {
             file_provider_domain_id: "icloud-drive".into(),
         };
         index.validate().unwrap();
+
+        let original = index.entries[0].clone();
+        let mut duplicate_hot = original.clone();
+        duplicate_hot.evidence_id = "evidence-2".into();
+        duplicate_hot.full_evidence_sha256 = digest('f');
+        duplicate_hot.compact_record_sha256 = digest('1');
+        index.entries.push(duplicate_hot);
+        assert!(index
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("hot evidence paths"));
+
+        index.entries[1].hot_path.components = vec!["2026".into(), "EVIDENCE-1.JSON".into()];
+        assert!(index.validate().is_err());
+
+        index.entries[1].hot_path.components = vec!["2026".into(), "evidence-2.json".into()];
+        assert!(index
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cold evidence paths"));
+
+        index.entries.truncate(1);
+        index.entries[0].hot_path.components[0] = "café".into();
+        assert!(index.validate().is_err());
     }
 
     #[test]
@@ -4209,6 +4701,7 @@ mod tests {
             }],
         };
         status.validate().unwrap();
+        let valid_status = status.clone();
 
         status.cases[0].hold = OptionalRecordRefV1::Record {
             id: "hold-1".into(),
@@ -4237,6 +4730,45 @@ mod tests {
         *state = AuthorityStateV1::Active;
         *expires_at_ms = 9;
         assert!(status.validate().is_err());
+
+        let mut future_last = valid_status.clone();
+        future_last.last_window = OptionalWindowV1::Window {
+            id: "window-future-last".into(),
+            scheduled_at_ms: 20,
+        };
+        future_last.next_window = OptionalWindowV1::Window {
+            id: "window-future-next".into(),
+            scheduled_at_ms: 30,
+        };
+        assert!(future_last.validate().is_err());
+
+        let mut missing_grant = valid_status.clone();
+        missing_grant.provider_grant = OptionalAuthorityStatusV1::Absent;
+        assert!(missing_grant.validate().is_err());
+
+        let mut missing_next = valid_status.clone();
+        missing_next.next_window = OptionalWindowV1::Absent;
+        assert!(missing_next.validate().is_err());
+
+        let mut unconsented_cold = valid_status.clone();
+        unconsented_cold.storage_state = StorageStateV1::ColdEligible;
+        assert!(unconsented_cold.validate().is_err());
+        unconsented_cold.storage_state = StorageStateV1::Synchronized;
+        assert!(unconsented_cold.validate().is_err());
+
+        let mut revoked = valid_status;
+        revoked.cases[0].lifecycle = ScheduleCaseLifecycleV1::Deferred;
+        let OptionalAuthorityStatusV1::Authority {
+            state,
+            expires_at_ms,
+            ..
+        } = &mut revoked.provider_grant
+        else {
+            unreachable!()
+        };
+        *state = AuthorityStateV1::Revoked;
+        *expires_at_ms = 9;
+        revoked.validate().unwrap();
     }
 
     #[test]
@@ -4294,6 +4826,14 @@ mod tests {
         let mut outbox = serde_json::to_value(publication_outbox()).unwrap();
         outbox["repository"] = serde_json::json!("sk-live-abcdefghijklmnopqrstuvwxyz123456");
         std::fs::write(&path, serde_json::to_vec(&outbox).unwrap()).unwrap();
+        let error = validate_schedule_record("publication-outbox", &path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("secret-shaped"), "{error}");
+
+        let mut nested = serde_json::to_value(publication_outbox()).unwrap();
+        nested["unexpected_nested"] = serde_json::json!({"password": "hunter2"});
+        std::fs::write(&path, serde_json::to_vec(&nested).unwrap()).unwrap();
         let error = validate_schedule_record("publication-outbox", &path)
             .unwrap_err()
             .to_string();

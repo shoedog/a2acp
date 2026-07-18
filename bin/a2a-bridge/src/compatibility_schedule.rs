@@ -398,6 +398,7 @@ struct LoadedToml<T> {
     value: T,
     canonical_path: PathBuf,
     sha256: String,
+    file_identity: local_file::RegularFileIdentity,
 }
 
 #[derive(Debug)]
@@ -411,6 +412,7 @@ pub(super) struct LoadedScheduleFoundation {
 struct CapturedFoundationFile {
     canonical_path: PathBuf,
     sha256: String,
+    file_identity: local_file::RegularFileIdentity,
     label: String,
     max_bytes: u64,
 }
@@ -492,6 +494,7 @@ fn load_toml<T: DeserializeOwned>(path: &Path, label: &str) -> Result<LoadedToml
         value,
         canonical_path: snapshot.canonical_path,
         sha256: snapshot.sha256,
+        file_identity: snapshot.identity,
     })
 }
 
@@ -517,9 +520,11 @@ fn load_foundation_toml<T: DeserializeOwned>(
 }
 
 fn canonical_hash<T: Serialize>(label: &str, value: &T) -> Result<String, BoxError> {
-    let bytes = serde_json::to_vec(value)
+    let canonical = serde_json::to_vec(value)
         .map_err(|error| format!("schedule foundation: cannot canonicalize {label}: {error}"))?;
-    Ok(local_file::sha256_hex(&bytes))
+    let mut domain_separated = format!("a2a-bridge:r3d0:{label}:v1\0").into_bytes();
+    domain_separated.extend_from_slice(&canonical);
+    Ok(local_file::sha256_hex(&domain_separated))
 }
 
 fn exact_toml_keys(
@@ -823,6 +828,15 @@ fn validate_policy(policy: &SchedulePolicyV1) -> Result<(), BoxError> {
     if policy.deferred_profiles.len() > MAX_DEFERRED_PROFILES {
         return Err("schedule foundation: too many deferred profile records".into());
     }
+    if policy
+        .deferred_profiles
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .len()
+        != policy.deferred_profiles.len()
+    {
+        return Err("schedule foundation: deferred profile records must be unique".into());
+    }
     for (index, value) in policy.deferred_profiles.iter().enumerate() {
         bounded_text(&format!("deferred_profiles[{index}]"), value)?;
     }
@@ -1108,6 +1122,93 @@ fn validate_config_cross_bindings(
         )
         .into());
     }
+    if config.server_addr != "127.0.0.1:8080" {
+        return Err(format!(
+            "schedule foundation: case {:?} must keep the inert loopback bridge server binding",
+            case.id
+        )
+        .into());
+    }
+    let expected_base_url =
+        (case.provider_family == "ollama-local").then_some("http://127.0.0.1:11434/v1");
+    if config.base_url.as_deref() != expected_base_url {
+        return Err(format!(
+            "schedule foundation: case {:?} provider endpoint contradicts its reviewed provider path",
+            case.id
+        )
+        .into());
+    }
+    let expected_args = match (case.provider_family.as_str(), case.execution_mode) {
+        ("openai-codex", ScheduleExecutionModeV1::Host) => vec![
+            "-c".to_owned(),
+            "sandbox_mode=\"read-only\"".to_owned(),
+            "-c".to_owned(),
+            "approval_policy=\"never\"".to_owned(),
+        ],
+        ("openai-codex", ScheduleExecutionModeV1::ContainerRo) => vec![
+            "-c".to_owned(),
+            "sandbox_mode=\"danger-full-access\"".to_owned(),
+            "-c".to_owned(),
+            "approval_policy=\"never\"".to_owned(),
+        ],
+        _ => Vec::new(),
+    };
+    if config.args != expected_args {
+        return Err(format!(
+            "schedule foundation: case {:?} command arguments contradict its reviewed effect boundary",
+            case.id
+        )
+        .into());
+    }
+    match case.execution_mode {
+        ScheduleExecutionModeV1::ContainerRo => {
+            const READER_ROOT: &str = "/Users/wesleyjinks/code";
+            let sandbox = config.sandbox.as_ref().ok_or_else(|| -> BoxError {
+                format!(
+                    "schedule foundation: reader case {:?} has no canonical sandbox",
+                    case.id
+                )
+                .into()
+            })?;
+            let expected_volume = match case.provider_family.as_str() {
+                "openai-codex" => {
+                    "/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json"
+                }
+                "anthropic-claude" => "/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json",
+                _ => {
+                    return Err(format!(
+                        "schedule foundation: reader case {:?} has no reviewed credential-volume contract",
+                        case.id
+                    )
+                    .into())
+                }
+            };
+            if config.allowed_cwd_root.as_deref() != Some(READER_ROOT)
+                || !case.session_cwd.starts_with(READER_ROOT)
+                || sandbox.mount != READER_ROOT
+                || sandbox.access != "ro"
+                || sandbox.egress != "locked"
+                || sandbox.network != "a2a-egress-internal"
+                || sandbox.proxy != "http://a2a-egress-proxy:8888"
+                || sandbox.volumes != [expected_volume]
+            {
+                return Err(format!(
+                    "schedule foundation: reader case {:?} sandbox/mount/egress/proxy/credential-volume contract drifted",
+                    case.id
+                )
+                .into());
+            }
+        }
+        ScheduleExecutionModeV1::Host | ScheduleExecutionModeV1::RemoteApi => {
+            if config.allowed_cwd_root.is_some() || config.sandbox.is_some() {
+                return Err(format!(
+                    "schedule foundation: non-reader case {:?} must not carry a container filesystem boundary",
+                    case.id
+                )
+                .into());
+            }
+        }
+    }
     let auth_matches = match case.auth_path {
         ScheduleAuthPathV1::PreAuthenticated => {
             config.pre_authenticated
@@ -1279,6 +1380,7 @@ fn validate_config(
     let captured = CapturedFoundationFile {
         canonical_path: snapshot.canonical_path,
         sha256: snapshot.sha256,
+        file_identity: snapshot.identity,
         label: format!("scheduled config {:?}", case.id),
         max_bytes: MAX_CONFIG_BYTES,
     };
@@ -1293,6 +1395,7 @@ fn scheduled_profile(
 ) -> CanonicalProfileInputV1 {
     let mut allowed_effects = case.allowed_effects.clone();
     allowed_effects.sort();
+    let required_env = canonical_required_environment(case.required_env.clone());
     CanonicalProfileInputV1 {
         schema_version: 1,
         source_kind: ProfileSourceKindV1::ScheduledAdvisory,
@@ -1324,7 +1427,7 @@ fn scheduled_profile(
         }
         .into(),
         credential_env_name: case.credential_env.clone(),
-        required_env: case.required_env.clone(),
+        required_env,
         environment_owner: case.environment_owner.clone(),
         os: case.os.clone(),
         architecture: case.architecture.clone(),
@@ -1580,6 +1683,7 @@ fn support_profile(
     captures.push(CapturedFoundationFile {
         canonical_path: config_snapshot.canonical_path.clone(),
         sha256: config_snapshot.sha256.clone(),
+        file_identity: config_snapshot.identity.clone(),
         label: format!("support config {id:?}"),
         max_bytes: MAX_CONFIG_BYTES,
     });
@@ -1632,6 +1736,7 @@ fn support_profile(
         .transpose()
         .map_err(|error| format!("schedule foundation: invalid support required_env: {error}"))?
         .unwrap_or_default();
+    let required_env = canonical_required_environment(required_env);
     let artifact = case
         .get("artifact")
         .and_then(toml::Value::as_table)
@@ -1738,6 +1843,13 @@ fn support_profile(
         )
         .into());
     }
+    validate_claimed_support_config_effect_boundary(
+        &id,
+        provider_family,
+        &execution_mode,
+        optional("session_cwd").as_deref(),
+        &config_projection,
+    )?;
     let expected_status = match required("expected_status")?.as_str() {
         "PASS" => ExpectedStatusV1::Pass,
         "FAIL" => ExpectedStatusV1::Fail,
@@ -1811,6 +1923,101 @@ fn support_profile(
             .to_owned(),
         maximum_caps: caps,
     })
+}
+
+fn validate_claimed_support_config_effect_boundary(
+    id: &str,
+    provider_family: &str,
+    execution_mode: &str,
+    session_cwd: Option<&str>,
+    config: &CanonicalConfigTemplateV1,
+) -> Result<(), BoxError> {
+    if config.server_addr != "127.0.0.1:8080" || config.base_url.is_some() {
+        return Err(format!(
+            "schedule foundation: support case {id:?} endpoint contradicts its reviewed provider path"
+        )
+        .into());
+    }
+    let expected_args = match (provider_family, execution_mode) {
+        ("openai-codex", "host") => vec![
+            "-c".to_owned(),
+            "sandbox_mode=\"read-only\"".to_owned(),
+            "-c".to_owned(),
+            "approval_policy=\"never\"".to_owned(),
+        ],
+        ("openai-codex", "container_ro") => vec![
+            "-c".to_owned(),
+            "sandbox_mode=\"danger-full-access\"".to_owned(),
+            "-c".to_owned(),
+            "approval_policy=\"never\"".to_owned(),
+        ],
+        ("anthropic-claude", "host" | "container_ro") => Vec::new(),
+        _ => {
+            return Err(format!(
+                "schedule foundation: support case {id:?} has no reviewed provider/effect boundary"
+            )
+            .into())
+        }
+    };
+    if config.args != expected_args {
+        return Err(format!(
+            "schedule foundation: support case {id:?} command arguments contradict its reviewed effect boundary"
+        )
+        .into());
+    }
+    if execution_mode == "host" {
+        if config.allowed_cwd_root.is_some() || config.sandbox.is_some() {
+            return Err(format!(
+                "schedule foundation: support host case {id:?} must not carry a container filesystem boundary"
+            )
+            .into());
+        }
+        return Ok(());
+    }
+
+    const READER_ROOT: &str = "/Users/wesleyjinks/code";
+    let sandbox = config.sandbox.as_ref().ok_or_else(|| -> BoxError {
+        format!("schedule foundation: support reader case {id:?} has no canonical sandbox").into()
+    })?;
+    let mut expected_volumes = match provider_family {
+        "openai-codex" => vec![
+            "/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json"
+                .to_owned(),
+        ],
+        "anthropic-claude" => vec![
+            "/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json"
+                .to_owned(),
+            "/Users/wesleyjinks/code/a2a-bridge-operator-main/deploy/containers/claude-fable-settings.json:/root/.claude/settings.json:ro"
+                .to_owned(),
+        ],
+        _ => unreachable!("provider family was closed above"),
+    };
+    expected_volumes.sort();
+    if config.allowed_cwd_root.as_deref() != Some(READER_ROOT)
+        || !session_cwd.is_some_and(|cwd| Path::new(cwd).starts_with(READER_ROOT))
+        || sandbox.mount != READER_ROOT
+        || sandbox.access != "ro"
+        || sandbox.egress != "locked"
+        || sandbox.network != "a2a-egress-internal"
+        || sandbox.proxy != "http://a2a-egress-proxy:8888"
+        || sandbox.volumes != expected_volumes
+    {
+        return Err(format!(
+            "schedule foundation: support reader case {id:?} sandbox/mount/egress/proxy/credential-volume contract drifted"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn canonical_required_environment(
+    mut values: Vec<RequiredEnvironmentV1>,
+) -> Vec<RequiredEnvironmentV1> {
+    for required in &mut values {
+        required.one_of.sort();
+    }
+    values.sort_by(|left, right| left.name.cmp(&right.name));
+    values
 }
 
 fn validate_inventory(
@@ -1918,8 +2125,18 @@ fn canonical_floating_recipes_sha256(
 }
 
 fn recheck_foundation_files(captures: &[CapturedFoundationFile]) -> Result<(), BoxError> {
+    recheck_foundation_files_with_hook(captures, |_| {})
+}
+
+fn recheck_foundation_files_with_hook<F>(
+    captures: &[CapturedFoundationFile],
+    mut after_recheck: F,
+) -> Result<(), BoxError>
+where
+    F: FnMut(usize),
+{
     let mut seen = BTreeMap::<&Path, &str>::new();
-    for capture in captures {
+    for (index, capture) in captures.iter().enumerate() {
         if let Some(previous) = seen.insert(&capture.canonical_path, &capture.sha256) {
             if previous != capture.sha256 {
                 return Err(format!(
@@ -1935,13 +2152,17 @@ fn recheck_foundation_files(captures: &[CapturedFoundationFile]) -> Result<(), B
             &format!("{} final recheck", capture.label),
             capture.max_bytes,
         )?;
-        if current.canonical_path != capture.canonical_path || current.sha256 != capture.sha256 {
+        if current.canonical_path != capture.canonical_path
+            || current.sha256 != capture.sha256
+            || current.identity != capture.file_identity
+        {
             return Err(format!(
                 "schedule foundation: {} changed during the multi-file snapshot",
                 capture.label
             )
             .into());
         }
+        after_recheck(index);
     }
     Ok(())
 }
@@ -1985,36 +2206,41 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
         CapturedFoundationFile {
             canonical_path: policy.canonical_path.clone(),
             sha256: policy.sha256.clone(),
+            file_identity: policy.file_identity.clone(),
             label: "scheduling policy".into(),
             max_bytes: MAX_FOUNDATION_FILE_BYTES,
         },
         CapturedFoundationFile {
             canonical_path: registry.canonical_path.clone(),
             sha256: registry.sha256.clone(),
+            file_identity: registry.file_identity.clone(),
             label: "scheduled case registry".into(),
             max_bytes: MAX_FOUNDATION_FILE_BYTES,
         },
         CapturedFoundationFile {
             canonical_path: inventory.canonical_path.clone(),
             sha256: inventory.sha256.clone(),
+            file_identity: inventory.file_identity.clone(),
             label: "characterization profile inventory".into(),
             max_bytes: MAX_FOUNDATION_FILE_BYTES,
         },
     ];
 
-    let (production_manifest_bytes, production_manifest_sha256, production_manifest_canonical_path) =
+    let production_manifest_snapshot =
         compatibility::validated_manifest_snapshot(&root.join(&policy.value.production_manifest))?;
     ensure_snapshot_within_root(
         &root,
-        &production_manifest_canonical_path,
+        &production_manifest_snapshot.canonical_path,
         "production manifest",
     )?;
     captures.push(CapturedFoundationFile {
-        canonical_path: production_manifest_canonical_path,
-        sha256: production_manifest_sha256,
+        canonical_path: production_manifest_snapshot.canonical_path.clone(),
+        sha256: production_manifest_snapshot.sha256.clone(),
+        file_identity: production_manifest_snapshot.identity.clone(),
         label: "production manifest".into(),
         max_bytes: MAX_FOUNDATION_FILE_BYTES,
     });
+    let production_manifest_bytes = production_manifest_snapshot.bytes;
     let floating =
         compatibility_resolution::load_recipes(&root.join(&policy.value.floating_recipes))?;
     ensure_snapshot_within_root(&root, &floating.canonical_path, "floating recipes")?;
@@ -2028,6 +2254,10 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
     captures.push(CapturedFoundationFile {
         canonical_path: floating.canonical_path.clone(),
         sha256: floating.sha256.clone(),
+        file_identity: floating
+            .file_identity
+            .clone()
+            .ok_or("schedule foundation: floating recipe loader omitted file identity")?,
         label: "floating recipes".into(),
         max_bytes: MAX_FOUNDATION_FILE_BYTES,
     });
@@ -2176,6 +2406,42 @@ mod tests {
     }
 
     #[test]
+    fn required_environment_identity_is_set_order_independent() {
+        let left = vec![
+            RequiredEnvironmentV1 {
+                name: "Z_ENV".into(),
+                one_of: vec!["two".into(), "one".into()],
+            },
+            RequiredEnvironmentV1 {
+                name: "A_ENV".into(),
+                one_of: vec!["beta".into(), "alpha".into()],
+            },
+        ];
+        let right = vec![
+            RequiredEnvironmentV1 {
+                name: "A_ENV".into(),
+                one_of: vec!["alpha".into(), "beta".into()],
+            },
+            RequiredEnvironmentV1 {
+                name: "Z_ENV".into(),
+                one_of: vec!["one".into(), "two".into()],
+            },
+        ];
+        assert_eq!(
+            canonical_required_environment(left),
+            canonical_required_environment(right)
+        );
+    }
+
+    #[test]
+    fn canonical_hashes_are_domain_separated() {
+        let value = vec!["same", "canonical", "bytes"];
+        let profile = canonical_hash("scheduled characterization profile", &value).unwrap();
+        let bundle = canonical_hash("profile policy bundle", &value).unwrap();
+        assert_ne!(profile, bundle);
+    }
+
+    #[test]
     fn final_snapshot_recheck_rejects_mid_validation_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("foundation.toml");
@@ -2189,6 +2455,7 @@ mod tests {
         let capture = CapturedFoundationFile {
             canonical_path: snapshot.canonical_path,
             sha256: snapshot.sha256,
+            file_identity: snapshot.identity,
             label: "foundation recheck fixture".into(),
             max_bytes: MAX_FOUNDATION_FILE_BYTES,
         };
@@ -2198,5 +2465,40 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("changed during"));
+    }
+
+    #[test]
+    fn final_snapshot_recheck_rejects_same_content_object_swap_and_mixed_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_path = temp.path().join("first.toml");
+        let second_path = temp.path().join("second.toml");
+        std::fs::write(&first_path, b"schema_version = 1\n").unwrap();
+        std::fs::write(&second_path, b"schema_version = 1\n").unwrap();
+        let capture = |path: &Path, label: &str| {
+            let snapshot =
+                local_file::read_regular_file_bounded(path, label, MAX_FOUNDATION_FILE_BYTES)
+                    .unwrap();
+            CapturedFoundationFile {
+                canonical_path: snapshot.canonical_path,
+                sha256: snapshot.sha256,
+                file_identity: snapshot.identity,
+                label: label.into(),
+                max_bytes: MAX_FOUNDATION_FILE_BYTES,
+            }
+        };
+        let captures = vec![
+            capture(&first_path, "first fixture"),
+            capture(&second_path, "second fixture"),
+        ];
+        let displaced = temp.path().join("second-old.toml");
+        let error = recheck_foundation_files_with_hook(&captures, |index| {
+            if index == 0 {
+                std::fs::rename(&second_path, &displaced).unwrap();
+                std::fs::write(&second_path, b"schema_version = 1\n").unwrap();
+            }
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("changed during"), "{error}");
     }
 }

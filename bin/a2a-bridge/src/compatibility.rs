@@ -302,6 +302,7 @@ struct LoadedManifest {
     canonical_path: PathBuf,
     canonical_path_text: String,
     sha256: String,
+    file_identity: Option<local_file::RegularFileIdentity>,
     resolution_binding: Option<ResolutionBindingRecord>,
 }
 
@@ -380,12 +381,58 @@ pub(super) fn looks_like_secret(value: &str) -> bool {
     secret_shaped_tokens(value)
         || lower.contains("bearer ")
         || lower.contains("basic ")
+        || contains_structured_credential_assignment(&lower)
         || lower.contains("api_key=")
         || lower.contains("apikey=")
         || lower.contains("token=")
         || lower.contains("password=")
         || lower.contains("secret=")
         || value.contains("-----BEGIN PRIVATE KEY-----")
+}
+
+fn contains_structured_credential_assignment(lower: &str) -> bool {
+    const KEYS: [&str; 12] = [
+        "api_key",
+        "api-key",
+        "apikey",
+        "authorization",
+        "client_secret",
+        "cookie",
+        "credential",
+        "credentials",
+        "passwd",
+        "password",
+        "secret",
+        "token",
+    ];
+    KEYS.into_iter().any(|key| {
+        lower.match_indices(key).any(|(start, _)| {
+            let token_boundary = start == 0
+                || !lower.as_bytes()[start - 1].is_ascii_alphanumeric()
+                    && lower.as_bytes()[start - 1] != b'_';
+            if !token_boundary {
+                return false;
+            }
+            let mut tail = &lower[start + key.len()..];
+            if tail.starts_with('"') || tail.starts_with('\'') {
+                tail = &tail[1..];
+            }
+            tail = tail.trim_start_matches(char::is_whitespace);
+            let Some(delimiter) = tail.as_bytes().first() else {
+                return false;
+            };
+            if !matches!(delimiter, b':' | b'=') {
+                return false;
+            }
+            tail = tail[1..].trim_start_matches(char::is_whitespace);
+            if tail.starts_with('"') || tail.starts_with('\'') {
+                tail = &tail[1..];
+            }
+            tail.as_bytes().first().is_some_and(|byte| {
+                !byte.is_ascii_whitespace() && !matches!(byte, b'"' | b'\'' | b',' | b'}' | b']')
+            })
+        })
+    })
 }
 
 fn secret_shaped_tokens(value: &str) -> bool {
@@ -1008,20 +1055,24 @@ fn load_manifest(path: &Path) -> Result<LoadedManifest, BoxError> {
         canonical_path: snapshot.canonical_path,
         canonical_path_text,
         sha256: snapshot.sha256,
+        file_identity: Some(snapshot.identity),
         resolution_binding: None,
     })
 }
 
 pub(super) fn validated_manifest_snapshot(
     path: &Path,
-) -> Result<(Vec<u8>, String, PathBuf), BoxError> {
+) -> Result<local_file::LocalFileSnapshot, BoxError> {
     let loaded = load_manifest(path)?;
     let snapshot =
         local_file::read_regular_file_bounded(path, "compatibility manifest", MAX_MANIFEST_BYTES)?;
-    if snapshot.sha256 != loaded.sha256 {
+    if snapshot.sha256 != loaded.sha256
+        || loaded.file_identity.as_ref() != Some(&snapshot.identity)
+        || snapshot.canonical_path != loaded.canonical_path
+    {
         return Err("compatibility manifest: changed during schedule-foundation validation".into());
     }
-    Ok((snapshot.bytes, snapshot.sha256, snapshot.canonical_path))
+    Ok(snapshot)
 }
 
 fn parse_manifest_text(raw: &str) -> Result<CompatibilityManifest, BoxError> {
@@ -4926,6 +4977,7 @@ mod tests {
             canonical_path_text: canonical_path.to_str().unwrap().into(),
             canonical_path,
             sha256: "a".repeat(64),
+            file_identity: None,
             resolution_binding: None,
         }
     }
@@ -4983,6 +5035,7 @@ mod tests {
             canonical_path: production_path.clone(),
             canonical_path_text: production_path.to_string_lossy().into_owned(),
             sha256: "c".repeat(64),
+            file_identity: None,
             resolution_binding: None,
         };
         let execution = LoadedManifest {
@@ -4990,6 +5043,7 @@ mod tests {
             canonical_path: execution_path.clone(),
             canonical_path_text: execution_path.to_string_lossy().into_owned(),
             sha256: "d".repeat(64),
+            file_identity: None,
             resolution_binding: None,
         };
         let limits = compatibility_resolution::ResolutionLimits {
@@ -5028,6 +5082,7 @@ mod tests {
             canonical_path: recipe_path.clone(),
             canonical_path_text: recipe_path.to_string_lossy().into_owned(),
             sha256: "e".repeat(64),
+            file_identity: None,
         };
         let package = compatibility_resolution::ResolvedPackageSet {
             id: "codex-current".into(),
@@ -7806,11 +7861,10 @@ agent_cli = "@openai/codex=0.144.1"
     ) {
         let dir = tempfile::tempdir().unwrap();
         let bytes = b"#!/bin/sh\nexit 0\n".to_vec();
-        let snapshot = local_file::LocalFileSnapshot {
-            canonical_path: dir.path().join("source"),
-            sha256: local_file::sha256_hex(&bytes),
-            bytes,
-        };
+        let source = dir.path().join("source");
+        std::fs::write(&source, &bytes).unwrap();
+        let snapshot =
+            local_file::read_regular_file_bounded(&source, "candidate source", 1024).unwrap();
         let scratch = scratch_in(dir.path());
         let staged = stage_candidate(&snapshot, &scratch).unwrap();
         assert_eq!(std::fs::read(&staged.staged_path).unwrap(), snapshot.bytes);

@@ -16,6 +16,15 @@ fn digest(ch: char) -> String {
     ch.to_string().repeat(64)
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn copy_foundation(destination: &Path) {
     let source = compatibility_root();
     for name in [
@@ -311,6 +320,54 @@ fn r3d0_foundation_rejects_config_row_cross_binding_mutations() {
             "pre_authenticated = false",
             "auth/pre-auth/API-key bindings disagree",
         ),
+        (
+            "configs/codex-luna-host.toml",
+            r#"sandbox_mode=\"read-only\""#,
+            r#"sandbox_mode=\"danger-full-access\""#,
+            "command arguments contradict",
+        ),
+        (
+            "configs/ollama-local.toml",
+            "http://127.0.0.1:11434/v1",
+            "https://unreviewed.example/v1",
+            "provider endpoint contradicts",
+        ),
+        (
+            "configs/codex-luna-reader.toml",
+            "mount = \"/Users/wesleyjinks/code\"",
+            "mount = \"/Users/wesleyjinks\"",
+            "sandbox/mount/egress/proxy/credential-volume contract drifted",
+        ),
+        (
+            "configs/codex-luna-reader.toml",
+            "egress = \"locked\"",
+            "egress = \"open\"",
+            "sandbox/mount/egress/proxy/credential-volume contract drifted",
+        ),
+        (
+            "configs/codex-luna-reader.toml",
+            "proxy = \"http://a2a-egress-proxy:8888\"",
+            "proxy = \"http://127.0.0.1:9999\"",
+            "sandbox/mount/egress/proxy/credential-volume contract drifted",
+        ),
+        (
+            "configs/codex-luna-reader.toml",
+            "/Users/wesleyjinks/.config/a2a-creds/codex/auth.json:/root/.codex/auth.json",
+            "/Users/wesleyjinks/.ssh/id_rsa:/root/.ssh/id_rsa",
+            "sandbox/mount/egress/proxy/credential-volume contract drifted",
+        ),
+        (
+            "configs/codex-luna-reader.toml",
+            "allowed_cwd_root = \"/Users/wesleyjinks/code\"",
+            "allowed_cwd_root = \"/Users/wesleyjinks\"",
+            "sandbox/mount/egress/proxy/credential-volume contract drifted",
+        ),
+        (
+            "configs/claude-haiku-host.toml",
+            "addr = \"127.0.0.1:8080\"",
+            "addr = \"0.0.0.0:8080\"",
+            "inert loopback bridge server binding",
+        ),
     ];
     for (relative, from, to, expected) in mutations {
         let temp = tempfile::tempdir().unwrap();
@@ -541,17 +598,49 @@ fn r3d0_claimed_support_config_bytes_must_match_the_manifest_pin() {
 }
 
 #[test]
+fn r3d0_claimed_support_pin_update_cannot_bypass_reviewed_effect_semantics() {
+    let temp = tempfile::tempdir().unwrap();
+    copy_foundation(temp.path());
+    let config_path = temp.path().join("configs/codex-host.toml");
+    let original = fs::read(&config_path).unwrap();
+    let original_text = std::str::from_utf8(&original).unwrap();
+    let changed_text = original_text.replacen(
+        r#"sandbox_mode=\"read-only\""#,
+        r#"sandbox_mode=\"danger-full-access\""#,
+        1,
+    );
+    assert_ne!(changed_text, original_text);
+    fs::write(&config_path, changed_text.as_bytes()).unwrap();
+
+    let manifest_path = temp.path().join("manifest.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    let manifest = manifest.replacen(
+        &sha256_hex(&original),
+        &sha256_hex(changed_text.as_bytes()),
+        1,
+    );
+    fs::write(manifest_path, manifest).unwrap();
+
+    let output = validate_foundation(temp.path());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("command arguments contradict"), "{stderr}");
+}
+
+#[test]
 fn r3d0_foundation_rejects_secret_shaped_comments() {
-    for relative in ["scheduling-policy.toml", "configs/codex-luna-host.toml"] {
+    for (relative, comment) in [
+        (
+            "scheduling-policy.toml",
+            "# accidental sk-not-a-real-secret",
+        ),
+        ("configs/codex-luna-host.toml", "# password: hunter2"),
+    ] {
         let temp = tempfile::tempdir().unwrap();
         copy_foundation(temp.path());
         let path = temp.path().join(relative);
         let original = fs::read_to_string(&path).unwrap();
-        fs::write(
-            path,
-            format!("# accidental sk-not-a-real-secret\n{original}"),
-        )
-        .unwrap();
+        fs::write(path, format!("{comment}\n{original}")).unwrap();
 
         let output = validate_foundation(temp.path());
         assert!(!output.status.success());
@@ -633,19 +722,39 @@ fn r3d0_characterization_inventory_rejects_omitted_and_duplicate_profiles() {
 }
 
 #[test]
+fn r3d0_policy_rejects_duplicate_deferred_profile_records() {
+    let temp = tempfile::tempdir().unwrap();
+    copy_foundation(temp.path());
+    let path = temp.path().join("scheduling-policy.toml");
+    let original = fs::read_to_string(&path).unwrap();
+    let row = "  \"openrouter: R3e not implemented\",\n";
+    let changed = original.replacen(row, &format!("{row}{row}"), 1);
+    assert_ne!(changed, original);
+    fs::write(path, changed).unwrap();
+
+    let output = validate_foundation(temp.path());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deferred profile records must be unique"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn r3d0_case_and_admission_fingerprint_records_are_supported() {
     let temp = tempfile::tempdir().unwrap();
     for (kind, value) in [
         (
             "case-execution-fingerprint",
             case_execution_record_json(
-                "b54b484b884757815a60772d91da7d5696f2d03a9b7ad8d2eff23f485eeb6c12",
+                "8803c9e9a6cec36583ec16be1854daf3f4703d2aa5efe32a0e02112165ecd13a",
             ),
         ),
         (
             "admission-attempt-fingerprint",
             admission_attempt_record_json(
-                "f3b351b9ee199f754755a65efe8562d075cc942f638dd37c975eba473c3cc127",
+                "c4ebb80360bd7e28014d8aefac9416ae42df0f5e8ddf03c1d063206cf58e9b02",
             ),
         ),
     ] {

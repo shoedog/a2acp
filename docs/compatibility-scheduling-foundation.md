@@ -25,12 +25,16 @@ a2a-bridge compatibility validate --schedule-foundation compatibility
 ```
 
 Validation pins the foundation-root directory identity, uses bounded regular-file/no-follow reads, rejects
-any resolved child path outside that root, and rechecks every captured path and digest before returning. It
-raw-scans before parsing, never invokes the runtime config parser or expands environment variables, applies
-strict TOML/recipe schemas and exact inventory coverage, and checks provider, adapter/command, auth/pre-auth/
-API-key environment, resolution-recipe, config-template, and effect agreement. Claimed-support config bytes
-must match their exact production-manifest pin. The result is a canonical semantic profile-policy bundle:
-comments and set/row ordering do not affect it, while material policy, recipe, or template changes do.
+any resolved child path outside that root, and retains each file's descriptor object/change identity as well
+as its path and digest. The final pass requires all four to remain unchanged, including across same-byte
+atomic replacement. It raw-scans comments and values before parsing, recognizes structured credential-key
+delimiters, never invokes the runtime config parser or expands environment variables, applies strict TOML/
+recipe schemas and exact inventory coverage, and checks provider, adapter/command, auth/pre-auth/API-key
+environment, resolution recipe, endpoint, arguments, server, mount, egress, network, proxy, credential
+volume, config-template, and effect agreement. Claimed-support config bytes must match their exact production-
+manifest pin and cannot bypass those semantic constraints by updating the pin. The result is a canonical
+semantic profile-policy bundle: comments and set/row ordering do not affect it, while material policy,
+recipe, or template changes do. Every canonical hash includes an explicit versioned identity-kind domain.
 
 The profile-policy bundle deliberately excludes exact candidate bytes, test-merge/main targets, generated
 run manifests, package versions, and image/config digests. Those are execution identities. Changing an
@@ -63,8 +67,9 @@ Supported kinds are:
   `schedule-sidecar`, `publication-outbox`, `evidence-index`, `status`, `routing`.
 
 All records are versioned, deny unknown fields, raw-scan every string for secret-shaped material, and use
-bounded local file reads. Git object identities are tagged SHA-1/SHA-256 object IDs rather than content
-SHA-256 digests, so current 40-character GitHub `merge_commit_sha` values are representable. Reusable
+bounded local file reads. Git object identities are non-null tagged SHA-1/SHA-256 object IDs rather than
+content SHA-256 digests, so current 40-character GitHub `merge_commit_sha` values are representable; every
+object ID in one repository target must use the same repository object algorithm. Reusable
 case-execution input contains the exact target/candidate/manifest/config/pin/resolution/
 package/image/environment/cap bindings but structurally cannot contain a trigger or authority. The separate
 admission-attempt input binds that execution to exactly one tagged authority plus request/window/attempt and
@@ -74,24 +79,32 @@ omitted field.
 Provider grants require one exact label/plist binding for each daily or test-merge launchd trigger, and the
 component-wise sum of scheduled, test-merge, and manual-unallocated pools must fit both UTC-day and rolling
 ceilings. Generic manual authority is a closed direct-local-CLI `compatibility_run` record and cannot request
-characterization. Holds and quarantine have explicit immutable open/clear or open/close lifecycles; a second
-untyped failure remains conservatively retained rather than becoming suppressible.
+characterization. A reviewed completed characterization may later satisfy advisory work only through its
+tagged record identity, freshness observation/bucket, review identity, and coherent terminal/review/
+consumption times. Holds bind a canonical opening hash and canonical clearance-action identity; quarantine
+binds its opening hash. A second untyped failure remains conservatively retained rather than becoming
+suppressible.
 
 Impact records enforce the initial claimed-support due-case matrix: documentation/tests-only changes make no
 provider case due, container changes bind both reader profiles, ACP/core changes bind the full four-profile
-set, and new providers remain `characterization_required`. Evidence-index paths are portable normalized
-root-relative components bound to explicit hot/cold root identities. Status uses tagged window, authority,
-consent, hold, and quarantine state with expiry/lifecycle coherence. Routing records accept only the exact
-checked-in task matrix.
+set, and new providers remain `characterization_required`. Evidence-index paths are ASCII-portable,
+case-folded for uniqueness, root-relative components bound to explicit hot/cold root identities; duplicate
+hot or cold ownership is invalid. Status enforces `last_window <= generated_at < next_window`, preserves
+revocation as a durable cause even after expiry, requires consent-consistent cold state, and requires an
+active provider grant plus a next window for active scheduled/gate cases. Routing records accept only the
+exact checked-in task matrix.
 
 The sealed scheduled and claimed-support sources embed both canonical records and cross-check their source
 row, identity, config, caps, authority, and trigger. The sidecar separately binds reservations, equivalent
 work, consumption, controls, deadline/preflight/supervisor/freshness evidence, and publication state while
 leaving the existing R3 aggregate schema byte-compatible.
 
-Publication-outbox check, terminal, guard, and observation values use tagged absences. Terminal fields are
-all absent before `prepared` and all present from `prepared` onward; remotely observed states additionally
-require a bounded nonzero observation-attempt count. Partial or nullable encodings are invalid.
+Publication-outbox check, terminal, guard, and observation values use tagged absences. The stable outbox id
+is derived from a domain-separated fingerprint over repository, PR, test-merge object, context, App, and
+external id. Every post-intent record carries its predecessor hash, and a learned check-run id has its own
+binding to that immutable identity. Terminal fields are all absent before `prepared` and all present from
+`prepared` onward; remotely observed states additionally require a bounded nonzero observation-attempt
+count. Partial, nullable, unchained, or identity-mutated encodings are invalid.
 
 Passing a validator proves only that bytes satisfy the R3d0 contract. It does not prove current provider
 compatibility, authorize an effect, consume a nonce, reserve a budget, characterize a profile, or enable a
