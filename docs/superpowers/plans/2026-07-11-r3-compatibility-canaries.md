@@ -9,8 +9,10 @@
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test commit
   `e771067f4a7e742ad813368f01018b011e86bbce` isolates its sole nonblocking `SMELL`; exact
   `c548dc0edcc1b21bfb14aa3e78736d633ce0fdc7` confirmed the proof `FIXED` and mechanism unchanged,
-  then returned `REVISE` on one stale-handoff `WRONG` and one no-effect-wording `SMELL`, both closed by the
-  current docs fold. No timer, private authority issuance, live characterization, model discovery, credential
+  then returned `REVISE` on one stale-handoff `WRONG` and one no-effect-wording `SMELL`; exact
+  `e9d030f07d4c623ad2d00d0c918d02486d32fb7b` marked the wording `FIXED` and handoff `PARTIAL`
+  only on conditional publication language, with no new finding. The current docs fold closes that remainder.
+  No timer, private authority issuance, live characterization, model discovery, credential
   access, container/runtime access, registry/image effect, compatibility provider turn, GitHub check mutation,
   or production-operator lifecycle action has occurred. Nine pinned rows are
   implemented. Exact
@@ -1123,7 +1125,9 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   `5baeeb3f47183ea2a47d2cdc5ffce26f1df7dbfb`, approved cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test head
   `e771067f4a7e742ad813368f01018b011e86bbce`; exact proof-confirmation cursor
-  `c548dc0edcc1b21bfb14aa3e78736d633ce0fdc7` found docs-only remediation. No timer, private
+  `c548dc0edcc1b21bfb14aa3e78736d633ce0fdc7` found docs-only remediation, and exact second-
+  confirmation cursor `e9d030f07d4c623ad2d00d0c918d02486d32fb7b` left only conditional publication
+  wording. No timer, private
   authority issuance, live characterization, model discovery, credential access, container/runtime access,
   registry/image effect, compatibility provider turn, GitHub check mutation, or production-operator lifecycle
   action has occurred
@@ -1347,8 +1351,17 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   SHA-256 `5b45405e21118bf5b98cd0f1944e69e0bcb13815c5308864ca19abdad9d1a7f8`. The current
   docs-only fold replaces both obsolete handoffs with the proof-confirmation cursor and required sequence,
   and uses the same complete no-effect boundary in every current status surface. No production, schema,
-  configuration, or test code changes. Next: run one narrow fresh Sol/xhigh exact-head confirmation of this
-  docs remediation; only after approval run the separately required Opus/xhigh release/compatibility lens.
+  configuration, or test code changes. The second proof-fold confirmation is recorded immediately below.
+- **Second R3d0 proof-fold confirmation:** one fresh bridge-mediated Sol/xhigh/read-only review of exact cursor
+  `e9d030f07d4c623ad2d00d0c918d02486d32fb7b` marked the no-effect-inventory `SMELL` `FIXED`,
+  marked the stale-handoff `WRONG` `PARTIAL` only because six surfaces did not state the same conditional
+  publication tail, found no new `WRONG` or `SMELL`, and returned `R3D0 DOCS REMEDIATION: REVISE`. Its
+  retained output is `/private/tmp/a2a-bridge-r3d0-sol-confirm-e9d030f/review.md`, mode `0644`, 8,750
+  bytes, SHA-256 `aa24e4e8a307b12fe6c5cca57212b536cce0c26e58c7d66f25641a4d191a9daf`. This
+  docs-only fold applies one literal sequence everywhere: Run the narrow Sol/xhigh exact-head confirmation;
+  only after approval run the Opus/xhigh release/compatibility lens; fold any findings and rerun affected
+  deterministic gates; publish the non-draft R3d0 PR only if the resulting release/compatibility disposition
+  and affected gates are green.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
 tagged effect authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
@@ -2683,10 +2696,16 @@ across **55** binaries; all complete deterministic release/validator gates are g
 retained at `/private/tmp/a2a-bridge-r3d0-sol-confirm-c548dc0/review.md`, SHA-256
 `5b45405e21118bf5b98cd0f1944e69e0bcb13815c5308864ca19abdad9d1a7f8`; it marked the proof
 `SMELL` `FIXED` and mechanism unchanged, found one stale-handoff `WRONG` and one no-effect-wording `SMELL`,
-and returned `R3D0 PROOF FOLD: REVISE`. This docs-only fold closes both items. Next: run one narrow fresh
-Sol/xhigh exact-head confirmation of the docs remediation; only after confirmation run one Opus/xhigh
-release/compatibility lens, fold any findings, rerun affected gates, and publish its non-draft PR. Preserve
-R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
+and returned `R3D0 PROOF FOLD: REVISE`. Exact cursor
+`e9d030f07d4c623ad2d00d0c918d02486d32fb7b` then marked the no-effect `SMELL` `FIXED`, the
+handoff `WRONG` `PARTIAL` only on conditional publication wording, found no new item, and returned
+`R3D0 DOCS REMEDIATION: REVISE`; its retained report is
+`/private/tmp/a2a-bridge-r3d0-sol-confirm-e9d030f/review.md`, SHA-256
+`aa24e4e8a307b12fe6c5cca57212b536cce0c26e58c7d66f25641a4d191a9daf`. This docs-only fold
+closes that remainder. Run the narrow Sol/xhigh exact-head confirmation; only after approval run the
+Opus/xhigh release/compatibility lens; fold any findings and rerun affected deterministic gates; publish the
+non-draft R3d0 PR only if the resulting release/compatibility disposition and affected gates are green.
+Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 
 ## R3e — OpenRouter provider expansion
 
