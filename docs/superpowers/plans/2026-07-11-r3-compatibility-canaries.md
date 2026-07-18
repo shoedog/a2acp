@@ -4,9 +4,9 @@
   **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at
   `983398427c9f04861a2f1da501a7650c4a1cdd80` by PR #33; R3d design is **APPROVED / MERGED**
   at exact design head `b54840a017b87521677f1f95c3f7be69de55361d` by PR #37, merge
-  `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is **REMEDIATED AGAIN / SECOND CLOSURE REVIEW
-  PENDING** on `agent/reliability-r3d0-foundation` at exact code/foundation-doc commit
-  `e3321db5c052d7f8a9d549b23cea6aa9a7df3784`; no live/timer/operator effect is in scope. Nine pinned rows are
+  `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is **THIRD REMEDIATION IN PROGRESS / THIRD
+  CLOSURE REVIEW PENDING** on `agent/reliability-r3d0-foundation` after exact reviewed cursor head
+  `ee57f4a2f7509dd5a4bd281be1a36b7f117d834b`; no live/timer/operator effect is in scope. Nine pinned rows are
   implemented. Exact
   `c458045cf3d0923457519e253d22dd545363f98d` Sol/xhigh review approved the pre-incident deterministic
   tree. Authorized attempt 1 remains non-promotable stale-auth evidence; authorized attempt 2 passed both
@@ -1113,8 +1113,8 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 - **Base:** merged R3d design main `6eeea6ce553b792dc92cef95ee45f2234f7afe4e` (PR #37)
 - **Status:** design of record **APPROVED / MERGED** at exact design head
   `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 default-off policy/schema implementation is
-  **REMEDIATED AGAIN / SECOND CLOSURE REVIEW PENDING** at exact code/foundation-doc commit
-  `e3321db5c052d7f8a9d549b23cea6aa9a7df3784`, with no live/timer/operator effects
+  **THIRD REMEDIATION IN PROGRESS / THIRD CLOSURE REVIEW PENDING** after exact cursor head
+  `ee57f4a2f7509dd5a4bd281be1a36b7f117d834b`, with no live/timer/operator effects
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
   `/Users/wesleyjinks/.claude/plans/r3d-clean-room-adversarial-deep-hollerith.md`, mode `0644`, 40,180
@@ -1263,6 +1263,26 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   dependency policy, hygiene **37/7**, pinned-manifest **9**, floating-recipe **4**, and schedule-foundation
   validation are green. The next action is a fresh Sol/xhigh closure review of the exact cursor-fold head;
   the one Opus release/compatibility lens remains gated on Sol approval.
+- **Second R3d0 implementation closure review:** one fresh bridge-mediated Sol/xhigh/read-only review of exact
+  cursor head `ee57f4a2f7509dd5a4bd281be1a36b7f117d834b` marked Git identity, status/hold/evidence,
+  reviewed-characterization reuse, and publication-outbox identity `FIXED`; marked strict secret handling,
+  repeated-path file-generation checking, and cursor/proof reconciliation `PARTIAL`; found no new `WRONG`
+  beyond those residuals, found two `SMELL`, and returned `R3D0 IMPLEMENTATION: REVISE`. Its retained output
+  is `/private/tmp/a2a-bridge-r3d0-sol-closure-ee57f4a/review.md`, mode `0644`, 18,583 bytes, SHA-256
+  `445191467e708fef46036dbe41548599ffbfedfa8f21a68a93e16879dd565f99`. Its working analysis also
+  identified that host and reader rows accepted arbitrary absolute session cwds; independent external-CLI
+  probes confirmed both scheduled-advisory and claimed-support traversal escapes before remediation.
+  The current fold trims inside an opening quote before credential-value classification; scans decoded JSON
+  object keys; binds policy, advisory rows, and claimed-support rows to the exact owner-approved trusted cwd
+  root; compares digest and file identity for every repeated canonical capture; adds paired CLI valid/invalid
+  probes for Git, status, holds, portable evidence, reviewed-characterization reuse, and publication outbox;
+  corrects the stale dependency node; and specifies R3d3's required quarantine-opening dereference under the
+  owner lock. The review's proposed rename/restore full-loader sequence is not a valid pre-change acceptance
+  witness because rename/restore changes the ctime captured in `RegularFileIdentity`: chronological A-to-B
+  replacement already fails the final snapshot check. A direct regression now proves that existing failure
+  and separately proves that duplicate same-path captures with distinct identities fail before deduplication.
+  Focused post-fold gates are foundation units **8/0**, schema units **23/0**, and R3d0 CLI **28/0**; complete
+  workspace and release gates remain pending before the exact-head re-review.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
 tagged effect authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
@@ -1768,7 +1788,9 @@ Three controls remain distinct:
   and are re-evaluated by their own lifecycle; they are not relabeled as waste.
 - **Operator quarantine:** an explicit owner action that skips a case until another explicit action.
   Private mode-`0600` records follow a checked-in schema and can be mutated only by the local CLI, never
-  `serve` or A2A. Expiry fails closed and does not auto-resume.
+  `serve` or A2A. R3d0 validates a closed record's `opening_sha256` only as a syntactically valid digest;
+  R3d3 must, under the owner lock, dereference the immutable opening record and verify that exact hash before
+  accepting closure. Expiry fails closed and does not auto-resume.
 
 Pre-prompt auth/model/runtime/owner/environment refusals, clean expected negatives, first clean transient
 provider failure, missing cost telemetry with a retained conservative charge, and poor-but-terminal output
@@ -2269,7 +2291,8 @@ unknown sidecar version fails schedule-specific consumption without making the u
 4. **R3d3 — evidence, status, and retention.** Add hot/cold stores, index, sealing, pins, tombstones, quotas,
    leases, bundle/image GC, local CLI/status/notifications, strict schedule-sidecar plus unchanged-aggregate
    compatibility, crash-consistent publication-outbox journal storage, explicit owner-iCloud upload/offload
-   state plus rotating content verification, and incident migration.
+   state plus rotating content verification, quarantine-opening dereference under the owner lock before
+   closure, and incident migration.
 5. **R3d4 — launchd and trusted test-merge/main triggers.** Add dry-run/preflight-only modes, fake-clock
    timer, impact classifier, exact `merge_commit_sha` / `refs/pull/<n>/merge` watcher, local GitHub check
    publisher App including its single-check-run crash-recovery outbox, consumed-evidence mapping, and
@@ -2557,11 +2580,19 @@ code/foundation-doc commit `e3321db5c052d7f8a9d549b23cea6aa9a7df3784` folds all 
 remediation families and passes foundation units **6/0**, schema units **22/0**, R3d0 CLI integration
 **21/0**, and the full serial workspace **2,214/0/12 ignored** across **55** reported test binaries;
 workspace check, warnings-denied Clippy, locked release build, dependency policy, repository hygiene, and
-manifest/recipe/schedule-foundation validators are green. The current profile-policy bundle SHA-256 is
-`5e4b6bcc138d5304d6a0506f5ae3f35fad9c2c296e89ece78d141fa44d32ef69`. No timer, private authority
+manifest/recipe/schedule-foundation validators are green. Exact cursor `ee57f4a2f7509dd5a4bd281be1a36b7f117d834b`
+then received the second R3d0 implementation closure review retained at
+`/private/tmp/a2a-bridge-r3d0-sol-closure-ee57f4a/review.md`, SHA-256
+`445191467e708fef46036dbe41548599ffbfedfa8f21a68a93e16879dd565f99`; it returned four
+inherited `FIXED`, three `PARTIAL`, no new `WRONG`, two `SMELL`, and `R3D0 IMPLEMENTATION: REVISE`.
+The third remediation closes its five requested items plus independently reproduced trusted-cwd and decoded-
+key failures. Its focused gates are foundation **8/0**, schema **23/0**, and R3d0 CLI **28/0**; full gates
+remain pending. The current profile-policy bundle SHA-256 is
+`aed0e9b224d84624220a6091e51601a677b13d254091a12bc3b1879e36bf5e81`. No timer, private authority
 issuance, live characterization, model discovery, credential access, registry/image effect, compatibility
-provider turn, GitHub check mutation, or production-operator action has been performed. Next: freeze this
-cursor fold and run a fresh Sol/xhigh closure review of its exact head; only after approval run one Opus
+provider turn, GitHub check mutation, or production-operator action has been performed. Next: complete the
+full deterministic gates, freeze this cursor fold, and run a fresh Sol/xhigh closure review of its exact head;
+only after approval run one Opus
 release/compatibility lens, fold any findings, rerun the complete deterministic gates, and publish its non-
 draft PR. Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 

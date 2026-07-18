@@ -428,6 +428,7 @@ fn contains_structured_credential_assignment(lower: &str) -> bool {
             if tail.starts_with('"') || tail.starts_with('\'') {
                 tail = &tail[1..];
             }
+            tail = tail.trim_start_matches(char::is_whitespace);
             tail.as_bytes().first().is_some_and(|byte| {
                 !byte.is_ascii_whitespace() && !matches!(byte, b'"' | b'\'' | b',' | b'}' | b']')
             })
@@ -2542,7 +2543,7 @@ fn value_contains_secret(value: &Value, known_secrets: &[String]) -> bool {
     }
 }
 
-fn sensitive_json_key(key: &str) -> bool {
+pub(super) fn sensitive_json_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     matches!(
         lower.as_str(),

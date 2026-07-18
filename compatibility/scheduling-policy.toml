@@ -1,6 +1,7 @@
 # R3d0 checked-in policy. This file is reviewable input only and grants no effects.
 schema_version = 1
 environment_owner = "wesley-macbook"
+trusted_cwd_root = "/Users/wesleyjinks/code"
 repository = "shoedog/a2acp"
 fixed_prompt_contract = "r2c-fixed-pong-v1"
 artifact_template = "schedule-evidence-v1"

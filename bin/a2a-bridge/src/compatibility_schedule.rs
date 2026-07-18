@@ -21,6 +21,7 @@ const MAX_DEFERRED_PROFILES: usize = 32;
 const MAX_TIMEOUT_SECS: u64 = 900;
 const MAX_TOKENS: u64 = 1_000_000;
 const MAX_COST_MICROUSD: u64 = 100_000_000;
+const OWNER_APPROVED_TRUSTED_CWD_ROOT: &str = "/Users/wesleyjinks/code";
 pub(super) const EXPECTED_SUPPORT_PROFILES: [&str; 4] = [
     "claude-host-acp-044-fable",
     "claude-reader-055-fable",
@@ -128,6 +129,7 @@ struct StoragePolicyV1 {
 struct SchedulePolicyV1 {
     schema_version: u16,
     environment_owner: String,
+    trusted_cwd_root: PathBuf,
     repository: String,
     fixed_prompt_contract: String,
     artifact_template: String,
@@ -481,6 +483,25 @@ fn validate_relative_path(label: &str, path: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
+fn validate_trusted_session_cwd(
+    label: &str,
+    path: &Path,
+    trusted_root: &Path,
+) -> Result<(), BoxError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+        || !path.starts_with(trusted_root)
+    {
+        return Err(format!(
+            "schedule foundation: {label} must be an absolute traversal-free path under the owner-approved trusted cwd root"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn load_toml<T: DeserializeOwned>(path: &Path, label: &str) -> Result<LoadedToml<T>, BoxError> {
     let snapshot = local_file::read_regular_file_bounded(path, label, MAX_FOUNDATION_FILE_BYTES)?;
     let text = std::str::from_utf8(&snapshot.bytes)
@@ -759,6 +780,12 @@ fn validate_policy(policy: &SchedulePolicyV1) -> Result<(), BoxError> {
         return Err("schedule foundation: policy schema_version must be 1".into());
     }
     stable_id("policy.environment_owner", &policy.environment_owner)?;
+    if policy.trusted_cwd_root != Path::new(OWNER_APPROVED_TRUSTED_CWD_ROOT) {
+        return Err(
+            "schedule foundation: trusted_cwd_root does not match the owner-approved repository root"
+                .into(),
+        );
+    }
     bounded_text("policy.repository", &policy.repository)?;
     stable_id(
         "policy.fixed_prompt_contract",
@@ -944,13 +971,18 @@ fn validate_scheduled_case(
         )
         .into());
     }
-    if case.os != "macos" || case.architecture != "aarch64" || !case.session_cwd.is_absolute() {
+    if case.os != "macos" || case.architecture != "aarch64" {
         return Err(format!(
-            "schedule foundation: case {:?} has an unsupported environment or relative session cwd",
+            "schedule foundation: case {:?} has an unsupported environment",
             case.id
         )
         .into());
     }
+    validate_trusted_session_cwd(
+        &format!("case {:?} session cwd", case.id),
+        &case.session_cwd,
+        &policy.trusted_cwd_root,
+    )?;
     validate_relative_path("scheduled case config", &case.config)?;
     stable_id("scheduled config_template", &case.config_template)?;
     bounded_text("scheduled adapter_family", &case.adapter_family)?;
@@ -1162,7 +1194,6 @@ fn validate_config_cross_bindings(
     }
     match case.execution_mode {
         ScheduleExecutionModeV1::ContainerRo => {
-            const READER_ROOT: &str = "/Users/wesleyjinks/code";
             let sandbox = config.sandbox.as_ref().ok_or_else(|| -> BoxError {
                 format!(
                     "schedule foundation: reader case {:?} has no canonical sandbox",
@@ -1183,9 +1214,8 @@ fn validate_config_cross_bindings(
                     .into())
                 }
             };
-            if config.allowed_cwd_root.as_deref() != Some(READER_ROOT)
-                || !case.session_cwd.starts_with(READER_ROOT)
-                || sandbox.mount != READER_ROOT
+            if config.allowed_cwd_root.as_deref() != Some(OWNER_APPROVED_TRUSTED_CWD_ROOT)
+                || sandbox.mount != OWNER_APPROVED_TRUSTED_CWD_ROOT
                 || sandbox.access != "ro"
                 || sandbox.egress != "locked"
                 || sandbox.network != "a2a-egress-internal"
@@ -1660,6 +1690,23 @@ fn support_profile(
             .map(str::to_owned)
     };
     let id = required("id")?;
+    let environment_owner = required("environment_owner")?;
+    let os = required("os")?;
+    let architecture = required("architecture")?;
+    if environment_owner != policy.environment_owner || os != "macos" || architecture != "aarch64" {
+        return Err(format!(
+            "schedule foundation: support case {id:?} does not match the owner-approved environment"
+        )
+        .into());
+    }
+    let session_cwd = optional("session_cwd").ok_or_else(|| -> BoxError {
+        format!("schedule foundation: support case {id:?} has no trusted session cwd").into()
+    })?;
+    validate_trusted_session_cwd(
+        &format!("support case {id:?} session cwd"),
+        Path::new(&session_cwd),
+        &policy.trusted_cwd_root,
+    )?;
     let config = PathBuf::from(required("config")?);
     validate_relative_path("support config", &config)?;
     let config_snapshot = local_file::read_regular_file_bounded(
@@ -1847,7 +1894,6 @@ fn support_profile(
         &id,
         provider_family,
         &execution_mode,
-        optional("session_cwd").as_deref(),
         &config_projection,
     )?;
     let expected_status = match required("expected_status")?.as_str() {
@@ -1899,10 +1945,10 @@ fn support_profile(
         auth_path,
         credential_env_name: optional("credential_env"),
         required_env,
-        environment_owner: required("environment_owner")?,
-        os: required("os")?,
-        architecture: required("architecture")?,
-        session_cwd: optional("session_cwd").unwrap_or_else(|| "not_applicable".into()),
+        environment_owner,
+        os,
+        architecture,
+        session_cwd,
         requested_model: model.clone(),
         requested_effort: optional("effort"),
         requested_mode: optional("mode"),
@@ -1929,7 +1975,6 @@ fn validate_claimed_support_config_effect_boundary(
     id: &str,
     provider_family: &str,
     execution_mode: &str,
-    session_cwd: Option<&str>,
     config: &CanonicalConfigTemplateV1,
 ) -> Result<(), BoxError> {
     if config.server_addr != "127.0.0.1:8080" || config.base_url.is_some() {
@@ -1975,7 +2020,6 @@ fn validate_claimed_support_config_effect_boundary(
         return Ok(());
     }
 
-    const READER_ROOT: &str = "/Users/wesleyjinks/code";
     let sandbox = config.sandbox.as_ref().ok_or_else(|| -> BoxError {
         format!("schedule foundation: support reader case {id:?} has no canonical sandbox").into()
     })?;
@@ -1993,9 +2037,8 @@ fn validate_claimed_support_config_effect_boundary(
         _ => unreachable!("provider family was closed above"),
     };
     expected_volumes.sort();
-    if config.allowed_cwd_root.as_deref() != Some(READER_ROOT)
-        || !session_cwd.is_some_and(|cwd| Path::new(cwd).starts_with(READER_ROOT))
-        || sandbox.mount != READER_ROOT
+    if config.allowed_cwd_root.as_deref() != Some(OWNER_APPROVED_TRUSTED_CWD_ROOT)
+        || sandbox.mount != OWNER_APPROVED_TRUSTED_CWD_ROOT
         || sandbox.access != "ro"
         || sandbox.egress != "locked"
         || sandbox.network != "a2a-egress-internal"
@@ -2135,10 +2178,13 @@ fn recheck_foundation_files_with_hook<F>(
 where
     F: FnMut(usize),
 {
-    let mut seen = BTreeMap::<&Path, &str>::new();
+    let mut seen = BTreeMap::<&Path, (&str, &local_file::RegularFileIdentity)>::new();
     for (index, capture) in captures.iter().enumerate() {
-        if let Some(previous) = seen.insert(&capture.canonical_path, &capture.sha256) {
-            if previous != capture.sha256 {
+        if let Some((previous_sha256, previous_identity)) = seen.insert(
+            &capture.canonical_path,
+            (&capture.sha256, &capture.file_identity),
+        ) {
+            if previous_sha256 != capture.sha256 || previous_identity != &capture.file_identity {
                 return Err(format!(
                     "schedule foundation: {:?} was observed with conflicting identities",
                     capture.canonical_path
@@ -2442,6 +2488,28 @@ mod tests {
     }
 
     #[test]
+    fn trusted_session_cwd_rejects_traversal_relative_and_sibling_paths() {
+        let root = Path::new(OWNER_APPROVED_TRUSTED_CWD_ROOT);
+        validate_trusted_session_cwd(
+            "valid fixture",
+            Path::new("/Users/wesleyjinks/code/a2a-bridge"),
+            root,
+        )
+        .unwrap();
+        validate_trusted_session_cwd("root fixture", root, root).unwrap();
+
+        for path in [
+            "/Users/wesleyjinks/code/../Documents",
+            "/Users/wesleyjinks/code-other/repo",
+            "relative/repo",
+        ] {
+            assert!(
+                validate_trusted_session_cwd("invalid fixture", Path::new(path), root).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn final_snapshot_recheck_rejects_mid_validation_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("foundation.toml");
@@ -2500,5 +2568,46 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("changed during"), "{error}");
+    }
+
+    #[test]
+    fn final_snapshot_recheck_rejects_duplicate_path_with_conflicting_object_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("foundation.toml");
+        let first_name = temp.path().join("first-object.toml");
+        std::fs::write(&path, b"schema_version = 1\n").unwrap();
+        let capture = |label: &str| {
+            let snapshot =
+                local_file::read_regular_file_bounded(&path, label, MAX_FOUNDATION_FILE_BYTES)
+                    .unwrap();
+            CapturedFoundationFile {
+                canonical_path: snapshot.canonical_path,
+                sha256: snapshot.sha256,
+                file_identity: snapshot.identity,
+                label: label.into(),
+                max_bytes: MAX_FOUNDATION_FILE_BYTES,
+            }
+        };
+        let first = capture("first observation");
+        std::fs::rename(&path, &first_name).unwrap();
+        std::fs::write(&path, b"schema_version = 1\n").unwrap();
+        let second = capture("second observation");
+
+        let chronological_error = recheck_foundation_files(&[first.clone(), second.clone()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            chronological_error.contains("changed during"),
+            "{chronological_error}"
+        );
+
+        let error = recheck_foundation_files(&[second, first])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("conflicting identities"), "{error}");
+
+        let same_object_first = capture("same object first observation");
+        let same_object_second = capture("same object second observation");
+        recheck_foundation_files(&[same_object_first, same_object_second]).unwrap();
     }
 }

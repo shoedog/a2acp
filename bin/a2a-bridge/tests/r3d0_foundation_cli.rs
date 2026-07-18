@@ -108,6 +108,91 @@ fn fingerprint_json(ch: char) -> serde_json::Value {
     serde_json::json!({"schema_version": 1, "sha256": digest(ch)})
 }
 
+fn standing_authority_json() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "standing_grant",
+        "grant_id": "grant-1",
+        "generation": 1,
+        "grant_sha256": digest('a'),
+        "characterization_id": "characterization-1",
+        "characterization_sha256": digest('b')
+    })
+}
+
+fn validate_schedule_record(kind: &str, path: &Path) -> std::process::Output {
+    compatibility_command()
+        .arg("validate")
+        .arg("--schedule-record")
+        .arg(kind)
+        .arg(path)
+        .output()
+        .unwrap()
+}
+
+fn canonical_input_sha256<T: serde::Serialize>(label: &str, value: &T) -> String {
+    let canonical = serde_json::to_vec(value).unwrap();
+    let mut domain_separated = format!("a2a-bridge:r3d0:{label}:v1\0").into_bytes();
+    domain_separated.extend_from_slice(&canonical);
+    sha256_hex(&domain_separated)
+}
+
+#[derive(serde::Serialize)]
+struct GitOidFixture<'a> {
+    algorithm: &'a str,
+    hex: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct PublicationOutboxIdentityFixture<'a> {
+    schema_version: u16,
+    repository: &'a str,
+    pull_request: u64,
+    test_merge_oid: GitOidFixture<'a>,
+    context: &'a str,
+    app_id: &'a str,
+    external_id: &'a str,
+}
+
+fn publication_outbox_record_json() -> serde_json::Value {
+    let oid_hex = "a".repeat(40);
+    let identity = canonical_input_sha256(
+        "publication-outbox immutable identity",
+        &PublicationOutboxIdentityFixture {
+            schema_version: 1,
+            repository: "shoedog/a2acp",
+            pull_request: 37,
+            test_merge_oid: GitOidFixture {
+                algorithm: "sha1",
+                hex: &oid_hex,
+            },
+            context: "a2a-bridge/r3d",
+            app_id: "app-1",
+            external_id: "external-1",
+        },
+    );
+    serde_json::json!({
+        "schema_version": 1,
+        "outbox_id": format!("outbox:{identity}"),
+        "immutable_identity": {"schema_version": 1, "sha256": identity},
+        "previous_record": {"kind": "absent"},
+        "state": "create_intent",
+        "repository": "shoedog/a2acp",
+        "pull_request": 37,
+        "test_merge_oid": {"algorithm": "sha1", "hex": oid_hex},
+        "context": "a2a-bridge/r3d",
+        "app_id": "app-1",
+        "external_id": "external-1",
+        "check_run": {"kind": "absent"},
+        "check_run_binding": {"kind": "absent"},
+        "terminal_consumption": {"kind": "absent"},
+        "desired_conclusion": {"kind": "absent"},
+        "evidence_set": {"kind": "absent"},
+        "final_guard": {"kind": "absent"},
+        "remote_observation": {"kind": "absent"},
+        "remote_observation_attempts": 0
+    })
+}
+
 fn case_execution_record_json(fingerprint: &str) -> serde_json::Value {
     serde_json::json!({
         "schema_version": 1,
@@ -628,6 +713,76 @@ fn r3d0_claimed_support_pin_update_cannot_bypass_reviewed_effect_semantics() {
 }
 
 #[test]
+fn r3d0_foundation_rejects_untrusted_scheduled_and_claimed_support_cwds() {
+    for relative in ["scheduled-cases.toml", "manifest.toml"] {
+        let temp = tempfile::tempdir().unwrap();
+        copy_foundation(temp.path());
+        let path = temp.path().join(relative);
+        let original = fs::read_to_string(&path).unwrap();
+        let changed = original.replacen(
+            "session_cwd = \"/Users/wesleyjinks/code/a2a-bridge\"",
+            "session_cwd = \"/Users/wesleyjinks/code/../Documents\"",
+            1,
+        );
+        assert_ne!(changed, original);
+        fs::write(path, changed).unwrap();
+
+        let output = validate_foundation(temp.path());
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("owner-approved trusted cwd root"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("fingerprint mismatch"), "{stderr}");
+    }
+}
+
+#[test]
+fn r3d0_claimed_support_profile_keeps_the_owner_approved_environment() {
+    let temp = tempfile::tempdir().unwrap();
+    copy_foundation(temp.path());
+    let path = temp.path().join("manifest.toml");
+    let original = fs::read_to_string(&path).unwrap();
+    let changed = original.replacen(
+        "environment_owner = \"wesley-macbook\"",
+        "environment_owner = \"another-machine\"",
+        1,
+    );
+    assert_ne!(changed, original);
+    fs::write(path, changed).unwrap();
+
+    let output = validate_foundation(temp.path());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("owner-approved environment"), "{stderr}");
+    assert!(!stderr.contains("fingerprint mismatch"), "{stderr}");
+}
+
+#[test]
+fn r3d0_policy_rejects_a_changed_trusted_cwd_root() {
+    let temp = tempfile::tempdir().unwrap();
+    copy_foundation(temp.path());
+    let path = temp.path().join("scheduling-policy.toml");
+    let original = fs::read_to_string(&path).unwrap();
+    let changed = original.replacen(
+        "trusted_cwd_root = \"/Users/wesleyjinks/code\"",
+        "trusted_cwd_root = \"/Users/wesleyjinks\"",
+        1,
+    );
+    assert_ne!(changed, original);
+    fs::write(path, changed).unwrap();
+
+    let output = validate_foundation(temp.path());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("owner-approved repository root"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn r3d0_foundation_rejects_secret_shaped_comments() {
     for (relative, comment) in [
         (
@@ -635,6 +790,8 @@ fn r3d0_foundation_rejects_secret_shaped_comments() {
             "# accidental sk-not-a-real-secret",
         ),
         ("configs/codex-luna-host.toml", "# password: hunter2"),
+        ("scheduling-policy.toml", "# password: \" hunter2\""),
+        ("configs/codex-luna-host.toml", "# api_key: \" hunter2\""),
     ] {
         let temp = tempfile::tempdir().unwrap();
         copy_foundation(temp.path());
@@ -650,6 +807,52 @@ fn r3d0_foundation_rejects_secret_shaped_comments() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn r3d0_schedule_records_reject_quoted_whitespace_credentials_but_allow_ordinary_text() {
+    let temp = tempfile::tempdir().unwrap();
+    for (index, reason) in ["password: \" hunter2\"", "api_key: \" hunter2\""]
+        .into_iter()
+        .enumerate()
+    {
+        let path = temp.path().join(format!("secret-{index}.json"));
+        let record = serde_json::json!({
+            "state": "open",
+            "schema_version": 1,
+            "quarantine_id": format!("quarantine-{index}"),
+            "profile": fingerprint_json('a'),
+            "operator": "Wesley Jinks",
+            "reason": reason,
+            "created_at_ms": 1,
+            "expires_at_ms": 2
+        });
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        let output = validate_schedule_record("quarantine", &path);
+        assert!(!output.status.success(), "{reason} unexpectedly passed");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("secret-shaped"), "{reason}: {stderr}");
+    }
+
+    let ordinary_path = temp.path().join("ordinary.json");
+    let ordinary = serde_json::json!({
+        "state": "open",
+        "schema_version": 1,
+        "quarantine_id": "quarantine-ordinary",
+        "profile": fingerprint_json('a'),
+        "operator": "Wesley Jinks",
+        "reason": "note: \" ordinary\"",
+        "created_at_ms": 1,
+        "expires_at_ms": 2
+    });
+    fs::write(&ordinary_path, serde_json::to_vec(&ordinary).unwrap()).unwrap();
+    let ordinary_output = validate_schedule_record("quarantine", &ordinary_path);
+    assert!(
+        ordinary_output.status.success(),
+        "ordinary quoted text failed: {}",
+        String::from_utf8_lossy(&ordinary_output.stderr)
+    );
 }
 
 #[test]
@@ -820,6 +1023,23 @@ fn r3d0_fingerprint_layers_reject_drift_and_cross_layer_fields() {
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("fingerprint mismatch"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut mixed_git_algorithms = case_execution_record_json(case_hash);
+    mixed_git_algorithms["input"]["target"]["tree_oid"] =
+        serde_json::json!({"algorithm": "sha256", "hex": digest('c')});
+    let mixed_git_path = temp.path().join("mixed-git-algorithms.json");
+    fs::write(
+        &mixed_git_path,
+        serde_json::to_vec(&mixed_git_algorithms).unwrap(),
+    )
+    .unwrap();
+    let output = validate_schedule_record("case-execution-fingerprint", &mixed_git_path);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("mixes Git object algorithms"),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1079,5 +1299,233 @@ fn r3d0_schedule_records_reject_invalid_identity_and_generation_fields() {
         valid_index.status.success(),
         "valid evidence index failed: {}",
         String::from_utf8_lossy(&valid_index.stderr)
+    );
+}
+
+#[test]
+fn r3d0_cli_status_and_safety_hold_enforce_temporal_and_opening_coherence() {
+    let temp = tempfile::tempdir().unwrap();
+    let status_path = temp.path().join("status.json");
+    let status = serde_json::json!({
+        "schema_version": 1,
+        "generated_at_ms": 10,
+        "policy_sha256": digest('a'),
+        "last_window": {"kind": "window", "id": "window-1", "scheduled_at_ms": 5},
+        "next_window": {"kind": "window", "id": "window-2", "scheduled_at_ms": 20},
+        "provider_grant": {
+            "kind": "authority",
+            "id": "grant-1",
+            "sha256": digest('b'),
+            "state": "active",
+            "expires_at_ms": 100,
+            "revocation_generation": 1
+        },
+        "storage_consent": {"kind": "absent"},
+        "ledger_headroom_sha256": digest('c'),
+        "storage_state": "hot_only",
+        "missed_ticks": 0,
+        "fresh_one_shot_compatibility": "unknown",
+        "shared_operator_health": "not_evaluated",
+        "cases": [{
+            "case_id": "case-1",
+            "lifecycle": "scheduled_active",
+            "last_outcome": {"kind": "absent"},
+            "hold": {"kind": "absent"},
+            "quarantine": {"kind": "absent"}
+        }]
+    });
+    fs::write(&status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+    let valid_status = validate_schedule_record("status", &status_path);
+    assert!(
+        valid_status.status.success(),
+        "valid status failed: {}",
+        String::from_utf8_lossy(&valid_status.stderr)
+    );
+
+    let mut future_last_window = status;
+    future_last_window["last_window"]["scheduled_at_ms"] = serde_json::json!(15);
+    fs::write(
+        &status_path,
+        serde_json::to_vec(&future_last_window).unwrap(),
+    )
+    .unwrap();
+    let invalid_status = validate_schedule_record("status", &status_path);
+    assert!(!invalid_status.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_status.stderr)
+            .contains("last window cannot follow status generation time"),
+        "stderr: {}",
+        String::from_utf8_lossy(&invalid_status.stderr)
+    );
+
+    let hold_path = temp.path().join("safety-hold.json");
+    let hold = serde_json::json!({
+        "schema_version": 1,
+        "hold_id": "hold-1",
+        "characterization_profile": fingerprint_json('d'),
+        "case_execution": fingerprint_json('e'),
+        "reason": "cleanup_failed",
+        "created_at_ms": 1,
+        "lifecycle": {"state": "active"}
+    });
+    fs::write(&hold_path, serde_json::to_vec(&hold).unwrap()).unwrap();
+    let valid_hold = validate_schedule_record("safety-hold", &hold_path);
+    assert!(
+        valid_hold.status.success(),
+        "valid safety hold failed: {}",
+        String::from_utf8_lossy(&valid_hold.stderr)
+    );
+
+    let mut wrong_opening = hold;
+    wrong_opening["lifecycle"] = serde_json::json!({
+        "state": "cleared",
+        "opening_sha256": digest('f'),
+        "clearance_action_id": "clearance-1",
+        "clearance_action_sha256": digest('1'),
+        "cleared_at_ms": 2,
+        "operator": "Wesley Jinks",
+        "reason": "verified cleanup"
+    });
+    fs::write(&hold_path, serde_json::to_vec(&wrong_opening).unwrap()).unwrap();
+    let invalid_hold = validate_schedule_record("safety-hold", &hold_path);
+    assert!(!invalid_hold.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_hold.stderr)
+            .contains("does not bind the canonical opening record"),
+        "stderr: {}",
+        String::from_utf8_lossy(&invalid_hold.stderr)
+    );
+}
+
+#[test]
+fn r3d0_cli_evidence_paths_and_reviewed_characterization_reuse_are_strict() {
+    let temp = tempfile::tempdir().unwrap();
+    let index_path = temp.path().join("evidence-index.json");
+    let entry = serde_json::json!({
+        "evidence_id": "evidence-1",
+        "evidence_class": "routine_green",
+        "full_evidence_sha256": digest('a'),
+        "compact_record_sha256": digest('b'),
+        "hot_path": {"components": ["2026", "evidence-1.json"]},
+        "cold_path": {"kind": "absent"},
+        "full_retain_until_ms": 10,
+        "compact_retain_until_ms": 20,
+        "pinned": false,
+        "lease_count": 0
+    });
+    let index = serde_json::json!({
+        "schema_version": 1,
+        "index_id": "index-1",
+        "generation": 1,
+        "hot_root_sha256": digest('c'),
+        "cold_storage": {"kind": "absent"},
+        "entries": [entry]
+    });
+    fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+    let valid_index = validate_schedule_record("evidence-index", &index_path);
+    assert!(
+        valid_index.status.success(),
+        "valid evidence index failed: {}",
+        String::from_utf8_lossy(&valid_index.stderr)
+    );
+
+    let mut duplicate_path = index;
+    let mut duplicate_entry = duplicate_path["entries"][0].clone();
+    duplicate_entry["evidence_id"] = serde_json::json!("evidence-2");
+    duplicate_entry["full_evidence_sha256"] = serde_json::json!(digest('d'));
+    duplicate_entry["compact_record_sha256"] = serde_json::json!(digest('e'));
+    duplicate_path["entries"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate_entry);
+    fs::write(&index_path, serde_json::to_vec(&duplicate_path).unwrap()).unwrap();
+    let invalid_index = validate_schedule_record("evidence-index", &index_path);
+    assert!(!invalid_index.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_index.stderr).contains("hot evidence paths"),
+        "stderr: {}",
+        String::from_utf8_lossy(&invalid_index.stderr)
+    );
+
+    let consumption_path = temp.path().join("consumption.json");
+    let consumption = serde_json::json!({
+        "schema_version": 1,
+        "consumption_id": "consumption-1",
+        "equivalent_work_key": digest('f'),
+        "evidence_sha256": digest('1'),
+        "requested_purpose": "provider_path_advisory",
+        "satisfied_purpose": "characterization",
+        "provenance": {
+            "kind": "reviewed_characterization",
+            "characterization_id": "characterization-1",
+            "characterization_record_sha256": digest('2'),
+            "freshness_bucket": "policy-window-1",
+            "freshness_observation_sha256": digest('3'),
+            "terminal_at_ms": 10,
+            "reviewed_at_ms": 20,
+            "reviewer": "Wesley Jinks"
+        },
+        "characterization_profile": fingerprint_json('4'),
+        "case_execution": fingerprint_json('5'),
+        "admission_attempt": fingerprint_json('6'),
+        "authority": standing_authority_json(),
+        "consumed_at_ms": 30
+    });
+    fs::write(&consumption_path, serde_json::to_vec(&consumption).unwrap()).unwrap();
+    let valid_consumption = validate_schedule_record("consumption", &consumption_path);
+    assert!(
+        valid_consumption.status.success(),
+        "valid reviewed consumption failed: {}",
+        String::from_utf8_lossy(&valid_consumption.stderr)
+    );
+
+    let mut unreviewed = consumption;
+    unreviewed["provenance"] = serde_json::json!({"kind": "ordinary"});
+    fs::write(&consumption_path, serde_json::to_vec(&unreviewed).unwrap()).unwrap();
+    let invalid_consumption = validate_schedule_record("consumption", &consumption_path);
+    assert!(!invalid_consumption.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_consumption.stderr)
+            .contains("evidence-purpose reuse is not equal-or-stronger"),
+        "stderr: {}",
+        String::from_utf8_lossy(&invalid_consumption.stderr)
+    );
+}
+
+#[test]
+fn r3d0_cli_publication_outbox_binds_identity_and_create_chain_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("publication-outbox.json");
+    let outbox = publication_outbox_record_json();
+    fs::write(&path, serde_json::to_vec(&outbox).unwrap()).unwrap();
+    let valid = validate_schedule_record("publication-outbox", &path);
+    assert!(
+        valid.status.success(),
+        "valid publication outbox failed: {}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+
+    let mut changed_repository = outbox.clone();
+    changed_repository["repository"] = serde_json::json!("shoedog/another-repository");
+    fs::write(&path, serde_json::to_vec(&changed_repository).unwrap()).unwrap();
+    let identity_drift = validate_schedule_record("publication-outbox", &path);
+    assert!(!identity_drift.status.success());
+    assert!(
+        String::from_utf8_lossy(&identity_drift.stderr).contains("immutable remote identity"),
+        "stderr: {}",
+        String::from_utf8_lossy(&identity_drift.stderr)
+    );
+
+    let mut invalid_create_chain = outbox;
+    invalid_create_chain["previous_record"] =
+        serde_json::json!({"kind": "sha256", "value": digest('9')});
+    fs::write(&path, serde_json::to_vec(&invalid_create_chain).unwrap()).unwrap();
+    let chained_create = validate_schedule_record("publication-outbox", &path);
+    assert!(!chained_create.status.success());
+    assert!(
+        String::from_utf8_lossy(&chained_create.stderr)
+            .contains("only create-intent may omit the previous outbox record hash"),
+        "stderr: {}",
+        String::from_utf8_lossy(&chained_create.stderr)
     );
 }

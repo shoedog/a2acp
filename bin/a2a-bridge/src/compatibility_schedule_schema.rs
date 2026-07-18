@@ -1083,11 +1083,13 @@ pub(super) struct DogfoodRoutingPolicyV1 {
 }
 
 fn bounded_text(label: &str, value: &str) -> Result<(), BoxError> {
+    if compatibility::looks_like_secret(value) {
+        return Err(format!("schedule schema: {label} contains secret-shaped material").into());
+    }
     if value.is_empty()
         || value.trim() != value
         || value.len() > MAX_TEXT_BYTES
         || value.chars().any(char::is_control)
-        || compatibility::looks_like_secret(value)
     {
         return Err(format!(
             "schedule schema: {label} must be non-empty, unpadded, control-free UTF-8 of at most {MAX_TEXT_BYTES} bytes"
@@ -3266,7 +3268,17 @@ fn parse_and_validate<T: DeserializeOwned + ValidateRecord>(
             }
             serde_json::Value::Object(values) => {
                 for (key, value) in values {
-                    scan(value, &format!("{path}.{key}"))?;
+                    let key_path = format!("{path}.{key}");
+                    if compatibility::sensitive_json_key(key)
+                        || compatibility::looks_like_secret(key)
+                    {
+                        return Err(format!(
+                            "schedule schema: {key_path} contains secret-shaped material"
+                        )
+                        .into());
+                    }
+                    bounded_text(&format!("{path} object key"), key)?;
+                    scan(value, &key_path)?;
                 }
                 Ok(())
             }
@@ -4838,5 +4850,23 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("secret-shaped"), "{error}");
+    }
+
+    #[test]
+    fn record_parser_secret_scans_decoded_object_keys_before_typed_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        std::fs::write(&path, br#"{"\u0070assword":"hunter2"}"#).unwrap();
+        let error = validate_schedule_record("publication-outbox", &path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("secret-shaped"), "{error}");
+
+        std::fs::write(&path, br#"{"\u0073afe_unknown":"ordinary"}"#).unwrap();
+        let error = validate_schedule_record("publication-outbox", &path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(!error.contains("secret-shaped"), "{error}");
     }
 }

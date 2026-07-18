@@ -9,8 +9,8 @@ operator.
 ## Checked-in inputs
 
 - `compatibility/scheduling-policy.toml` is non-authoritative policy. It records the approved trigger/effect
-  classes, profile maxima, price-ranking contract, and 10 GiB hot plus 25 GiB owner-iCloud cold-storage
-  allocation.
+  classes, exact owner/environment identity, the `/Users/wesleyjinks/code` trusted repository-cwd root,
+  profile maxima, price-ranking contract, and 10 GiB hot plus 25 GiB owner-iCloud cold-storage allocation.
 - `compatibility/scheduled-cases.toml` contains six provider-minimal advisory rows. Every row starts at
   `characterization_required`, is classified `canary`, and lives outside the production support manifest.
 - `compatibility/characterization-profiles.toml` is the complete initial inventory: the six advisory
@@ -26,15 +26,18 @@ a2a-bridge compatibility validate --schedule-foundation compatibility
 
 Validation pins the foundation-root directory identity, uses bounded regular-file/no-follow reads, rejects
 any resolved child path outside that root, and retains each file's descriptor object/change identity as well
-as its path and digest. The final pass requires all four to remain unchanged, including across same-byte
-atomic replacement. It raw-scans comments and values before parsing, recognizes structured credential-key
-delimiters, never invokes the runtime config parser or expands environment variables, applies strict TOML/
-recipe schemas and exact inventory coverage, and checks provider, adapter/command, auth/pre-auth/API-key
-environment, resolution recipe, endpoint, arguments, server, mount, egress, network, proxy, credential
-volume, config-template, and effect agreement. Claimed-support config bytes must match their exact production-
-manifest pin and cannot bypass those semantic constraints by updating the pin. The result is a canonical
-semantic profile-policy bundle: comments and set/row ordering do not affect it, while material policy,
-recipe, or template changes do. Every canonical hash includes an explicit versioned identity-kind domain.
+as its path and digest. The final pass compares every capture, including repeated canonical paths, and
+requires all four to remain unchanged; same-byte atomic replacement and mixed file-object generations fail
+closed. Every scheduled-advisory and claimed-support `session_cwd` must be absolute, traversal-free, and at
+or below the exact trusted repository root. Validation raw-scans comments and values before parsing,
+recognizes structured credential-key delimiters, never invokes the runtime config parser or expands
+environment variables, applies strict TOML/recipe schemas and exact inventory coverage, and checks provider,
+adapter/command, auth/pre-auth/API-key environment, resolution recipe, endpoint, arguments, server, mount,
+egress, network, proxy, credential volume, config-template, and effect agreement. Claimed-support config
+bytes must match their exact production-manifest pin and cannot bypass those semantic constraints by updating
+the pin. The result is a canonical semantic profile-policy bundle: comments and set/row ordering do not
+affect it, while material policy, recipe, or template changes do. Every canonical hash includes an explicit
+versioned identity-kind domain.
 
 The profile-policy bundle deliberately excludes exact candidate bytes, test-merge/main targets, generated
 run manifests, package versions, and image/config digests. Those are execution identities. Changing an
@@ -66,8 +69,8 @@ Supported kinds are:
 - sealed sources and evidence: `scheduled-source`, `claimed-support-characterization-source`,
   `schedule-sidecar`, `publication-outbox`, `evidence-index`, `status`, `routing`.
 
-All records are versioned, deny unknown fields, raw-scan every string for secret-shaped material, and use
-bounded local file reads. Git object identities are non-null tagged SHA-1/SHA-256 object IDs rather than
+All records are versioned, deny unknown fields, raw-scan every decoded object key and string for secret-shaped
+material, and use bounded local file reads. Git object identities are non-null tagged SHA-1/SHA-256 object IDs rather than
 content SHA-256 digests, so current 40-character GitHub `merge_commit_sha` values are representable; every
 object ID in one repository target must use the same repository object algorithm. Reusable
 case-execution input contains the exact target/candidate/manifest/config/pin/resolution/
@@ -81,9 +84,11 @@ component-wise sum of scheduled, test-merge, and manual-unallocated pools must f
 ceilings. Generic manual authority is a closed direct-local-CLI `compatibility_run` record and cannot request
 characterization. A reviewed completed characterization may later satisfy advisory work only through its
 tagged record identity, freshness observation/bucket, review identity, and coherent terminal/review/
-consumption times. Holds bind a canonical opening hash and canonical clearance-action identity; quarantine
-binds its opening hash. A second untyped failure remains conservatively retained rather than becoming
-suppressible.
+consumption times. Holds locally bind a canonical opening hash and canonical clearance-action identity.
+R3d0 quarantine closure validates only the shape of its `opening_sha256`; R3d3 storage, under the owner lock,
+must dereference the immutable opening record and verify that hash before accepting a close. Until that
+cross-record check exists, a locally valid closed-quarantine record is not sufficient clearance. A second
+untyped failure remains conservatively retained rather than becoming suppressible.
 
 Impact records enforce the initial claimed-support due-case matrix: documentation/tests-only changes make no
 provider case due, container changes bind both reader profiles, ACP/core changes bind the full four-profile
