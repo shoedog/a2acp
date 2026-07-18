@@ -153,24 +153,28 @@ plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
   and OpenCode as independent explicit provider increments before R4. Credentials remain environment-only;
   each integration must pass local fake/corpus gates before a separately authorized live smoke, and
   neither becomes an automatic fallback target.
-- Bootstrap each fixed minimal case under one exact, operator-issued, single-use characterization entry; only
-  after completed characterization may it run under a narrow private provider-effect standing grant. Use the
+- Bootstrap each fixed minimal effect profile under one exact, operator-issued, single-use characterization
+  entry; only after completed profile characterization may it run under a narrow private provider-effect
+  standing grant. Reject duplicate live entries for the same profile across authorization batches. Use the
   lowest-cost
   eligible model for a provider-generic adapter/capability probe. A model/effort/mode/alias/capability-
   specific PR must exercise the exact affected claimed-support identity; a cheap substitute cannot green
   that gate. New provider-minimal probes live in a separate non-support scheduled-case registry through
-  characterization; an R3d-only strict scheduled-execution source binds exactly one tagged bootstrap or
-  standing-grant arm and permits only the exact registry-bound model variance without weakening R3c's support-
-  baseline resolver. A bootstrap arm cannot enter an unattended trigger, and a standing arm cannot exist
-  without the exact completed characterization. They remain advisory unless R4 promotes
+  characterization; an R3d-only strict scheduled-execution source binds a stable characterization-profile
+  fingerprint, a distinct exact execution fingerprint, and exactly one tagged bootstrap or standing-grant arm.
+  A bootstrap arm cannot enter an unattended trigger, and a standing arm cannot exist without the exact
+  completed profile characterization. New test-merge/candidate/package/image identities under unchanged
+  profile constraints execute once with a new exact fingerprint and never reuse prior evidence. They remain advisory unless R4 promotes
   them deliberately. Scheduling uses fresh one-shot processes and never manipulates the long-lived operator.
 - Require a trusted local affected-case canary on the exact current GitHub test-merge result SHA
   (`merge_commit_sha` / `refs/pull/<n>/merge`) before merging a compatibility-impacting same-repo PR. GitHub
   performs deterministic coordination/status only and never directly invokes credentialed work. Only an
   executed pass or locally proved no-impact state can satisfy the test-merge compatibility conclusion; due-
-  but-not-run remains blocking. Every characterization/reuse/consumption key binds one canonical exact test-
-  merge/base/head, manifest/case/pin, candidate, requested/expected-effective provider/model/config/prompt,
-  environment, and budget fingerprint; observed effective identity must match before reuse. The required
+  but-not-run remains blocking. Characterization binds a stable provider/capability/model/environment/prompt/
+  template/maximum-cap effect profile; exact execution, reuse, consumption, and publication additionally bind
+  the current test-merge/base/head, manifest/case/pin/resolution, candidate, config, and actual-cap fingerprint.
+  A matching profile grants only bounded execution authority, never cross-fingerprint evidence reuse, and the
+  observed effective identity must match. The required
   context is never posted to the PR head, so a regenerated test-merge SHA cannot fall back to old head
   evidence. A published success is deliberately valid for the lifetime of that immutable test-merge SHA;
   R3d does not claim GitHub can recheck local freshness or authority at the later merge click. Retain a
