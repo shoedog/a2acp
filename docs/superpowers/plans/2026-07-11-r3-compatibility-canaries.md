@@ -542,8 +542,7 @@ updates `docs/compatibility.md` and the changelog when release-relevant.
 ## R3c — floating-current lane
 
 - **Branch:** `agent/reliability-r3c-floating-lane`
-- **State:** **APPROVED / PENDING MERGE** from clean base
-  `504c1e434fd5845bc6745e0b0a0aae95427afbdd`
+- **State:** **MERGED** at `983398427c9f04861a2f1da501a7650c4a1cdd80` by PR #33
 - **Current code head:** `4bd63f3f129a08586742c3c3e946fecfa02839ba`; deterministic full-branch
   gates are green. Sol/xhigh review of exact
   docs head `9d9f713d1ba72763efc67243c77da9e4425a4893` adjudicated all 14 inherited findings **FIXED**, reported no
@@ -1107,7 +1106,7 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 
 - **Branch:** `agent/reliability-r3d-scheduled-canaries`
 - **Base:** merged R3c main `983398427c9f04861a2f1da501a7650c4a1cdd80`
-- **Status:** design of record revised from owner decisions and three exact-commit Sol reviews;
+- **Status:** design of record revised from owner decisions and four exact-commit Sol reviews;
   implementation not started; fresh Sol/xhigh closure review pending
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
@@ -1135,9 +1134,18 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   the scheduled-registry item `PARTIAL`, and found no regression in the earlier eleven. It then returned two
   new `WRONG`, three new `SMELL`, and `R3D DESIGN: REVISE`. Its fixed output is
   `/private/tmp/a2a-bridge-r3d-sol-closure-1c3a7ce.8VATsb/review.md`, mode `0644`, 16,643 bytes,
-  SHA-256 `f5e84d0c1ae800fc24255faa61302dd7d95d6922a54cc3cc8084f42dfb486588`. This revision
-  closes the lane-wire, exact-base invalidation, handoff-cursor, expected/observed identity, independent
-  storage-consent, and scan-before-iCloud findings.
+  SHA-256 `f5e84d0c1ae800fc24255faa61302dd7d95d6922a54cc3cc8084f42dfb486588`. Exact
+  `9414aa8` addressed its lane-wire, exact-base invalidation, handoff-cursor, expected/observed identity,
+  independent storage-consent, and scan-before-iCloud findings.
+- **Third closure review:** one fresh one-node bridge-mediated Sol/xhigh/read-only review of exact
+  `9414aa8f61f31b0b1286b88bc45f558f79f26d3b` marked four of six inherited items `FIXED`, two
+  `PARTIAL`, and found no regression in the earlier fixed mechanisms. It then returned two new `WRONG`, no
+  new `SMELL`, and `R3D DESIGN: REVISE`. Its fixed output is
+  `/private/tmp/a2a-bridge-r3d-sol-final-9414aa8.gTNxSa/review.md`, mode `0644`, 16,072 bytes, SHA-256
+  `6cc83e07d3ac9d97e9ea0ee4d2f357278f24841e80bc3ff04c64519acb6b4f95`. This revision
+  replaces watcher-timed base/head gating with an exact required current GitHub test-merge result, adds the
+  strict
+  scheduled-execution source, finishes authority terminology, and reconciles the merged R3c status.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
 standing authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
@@ -1179,7 +1187,7 @@ fallback, automatic promotion, or production-operator session management.
 | D4 — evidence | Two-tier owner storage: 10 GiB hot local evidence and 25 GiB cold iCloud-backed archives, with typed retention, pins, tombstones, quotas, and local status/notifications. |
 | D5 — representative probe | Defer broad scheduled reviews. Design the fixed read-only fixture adapter with operator input in a separate increment before implementation. |
 | D6 — holds/quarantine | Separate automatic safety holds, exact-fingerprint waste suppression, and explicit operator quarantine. Characterize every future scheduled compatibility/advisory case before eligibility. |
-| D7 — change gate | Compatibility-affecting PRs require a trusted local, exact-base/head, affected-case canary before merge. A coalesced main run remains the post-merge integration backstop. |
+| D7 — change gate | Compatibility-affecting PRs require a trusted local affected-case canary on the exact current GitHub test-merge result SHA (`merge_commit_sha` / `refs/pull/<n>/merge`) before merge. A dedicated required context exists only on that result, never the PR head; a coalesced main run remains the post-merge integration backstop. |
 | D8 — freshness/GC | Fresh same-window discovery observation with content-addressed reuse; bounded post-tick GC plus weekly reconciliation. Never call stale bytes current. |
 | D9 — budgets | Durable reserve-then-reconcile accounting with a UTC ledger, rolling guard, protected pre-merge pool, and conservative charge for ambiguous or missing usage. |
 | D10 — operator ownership | R3d proves fresh one-shot compatibility only. R2f owns shared-session health, close/capacity, stagnation, and non-disruptive drain/rotation. |
@@ -1193,10 +1201,10 @@ immutable installed `a2a-bridge compatibility schedule-tick` binary, and all pol
 deadline, child, ledger, artifact, and status behavior lives in reviewed bridge code. A slept-through
 window is missed; launchd does not cause a catch-up burst.
 
-Launchd uses separate arguments/labels for the low-frequency PR-gate watcher and the daily compatibility
+Launchd uses separate arguments/labels for the low-frequency test-merge-gate watcher and the daily compatibility
 window, but both enter the same reviewed binary, provider-effect grant, admission, ledger, and supervisor
 boundaries. The
-PR watcher only pulls metadata and posts state until deterministic checks are green and the debounce expires;
+test-merge watcher only pulls metadata and posts state until deterministic checks are green and the debounce expires;
 its exact poll/debounce cadence is a private policy value. The daily timer has at most one UTC window id.
 Neither accepts a webhook command or shell recipe.
 
@@ -1240,7 +1248,7 @@ before the authority-state lock; authority mutation takes only the latter, so no
 durable reservation commit is the authority linearization point: revocation or expiry before it refuses the
 attempt; revocation after it prevents later admissions but does not kill or replay the already-admitted bounded
 attempt. The operator CLI increments revocation generation under the same lock. A launchd invocation must
-match one exact allowed label and the installed plist hash; the daily and PR-watcher labels are both bound
+match one exact allowed label and the installed plist hash; the daily and test-merge-watcher labels are both bound
 explicitly rather than inferred from a singular name.
 
 Cold archive publication has its own action-time consent fence under the authority-state lock. It revalidates
@@ -1298,8 +1306,8 @@ through the bounded catalog captured by an admitted smoke session, and evaluates
 price/ranking changes. It emits an advisory recommendation and never mutates a pin or grant. Deprecation
 blocks visibly without silent fallback.
 
-The checked-in policy names the price/ranking authority, normalization schema, and maximum age. The private
-grant binds the normalized snapshot hash, `observed_at`, and `valid_until`; stale, missing, ambiguous, or
+The checked-in policy names the price/ranking authority, normalization schema, and maximum age. The
+provider-effect grant binds the normalized snapshot hash, `observed_at`, and `valid_until`; stale, missing, ambiguous, or
 currency-incompatible input blocks selection rather than choosing a model by name. Provider-reported quota
 is only an additional veto and never replaces this accounting or ranking authority.
 
@@ -1323,8 +1331,9 @@ model-, effort-, mode-, alias-, or capability-specific support claim runs that e
 Every R3d mechanism uses one canonical `case_execution_fingerprint`, never the current binary-only
 `CandidateIdentity` or an informal subset. It is SHA-256 over a versioned canonical serialization of:
 
-- repository identity and, for a claimed-support PR gate, expected base plus exact head SHA; scheduled main
-  work binds exact head and coalesced commit range;
+- repository identity and, for a claimed-support pre-merge gate, PR id, exact current test-merge SHA/ref/tree,
+  target-base SHA, head SHA, and both ordered parents; scheduled main work binds exact head and coalesced
+  commit range;
 - policy, production-manifest, scheduled-case-registry, recipe, config/template, and fixed-prompt hashes;
 - case id, lane, classification, evidence path, execution mode, expected status, and complete pin/resolution
   binding including bundle/package integrity;
@@ -1339,7 +1348,7 @@ implementations may not omit an applicable identity or substitute a path/name fo
 Characterization, hold/suppression state, equivalent-work reservation, ledger records, consumption records,
 and the schedule sidecar all bind this same fingerprint and schema version. Changing any field returns the
 case to `characterization_required` and cannot reuse prior evidence. `claimed_support_gate` evidence never
-crosses an exact PR base/head pair even when two pairs produce byte-identical candidates.
+crosses an exact test-merge result SHA even when two results produce byte-identical candidates.
 
 The pre-admission fingerprint never contains a value learned only after admission. The result separately
 records the observed effective model/effort/mode from the admitted session. That observation must equal the
@@ -1360,6 +1369,42 @@ separate registry and continue
 to parse the unchanged aggregate; feeding the registry to an old manifest command fails explicitly. A
 private characterization record plus an exact provider-effect grant entry—not a checked-in status edit—moves
 the probe into scheduled eligibility. R4 alone may promote support claims.
+
+### Strict scheduled-execution source
+
+R3c's existing `compatibility run --resolution` route deliberately requires every generated floating case's
+model/effort/mode to equal its pinned support baseline. R3d must not weaken that validator or feed the separate
+scheduled registry through it: Luna/Haiku provider-minimal probes intentionally differ from the Sol/Fable
+support rows. Direct hand-authored `run --lane floating-current` remains
+`floating_resolution_required`.
+
+R3d0 therefore adds a third, strict, versioned `ScheduledExecutionSourceV1` owned only by the R3d-aware
+scheduler. It is an owner-only, create-new/no-follow, content-hashed source under local evidence scratch that
+binds:
+
+- the scheduled-case-registry schema/hash and exact row id/hash;
+- the scheduling policy, provider-effect-grant id/generation, characterization id/hash, and complete canonical
+  case-execution fingerprint;
+- candidate binary/build provenance; exact package-set, adapter/SDK/CLI, image/base digest, config-template,
+  generated-config, prerequisite, auth-path, environment, prompt, and artifact-policy identities; and
+- the row's exact requested raw and expected-effective model/effort/mode plus caps and retry zero.
+
+Its generated execution manifest is still strict schema v1 lane `floating-current`, classification `canary`.
+Model/effort/mode may differ from a pinned support row only by equaling the exact scheduled registry row; no
+other field can inherit, widen, or fall back from caller input. The scheduler rederives the source and config
+from the checked-in row/templates plus verified package/image provenance, then journals its hash with the
+equivalent-work/budget reservation. The source never enters the production manifest/baseline, cannot carry
+`support`, cannot update pins, and is not promotion evidence.
+
+R3d2 adds a distinct `RunSource::Scheduled` validator and internal `--scheduled-source` runner path. It
+reopens and rehashes every bound object, rederives the complete source, requires the exact admitted authority
+and fingerprint, and refuses before provider-capable spawn on any mismatch. Only `schedule-tick` or an
+explicit one-run characterization command may create/admit that source; a direct compatibility invocation,
+arbitrary manifest, production-support classification, unlisted model variance, changed package/config, or
+missing/revoked authority fails closed. R3d4 uses the existing pinned production-manifest route whenever a
+test-merge impact requires an exact claimed-support identity; it may select `RunSource::Scheduled` only for
+an explicitly classifier-proved provider-generic/advisory case. Daily advisory work and R3d5 characterization
+use the scheduled source. Old R3 binaries never parse this separate source.
 
 General dogfooding routing is documentation and audit policy in R3d, not an automatic controller. Each
 turn records task class, provider, requested/observed effective model, effort, mode, override reason, and
@@ -1502,8 +1547,8 @@ timestamp. The policy defines a closed evidence-purpose lattice: `claimed_suppor
 as strong, while `manual_diagnostic` is incomparable by default. A live reservation for the key refuses
 without queuing; valid completed evidence with an equal-or-stronger purpose is reused without another
 provider call and gains a new consumption record binding the requesting trigger and authority to the
-existing evidence hash. Because the canonical fingerprint includes exact PR/main identity and every
-case/pin binding, reuse cannot cross a claimed-support head or material case change.
+existing evidence hash. Because the canonical fingerprint includes exact test-merge/main identity and every
+case/pin binding, reuse cannot cross a claimed-support test-merge result or material case change.
 
 A deliberately repeated diagnostic requires a one-run manual repeat authorization. The automatic transient
 confirmation requires an exact one-confirmation allowance in the provider-effect standing grant, applies
@@ -1526,12 +1571,13 @@ price keeps the cap charge.
 The attempt-idempotency key binds the canonical case-execution fingerprint, trigger, authorization id,
 window, and repeat nonce when explicitly present; the separate equivalent-work key above prevents sequential
 cross-trigger duplication. Journal and materialized snapshot updates are crash-consistent and replay
-idempotently. Scheduled background, pre-merge gates, and manual commands have separate accounting classes
+idempotently. Scheduled background, test-merge gates, and manual commands have separate accounting classes
 beneath shared provider and global ceilings. No class borrows another class's protected allocation without a
-new provider-effect grant. Manual work retains explicit acknowledgement, may use only otherwise-unallocated headroom
-after protected scheduled/PR reserves, records `manual_used`, and cannot borrow either protected pool; an
-intentional duplicate also requires the explicit repeat authorization above. Exhausted PR capacity leaves
-the required check blocked, not green. Manual acknowledgement alone cannot reallocate.
+new provider-effect grant. Manual work retains explicit acknowledgement, may use only otherwise-unallocated
+headroom after protected scheduled/test-merge reserves, records `manual_used`, and cannot borrow either
+protected pool; an intentional duplicate also requires the explicit repeat authorization above. Exhausted
+test-merge capacity leaves the required check blocked, not green. Manual acknowledgement alone cannot
+reallocate.
 Provider-reported remaining quota, when available, is an additional veto and never accounting truth. This
 ledger accounts for bridge compatibility activity only; it does not claim to measure interactive usage from
 other repositories or agents.
@@ -1618,7 +1664,7 @@ expiry, independent storage-consent hash/state/expiry,
 case lifecycle, last outcome, holds/quarantines, ledger headroom, storage/archival state, and missed ticks.
 Local macOS notifications fire only on transitions: green-to-red, recovery, auth expiry/block, missed tick,
 quota/storage pressure, safety hold, or unreaped ownership. Raw evidence is never committed or published to
-GitHub; the only upload exception is the grant-bound private owner-iCloud cold tier above. Later GitHub
+GitHub; the only upload exception is the storage-consent-bound private owner-iCloud cold tier above. Later GitHub
 publication may expose a separately reviewed sanitized summary; the initial check contains only state, exact
 SHA, and an evidence-record hash.
 
@@ -1677,42 +1723,56 @@ The remote artifact is never authority.
 | Documentation only | no provider case |
 | New OpenRouter/OpenCode/provider path | `characterization_required`, never immediate scheduling |
 
-For a compatibility-affecting PR, the local scheduler:
+The PR-head/base classification is advisory until GitHub creates the current synthetic test-merge result.
+R3d's atomic guard is the required context on that result:
 
-1. accepts only the configured repository, expected base, same-repository non-fork PR, operator-approved
-   author, and exact head SHA;
-2. waits for required deterministic checks to pass and for a debounce period with no changed expected base
-   or head;
-3. recomputes impact locally and validates provider-effect grant/case characterization;
-4. builds the exact candidate SHA in a fresh isolated environment with provider and GitHub credentials
-   withheld, then runs the verified candidate with only the narrow credentials required for the affected
-   fixed cases. Model-, effort-, mode-, alias-, capability-, auth-, or provider-specific impact executes the
-   exact currently claimed support identity, including Sol/Fable where applicable. A provider-minimal
-   low-cost substitute is allowed only for a classifier-proven provider-generic seam whose mutation tests
-   demonstrate that model-specific behavior is unreachable;
-5. records evidence bound to the exact expected base plus head and publishes a required check through a
-   least-privileged local credential. External conclusions are `success` only for an executed passing due set or a locally proven
-   `not_applicable` exact-base/head classification, `failure` for an executed support failure or invalid
-   candidate, and otherwise remain `in_progress/pending`. GitHub `neutral`/`skipped` is never used to
-   satisfy branch protection. Characterization-required, quarantined, held, suppressed, auth/budget/storage
-   blocked, scheduler-unavailable, unknown, or otherwise due-but-not-run states therefore cannot green the
-   check. A consumed artifact counts as executed-equivalent only when its consumption record proves the same
-   exact base, head, canonical case fingerprint, and an equal-or-stronger purpose: consumed pass may satisfy
-   that due item, consumed fail makes the check fail, and consumed unknown/blocked/expired/invalid evidence stays
-   pending. The publisher revalidates both PR base and head after consumption and immediately before
-   publication;
-6. on the first trusted observation that either expected base or head changed, invalidates the result, republishes
-   `in_progress/pending` for the new pair, and recomputes classification before any reuse.
+1. Before enforcement, the exact base-branch rule must require one new dedicated R3d context with strict
+   up-to-date protection and its expected authenticated publisher source. That context is never posted to a
+   PR head. If GitHub cannot bind the expected source for this repository, the gate remains disabled until an
+   equivalent owner-approved source restriction exists. Missing, changed, unreadable, loose, bypassed, or
+   head-populated protection leaves R3d pending and refuses enablement.
+2. After ordinary deterministic PR checks pass and the debounce expires, the local watcher accepts only the
+   configured repository/base, same-repository non-fork PR, operator-approved author, exact current base and
+   head, `mergeable = true`, non-null API `merge_commit_sha`, and canonical `refs/pull/<n>/merge` ref. A
+   webhook, workflow artifact, PR code, or caller-supplied SHA/ref is never authority.
+3. The watcher fetches that exact ref; requires the fetched SHA to equal the API `merge_commit_sha`; proves a
+   two-parent test merge whose ordered parents are the observed base and head; records its tree; recomputes
+   impact on that exact merge result; and validates provider-effect grant/case characterization. Any mismatch,
+   conflict, unknown mergeability, missing ref, or non-canonical parent relation stays pending.
+4. The scheduler builds that exact test-merge SHA in a fresh isolated environment with provider and GitHub
+   credentials withheld, then runs the verified candidate with only the narrow credentials required for the
+   affected fixed cases. Model-, effort-, mode-, alias-, capability-, auth-, or provider-specific impact
+   executes the exact currently claimed support identity, including Sol/Fable where applicable. A provider-
+   minimal low-cost substitute is allowed only for a classifier-proven provider-generic seam whose mutation
+   tests demonstrate that model-specific behavior is unreachable.
+5. The publisher records evidence and posts the dedicated required conclusion only on that exact test-merge
+   SHA. `success` requires an executed passing due set or locally proved `not_applicable` classification;
+   `failure` means an executed support failure or invalid candidate; every other state remains
+   `in_progress/pending`. GitHub `neutral`/`skipped` never satisfies the contract. A consumed artifact counts
+   only when it proves the same test-merge SHA/fingerprint and equal-or-stronger purpose: pass may satisfy,
+   fail fails, and unknown/blocked/expired/invalid stays pending.
+6. Immediately before consumption and publication, the publisher re-fetches PR metadata and the canonical
+   test-merge ref and proves the SHA, base, head, ordered parents, and tree still match in the same guarded
+   observation. Absence blocks publication. Any changed identity makes the artifact historical and forbids
+   publication/reuse. A newly generated different SHA has no R3d context, so the required gate remains
+   unsatisfied until new evidence exists. If an absent ref later reappears with the identical immutable SHA,
+   base, head, parents, and tree, it is the same result; reuse is still subject to normal freshness and
+   authority rules rather than an unenforceable ref-incarnation counter.
 
-The local publisher is not the atomic merge lock for a moving base. R3d may enforce this check only when the
-base branch's protection/ruleset requires [**strict** status checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging)
-(the PR branch must be up to date before merge), and the publisher reads and records that setting through
-trusted GitHub metadata. Under that
-conjunction, a base advance blocks merge even while the low-frequency watcher has not yet replaced an old
-head check; the next observation publishes pending and requires a new base/head fingerprint. Missing, loose,
-changed, or unreadable protection leaves R3d pending and refuses enablement. The initial design does not
-support merge queues; a later merge-queue mode must bind and execute the exact merge-group SHA rather than
-reuse head evidence.
+The required test-merge context—not watcher timing—is the atomic merge guard. GitHub documents that
+`merge_commit_sha` names the current test merge before merge, `refs/pull/<n>/merge` represents what the
+repository would look like if merged now, a status on the test merge must pass, and checks from a previous SHA
+do not satisfy the latest commit. R3d deliberately never creates this context on a PR head, so GitHub's
+head-status fallback cannot green a regenerated test merge. Strict up-to-date protection is defense in depth,
+not the source of exact-result atomicity. The current public personal repository cannot use GitHub merge
+queues; transferring to eligible organization infrastructure would be a separate owner decision, not a
+hidden R3d prerequisite.
+
+If the test merge is regenerated before any possible provider acceptance, its reservation is released and
+the new result may admit normally. If regeneration occurs after possible acceptance, the old attempt
+completes only as historical evidence with its conservative charge; the replacement remains pending until an
+explicit one-run reauthorization reserves its fresh fingerprint. Base/head churn never becomes automatic
+billable replay merely because GitHub produced another test-merge SHA.
 
 PR code, workflow output, and webhook callers cannot supply a prompt, command, path, case id, model, budget,
 provider-effect grant, or local effect. The local GitHub credential is never inherited by the build or
@@ -1748,14 +1808,16 @@ summary but may never act on it.
 The existing strict R3 aggregate and nested schema remain byte-compatible schema version 1; R3d does not add
 fields to them or claim that old `deny_unknown_fields` readers ignore additions. Scheduling metadata lives
 in a separate strict, independently versioned `ScheduleEvidenceRecord` JSON sidecar. It binds the aggregate
-SHA-256 when one exists plus trigger kind; repository/PR/base/head/commit or main range; policy,
+SHA-256 when one exists plus trigger kind; repository/PR/base/head, exact test-merge SHA/ref/tree and ordered
+parents, the guarded observation id, or scheduled-main commit range; policy,
 provider-effect-grant, storage-consent, quarantine, and characterization ids/hashes; scheduled-case-registry
 hash and canonical case-execution fingerprint/version;
 window, attempt-idempotency, equivalent-work, consumption, and optional repeat ids; classifier version/hash
 and affected cases; complete deadline derivation; preflight results; admission lock holder; budget
 reservations/reconciliation; supervisor process identities/escalation/reap results; freshness observation;
 requested and characterized expected-effective identities plus the separately observed effective result;
-evidence-index id; and status publication result.
+typed check scope (`test_merge_result`), required-rule/context/source hashes; evidence-index id; and status
+publication result. The dedicated context is invalid on a PR-head SHA by construction.
 
 The parent publishes the sidecar even for a killed/setup-incomplete run and joins it to the runner artifact
 by run/window id and optional aggregate hash. New schedule readers validate the sidecar and unchanged
@@ -1768,8 +1830,9 @@ unknown sidecar version fails schedule-specific consumption without making the u
 1. **R3d0 — design/policy/schema foundation (non-billable).** Land this approved design; add checked-in
    scheduling, provider-effect-grant, storage-consent, characterization, hold/quarantine, typed
    failure/suppression, impact, ledger,
-   canonical case-execution fingerprint, equivalent-work/consumption, scheduled-case registry,
-   schedule-sidecar, evidence-index, status, and routing schemas plus validators and docs. Add and review
+   canonical case-execution fingerprint, equivalent-work/consumption, scheduled-case registry, strict
+   scheduled-execution-source, schedule-sidecar, evidence-index, status, and routing schemas plus validators
+   and docs. Add and review
    every exact provider-minimal advisory row/config intended for R3d5 characterization; keep it outside the
    protected support manifest and do not execute it. No timer, credential access, registry/runtime effect,
    or provider path.
@@ -1777,21 +1840,25 @@ unknown sidecar version fails schedule-specific consumption without making the u
    derived deadline, exact process-tree identity, TERM/grace/KILL/reap, repeated-cancel, recovery, and joined
    parent/child artifact contract using fake processes only.
 3. **R3d2 — authority, admission, preflights, and accounting (non-billable tests).** Add provider-effect-grant
-   and storage-consent validation with independent revocation linearization, owner-wide lock, equivalent-work
-   reuse/refusal, characterization state, three control types, durable reserve/reconcile ledger, UTC/rolling
-   windows, scheduled/PR/manual accounting classes, legacy executable/process detection and conservative
-   import, and automated zero-effect preflights.
+   and storage-consent validation with independent revocation linearization, the scheduled-source generator/
+   `RunSource::Scheduled` validator, owner-wide lock, equivalent-work reuse/refusal, characterization state,
+   three control types, durable reserve/reconcile ledger, UTC/rolling windows, scheduled/test-merge/manual
+   accounting classes, legacy executable/process detection and conservative import, and automated zero-effect
+   preflights.
 4. **R3d3 — evidence, status, and retention.** Add hot/cold stores, index, sealing, pins, tombstones, quotas,
    leases, bundle/image GC, local CLI/status/notifications, strict schedule-sidecar plus unchanged-aggregate
    compatibility, explicit owner-iCloud upload/offload state plus rotating content verification, and incident
    migration.
-5. **R3d4 — launchd and trusted PR/main triggers.** Add dry-run/preflight-only modes, fake-clock timer,
-   impact classifier, local GitHub pull/check publisher including consumed-evidence mapping, base/head invalidation,
-   coalescing, debounce, and the disabled-by-default launchd installation. No schedule is enabled by merge.
+5. **R3d4 — launchd and trusted test-merge/main triggers.** Add dry-run/preflight-only modes, fake-clock
+   timer, impact classifier, exact `merge_commit_sha` / `refs/pull/<n>/merge` watcher, local GitHub check
+   publisher including consumed-evidence mapping and changed-test-merge invalidation, coalescing,
+   debounce, and the disabled-by-default launchd installation. Add a live validator for strict branch
+   protection, the dedicated required context and expected source, canonical test-merge production, and the
+   invariant that the context never exists on a PR head. No schedule or required check is enabled by merge.
 6. **R3d5 — characterization and staged enablement (separate live authority).** Characterize all future
    scheduled compatibility/advisory cases with the lower-cost models, finalize provisional hold/waste
-   classifications and exact caps, exercise the rollout ladder, then enable the provider-effect grant/timer and
-   enforced PR check only after the deterministic and review gates are green.
+   classifications and exact caps, exercise the rollout ladder, then enable the provider-effect grant/timer
+   and enforced test-merge check only after the deterministic and review gates are green.
 
 Each code slice must be reviewable and default-off. It may merge independently only when its own complete
 tests are green and no earlier invariant is weakened. The full R3d branch receives one Sol/xhigh adversarial
@@ -1813,15 +1880,17 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   that linearization permits only the already-admitted bounded copy and blocks every later archive/eviction.
 - Fake children cover ignored TERM, SIGSTOP, exited runner with surviving descendant group, publication
   wedge, repeated cancellation, unproved exit, startup recovery, and unrelated-process survival.
-- Scheduled versus manual, PR versus daily, concurrent and sequential duplicates, and two-process races
+- Scheduled versus manual, test-merge versus daily, concurrent and sequential duplicates, and two-process races
   prove exactly one equivalent compatibility attempt admits. Completed equal-or-stronger evidence is reused
   through a consumption record; explicit repeat/confirmation uses a distinct authorization and budget.
   Crash/restart never replays or double-charges.
-- Canonical-fingerprint mutation tests independently change repository/base/head or main range, policy/manifest/
-  scheduled-case/recipe/config/prompt hash, case/pin/resolution/auth/prerequisite/environment identity,
-  candidate bytes, requested and expected-effective model/effort/mode, and every cap. Each change prevents
-  reuse and returns characterization to required; absent-versus-empty and ordering/normalization collisions
-  are rejected; byte-identical candidates at two PR heads never share `claimed_support_gate` evidence.
+- Canonical-fingerprint mutation tests independently change repository/PR/test-merge SHA/ref/tree, base/head,
+  ordered parents, or scheduled-main range, policy/manifest/scheduled-case/recipe/
+  config/prompt hash,
+  case/pin/resolution/auth/prerequisite/environment identity, candidate bytes, requested and expected-effective
+  model/effort/mode, and every cap. Each change prevents reuse and returns characterization to required;
+  absent-versus-empty and ordering/normalization collisions are rejected; byte-identical candidates in two
+  test merges never share `claimed_support_gate` evidence.
   Observed-effective equality passes, while a mismatch returns `candidate_unknown`, holds the original
   fingerprint, forbids reuse/consumption, and never mutates the admitted reservation key.
 - Legacy-boundary tests allow the exact retained `serve` process, safety-hold a pre-R3d
@@ -1829,8 +1898,10 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   retain a full charge for an ambiguous attempt or unknown initial rolling window, and state-test the
   trusted-operator post-fence limit.
 - Ledger crash points cover reserve-before-spawn, spawn ambiguity, prompt acceptance, terminal reconcile,
-  midnight crossing, rolling guard, missing usage/cost, protected scheduled/PR reserves, manual unallocated
-  headroom, and idempotent restart.
+  test-merge regeneration before versus after possible acceptance, midnight crossing, rolling guard,
+  missing usage/cost, protected scheduled/test-merge reserves, manual unallocated headroom, and idempotent
+  restart. Pre-acceptance regeneration may release; post-acceptance regeneration charges and requires explicit
+  replacement-result reauthorization rather than automatic replay.
 - Preflight fixtures cover OAuth runway, provider/model removal, config drift, storage pressure, runtime
   start degradation, stale price/ranking snapshot, container cleanup failure, and
   characterization/quarantine/hold states with zero provider calls.
@@ -1838,17 +1909,25 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   `candidate_fail` becomes `confirmation_due`, a second identical complete failure suppresses, recovery
   passes, and authority/quarantine/budget states never enter the waste machine.
 - Fake-clock tests cover DST, sleep/missed window, no catch-up, duplicate tick, debounce, coalesced commits,
-  changed PR head, changed PR base with stable head, stale remote classification, unavailable local scheduler,
-  and a complete deadline whose
+  test-merge-ref creation/deletion/regeneration, changed base or head, the contained-base/stable-head
+  change-then-revert construction, unavailable local scheduler, required-check timeout, and a complete
+  deadline whose
   metadata/build/preflight/resolve/case/publication/archive/cleanup terms cannot be omitted or reset.
 - Impact tests cover every path class, exact claimed-model/effort/mode/alias/capability regressions,
   classifier mutations that attempt an unsafe low-cost substitution, forks/unknown authors, PR-supplied data
   that attempts to widen scope, and exact GitHub `success|failure|in_progress` mapping. Only proven
   no-impact may succeed without a provider case; every due-but-not-run fixture remains blocking. Consumed
-  exact-base/head pass/fail/unknown fixtures map to success/failure/pending respectively, and stale-base or
-  stale-head consumption is refused. Strict-versus-loose branch-protection fixtures prove that a stable-head/
-  moved-base PR is merge-blocked before the watcher republishes; missing/unreadable/loose protection refuses
-  enforcement, and merge-queue metadata is unsupported rather than silently treated as a head PR.
+  exact-test-merge pass/fail/unknown fixtures map to success/failure/pending respectively; a check on a PR
+  head or superseded test-merge result never counts. Test-merge fixtures prove a base advance from `B0` to
+  contained commit `C` with stable revert head `H` produces a distinct required result, refuse missing/
+  unreadable/noncanonical refs and non-two-parent merges, and reject ref/API/base/head/parent/tree/observation
+  races at final publication. A delete/recreate fixture proves an identical immutable result remains subject
+  to ordinary freshness/authority rules without inventing a GitHub-invisible generation. Protection fixtures
+  prove strict mode, the unique required context and expected
+  source, and absence of that context from every current/historical PR-head status/check before enablement.
+  A regenerated test-merge SHA starts without the context; a result from the prior SHA never counts. Finding
+  the context on a head, a loose/missing rule, or an unexpected source prevents enablement instead of
+  normalizing timeout to green. Bypass is recorded as an explicit waiver.
 - GC tests cover open-reader/exclusive deletion, started-between-query-and-remove, stopped-container image
   reference, pin survival, manifest/class/pin retention precedence, hot-cache versus cold-full clocks,
   keep/age ordering, tombstone-before-unlink crash, iCloud symlink/hard-link/replacement/placeholder,
@@ -1860,8 +1939,13 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   schedule-specific consumption. Scheduled-case registry tests prove an uncharacterized row is not a support
   claim, cannot run unattended, derives only an advisory lane `floating-current`, classification `canary`
   execution manifest under explicit authority, round-trips that exact wire spelling through the current strict
-  parser, and is never parsed as the production manifest by an old binary. A static/behavioral test proves
-  scheduler invocation contains no `serve` endpoint or production-operator lifecycle action.
+  parser, and is never parsed as the production manifest by an old binary. Scheduled-source tests are pre-
+  change red for Luna/Haiku against the support-baseline resolver, then prove an exact registry-bound source
+  executes through fake providers without relaxing `--resolution`. Direct/hand-authored sources, `support`
+  classification, unlisted model/effort/mode, changed package/config/image, caller-supplied fields, missing/
+  revoked authority, old-reader parsing, and an attempt to green an exact claimed-support impact with the
+  advisory source all refuse before provider-capable spawn. A static/behavioral test
+  proves scheduler invocation contains no `serve` endpoint or production-operator lifecycle action.
 - Run format/diff checks, workspace all-target check, warnings-denied Clippy, locked release build,
   repository hygiene, manifest/recipe/policy validation, all scheduler CLI tests, and the full serial
   workspace suite. Report exact passed/failed/ignored totals and every live/unexercised boundary.
@@ -1890,33 +1974,40 @@ are green:
    once through `launchctl kickstart` under that provider-effect grant. Verify label/plist binding,
    reservation/reconciliation, index, status, retention, and exact evidence binding, then unload it.
 6. Let one timer tick fire while the operator observes it. Deadline-kill remains fake-process-only.
-7. Run the local PR check in shadow mode on one exact trusted PR base/head pair, verify strict up-to-date
-   branch protection through the trusted API, then enforce only after stable-head/base-move blocking,
-   base/head invalidation, check publication, and emergency bypass are verified.
-8. Enable the low-use daily window. First post-enable red/unknown/blocked transitions are reviewed before
+7. Run PR classification in shadow mode on one exact trusted PR base/head pair; it remains advisory and is
+   never compatibility evidence.
+8. Bootstrap a fresh unique R3d context in shadow mode on an exact test-merge SHA only, then make one explicit
+   audited GitHub change that requires that context from the expected source and strict up-to-date protection.
+   First exercise a no-impact test merge and test-merge regeneration; then, with separate live authority,
+   exercise one affected exact test-merge SHA. Verify API/ref/base/head/tree/ordered-parent binding, that the
+   context is absent from every PR head, current-result required-check wait, prior-result refusal, the
+   contained-base/stable-head construction, pre/post-acceptance churn accounting, publication, missing or
+   unmergeable-ref blocking, timeout, and emergency bypass before leaving the rule enforced.
+9. Enable the low-use daily window. First post-enable red/unknown/blocked transitions are reviewed before
    the schedule is left unattended.
 
 ### Rollback and restart handoff
 
-Rollback unloads/disables both launchd labels, revokes the provider-effect grant, and disables or explicitly
-bypasses the required GitHub check through the audited owner path. It leaves cold-storage consent unchanged
-so already-completed evidence can satisfy retention unless the operator separately revokes that consent; a
+Rollback unloads/disables both launchd labels, revokes the provider-effect grant, and disables the required
+test-merge check or explicitly bypasses it through the audited owner path. It leaves cold-storage consent
+unchanged so already-completed evidence can satisfy retention unless the operator separately revokes that consent; a
 storage-consent revocation blocks new cloud writes/hot evictions but does not claim to recall existing bytes.
 Rollback does not revert evidence, erase ledger charges, delete pins/tombstones, restart the long-lived
 operator, or run missed windows on re-enable. The last reviewed immutable scheduler binary remains the code
 rollback target. Any code revert is a normal reviewed PR.
 
 **Restart point:** work from branch `agent/reliability-r3d-scheduled-canaries` based on merged main
-`98339842`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, and
-exact-`1c3a7ce` Sol reviews are retained at the paths/hashes above. The Fable six `WRONG`/thirteen `SMELL`,
-first-Sol four `WRONG`/seven `SMELL`, first-closure three `WRONG`/three `SMELL`, and second-closure two
-`WRONG`/three `SMELL` sets are folded into D1-D10 and the slices/gates above; the second closure found no
-regression in the earlier eleven. All D1-D10 owner decisions were approved on 2026-07-17. No implementation,
-schema, timer, private authority, live characterization, model discovery, registry/image effect,
-compatibility provider turn, GitHub check mutation, or production-operator action has been performed by this
-design fold; the only new provider activity was the three recorded read-only Sol reviews. Next: run one fresh
-Sol/xhigh closure review against this exact committed revision. If approved, publish the non-draft docs PR
-and start R3d0 only after merge. Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
+`98339842`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
+and exact-`9414aa8` Sol reviews are retained at the paths/hashes above. The Fable six `WRONG`/thirteen
+`SMELL`, first-Sol four `WRONG`/seven `SMELL`, first-closure three `WRONG`/three `SMELL`, second-closure
+two `WRONG`/three `SMELL`, and third-closure two `WRONG`/zero new `SMELL` sets are folded into D1-D10 and
+the slices/gates above; the third closure found no regression in earlier fixed mechanisms. All D1-D10 owner
+decisions were approved on 2026-07-17. No implementation, schema, timer, private authority, live
+characterization, model discovery, registry/image effect, compatibility provider turn, GitHub check
+mutation, or production-operator action has been performed by this design fold; the only new provider
+activity was the four recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
+this exact committed revision. If approved, publish the non-draft docs PR and start R3d0 only after merge.
+Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 
 ## R3e — OpenRouter provider expansion
 

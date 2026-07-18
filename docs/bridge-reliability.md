@@ -157,16 +157,18 @@ plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
   eligible model for a provider-generic adapter/capability probe. A model/effort/mode/alias/capability-
   specific PR must exercise the exact affected claimed-support identity; a cheap substitute cannot green
   that gate. New provider-minimal probes live in a separate non-support scheduled-case registry through
-  characterization and remain advisory unless R4 promotes them deliberately. Scheduling uses fresh
-  one-shot processes and never manipulates the long-lived operator.
-- Require a trusted local exact-base/head affected-case canary before merging compatibility-impacting same-repo
-  PRs; GitHub performs deterministic classification/status only and never directly invokes credentialed
-  work. Only an executed pass or locally proved no-impact state can satisfy the required check; due-but-not-
-  run remains blocking. Every characterization/reuse/consumption key binds one canonical exact
-  repository/base/head, manifest/case/pin, candidate, requested/expected-effective provider/model/config/
-  prompt, environment, and budget fingerprint; observed effective identity must match before reuse. Retain a
-  coalesced main run as the integration backstop. Enforce the check only with strict up-to-date branch
-  protection so a base advance blocks merge before the local watcher republishes pending.
+  characterization; an R3d-only strict scheduled-execution source permits only the exact registry-bound
+  model variance without weakening R3c's support-baseline resolver. They remain advisory unless R4 promotes
+  them deliberately. Scheduling uses fresh one-shot processes and never manipulates the long-lived operator.
+- Require a trusted local affected-case canary on the exact current GitHub test-merge result SHA
+  (`merge_commit_sha` / `refs/pull/<n>/merge`) before merging a compatibility-impacting same-repo PR. GitHub
+  performs deterministic coordination/status only and never directly invokes credentialed work. Only an
+  executed pass or locally proved no-impact state can satisfy the test-merge compatibility conclusion; due-
+  but-not-run remains blocking. Every characterization/reuse/consumption key binds one canonical exact test-
+  merge/base/head, manifest/case/pin, candidate, requested/expected-effective provider/model/config/prompt,
+  environment, and budget fingerprint; observed effective identity must match before reuse. The required
+  context is never posted to the PR head, so a regenerated test-merge SHA cannot fall back to old head
+  evidence. Retain a coalesced main run as the integration backstop.
 - Defer representative review scheduling until a separate owner-reviewed design defines a fixed Tier-2
   read-only fixture, prompt, scoring, caps, provider rotation, and evidence boundary. Review content is not
   compatibility or promotion evidence.
