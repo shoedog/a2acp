@@ -1106,7 +1106,7 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 
 - **Branch:** `agent/reliability-r3d-scheduled-canaries`
 - **Base:** merged R3c main `983398427c9f04861a2f1da501a7650c4a1cdd80`
-- **Status:** design of record revised from owner decisions and four exact-commit Sol reviews;
+- **Status:** design of record revised from owner decisions and five exact-commit Sol reviews;
   implementation not started; fresh Sol/xhigh closure review pending
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
@@ -1146,6 +1146,14 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   replaces watcher-timed base/head gating with an exact required current GitHub test-merge result, adds the
   strict
   scheduled-execution source, finishes authority terminology, and reconciles the merged R3c status.
+- **Fourth closure review:** one fresh one-node bridge-mediated Sol/xhigh/read-only review of exact
+  `6bc06fe6118c8b6e193be666e4b4961546916761` marked all four inherited items `FIXED`, found no
+  regression in earlier fixed mechanisms, then returned one new `WRONG`, one new `SMELL`, and
+  `R3D DESIGN: REVISE`. Its fixed output is
+  `/private/tmp/a2a-bridge-r3d-sol-closure-6bc06fe.uJsgZS/review.md`, mode `0600`, 12,872 bytes,
+  SHA-256 `1e8c35ce653ddbdb66c43ebe71a0cf49dc9eeed9decf1d4fcc87805a9e0b9317`. This revision
+  makes a published success valid for its immutable SHA lifetime, removes the unenforceable same-SHA
+  freshness promise, and adds action-time branch-rule/context/source revalidation.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
 standing authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
@@ -1750,14 +1758,16 @@ R3d's atomic guard is the required context on that result:
    `failure` means an executed support failure or invalid candidate; every other state remains
    `in_progress/pending`. GitHub `neutral`/`skipped` never satisfies the contract. A consumed artifact counts
    only when it proves the same test-merge SHA/fingerprint and equal-or-stronger purpose: pass may satisfy,
-   fail fails, and unknown/blocked/expired/invalid stays pending.
+   fail fails, and unknown/blocked/expired/invalid stays pending. Publication durably creates the terminal
+   GitHub-consumption record under the then-current policy, authority, and freshness bucket before posting.
 6. Immediately before consumption and publication, the publisher re-fetches PR metadata and the canonical
-   test-merge ref and proves the SHA, base, head, ordered parents, and tree still match in the same guarded
-   observation. Absence blocks publication. Any changed identity makes the artifact historical and forbids
-   publication/reuse. A newly generated different SHA has no R3d context, so the required gate remains
-   unsatisfied until new evidence exists. If an absent ref later reappears with the identical immutable SHA,
-   base, head, parents, and tree, it is the same result; reuse is still subject to normal freshness and
-   authority rules rather than an unenforceable ref-incarnation counter.
+   test-merge ref plus the exact active branch-protection/ruleset state. In one guarded observation it proves
+   the SHA, base, head, ordered parents, and tree still match; strict mode remains enabled; the dedicated
+   context and expected authenticated source remain required; and the context is absent from the PR head.
+   It binds the active rule ids and canonical response hashes into the sidecar before posting. Absence or any
+   identity/rule/source drift blocks publication; changed test-merge identity makes the artifact historical.
+   A newly generated different SHA has no R3d context, so the required gate remains unsatisfied until new
+   evidence exists.
 
 The required test-merge context—not watcher timing—is the atomic merge guard. GitHub documents that
 `merge_commit_sha` names the current test merge before merge, `refs/pull/<n>/merge` represents what the
@@ -1767,6 +1777,21 @@ head-status fallback cannot green a regenerated test merge. Strict up-to-date pr
 not the source of exact-result atomicity. The current public personal repository cannot use GitHub merge
 queues; transferring to eligible organization infrastructure would be a separate owner decision, not a
 hidden R3d prerequisite.
+
+GitHub does not consult local policy, freshness, or provider authority again when an administrator later
+merges a commit whose required context is already successful. R3d therefore makes the enforceable narrower
+contract explicit: after the terminal consumption record and success are published, that success is valid
+for the lifetime of the identical immutable test-merge SHA. If an absent ref reappears with the same SHA,
+base, head, ordered parents, and tree, the existing success remains valid; later policy/freshness-bucket or
+authority changes do not retroactively revoke it. They do block new execution, evidence reuse for another
+identity/purpose, and publication on another SHA. If owner policy later requires action-time freshness at
+the merge click, this gate must remain disabled until a GitHub-native or other action-time primitive can
+enforce it; watcher timing cannot provide that guarantee.
+
+An administrator can change or remove protection after the final guarded read or after publication. That is
+an explicit owner administrative bypass outside R3d's atomic claim, not a scheduler success. The next watcher
+observation records the drift locally, blocks later publication, and requires restoration or an explicit
+operator waiver; R3d does not claim it can prevent a repository administrator from removing the guard.
 
 If the test merge is regenerated before any possible provider acceptance, its reservation is released and
 the new result may admit normally. If regeneration occurs after possible acceptance, the old attempt
@@ -1921,13 +1946,17 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   head or superseded test-merge result never counts. Test-merge fixtures prove a base advance from `B0` to
   contained commit `C` with stable revert head `H` produces a distinct required result, refuse missing/
   unreadable/noncanonical refs and non-two-parent merges, and reject ref/API/base/head/parent/tree/observation
-  races at final publication. A delete/recreate fixture proves an identical immutable result remains subject
-  to ordinary freshness/authority rules without inventing a GitHub-invisible generation. Protection fixtures
-  prove strict mode, the unique required context and expected
+  races at final publication. A delete/recreate fixture begins with an already-published success and proves
+  an identical immutable result keeps that success for its SHA lifetime without inventing a GitHub-invisible
+  generation or a second local consumption. Policy/freshness/authority changes after publication do not
+  retroactively revoke it, while a changed SHA has no context and requires new authority/evidence. Protection
+  fixtures prove strict mode, the unique required context and expected
   source, and absence of that context from every current/historical PR-head status/check before enablement.
   A regenerated test-merge SHA starts without the context; a result from the prior SHA never counts. Finding
   the context on a head, a loose/missing rule, or an unexpected source prevents enablement instead of
-  normalizing timeout to green. Bypass is recorded as an explicit waiver.
+  normalizing timeout to green. A rule/strict/context/source/head-status mutation between evidence completion
+  and final publication also refuses. Post-publication administrative removal is classified as an explicit
+  owner bypass, never as a canary success.
 - GC tests cover open-reader/exclusive deletion, started-between-query-and-remove, stopped-container image
   reference, pin survival, manifest/class/pin retention precedence, hot-cache versus cold-full clocks,
   keep/age ordering, tombstone-before-unlink crash, iCloud symlink/hard-link/replacement/placeholder,
@@ -1982,7 +2011,8 @@ are green:
    exercise one affected exact test-merge SHA. Verify API/ref/base/head/tree/ordered-parent binding, that the
    context is absent from every PR head, current-result required-check wait, prior-result refusal, the
    contained-base/stable-head construction, pre/post-acceptance churn accounting, publication, missing or
-   unmergeable-ref blocking, timeout, and emergency bypass before leaving the rule enforced.
+   unmergeable-ref blocking, final branch-rule/context/source hash binding and drift refusal, immutable-SHA
+   success lifetime, timeout, and emergency/administrator bypass before leaving the rule enforced.
 9. Enable the low-use daily window. First post-enable red/unknown/blocked transitions are reviewed before
    the schedule is left unattended.
 
@@ -1998,14 +2028,16 @@ rollback target. Any code revert is a normal reviewed PR.
 
 **Restart point:** work from branch `agent/reliability-r3d-scheduled-canaries` based on merged main
 `98339842`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
-and exact-`9414aa8` Sol reviews are retained at the paths/hashes above. The Fable six `WRONG`/thirteen
+exact-`9414aa8`, and exact-`6bc06fe` Sol reviews are retained at the paths/hashes above. The Fable six
+`WRONG`/thirteen
 `SMELL`, first-Sol four `WRONG`/seven `SMELL`, first-closure three `WRONG`/three `SMELL`, second-closure
-two `WRONG`/three `SMELL`, and third-closure two `WRONG`/zero new `SMELL` sets are folded into D1-D10 and
-the slices/gates above; the third closure found no regression in earlier fixed mechanisms. All D1-D10 owner
+two `WRONG`/three `SMELL`, third-closure two `WRONG`/zero new `SMELL`, and fourth-closure one `WRONG`/one
+`SMELL` sets are folded into D1-D10 and the slices/gates above; the fourth closure marked all four inherited
+items fixed and found no regression in earlier fixed mechanisms. All D1-D10 owner
 decisions were approved on 2026-07-17. No implementation, schema, timer, private authority, live
 characterization, model discovery, registry/image effect, compatibility provider turn, GitHub check
 mutation, or production-operator action has been performed by this design fold; the only new provider
-activity was the four recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
+activity was the five recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
 this exact committed revision. If approved, publish the non-draft docs PR and start R3d0 only after merge.
 Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 

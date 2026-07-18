@@ -168,7 +168,9 @@ plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
   merge/base/head, manifest/case/pin, candidate, requested/expected-effective provider/model/config/prompt,
   environment, and budget fingerprint; observed effective identity must match before reuse. The required
   context is never posted to the PR head, so a regenerated test-merge SHA cannot fall back to old head
-  evidence. Retain a coalesced main run as the integration backstop.
+  evidence. A published success is deliberately valid for the lifetime of that immutable test-merge SHA;
+  R3d does not claim GitHub can recheck local freshness or authority at the later merge click. Retain a
+  coalesced main run as the integration backstop.
 - Defer representative review scheduling until a separate owner-reviewed design defines a fixed Tier-2
   read-only fixture, prompt, scoring, caps, provider rotation, and evidence boundary. Review content is not
   compatibility or promotion evidence.
