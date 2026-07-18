@@ -5,12 +5,14 @@ Grounded in the bridge's existing operator surfaces (permission suspend/resume, 
 clients, `/metrics`, the traces drill-down routes) — the UI is a **client** over those seams and contains no
 orchestration.
 
-**Rendered mockups:** [`operator-ui-mockups.html`](operator-ui-mockups.html) — open in a browser to see the
-TUI cockpit (overview, permission inbox, implement supervision) and the mobile screens as styled frames. This
-markdown is the full spec; the HTML is the visual companion.
+**Rendered mockups:** [`operator-ui-mockups.html`](operator-ui-mockups.html) (TUI cockpit — overview,
+permission inbox, implement supervision) and
+[`operator-ui-mobile-mockups.html`](operator-ui-mobile-mockups.html) (the mobile app — conversation, agents,
+workflows, models). Open either in a browser. This markdown is the full spec; the HTML is the visual companion.
 
-Three form factors were evaluated: **TUI (recommended, ships now)**, **web (deferred to Grafana + an optional
-thin cost page)**, and a **mobile companion (post-federation remote surface)**. Full treatment below.
+Three form factors are covered: **TUI (recommended, ships now)**, **web (deferred to Grafana + an optional
+thin cost page)**, and a **mobile app — a primary, conversing-first client over Tailscale** (§7, reframed from
+an earlier "companion" treatment). Full treatment below.
 
 ---
 
@@ -274,134 +276,97 @@ Palette conventions used below: **green** = healthy/running/approved, **yellow**
 
 ---
 
-## 7. Mobile companion app — a post-federation remote, not a third cockpit
+## 7. Mobile — a primary, conversing-first client
 
-**Honest fit assessment:** mobile is the *weakest* of the three form factors for this tool and should be built last, if at all — with one exception that genuinely justifies it: **approving a deferred permission while away from the desk.** `permission_timeout_ms` defaults to 120s; if the operator steps out for coffee mid-`implement`, today the request times out and the run dies. That single moment — approve/deny from a lock screen — is the entire reason this app deserves to exist. Everything else on a phone is a worse version of the TUI.
+*Reframed 2026-07-17. Rendered mockups: [`operator-ui-mobile-mockups.html`](operator-ui-mobile-mockups.html).*
 
-### 7.1 The hard constraint: mobile is gated on H3-2
+**This overturns the earlier "pager, build last, gated on H3-2" verdict, on operator facts.** The operator
+already drives everything under `~/code` from an iPhone over mosh + tmux + Tailscale; at home, mobile *is* the
+primary seat. Two consequences:
 
-The bridge binds `127.0.0.1:8080` behind NAT. A phone cannot reach it, period. Mobile therefore requires what the TUI gets for free:
+1. **Transport is solved.** The Tailscale mesh is the authenticated tunnel — the same trust-model class the
+   TUI enjoys on localhost, extended to the operator's own devices by mesh ACLs. Mobile is buildable **now**.
+   H3-2 (per-device identity, mTLS/JWT) is a hardening layer to adopt when it lands, not a gate. The bridge
+   binds the tailnet interface; ACLs scope it to the operator's nodes; done.
+2. **The centerpiece changes.** The daily act is *conversing with agents* — reading longform transcripts with
+   code and diffs, and composing replies. A phone terminal makes that tolerable; the app's job is to make it
+   *good* (editor-quality reading, a real composer). Approve/deny stays, but folded into the conversation:
+   **a permission request is a message you answer**, not a separate pager.
 
-- **(a) Secure remote reach** — Tailscale/WireGuard mesh, or an authenticated tunnel, so the phone can address the bridge at all.
-- **(b) TLS + per-caller auth + signed, pinned server identity** — you cannot put a *permission control plane* on a network path with only a shared bearer token and an unauthenticated Agent Card. This is exactly roadmap **H3-2 (A2A federation v1)**: per-caller identity, mTLS/JWT enforcement (explicitly listed as "not implemented" in the README's Known limitations), and the H1-4 config-fingerprint so the phone provably talks to the bridge running the config the operator thinks it is.
+What honestly *stays* on the desktop: deep multi-pane forensics (deepest-error journal spelunking,
+side-by-side diff review during implement supervision) — not because the phone can't render them, but because
+they're synthesis work that benefits from screen area. The mobile app should read them adequately, not be
+designed around them.
 
-**Sequencing consequence, stated plainly:** the TUI ships now against today's localhost trust model. The mobile app is a **post-federation surface** — starting it before H3-2 lands means either building throwaway auth or, worse, shipping approve/deny over a weakly authenticated network path. Don't.
+### 7.1 The one honest architectural addition: an admin sidecar
 
-### 7.2 The push problem
+Three of the five views need config read/write, and the bridge deliberately has **no admin API** — ADR-0005
+made the config *file* the registry's mutation surface (hot-reload, 200 ms debounce, atomic-rename-safe), and
+workflows/`[server]`/`[store]` are read once at boot. Rather than bolt admin routes onto `serve` (violating
+the keep-orchestration-out-of-the-core principle), add a tiny **mesh-bound admin sidecar** on the host
+(`a2a-bridge-admind`, separate binary): config read (TOML→JSON for `[[agents]]`/`[[workflows]]`/`[[prompts]]`),
+validated write-back (run `a2a-bridge validate` on a temp copy → atomic rename → the bridge's own hot-reload
+is the apply mechanism), and on-demand shell-outs to `doctor --json` / `models --json` / `prompt list` with
+cached results. **This sidecar does not exist yet** — it is the one new build besides the app itself, and it
+never touches the core.
 
-Real-time approval needs the phone to *learn* about a pending request within seconds. The local bridge cannot push to a phone (no APNs/FCM credentials, no public endpoint), and a phone cannot hold a reliable long-lived connection to a home machine (OS kills background sockets). Two transport architectures, honestly traded:
+### 7.2 Views
 
-| | **Direct-over-Tailscale (poll/SSE over tunnel)** | **Relay for push (bridge → relay → APNs/FCM)** |
-|---|---|---|
-| How | Phone polls `session status` / holds SSE over the mesh while app is foregrounded | Tiny relay (cloud or always-on host) with APNs/FCM creds; bridge POSTs pending-permission envelopes to it; relay pushes |
-| Wakes a locked phone | **No** — background polling is throttled to minutes by iOS/Android; useless for a 120s timeout | **Yes** — this is the only way to hit the lock screen in seconds |
-| New infrastructure | None (mesh already exists for reach) | A new always-on component + push credentials |
-| Security surface | Control plane stays inside the mesh; nothing leaves | Notification *envelope* transits third-party push infra — must carry **only** `{requestId, agent, title, deadline}`, never diff content, paths, or repo names; the **resolution RPC always goes back over the authenticated tunnel, never through the relay** |
-| Failure mode | Miss the request unless app is open | Relay down → degrade to in-app poll; bridge must treat relay as fire-and-forget, never block the permission registry on it |
+**Conversation / transcript — the centerpiece (all seams exist today).**
+Read and respond to agent transcripts better than mosh: rendered markdown, syntax-highlighted code blocks,
+tool calls collapsed-but-expandable, inline diffs, per-message **agent/model/effort/cost/duration chips**,
+turn/attempt dividers, jump-to-latest, and inline permission cards with Approve/Deny + countdown. Composer with
+three explicit modes — **Reply** (continues the task-bound conversation, `submit --context`), **Inject**
+(steers the warm loop, `session inject`), **Task-spec** (scaffolds typed input). Modes are explicit so a steer
+never masquerades as a chat turn. *Feeds:* SSE `SubscribeToTask` (Last-Event-ID reattach) · history
+`/tasks/:id/journal.jsonl` · chips `/turns/:turn_id` · permits `session status` → `SessionPermit`. **Gap:
+none — this ships against today's bridge.**
 
-**Recommendation:** both, layered — relay for the wake-up (content-free envelope), tunnel for everything else including the `SessionPermit` RPC itself. The relay is a doorbell, not a door. The security implication is accepted knowingly: putting approve/deny on the network at all is a real expansion of the control plane's attack surface, which is precisely why per-device revocable auth and generation stamping (§7.6) are non-negotiable, and why deny-by-timeout remains the fail-safe.
+**Agents — list + add/edit** *(read: mostly now · write: sidecar)*.
+The `[[agents]]` fleet as cards — kind (`acp`/`api`/`container_rw`), sandbox tier badge (T0–T3), pinned
+model/effort, MCP wiring, doctor health — plus a form to add/edit an entry. Pickers are fed by the live catalog
+so you cannot pin a model the agent doesn't advertise (which hard-fails at mint); the `[agents.sandbox]` section
+mirrors the real block field-for-field. **Validate** then **Apply** — apply is sidecar validate → atomic rename
+→ hot-reload, live with no restart; config-only edits reuse the warm backend. *Feeds:* Agent Card
+`agent-models` extension (exists) for catalog; sidecar (new) for config read/write, `doctor --json`,
+`models --json`.
 
-### 7.3 Scope: the phone gets four jobs, not seven
+**Workflows — list + run** *(run: now · defs: sidecar)*.
+List `[[workflows]]`, show each DAG (nodes + `inputs` fan-in edges, agents labeled), run one against a repo with
+a task-spec input. Run sheet = paste/share-sheet a `task.md` (+ session-cwd) → detached submit; the resulting
+run opens as a conversation thread — the thread *is* the watch surface. *Feeds:* run — `submit <workflow> --input`
++ SSE watch (exists); definitions — sidecar config read (workflow defs are not served over the wire today).
 
-**In:** (1) permission approve/deny with push — the killer case; (2) glance/overview — is anything running, anything red; (3) cost/quota alert — budget breach push + a burn readout; (4) **cancel a runaway run** — the one write beyond permit that belongs on a phone (a run burning $2/hr while you're at lunch).
+**Workflow builder/editor** *(sidecar + restart — flagged prominently)*.
+**Deliberately not a canvas** — a freeform graph editor on a 6-inch screen is a party trick. It's an ordered
+**node list + per-node form**: agent (picker from catalog), prompt (picker from the `[[prompts]]` registry),
+inputs (chips = the TOML's exact edge model). What you build is literally `[[workflows.nodes]]`. **Validate**
+runs the real `validate` (cycle/missing-ref errors come from the engine's validator, never a client-side
+imitation); **Save** is honest: writes via sidecar, then reports **"restart serve to apply"** — workflows are
+read once at boot, and the durable store + crash-resume make the restart survivable for in-flight runs.
 
-**Out, deliberately:** journal/deepest-error investigation, diff reading, review verdicts, implement supervision, session hygiene (compact/release/inject), doctor/model probes. Why: these are *forensic reading and steering* tasks — multi-pane, grep-driven, clipboard-heavy, consequence-laden. A 6-inch screen degrades them into skimming, and skim-approving a merge or skim-reading a diff-verdict is exactly how a supervised loop stops being supervised. The mobile rule: **decide only what was designed to be decided in one glance** (an agent-offered permission option, a cancel). Anything requiring synthesis waits for the desk. `session inject` is excluded for the same reason — steering text composed on a phone keyboard under time pressure is a liability, not a feature.
+**Provider / model catalog** *(read: ships now)*.
+Per-agent advertised models, per-model effort support matrix (with fallback semantics — e.g. `xhigh` runs as
+`high` on sonnet-4.6), modes, and **drift vs pinned**: a config pin the agent no longer advertises is a banner
+alert, because it hard-fails at the next session mint. *Feeds:* Agent Card `agent-models` extension (refreshed
+at boot + SIGHUP — exists); live probe `models --json` via sidecar (on demand — it spawns agents); pins from
+sidecar config read. Kiro shown discovery-only (`model_configurable: false`); fable-family exclusion noted as a
+catalog fact.
 
-### 7.4 Mockups
+### 7.3 Capability ledger (honest)
 
-**(a) Lock-screen push — pending permission** (content-free envelope + inline actions):
+| Needs | Status |
+|---|---|
+| Conversation view, inline permits, reply/inject, run workflows, model catalog read | **Exists today** — A2A JSON-RPC + SSE, `[traces]` routes, Agent Card, `SessionPermit`/`session inject`/`submit --context` |
+| Config read (agents/workflows/prompts), doctor/models/prompt-list over the mesh, validated config write-back | **Admin sidecar — new build**, mesh-bound, core untouched; apply-via-hot-reload for agents (live), apply-via-restart for workflows (boot-read) |
+| Per-device revocable tokens, mTLS | **H3-2 — layer on later**, not gating; until then Tailscale ACLs + bearer |
+| Push wake for permits with app backgrounded | A small push relay (content-free doorbell envelope; the resolution RPC always returns over the mesh, never the relay) |
 
-```
-┌──────────────────────────────┐
-│  🔒  09:41                   │
-│ ┌──────────────────────────┐ │
-│ │ ⚠ a2a-bridge      now    │ │
-│ │ Permission request       │ │
-│ │ codex · implement run    │ │
-│ │ req-7f21 · expires 78s   │ │
-│ │ ▓▓▓▓▓▓▓▓░░░░  ⏳          │ │
-│ │                          │ │
-│ │  [ Approve ]  [ Deny ]   │ │
-│ │  [ Open in app…       ]  │ │
-│ └──────────────────────────┘ │
-│   inline actions require     │
-│   device unlock (FaceID)     │
-└──────────────────────────────┘
-```
+### 7.4 Tech sketch
 
-Inline Approve/Deny fire the `SessionPermit` RPC over the tunnel after biometric unlock; if the tunnel is down the action fails **loudly** into the app rather than queueing. **Data source:** envelope from the relay (`{requestId, agent, runKind, deadline}`); actions → `SessionPermit` JSON-RPC over the mesh.
-
-**(b) In-app approval detail** (mobile analog of Inbox §3b — full context arrives over the tunnel, not the relay):
-
-```
-┌──────────────────────────────┐
-│ ◀ Inbox        req-7f21   ⚠  │
-├──────────────────────────────┤
-│ ⏳ 71s   ▓▓▓▓▓▓▓░░░░░        │
-│                              │
-│ codex @ t-01JX3A (implement) │
-│ tier3-impl · container :rw   │
-│ ctx c-impl-4420 · gen 3      │
-├──────────────────────────────┤
-│ TOOL CALL                    │
-│  fs/write                    │
-│  /repo/../../.ssh/config     │
-│  ⚠ outside clone root        │
-├──────────────────────────────┤
-│ OPTIONS (from agent)         │
-│  ○ allow-once                │
-│  ○ allow-always              │
-│  ● reject-once  ◀ default    │
-├──────────────────────────────┤
-│ Run context (journal tail)   │
-│  verify: 212 tests passed    │
-│  review: MAJOR — hardcoded…  │
-├──────────────────────────────┤
-│ ┌──────────┐  ┌───────────┐  │
-│ │ ✗ DENY   │  │ ✓ APPROVE │  │
-│ └──────────┘  └───────────┘  │
-│      [ escalate to desk ]    │
-└──────────────────────────────┘
-```
-
-"Escalate to desk" maps to `--escalate` — the honest mobile answer when the request needs the diff. **Data sources:** `session status` (PermissionView: requestId/gen/op/options), `GET /tasks/:id/journal.jsonl` tail — both over the tunnel; resolution via `SessionPermit` with `--context --generation --op`.
-
-**(c) Glance + cost alert:**
-
-```
-┌──────────────────────────────┐
-│ a2a-bridge   ● tunnel ✓ fp ✓ │
-├──────────────────────────────┤
-│ NOW                          │
-│  3 running · 4 queued        │
-│  ⚠ 1 pending permit (71s)    │
-├──────────────────────────────┤
-│ COST TODAY                   │
-│  $6.41 / $10.00              │
-│  ▓▓▓▓▓▓▓▓▓▓▓▓░░░░░  64%      │
-│  ⚠ projected EOD $9.80       │
-├──────────────────────────────┤
-│ RUNS                         │
-│  ● t-01JX3A impl  4m  $0.61  │
-│    review · attempt 2/3      │
-│                 [ CANCEL ]   │
-│  ● t-01JX3B rev   1m  $0.22  │
-│  ✗ t-01JX2M impl  — failed   │
-│    → investigate on desktop  │
-├──────────────────────────────┤
-│  Inbox(1)   Glance   Cost    │
-└──────────────────────────────┘
-```
-
-CANCEL requires a swipe-confirm and maps to `task cancel`. Failed runs deep-link nowhere — they say "investigate on desktop" on purpose. **Data sources:** `task list`, `session status`, `/metrics` counters (`bridge_turns_in_flight`, `bridge_queue_depth`, `bridge_turn_cost_total` deltas), all polled over the tunnel while foregrounded; budget-breach push via the relay.
-
-### 7.5 Position
-
-Mobile is a **remote companion for the latency-critical subset** — approve/deny, glance, cost alarm, emergency cancel — gated on H3-2 federation, while the TUI remains the primary cockpit and ships now. It is not a third place to do the job; it is a pager with a yes/no button. Both clients speak through the same seam: the shared `bridge-client` request builders (§6) define the *only* payloads either can send — `SessionPermit`, `TaskCancel`, `session status`, `task list`, `/metrics`, `journal.jsonl` — so the mobile app inherits the same 1:1-verb discipline and can never invent orchestration the CLI doesn't have.
-
-### 7.6 Tech sketch
-
-- **Client:** native (SwiftUI first, given the operator's macOS environment; Kotlin later) over a PWA. The deciding factor is push: actionable lock-screen notifications with inline approve/deny and biometric gating require native APNs categories; a PWA over the tunnel cannot wake reliably and reduces to "poll while open," which forfeits the killer case.
-- **Relay:** a ~200-line stateless service (fly.io/small VPS, or an always-on home host with APNs/FCM creds). Bridge-side: a fire-and-forget `[notify]` webhook POST on permission-registry insert and budget breach — envelope only, no content, and the registry never blocks on it. Relay compromise therefore leaks *that* a request happened, never what, and grants no control.
-- **Auth:** per-device tokens minted by the H3-2 caller-identity layer, revocable individually (`device revoke` on the desk), scoped to the mobile verb subset (permit, cancel, read) — a stolen phone cannot `merge`, `inject`, or `clear`. Server identity pinned via TLS cert + H1-4 config-fingerprint at pairing (QR code on the desk shows fingerprint + pairing token); on mismatch the app goes read-only, same fail-closed rule as the TUI (§5.2).
-- **Staleness:** the mobile `SessionPermit` carries the same `--context --generation --op` stamping as the TUI/CLI — a phone approving from a 90-second-old notification after the session reset gets a clean server-side rejection from the gen+op-keyed registry (`crates/bridge-core/src/permission.rs`), not a misapplied grant. The exact-once rendezvous also makes phone-and-desk racing safe: first resolver wins, the loser gets an error, nothing double-fires.
+SwiftUI native (the composer, share-sheet task-spec intake, and background push all favor native; a PWA can't
+wake for permits). Same seam discipline: request payloads generated from the shared `bridge-client` builders so
+the app can never send what the CLI couldn't. Stale-approve safety is unchanged and load-bearing: `SessionPermit`
+carries `--context --generation --op`, so an approve fired from a minutes-old screen after a session reset gets a
+clean server-side rejection from the gen+op-keyed, exact-once registry — phone and desk can race safely, first
+resolver wins.
