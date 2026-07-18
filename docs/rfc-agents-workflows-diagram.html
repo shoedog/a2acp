@@ -1,0 +1,155 @@
+<title>a2a-bridge — Agents/Workflows refactor (diagram)</title>
+<style>
+  :root{
+    --bg:#eef0f4; --surface:#ffffff; --surface-2:#f6f7fa;
+    --text:#212836; --muted:#5c6675; --line:#e0e4ea; --accent:#1c7ea8; --accent-soft:#e5f1f7;
+    --t-ok:#3a9d6f; --t-warn:#b9852a; --t-crit:#cf4048; --t-accent:#1c7ea8;
+    --mono:ui-monospace,"SF Mono","SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --maxw:960px;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#0b0e14; --surface:#11151d; --surface-2:#0e121a; --text:#c8d2e0; --muted:#828d9e;
+           --line:#1d2531; --accent:#5ab7e6; --accent-soft:#12222c;
+           --t-ok:#52c996; --t-warn:#e4b449; --t-crit:#ec5b66; --t-accent:#5ab7e6; }
+  }
+  :root[data-theme="light"]{ --bg:#eef0f4; --surface:#ffffff; --surface-2:#f6f7fa; --text:#212836;
+    --muted:#5c6675; --line:#e0e4ea; --accent:#1c7ea8; --t-ok:#3a9d6f; --t-warn:#b9852a; --t-crit:#cf4048; --t-accent:#1c7ea8; }
+  :root[data-theme="dark"]{ --bg:#0b0e14; --surface:#11151d; --surface-2:#0e121a; --text:#c8d2e0;
+    --muted:#828d9e; --line:#1d2531; --accent:#5ab7e6; --t-ok:#52c996; --t-warn:#e4b449; --t-crit:#ec5b66; --t-accent:#5ab7e6; }
+
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.6;margin:0}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:clamp(28px,5vw,64px) clamp(18px,4vw,32px) 88px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:var(--accent);margin:0 0 12px}
+  h1{font-size:clamp(27px,4.6vw,42px);line-height:1.06;letter-spacing:-.02em;margin:0 0 16px;text-wrap:balance;font-weight:680}
+  h1 .thin{color:var(--muted);font-weight:400}
+  .lede{font-size:clamp(15px,1.9vw,18px);color:var(--muted);max-width:66ch;margin:0 0 8px}
+  .lede code{font-family:var(--mono);font-size:.9em;background:var(--surface-2);border:1px solid var(--line);border-radius:4px;padding:.5px 5px;color:var(--text)}
+
+  section{margin-top:clamp(38px,6vw,64px)}
+  .sec-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:6px;padding-bottom:12px;border-bottom:1px solid var(--line)}
+  .sec-num{font-family:var(--mono);font-size:13px;color:var(--accent);letter-spacing:.1em}
+  .sec-head h2{font-size:clamp(19px,2.6vw,24px);margin:0;letter-spacing:-.01em;font-weight:640}
+  .sec-intro{color:var(--muted);max-width:72ch;margin:16px 0 20px;font-size:15px}
+  .sec-intro strong{color:var(--text);font-weight:600}
+  .sec-intro code{font-family:var(--mono);font-size:.88em;background:var(--surface-2);border:1px solid var(--line);border-radius:4px;padding:.5px 5px;color:var(--text)}
+
+  .diagram{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px 10px;
+    overflow-x:auto;box-shadow:0 14px 40px -26px rgba(0,0,0,.5)}
+  pre.mermaid{margin:0;text-align:center;min-width:520px}
+
+  .cap{display:flex;gap:11px;align-items:baseline;margin:12px 3px 0;flex-wrap:wrap}
+  .cap .k{font-family:var(--mono);font-size:12px;letter-spacing:.13em;text-transform:uppercase;color:var(--accent);flex:none}
+  .cap .v{font-size:14px;color:var(--muted);max-width:76ch}
+  .cap .v b{color:var(--text);font-weight:600}
+
+  .callout{display:flex;gap:14px;align-items:flex-start;background:var(--surface);border:1px solid var(--line);
+    border-left:3px solid var(--t-crit);border-radius:10px;padding:15px 18px;margin-top:22px}
+  .callout .mk{font-family:var(--mono);font-size:12px;letter-spacing:.13em;text-transform:uppercase;color:var(--t-crit);flex:none;padding-top:2px}
+  .callout p{margin:0;font-size:14.5px;color:var(--muted)}
+  .callout b{color:var(--text)} .callout a{color:var(--accent)}
+  .callout code{font-family:var(--mono);font-size:.88em;background:var(--surface-2);border:1px solid var(--line);border-radius:4px;padding:.5px 5px;color:var(--text)}
+
+  .phases{list-style:none;padding:0;margin:8px 0 0;display:flex;flex-direction:column;gap:9px}
+  .phases li{display:flex;gap:12px;align-items:baseline;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:11px 14px}
+  .phases .id{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--accent);flex:none;min-width:64px}
+  .phases .tx{font-size:14px;color:var(--muted)} .phases .tx b{color:var(--text);font-weight:600}
+  .phases li.p0{border-left:3px solid var(--t-crit)}
+
+  footer{margin-top:52px;padding-top:20px;border-top:1px solid var(--line);color:var(--muted);font-size:13.5px}
+  footer code{font-family:var(--mono);background:var(--surface-2);border:1px solid var(--line);border-radius:4px;padding:1px 6px;font-size:12.5px}
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Architecture · RFC diagram</p>
+  <h1>Agents/Workflows refactor <span class="thin">— the two shifts, visually</span></h1>
+  <p class="lede">Companion to the RFC. Two changes: split the fused <code>AgentEntry</code> into a
+    composable <b>Agent</b> over a <b>Provider</b>, and make workflow definitions runtime-mutable — both
+    landing without disturbing the runtime, because the registry already swaps atomically and runs already
+    pin their graph by value.</p>
+
+  <section>
+    <div class="sec-head"><span class="sec-num">01</span><h2>The Agent / Provider split</h2></div>
+    <p class="sec-intro">Today one flat struct fuses execution substrate, model tuning, tools, and identity —
+      and carries <strong>no role</strong> (role lives only in the node prompt). The target splits
+      <strong>ProviderEntry</strong> (adapter/sandbox/watchdog/model) from <strong>AgentDef</strong>
+      (role-prompt/tools/model-defaults), composing them into exactly today's <code>AgentEntry</code>
+      <em>above</em> the registry — so <code>bridge-registry</code>, <code>bridge-acp</code>, and the executor
+      never change.</p>
+    <div class="diagram">
+      <pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'primaryColor':'#12202c','primaryTextColor':'#dbe6f2','primaryBorderColor':'#2f5a72','lineColor':'#7c93a6','secondaryColor':'#1a2a1f','tertiaryColor':'#2a2018','fontFamily':'ui-monospace, SFMono-Regular, Menlo, monospace','fontSize':'13px'}}}%%
+flowchart LR
+  subgraph TODAY["TODAY — fused, no role"]
+    direction TB
+    N1["WorkflowNode<br/>agent = &quot;codex&quot;<br/>+ prompt_template"] --> AE1["AgentEntry<br/>substrate + model +<br/>mcp/tools + identity"]
+    AE1 --> R1["Registry (ArcSwap)"]
+  end
+  subgraph TARGET["TARGET — split, composed above the registry"]
+    direction TB
+    N2["WorkflowNode<br/>agent = &quot;codex&quot;<br/>+ overrides?"] --> AD["AgentDef<br/>role_prompt · mcp ·<br/>model-defaults · provider→"]
+    PE["ProviderEntry<br/>adapter · sandbox ·<br/>watchdog · model"] --> C{{"compose_agent()"}}
+    AD --> C
+    C --> AE2["AgentEntry (composed)<br/>== today's type"]
+    AE2 --> R2["Registry (ArcSwap)<br/><b>UNCHANGED</b>"]
+  end
+  TODAY -.->|"config/domain layer only"| TARGET
+      </pre>
+    </div>
+    <div class="cap"><span class="k">Key move</span><span class="v">Tools + cwd are <b>spawn-frozen</b> for codex (argv) and kiro (agent-config), so the true spawn unit is (provider × tools × cwd) ≈ today's entry. Composing above the registry keeps that intact; provider slot-sharing is a later, optional optimization.</span></div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-num">02</span><h2>Runtime workflows — apply flow &amp; run immutability</h2></div>
+    <p class="sec-intro">One file, one parse, ordered apply: registry then catalog, so a workflow can never
+      publish referencing an agent the published registry lacks — <strong>stronger</strong> than today's
+      one-time boot check. And the scary part is already solved: a run <strong>pins its graph by value</strong>
+      into the task store, so in-flight and resumable runs are immune to edits.</p>
+    <div class="diagram">
+      <pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'primaryColor':'#12202c','primaryTextColor':'#dbe6f2','primaryBorderColor':'#2f5a72','lineColor':'#7c93a6','fontFamily':'ui-monospace, SFMono-Regular, Menlo, monospace','fontSize':'13px'}}}%%
+flowchart TD
+  F["a2a-bridge.toml<br/>(single source of truth)"] -->|"watch · 200ms debounce"| P["unified parse →<br/>ConfigSnapshot"]
+  P --> RS["RegistrySnapshot"]
+  P --> VG["VersionedGraph[]<br/>resolved · def_hash"]
+  RS -->|"1. registry.apply"| REG["Registry (ArcSwap)"]
+  VG -->|"2. then catalog.apply"| CAT["WorkflowCatalog<br/>(ArcSwap) — NEW"]
+  REG --> CO["Coordinator"]
+  CAT --> CO
+  CO -->|"run_workflow"| EX["Executor<br/>takes graph snapshot per run"]
+  EX -->|"pin by value"| TStore["TaskStore<br/>workflow_spec_json<br/><b>immutable for this run</b>"]
+  TStore -.->|"crash-resume reads the<br/>snapshot, never config"| EX
+  ED["DAG editor<br/>(TUI / mobile / MCP)"] -->|"WorkflowConfigStore:<br/>validate → atomic rename"| F
+      </pre>
+    </div>
+    <div class="cap"><span class="k">Invariant</span><span class="v">The executor still takes <code>Arc&lt;WorkflowGraph&gt;</code> per run — it <b>can never observe a def mutation mid-run</b>. Every editor write goes file→watcher, so there is one source of truth and no split-brain.</span></div>
+
+    <div class="callout">
+      <span class="mk">Phase 0 bug</span>
+      <p>Found while grounding the RFC and <b>verified</b>: <code>registry.rs:496-511</code>'s warm-reuse
+        criterion omits the spawn-frozen <code>mcp</code>/<code>mcp_delivery</code>/<code>watchdog</code>, so
+        editing only an agent's tools hot-reloads into a stale warm process. Filed as
+        <a href="https://github.com/shoedog/a2acp/issues/35">issue #35</a> — a prerequisite fix for the split,
+        where agents are differentiated chiefly by toolset.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-num">03</span><h2>Phased plan</h2></div>
+    <ul class="phases">
+      <li class="p0"><span class="id">Phase 0</span><span class="tx"><b>Reuse-criterion fix</b> (issue #35) — add mcp/mcp_delivery/watchdog to the spawn-frozen comparison. Small, ships alone, prerequisite for both shifts.</span></li>
+      <li><span class="id">W1</span><span class="tx"><b>WorkflowCatalog</b> + unified snapshot + ordered reconcile + def_hash. The cheapest first increment; executor untouched.</span></li>
+      <li><span class="id">W2</span><span class="tx"><b>WorkflowConfigStore write-back</b> + Coordinator/MCP <code>workflow upsert/remove/list</code> — the DAG editor's server half.</span></li>
+      <li><span class="id">S2a</span><span class="tx"><b>Domain split</b>, pure refactor — ProviderEntry/AgentDef/compose_agent + legacy synthesis; golden parity across <code>examples/</code>.</span></li>
+      <li><span class="id">S2b</span><span class="tx"><b>New capability</b> — <code>[[providers]]</code> syntax, role_prompt composition, node overrides, three-layer effective_config.</span></li>
+      <li><span class="id">S2c</span><span class="tx"><b>Optional</b>, evidence-gated — provider slot-sharing by spawn-frozen InstanceKey; per-agent AgentCard skills.</span></li>
+    </ul>
+  </section>
+
+  <footer>
+    The bright line, preserved from ADR-0008: <b>agents are configuration, workflows are data, execution is
+    ports — the bridge never plans, and the orchestrator remains the caller.</b> Full RFC with code refs:
+    <code>rfc-agents-workflows.md</code>.
+  </footer>
+</div>
