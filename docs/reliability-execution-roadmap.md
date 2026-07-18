@@ -90,10 +90,29 @@
   made the quoted-TOML, decoded-key, duplicate-capture, trusted-cwd, support-owner, and policy-root regressions
   fail at their intended assertions. The valid-JSON quoted case was already rejected by the earlier raw-JSON
   scanner and is retained as defense-in-depth, not misreported as pre-change-red proof.
+  Exact cursor head `be9d8a7a689b5f2c451f6059784903ce6d78f8b5` then received the third fresh bridge-
+  mediated Sol/xhigh/read-only closure review: six inherited families `FIXED`, trusted-cwd family `PARTIAL`,
+  one new `WRONG` for credential-shaped scheduled prerequisites, no new `SMELL`, and
+  `R3D0 IMPLEMENTATION: REVISE`. Its retained report is
+  `/private/tmp/a2a-bridge-r3d0-sol-closure-be9d8a7/review.md`, mode `0644`, 16,562 bytes, SHA-256
+  `c0510898b83f09372313785dd45d48c236fe144e93ca3938b4715f76ded8b041`. Exact fourth remediation
+  `5baeeb3f47183ea2a47d2cdc5ffce26f1df7dbfb` resolves mounted owner roots/cwds to real contained
+  directories and binds the resolved path while preserving static-only no-authority validation when the
+  owner root is absent; it also shares the production credential-name exclusion with scheduled
+  `required_env` and forbids `credential_env` duplication. Pre-fix probes proved the cwd helper returned
+  `Ok(())` for an outside-target symlink and proved both credential-channel fixtures validate after inventory
+  re-pin; the ordinary `PATH` prerequisite is the paired positive.
+  Focused gates are foundation **9/0**, schema **23/0**, and R3d0 CLI **31/0**. The full serial workspace is
+  **2,228/0/12 ignored** across **55** reported test binaries. Format/diff, all-target workspace check,
+  warnings-denied all-target Clippy, locked release build, dependency policy, hygiene **37/7**, pinned
+  manifest **9**, floating recipes **4**, and schedule foundation **6/4** are green. The profile-policy
+  bundle remains `aed0e9b224d84624220a6091e51601a677b13d254091a12bc3b1879e36bf5e81`; the
+  provider-unexercised release binary is 26,480,544 bytes at SHA-256
+  `f2869caa4ccdc5b8fc055a803e462a05a2354cd53f4fa5b5aeaed71ea64efd28`.
   No timer, private authority issuance, live characterization, credential access, registry/image effect,
   compatibility provider turn, GitHub check mutation, or production-operator action has occurred. Status is
-  **THIRD REMEDIATION COMPLETE / THIRD CLOSURE REVIEW PENDING**. Next: freeze the cursor fold and run a fresh
-  Sol/xhigh closure review of that exact head; only after Sol approval run one Opus release/compatibility
+  **FOURTH REMEDIATION COMPLETE / FOURTH CLOSURE REVIEW PENDING**. Next: freeze the cursor fold and run a fresh
+  Sol/xhigh closure rereview of that exact head; only after Sol approval run one Opus release/compatibility
   lens, fold any findings, and publish the R3d0 PR. No Fable review is planned unless a genuinely hard or
   complex unresolved problem justifies it.
 - **Last merged R3c deterministic gate:** code head
@@ -388,7 +407,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (three incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`. D1-D10 and all sixteen design-review sets are folded. R3d0 is **THIRD REMEDIATION COMPLETE / THIRD CLOSURE REVIEW PENDING** on `agent/reliability-r3d0-foundation`: exact `e7e5fa1` Sol/xhigh review returned eleven `WRONG` and two `SMELL`; exact-`f4f242f` closure review marked six inherited items `FIXED`, seven `PARTIAL`, found two new `WRONG` and two `SMELL`; exact code/foundation-doc commit `e3321db` folded those seven required families; exact cursor `ee57f4a` closure review then returned four inherited `FIXED`, three `PARTIAL`, no new `WRONG`, two `SMELL`, and `REVISE`; exact remediation `ca4c453` closes its requested and independently proved seams. Focused gates are **8/0**, **23/0**, and **28/0**; full serial workspace is **2,224/0/12 ignored** across **55** binaries; all deterministic release/validator gates are green. No timer, private authority, live characterization, provider/registry/image effect, GitHub check mutation, or operator lifecycle action has run. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | Run a fresh Sol/xhigh closure review; only after approval run one Opus release/compatibility lens, fold findings, rerun gates, then publish the non-draft R3d0 PR. R3d never touches the long-lived operator. |
+| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`. D1-D10 and all sixteen design-review sets are folded. R3d0 is **FOURTH REMEDIATION COMPLETE / FOURTH CLOSURE REVIEW PENDING** on `agent/reliability-r3d0-foundation`: exact cursor `be9d8a7` received a third fresh Sol/xhigh closure review that marked six inherited families `FIXED`, trusted cwd `PARTIAL`, found one new `WRONG`, no new `SMELL`, and returned `REVISE`; exact remediation `5baeeb3` closes symlink-mediated cwd escape plus credential-shaped/duplicated scheduled prerequisites. Focused gates are **9/0**, **23/0**, and **31/0**; full serial workspace is **2,228/0/12 ignored** across **55** binaries; all deterministic release/validator gates are green. No timer, private authority, live characterization, provider/registry/image effect, GitHub check mutation, or operator lifecycle action has run. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | Run a fresh Sol/xhigh closure rereview; only after approval run one Opus release/compatibility lens, fold findings, rerun gates, then publish the non-draft R3d0 PR. R3d never touches the long-lived operator. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -721,8 +740,13 @@ Next action:
   plus independently reproduced trusted-cwd and decoded-key failures at exact
   `ca4c453e6f589295b2434abfb1e1c708a2cb1dd2`; focused gates are **8/0**, **23/0**, and **28/0**,
   and the full serial workspace is **2,224/0/12 ignored** across **55** reported test binaries. All complete
-  deterministic release/validator gates are green; the exact-head Sol closure review is next. Only after Sol
-  approval run the one Opus release/compatibility lens. Live/timer/operator effects remain unstarted.
+  deterministic release/validator gates are green. Exact cursor `be9d8a7` then received the third Sol/xhigh
+  closure review: six inherited `FIXED`, trusted cwd `PARTIAL`, one new `WRONG`, no new `SMELL`, and
+  `REVISE`. Exact fourth remediation `5baeeb3f47183ea2a47d2cdc5ffce26f1df7dbfb` closes the cwd
+  symlink escape and scheduled credential-prerequisite seams; focused gates are **9/0**, **23/0**, and
+  **31/0**, and the full serial workspace is **2,228/0/12 ignored** across **55** binaries. All complete
+  deterministic release/validator gates are green; the exact-head Sol closure rereview is next. Only after
+  Sol approval run the one Opus release/compatibility lens. Live/timer/operator effects remain unstarted.
 - The merged-R3c production operator binary is installed at
   `/Users/wesleyjinks/Library/Application Support/a2a-bridge/operator/releases/983398427c9f0486/a2a-bridge`,
   24,673,456 bytes, SHA-256
