@@ -1107,7 +1107,7 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 
 - **Branch:** `agent/reliability-r3d-scheduled-canaries`
 - **Base:** merged R3c main `983398427c9f04861a2f1da501a7650c4a1cdd80`
-- **Status:** design of record revised from owner decisions and two exact-commit Sol reviews;
+- **Status:** design of record revised from owner decisions and three exact-commit Sol reviews;
   implementation not started; fresh Sol/xhigh closure review pending
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
@@ -1122,15 +1122,22 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   `/private/tmp/a2a-bridge-r3d-sol-review-a20db199.XvVxDw/review.md`, mode `0644`, 21,877 bytes,
   SHA-256 `30835e786959019c2a96c3f4d0c1eda1fa4e23612afafd89e820592b1e708aee`. It used one
   one-node provider turn, did not read the Fable report or invoke a nested reviewer, and left the
-  production operator untouched. This revision folds its concrete mechanisms; one fresh closure review
-  remains the design gate.
+  production operator untouched. Its concrete mechanisms were folded in exact `d5041ee`.
 - **First closure review:** one fresh bridge-mediated Sol/xhigh/read-only review of exact
   `d5041eedb8c95397600851db36de822182c9565a` adjudicated all eleven inherited findings `FIXED`,
   then returned three new `WRONG`, three new `SMELL`, and `R3D DESIGN: REVISE`. Its fixed output is
   `/private/tmp/a2a-bridge-r3d-sol-closure-d5041ee.FVPJeA/review.md`, mode `0644`, 18,966 bytes,
-  SHA-256 `03e404d559d16b29701b1606653979c943b86affdca1f14b80c8aa3a9609b701`. This revision
-  folds its canonical execution fingerprint, legacy-entrypoint boundary, explicit owner-iCloud privacy
-  contract, scheduled-case registry, ongoing cold verification, and consumed-evidence mapping.
+  SHA-256 `03e404d559d16b29701b1606653979c943b86affdca1f14b80c8aa3a9609b701`. Exact
+  `1c3a7ce` folded its canonical execution fingerprint, legacy-entrypoint boundary, explicit owner-iCloud
+  privacy contract, scheduled-case registry, ongoing cold verification, and consumed-evidence mapping.
+- **Second closure review:** one fresh one-node bridge-mediated Sol/xhigh/read-only review of exact
+  `1c3a7ce0e2c52e0181ccd3bdfd81776d402b7565` marked five of the six inherited findings `FIXED`,
+  the scheduled-registry item `PARTIAL`, and found no regression in the earlier eleven. It then returned two
+  new `WRONG`, three new `SMELL`, and `R3D DESIGN: REVISE`. Its fixed output is
+  `/private/tmp/a2a-bridge-r3d-sol-closure-1c3a7ce.8VATsb/review.md`, mode `0644`, 16,643 bytes,
+  SHA-256 `f5e84d0c1ae800fc24255faa61302dd7d95d6922a54cc3cc8084f42dfb486588`. This revision
+  closes the lane-wire, exact-base invalidation, handoff-cursor, expected/observed identity, independent
+  storage-consent, and scan-before-iCloud findings.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
 standing authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
@@ -1143,35 +1150,36 @@ fallback, automatic promotion, or production-operator session management.
   long-lived production `serve` endpoint and never stop, restart, drain, rotate, or close its sessions.
 - GitHub never directly invokes credentialed provider work. A trusted local scheduler pulls immutable
   metadata, recomputes impact, and owns every local effect.
-- The standing grant authorizes only fixed compatibility case ids and fixed lifecycle probes. It is not
-  authority for general `serve`, `submit`, `run-workflow`, `implement`, other repositories/controllers,
-  arbitrary prompts, or automatic fallback.
+- The provider-effect standing grant authorizes only fixed compatibility case ids and fixed lifecycle probes.
+  It is not authority for general `serve`, `submit`, `run-workflow`, `implement`, other repositories/
+  controllers, arbitrary prompts, or automatic fallback.
 - Every prompt-capable attempt remains one fixed prompt, zero retry, zero provider substitution, and zero
   replay after possible acceptance. A failure is evidence, never same-window retry permission. The sole
   later-window transient confirmation is a new independently admitted attempt authorized in advance by the
-  bounded `confirmation_due` policy, grant allowance, repeat nonce, and budget below.
+  bounded `confirmation_due` policy, provider-effect grant allowance, repeat nonce, and budget below.
 - Candidate outcomes remain `candidate_pass`, `candidate_fail`, or `candidate_unknown`. Scheduling does
   not promote a pin, baseline, support claim, config, image, release, or production service.
 - Raw operator evidence remains private to the named operator. Secret-scanned sealed archives may leave the
-  Mac only through the owner-authorized iCloud cold tier bound in the private grant; they are never public
+  Mac only through the owner-authorized iCloud cold tier bound by valid storage consent; they are never public
   compatibility or promotion artifacts. Only bounded state and an evidence-record hash may be committed or
   published to GitHub.
-- Locking/accounting guarantees cover only R3d-aware entrypoints. While an R3d standing grant is active, the
-  trusted operator must not invoke billable compatibility through a retained pre-R3d binary. Exact legacy
-  process detection, conservative reconciliation, and the explicit enforcement limit are defined below;
-  the already-running legacy `serve` process remains allowed because R3d never routes canaries through it.
+- Locking/accounting guarantees cover only R3d-aware entrypoints. While an R3d provider-effect standing grant
+  is active, the trusted operator must not invoke billable compatibility through a retained pre-R3d binary.
+  Exact legacy process detection, conservative reconciliation, and the explicit enforcement limit are
+  defined below; the already-running legacy `serve` process remains allowed because R3d never routes canaries
+  through it.
 
 ### Approved owner decisions
 
 | Decision | Approved contract |
 |---|---|
 | D1 — substrate | Hybrid: local launchd supplies time, a fresh one-shot bridge owns each canary, the long-lived operator remains interactive, and GitHub performs deterministic checks/change detection only. A later R2f-gated lane owns long-lived operator health. |
-| D2 — authority | Checked-in non-authoritative policy plus a private owner-only standing grant. The grant is narrow to R3d compatibility scheduling/dogfood cases and never authorizes general bridge/server use. |
+| D2 — authority | Checked-in non-authoritative policy plus a private owner-only provider-effect standing grant and independently revocable cold-storage consent. The provider grant is narrow to R3d compatibility scheduling/dogfood cases and never authorizes general bridge/server use; storage consent grants only the approved iCloud evidence lifecycle. |
 | D3 — model/task routing | Compatibility uses the lowest-cost eligible model for the exact provider/adapter/capability. General dogfooding uses the task matrix below as advisory, auditable policy rather than automatic routing. |
 | D4 — evidence | Two-tier owner storage: 10 GiB hot local evidence and 25 GiB cold iCloud-backed archives, with typed retention, pins, tombstones, quotas, and local status/notifications. |
 | D5 — representative probe | Defer broad scheduled reviews. Design the fixed read-only fixture adapter with operator input in a separate increment before implementation. |
 | D6 — holds/quarantine | Separate automatic safety holds, exact-fingerprint waste suppression, and explicit operator quarantine. Characterize every future scheduled compatibility/advisory case before eligibility. |
-| D7 — change gate | Compatibility-affecting PRs require a trusted local, exact-SHA, affected-case canary before merge. A coalesced main run remains the post-merge integration backstop. |
+| D7 — change gate | Compatibility-affecting PRs require a trusted local, exact-base/head, affected-case canary before merge. A coalesced main run remains the post-merge integration backstop. |
 | D8 — freshness/GC | Fresh same-window discovery observation with content-addressed reuse; bounded post-tick GC plus weekly reconciliation. Never call stale bytes current. |
 | D9 — budgets | Durable reserve-then-reconcile accounting with a UTC ledger, rolling guard, protected pre-merge pool, and conservative charge for ambiguous or missing usage. |
 | D10 — operator ownership | R3d proves fresh one-shot compatibility only. R2f owns shared-session health, close/capacity, stagnation, and non-disruptive drain/rotation. |
@@ -1186,69 +1194,82 @@ deadline, child, ledger, artifact, and status behavior lives in reviewed bridge 
 window is missed; launchd does not cause a catch-up burst.
 
 Launchd uses separate arguments/labels for the low-frequency PR-gate watcher and the daily compatibility
-window, but both enter the same reviewed binary, grant, admission, ledger, and supervisor boundaries. The
+window, but both enter the same reviewed binary, provider-effect grant, admission, ledger, and supervisor
+boundaries. The
 PR watcher only pulls metadata and posts state until deterministic checks are green and the debounce expires;
 its exact poll/debounce cadence is a private policy value. The daily timer has at most one UTC window id.
 Neither accepts a webhook command or shell recipe.
 
-R3d adds two distinct policy objects:
+R3d adds one checked-in policy and one private authority envelope:
 
 1. A checked-in scheduling policy defines schema version, allowed trigger and case groups, impact rules,
    characterization requirements, provider families, capability requirements, hard maxima, required
    preflights, evidence classes, and notification transitions. It is reviewable but grants no effects.
-2. A private grant below the operator home is a single-link regular file, directory mode `0700`, file mode
-   `0600`, writable only through the local operator CLI. It binds a unique grant id; operator and
-   environment owner; exact policy, manifest, recipe, config-template, and candidate-scheduler hashes;
-   exact trigger lanes and case ids; allowed registry/image/provider effects; provider families; per-case,
-   per-run, per-trigger-pool, per-provider, UTC-day, and rolling limits; the exact allowed launchd-label
-   set plus each installed plist's canonical hash and trigger lane; `not_before` and `expires_at`; and
-   revocation generation. It also binds a separable cold-storage-consent id/hash, evidence-class scope,
-   independent validity/revocation generation, exact cold root, owner-approved `owner_icloud` replication
-   mode plus opaque local FileProvider-domain identity, and the known pre-R3d executable inventory. Storage
-   consent may outlive provider-effect authority but grants only seal/upload/verify/retention operations.
+2. A private authority envelope below the operator home is a single-link regular file, directory mode
+   `0700`, file mode `0600`, writable only through the local operator CLI. It contains two independently
+   validatable and revocable records:
+   - the **provider-effect grant** binds a unique grant id; operator and environment owner; exact policy,
+     manifest, recipe, config-template, and candidate-scheduler hashes; exact trigger lanes and case ids;
+     allowed registry/image/provider effects; provider families; per-case, per-run, per-trigger-pool,
+     per-provider, UTC-day, and rolling limits; the exact allowed launchd-label set plus each installed
+     plist's canonical hash and trigger lane; `not_before`, `expires_at`, and provider-grant revocation
+     generation; and the known pre-R3d executable inventory; and
+   - the **cold-storage consent** binds its own id/hash, operator/environment owner, evidence-class scope,
+     independent `not_before`/`expires_at` and revocation generation, exact cold root, owner-approved
+     `owner_icloud` replication mode, and opaque local FileProvider-domain identity.
 
-The scheduler validates the complete grant before credential access, registry/image/provider effects, or
-candidate spawn. Missing, expired, revoked, wrong-owner, wrong-host, stale-hash, broadened-case, or cap
-mismatch refuses with a typed zero-effect status. Policy changes invalidate the old grant; neither the
-scheduler nor `serve` can mint, renew, widen, or repair it. Exact dates and numerical caps are operator
-rollout values derived from characterization, not code defaults and never auto-renewed.
+Cold-storage consent may outlive or be revoked independently of provider-effect authority and grants only
+cold publication/upload/verification/cloud-retention/hot-eviction operations over already-completed,
+locally sealed evidence. Neither record's validity implies the other's. The scheduler validates the
+provider-effect grant before credential access, registry/image/provider effects, or candidate spawn; the
+archive publisher validates cold-storage consent before any iCloud-root write.
 
-Grant mutation and final admission share a short-lived grant-state lock distinct from the aggregate-wide
-admission lock. Under that lock, admission reopens and validates the grant, proves
-`now + derived_terminal_deadline <= expires_at`, and atomically journals the exact grant id, generation,
+Missing, expired, revoked, wrong-owner, wrong-host, stale-hash, broadened-case, or cap mismatch in the
+provider-effect grant refuses scheduling with a typed zero-effect status. Policy changes invalidate the old
+provider-effect grant; neither the scheduler nor `serve` can mint, renew, widen, or repair it. Exact dates and
+numerical caps are operator rollout values derived from characterization, not code defaults and never
+auto-renewed.
+
+Private-authority mutation and final admission share a short-lived authority-state lock distinct from the
+aggregate-wide admission lock. Under that lock, admission reopens and validates the provider-effect grant,
+proves
+`now + derived_terminal_deadline <= expires_at`, and atomically journals the exact provider-effect grant id,
+generation,
 hash, equivalent-work reservation, and budget reservation. Admission always acquires the aggregate-wide lock
-before the grant-state lock; grant mutation takes only the latter, so no path reverses the order. That durable
-reservation commit is the authority linearization point: revocation or expiry before it refuses the attempt;
-revocation after it prevents later admissions but does not kill or replay the already-admitted bounded
+before the authority-state lock; authority mutation takes only the latter, so no path reverses the order. That
+durable reservation commit is the authority linearization point: revocation or expiry before it refuses the
+attempt; revocation after it prevents later admissions but does not kill or replay the already-admitted bounded
 attempt. The operator CLI increments revocation generation under the same lock. A launchd invocation must
 match one exact allowed label and the installed plist hash; the daily and PR-watcher labels are both bound
 explicitly rather than inferred from a singular name.
 
-Cold archive publication has its own action-time consent fence under the grant-state lock. It revalidates the
-separable storage-consent id/hash, evidence class, root/domain, and revocation generation and journals that
-consumption before writing into iCloud. Revocation before this point keeps the artifact hot; revocation after
-publication blocks later archives/hot eviction but cannot claim already-synchronized bytes were recalled or
+Cold archive publication has its own action-time consent fence under the authority-state lock. It revalidates
+the independently valid cold-storage-consent id/hash, owner/environment, time bounds, evidence class,
+root/domain, and revocation generation; proves the remaining derived cold-publication bound ends no later
+than consent expiry; and journals that consumption before writing into iCloud. Revocation or expiry before
+this point keeps the artifact hot; revocation after publication blocks later archives/hot eviction but cannot
+claim already-synchronized bytes were recalled or
 delete them implicitly. Read-only integrity reconciliation of already-retained evidence remains allowed and
 visible; removing cloud data is a separate explicit owner action.
 
 The initial trust domain is one named operator account on one named Mac. Locks, ledgers, and active indexes
-must reside on its local APFS filesystem, never iCloud or a network filesystem. The grant's host identity
-plus `environment_owner` excludes distributed execution; R3d does not implement a distributed lease. A
+must reside on its local APFS filesystem, never iCloud or a network filesystem. The provider-effect grant's
+host identity plus `environment_owner` excludes distributed execution; R3d does not implement a distributed lease. A
 hostile same-UID/root actor and malicious code from an operator-approved same-repository author remain
 explicit non-goals. Candidate builds receive no credentials, and candidate runs receive only the one
 provider's narrow required credential set; no other operator or GitHub secrets are inherited.
 
 Manual compatibility commands invoked through the installed R3d-aware binary retain their explicit
 acknowledgements and case selection. They share R3d's admission lock and accounting ledger but do not inherit
-the standing grant. The standing grant supersedes per-aggregate manual acknowledgement only for an exact
-scheduled or trusted-pre-merge request that binds the grant in its evidence.
+the provider-effect standing grant. That grant supersedes per-aggregate manual acknowledgement only for an
+exact scheduled or trusted-pre-merge request that binds the provider-effect grant in its evidence.
 
-A manual command may reference only the grant's separable cold-storage-consent id/hash after an explicit
+A manual command may reference only the authority envelope's cold-storage-consent id/hash after an explicit
 `archive-to-owner-icloud` acknowledgement for already-completed, secret-scanned evidence. That storage-only
 use grants no provider/registry/image/scheduler authority. Without it, manual full evidence remains hot and
 storage status may block later work rather than uploading implicitly.
 
-Retained pre-R3d binaries cannot participate in the new cooperative lock/ledger. Grant activation therefore
+Retained pre-R3d binaries cannot participate in the new cooperative lock/ledger. Provider-effect grant activation therefore
 binds an inventory of their exact path, device/inode, hash, and allowed non-compatibility process identities;
 documents their compatibility subcommands as rollback-only/not authorized while scheduling is active; and
 requires a zero-live-legacy-compatibility observation. Preflight and the final pre-spawn fence enumerate
@@ -1309,29 +1330,40 @@ Every R3d mechanism uses one canonical `case_execution_fingerprint`, never the c
   binding including bundle/package integrity;
 - candidate binary hash/length/build provenance; provider, agent, adapter/SDK/CLI, image/base-image digest,
   auth-path type, and non-secret prerequisite names/shapes;
-- raw/effective model, effort, mode, environment owner, OS/architecture, trusted session cwd, timeout,
-  token/cost/attempt caps, retry cap zero, and redaction/artifact policy.
+- requested raw model/effort/mode, characterized expected-effective model/effort/mode, environment owner,
+  OS/architecture, trusted session cwd, timeout, token/cost/attempt caps, retry cap zero, and
+  redaction/artifact policy.
 
 The canonical schema fixes field order, normalization, and typed absent markers for inapplicable fields;
 implementations may not omit an applicable identity or substitute a path/name for its required content hash.
 Characterization, hold/suppression state, equivalent-work reservation, ledger records, consumption records,
 and the schedule sidecar all bind this same fingerprint and schema version. Changing any field returns the
 case to `characterization_required` and cannot reuse prior evidence. `claimed_support_gate` evidence never
-crosses an exact PR head even when two heads produce byte-identical candidates.
+crosses an exact PR base/head pair even when two pairs produce byte-identical candidates.
+
+The pre-admission fingerprint never contains a value learned only after admission. The result separately
+records the observed effective model/effort/mode from the admitted session. That observation must equal the
+characterized expected-effective identity before evidence is eligible for reuse or consumption. A mismatch
+is `candidate_unknown`, creates a safety hold for that fingerprint, and retains the original reservation and
+conservative charge; it never re-keys the admitted ledger/equivalent-work record after provider acceptance.
+For a first characterization, the one-run live authorization and reviewed scheduled-case row bind a proposed
+expected-effective identity before admission. It becomes the private characterized binding only after the
+observed result matches; mismatch remains non-reusable `candidate_unknown` evidence.
 
 R3d0 adds a separate strict versioned `compatibility/scheduled-cases.toml` registry for provider-minimal
 advisory probes. A row declares the exact case/config/template bindings above and starts at
 `characterization_required`; it is not a `support` claim and is never inserted into the protected
 production manifest/baseline. For an explicitly authorized characterization or eligible tick, the R3d-aware
-scheduler derives a sealed schema-v1 `floating_current`/`canary` execution manifest and records the
-registry/fingerprint in the schedule sidecar. Old R3 binaries never read the separate registry and continue
+scheduler derives a sealed schema-v1 execution manifest with lane `floating-current` and classification
+`canary`, then records the registry/fingerprint in the schedule sidecar. Old R3 binaries never read the
+separate registry and continue
 to parse the unchanged aggregate; feeding the registry to an old manifest command fails explicitly. A
-private characterization record plus an exact grant entry—not a checked-in status edit—moves the probe into
-scheduled eligibility. R4 alone may promote support claims.
+private characterization record plus an exact provider-effect grant entry—not a checked-in status edit—moves
+the probe into scheduled eligibility. R4 alone may promote support claims.
 
 General dogfooding routing is documentation and audit policy in R3d, not an automatic controller. Each
-turn records task class, provider, raw/effective model, effort, mode, override reason, and whether it is a
-primary or independent lens.
+turn records task class, provider, requested/observed effective model, effort, mode, override reason, and
+whether it is a primary or independent lens.
 
 | Task class | Primary | Effort | Escalation or second opinion |
 |---|---|---|---|
@@ -1364,9 +1396,10 @@ proposed
   -> retired
 ```
 
-Characterization is a separately authorized, operator-observed run of the exact provider, raw/effective
-model, effort, environment owner, config, adapter/CLI/image identity, execution mode, prompt shape, and
-budget. An exact fingerprint change returns the case to `characterization_required`. Uncharacterized is
+Characterization is a separately authorized, operator-observed run of the exact provider, requested raw
+model/effort/mode, characterized expected-effective model/effort/mode, observed effective identity,
+environment owner, config, adapter/CLI/image identity, execution mode, prompt shape, and budget. An exact
+fingerprint change returns the case to `characterization_required`. Uncharacterized is
 not quarantine and records `not_run(characterization_required)`. Before R3d finalizes the automatic
 unsafe/waste table or enables scheduling, run every future scheduled compatibility/advisory case once using
 the approved lower-cost models. Some may remain known issues, quarantined, or deferred; none should surprise
@@ -1404,10 +1437,11 @@ quarantined, held, or suppressed aggregate status is degraded and non-promotable
 
 ### Non-billable preflights
 
-Immediately before admission, the trusted scheduler revalidates host owner/architecture, grant and policy
-hashes, exact candidate/config/manifest/recipe identities, case characterization, quarantine/hold state,
+Immediately before admission, the trusted scheduler revalidates host owner/architecture, provider-effect grant
+and policy hashes, exact candidate/config/manifest/recipe identities, case characterization, quarantine/hold state,
 ledger headroom, OAuth runway, required environment bindings, the last characterized raw-model binding and
-bound pricing/ranking snapshot, local storage headroom, and the R3b container-start control for reader cases
+expected-effective model/effort/mode binding, the bound pricing/ranking snapshot, local storage headroom, and
+the R3b container-start control for reader cases
 using an already-present pinned image with no pull. It also validates the scheduled-case registry/fingerprint
 and legacy executable/process inventory above. A non-OK preflight records
 `not_run(<typed-reason>)`, zero provider spend, status transition, and notification threshold progress. It
@@ -1461,7 +1495,7 @@ can obtain effect authority.
 
 Serialization is not deduplication. Before reservation, the same transaction computes a trigger-independent
 `equivalent_work_key` from the complete canonical `case_execution_fingerprint`, evidence-purpose
-contract, and required freshness bucket. Trigger, grant, and request ids identify the consumer/attempt but
+contract, and required freshness bucket. Trigger, provider-effect grant, and request ids identify the consumer/attempt but
 are not part of this key; the freshness bucket is canonical policy output, never a trigger-specific
 timestamp. The policy defines a closed evidence-purpose lattice: `claimed_support_gate` may satisfy
 `provider_path_advisory` only when every exact identity, prompt, cap, and freshness requirement is at least
@@ -1472,8 +1506,8 @@ existing evidence hash. Because the canonical fingerprint includes exact PR/main
 case/pin binding, reuse cannot cross a claimed-support head or material case change.
 
 A deliberately repeated diagnostic requires a one-run manual repeat authorization. The automatic transient
-confirmation requires an exact one-confirmation allowance in the standing grant, applies only to
-`confirmation_due` in the next eligible window, and has its own budget/repeat nonce. Neither repeat is
+confirmation requires an exact one-confirmation allowance in the provider-effect standing grant, applies
+only to `confirmation_due` in the next eligible window, and has its own budget/repeat nonce. Neither repeat is
 inferred from a different trigger.
 
 ### D9 — durable budget accounting
@@ -1494,7 +1528,7 @@ window, and repeat nonce when explicitly present; the separate equivalent-work k
 cross-trigger duplication. Journal and materialized snapshot updates are crash-consistent and replay
 idempotently. Scheduled background, pre-merge gates, and manual commands have separate accounting classes
 beneath shared provider and global ceilings. No class borrows another class's protected allocation without a
-new private grant. Manual work retains explicit acknowledgement, may use only otherwise-unallocated headroom
+new provider-effect grant. Manual work retains explicit acknowledgement, may use only otherwise-unallocated headroom
 after protected scheduled/PR reserves, records `manual_used`, and cannot borrow either protected pool; an
 intentional duplicate also requires the explicit repeat authorization above. Exhausted PR capacity leaves
 the required check blocked, not green. Manual acknowledgement alone cannot reallocate.
@@ -1503,8 +1537,8 @@ ledger accounts for bridge compatibility activity only; it does not claim to mea
 other repositories or agents.
 
 Numerical values are derived from characterization evidence plus a documented margin and then written into
-the private grant. They do not inherit the current broad `500000` token / `$5` aggregate defaults and never
-auto-increase.
+the provider-effect grant. They do not inherit the current broad `500000` token / `$5` aggregate defaults and
+never auto-increase.
 
 ### D4 — evidence store, retention, visibility, and privacy
 
@@ -1520,16 +1554,21 @@ files and a 10 GiB hard cap:
 The cold root is `~/Documents/a2a-bridge/evidence-archive/`, mode `0700`, with an initial 25 GiB cap.
 This is an explicit owner-approved iCloud Drive replication/offload boundary, not local-only storage:
 secret-scanned sealed evidence may be uploaded to and later offloaded by the owner's private iCloud account
-when—and only when—the active private grant binds `owner_icloud`, the root, and the local FileProvider
-domain. No other cloud destination or public artifact publication is authorized.
+when—and only when—cold-storage consent is currently valid and binds `owner_icloud`, the root, and the local
+FileProvider domain. Provider-effect authority may be valid, expired, or revoked independently; it neither
+grants nor withdraws cold-storage consent. No other cloud destination or public artifact publication is
+authorized.
 
 Completed directories are sealed as one compressed archive plus manifest rather than syncing package-tree
-fanout. Every `.partial`, archive, and manifest is created `0600` through descriptor-relative,
-no-follow/create-new operations; before and after publication it must be the same single-link regular file
-with the expected owner/device/inode. The trusted packer performs the bounded secret/redaction scan before
-sealing, hashes from the held descriptor, verifies copied length and SHA-256, and atomically renames within
-the cold root. Any symlink, replacement, hard-link, placeholder/unavailable-file, scan, copy, hash, or
-unexpected FileProvider-domain anomaly refuses archival and degrades status without deleting the hot source.
+fanout. The trusted packer first constructs, seals, secret/redaction-scans, and hashes the archive plus
+manifest in descriptor-held local-APFS scratch under the hot root. A scan failure creates no path in the
+iCloud-backed cold root. Only after that immutable local object passes the scan and the action-time storage-
+consent fence may the publisher create a cold `.partial` mode `0600` through descriptor-relative,
+no-follow/create-new operations and copy the already-scanned bytes. It verifies copied length and SHA-256,
+then atomically renames within the cold root. Before and after publication, each cold partial/archive/manifest
+must be the same single-link regular file with the expected owner/device/inode. Any symlink, replacement,
+hard-link, placeholder/unavailable-file, scan, copy, hash, or unexpected FileProvider-domain anomaly refuses
+archival and degrades status without deleting the hot source.
 Active databases, locks, ledgers, indexes, and runtime images stay local; R3d adds no application-level
 encryption claim beyond the owner's iCloud account/platform protections.
 
@@ -1574,7 +1613,8 @@ The two R3b live-attempt aggregates are migrated from `/private/tmp` into pinned
 known hashes during rollout. If a source is already missing, record that absence and the expected hash; never
 fabricate migrated evidence.
 
-`compatibility schedule status [--json]` reports last/next window, current policy/grant hashes and expiry,
+`compatibility schedule status [--json]` reports last/next window, current policy/provider-grant hashes and
+expiry, independent storage-consent hash/state/expiry,
 case lifecycle, last outcome, holds/quarantines, ledger headroom, storage/archival state, and missed ticks.
 Local macOS notifications fire only on transitions: green-to-red, recovery, auth expiry/block, missed tick,
 quota/storage pressure, safety hold, or unreaped ownership. Raw evidence is never committed or published to
@@ -1592,7 +1632,9 @@ the underlying canary outcome.
 
 Every scheduled or pre-merge floating execution obtains a same-window observation of registry versions and
 integrities, base-image digests, relevant configuration, and the pricing/ranking input used for selection;
-the one admitted smoke session supplies the same-window effective model/catalog observation. If the
+the one admitted smoke session supplies the same-window observed effective model/effort/mode and catalog
+observation. The observed identity is result evidence and must match the pre-admission characterized
+expected-effective identity as defined above. If the
 provider-free immutable identity matches a verified retained object, reuse its content-addressed bytes and
 record a new observation. Materialize/build only on identity change, missing bytes, or failed verification.
 The low-cost smoke still runs once in an eligible scheduled window because unchanged packages do not exclude
@@ -1639,28 +1681,42 @@ For a compatibility-affecting PR, the local scheduler:
 
 1. accepts only the configured repository, expected base, same-repository non-fork PR, operator-approved
    author, and exact head SHA;
-2. waits for required deterministic checks to pass and for a debounce period with no newer head;
-3. recomputes impact locally and validates grant/case characterization;
+2. waits for required deterministic checks to pass and for a debounce period with no changed expected base
+   or head;
+3. recomputes impact locally and validates provider-effect grant/case characterization;
 4. builds the exact candidate SHA in a fresh isolated environment with provider and GitHub credentials
    withheld, then runs the verified candidate with only the narrow credentials required for the affected
    fixed cases. Model-, effort-, mode-, alias-, capability-, auth-, or provider-specific impact executes the
    exact currently claimed support identity, including Sol/Fable where applicable. A provider-minimal
    low-cost substitute is allowed only for a classifier-proven provider-generic seam whose mutation tests
    demonstrate that model-specific behavior is unreachable;
-5. records evidence bound to the SHA and publishes a required check through a least-privileged local
-   credential. External conclusions are `success` only for an executed passing due set or a locally proven
-   `not_applicable` exact-SHA classification, `failure` for an executed support failure or invalid
+5. records evidence bound to the exact expected base plus head and publishes a required check through a
+   least-privileged local credential. External conclusions are `success` only for an executed passing due set or a locally proven
+   `not_applicable` exact-base/head classification, `failure` for an executed support failure or invalid
    candidate, and otherwise remain `in_progress/pending`. GitHub `neutral`/`skipped` is never used to
    satisfy branch protection. Characterization-required, quarantined, held, suppressed, auth/budget/storage
    blocked, scheduler-unavailable, unknown, or otherwise due-but-not-run states therefore cannot green the
    check. A consumed artifact counts as executed-equivalent only when its consumption record proves the same
-   exact head/canonical case fingerprint and an equal-or-stronger purpose: consumed pass may satisfy that due
-   item, consumed fail makes the check fail, and consumed unknown/blocked/expired/invalid evidence stays
-   pending. The publisher revalidates the PR head after consumption and immediately before publication;
-6. invalidates the result immediately when the PR head changes.
+   exact base, head, canonical case fingerprint, and an equal-or-stronger purpose: consumed pass may satisfy
+   that due item, consumed fail makes the check fail, and consumed unknown/blocked/expired/invalid evidence stays
+   pending. The publisher revalidates both PR base and head after consumption and immediately before
+   publication;
+6. on the first trusted observation that either expected base or head changed, invalidates the result, republishes
+   `in_progress/pending` for the new pair, and recomputes classification before any reuse.
+
+The local publisher is not the atomic merge lock for a moving base. R3d may enforce this check only when the
+base branch's protection/ruleset requires [**strict** status checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging)
+(the PR branch must be up to date before merge), and the publisher reads and records that setting through
+trusted GitHub metadata. Under that
+conjunction, a base advance blocks merge even while the low-frequency watcher has not yet replaced an old
+head check; the next observation publishes pending and requires a new base/head fingerprint. Missing, loose,
+changed, or unreadable protection leaves R3d pending and refuses enablement. The initial design does not
+support merge queues; a later merge-queue mode must bind and execute the exact merge-group SHA rather than
+reuse head evidence.
 
 PR code, workflow output, and webhook callers cannot supply a prompt, command, path, case id, model, budget,
-grant, or local effect. The local GitHub credential is never inherited by the build or candidate process.
+provider-effect grant, or local effect. The local GitHub credential is never inherited by the build or
+candidate process.
 Forks and unknown authors fail closed. Because an unavailable local scheduler leaves the check pending,
 branch protection has one explicit audited operator bypass for emergencies; it never manufactures a pass.
 
@@ -1692,11 +1748,13 @@ summary but may never act on it.
 The existing strict R3 aggregate and nested schema remain byte-compatible schema version 1; R3d does not add
 fields to them or claim that old `deny_unknown_fields` readers ignore additions. Scheduling metadata lives
 in a separate strict, independently versioned `ScheduleEvidenceRecord` JSON sidecar. It binds the aggregate
-SHA-256 when one exists plus trigger kind; repository/PR/commit or main range; policy, grant, quarantine, and
-characterization ids/hashes; scheduled-case-registry hash and canonical case-execution fingerprint/version;
+SHA-256 when one exists plus trigger kind; repository/PR/base/head/commit or main range; policy,
+provider-effect-grant, storage-consent, quarantine, and characterization ids/hashes; scheduled-case-registry
+hash and canonical case-execution fingerprint/version;
 window, attempt-idempotency, equivalent-work, consumption, and optional repeat ids; classifier version/hash
 and affected cases; complete deadline derivation; preflight results; admission lock holder; budget
 reservations/reconciliation; supervisor process identities/escalation/reap results; freshness observation;
+requested and characterized expected-effective identities plus the separately observed effective result;
 evidence-index id; and status publication result.
 
 The parent publishes the sidecar even for a killed/setup-incomplete run and joins it to the runner artifact
@@ -1708,7 +1766,8 @@ unknown sidecar version fails schedule-specific consumption without making the u
 ### Dependency-ordered implementation slices
 
 1. **R3d0 — design/policy/schema foundation (non-billable).** Land this approved design; add checked-in
-   scheduling, grant, characterization, hold/quarantine, typed failure/suppression, impact, ledger,
+   scheduling, provider-effect-grant, storage-consent, characterization, hold/quarantine, typed
+   failure/suppression, impact, ledger,
    canonical case-execution fingerprint, equivalent-work/consumption, scheduled-case registry,
    schedule-sidecar, evidence-index, status, and routing schemas plus validators and docs. Add and review
    every exact provider-minimal advisory row/config intended for R3d5 characterization; keep it outside the
@@ -1717,21 +1776,21 @@ unknown sidecar version fails schedule-specific consumption without making the u
 2. **R3d1 — supervisor and signal parity (non-billable).** Add `schedule-tick` parent, SIGTERM parity,
    derived deadline, exact process-tree identity, TERM/grace/KILL/reap, repeated-cancel, recovery, and joined
    parent/child artifact contract using fake processes only.
-3. **R3d2 — authority, admission, preflights, and accounting (non-billable tests).** Add private-grant
-   validation and revocation linearization, owner-wide lock, equivalent-work reuse/refusal, characterization
-   state, three control types, durable reserve/reconcile ledger, UTC/rolling windows, scheduled/PR/manual
-   accounting classes, legacy executable/process detection and conservative import, and automated
-   zero-effect preflights.
+3. **R3d2 — authority, admission, preflights, and accounting (non-billable tests).** Add provider-effect-grant
+   and storage-consent validation with independent revocation linearization, owner-wide lock, equivalent-work
+   reuse/refusal, characterization state, three control types, durable reserve/reconcile ledger, UTC/rolling
+   windows, scheduled/PR/manual accounting classes, legacy executable/process detection and conservative
+   import, and automated zero-effect preflights.
 4. **R3d3 — evidence, status, and retention.** Add hot/cold stores, index, sealing, pins, tombstones, quotas,
    leases, bundle/image GC, local CLI/status/notifications, strict schedule-sidecar plus unchanged-aggregate
    compatibility, explicit owner-iCloud upload/offload state plus rotating content verification, and incident
    migration.
 5. **R3d4 — launchd and trusted PR/main triggers.** Add dry-run/preflight-only modes, fake-clock timer,
-   impact classifier, local GitHub pull/check publisher including consumed-evidence mapping, SHA invalidation,
+   impact classifier, local GitHub pull/check publisher including consumed-evidence mapping, base/head invalidation,
    coalescing, debounce, and the disabled-by-default launchd installation. No schedule is enabled by merge.
 6. **R3d5 — characterization and staged enablement (separate live authority).** Characterize all future
    scheduled compatibility/advisory cases with the lower-cost models, finalize provisional hold/waste
-   classifications and exact caps, exercise the rollout ladder, then enable the private grant/timer and
+   classifications and exact caps, exercise the rollout ladder, then enable the provider-effect grant/timer and
    enforced PR check only after the deterministic and review gates are green.
 
 Each code slice must be reviewable and default-off. It may merge independently only when its own complete
@@ -1743,22 +1802,28 @@ adversarial implementation/release lens is justified only after Sol is green, wi
 
 - Every new behavior has a regression that fails against its pre-change implementation plus a negative or
   edge case for every new path.
-- Policy/grant absence, expiry, revocation before reservation, stale hashes, owner/host mismatch, broadened
-  cases, invalid caps, wrong label/plist hash, deadline past grant expiry, and unauthorized trigger all
-  refuse before effects. Revocation after durable reservation blocks successors without killing the bounded
-  admitted attempt. Missing/revoked/wrong-root/wrong-domain cold consent keeps scheduled or explicitly
-  acknowledged manual evidence hot with zero iCloud write.
+- Policy/provider-grant absence, expiry, revocation before reservation, stale hashes, owner/host mismatch, broadened
+  cases, invalid caps, wrong label/plist hash, deadline past provider-grant expiry, and unauthorized trigger
+  all refuse before effects. Revocation after durable reservation blocks successors without killing the
+  bounded admitted attempt. Missing/revoked/wrong-root/wrong-domain cold consent or a cold-publication bound
+  past consent expiry keeps scheduled or explicitly acknowledged manual evidence hot with zero iCloud write.
+  Crossed-state tests prove expired/revoked provider authority plus valid storage consent can archive only
+  already-completed evidence, while valid provider authority plus expired/revoked storage consent cannot
+  create a cold entry. Consent revocation before its publication journal blocks the write; revocation after
+  that linearization permits only the already-admitted bounded copy and blocks every later archive/eviction.
 - Fake children cover ignored TERM, SIGSTOP, exited runner with surviving descendant group, publication
   wedge, repeated cancellation, unproved exit, startup recovery, and unrelated-process survival.
 - Scheduled versus manual, PR versus daily, concurrent and sequential duplicates, and two-process races
   prove exactly one equivalent compatibility attempt admits. Completed equal-or-stronger evidence is reused
   through a consumption record; explicit repeat/confirmation uses a distinct authorization and budget.
   Crash/restart never replays or double-charges.
-- Canonical-fingerprint mutation tests independently change repository/head or main range, policy/manifest/
+- Canonical-fingerprint mutation tests independently change repository/base/head or main range, policy/manifest/
   scheduled-case/recipe/config/prompt hash, case/pin/resolution/auth/prerequisite/environment identity,
-  candidate bytes, model/effort/mode, and every cap. Each change prevents reuse and returns characterization
-  to required; absent-versus-empty and ordering/normalization collisions are rejected; byte-identical
-  candidates at two PR heads never share `claimed_support_gate` evidence.
+  candidate bytes, requested and expected-effective model/effort/mode, and every cap. Each change prevents
+  reuse and returns characterization to required; absent-versus-empty and ordering/normalization collisions
+  are rejected; byte-identical candidates at two PR heads never share `claimed_support_gate` evidence.
+  Observed-effective equality passes, while a mismatch returns `candidate_unknown`, holds the original
+  fingerprint, forbids reuse/consumption, and never mutates the admitted reservation key.
 - Legacy-boundary tests allow the exact retained `serve` process, safety-hold a pre-R3d
   `compatibility run` or ambiguous child at both preflight fences, import a validated legacy aggregate,
   retain a full charge for an ambiguous attempt or unknown initial rolling window, and state-test the
@@ -1773,25 +1838,29 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   `candidate_fail` becomes `confirmation_due`, a second identical complete failure suppresses, recovery
   passes, and authority/quarantine/budget states never enter the waste machine.
 - Fake-clock tests cover DST, sleep/missed window, no catch-up, duplicate tick, debounce, coalesced commits,
-  changed PR head, stale remote classification, unavailable local scheduler, and a complete deadline whose
+  changed PR head, changed PR base with stable head, stale remote classification, unavailable local scheduler,
+  and a complete deadline whose
   metadata/build/preflight/resolve/case/publication/archive/cleanup terms cannot be omitted or reset.
 - Impact tests cover every path class, exact claimed-model/effort/mode/alias/capability regressions,
   classifier mutations that attempt an unsafe low-cost substitution, forks/unknown authors, PR-supplied data
   that attempts to widen scope, and exact GitHub `success|failure|in_progress` mapping. Only proven
   no-impact may succeed without a provider case; every due-but-not-run fixture remains blocking. Consumed
-  exact-head pass/fail/unknown fixtures map to success/failure/pending respectively, and stale-head
-  consumption is refused.
+  exact-base/head pass/fail/unknown fixtures map to success/failure/pending respectively, and stale-base or
+  stale-head consumption is refused. Strict-versus-loose branch-protection fixtures prove that a stable-head/
+  moved-base PR is merge-blocked before the watcher republishes; missing/unreadable/loose protection refuses
+  enforcement, and merge-queue metadata is unsupported rather than silently treated as a head PR.
 - GC tests cover open-reader/exclusive deletion, started-between-query-and-remove, stopped-container image
   reference, pin survival, manifest/class/pin retention precedence, hot-cache versus cold-full clocks,
   keep/age ordering, tombstone-before-unlink crash, iCloud symlink/hard-link/replacement/placeholder,
   wrong FileProvider domain, not-uploaded/offloaded action-time state, periodic rehydrate/hash corruption,
-  secret-scan/partial/copy/hash failure, and quota pressure that blocks rather than deletes protected
-  evidence.
+  local secret-scan failure with no cold entry, partial/copy/hash failure, and quota pressure that blocks
+  rather than deletes protected evidence.
 - The strict schedule sidecar round-trips through the new parser; the old-parser compatibility fixture reads
   the byte-unchanged aggregate while ignoring the separate file, and unknown sidecar versions fail only
   schedule-specific consumption. Scheduled-case registry tests prove an uncharacterized row is not a support
-  claim, cannot run unattended, derives only an advisory floating/canary execution manifest under explicit
-  authority, and is never parsed as the production manifest by an old binary. A static/behavioral test proves
+  claim, cannot run unattended, derives only an advisory lane `floating-current`, classification `canary`
+  execution manifest under explicit authority, round-trips that exact wire spelling through the current strict
+  parser, and is never parsed as the production manifest by an old binary. A static/behavioral test proves
   scheduler invocation contains no `serve` endpoint or production-operator lifecycle action.
 - Run format/diff checks, workspace all-target check, warnings-denied Clippy, locked release build,
   repository hygiene, manifest/recipe/policy validation, all scheduler CLI tests, and the full serial
@@ -1815,35 +1884,39 @@ are green:
    complete future schedule set, not obsolete historical/non-goal rows.
 4. Review the aggregate once, classify known issues/inconclusive cases, set holds/suppressions/quarantines,
    derive numerical caps, record legacy-manual quiescence, explicitly authorize the private owner-iCloud
-   cold boundary, and have the operator issue the first private grant. Do not rerun failures merely to obtain
-   green.
+   cold boundary, and have the operator issue the first provider-effect grant plus independent cold-storage
+   consent. Do not rerun failures merely to obtain green.
 5. Keep calendar firing disabled, load the reviewed daily job for on-demand use, and invoke its exact label
-   once through `launchctl kickstart` under that grant. Verify label/plist binding,
+   once through `launchctl kickstart` under that provider-effect grant. Verify label/plist binding,
    reservation/reconciliation, index, status, retention, and exact evidence binding, then unload it.
 6. Let one timer tick fire while the operator observes it. Deadline-kill remains fake-process-only.
-7. Run the local PR check in shadow mode on one exact trusted PR SHA, then enforce branch protection only
-   after SHA invalidation, check publication, and emergency bypass are verified.
+7. Run the local PR check in shadow mode on one exact trusted PR base/head pair, verify strict up-to-date
+   branch protection through the trusted API, then enforce only after stable-head/base-move blocking,
+   base/head invalidation, check publication, and emergency bypass are verified.
 8. Enable the low-use daily window. First post-enable red/unknown/blocked transitions are reviewed before
    the schedule is left unattended.
 
 ### Rollback and restart handoff
 
-Rollback unloads/disables both launchd labels, revokes the private grant, and disables or explicitly bypasses
-the required GitHub check through the audited owner path. It does not revert evidence, erase ledger charges,
-delete pins/tombstones, restart the long-lived operator, or run missed windows on re-enable. The last reviewed
-immutable scheduler binary remains the code rollback target. Any code revert is a normal reviewed PR.
+Rollback unloads/disables both launchd labels, revokes the provider-effect grant, and disables or explicitly
+bypasses the required GitHub check through the audited owner path. It leaves cold-storage consent unchanged
+so already-completed evidence can satisfy retention unless the operator separately revokes that consent; a
+storage-consent revocation blocks new cloud writes/hot evictions but does not claim to recall existing bytes.
+Rollback does not revert evidence, erase ledger charges, delete pins/tombstones, restart the long-lived
+operator, or run missed windows on re-enable. The last reviewed immutable scheduler binary remains the code
+rollback target. Any code revert is a normal reviewed PR.
 
 **Restart point:** work from branch `agent/reliability-r3d-scheduled-canaries` based on merged main
-`98339842`. The initial exact-base Fable review plus exact-`a20db199` and exact-`d5041ee` Sol reviews are
-retained at the paths/hashes above. The Fable six `WRONG`/thirteen `SMELL`, first-Sol four
-`WRONG`/seven `SMELL`, and first-closure three `WRONG`/three `SMELL` sets are folded into D1-D10 and
-the slices/gates above; the first closure review marked all eleven inherited findings `FIXED`. All D1-D10
-owner decisions were approved on 2026-07-17. No implementation, schema, timer, private grant, live
-characterization, model discovery, registry/image effect, compatibility provider turn, GitHub check
-mutation, or production-operator action has been performed by this design fold; the only new provider
-activity was the two recorded read-only Sol reviews. Next: commit this second docs-only closure fold and run
-one fresh Sol/xhigh closure review against that exact commit. If approved, publish the non-draft docs PR and
-start R3d0 only after merge. Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
+`98339842`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, and
+exact-`1c3a7ce` Sol reviews are retained at the paths/hashes above. The Fable six `WRONG`/thirteen `SMELL`,
+first-Sol four `WRONG`/seven `SMELL`, first-closure three `WRONG`/three `SMELL`, and second-closure two
+`WRONG`/three `SMELL` sets are folded into D1-D10 and the slices/gates above; the second closure found no
+regression in the earlier eleven. All D1-D10 owner decisions were approved on 2026-07-17. No implementation,
+schema, timer, private authority, live characterization, model discovery, registry/image effect,
+compatibility provider turn, GitHub check mutation, or production-operator action has been performed by this
+design fold; the only new provider activity was the three recorded read-only Sol reviews. Next: run one fresh
+Sol/xhigh closure review against this exact committed revision. If approved, publish the non-draft docs PR
+and start R3d0 only after merge. Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 
 ## R3e — OpenRouter provider expansion
 

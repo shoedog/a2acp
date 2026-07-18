@@ -153,32 +153,35 @@ plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
   and OpenCode as independent explicit provider increments before R4. Credentials remain environment-only;
   each integration must pass local fake/corpus gates before a separately authorized live smoke, and
   neither becomes an automatic fallback target.
-- Run only characterized, fixed minimal cases under a narrow private standing grant, using the lowest-cost
+- Run only characterized, fixed minimal cases under a narrow private provider-effect standing grant, using the lowest-cost
   eligible model for a provider-generic adapter/capability probe. A model/effort/mode/alias/capability-
   specific PR must exercise the exact affected claimed-support identity; a cheap substitute cannot green
   that gate. New provider-minimal probes live in a separate non-support scheduled-case registry through
   characterization and remain advisory unless R4 promotes them deliberately. Scheduling uses fresh
   one-shot processes and never manipulates the long-lived operator.
-- Require a trusted local exact-SHA affected-case canary before merging compatibility-impacting same-repo
+- Require a trusted local exact-base/head affected-case canary before merging compatibility-impacting same-repo
   PRs; GitHub performs deterministic classification/status only and never directly invokes credentialed
   work. Only an executed pass or locally proved no-impact state can satisfy the required check; due-but-not-
   run remains blocking. Every characterization/reuse/consumption key binds one canonical exact
-  repository/head, manifest/case/pin, candidate, provider/model/config/prompt, environment, and budget
-  fingerprint. Retain a coalesced main run as the integration backstop.
+  repository/base/head, manifest/case/pin, candidate, requested/expected-effective provider/model/config/
+  prompt, environment, and budget fingerprint; observed effective identity must match before reuse. Retain a
+  coalesced main run as the integration backstop. Enforce the check only with strict up-to-date branch
+  protection so a base advance blocks merge before the local watcher republishes pending.
 - Defer representative review scheduling until a separate owner-reviewed design defines a fixed Tier-2
   read-only fixture, prompt, scoring, caps, provider rotation, and evidence boundary. Review content is not
   compatibility or promotion evidence.
 - Persist the unchanged strict compatibility aggregate plus a separate versioned scheduling sidecar in
   bounded private hot storage and the explicitly owner-authorized private iCloud cold tier. Case/class/pin
   retention uses explicit extending precedence; cold files receive no-follow, single-link, owner-only
-  protections and upload/offload-aware revalidation before hot eviction and during retention. Raw evidence
-  is never published to GitHub. Fresh floating observations may reuse content-addressed bytes only when
-  exact immutable identity is unchanged.
+  protections, local scan/seal before the first iCloud-visible byte, independent storage consent, and upload/
+  offload-aware revalidation before hot eviction and during retention. Raw evidence is never published to
+  GitHub. Fresh floating observations may reuse content-addressed bytes only when exact immutable identity is
+  unchanged.
 - Keep automatic safety holds, exact-fingerprint waste suppression, and explicit operator quarantine
   distinct. `candidate_fail` alone is not permanent: one typed transient confirmation is allowed before
   suppression. Admission separately deduplicates equivalent work across R3d-aware trigger sources. Retained
-  pre-R3d compatibility commands do not participate in that lease and are prohibited while a standing grant
-  is active; exact process detection holds and conservatively reconciles observed legacy attempts without
+  pre-R3d compatibility commands do not participate in that lease and are prohibited while a provider-effect
+  standing grant is active; exact process detection holds and conservatively reconciles observed legacy attempts without
   touching the legacy production `serve` process. Every future scheduled compatibility case is
   characterized before eligibility, and no skipped or unknown case is normalized into green.
 
