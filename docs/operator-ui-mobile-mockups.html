@@ -1,0 +1,603 @@
+<title>a2a-bridge — Mobile mockups</title>
+<style>
+  :root{
+    --bg:#eef0f4; --surface:#ffffff; --surface-2:#f6f7fa;
+    --text:#212836; --muted:#5c6675; --line:#e0e4ea; --accent:#1c7ea8; --accent-soft:#e5f1f7;
+    /* device world — committed dark, fixed in both themes */
+    --t-bg:#0a0d13; --t-panel:#0f141d; --t-panel-2:#0c1119; --t-border:#1f2937; --t-border-soft:#161d28;
+    --t-text:#c6d0df; --t-dim:#5b6779; --t-faint:#3d4757;
+    --t-ok:#52c996; --t-warn:#e4b449; --t-crit:#ec5b66; --t-accent:#5ab7e6;
+    --t-ok-bg:rgba(82,201,150,.12); --t-warn-bg:rgba(228,180,73,.13); --t-crit-bg:rgba(236,91,102,.13);
+    --t-sel:rgba(90,183,230,.12);
+    --mono:ui-monospace,"SF Mono","SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --maxw:1080px;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#0b0e14; --surface:#11151d; --surface-2:#0e121a; --text:#c8d2e0; --muted:#828d9e;
+           --line:#1d2531; --accent:#5ab7e6; --accent-soft:#12222c; }
+  }
+  :root[data-theme="light"]{ --bg:#eef0f4; --surface:#ffffff; --surface-2:#f6f7fa; --text:#212836;
+    --muted:#5c6675; --line:#e0e4ea; --accent:#1c7ea8; --accent-soft:#e5f1f7; }
+  :root[data-theme="dark"]{ --bg:#0b0e14; --surface:#11151d; --surface-2:#0e121a; --text:#c8d2e0;
+    --muted:#828d9e; --line:#1d2531; --accent:#5ab7e6; --accent-soft:#12222c; }
+
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.6;margin:0;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:clamp(28px,5vw,72px) clamp(18px,4vw,32px) 96px}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+
+  /* ---- header ---- */
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--accent);margin:0 0 14px}
+  h1{font-size:clamp(30px,5.2vw,50px);line-height:1.04;letter-spacing:-.02em;margin:0 0 18px;
+    text-wrap:balance;font-weight:680}
+  h1 .thin{color:var(--muted);font-weight:400}
+  .lede{font-size:clamp(16px,2vw,19px);color:var(--muted);max-width:64ch;margin:0 0 26px}
+  .lede b{color:var(--text);font-weight:600}
+  .legend{display:flex;flex-wrap:wrap;gap:8px 10px;margin:0 0 8px;padding:0;list-style:none}
+  .legend li{font-family:var(--mono);font-size:12px;display:flex;align-items:center;gap:7px;
+    background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:5px 11px 5px 9px;color:var(--muted)}
+  .dot{width:8px;height:8px;border-radius:50%;flex:none;box-shadow:0 0 0 3px color-mix(in srgb,currentColor 16%,transparent)}
+  .g-ok{color:var(--t-ok)} .g-warn{color:var(--t-warn)} .g-crit{color:var(--t-crit)} .g-dim{color:#8b95a6}
+
+  /* ---- section scaffolding ---- */
+  section{margin-top:clamp(46px,7vw,86px)}
+  .sec-head{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:8px;
+    padding-bottom:14px;border-bottom:1px solid var(--line)}
+  .sec-num{font-family:var(--mono);font-size:13px;color:var(--accent);letter-spacing:.1em}
+  .sec-head h2{font-size:clamp(21px,3vw,27px);margin:0;letter-spacing:-.01em;font-weight:640}
+  .sec-tag{margin-left:auto;font-family:var(--mono);font-size:12px;color:var(--muted);
+    border:1px solid var(--line);border-radius:6px;padding:3px 9px}
+  .sec-tag.ships{color:var(--t-ok);border-color:color-mix(in srgb,var(--t-ok) 40%,var(--line))}
+  .sec-tag.later{color:var(--t-warn);border-color:color-mix(in srgb,var(--t-warn) 40%,var(--line))}
+  .sec-intro{color:var(--muted);max-width:70ch;margin:18px 0 28px;font-size:15.5px}
+  .sec-intro strong{color:var(--text);font-weight:600}
+  .sec-intro code{font-family:var(--mono);background:var(--surface-2);border:1px solid var(--line);
+    border-radius:4px;padding:.5px 5px;font-size:.88em;color:var(--text)}
+
+  /* ---- captions ---- */
+  .cap{display:flex;gap:12px;align-items:baseline;margin:14px 2px 0;flex-wrap:wrap}
+  .cap .k{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--accent);flex:none;padding-top:1px}
+  .cap .v{font-size:14px;color:var(--muted);max-width:78ch}
+  .cap .v b{color:var(--text);font-weight:600}
+  .cap .src{font-family:var(--mono);font-size:12px;color:var(--muted)}
+  .cap .src code{background:var(--surface-2);border:1px solid var(--line);border-radius:4px;padding:.5px 5px;color:var(--text)}
+
+  /* ---- aside ---- */
+  .aside{display:flex;gap:14px;align-items:flex-start;background:var(--surface);border:1px solid var(--line);
+    border-left:3px solid var(--accent);border-radius:10px;padding:16px 18px;margin:26px 0 6px}
+  .aside.warn{border-left-color:var(--t-warn)}
+  .aside .mk{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);flex:none;padding-top:2px}
+  .aside.warn .mk{color:var(--t-warn)}
+  .aside p{margin:0;font-size:14.5px;color:var(--muted)}
+  .aside b{color:var(--text)}
+  .aside code{font-family:var(--mono);background:var(--surface-2);border:1px solid var(--line);
+    border-radius:4px;padding:.5px 5px;font-size:.88em;color:var(--text)}
+
+  /* ---- phones ---- */
+  .phones{display:flex;gap:clamp(20px,4vw,48px);flex-wrap:wrap;align-items:flex-start;margin-top:8px}
+  .phone-block{flex:1 1 280px;max-width:320px}
+  .phone{width:100%;max-width:300px;margin:0 auto;background:#05070b;border:1px solid #232c3a;border-radius:38px;
+    padding:12px;box-shadow:0 26px 60px -30px rgba(0,0,0,.7);position:relative}
+  .notch{position:absolute;top:12px;left:50%;transform:translateX(-50%);width:44%;height:24px;background:#05070b;
+    border-bottom-left-radius:14px;border-bottom-right-radius:14px;z-index:3}
+  .p-screen{background:linear-gradient(180deg,#0a0f18,#0b1017);border-radius:28px;overflow:hidden;
+    font-family:var(--mono);color:var(--t-text);min-height:560px;display:flex;flex-direction:column}
+  .p-status{display:flex;justify-content:space-between;padding:14px 18px 6px;font-size:11px;color:var(--t-dim)}
+  .p-app-h{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--t-border);
+    font-size:12.5px;color:var(--t-text)}
+  .p-app-h .rid{margin-left:auto;color:var(--t-dim);font-size:11px;text-align:right;line-height:1.35}
+  .p-app-h .sub{display:block;font-size:10px;color:var(--t-faint)}
+  .navbar{display:flex;border-top:1px solid var(--t-border);font-size:11px;margin-top:auto}
+  .navbar div{flex:1;text-align:center;padding:10px 2px;color:var(--t-dim)}
+  .navbar div.on{color:var(--t-accent)}
+  .navbar .bdg{color:var(--t-warn)}
+
+  .ok{color:var(--t-ok)} .warn{color:var(--t-warn)} .crit{color:var(--t-crit)}
+  .dim{color:var(--t-dim)} .acc{color:var(--t-accent)} .faint{color:var(--t-faint)}
+  .num{font-variant-numeric:tabular-nums}
+  .track{display:inline-block;height:8px;border-radius:3px;background:#1a2331;vertical-align:middle;overflow:hidden}
+  .track i{display:block;height:100%;border-radius:3px}
+  .fill-ok{background:var(--t-ok)} .fill-warn{background:var(--t-warn)} .fill-acc{background:var(--t-accent)}
+
+  /* ---- conversation ---- */
+  .p-scroll{flex:1;padding:10px 10px 6px;display:flex;flex-direction:column;gap:9px;position:relative}
+  .turnmark{display:flex;align-items:center;gap:8px;font-size:9.5px;color:var(--t-faint);
+    letter-spacing:.14em;text-transform:uppercase}
+  .turnmark::before,.turnmark::after{content:"";flex:1;height:1px;background:var(--t-border-soft)}
+  .msg{border:1px solid var(--t-border-soft);border-radius:14px;background:var(--t-panel);padding:9px 11px 8px}
+  .msg.you{background:#0d1a24;border-color:color-mix(in srgb,var(--t-accent) 32%,var(--t-border-soft));margin-left:26px}
+  .msg-h{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--t-dim);margin-bottom:5px}
+  .msg-h .who{color:var(--t-accent);font-weight:600}
+  .msg-h .who.me{color:var(--t-ok)}
+  .msg-h .tm{margin-left:auto;color:var(--t-faint)}
+  .md{font-family:var(--sans);font-size:12.5px;line-height:1.55;color:#dbe3ee}
+  .md p{margin:0 0 6px} .md p:last-child{margin-bottom:0}
+  .md .b{font-weight:650;color:#eef2f8}
+  .code{font-family:var(--mono);font-size:10.5px;line-height:1.6;background:#070b11;border:1px solid var(--t-border-soft);
+    border-radius:8px;padding:7px 9px;margin:6px 0;overflow-x:auto;white-space:pre;color:#c9d4e3}
+  .kw{color:var(--t-accent)} .str{color:var(--t-ok)} .fnc{color:var(--t-warn)} .cm{color:var(--t-faint);font-style:italic}
+  .diff{font-family:var(--mono);font-size:10.5px;line-height:1.6;background:#070b11;border:1px solid var(--t-border-soft);
+    border-radius:8px;margin:6px 0;overflow-x:auto;padding:4px 0}
+  .diff .dl{display:block;padding:0 9px;white-space:pre}
+  .dl.hd{color:var(--t-faint)}
+  .dl.add{background:var(--t-ok-bg);color:var(--t-ok)}
+  .dl.del{background:var(--t-crit-bg);color:var(--t-crit)}
+  .tool{display:flex;align-items:center;gap:7px;font-size:10.5px;color:var(--t-dim);
+    border:1px dashed var(--t-border-soft);border-radius:9px;padding:4px 9px;margin:5px 0;white-space:nowrap;overflow:hidden}
+  .tool .tw{color:var(--t-faint);flex:none}
+  .tool .nm{color:var(--t-text);overflow:hidden;text-overflow:ellipsis}
+  .tool .st{margin-left:auto;flex:none}
+  .chips{display:flex;gap:5px;margin-top:7px;flex-wrap:wrap}
+  .chip{font-size:9px;color:var(--t-dim);border:1px solid var(--t-border-soft);border-radius:999px;
+    padding:1.5px 7px;background:var(--t-panel-2);white-space:nowrap}
+  .chip.c-acc{color:var(--t-accent)} .chip.c-ok{color:var(--t-ok)} .chip.c-warn{color:var(--t-warn)}
+  .caret{background:var(--t-text);color:var(--t-text);animation:bl 1.1s steps(1) infinite}
+  @keyframes bl{50%{opacity:0}}
+  @media (prefers-reduced-motion:reduce){.caret{animation:none}}
+  .permcard{border:1px solid color-mix(in srgb,var(--t-warn) 45%,var(--t-border));background:var(--t-warn-bg);
+    border-radius:14px;padding:9px 11px}
+  .permcard .ph{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--t-warn);margin-bottom:5px;
+    letter-spacing:.08em;text-transform:uppercase}
+  .permcard .ph .tm{margin-left:auto;font-variant-numeric:tabular-nums}
+  .permcard .pc{font-size:11px;color:var(--t-text);margin-bottom:2px}
+  .permcard .pn{font-size:10px;color:var(--t-dim);margin-bottom:8px}
+  .pact{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+  .abtn{font-family:var(--sans);font-size:12px;font-weight:600;text-align:center;padding:7px 0;border-radius:10px;
+    border:1px solid #2c374a;color:var(--t-text);background:rgba(255,255,255,.03)}
+  .abtn.ok{color:#062015;background:var(--t-ok);border-color:transparent}
+  .abtn.no{color:#230d10;background:var(--t-crit);border-color:transparent}
+  .abtn.ghost{color:var(--t-dim);font-weight:500}
+  .jump{align-self:center;font-size:10px;color:var(--t-accent);border:1px solid color-mix(in srgb,var(--t-accent) 40%,var(--t-border));
+    border-radius:999px;padding:3px 11px;background:rgba(13,26,36,.92)}
+
+  /* ---- composer ---- */
+  .composer{border-top:1px solid var(--t-border);padding:8px 10px;display:flex;flex-direction:column;gap:7px}
+  .modes{display:flex;gap:6px}
+  .mode{font-family:var(--sans);font-size:10.5px;padding:3px 11px;border-radius:999px;
+    border:1px solid var(--t-border-soft);color:var(--t-dim)}
+  .mode.on{color:var(--t-accent);border-color:color-mix(in srgb,var(--t-accent) 45%,var(--t-border));background:var(--t-sel)}
+  .cinput{display:flex;align-items:center;gap:8px;border:1px solid var(--t-border);border-radius:12px;
+    padding:7px 11px;color:var(--t-faint);font-size:11.5px;background:var(--t-panel-2);font-family:var(--sans)}
+  .cinput .send{margin-left:auto;color:var(--t-accent)}
+  .ta{border:1px solid color-mix(in srgb,var(--t-accent) 40%,var(--t-border));border-radius:12px;padding:8px 11px;
+    font-family:var(--sans);font-size:12.5px;color:#e6ecf5;background:var(--t-panel-2);line-height:1.5;min-height:78px}
+  .qrow{display:flex;gap:6px;flex-wrap:wrap}
+  .qchip{font-family:var(--sans);font-size:10.5px;color:var(--t-dim);border:1px solid var(--t-border-soft);
+    border-radius:999px;padding:3px 10px;background:var(--t-panel-2)}
+  .qchip.go{color:#062015;background:var(--t-ok);border-color:transparent;font-weight:600;margin-left:auto}
+  .kbd{display:flex;flex-direction:column;gap:4px;padding:7px 6px 10px;background:#0d1219;border-top:1px solid var(--t-border)}
+  .krow{display:flex;gap:3px;justify-content:center}
+  .key{flex:0 0 auto;min-width:20px;padding:6px 2px;text-align:center;background:#1a2331;border-radius:5px;
+    font-size:10.5px;color:#cbd5e3;font-family:var(--sans)}
+  .key.wide{min-width:32px;color:var(--t-dim)}
+  .key.sp{flex:1;max-width:130px}
+  .key.rtn{min-width:52px;color:var(--t-accent)}
+
+  /* ---- forms + lists ---- */
+  .p-body{padding:11px 12px;display:flex;flex-direction:column;gap:9px;font-size:12px;flex:1}
+  .acard{border:1px solid var(--t-border-soft);border-radius:12px;padding:9px 11px;background:var(--t-panel-2)}
+  .acard .rw1{display:flex;align-items:center;gap:7px;font-size:12.5px}
+  .acard .rw1 .nm{font-weight:600;color:#e6ecf5}
+  .acard .rw1 .arr{margin-left:auto;color:var(--t-faint)}
+  .acard .rw2{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}
+  .tierb{font-size:8.5px;letter-spacing:.06em;border-radius:5px;padding:1.5px 6px;font-weight:700;font-family:var(--mono)}
+  .t0{border:1px solid var(--t-border);color:var(--t-dim)}
+  .t1{background:rgba(90,183,230,.16);color:var(--t-accent)}
+  .t2{background:var(--t-warn-bg);color:var(--t-warn)}
+  .t3{background:var(--t-crit-bg);color:var(--t-crit)}
+  .fld{display:flex;flex-direction:column;gap:4px}
+  .fld .lb{font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--t-dim)}
+  .inp{border:1px solid var(--t-border);background:var(--t-panel-2);border-radius:9px;padding:7px 10px;
+    font-size:11.5px;color:var(--t-text);display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .inp .cue{color:var(--t-faint);flex:none}
+  .inp .vok{color:var(--t-ok);flex:none;font-size:10px}
+  .seg{display:flex;border:1px solid var(--t-border);border-radius:9px;overflow:hidden}
+  .seg span{flex:1;text-align:center;font-size:10.5px;padding:6px 0;color:var(--t-dim);border-right:1px solid var(--t-border-soft)}
+  .seg span:last-child{border-right:0}
+  .seg .on{background:var(--t-sel);color:var(--t-accent)}
+  .formfoot{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:2px}
+  .note{font-size:10.5px;color:var(--t-dim);border-left:2px solid var(--t-warn);padding:5px 9px;
+    background:var(--t-warn-bg);border-radius:0 8px 8px 0;line-height:1.5}
+  .note.okn{border-color:var(--t-ok);background:var(--t-ok-bg)}
+  .note b{color:var(--t-text);font-weight:600}
+  .subh{font-size:9.5px;letter-spacing:.15em;text-transform:uppercase;color:var(--t-dim);margin:3px 0 -3px}
+
+  /* ---- workflows ---- */
+  .minidag{font-family:var(--mono);font-size:10px;color:var(--t-dim);white-space:pre;overflow-x:auto;
+    background:#070b11;border:1px solid var(--t-border-soft);border-radius:8px;padding:6px 9px;margin:6px 0 7px;line-height:1.65}
+  .minidag .n{color:var(--t-text)} .minidag .a{color:var(--t-accent)} .minidag .e{color:var(--t-faint)}
+  .wmeta{display:flex;align-items:center;gap:8px;font-size:10.5px;color:var(--t-dim)}
+  .runbtn{font-family:var(--sans);font-size:11px;font-weight:700;color:#062015;background:var(--t-ok);
+    border-radius:8px;padding:4px 13px;margin-left:auto}
+  .noderow{display:flex;align-items:center;gap:8px;border:1px solid var(--t-border-soft);border-radius:10px;
+    padding:7px 10px;background:var(--t-panel-2);font-size:11.5px}
+  .noderow .grip{color:var(--t-faint)}
+  .noderow .nid{color:#e6ecf5;font-weight:600}
+  .noderow .meta{margin-left:auto;color:var(--t-dim);font-size:10px;text-align:right}
+  .noderow.sel{border-color:color-mix(in srgb,var(--t-accent) 50%,var(--t-border));background:#0d1a24}
+  .edge{color:var(--t-faint);text-align:center;font-size:10px;line-height:1;margin:-4px 0}
+  .nodeform{border:1px solid color-mix(in srgb,var(--t-accent) 40%,var(--t-border));border-radius:12px;
+    padding:10px 11px;background:#0c1420;display:flex;flex-direction:column;gap:8px}
+  .ichips{display:flex;gap:5px;flex-wrap:wrap}
+  .ichip{font-size:10px;color:var(--t-text);border:1px solid var(--t-border);border-radius:999px;
+    padding:2px 9px;background:var(--t-panel-2)}
+  .ichip .x{color:var(--t-faint);margin-left:4px}
+  .ichip.addi{color:var(--t-accent);border-style:dashed}
+
+  /* ---- models ---- */
+  .mgrp{border:1px solid var(--t-border-soft);border-radius:12px;background:var(--t-panel-2);padding:8px 11px 9px}
+  .mgrp .gh{display:flex;align-items:center;gap:7px;font-size:11.5px;margin-bottom:5px}
+  .mgrp .gh .nm{font-weight:600;color:#e6ecf5}
+  .mgrp .gh .bin{margin-left:auto;color:var(--t-faint);font-size:9.5px}
+  .mrow{display:flex;align-items:center;gap:7px;font-size:11px;padding:3px 0;flex-wrap:wrap}
+  .mrow .mid{color:var(--t-text)}
+  .effs{display:flex;gap:3px;margin-left:auto}
+  .eff{font-size:8.5px;border:1px solid var(--t-border-soft);border-radius:4px;padding:1px 5px;color:var(--t-dim)}
+  .eff.on{color:var(--t-accent);border-color:color-mix(in srgb,var(--t-accent) 45%,var(--t-border))}
+
+  /* ---- closing ---- */
+  footer{margin-top:60px;padding-top:22px;border-top:1px solid var(--line);color:var(--muted);font-size:13.5px}
+  footer code{font-family:var(--mono);background:var(--surface-2);border:1px solid var(--line);border-radius:4px;padding:1px 6px;font-size:12.5px}
+</style>
+
+<div class="wrap">
+
+  <p class="eyebrow">Operator control panel · mobile design study</p>
+  <h1>a2a-bridge <span class="thin">— Mobile, reframed</span></h1>
+  <p class="lede">Not a pager — a <b>primary interface</b>. At work: laptop + TUI. At home: this app, over the
+    operator's existing <b>Tailscale mesh</b> (the same authenticated transport that already carries their
+    mosh sessions). The centerpiece is <b>conversing with agents</b> — reading transcripts the way a good
+    editor renders them, and replying with a real composer — because that's the daily act a phone terminal
+    makes merely tolerable.</p>
+
+  <ul class="legend" aria-label="status color legend">
+    <li><span class="dot g-ok"></span>running · healthy · exists today</li>
+    <li><span class="dot g-warn"></span>waiting · warn · needs sidecar</li>
+    <li><span class="dot g-crit"></span>failed · tier-3 quarantine</li>
+    <li><span class="dot g-dim"></span>idle · historic</li>
+  </ul>
+
+  <div class="aside">
+    <span class="mk">Transport</span>
+    <p><b>Tailscale is the tunnel.</b> The bridge stays bound to the tailnet interface; mesh ACLs limit it to
+      the operator's own devices. The app speaks the same seams as the TUI — A2A JSON-RPC, SSE with
+      <code>Last-Event-ID</code> reattach, the <code>[traces]</code> routes — through the shared
+      <code>bridge-client</code> payload builders, so it can never send anything the CLI couldn't.
+      Per-device tokens (H3-2) layer on later; they don't gate this.</p>
+  </div>
+
+  <!-- ============ 01 CONVERSATION ============ -->
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">01</span>
+      <h2>Conversation — the centerpiece</h2>
+      <span class="sec-tag ships">ships now · all seams exist</span>
+    </div>
+    <p class="sec-intro">One thread per warm context. Rendered markdown, highlighted code, tool calls
+      collapsed until tapped, inline diffs, per-message <strong>model / effort / cost chips</strong> — and a
+      permission request is just <strong>a message you answer</strong>, not a separate pager. The composer
+      replies into the same task-bound session (<code>submit --context</code>), steers the loop
+      (<code>session inject</code>), or resolves a permit inline.</p>
+
+    <div class="phones">
+      <!-- reading -->
+      <div class="phone-block">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="p-screen">
+            <div class="p-status"><span>21:47</span><span>tailscale ✓ · 5G · 71%</span></div>
+            <div class="p-app-h"><span class="acc">◀</span> impl · retry backoff
+              <span class="rid">t-01JX3A<span class="sub">codex · c-impl-4420</span></span></div>
+            <div class="p-scroll">
+              <div class="turnmark">edit · attempt 2 · 21:41</div>
+
+              <div class="msg you">
+                <div class="msg-h"><span class="who me">you</span><span class="dim">inject</span><span class="tm">21:41</span></div>
+                <div class="md"><p>Also clamp the jitter calc — review flagged an overflow on u32::MAX.</p></div>
+              </div>
+
+              <div class="msg">
+                <div class="msg-h"><span class="who">codex</span><span class="tm">21:43</span></div>
+                <div class="md"><p>Patched. Backoff now clamps <span class="b">before</span> the multiply, with a regression test:</p></div>
+                <div class="code"><span class="kw">fn</span> <span class="fnc">jitter</span>(base: <span class="kw">u32</span>) -&gt; <span class="kw">u32</span> {
+    <span class="kw">let</span> cap = base.<span class="fnc">saturating_mul</span>(<span class="str">2</span>); <span class="cm">// was: base * 2</span>
+    rng().<span class="fnc">gen_range</span>(<span class="str">0..=cap</span>)
+}</div>
+                <div class="tool"><span class="tw">▸</span><span class="nm">bash · cargo test</span><span class="st ok">✓ 212 · 41s</span></div>
+                <div class="tool"><span class="tw">▸</span><span class="nm">fs/write · src/client.rs</span><span class="st dim">+61 −9</span></div>
+                <div class="diff"><span class="dl hd">@@ src/client.rs:147</span><span class="dl del">- let cap = base * 2;</span><span class="dl add">+ let cap = base.saturating_mul(2);</span></div>
+                <div class="chips"><span class="chip c-acc">gpt-5.6-sol</span><span class="chip">high</span><span class="chip">38k tok</span><span class="chip c-ok">$0.14</span><span class="chip">41s</span></div>
+              </div>
+
+              <div class="permcard">
+                <div class="ph"><span>⚠ permission · codex</span><span class="tm">⏳ 78s</span></div>
+                <div class="pc">bash · <span class="acc">git push origin impl/retry-backoff</span></div>
+                <div class="pn">tier-3 egress is locked — network write needs a grant · gen 3 · op-11</div>
+                <div class="track" style="width:100%;margin-bottom:8px"><i class="fill-warn" style="width:62%"></i></div>
+                <div class="pact"><span class="abtn no">Deny</span><span class="abtn ok">Approve</span></div>
+              </div>
+
+              <div class="turnmark">review · attempt 2 · streaming</div>
+              <div class="msg">
+                <div class="msg-h"><span class="who">claude</span><span class="dim">reviewer</span><span class="tm">now</span></div>
+                <div class="md"><p>Re-reading the clamp — checking blast radius via the prism diff-slice <span class="caret">▌</span></p></div>
+                <div class="chips"><span class="chip c-acc">opus-4.8</span><span class="chip">high</span><span class="chip">streaming…</span></div>
+              </div>
+
+              <div class="jump">↓ latest</div>
+            </div>
+            <div class="composer">
+              <div class="cinput"><span>Reply to codex…</span><span class="send">↑</span></div>
+            </div>
+            <div class="navbar"><div class="on">Chats<span class="bdg">·1</span></div><div>Agents</div><div>Workflows</div><div>Models</div></div>
+          </div>
+        </div>
+        <div class="cap"><span class="k">Reading</span><span class="v">The transcript as an editor renders it, not as a terminal scrolls it. Tool calls fold, diffs are diffs, every message carries its <b>model · effort · cost</b>. The permit is inline — answer it where you're already reading.</span></div>
+        <div class="cap"><span class="src">SSE <code>SubscribeToTask</code> (Last-Event-ID) · history <code>/tasks/:id/journal.jsonl</code> · chips <code>/turns/:turn_id</code> · permit <code>session status</code> → <code>session permit --context --generation --op</code></span></div>
+      </div>
+
+      <!-- composing -->
+      <div class="phone-block">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="p-screen">
+            <div class="p-status"><span>21:48</span><span>tailscale ✓ · 5G · 71%</span></div>
+            <div class="p-app-h"><span class="acc">◀</span> impl · retry backoff
+              <span class="rid">t-01JX3A<span class="sub">codex · c-impl-4420</span></span></div>
+            <div class="p-scroll" style="gap:6px">
+              <div class="msg" style="opacity:.55">
+                <div class="msg-h"><span class="who">claude</span><span class="dim">reviewer</span><span class="tm">21:47</span></div>
+                <div class="md"><p>No overflow path remains. <span class="b">Verdict: Approved.</span> Nit for later: retry ceiling is still hard-coded.</p></div>
+                <div class="chips"><span class="chip c-acc">opus-4.8</span><span class="chip">high</span><span class="chip c-ok">$0.09</span></div>
+              </div>
+            </div>
+            <div class="composer">
+              <div class="modes"><span class="mode on">Reply</span><span class="mode">Inject</span><span class="mode">Task-spec</span></div>
+              <div class="ta">Approved the push. Before merge: squash the two fix commits and re-run verify — I want one clean commit on the branch.</div>
+              <div class="qrow"><span class="qchip">``` code</span><span class="qchip">attach task.md</span><span class="qchip go">Send ↑</span></div>
+            </div>
+            <div class="kbd">
+              <div class="krow"><span class="key">q</span><span class="key">w</span><span class="key">e</span><span class="key">r</span><span class="key">t</span><span class="key">y</span><span class="key">u</span><span class="key">i</span><span class="key">o</span><span class="key">p</span></div>
+              <div class="krow"><span class="key">a</span><span class="key">s</span><span class="key">d</span><span class="key">f</span><span class="key">g</span><span class="key">h</span><span class="key">j</span><span class="key">k</span><span class="key">l</span></div>
+              <div class="krow"><span class="key wide">⇧</span><span class="key">z</span><span class="key">x</span><span class="key">c</span><span class="key">v</span><span class="key">b</span><span class="key">n</span><span class="key">m</span><span class="key wide">⌫</span></div>
+              <div class="krow"><span class="key wide">123</span><span class="key sp">space</span><span class="key rtn">return</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="cap"><span class="k">Composing</span><span class="v"><b>Reply</b> continues the task-bound conversation; <b>Inject</b> steers the warm loop mid-flight; <b>Task-spec</b> scaffolds a typed input. The mode is explicit so a steer never masquerades as a chat turn.</span></div>
+        <div class="cap"><span class="src">Reply → <code>submit --context c-impl-4420</code> (A2A SendMessage, task binding ADR-0005) · Inject → <code>session inject &lt;ctx&gt; --input - --append</code></span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 02 AGENTS ============ -->
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">02</span>
+      <h2>Agents — fleet + config editing</h2>
+      <span class="sec-tag later">read: now · write: admin sidecar</span>
+    </div>
+    <p class="sec-intro">The <code>[[agents]]</code> registry as cards — kind, sandbox tier, pinned
+      model/effort, MCP wiring, doctor health — and a real mobile form to add or edit an entry. The registry's
+      mutation surface is deliberately the <strong>config file + hot-reload</strong> (ADR-0005); there is no
+      remote admin API, and none gets bolted onto <code>serve</code>. Writes go through a tiny mesh-only
+      <strong>admin sidecar</strong> on the host that runs <code>validate</code> against a temp copy, then
+      atomic-renames into place — the bridge's own 200&nbsp;ms hot-reload is the apply mechanism.</p>
+
+    <div class="phones">
+      <!-- agents list -->
+      <div class="phone-block">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="p-screen">
+            <div class="p-status"><span>21:50</span><span>tailscale ✓ · 71%</span></div>
+            <div class="p-app-h">Agents · 4 <span class="rid"><span class="ok">config ✓ synced</span><span class="sub">a2a-bridge.toml · fp 9f3c…41e1</span></span></div>
+            <div class="p-body">
+              <div class="acard">
+                <div class="rw1"><span class="ok">●</span><span class="nm">codex</span><span class="tierb t1">T1 RO</span><span class="arr">›</span></div>
+                <div class="rw2"><span class="chip">acp · codex-acp</span><span class="chip c-acc">gpt-5.6-sol</span><span class="chip">high</span><span class="chip">mcp: prism, lsp</span><span class="chip c-ok">doctor 9/9</span></div>
+              </div>
+              <div class="acard">
+                <div class="rw1"><span class="warn">●</span><span class="nm">claude</span><span class="tierb t0">T0</span><span class="arr">›</span></div>
+                <div class="rw2"><span class="chip">acp · claude-agent-acp</span><span class="chip c-acc">opus-4.8</span><span class="chip">xhigh</span><span class="chip c-warn">doctor 8/9 · auth ~1h stale</span></div>
+              </div>
+              <div class="acard">
+                <div class="rw1"><span class="ok">●</span><span class="nm">kiro</span><span class="tierb t2">T2 :ro</span><span class="arr">›</span></div>
+                <div class="rw2"><span class="chip">acp · kiro-cli acp</span><span class="chip">sandbox: reader img</span><span class="chip">egress locked</span><span class="chip">model: discovery-only</span><span class="chip c-ok">9/9</span></div>
+              </div>
+              <div class="acard">
+                <div class="rw1"><span class="ok">●</span><span class="nm">impl</span><span class="tierb t3">T3 :rw</span><span class="arr">›</span></div>
+                <div class="rw2"><span class="chip">container_rw · codex-acp</span><span class="chip c-acc">gpt-5.6-sol</span><span class="chip">quarantine clone</span><span class="chip">mcp: lsp (in-ctr)</span><span class="chip c-ok">9/9</span></div>
+              </div>
+              <div class="note okn"><b>Live edits, no restart:</b> agent entries hot-reload on file change — config-only edits reuse the warm backend.</div>
+            </div>
+            <div class="navbar"><div>Chats</div><div class="on">Agents</div><div>Workflows</div><div>Models</div></div>
+          </div>
+        </div>
+        <div class="cap"><span class="k">Agents</span><span class="v">Tier badges are load-bearing: <b>T0</b> prompt-contract only, <b>T1</b> agent-native RO, <b>T2</b> container <b>:ro</b> + egress lock, <b>T3</b> container <b>:rw</b> quarantine. Doctor state is the cached last run, timestamped.</span></div>
+        <div class="cap"><span class="src">Card <code>agent-models</code> extension (HTTP, exists) · config read + <code>doctor --json</code> / <code>models --json</code> via sidecar (new)</span></div>
+      </div>
+
+      <!-- agent edit form -->
+      <div class="phone-block">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="p-screen">
+            <div class="p-status"><span>21:51</span><span>tailscale ✓ · 71%</span></div>
+            <div class="p-app-h"><span class="acc">◀</span> Edit agent <span class="rid">impl<span class="sub">[[agents]] entry</span></span></div>
+            <div class="p-body">
+              <div class="fld"><span class="lb">id</span><div class="inp">impl</div></div>
+              <div class="fld"><span class="lb">kind</span>
+                <div class="seg"><span>acp</span><span>api</span><span class="on">container_rw</span></div></div>
+              <div class="fld"><span class="lb">cmd · must be in allowed_cmds</span>
+                <div class="inp">codex-acp <span class="vok">✓ allowlisted</span></div></div>
+              <div class="fld"><span class="lb">model · validated at session mint</span>
+                <div class="inp">gpt-5.6-sol <span class="vok">✓ advertised</span><span class="cue">▾</span></div></div>
+              <div class="fld"><span class="lb">effort</span>
+                <div class="seg"><span>low</span><span>med</span><span>high</span><span class="on">xhigh</span></div></div>
+              <div class="subh">[agents.sandbox] — tier 3</div>
+              <div class="fld"><span class="lb">image</span><div class="inp">a2a-toolchain:latest</div></div>
+              <div class="fld"><span class="lb">mount · access</span>
+                <div class="inp">~/code <span class="cue">·</span> <span class="crit">rw</span> <span class="cue">quarantine clone</span></div></div>
+              <div class="fld"><span class="lb">egress</span>
+                <div class="inp">locked <span class="vok">✓ proxy a2a-egress-proxy:8888</span></div></div>
+              <div class="formfoot"><span class="abtn ghost">Validate ✓</span><span class="abtn ok">Apply — live</span></div>
+              <div class="note okn"><b>Apply path:</b> sidecar runs <b>validate</b> on a temp copy → atomic rename → registry hot-reload picks it up in 200&nbsp;ms. A failing validate never touches the live file.</div>
+            </div>
+          </div>
+        </div>
+        <div class="cap"><span class="k">Edit form</span><span class="v">Pickers are fed by the live catalog, so you can't pin a model the agent doesn't advertise (which would <b>hard-fail at mint</b>). The tier section mirrors <b>[agents.sandbox]</b> exactly — a misconfigured block is a load error, never silent degradation.</span></div>
+        <div class="cap"><span class="src">Write-back: admin sidecar (new, mesh-bound) → <code>a2a-bridge validate --config</code> → atomic rename → hot-reload (ADR-0005)</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 03 WORKFLOWS ============ -->
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">03</span>
+      <h2>Workflows — run now, edit honestly</h2>
+      <span class="sec-tag later">run: now · edit: sidecar + restart</span>
+    </div>
+    <p class="sec-intro">List <code>[[workflows]]</code>, see the DAG, run one against a repo — running is pure
+      existing surface (<code>submit &lt;workflow&gt; --input</code>, then the conversation view watches it).
+      Editing is where honesty matters twice: definitions aren't served over the wire (the sidecar reads the
+      config), and workflows are <strong>read once at boot</strong> — an edit needs a <code>serve</code>
+      restart, which the durable store + crash-resume makes survivable. The builder is a <strong>node list +
+      per-node form</strong>, not a canvas: on a phone, dragging edges is a party trick; picking
+      <code>inputs</code> from a list is engineering.</p>
+
+    <div class="phones">
+      <!-- workflow list -->
+      <div class="phone-block">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="p-screen">
+            <div class="p-status"><span>21:53</span><span>tailscale ✓ · 70%</span></div>
+            <div class="p-app-h">Workflows · 3 <span class="rid"><span class="sub">read at boot · restart to change</span></span></div>
+            <div class="p-body">
+              <div class="acard">
+                <div class="rw1"><span class="nm">code-review</span><span class="chip">3 nodes</span><span class="runbtn">Run</span></div>
+                <div class="minidag"><span class="n">correctness</span> <span class="a">codex</span> <span class="e">──┐</span>
+<span class="n">architecture</span> <span class="a">claude</span> <span class="e">─┴─▶</span> <span class="n">synth</span> <span class="a">claude</span></div>
+                <div class="wmeta"><span>last run 22m ago</span><span>·</span><span class="ok">$0.44</span><span>·</span><span>input: task-spec code-review</span></div>
+              </div>
+              <div class="acard">
+                <div class="rw1"><span class="nm">spec-review</span><span class="chip">3 nodes</span><span class="runbtn">Run</span></div>
+                <div class="minidag"><span class="n">rigor</span> <span class="a">codex</span> <span class="e">──┐</span>
+<span class="n">soundness</span> <span class="a">claude</span> <span class="e">─┴─▶</span> <span class="n">synth</span> <span class="a">claude</span></div>
+                <div class="wmeta"><span>last run 3d ago</span><span>·</span><span class="ok">$0.31</span></div>
+              </div>
+              <div class="acard">
+                <div class="rw1"><span class="nm">plan-review</span><span class="chip">3 nodes</span><span class="arr dim" style="margin-left:auto">›</span></div>
+                <div class="wmeta"><span>exec + coverage → synth</span><span>·</span><span>never run</span></div>
+              </div>
+              <div class="note"><b>Run sheet:</b> pick input (paste / share-sheet a <b>task.md</b>) + session-cwd → detached submit; the run opens as a conversation thread.</div>
+            </div>
+            <div class="navbar"><div>Chats</div><div>Agents</div><div class="on">Workflows</div><div>Models</div></div>
+          </div>
+        </div>
+        <div class="cap"><span class="k">Workflows</span><span class="v">Run is one tap into the existing detached path — the new thread <b>is</b> the watch surface. The mini-DAG is read from the same TOML the engine executes; nothing is re-modeled client-side.</span></div>
+        <div class="cap"><span class="src">Defs: sidecar config read (new — not on the wire) · Run: <code>submit code-review --input task.md</code> + SSE watch · validate input: <code>task-spec input</code></span></div>
+      </div>
+
+      <!-- workflow builder -->
+      <div class="phone-block">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="p-screen">
+            <div class="p-status"><span>21:55</span><span>tailscale ✓ · 70%</span></div>
+            <div class="p-app-h"><span class="acc">◀</span> Edit workflow <span class="rid">code-review<span class="sub">3 nodes · DAG valid ✓</span></span></div>
+            <div class="p-body">
+              <div class="minidag"><span class="n">correctness</span> <span class="e">──┐</span>
+<span class="n">architecture</span> <span class="e">─┴─▶</span> <span class="n">synth</span></div>
+              <div class="noderow"><span class="grip">⠿</span><span class="nid">correctness</span><span class="meta">codex · review-correctness</span></div>
+              <div class="noderow"><span class="grip">⠿</span><span class="nid">architecture</span><span class="meta">claude · review-architecture</span></div>
+              <div class="edge">│ inputs ▾</div>
+              <div class="nodeform">
+                <div class="noderow sel" style="border:0;background:transparent;padding:0"><span class="grip">⠿</span><span class="nid">synth</span><span class="meta acc">editing</span></div>
+                <div class="fld"><span class="lb">agent</span><div class="inp">claude <span class="cue">▾ from catalog</span></div></div>
+                <div class="fld"><span class="lb">prompt · [[prompts]] registry</span><div class="inp">review-synth <span class="cue">▾</span></div></div>
+                <div class="fld"><span class="lb">inputs · fan-in edges</span>
+                  <div class="ichips"><span class="ichip">correctness<span class="x">×</span></span><span class="ichip">architecture<span class="x">×</span></span><span class="ichip addi">+ add</span></div></div>
+              </div>
+              <div class="acard" style="border-style:dashed;text-align:center;color:var(--t-accent);font-size:11px">+ add node</div>
+              <div class="formfoot"><span class="abtn ghost">Validate ✓ DAG</span><span class="abtn ok">Save…</span></div>
+              <div class="note"><b>Save is honest:</b> sidecar writes + validates, then reports <b>“restart serve to apply”</b> — workflows load at boot. In-flight runs survive: durable store + crash-resume.</div>
+            </div>
+          </div>
+        </div>
+        <div class="cap"><span class="k">Builder</span><span class="v">Node list + per-node form. Edges are the <b>inputs</b> chips — exactly the TOML's edge model, so what you build is what <b>[[workflows.nodes]]</b> says. Cycle/missing-ref errors come from the real <b>validate</b>, not a client-side imitation.</span></div>
+        <div class="cap"><span class="src">Prompt picker: <code>prompt list</code> via sidecar · agent picker: <code>agent-models</code> card · save: sidecar write + <code>validate</code> → flag restart</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 04 MODELS ============ -->
+  <section>
+    <div class="sec-head">
+      <span class="sec-num">04</span>
+      <h2>Models — catalog & drift</h2>
+      <span class="sec-tag ships">read: ships now</span>
+    </div>
+    <p class="sec-intro">What each agent actually advertises — models, effort tiers, modes — against what the
+      config pins. Drift is the one thing worth an alert: a pin the agent no longer advertises
+      <strong>hard-fails at session mint</strong>, and it's far cheaper to learn that on the couch than at the
+      next run.</p>
+
+    <div class="phones">
+      <div class="phone-block">
+        <div class="phone">
+          <div class="notch"></div>
+          <div class="p-screen">
+            <div class="p-status"><span>21:57</span><span>tailscale ✓ · 70%</span></div>
+            <div class="p-app-h">Models <span class="rid"><span class="sub">card refreshed at boot + SIGHUP</span></span></div>
+            <div class="p-body">
+              <div class="note"><b>⚠ drift:</b> agent <b>review-b</b> pins <b>opus-4.7</b> — no longer advertised. Next session mint will hard-fail. <span class="acc">Fix pin ›</span></div>
+              <div class="mgrp">
+                <div class="gh"><span class="ok">●</span><span class="nm">codex</span><span class="bin">codex-acp</span></div>
+                <div class="mrow"><span class="mid">gpt-5.6-sol</span><span class="chip c-ok">pinned ✓</span>
+                  <span class="effs"><span class="eff on">low</span><span class="eff on">med</span><span class="eff on">high</span><span class="eff on">xhigh</span><span class="eff">max</span></span></div>
+                <div class="mrow dim" style="font-size:10px">alias gpt-5-6-sol accepted when canonical id advertised</div>
+              </div>
+              <div class="mgrp">
+                <div class="gh"><span class="ok">●</span><span class="nm">claude</span><span class="bin">claude-agent-acp</span></div>
+                <div class="mrow"><span class="mid">opus-4.8</span><span class="chip c-ok">pinned ✓</span>
+                  <span class="effs"><span class="eff on">low</span><span class="eff on">med</span><span class="eff on">high</span><span class="eff on">xhigh</span><span class="eff on">max</span></span></div>
+                <div class="mrow"><span class="mid">sonnet-4.6</span>
+                  <span class="effs"><span class="eff on">low</span><span class="eff on">med</span><span class="eff on">high</span><span class="eff">xhigh</span><span class="eff on">max</span></span></div>
+                <div class="mrow dim" style="font-size:10px">xhigh falls back to high on sonnet-4.6 · fable-family ids blocked from catalog</div>
+              </div>
+              <div class="mgrp">
+                <div class="gh"><span class="ok">●</span><span class="nm">kiro</span><span class="bin">kiro-cli acp</span></div>
+                <div class="mrow dim" style="font-size:10.5px">model list discovery-only under ACP SDK 1.x — leave unpinned (model_configurable: false)</div>
+              </div>
+              <div class="mgrp">
+                <div class="gh"><span class="dim">●</span><span class="nm">api</span><span class="bin">openai-compatible http</span></div>
+                <div class="mrow"><span class="mid">gpt-5.6-sol</span><span class="chip">key: OPENAI_API_KEY</span><span class="chip">effort/mode ignored</span></div>
+              </div>
+            </div>
+            <div class="navbar"><div>Chats</div><div>Agents</div><div>Workflows</div><div class="on">Models</div></div>
+          </div>
+        </div>
+        <div class="cap"><span class="k">Models</span><span class="v">Effort pills show the <b>per-model</b> support matrix, with fallback semantics spelled out where they bite. The drift banner compares config pins against the advertised set on every refresh.</span></div>
+        <div class="cap"><span class="src">Agent Card <code>agent-models</code> ext (<code>capabilities.extensions[].params.agents</code>, exists) · live probe <code>models --json</code> via sidecar · pins from sidecar config read</span></div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    Same discipline as the TUI: every screen is a client over a named seam — A2A JSON-RPC + SSE, the
+    <code>[traces]</code> routes, the Agent Card — plus one honest addition, a mesh-bound <b>admin sidecar</b>
+    that turns the config file (the registry's real mutation surface, ADR-0005) into a validated, atomic
+    write-back path. The app invents no orchestration; a stale approve is rejected server-side by
+    generation/op stamping. Full spec: <code>operator-ui-design.md</code>; desktop mockups:
+    <code>operator-ui-mockups.html</code>.
+  </footer>
+
+</div>

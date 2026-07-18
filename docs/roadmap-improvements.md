@@ -327,7 +327,9 @@ Permission approvals + cost dashboards + run status. *Value:* the interactive su
 / budget / trace data that already exists server-side. *Design:* server-side seams (permission suspend/resume,
 `/metrics`, drill-down routes) already exist — this is a client, keep orchestration out of it.
 A concrete design with rendered mockups now exists: [`operator-ui-design.md`](operator-ui-design.md) (TUI-first,
-web→Grafana, mobile as a post-federation companion) and [`operator-ui-mockups.html`](operator-ui-mockups.html).
+web→Grafana, mobile as a primary conversing-first client over Tailscale), with mockups in
+[`operator-ui-mockups.html`](operator-ui-mockups.html) (TUI cockpit) and
+[`operator-ui-mobile-mockups.html`](operator-ui-mobile-mockups.html) (mobile app).
 
 ### H3-6 ★ Linux rootless podman + per-language verify hardening
 ADR-0030 validated only macOS `podman machine`; Linux rootless (uid/SELinux `:z/:Z`) is a separate spike.
