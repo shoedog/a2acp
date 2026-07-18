@@ -6,16 +6,16 @@
 - **Completed through:** R3c **MERGED** at `98339842`; R2e remains deferred and off the critical path
 - **Active slice:** R3d owner-bound scheduling/evidence-retention design revision on
   `agent/reliability-r3d-scheduled-canaries`; implementation has not started
-- **Current R3d design gate:** one Fable/xhigh clean-room review of exact merged base `98339842` returned
-  six `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its concrete findings are folded into the
-  expanded R3d plan after operator approval of D1-D10 on 2026-07-17: hybrid local launchd/GitHub
-  infrastructure, narrow private standing authority, low-cost compatibility routing plus advisory
-  dogfooding policy, 10 GiB hot/25 GiB cold retention, deferred representative probes, characterization
-  plus three distinct controls, enforced affected-case pre-merge canaries with a post-merge backstop,
-  same-window content-addressed freshness/GC, durable reserve/reconcile budgets, and R2f ownership of the
-  long-lived operator. No implementation, schema, timer, grant, characterization, registry/image effect,
-  provider turn, GitHub check mutation, or operator lifecycle action was performed by the design fold.
-  Next design gate is one exact-docs-commit Sol/xhigh clean-room review; no Fable re-review is planned.
+- **Current R3d design gate:** the initial Fable/xhigh clean-room review of exact merged base `98339842`
+  returned six `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. After D1-D10 owner approval, a
+  fresh bridge-mediated Sol/xhigh/read-only review of exact docs commit `a20db199` returned four `WRONG`,
+  seven `SMELL`, and `R3D DESIGN: REVISE`. The current docs fold closes its exact claimed-case PR
+  selection, cross-trigger equivalent-work deduplication, typed transient-confirmation, strict-reader
+  sidecar, retention precedence, grant linearization/launchd-label binding, complete deadline, GitHub
+  conclusion, cold-file protection, and manual-pool/case-ownership findings. No implementation, schema,
+  timer, grant, live characterization, registry/image effect, compatibility smoke, GitHub check mutation,
+  or operator lifecycle action was performed; the Sol turn is review evidence only. Next gate is one fresh
+  exact-commit Sol/xhigh closure review. No Fable re-review is planned.
 - **Last merged R3c deterministic gate:** code head
   `4bd63f3f129a08586742c3c3e946fecfa02839ba` completes all four implementation slices and seven
   adversarial-review rounds. The initial Sol/xhigh review of exact `a5dfef8` returned nine `WRONG`, no
@@ -247,11 +247,12 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** finish the docs-only R3d design fold, verify the exact four-document boundary, commit it,
-  and run one fresh Sol/xhigh clean-room design review against that exact commit. Fold concrete findings,
-  obtain design approval, and publish the non-draft docs PR before R3d0 implementation. No live
-  characterization, model discovery, registry/image effect, provider turn, GitHub check mutation, private
-  grant, timer enablement, or production-operator lifecycle action is authorized. OpenRouter/OpenCode remain
+- **Next action:** verify and commit the docs-only R3d closure fold, then run one fresh Sol/xhigh closure
+  review against that exact commit. Obtain design approval and publish the non-draft docs PR before R3d0
+  implementation. No live
+  characterization, model discovery, registry/image effect, compatibility/live-smoke provider turn, GitHub
+  check mutation, private grant, timer enablement, or production-operator lifecycle action is authorized.
+  OpenRouter/OpenCode remain
   R3e/R3f after the R3 core and before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
@@ -305,7 +306,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (three incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33. R3b attempts 1 and 2 remain non-promotable failure evidence. R3c code head `4bd63f3` passed focused **61 / 0** and full host **2,165 / 0 / 12 ignored** across **70** groups; exact-`0567381` Sol/xhigh closure review returned `GATE: APPROVE`, and exact-`6637c13` Opus 4.8/xhigh release/compatibility review returned `READY` and `GATE: APPROVE`. R3d's initial Fable/xhigh design review of exact `98339842` returned six `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`; all D1-D10 owner decisions are approved and folded into the expanded design, with exact-commit Sol/xhigh review pending and no implementation/live action yet. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3d adds narrow owner-bound scheduling, supervision, accounting, retention, and pre-merge gating without touching the long-lived operator; then R3e OpenRouter and R3f OpenCode. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33. R3b attempts 1 and 2 remain non-promotable failure evidence. R3c code head `4bd63f3` passed focused **61 / 0** and full host **2,165 / 0 / 12 ignored** across **70** groups; exact-`0567381` Sol/xhigh closure review returned `GATE: APPROVE`, and exact-`6637c13` Opus 4.8/xhigh release/compatibility review returned `READY` and `GATE: APPROVE`. R3d's initial Fable review returned six `WRONG`/thirteen `SMELL`; exact-`a20db199` Sol review returned four `WRONG`/seven `SMELL`. D1-D10 and both review sets are folded; one exact-commit Sol closure review remains pending, with no implementation or live compatibility action yet. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3d adds narrow owner-bound scheduling, supervision, accounting, retention, and pre-merge gating without touching the long-lived operator; then R3e OpenRouter and R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -590,12 +591,13 @@ Next action:
   fails if the bundled Claude version is not 2.1.198. Its still-floating Kiro download resolved 2.12.3,
   so both Kiro rows remain `STALE` for R4 rather than becoming support evidence.
 - The initial exact-base R3d Fable/xhigh design review returned six `WRONG`, thirteen `SMELL`, and
-  `R3D DESIGN: REVISE`. All D1-D10 owner decisions were approved on 2026-07-17 and are now explicit in the
-  R3 plan: local launchd plus fresh one-shot canaries, trusted local pre-merge checks, narrow private
-  authority, low-cost provider routing, characterization-before-schedule, separate safety/waste/quarantine
-  controls, conservative cross-run accounting, two-tier retention/GC, and strict R2f ownership of the
-  long-lived operator. The docs-only fold has no code/schema/timer/grant/live effects. Its next gate is one
-  fresh exact-commit Sol/xhigh clean-room design review, then a non-draft docs PR before R3d0.
+  `R3D DESIGN: REVISE`. All D1-D10 owner decisions were approved on 2026-07-17. Fresh
+  Sol/xhigh/read-only review of exact `a20db199` then returned four `WRONG`, seven `SMELL`, and
+  `R3D DESIGN: REVISE`; the current fold closes its claimed-support PR selection, equivalent-work
+  deduplication, typed suppression, sidecar compatibility, retention, authority, deadline, GitHub-state,
+  cold-storage, and manual-accounting findings. The docs-only fold has no code/schema/timer/grant/live
+  compatibility effects. Its next gate is one fresh exact-commit Sol/xhigh closure review, then a non-draft
+  docs PR before R3d0.
 - The merged-R3c production operator binary is installed at
   `/Users/wesleyjinks/Library/Application Support/a2a-bridge/operator/releases/983398427c9f0486/a2a-bridge`,
   24,673,456 bytes, SHA-256

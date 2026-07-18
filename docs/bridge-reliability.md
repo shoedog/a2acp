@@ -154,20 +154,25 @@ plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
   each integration must pass local fake/corpus gates before a separately authorized live smoke, and
   neither becomes an automatic fallback target.
 - Run only characterized, fixed minimal cases under a narrow private standing grant, using the lowest-cost
-  eligible model for the provider/adapter/capability. Scheduling uses fresh one-shot processes and never
-  manipulates the long-lived operator.
+  eligible model for a provider-generic adapter/capability probe. A model/effort/mode/alias/capability-
+  specific PR must exercise the exact affected claimed-support identity; a cheap substitute cannot green
+  that gate. Scheduling uses fresh one-shot processes and never manipulates the long-lived operator.
 - Require a trusted local exact-SHA affected-case canary before merging compatibility-impacting same-repo
   PRs; GitHub performs deterministic classification/status only and never directly invokes credentialed
-  work. Retain a coalesced main run as the integration backstop.
+  work. Only an executed pass or locally proved no-impact state can satisfy the required check; due-but-not-
+  run remains blocking. Retain a coalesced main run as the integration backstop.
 - Defer representative review scheduling until a separate owner-reviewed design defines a fixed Tier-2
   read-only fixture, prompt, scoring, caps, provider rotation, and evidence boundary. Review content is not
   compatibility or promotion evidence.
-- Persist private machine-readable outcomes in bounded local/cold storage and diff them against previous
-  successful runs. Fresh floating observations may reuse content-addressed bytes only when exact immutable
-  identity is unchanged.
+- Persist the unchanged strict compatibility aggregate plus a separate versioned scheduling sidecar in
+  bounded private local/cold storage. Case/class/pin retention uses explicit extending precedence, and cold
+  files receive the same no-follow, single-link, owner-only protections as hot files. Fresh floating
+  observations may reuse content-addressed bytes only when exact immutable identity is unchanged.
 - Keep automatic safety holds, exact-fingerprint waste suppression, and explicit operator quarantine
-  distinct. Every future scheduled support case is characterized before eligibility, and no skipped or
-  unknown case is normalized into green.
+  distinct. `candidate_fail` alone is not permanent: one typed transient confirmation is allowed before
+  suppression. Admission separately deduplicates equivalent work across trigger sources. Every future
+  scheduled support case is characterized before eligibility, and no skipped or unknown case is normalized
+  into green.
 
 Exit: upstream drift is found by the canary rather than an unrelated feature branch.
 
