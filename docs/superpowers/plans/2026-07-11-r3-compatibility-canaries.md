@@ -1106,7 +1106,7 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 
 - **Branch:** `agent/reliability-r3d-scheduled-canaries`
 - **Base:** merged R3c main `983398427c9f04861a2f1da501a7650c4a1cdd80`
-- **Status:** design of record revised from owner decisions and twelve exact-commit Sol reviews;
+- **Status:** design of record revised from owner decisions and thirteen exact-commit Sol reviews;
   implementation not started; fresh Sol/xhigh closure review pending
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
@@ -1209,6 +1209,14 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   SHA-256 `602dd9259c25b9e70b7fb544e813aeb8e5b9336db53b2be5a843524b16fedf6d`. This revision
   replaces the standing grant's ambiguous exact-manifest binding with a stable named profile-policy bundle,
   keeps trigger/request/window/attempt identity admission-only, and reconciles the overview terminology.
+- **Twelfth closure review:** one fresh one-node bridge-mediated Sol/xhigh/read-only review of exact
+  `8dc60542eaff8579224c75112ca7a9a7f293cf3b` marked the stable-bundle repair and overview reconciliation
+  `FIXED`, trigger-independent execution identity `PARTIAL`, and found no regression in the earlier closed
+  mechanisms. It returned two new `WRONG`, one new `SMELL`, and `R3D DESIGN: REVISE`. Its fixed output is
+  `/private/tmp/a2a-bridge-r3d-sol-closure-8dc6054.OvmshJ/review.md`, mode `0600`, 14,130 bytes,
+  SHA-256 `f680c3517af959f086d3e2fa1445b0e1fb329bba269db901e30a76b36949fc8f`. This revision
+  gives generic manual work a one-run admission identity, stages every D7-reachable claimed-support profile,
+  carries R3c's non-reusable process-group anchor into R3d1, and revokes live one-shot entries on rollback.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
 tagged effect authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
@@ -1238,8 +1246,8 @@ fallback, automatic promotion, or production-operator session management.
   Mac only through the owner-authorized iCloud cold tier bound by valid storage consent; they are never public
   compatibility or promotion artifacts. Only bounded state and an evidence-record hash may be committed or
   published to GitHub.
-- Locking/accounting guarantees cover only R3d-aware entrypoints. While an R3d provider-effect standing grant
-  is active, the trusted operator must not invoke billable compatibility through a retained pre-R3d binary.
+- Locking/accounting guarantees cover only R3d-aware entrypoints. While either R3d provider-effect authority
+  arm can admit, the trusted operator must not invoke billable compatibility through a retained pre-R3d binary.
   Exact legacy process detection, conservative reconciliation, and the explicit enforcement limit are
   defined below; the already-running legacy `serve` process remains allowed because R3d never routes canaries
   through it.
@@ -1249,11 +1257,11 @@ fallback, automatic promotion, or production-operator session management.
 | Decision | Approved contract |
 |---|---|
 | D1 — substrate | Hybrid: local launchd supplies time, a fresh one-shot bridge owns each canary, the long-lived operator remains interactive, and GitHub performs deterministic checks/change detection only. A later R2f-gated lane owns long-lived operator health. |
-| D2 — authority | Checked-in non-authoritative policy plus a private owner-only effect-authority envelope with mutually exclusive one-shot-characterization and post-characterization standing-grant admission arms, and independently revocable cold-storage consent. Each one-shot entry is narrow to one characterization profile and one exact characterization execution; the standing grant is narrow to characterized profiles while every concrete run remains exact-fingerprint bound. Neither authorizes general bridge/server use; storage consent grants only the approved iCloud evidence lifecycle. |
+| D2 — authority | Checked-in non-authoritative policy plus a private owner-only effect-authority envelope with mutually exclusive one-shot-characterization and post-characterization standing-grant admission arms, and independently revocable cold-storage consent. Each one-shot entry is narrow to one characterization profile and one exact characterization execution; the standing grant is narrow to characterized profiles while every concrete run remains exact-execution-fingerprint bound. A direct generic manual run instead carries one non-reusable, one-run local-CLI acknowledgement identity and never inherits the envelope's standing authority. Neither persistent arm authorizes general bridge/server use; storage consent grants only the approved iCloud evidence lifecycle. |
 | D3 — model/task routing | Compatibility uses the lowest-cost eligible model for the exact provider/adapter/capability. General dogfooding uses the task matrix below as advisory, auditable policy rather than automatic routing. |
 | D4 — evidence | Two-tier owner storage: 10 GiB hot local evidence and 25 GiB cold iCloud-backed archives, with typed retention, pins, tombstones, quotas, and local status/notifications. |
 | D5 — representative probe | Defer broad scheduled reviews. Design the fixed read-only fixture adapter with operator input in a separate increment before implementation. |
-| D6 — holds/quarantine | Separate automatic safety holds, exact-execution-fingerprint waste suppression, and explicit operator quarantine. Characterize every future scheduled compatibility/advisory profile before eligibility; new exact drift identities under an unchanged profile execute once and never reuse evidence. |
+| D6 — holds/quarantine | Separate automatic safety holds, exact-execution-fingerprint waste suppression, and explicit operator quarantine. Characterize every profile that R3d may admit automatically or require for D7, including future scheduled advisory and exact claimed-support profiles, before eligibility; new exact drift identities under an unchanged profile execute once and never reuse evidence. |
 | D7 — change gate | Compatibility-affecting PRs require a trusted local affected-case canary on the exact current GitHub test-merge result SHA (`merge_commit_sha` / `refs/pull/<n>/merge`) before merge. A dedicated required context exists only on that result, never the PR head; a coalesced main run remains the post-merge integration backstop. |
 | D8 — freshness/GC | Fresh same-window discovery observation with content-addressed reuse; bounded post-tick GC plus weekly reconciliation. Never call stale bytes current. |
 | D9 — budgets | Durable reserve-then-reconcile accounting with a UTC ledger, rolling guard, protected pre-merge pool, and conservative charge for ambiguous or missing usage. |
@@ -1280,8 +1288,9 @@ R3d adds one checked-in policy and one private authority envelope:
 1. A checked-in scheduling policy defines schema version, allowed trigger and case groups, impact rules,
    characterization requirements, provider families, capability requirements, hard maxima, required
    preflights, evidence classes, and notification transitions. R3d0 canonically derives a versioned
-   `profile_policy_bundle_hash` over that policy, scheduled-registry semantic profile definitions, resolver/
-   recipe constraints, config/prompt/artifact templates, allowed effect classes, and profile maxima. This
+   `profile_policy_bundle_hash` over that policy, the characterization inventory's scheduled-registry and
+   D7-reachable production-support semantic profile definitions, resolver/recipe constraints, config/prompt/
+   artifact templates, allowed effect classes, and profile maxima. This
    stable authority artifact is not a production or generated execution manifest and contains no exact pin,
    resolved package/image/config, test target, or candidate identity. It is reviewable but grants no effects.
 2. A private authority envelope below the operator home is a single-link regular file, directory mode
@@ -1290,8 +1299,8 @@ R3d adds one checked-in policy and one private authority envelope:
    - a **one-shot characterization authorization** contains one or more exact, independently consumable
      `characterization_once` entries. Each entry binds its batch-authorization id/hash plus a unique entry id,
      generation, hash, and consumption nonce; operator and environment owner; exact
-     `profile_policy_bundle_hash`, scheduled-case
-     row/hash, characterization-profile fingerprint and exact characterization-execution fingerprint;
+     `profile_policy_bundle_hash`, tagged profile-source kind plus exact scheduled-advisory or production-
+     support row/hash, characterization-profile fingerprint and exact characterization-execution fingerprint;
      installed scheduler binary and normalized price/ranking-snapshot hashes,
      proposed expected-effective identity, provider family, allowed registry/image/provider effects, and known
      pre-R3d executable inventory; conservative token/cost/time/attempt caps, retry/fallback zero, the explicit
@@ -1376,8 +1385,23 @@ acknowledgements and case selection. They share R3d's admission lock and account
 the provider-effect standing grant. That grant supersedes per-aggregate manual acknowledgement only for an
 exact scheduled or trusted-pre-merge request that binds the provider-effect grant in its evidence.
 
-The explicit characterization command is the sole manual-shaped exception: it accepts only a sealed
-`ScheduledExecutionSourceV1` carrying the sole valid `characterization_once` entry for an exact
+At final admission, a direct local generic manual invocation's explicit `--acknowledge-billable` creates a
+strict, non-renewable `ManualAdmissionV1` identity under the authority-state lock. It binds a scheduler-generated
+unique request nonce; operator/environment owner and installed scheduler binary; exact input source and selected
+case/profile/execution fingerprints; requested evidence purpose and freshness bucket; command, caps, retry/
+fallback zero, allowed provider/registry/image effects, and a short one-run expiry. Its tagged
+`manual_acknowledgement` hash is durably consumed with the reservation whether the request executes or reuses
+eligible evidence. It cannot be supplied or replayed by a caller, accepted from `serve`/A2A/a timer/watcher,
+stored as reusable/standing authority, or used by `ScheduledExecutionSourceV1`. Its immutable audit record
+remains durable. Missing explicit acknowledgement,
+source/case/cap/purpose mismatch, stale scheduler identity, expiry, duplicate nonce, or post-seal mutation
+refuses before credential or provider-capable process access. This one-run local-CLI identity is admission
+authority for generic manual accounting only; it is not a third arm in the private provider-effect envelope.
+
+The explicit characterization command is the sole manual-shaped path that may consume persistent envelope
+authority: it accepts only a sealed `ScheduledExecutionSourceV1` or
+`ClaimedSupportCharacterizationSourceV1`
+carrying the sole valid `characterization_once` entry for an exact
 `characterization_required` profile and its bound characterization execution. It cannot accept
 `standing_grant`, an already consumed entry, a completed characterization for that profile, or any scheduled/
 test-merge/main trigger. Generic manual
@@ -1444,9 +1468,9 @@ R3d defines two distinct versioned canonical SHA-256 identities. The
 `characterization_profile_fingerprint` names the bounded provider-effect shape that the operator observes once.
 It serializes:
 
-- repository identity without a commit, PR, or test-merge identity; scheduled-case-registry schema and semantic
-  row shape; scheduling policy, recipe/resolution-policy, config-template, fixed-prompt, and artifact-policy
-  hashes;
+- repository identity without a commit, PR, or test-merge identity; tagged profile-source registry/schema and
+  semantic scheduled-advisory or production-support row shape; scheduling policy, recipe/resolution-policy,
+  config-template, fixed-prompt, and artifact-policy hashes;
 - case id, lane, classification, evidence purpose, execution mode, expected status, provider/agent/capability,
   adapter/SDK/CLI and image-family names plus their allowed resolution constraints, auth-path type, and
   non-secret prerequisite names/shapes;
@@ -1484,15 +1508,21 @@ once; it cannot reuse, consume, suppress from, or green itself with evidence fro
 `claimed_support_gate` evidence never crosses an exact test-merge result SHA even when two results produce
 byte-identical candidates.
 
-Effect-authority ids are not fields in either reusable identity: rotating an otherwise equivalent standing
-grant must not itself force recharacterization. Final admission instead derives an
-`admission_attempt_fingerprint` over both profile and execution fingerprints plus the exact tagged authority
-kind and complete arm identity: batch-authorization id/hash plus one-shot entry id/generation/hash/consumption
-nonce, or standing-grant id/generation/hash plus characterization id/hash. It also binds the trigger/window/
-attempt identity. Concretely that is trigger source/kind, request id, window id, attempt id, and optional repeat
-nonce. The sealed source, equivalent-work and budget reservation, ledger, consumption record, and
-schedule sidecar bind all three fingerprints. Authority rotation therefore prevents stale admission/replay
-without relabeling unchanged case or execution evidence.
+Persistent effect-authority ids and a one-run manual-acknowledgement id are not fields in either reusable
+identity: rotating an otherwise equivalent standing grant or invoking equivalent work manually must not force
+recharacterization. Final admission instead derives an `admission_attempt_fingerprint` over both profile and
+execution fingerprints plus exactly one complete tagged admission-authority identity:
+
+- batch-authorization id/hash plus one-shot entry id/generation/hash/consumption nonce for
+  `characterization_once`;
+- standing-grant id/generation/hash plus characterization id/hash for `standing_grant`; or
+- locally derived `ManualAdmissionV1` hash and unique consumed request nonce for `manual_acknowledgement`.
+
+It also binds the trigger/window/attempt identity. Concretely that is trigger source/kind, request id, window
+id, attempt id, and optional repeat nonce. The applicable sealed source or manual admission record,
+equivalent-work and budget reservation, ledger, and consumption record bind all three fingerprints; the
+schedule sidecar does so for characterization/scheduled/test-merge work. Authority rotation therefore
+prevents stale admission/replay without relabeling unchanged case or execution evidence.
 
 No pre-admission fingerprint contains a value learned only after admission. The result separately records the
 observed effective model/effort/mode from the admitted session. That observation must equal the profile's
@@ -1517,6 +1547,18 @@ to parse the unchanged aggregate; feeding the registry to an old manifest comman
 private profile-characterization record plus an exact provider-effect grant entry—not a checked-in status
 edit—moves the probe into scheduled eligibility. R4 alone may promote support claims.
 
+R3d0 also adds one checked-in strict `CharacterizationProfileInventoryV1`. Each entry is tagged as either a
+`scheduled_advisory` reference to the exact semantic scheduled-registry row or a `claimed_support_gate`
+reference to the canonical semantic profile projection of a production-manifest `classification = "support"`
+row. The inventory must contain every profile that a timer, trusted main/test-merge trigger, or D7 classifier
+can make due; startup/dry-run recomputes it from both source registries and fails closed on omission, duplicate,
+stale hash, or a reachable support row that is not inventoried. The initial claimed-support inventory is
+exactly `codex-host-bridge-gpt56-sol`, `codex-reader-bridge-gpt56-sol`,
+`claude-host-acp-044-fable`, and `claude-reader-055-fable`. Their semantic profile projections—not the exact
+generated run manifest, candidate, package/image resolution, or test target—join the stable
+`profile_policy_bundle_hash`. A production support-row/profile change therefore requires an inventory/bundle
+update and fresh characterization before D7 may admit that profile.
+
 ### Strict scheduled-execution source
 
 R3c's existing `compatibility run --resolution` route deliberately requires every generated floating case's
@@ -1537,7 +1579,7 @@ binds:
   generated-config, prerequisite, auth-path, environment, prompt, and artifact-policy identities; and
 - the row's exact requested raw and expected-effective model/effort/mode plus caps and retry zero.
 
-`admission_authority` is a strict tagged union with exactly two arms:
+For this scheduled source only, `admission_authority` is a strict tagged union with exactly two arms:
 
 - `characterization_once` binds the batch-authorization id/hash and one-shot entry id, generation, hash, and
   consumption nonce; the exact `characterization_required` profile and characterization execution fingerprint;
@@ -1555,6 +1597,8 @@ Missing, unknown, or multiple arms; a mixed-arm payload; a stale/consumed one-sh
 an already characterized or different profile/execution; a standing grant without the exact completed profile
 characterization; an execution value outside the profile's constraints; or any noncanonical absence marker
 fails schema/validation before credential or provider-capable process access.
+`manual_acknowledgement` and every `ManualAdmissionV1` field are schema-invalid here; generic manual work uses
+the unchanged pinned/floating compatibility source plus its separate local admission record, never this source.
 
 Its generated execution manifest is still strict schema v1 lane `floating-current`, classification `canary`.
 Model/effort/mode may differ from a pinned support row only by equaling the exact scheduled registry row; no
@@ -1577,8 +1621,20 @@ only when the source generator derived it under unchanged profile-bound constrai
 execution fingerprint and never evidence reuse. R3d4 uses the existing pinned production-manifest route
 whenever a
 test-merge impact requires an exact claimed-support identity; it may select `RunSource::Scheduled` only for
-an explicitly classifier-proved provider-generic/advisory case. Daily advisory work and R3d5 characterization
-use the scheduled source. Old R3 binaries never parse this separate source.
+an explicitly classifier-proved provider-generic/advisory case. Daily advisory work and R3d5 scheduled-
+advisory characterization use the scheduled source. Old R3 binaries never parse this separate source.
+
+Claimed-support characterization does not pass a production support row through that advisory source. R3d0
+adds a separate strict, owner-only, create-new/no-follow `ClaimedSupportCharacterizationSourceV1` for the
+explicit one-run command. It binds the exact production-manifest schema/hash and
+`classification = "support"` row/hash, stable bundle/profile plus exact characterization-execution and
+admission fingerprints, installed candidate, full pinned config/package/image identities, exact requested/
+expected model/effort/mode and caps, and only the matching `characterization_once` entry. `standing_grant`,
+`manual_acknowledgement`, timer/watcher/main triggers, row substitution, and typed-arm mixing are invalid.
+R3d2's internal `--claimed-support-characterization-source` validator reopens and rederives all bindings, then
+invokes the unchanged strict pinned-manifest runner. Its evidence purpose remains `characterization`, never
+support promotion, manifest mutation, or reusable proof for another exact execution. A later D7 gate uses the
+ordinary pinned production route under `standing_grant`; R4 alone owns support promotion.
 
 General dogfooding routing is documentation and audit policy in R3d, not an automatic controller. Each
 turn records task class, provider, requested/observed effective model, effort, mode, override reason, and
@@ -1605,14 +1661,14 @@ scheduler commands.
 
 ### D6 — case characterization, holds, suppression, and quarantine
 
-Every characterization profile intended for future unattended compatibility or advisory scheduling follows
-this lifecycle:
+Every inventoried characterization profile intended for future unattended/advisory compatibility or a D7
+claimed-support gate follows this lifecycle:
 
 ```text
 proposed
   -> characterization_required
   -> characterized_green | characterized_known_issue | characterization_inconclusive
-  -> scheduled_active | operator_quarantined | deferred
+  -> scheduled_active | required_gate_active | operator_quarantined | deferred
   -> retired
 ```
 
@@ -1622,15 +1678,18 @@ environment/auth/execution shape, prompt/template, maximum caps, and the selecte
 candidate identities are all recorded; the observed effective identity must match. A profile-fingerprint
 change returns the case shape to `characterization_required`. An execution-only test-merge, candidate, or
 strictly resolved package/image change under the same profile does not. Uncharacterized is
-not quarantine and records `not_run(characterization_required)`. Before R3d finalizes the automatic
-unsafe/waste table or enables scheduling, characterize every future scheduled compatibility/advisory profile
-once using
-the approved lower-cost models. Some may remain known issues, quarantined, or deferred; none should surprise
-the first unattended tick. Obsolete historical and explicit non-goal rows are outside this matrix.
+not quarantine and records `not_run(characterization_required)`. Before R3d finalizes the automatic unsafe/
+waste table or enables any timer/check admission, characterize every inventoried profile once. Scheduled
+advisory profiles use the approved lower-cost models; D7 claimed-support profiles use their exact production
+Sol/Fable model, effort, mode, adapter, capability, and host/reader shape. Some advisory profiles may remain
+known issues, quarantined, or deferred; none should surprise the first unattended tick. A claimed-support
+profile must be characterized and present in the standing grant before its required-check impact class can be
+enabled. Obsolete historical and explicit non-goal rows are outside this matrix.
 
-The initial characterization set is Codex Luna-low host/reader, Claude Haiku host/reader, Claude
-Sonnet-low effort control, Kiro/Qwen host/reader once deterministic support exists, Ollama, and later
-OpenRouter/OpenCode after integration. A floating case profile is characterized once. Each newly resolved
+The initial scheduled-advisory set is Codex Luna-low host/reader, Claude Haiku host/reader, Claude Sonnet-low
+effort control, Kiro/Qwen host/reader once deterministic support exists, Ollama, and later OpenRouter/OpenCode
+after integration. The initial D7 set is the four exact Sol/Fable production-support profiles named above. A
+floating case profile is characterized once. Each newly resolved
 immutable execution fingerprint still runs once as advisory `candidate_pass|candidate_fail|candidate_unknown`
 evidence; evidence, hold, suppression, and consumption state remain exact-execution scoped and never transfer
 merely because the profile matches.
@@ -1689,23 +1748,37 @@ before credential/registry/image/provider effects when the schedule window, gran
 cannot contain the complete bound. The deadline is not reset between phases.
 
 The compatibility runner handles SIGTERM exactly like SIGINT: stop admitting later cases, let the current
-bounded child follow its cancel/release/retire path, publish its aggregate, and clean scratch. The parent
-records runner and staged-smoke pids, process groups, start identities, container run labels, and phase
-before effects. Escalation is:
+bounded child follow its cancel/release/retire path, publish its aggregate, and clean scratch. Before spawning
+the runner or staged smoke, the parent creates a trusted inert bridge-owned group-leader anchor and places the
+workload in that process group. It records anchor/runner/child pids, process groups, start identities, container
+run labels, and phase before effects. The anchor remains live through TERM; the one terminal group-KILL step
+keeps its exited leader unreaped until the supervisor journals that no later group signal is permitted, then
+final wait/reap releases the identity. A crash that makes the signal/journal ordering ambiguous recovers to a
+hold and never retries a numeric-group signal. R3d1
+reuses or factors the already-proven R3c `CommandProcessGroupGuard` mechanism; it must not restore a numeric-
+PGID-only signal path. A
+descendant-created group in the same session may be group-signaled only after the supervisor successfully
+adds and retains its own anchor member; a new-session escape, vanished leader, failed anchor acquisition, or
+ambiguous identity creates a safety hold and is never signaled through a stale numeric PGID. Escalation is:
 
 1. TERM the runner and begin the bounded cleanup grace;
 2. a second TERM/INT during grace escalates immediately;
-3. KILL the exact recorded/enumerated runner and child groups, never a process name;
-4. reap only containers with the exact run label;
-5. prove exit, or retain the owner-wide admission lock/hold state and refuse successors;
-6. publish a durable `killed_after_deadline` supervisor record joined to the runner artifact by run/window id
+3. KILL only exact recorded/enumerated runner and child groups whose bridge-owned anchor is still live, never a
+   process name or unanchored/stale numeric PGID;
+4. journal the terminal group-signal attempt, wait/reap direct workload children, prove no non-anchor member
+   remains, then release/reap each bridge-owned anchor and prove group absence; repeated cancellation after
+   this mark performs no group signal;
+5. reap only containers with the exact run label;
+6. prove exit, or retain the owner-wide admission lock/hold state and refuse successors;
+7. publish a durable `killed_after_deadline` supervisor record joined to the runner artifact by run/window id
    and retain the conservative budget charge.
 
 Startup reconciles any incomplete supervisor record before new admission. An unproved or uninterruptible
-survivor creates a safety hold rather than a duplicate attempt. Recorded descendants that create another
-session/process group remain in the enumeration; an unobserved host descendant that escapes all recorded
-ancestry is an explicit macOS containment limit, not grounds for a success claim. Deadline-kill tests use
-fake children only; a live provider turn is never killed merely to prove the mechanism.
+survivor, missing/dead anchor before group absence is proved, or unreconciled anchor release creates a safety
+hold rather than a duplicate attempt or stale signal. Recorded descendants that create another session/
+process group remain in the enumeration and follow the anchor-or-hold rule; an unobserved host descendant that
+escapes all recorded ancestry is an explicit macOS containment limit, not grounds for a success claim.
+Deadline-kill tests use fake children only; a live provider turn is never killed merely to prove the mechanism.
 
 ### Admission and concurrency
 
@@ -1940,6 +2013,13 @@ R3d's atomic guard is the required context on that result:
    executes the exact currently claimed support identity, including Sol/Fable where applicable. A provider-
    minimal low-cost substitute is allowed only for a classifier-proven provider-generic seam whose mutation
    tests demonstrate that model-specific behavior is unreachable.
+   If the PR introduces or changes a D7-reachable claimed-support profile, the check remains
+   `in_progress(characterization_required)` and the watcher cannot characterize it. The operator may issue a
+   separately reviewed one-shot entry bound to that profile and the then-current exact test-merge execution,
+   invoke the explicit characterization command under a manual characterization trigger, and revise the
+   standing grant after terminal reconciliation. Test-merge regeneration retains only the completed profile
+   characterization; the required gate must still execute the new exact execution fingerprint. No impact class
+   is enabled unless every profile it can select is inventoried, characterized, and present in the grant.
 5. The publisher records evidence and posts the dedicated required conclusion only on that exact test-merge
    SHA. `success` requires an executed passing due set or locally proved `not_applicable` classification.
    `failure` requires a typed immutable/invalid-candidate failure or the second identical complete failure
@@ -2080,11 +2160,13 @@ parents, the guarded observation id, or scheduled-main commit range; policy,
 the exact tagged admission-authority kind and complete arm identity—batch-authorization id/hash plus one-shot
 entry id/generation/hash/consumption nonce, or standing-grant id/generation/hash plus characterization id/hash—
 with canonical typed absences, storage-consent, quarantine, and characterization
-ids/hashes; scheduled-case-registry hash and canonical characterization-profile, case-execution, and
+ids/hashes; tagged scheduled-advisory-registry or production-support-manifest source/row hashes and canonical
+typed absences; canonical characterization-profile, case-execution, and
 admission-attempt fingerprints/versions plus the canonical `profile_policy_bundle_hash`;
 window, attempt-idempotency, equivalent-work, consumption, and optional repeat ids; classifier version/hash
 and affected cases; complete deadline derivation; preflight results; admission lock holder; budget
-reservations/reconciliation; supervisor process identities/escalation/reap results; freshness observation;
+reservations/reconciliation; supervisor anchor/process identities, anchor acquisition/release,
+escalation/reap results; freshness observation;
 requested and characterized expected-effective identities plus the separately observed effective result;
 typed check scope (`test_merge_result`), required-rule/context/source hashes; publication-outbox id/state,
 check-run/external ids, optional terminal-consumption id and desired conclusion with typed absence before
@@ -2100,24 +2182,29 @@ unknown sidecar version fails schedule-specific consumption without making the u
 ### Dependency-ordered implementation slices
 
 1. **R3d0 — design/policy/schema foundation (non-billable).** Land this approved design; add checked-in
-   scheduling, one-shot-characterization authorization, provider-effect-grant, tagged admission-authority,
+   scheduling, characterization-profile inventory, one-shot-characterization authorization, provider-effect-
+   grant, tagged admission-authority, one-run manual-admission,
    storage-consent, characterization, hold/quarantine, typed
    failure/suppression, impact, ledger,
    canonical profile-policy bundle, characterization-profile, case-execution, and admission-attempt
    fingerprints, equivalent-work/
-   consumption, scheduled-case registry, strict
-   scheduled-execution-source, schedule-sidecar, publication-outbox, evidence-index, status, and routing
+   consumption, scheduled-case registry, strict scheduled- and claimed-support-characterization sources,
+   schedule-sidecar, publication-outbox, evidence-index, status, and routing
    schemas plus validators and docs. Add and review
    every exact provider-minimal advisory row/config intended for R3d5 characterization; keep it outside the
-   protected support manifest and do not execute it. No timer, credential access, registry/runtime effect,
-   or provider path.
+   protected support manifest. Add the initial four exact claimed-support profile references without changing
+   that manifest. Do not execute either class. No timer, credential access, registry/runtime effect, or provider
+   path.
 2. **R3d1 — supervisor and signal parity (non-billable).** Add `schedule-tick` parent, SIGTERM parity,
-   derived deadline, exact process-tree identity, TERM/grace/KILL/reap, repeated-cancel, recovery, and joined
+   derived deadline, retained bridge-owned group-leader anchors through TERM/grace/KILL/reap, exact process-
+   tree identity, anchor-or-hold handling for descendant-created groups, repeated-cancel, recovery, and joined
    parent/child artifact contract using fake processes only.
 3. **R3d2 — authority, admission, preflights, and accounting (non-billable tests).** Add provider-effect-grant,
    one-shot-characterization, and storage-consent validation with independent revocation linearization, the
-   mutually exclusive admission-authority reducer, scheduled-source generator/`RunSource::Scheduled`
-   validator with independent profile-policy-bundle rederivation, owner-wide lock, authority-bound attempt
+   mutually exclusive scheduled/claimed-support-characterization admission-authority reducers, scheduled- and
+   claimed-support-characterization-source generators/validators with independent profile-policy-bundle
+   rederivation, strict
+   one-run local `ManualAdmissionV1` derivation/consumption, owner-wide lock, authority-bound attempt
    fingerprints, profile-indexed one-shot uniqueness,
    equivalent-work reuse/refusal, characterization state,
    three control types, durable reserve/reconcile ledger, UTC/rolling windows, scheduled/test-merge/manual
@@ -2134,11 +2221,12 @@ unknown sidecar version fails schedule-specific consumption without making the u
    debounce, and the disabled-by-default launchd installation. Add a live validator for strict branch
    protection, the dedicated required context and expected source, canonical test-merge production, and the
    invariant that the context never exists on a PR head. No schedule or required check is enabled by merge.
-6. **R3d5 — characterization and staged enablement (separate live authority).** Characterize all future
-   scheduled compatibility/advisory profiles with the lower-cost models under exact single-use
-   `characterization_once` entries, finalize provisional hold/waste classifications and exact caps, exercise
-   the rollout ladder, then issue and enable the first post-characterization provider-effect standing grant/
-   timer and enforced test-merge check only after the deterministic and review gates are green.
+6. **R3d5 — characterization and staged enablement (separate live authority).** Characterize every inventoried
+   future scheduled-advisory profile with its lower-cost model and every D7-reachable claimed-support profile
+   with its exact Sol/Fable production identity under exact single-use `characterization_once` entries. Finalize
+   provisional hold/waste classifications and exact caps, exercise the rollout ladder, then issue and enable
+   the first post-characterization provider-effect standing grant/timer and only the required-check impact
+   classes whose complete profile set is characterized, after the deterministic and review gates are green.
 
 Each code slice must be reviewable and default-off. It may merge independently only when its own complete
 tests are green and no earlier invariant is weakened. The full R3d branch receives one Sol/xhigh adversarial
@@ -2158,6 +2246,10 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   already-completed evidence, while valid provider authority plus expired/revoked storage consent cannot
   create a cold entry. Consent revocation before its publication journal blocks the write; revocation after
   that linearization permits only the already-admitted bounded copy and blocks every later archive/eviction.
+- Rollback state/crash tests revoke the standing grant and every `available` or `consumed_unreconciled`
+  one-shot entry under the authority lock before labels/check admission are disabled. A crash at each journal
+  point recovers fail-closed; an already reserved bounded attempt is not killed, reconciled history remains
+  immutable, and no unused/revoked entry can admit or be replayed after rollback.
 - Tagged-admission tests prove an exact `characterization_once` entry admits the explicit first profile
   characterization while both completed profile characterization and applicable standing grant are absent,
   and that `standing_grant` later admits a different exact execution under the same profile. Missing/unknown/
@@ -2173,18 +2265,32 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   it receives a new nonce/budget and no pre-pooled retry. One-shot and standing positives bind distinct
   authority-bound attempt fingerprints, reservations, ledger entries, and sidecars to the same profile and
   their different exact execution fingerprints.
+- Generic-manual admission tests prove an explicit local `--acknowledge-billable` derives and consumes one
+  `ManualAdmissionV1` identity without reading or inheriting `standing_grant`. Missing acknowledgement,
+  caller-supplied/duplicate nonce, replay, stale binary/expiry, wrong source/case/profile/execution/purpose/
+  freshness/cap/effect, `serve`/A2A/timer/watcher origin, post-seal mutation, use as characterization, and any
+  manual field in `ScheduledExecutionSourceV1` refuse before effects. A valid one-run record binds its own
+  admission fingerprint, reservation, ledger, consumption, and manual artifact.
 - Fake children cover ignored TERM, SIGSTOP, exited runner with surviving descendant group, publication
-  wedge, repeated cancellation, unproved exit, startup recovery, and unrelated-process survival.
+  wedge, repeated cancellation, unproved exit, startup recovery, and unrelated-process survival. A direct
+  recycled-PGID red mutation releases/reaps the anchor before final group signaling, reassigns the old numeric
+  group to an unrelated fake group, and demonstrates the stale signal; the production path retains the anchor,
+  prevents that reassignment until final reap, and leaves the unrelated group alive. Forced anchor-acquisition
+  or anchor-liveness failure and crashes immediately before/after the terminal-signal journal instead hold with
+  no stale group-signal retry.
 - Scheduled versus manual and test-merge-watcher versus daily trigger sources targeting the same exact execution,
-  plus concurrent/sequential duplicates and two-process races, prove one execution fingerprint/equivalent-work
-  key and exactly one billable attempt. Trigger source/kind and request/window/attempt/repeat mutations change
-  only admission fingerprints; changing the exact target SHA/range changes the execution fingerprint and is
-  intentionally non-equivalent. Completed equal-or-stronger evidence is reused through a consumption record;
-  explicit repeat/confirmation uses a distinct authorization and budget. Crash/restart never replays or double-
-  charges.
-- Canonical-fingerprint mutation tests change every profile field independently: repository, semantic
-  scheduled-case/policy/recipe/resolution constraint, template/prompt/artifact policy, case/purpose/execution
-  shape, provider/agent/capability/family, auth/prerequisite/environment, requested or expected-effective
+  same evidence purpose, and same canonical freshness bucket, plus concurrent/sequential duplicates and two-
+  process races, prove one execution fingerprint/equivalent-work key and exactly one billable attempt. Trigger
+  source/kind and request/window/attempt/repeat or manual-versus-standing authority mutations change only
+  admission fingerprints; changing the exact target SHA/range changes the execution fingerprint and is
+  intentionally non-equivalent. A separate `manual_diagnostic` purpose remains incomparable with scheduled
+  advisory work and therefore does not reuse it. Completed equal-or-stronger evidence is reused through a
+  consumption record; explicit repeat/confirmation uses a distinct authorization and budget. Crash/restart
+  never replays or double-charges.
+- Canonical-fingerprint mutation tests change every profile field independently: repository, tagged semantic
+  scheduled-advisory or production-support row, policy/recipe/resolution constraint, template/prompt/artifact
+  policy, case/purpose/execution shape, provider/agent/capability/family, auth/prerequisite/environment,
+  requested or expected-effective
   model/effort/mode, and maximum cap. Each changes the profile and returns characterization to required;
   absent-versus-empty and ordering/normalization collisions are rejected. Separate exact-execution mutations
   change PR/test-merge SHA/ref/tree/base/head/ordered parents or main range, candidate bytes, exact manifest/
@@ -2196,8 +2302,9 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   evidence.
   Observed-effective equality passes, while a mismatch returns `candidate_unknown`, holds the original
   fingerprint, forbids reuse/consumption, and never mutates the admitted reservation key.
-- Profile-policy-bundle mutation tests independently change each bound policy, semantic scheduled-row,
-  resolver/recipe constraint, template, allowed effect class, and profile-maximum input. The canonical hash
+- Profile-policy-bundle mutation tests independently change each bound policy, semantic scheduled-advisory or
+  D7-reachable production-support row, characterization-inventory entry, resolver/recipe constraint, template,
+  allowed effect class, and profile-maximum input. The canonical hash
   changes and every one-shot entry or standing grant carrying the old/wrong hash refuses before effects; omitted,
   reordered, broadened, and noncanonical inputs also refuse. Exact test target, candidate, run-manifest, pin,
   resolved package/image/config, or within-maximum actual-cap drift leaves the bundle hash and standing grant
@@ -2213,7 +2320,9 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   replacement-result reauthorization rather than automatic replay.
 - Preflight fixtures cover OAuth runway, provider/model removal, config drift, storage pressure, runtime
   start degradation, stale price/ranking snapshot, container cleanup failure, and
-  characterization/quarantine/hold states with zero provider calls.
+  characterization/quarantine/hold states with zero provider calls. Characterization-inventory fixtures cover
+  the four initial production-support profiles plus all scheduled-advisory rows; omitted, duplicate, stale, or
+  newly D7-reachable uncharacterized profiles keep their impact class/check disabled or pending.
 - Failure-disposition tests prove typed immutable failure suppresses and terminalizes immediately. A first
   transient/untyped `candidate_fail` becomes `confirmation_due`, leaves the same remote check `in_progress`,
   and creates no terminal GitHub consumption; crash/restart preserves that state without replay. One
@@ -2290,7 +2399,13 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   sources, `support` classification, unlisted model/effort/mode, caller-supplied or post-seal package/config/
   image changes, resolution outside profile-bound constraints, missing/revoked authority, old-reader parsing,
   and an attempt to green an exact claimed-support impact with the advisory source all refuse before provider-
-  capable spawn. A static/behavioral test
+  capable spawn. Claimed-support-characterization-source tests exercise all four initial production-support
+  profiles through fake providers. The source must preserve the exact protected
+  support row and pinned-run validator while binding one-shot/profile/execution/admission identities; wrong or
+  non-support row, row/profile drift, standing/manual authority, unattended trigger, replay, an attempt to
+  mutate the support manifest/baseline, or an attempt to treat characterization evidence as promotion refuses.
+  A newly introduced D7 profile keeps its check pending until that explicit one-shot path completes and the
+  revised standing grant covers it. A static/behavioral test
   proves scheduler invocation contains no `serve` endpoint or production-operator lifecycle action.
 - Run format/diff checks, workspace all-target check, warnings-denied Clippy, locked release build,
   repository hygiene, manifest/recipe/policy validation, all scheduler CLI tests, and the full serial
@@ -2309,12 +2424,13 @@ are green:
    evidence, status/notification transitions, and zero spend. A fake/exact-fixture legacy compatibility
    process must hold admission while the retained production `serve` identity remains allowed.
 3. Have the operator issue one reviewed no-retry/no-fallback `CharacterizationAuthorizationV1` batch whose
-   entries enumerate every future scheduled compatibility/advisory profile exactly once. Invoke the explicit
-   characterization command once per entry using the exact approved low-cost provider/model/effort/
-   environment/config profile and exact characterization-execution fingerprints. Each source binds and
-   consumes its own `characterization_once` entry; the
-   batch grants no pooled retries or scope. This is the complete future schedule set, not obsolete historical/
-   non-goal rows.
+   entries enumerate the complete initial `CharacterizationProfileInventoryV1` exactly once: every future
+   scheduled-advisory profile plus the four D7-reachable production-support profiles. Invoke the explicit
+   characterization command once per entry using the exact approved low-cost identity for advisory rows and
+   the exact pinned Sol/Fable identity for support rows, each with its exact environment/config and
+   characterization-execution fingerprint. Each scheduled or claimed-support-characterization source binds and
+   consumes its own `characterization_once` entry; the batch grants no pooled retries or scope. It omits
+   obsolete historical, non-goal, or not-yet-integrated rows.
 4. Review the aggregate once, classify known issues/inconclusive cases, set holds/suppressions/quarantines,
    derive numerical caps, record legacy-manual quiescence, explicitly authorize the private owner-iCloud cold
    boundary, and only then have the operator issue the first `standing_grant` provider-effect authority plus
@@ -2325,8 +2441,10 @@ are green:
 6. Let one timer tick fire while the operator observes it. Deadline-kill remains fake-process-only.
 7. Run PR classification in shadow mode on one exact trusted PR base/head pair; it remains advisory and is
    never compatibility evidence.
-8. Bootstrap a fresh unique R3d context in shadow mode on an exact test-merge SHA only, then make one explicit
-   audited GitHub change that requires that context from the expected source and strict up-to-date protection.
+8. After proving every impact class maps only to inventoried, completed characterizations present in the
+   standing grant, bootstrap a fresh unique R3d context in shadow mode on an exact test-merge SHA only, then
+   make one explicit audited GitHub change that requires that context from the expected source and strict up-
+   to-date protection.
    First exercise a no-impact test merge and test-merge regeneration; then, with separate live authority,
    exercise one affected exact test-merge SHA. Verify API/ref/base/head/tree/ordered-parent binding, that the
    context is absent from every PR head, current-result required-check wait, prior-result refusal, the
@@ -2340,8 +2458,12 @@ are green:
 
 ### Rollback and restart handoff
 
-Rollback unloads/disables both launchd labels, revokes the provider-effect grant, and disables the required
-test-merge check or explicitly bypasses it through the audited owner path. It leaves cold-storage consent
+Rollback first takes the authority-state lock and increments revocation generations for the provider-effect
+standing grant and every nonterminal one-shot entry, including `available` and `consumed_unreconciled`; it
+preserves immutable consumed/reconciled audit records. An attempt already past durable reservation remains
+bounded and is not killed, but no revoked entry can admit, replay, reissue, or lend scope. Rollback then unloads/
+disables both launchd labels and disables the required test-merge check or explicitly bypasses it through the
+audited owner path. It leaves cold-storage consent
 unchanged so already-completed evidence can satisfy retention unless the operator separately revokes that consent; a
 storage-consent revocation blocks new cloud writes/hot evictions but does not claim to recall existing bytes.
 Rollback does not revert evidence, erase ledger charges, delete pins/tombstones, restart the long-lived
@@ -2351,20 +2473,21 @@ rollback target. Any code revert is a normal reviewed PR.
 **Restart point:** work from branch `agent/reliability-r3d-scheduled-canaries` based on merged main
 `98339842`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
 exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, exact-`c50811f`, and
-exact-`fb8a2f4`, exact-`ae9db39`, and exact-`2eb242a`
+exact-`fb8a2f4`, exact-`ae9db39`, exact-`2eb242a`, and exact-`8dc6054`
 Sol reviews are retained at the paths/hashes above.
 The Fable six `WRONG`/thirteen `SMELL`; first-Sol four `WRONG`/seven `SMELL`; first-closure three
 `WRONG`/three `SMELL`; second-closure two `WRONG`/three `SMELL`; third-closure two `WRONG`/zero new
 `SMELL`; fourth-closure one `WRONG`/one `SMELL`; fifth-closure zero `WRONG`/one `SMELL`; sixth-closure
 one `WRONG`/zero new `SMELL`; seventh-closure zero new `WRONG`/one `SMELL`; and eighth-closure one
 `WRONG`/zero new `SMELL`; ninth-closure one `WRONG`/zero new `SMELL`; tenth-closure one `WRONG`/one
-`SMELL`; and eleventh-closure two residual `WRONG`/one `SMELL` sets are folded into D1-D10 and the slices/
-gates above. The eleventh closure fixed duplicate-entry handling and left the identity split partial because
-exact manifest and trigger fields still occupied the wrong layers. All D1-D10 owner
+`SMELL`; eleventh-closure two residual `WRONG`/one `SMELL`; and twelfth-closure two new `WRONG`/one new
+`SMELL` sets are folded into D1-D10 and the slices/gates above. The twelfth closure fixed the stable-bundle and
+overview repairs but left admission identity partial because generic manual work lacked a defined authority
+arm; it also found the D7 profile-inventory, process-group-anchor, and rollback gaps. All D1-D10 owner
 decisions were approved on 2026-07-17. No implementation, schema, timer, private authority, live
 characterization, model discovery, registry/image effect, compatibility provider turn, GitHub check
 mutation, or production-operator action has been performed by this design fold; the only new provider
-activity was the twelve recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
+activity was the thirteen recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
 this exact committed revision. If approved, publish the non-draft docs PR and start R3d0 only after merge.
 Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 

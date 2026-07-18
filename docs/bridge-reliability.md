@@ -159,13 +159,18 @@ plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
   lowest-cost
   eligible model for a provider-generic adapter/capability probe. A model/effort/mode/alias/capability-
   specific PR must exercise the exact affected claimed-support identity; a cheap substitute cannot green
-  that gate. New provider-minimal probes live in a separate non-support scheduled-case registry through
+  that gate. Every D7-reachable production-support profile is inventoried and characterized through a strict
+  one-shot wrapper around the unchanged pinned runner before its impact class can be enabled. New provider-
+  minimal probes live in a separate non-support scheduled-case registry through
   characterization; an R3d-only strict scheduled-execution source binds a stable characterization-profile
   fingerprint, a distinct exact execution fingerprint, and exactly one tagged bootstrap or standing-grant arm.
   A bootstrap arm cannot enter an unattended trigger, and a standing arm cannot exist without the exact
   completed profile characterization. New test-merge/candidate/package/image identities under unchanged
   profile constraints execute once with a new exact fingerprint and never reuse prior evidence. They remain advisory unless R4 promotes
-  them deliberately. Scheduling uses fresh one-shot processes and never manipulates the long-lived operator.
+  them deliberately. Generic direct manual compatibility uses a non-reusable one-run local acknowledgement and
+  the same admission/deduplication/ledger boundary without inheriting standing authority. Scheduling uses fresh
+  one-shot processes, retains a bridge-owned process-group leader through final kill/reap, and never manipulates
+  the long-lived operator.
 - Require a trusted local affected-case canary on the exact current GitHub test-merge result SHA
   (`merge_commit_sha` / `refs/pull/<n>/merge`) before merging a compatibility-impacting same-repo PR. GitHub
   performs deterministic coordination/status only and never directly invokes credentialed work. Only an
@@ -200,8 +205,9 @@ plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
   suppression. Admission separately deduplicates equivalent work across R3d-aware trigger sources. Retained
   pre-R3d compatibility commands do not participate in that lease and are prohibited while any R3d provider-
   effect authority can admit; exact process detection holds and conservatively reconciles observed legacy
-  attempts without touching the legacy production `serve` process. Every future scheduled compatibility profile
-  is characterized before eligibility, and no skipped or unknown case is normalized into green.
+  attempts without touching the legacy production `serve` process. Every future scheduled/advisory or D7
+  claimed-support compatibility profile is characterized before eligibility, and no skipped or unknown case is
+  normalized into green.
 
 Exit: upstream drift is found by the canary rather than an unrelated feature branch.
 
