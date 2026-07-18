@@ -195,13 +195,13 @@ plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
   offload-aware revalidation before hot eviction and during retention. Raw evidence is never published to
   GitHub. Fresh floating observations may reuse content-addressed bytes only when exact immutable identity is
   unchanged.
-- Keep automatic safety holds, exact-fingerprint waste suppression, and explicit operator quarantine
+- Keep automatic safety holds, exact-execution-fingerprint waste suppression, and explicit operator quarantine
   distinct. `candidate_fail` alone is not permanent: one typed transient confirmation is allowed before
   suppression. Admission separately deduplicates equivalent work across R3d-aware trigger sources. Retained
-  pre-R3d compatibility commands do not participate in that lease and are prohibited while a provider-effect
-  standing grant is active; exact process detection holds and conservatively reconciles observed legacy attempts without
-  touching the legacy production `serve` process. Every future scheduled compatibility case is
-  characterized before eligibility, and no skipped or unknown case is normalized into green.
+  pre-R3d compatibility commands do not participate in that lease and are prohibited while any R3d provider-
+  effect authority can admit; exact process detection holds and conservatively reconciles observed legacy
+  attempts without touching the legacy production `serve` process. Every future scheduled compatibility profile
+  is characterized before eligibility, and no skipped or unknown case is normalized into green.
 
 Exit: upstream drift is found by the canary rather than an unrelated feature branch.
 
