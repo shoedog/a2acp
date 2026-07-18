@@ -130,10 +130,14 @@ missing Fable opt-in and missing reader settings prerequisite before a paid turn
 
 Exit: an operator can tell which boundary failed from one bounded run and its JSON artifact.
 
-Deferred R2f follow-up: phase-aware liveness and safe takeover after useful edits. The trigger is the
-operator-reported `INC-VERIFY-STALL-2026-07-11`, where a Luna run completed edits quickly and then parked
-in verification for nearly three hours. R2f must distinguish a silent healthy verifier from provider,
-adapter, child-process, or waiter failure before adding automated action; see the [R2f
+Deferred R2f follow-up: phase-aware liveness and safe takeover after useful edits, plus shared-operator
+session/backend health. The verification trigger is `INC-VERIFY-STALL-2026-07-11`, where a Luna run
+completed edits quickly and then parked in verification for nearly three hours. The shared-service triggers
+are `INC-SHARED-WARM-CRASH-2026-07-16` and `INC-SHARED-SESSION-CAPACITY-2026-07-17`, where the long-lived
+operator failed before observable prompt start while a fresh one-shot control succeeded. R2f must distinguish
+a silent healthy verifier from provider/adapter/child/waiter failure and distinguish poisoned transport from
+session-capacity debt before adding action. It owns capability-gated close and non-disruptive generation
+drain/rotation that preserves running turns and warm sessions; see the [R2f
 plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
 
 ### R3 — compatibility harness and canaries
@@ -149,11 +153,21 @@ plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
   and OpenCode as independent explicit provider increments before R4. Credentials remain environment-only;
   each integration must pass local fake/corpus gates before a separately authorized live smoke, and
   neither becomes an automatic fallback target.
-- Run a cheap minimal canary daily and a representative review workflow weekly.
-- Trigger both lanes on adapter, protocol-crate, agent-CLI, image, auth, or model-policy changes.
-- Persist machine-readable outcomes and diff them against the previous successful run.
-- Quarantine upstream/flaky failures with owner, expiry, cost cap, and retry limit; never normalize
-  them into green.
+- Run only characterized, fixed minimal cases under a narrow private standing grant, using the lowest-cost
+  eligible model for the provider/adapter/capability. Scheduling uses fresh one-shot processes and never
+  manipulates the long-lived operator.
+- Require a trusted local exact-SHA affected-case canary before merging compatibility-impacting same-repo
+  PRs; GitHub performs deterministic classification/status only and never directly invokes credentialed
+  work. Retain a coalesced main run as the integration backstop.
+- Defer representative review scheduling until a separate owner-reviewed design defines a fixed Tier-2
+  read-only fixture, prompt, scoring, caps, provider rotation, and evidence boundary. Review content is not
+  compatibility or promotion evidence.
+- Persist private machine-readable outcomes in bounded local/cold storage and diff them against previous
+  successful runs. Fresh floating observations may reuse content-addressed bytes only when exact immutable
+  identity is unchanged.
+- Keep automatic safety holds, exact-fingerprint waste suppression, and explicit operator quarantine
+  distinct. Every future scheduled support case is characterized before eligibility, and no skipped or
+  unknown case is normalized into green.
 
 Exit: upstream drift is found by the canary rather than an unrelated feature branch.
 

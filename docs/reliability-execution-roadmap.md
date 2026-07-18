@@ -1,11 +1,22 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main base:** `origin/main` at `504c1e43` on 2026-07-16 (PR #32 merged R3b)
-- **Completed through:** R3b **MERGED** at `504c1e43`; R2e remains deferred and off the critical path
-- **Active slice:** R3c floating-current lane **APPROVED / PENDING MERGE** on
-  `agent/reliability-r3c-floating-lane`
-- **Current R3c deterministic gate:** code head
+- **Current main base:** `origin/main` at `983398427c9f04861a2f1da501a7650c4a1cdd80` on 2026-07-17
+  (PR #33 merged R3c)
+- **Completed through:** R3c **MERGED** at `98339842`; R2e remains deferred and off the critical path
+- **Active slice:** R3d owner-bound scheduling/evidence-retention design revision on
+  `agent/reliability-r3d-scheduled-canaries`; implementation has not started
+- **Current R3d design gate:** one Fable/xhigh clean-room review of exact merged base `98339842` returned
+  six `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its concrete findings are folded into the
+  expanded R3d plan after operator approval of D1-D10 on 2026-07-17: hybrid local launchd/GitHub
+  infrastructure, narrow private standing authority, low-cost compatibility routing plus advisory
+  dogfooding policy, 10 GiB hot/25 GiB cold retention, deferred representative probes, characterization
+  plus three distinct controls, enforced affected-case pre-merge canaries with a post-merge backstop,
+  same-window content-addressed freshness/GC, durable reserve/reconcile budgets, and R2f ownership of the
+  long-lived operator. No implementation, schema, timer, grant, characterization, registry/image effect,
+  provider turn, GitHub check mutation, or operator lifecycle action was performed by the design fold.
+  Next design gate is one exact-docs-commit Sol/xhigh clean-room review; no Fable re-review is planned.
+- **Last merged R3c deterministic gate:** code head
   `4bd63f3f129a08586742c3c3e946fecfa02839ba` completes all four implementation slices and seven
   adversarial-review rounds. The initial Sol/xhigh review of exact `a5dfef8` returned nine `WRONG`, no
   `SMELL`, and `GATE: REVISE`; `e3459a5` closes all nine, and `d86e418` adds the missing pre-fix-red
@@ -52,9 +63,16 @@
   authorized provider-free host diagnostics resolved Codex and Claude package trees; generated-config
   doctors passed **10/0/0** and **11/0/0** respectively, but the retained bundles predate `f15ae88`,
   `b3793e8`, `4621ab5`, `dd99267`, and `4bd63f3` and are
-  diagnostic rather than exact-current compatibility evidence. No compatibility/provider smoke turn, model
-  discovery, image resolution/build, compatibility aggregate, operator rebuild, or operator swap ran; the
-  recorded review turns are review evidence only.
+  diagnostic rather than exact-current compatibility evidence. At that exact R3c review boundary, no
+  compatibility/provider smoke turn, model discovery, image resolution/build, compatibility aggregate,
+  operator rebuild, or operator swap ran; the recorded review turns are review evidence only. R3c merged
+  through PR #33 at `98339842`.
+- **Current production operator:** the immutable merged-R3c binary remains installed at
+  `/Users/wesleyjinks/Library/Application Support/a2a-bridge/operator/releases/983398427c9f0486/a2a-bridge`,
+  24,673,456 bytes, SHA-256
+  `2f548e23e21dd9c2d7e92bd461e30d4b405b5c519186b15adf8e6c0e42cc7719`; a live process was observed
+  listening on `127.0.0.1:18080` on 2026-07-17. This operator deployment is runtime state, not compatibility
+  or promotion evidence, and R3d must not stop, restart, drain, or rotate it.
 - **Last merged R3b deterministic gate:** nine pinned rows validate at manifest SHA-256
   `5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`. The current post-incident
   container-start fold passes binary **395 / 0 / 0**, affected bridge-core/ACP **514 / 0**, and the full
@@ -229,9 +247,12 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** publish the exact gate-green R3c approval fold as a non-draft PR. No exact-current
-  live resolution, model discovery, compatibility aggregate, operator rebuild, or operator swap is
-  authorized. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
+- **Next action:** finish the docs-only R3d design fold, verify the exact four-document boundary, commit it,
+  and run one fresh Sol/xhigh clean-room design review against that exact commit. Fold concrete findings,
+  obtain design approval, and publish the non-draft docs PR before R3d0 implementation. No live
+  characterization, model discovery, registry/image effect, provider turn, GitHub check mutation, private
+  grant, timer enablement, or production-operator lifecycle action is authorized. OpenRouter/OpenCode remain
+  R3e/R3f after the R3 core and before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**
@@ -257,11 +278,13 @@ R2a provenance (MERGED)
   -> R2c explicit one-turn billable smoke (MERGED)
        -> R2d local non-billable fallback plan (MERGED)
             -> R3 compatibility manifest + pinned/floating canaries + OpenRouter/OpenCode
-               (IN REVIEW: R3a/R3b MERGED; R3c APPROVED / PENDING MERGE)
+               (IN REVIEW: R3a/R3b/R3c MERGED; R3d DESIGN REVIEW)
                  -> R4 reproducible dependency/image pins + release promotion gate
 
 R2e authenticated in-process fallback is DEFERRED and off the critical path.
 It requires R2d plus a separately approved authenticated-policy/attestation design.
+R2f shared liveness/session-capacity/drain work is DEFERRED and remains parallel to R3d; R3d may display a
+future read-only R2f health result but cannot perform operator lifecycle actions.
 ```
 
 M4 Slice 3b/3c remains parked until the reliability exit gates in
@@ -281,8 +304,8 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2c — live smoke | **MERGED** at `be54bc51` by PR #28 (initial Fable/xhigh review `REVISE`; closure re-review `APPROVE` at `0e3b8ce`; attempt 1 rejected for initial `0644`; permission-fold review `APPROVE` at `23384622`; create-new closure review `APPROVE` at `ffb7e891`; full host workspace **1,933 / 0 / 12 ignored**; separately authorized attempt 2 on `1c9e4a43` passed artifact-exact in 8.770 s with mode `0600`, exact terminal `PONG`, no retry/fallback, and clean teardown) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
-| R2f — phase-aware liveness/takeover | **DEFERRED** (incident recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument first; phase-aware stagnation, exact process-tree termination, preserved-work takeover. Starts after R2b. |
-| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **APPROVED / PENDING MERGE** at code head `4bd63f3`. R3b attempts 1 and 2 remain non-promotable failure evidence. R3b exact `87c8f4e` Sol closure review approved and the one clean-room Fable/xhigh review of exact `a0c2c4c` returned release verdict `READY` and `GATE: APPROVE`; no Fable re-review. R3c Sol reviews of exact `a5dfef8`, `646d61b`, `5facc9c`, `260e4a6`, `af69806`, and `9d9f713` returned `REVISE`; `4bd63f3` closes the last hidden tar-metadata allocation `WRONG`. Exact-`0567381` Sol/xhigh closure review fixed all 15 inherited findings, found no new `WRONG` or `SMELL`, and returned `GATE: APPROVE`. Exact-`6637c13` Opus 4.8/xhigh release/compatibility review found no `WRONG` or `SMELL`, returned `READY`, and ended `GATE: APPROVE`; exact-head full/release/policy gates are green. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3a local manifest/runner and R3b pinned lane merged; R3c owns provider-free floating resolution plus bound execution; then R3d owner-bound scheduling, R3e OpenRouter, R3f OpenCode. |
+| R2f — phase-aware liveness/takeover | **DEFERRED** (three incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
+| R3 — compatibility canaries | **IN REVIEW** — R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33. R3b attempts 1 and 2 remain non-promotable failure evidence. R3c code head `4bd63f3` passed focused **61 / 0** and full host **2,165 / 0 / 12 ignored** across **70** groups; exact-`0567381` Sol/xhigh closure review returned `GATE: APPROVE`, and exact-`6637c13` Opus 4.8/xhigh release/compatibility review returned `READY` and `GATE: APPROVE`. R3d's initial Fable/xhigh design review of exact `98339842` returned six `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`; all D1-D10 owner decisions are approved and folded into the expanded design, with exact-commit Sol/xhigh review pending and no implementation/live action yet. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | R3d adds narrow owner-bound scheduling, supervision, accounting, retention, and pre-merge gating without touching the long-lived operator; then R3e OpenRouter and R3f OpenCode. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -319,8 +342,9 @@ model, effort, mode, and exact review worktree. Its non-billable validate/model/
 package/model/auth/cwd incompatibility but does not distinguish stale shared ACP connection state from a
 serve-only session/configuration defect. Source inspection confirms `session/new` transport failure and
 model/effort `session/set_config_option` rejection can both map to `AgentCrashed` before a turn-log row.
-Carry the missing structured failure projection and stale-shared-state recovery question into R2f/R3d;
-do not replay automatically or use this review as compatibility evidence.
+Carry the missing structured failure projection and stale-shared-state recovery question into R2f. R3d's
+only disposition is an explicit fresh-one-shot boundary with `shared_operator_health = not_evaluated`; it
+must not replay automatically or use this review as compatibility evidence.
 
 ### Deferred incident: long-lived operator accumulated unreleased ACP sessions
 
@@ -337,10 +361,11 @@ model, auth, and cwd incompatibility predict failure in the isolated operator an
 turn. A transport-specific fault predicts old-only failure without requiring a particular session count and
 remains viable. No operator process, warm session, or active turn was stopped or restarted.
 
-Carry this into R2f/R3d as structured pre-turn ACP error retention, backend/session-capacity health,
-capability-gated close semantics, dead-backend detection, a deterministic threshold regression, and a
-non-disruptive drain/rotate design that never interrupts running turns or warm sessions. Do not automatically
-replay the failed request or treat the isolated review as compatibility evidence.
+Carry this into R2f as structured pre-turn ACP error retention, backend/session-capacity health,
+capability-gated close semantics, dead-backend detection, deterministic capacity-versus-transport
+separation, and a non-disruptive generation drain/rotate design that never interrupts running turns or warm
+sessions. R3d remains one-shot only and may later display, but never act on, a separate R2f health artifact.
+Do not automatically replay the failed request or treat the isolated review as compatibility evidence.
 
 ### Resolved incident: synchronized but expired Claude OAuth reached billable prompt
 
@@ -552,18 +577,31 @@ Next action:
 ## Current handoff
 
 - R3a merged through PR #31 at `3927df3f1dce03fde50b7754151a718017f45815`. R3b merged through PR #32
-  at `504c1e434fd5845bc6745e0b0a0aae95427afbdd`. R3c is **APPROVED / PENDING MERGE** on
-  `agent/reliability-r3c-floating-lane`, based directly on that merge. The
-  manifest now contains nine
+  at `504c1e434fd5845bc6745e0b0a0aae95427afbdd`. R3c merged through PR #33 at
+  `983398427c9f04861a2f1da501a7650c4a1cdd80`. R3d design revision is active on
+  `agent/reliability-r3d-scheduled-canaries`, based directly on that merge. The manifest now contains nine
   exact pinned rows: four release-blocking minimal bridge-smoke support cases and five explicit
   historical/non-goal controls. Every config is checked in and SHA-bound before provider spawn. The two
   supported reader cases and the stale Kiro reader control use the separately tagged immutable image
   `sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1`; bounded image inspection
   supplies exact adapter/CLI package labels, and Claude Fable additionally binds the mounted minimal
-  settings file at SHA-256 `6ee4ad31...eef81f19`. The existing operator image/tag/process were not
-  changed. The reader build now pins the nested Codex 0.144.1 and Claude SDK 0.3.198 resolutions and
+  settings file at SHA-256 `6ee4ad31...eef81f19`. R3b did not change the then-existing operator
+  image/tag/process. The reader build now pins the nested Codex 0.144.1 and Claude SDK 0.3.198 resolutions and
   fails if the bundled Claude version is not 2.1.198. Its still-floating Kiro download resolved 2.12.3,
   so both Kiro rows remain `STALE` for R4 rather than becoming support evidence.
+- The initial exact-base R3d Fable/xhigh design review returned six `WRONG`, thirteen `SMELL`, and
+  `R3D DESIGN: REVISE`. All D1-D10 owner decisions were approved on 2026-07-17 and are now explicit in the
+  R3 plan: local launchd plus fresh one-shot canaries, trusted local pre-merge checks, narrow private
+  authority, low-cost provider routing, characterization-before-schedule, separate safety/waste/quarantine
+  controls, conservative cross-run accounting, two-tier retention/GC, and strict R2f ownership of the
+  long-lived operator. The docs-only fold has no code/schema/timer/grant/live effects. Its next gate is one
+  fresh exact-commit Sol/xhigh clean-room design review, then a non-draft docs PR before R3d0.
+- The merged-R3c production operator binary is installed at
+  `/Users/wesleyjinks/Library/Application Support/a2a-bridge/operator/releases/983398427c9f0486/a2a-bridge`,
+  24,673,456 bytes, SHA-256
+  `2f548e23e21dd9c2d7e92bd461e30d4b405b5c519186b15adf8e6c0e42cc7719`; it was observed listening on
+  `127.0.0.1:18080` on 2026-07-17. This runtime state is not compatibility evidence, and R3d has no
+  authority to stop, restart, drain, rotate, or close it.
 - R3b closes the R3a approval debt with symmetric final-sibling replacement coverage, expanded
   credential-shaped prerequisite rejection, and explicit blocking negative, non-finite, or non-USD cost evidence
   that remains sticky across later usage snapshots.
@@ -585,8 +623,9 @@ Next action:
   invalid/valid usage orders. The Docker label path was exercised
   against the candidate image. A real Podman label inspection remains unverified because no local Podman
   image was available; bounded parser/runtime fakes cover Podman-shaped image IDs. Authorized attempt 1
-  produced two Codex passes and two Fable HTTP 401 failures with no retry/fallback; no baseline promotion,
-  operator rebuild, or operator swap has run. A later exact-`f9f3e68` Sol review returned `REVISE` on the
+  produced two Codex passes and two Fable HTTP 401 failures with no retry/fallback; at that R3b evidence
+  boundary no baseline promotion, operator rebuild, or operator swap had run. A later exact-`f9f3e68` Sol
+  review returned `REVISE` on the
   pre-recovery deadline gap plus parser/comment smells; local mutation-backed deadline/config-directory and parser folds have full
   host/Linux/merge-policy gates green. Sol approved that exact tree with no findings. A subsequent local
   audit demonstrated and folded immediate-expiry resolver polling plus pinned external-provider false-blocks.
@@ -661,9 +700,10 @@ Next action:
   diagnostics resolved current Codex and Claude package trees and produced green generated-config doctors,
   but the retained bundles predate `f15ae88`, `b3793e8`, `4621ab5`, `dd99267`, and `4bd63f3` and are
   diagnostic rather than exact-current compatibility evidence. Linux/Rust 1.94 remains green only on
-  historical implementation head `57e63a0`; no local image remains and no pull was authorized. No
-  compatibility/provider smoke turn, model discovery, image resolution/build, compatibility aggregate,
-  operator rebuild, or operator swap ran; the recorded review turns are review evidence only. The complete
+  historical implementation head `57e63a0`; no local image remains and no pull was authorized. At the R3c
+  review boundary no compatibility/provider smoke turn, model discovery, image resolution/build,
+  compatibility aggregate, operator rebuild, or operator swap ran; the recorded review turns are review
+  evidence only. The complete
   restart contract, schemas, failure taxonomy, mutation matrix, live authorization gates, rollback, and
   deferrals remain in the active R3 plan.
 - Authorized attempt 2 is retained at
@@ -678,9 +718,9 @@ Next action:
   source-runtime shutdown both before and during ordinary-error settlement with exact client exit before one
   joined reap. The local OrbStack/Docker initiating cause remains unknown.
 - OpenRouter and OpenCode are recorded as R3e/R3f after the pinned/floating/scheduling core and before
-  R4. Credentials remain environment-only; neither provider is eligible for automatic fallback. The
-  running operator service is unchanged until a merged candidate is rebuilt and swapped during a
-  coordinated quiet period.
+  R4. Credentials remain environment-only; neither provider is eligible for automatic fallback. Neither
+  provider is present in the deployed merged-R3c operator; any future provider-bearing candidate requires a
+  new reviewed build and a coordinated non-disruptive deployment decision.
 - R2d adds a default-off unsandboxed-ACP target capability and a local non-billable `fallback-plan`.
   The planner accepts only a complete failed smoke-v2 regular-file artifact bound by canonical path and
   exact-byte SHA-256 to the current pinned registry-only config. It rejects task envelopes and smoke-v1,
