@@ -868,16 +868,30 @@ fn r3d0_policy_rejects_a_changed_trusted_cwd_root() {
 #[test]
 fn r3d0_scheduled_required_env_rejects_credential_channels_before_inventory_identity() {
     let mut accepted = Vec::new();
-    for (label, from, to) in [
+    for (label, from, to, config_rewrite, expected_error) in [
         (
             "credential-shaped prerequisite",
             "required_env = []",
             "required_env = [{ name = \"OPENAI_API_KEY\" }]",
+            None,
+            "credential-shaped",
         ),
         (
             "credential prerequisite duplication",
             "credential_env = \"OLLAMA_API_KEY\"\nrequired_env = []",
             "credential_env = \"OLLAMA_API_KEY\"\nrequired_env = [{ name = \"OLLAMA_API_KEY\" }]",
+            None,
+            "credential-shaped",
+        ),
+        (
+            "ordinary-name credential prerequisite duplication",
+            "credential_env = \"OLLAMA_API_KEY\"\nrequired_env = []",
+            "credential_env = \"SERVICE_ENV\"\nrequired_env = [{ name = \"SERVICE_ENV\" }]",
+            Some((
+                "api_key_env = \"OLLAMA_API_KEY\"",
+                "api_key_env = \"SERVICE_ENV\"",
+            )),
+            "must not repeat credential_env",
         ),
     ] {
         let temp = tempfile::tempdir().unwrap();
@@ -887,6 +901,14 @@ fn r3d0_scheduled_required_env_rejects_credential_channels_before_inventory_iden
         let changed = original.replacen(from, to, 1);
         assert_ne!(changed, original, "{label} fixture did not mutate");
         fs::write(path, changed).unwrap();
+
+        if let Some((config_from, config_to)) = config_rewrite {
+            let config_path = temp.path().join("configs/ollama-local.toml");
+            let original = fs::read_to_string(&config_path).unwrap();
+            let changed = original.replacen(config_from, config_to, 1);
+            assert_ne!(changed, original, "{label} config fixture did not mutate");
+            fs::write(config_path, changed).unwrap();
+        }
 
         let first = validate_foundation(temp.path());
         let output = if String::from_utf8_lossy(&first.stderr).contains("fingerprint mismatch") {
@@ -899,7 +921,7 @@ fn r3d0_scheduled_required_env_rejects_credential_channels_before_inventory_iden
             continue;
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("credential-shaped"), "{label}: {stderr}");
+        assert!(stderr.contains(expected_error), "{label}: {stderr}");
         assert!(
             !stderr.contains("fingerprint mismatch"),
             "{label}: {stderr}"
