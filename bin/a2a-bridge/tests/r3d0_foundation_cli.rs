@@ -93,6 +93,34 @@ fn bundle_sha256(output: &std::process::Output) -> String {
         .to_owned()
 }
 
+fn repin_single_profile_mismatch(
+    root: &Path,
+    output: &std::process::Output,
+) -> std::process::Output {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected_marker = " expected ";
+    let found_marker = " but found ";
+    let expected_start = stderr
+        .find(expected_marker)
+        .unwrap_or_else(|| panic!("missing expected fingerprint in stderr: {stderr}"))
+        + expected_marker.len();
+    let found_start = stderr[expected_start..]
+        .find(found_marker)
+        .map(|offset| expected_start + offset + found_marker.len())
+        .unwrap_or_else(|| panic!("missing found fingerprint in stderr: {stderr}"));
+    let expected = &stderr[expected_start..expected_start + 64];
+    let found = &stderr[found_start..found_start + 64];
+    assert!(expected.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(found.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    let inventory_path = root.join("characterization-profiles.toml");
+    let inventory = fs::read_to_string(&inventory_path).unwrap();
+    let repinned = inventory.replacen(found, expected, 1);
+    assert_ne!(repinned, inventory, "inventory fingerprint was not found");
+    fs::write(inventory_path, repinned).unwrap();
+    validate_foundation(root)
+}
+
 fn caps_json() -> serde_json::Value {
     serde_json::json!({
         "timeout_secs": 180,
@@ -738,6 +766,61 @@ fn r3d0_foundation_rejects_untrusted_scheduled_and_claimed_support_cwds() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn r3d0_foundation_rejects_a_scheduled_cwd_symlink_escape_after_inventory_repin() {
+    use std::os::unix::fs::symlink;
+
+    let trusted_root = Path::new("/Users/wesleyjinks/code");
+    if !trusted_root.is_dir() {
+        // Portable CI validates the owner-specific checked-in identity without mounting the
+        // owner's repository root. The unit-level object-resolution test remains unconditional.
+        return;
+    }
+
+    let outside = tempfile::tempdir().unwrap();
+    let placeholder = tempfile::NamedTempFile::new_in(trusted_root).unwrap();
+    let link = placeholder.path().to_path_buf();
+    drop(placeholder);
+    symlink(outside.path(), &link).unwrap();
+    struct RemoveSymlink(PathBuf);
+    impl Drop for RemoveSymlink {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = RemoveSymlink(link.clone());
+
+    let temp = tempfile::tempdir().unwrap();
+    copy_foundation(temp.path());
+    let registry_path = temp.path().join("scheduled-cases.toml");
+    let original = fs::read_to_string(&registry_path).unwrap();
+    let changed = original.replacen(
+        "session_cwd = \"/Users/wesleyjinks/code/a2a-bridge\"",
+        &format!("session_cwd = {:?}", link.to_string_lossy()),
+        1,
+    );
+    assert_ne!(changed, original);
+    fs::write(registry_path, changed).unwrap();
+
+    let first = validate_foundation(temp.path());
+    let output = if String::from_utf8_lossy(&first.stderr).contains("fingerprint mismatch") {
+        repin_single_profile_mismatch(temp.path(), &first)
+    } else {
+        first
+    };
+    assert!(
+        !output.status.success(),
+        "symlink escape passed after re-pin"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("owner-approved trusted cwd root"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("fingerprint mismatch"), "{stderr}");
+}
+
 #[test]
 fn r3d0_claimed_support_profile_keeps_the_owner_approved_environment() {
     let temp = tempfile::tempdir().unwrap();
@@ -779,6 +862,76 @@ fn r3d0_policy_rejects_a_changed_trusted_cwd_root() {
     assert!(
         stderr.contains("owner-approved repository root"),
         "{stderr}"
+    );
+}
+
+#[test]
+fn r3d0_scheduled_required_env_rejects_credential_channels_before_inventory_identity() {
+    let mut accepted = Vec::new();
+    for (label, from, to) in [
+        (
+            "credential-shaped prerequisite",
+            "required_env = []",
+            "required_env = [{ name = \"OPENAI_API_KEY\" }]",
+        ),
+        (
+            "credential prerequisite duplication",
+            "credential_env = \"OLLAMA_API_KEY\"\nrequired_env = []",
+            "credential_env = \"OLLAMA_API_KEY\"\nrequired_env = [{ name = \"OLLAMA_API_KEY\" }]",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        copy_foundation(temp.path());
+        let path = temp.path().join("scheduled-cases.toml");
+        let original = fs::read_to_string(&path).unwrap();
+        let changed = original.replacen(from, to, 1);
+        assert_ne!(changed, original, "{label} fixture did not mutate");
+        fs::write(path, changed).unwrap();
+
+        let first = validate_foundation(temp.path());
+        let output = if String::from_utf8_lossy(&first.stderr).contains("fingerprint mismatch") {
+            repin_single_profile_mismatch(temp.path(), &first)
+        } else {
+            first
+        };
+        if output.status.success() {
+            accepted.push(label);
+            continue;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("credential-shaped"), "{label}: {stderr}");
+        assert!(
+            !stderr.contains("fingerprint mismatch"),
+            "{label}: {stderr}"
+        );
+    }
+    assert!(
+        accepted.is_empty(),
+        "credential channels accepted after inventory re-pin: {accepted:?}"
+    );
+}
+
+#[test]
+fn r3d0_scheduled_required_env_accepts_an_ordinary_non_secret_prerequisite() {
+    let temp = tempfile::tempdir().unwrap();
+    copy_foundation(temp.path());
+    let path = temp.path().join("scheduled-cases.toml");
+    let original = fs::read_to_string(&path).unwrap();
+    let changed = original.replacen(
+        "required_env = []",
+        "required_env = [{ name = \"PATH\" }]",
+        1,
+    );
+    assert_ne!(changed, original);
+    fs::write(path, changed).unwrap();
+
+    let mismatch = validate_foundation(temp.path());
+    assert!(!mismatch.status.success());
+    let output = repin_single_profile_mismatch(temp.path(), &mismatch);
+    assert!(
+        output.status.success(),
+        "ordinary prerequisite failed after re-pin: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

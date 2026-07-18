@@ -1560,8 +1560,9 @@ It serializes:
   adapter/SDK/CLI and image-family names plus their allowed resolution constraints, auth-path type, and
   non-secret prerequisite names/shapes;
 - requested raw model/effort/mode and proposed-or-characterized expected-effective model/effort/mode;
-  environment owner, OS/architecture, trusted session cwd, host/reader shape, redaction policy, retry/fallback
-  zero, and maximum token/cost/time/attempt caps.
+  environment owner, OS/architecture, trusted session cwd (the resolved in-root directory path when the owner
+  root is mounted; otherwise only the declared static path for no-effect offline validation), host/reader
+  shape, redaction policy, retry/fallback zero, and maximum token/cost/time/attempt caps.
 
 The profile deliberately excludes the changing immutable execution inputs the canary is meant to test: exact
 PR/base/head/test-merge SHA/ref/tree/ordered parents or scheduled-main range; candidate binary bytes/build
@@ -2277,7 +2278,9 @@ unknown sidecar version fails schedule-specific consumption without making the u
    fingerprints, equivalent-work/
    consumption, scheduled-case registry, strict scheduled- and claimed-support-characterization sources,
    schedule-sidecar, publication-outbox, evidence-index, status, and routing
-   schemas plus validators and docs. Add and review
+   schemas plus validators and docs. Scheduled prerequisites reuse the production credential-name exclusion,
+   and mounted owner cwd paths resolve to real directories inside the trusted root; an offline static-path
+   validation never authorizes execution. Add and review
    every exact provider-minimal advisory row/config intended for R3d5 characterization; keep it outside the
    protected support manifest. Add the initial four exact claimed-support profile references without changing
    that manifest. Do not execute either class. No timer, credential access, registry/runtime effect, or provider
@@ -2296,7 +2299,9 @@ unknown sidecar version fails schedule-specific consumption without making the u
    equivalent-work reuse/refusal, characterization state,
    three control types, durable reserve/reconcile ledger, UTC/rolling windows, scheduled/test-merge/manual
    accounting classes, legacy executable/process detection and conservative import, and automated zero-effect
-   preflights.
+   preflights. Immediately before admission, re-resolve the trusted owner root and requested cwd as real
+   filesystem objects and fail closed unless the cwd remains contained; an R3d0 offline/static validation is
+   never sufficient for that action-time check.
 4. **R3d3 — evidence, status, and retention.** Add hot/cold stores, index, sealing, pins, tombstones, quotas,
    leases, bundle/image GC, local CLI/status/notifications, strict schedule-sidecar plus unchanged-aggregate
    compatibility, crash-consistent publication-outbox journal storage, explicit owner-iCloud upload/offload

@@ -483,11 +483,11 @@ fn validate_relative_path(label: &str, path: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
-fn validate_trusted_session_cwd(
+fn resolve_trusted_session_cwd(
     label: &str,
     path: &Path,
     trusted_root: &Path,
-) -> Result<(), BoxError> {
+) -> Result<PathBuf, BoxError> {
     if !path.is_absolute()
         || path
             .components()
@@ -499,7 +499,46 @@ fn validate_trusted_session_cwd(
         )
         .into());
     }
-    Ok(())
+
+    match std::fs::symlink_metadata(trusted_root) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // The checked-in foundation is also validated on non-owner CI hosts where this exact
+            // owner-only root does not exist. Static lexical containment remains deterministic
+            // there; an owner host with the root present must complete object resolution below.
+            return Ok(path.to_path_buf());
+        }
+        Err(error) => {
+            return Err(format!(
+                "schedule foundation: cannot inspect the owner-approved trusted cwd root for {label}: {error}"
+            )
+            .into())
+        }
+    }
+
+    let canonical_root = std::fs::canonicalize(trusted_root).map_err(|error| {
+        format!(
+            "schedule foundation: cannot resolve the owner-approved trusted cwd root for {label}: {error}"
+        )
+    })?;
+    if !canonical_root.is_dir() {
+        return Err(format!(
+            "schedule foundation: owner-approved trusted cwd root for {label} is not a directory"
+        )
+        .into());
+    }
+    let canonical_path = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "schedule foundation: {label} is not a resolvable directory under the owner-approved trusted cwd root: {error}"
+        )
+    })?;
+    if !canonical_path.is_dir() || !canonical_path.starts_with(&canonical_root) {
+        return Err(format!(
+            "schedule foundation: {label} must resolve to a directory under the owner-approved trusted cwd root"
+        )
+        .into());
+    }
+    Ok(canonical_path)
 }
 
 fn load_toml<T: DeserializeOwned>(path: &Path, label: &str) -> Result<LoadedToml<T>, BoxError> {
@@ -978,7 +1017,7 @@ fn validate_scheduled_case(
         )
         .into());
     }
-    validate_trusted_session_cwd(
+    resolve_trusted_session_cwd(
         &format!("case {:?} session cwd", case.id),
         &case.session_cwd,
         &policy.trusted_cwd_root,
@@ -1002,6 +1041,20 @@ fn validate_scheduled_case(
         if !env_name(&required.name) || !envs.insert(required.name.as_str()) {
             return Err(format!(
                 "schedule foundation: case {:?} has an invalid or duplicate required environment name",
+                case.id
+            )
+            .into());
+        }
+        if compatibility::credential_shaped_env_name(&required.name) {
+            return Err(format!(
+                "schedule foundation: case {:?} must declare credential-shaped environment name {:?} as credential_env, not required_env",
+                case.id, required.name
+            )
+            .into());
+        }
+        if case.credential_env.as_deref() == Some(required.name.as_str()) {
+            return Err(format!(
+                "schedule foundation: case {:?} must not repeat credential_env in required_env",
                 case.id
             )
             .into());
@@ -1422,11 +1475,16 @@ fn scheduled_profile(
     case: &ScheduledCaseV1,
     config_sha256: String,
     resolution_constraint_sha256: Option<String>,
-) -> CanonicalProfileInputV1 {
+) -> Result<CanonicalProfileInputV1, BoxError> {
     let mut allowed_effects = case.allowed_effects.clone();
     allowed_effects.sort();
     let required_env = canonical_required_environment(case.required_env.clone());
-    CanonicalProfileInputV1 {
+    let session_cwd = resolve_trusted_session_cwd(
+        &format!("case {:?} session cwd", case.id),
+        &case.session_cwd,
+        &policy.trusted_cwd_root,
+    )?;
+    Ok(CanonicalProfileInputV1 {
         schema_version: 1,
         source_kind: ProfileSourceKindV1::ScheduledAdvisory,
         source_id: case.id.clone(),
@@ -1461,7 +1519,7 @@ fn scheduled_profile(
         environment_owner: case.environment_owner.clone(),
         os: case.os.clone(),
         architecture: case.architecture.clone(),
-        session_cwd: case.session_cwd.to_string_lossy().into_owned(),
+        session_cwd: session_cwd.to_string_lossy().into_owned(),
         requested_model: case.model.clone(),
         requested_effort: case.effort.clone(),
         requested_mode: case.mode.clone(),
@@ -1477,7 +1535,7 @@ fn scheduled_profile(
         artifact_retention_days: case.artifact.retention_days,
         artifact_redaction: "strict".into(),
         maximum_caps: case.caps.clone(),
-    }
+    })
 }
 
 #[derive(Serialize)]
@@ -1702,11 +1760,13 @@ fn support_profile(
     let session_cwd = optional("session_cwd").ok_or_else(|| -> BoxError {
         format!("schedule foundation: support case {id:?} has no trusted session cwd").into()
     })?;
-    validate_trusted_session_cwd(
+    let session_cwd = resolve_trusted_session_cwd(
         &format!("support case {id:?} session cwd"),
         Path::new(&session_cwd),
         &policy.trusted_cwd_root,
-    )?;
+    )?
+    .to_string_lossy()
+    .into_owned();
     let config = PathBuf::from(required("config")?);
     validate_relative_path("support config", &config)?;
     let config_snapshot = local_file::read_regular_file_bounded(
@@ -2324,7 +2384,7 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
             case,
             config_sha256,
             resolution_constraint_sha256,
-        );
+        )?;
         let hash = canonical_hash("scheduled characterization profile", &profile)?;
         expected.insert(
             (ProfileSourceKindV1::ScheduledAdvisory, case.id.clone()),
@@ -2489,24 +2549,50 @@ mod tests {
 
     #[test]
     fn trusted_session_cwd_rejects_traversal_relative_and_sibling_paths() {
-        let root = Path::new(OWNER_APPROVED_TRUSTED_CWD_ROOT);
-        validate_trusted_session_cwd(
-            "valid fixture",
-            Path::new("/Users/wesleyjinks/code/a2a-bridge"),
-            root,
-        )
-        .unwrap();
-        validate_trusted_session_cwd("root fixture", root, root).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("trusted-root");
+        let inside = root.join("repository");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+
+        assert_eq!(
+            resolve_trusted_session_cwd("valid fixture", &inside, &root).unwrap(),
+            std::fs::canonicalize(&inside).unwrap()
+        );
+        assert_eq!(
+            resolve_trusted_session_cwd("root fixture", &root, &root).unwrap(),
+            std::fs::canonicalize(&root).unwrap()
+        );
 
         for path in [
-            "/Users/wesleyjinks/code/../Documents",
-            "/Users/wesleyjinks/code-other/repo",
-            "relative/repo",
+            root.join("../outside"),
+            temp.path().join("trusted-root-sibling/repository"),
+            PathBuf::from("relative/repo"),
         ] {
-            assert!(
-                validate_trusted_session_cwd("invalid fixture", Path::new(path), root).is_err()
-            );
+            assert!(resolve_trusted_session_cwd("invalid fixture", &path, &root).is_err());
         }
+
+        #[cfg(unix)]
+        {
+            let link = root.join("outside-link");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            let error = resolve_trusted_session_cwd("symlink escape fixture", &link, &root)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("owner-approved trusted cwd root"), "{error}");
+        }
+    }
+
+    #[test]
+    fn trusted_session_cwd_retains_static_identity_when_owner_root_is_offline() {
+        let temp = tempfile::tempdir().unwrap();
+        let offline_root = temp.path().join("owner-root-not-mounted");
+        let declared = offline_root.join("repository");
+        assert_eq!(
+            resolve_trusted_session_cwd("offline fixture", &declared, &offline_root).unwrap(),
+            declared
+        );
     }
 
     #[test]

@@ -351,7 +351,7 @@ fn env_name(value: &str) -> bool {
         && value.len() <= MAX_ID_BYTES
 }
 
-fn credential_shaped_env_name(value: &str) -> bool {
+pub(super) fn credential_shaped_env_name(value: &str) -> bool {
     value.split('_').any(|part| {
         matches!(
             part,

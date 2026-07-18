@@ -29,11 +29,19 @@ any resolved child path outside that root, and retains each file's descriptor ob
 as its path and digest. The final pass compares every capture, including repeated canonical paths, and
 requires all four to remain unchanged; same-byte atomic replacement and mixed file-object generations fail
 closed. Every scheduled-advisory and claimed-support `session_cwd` must be absolute, traversal-free, and at
-or below the exact trusted repository root. Validation raw-scans comments and values before parsing,
-recognizes structured credential-key delimiters, never invokes the runtime config parser or expands
-environment variables, applies strict TOML/recipe schemas and exact inventory coverage, and checks provider,
-adapter/command, auth/pre-auth/API-key environment, resolution recipe, endpoint, arguments, server, mount,
-egress, network, proxy, credential volume, config-template, and effect agreement. Claimed-support config
+or below the exact trusted repository root. When that owner root is mounted, validation canonicalizes the
+root and each cwd, requires a real directory whose resolved object remains inside the root, and binds the
+resolved path into profile identity; an in-root symlink to an outside directory fails before inventory
+comparison. A non-owner/offline validator on which the exact owner root is absent retains only the static
+absolute, traversal-free path identity so deterministic no-effect CI remains possible. That offline result is
+not execution proof: R3d2 must repeat real-directory/object containment immediately before admitting any
+effect. Validation raw-scans comments and values before parsing, recognizes structured credential-key
+delimiters, never invokes the runtime config parser or expands environment variables, applies strict TOML/
+recipe schemas and exact inventory coverage, and checks provider, adapter/command, auth/pre-auth/API-key
+environment, resolution recipe, endpoint, arguments, server, mount, egress, network, proxy, credential
+volume, config-template, and effect agreement. Scheduled `required_env` uses the same credential-shaped-name
+classifier as the production manifest and cannot repeat `credential_env`; ordinary non-secret prerequisites
+remain valid. Claimed-support config
 bytes must match their exact production-manifest pin and cannot bypass those semantic constraints by updating
 the pin. The result is a canonical semantic profile-policy bundle: comments and set/row ordering do not
 affect it, while material policy, recipe, or template changes do. Every canonical hash includes an explicit
