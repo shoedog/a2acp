@@ -1106,7 +1106,7 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 
 - **Branch:** `agent/reliability-r3d-scheduled-canaries`
 - **Base:** merged R3c main `983398427c9f04861a2f1da501a7650c4a1cdd80`
-- **Status:** design of record revised from owner decisions and nine exact-commit Sol reviews;
+- **Status:** design of record revised from owner decisions and ten exact-commit Sol reviews;
   implementation not started; fresh Sol/xhigh closure review pending
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
@@ -1185,9 +1185,17 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   SHA-256 `5b3be5b5ee762618a88a20bb5436c53057b4bd04d29bcf68c85eb6a6de0492a1`. This revision keeps repeated
   non-waste `candidate_unknown` in its existing lifecycle and reserves suppression for independently typed
   immutable waste or the second identical complete typed transient failure.
+- **Ninth closure review:** one fresh one-node bridge-mediated Sol/xhigh/read-only review of exact
+  `fb8a2f48a810c4975c386b93f6dd5db06ee6ede6` marked the repeated-non-waste-unknown finding `FIXED`,
+  found no regression in earlier closed mechanisms, then returned one initial-characterization authority
+  `WRONG`, no new `SMELL`, and `R3D DESIGN: REVISE`. Its fixed output is
+  `/private/tmp/a2a-bridge-r3d-sol-closure-fb8a2f4.VP48YA/review.md`, mode `0600`, 12,032 bytes,
+  SHA-256 `af6e8ce71696781f080a1592fa689575f5c9da84c8f6d14398220eb5a577b948`. This revision
+  adds mutually exclusive one-shot characterization and post-characterization standing-grant admission arms,
+  so bootstrap never fabricates an authority or characterization identity that does not yet exist.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
-standing authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
+tagged effect authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
 and a trusted pre-merge compatibility gate. It does not add arbitrary prompts, automatic provider
 fallback, automatic promotion, or production-operator session management.
 
@@ -1197,9 +1205,12 @@ fallback, automatic promotion, or production-operator session management.
   long-lived production `serve` endpoint and never stop, restart, drain, rotate, or close its sessions.
 - GitHub never directly invokes credentialed provider work. A trusted local scheduler pulls immutable
   metadata, recomputes impact, and owns every local effect.
-- The provider-effect standing grant authorizes only fixed compatibility case ids and fixed lifecycle probes.
-  It is not authority for general `serve`, `submit`, `run-workflow`, `implement`, other repositories/
-  controllers, arbitrary prompts, or automatic fallback.
+- The one-shot characterization authorization and provider-effect standing grant authorize only exact fixed
+  compatibility case ids and fixed lifecycle probes. The first is consumable only by the explicit
+  characterization command for a `characterization_required` fingerprint; the second is usable only after
+  completed characterization and is the sole authority for unattended scheduling. Neither is authority for
+  general `serve`, `submit`, `run-workflow`, `implement`, other repositories/controllers, arbitrary prompts,
+  or automatic fallback.
 - Every prompt-capable attempt remains one fixed prompt, zero retry, zero provider substitution, and zero
   replay after possible acceptance. A failure is evidence, never same-window retry permission. The sole
   later-window transient confirmation is a new independently admitted attempt authorized in advance by the
@@ -1221,7 +1232,7 @@ fallback, automatic promotion, or production-operator session management.
 | Decision | Approved contract |
 |---|---|
 | D1 — substrate | Hybrid: local launchd supplies time, a fresh one-shot bridge owns each canary, the long-lived operator remains interactive, and GitHub performs deterministic checks/change detection only. A later R2f-gated lane owns long-lived operator health. |
-| D2 — authority | Checked-in non-authoritative policy plus a private owner-only provider-effect standing grant and independently revocable cold-storage consent. The provider grant is narrow to R3d compatibility scheduling/dogfood cases and never authorizes general bridge/server use; storage consent grants only the approved iCloud evidence lifecycle. |
+| D2 — authority | Checked-in non-authoritative policy plus a private owner-only effect-authority envelope with mutually exclusive one-shot-characterization and post-characterization standing-grant admission arms, and independently revocable cold-storage consent. Each one-shot entry is narrow to one exact characterization fingerprint; the standing grant is narrow to characterized R3d compatibility scheduling/dogfood cases. Neither authorizes general bridge/server use; storage consent grants only the approved iCloud evidence lifecycle. |
 | D3 — model/task routing | Compatibility uses the lowest-cost eligible model for the exact provider/adapter/capability. General dogfooding uses the task matrix below as advisory, auditable policy rather than automatic routing. |
 | D4 — evidence | Two-tier owner storage: 10 GiB hot local evidence and 25 GiB cold iCloud-backed archives, with typed retention, pins, tombstones, quotas, and local status/notifications. |
 | D5 — representative probe | Defer broad scheduled reviews. Design the fixed read-only fixture adapter with operator input in a separate increment before implementation. |
@@ -1231,7 +1242,7 @@ fallback, automatic promotion, or production-operator session management.
 | D9 — budgets | Durable reserve-then-reconcile accounting with a UTC ledger, rolling guard, protected pre-merge pool, and conservative charge for ambiguous or missing usage. |
 | D10 — operator ownership | R3d proves fresh one-shot compatibility only. R2f owns shared-session health, close/capacity, stagnation, and non-disruptive drain/rotation. |
 
-### D1/D2 — execution owner and standing authority
+### D1/D2 — execution owner and effect authority
 
 The developer Mac identified by `environment_owner` owns credentials, launchd, the evidence root, the
 local scheduler, and the least-privileged GitHub check credential. There is no self-hosted GitHub Actions
@@ -1253,10 +1264,21 @@ R3d adds one checked-in policy and one private authority envelope:
    characterization requirements, provider families, capability requirements, hard maxima, required
    preflights, evidence classes, and notification transitions. It is reviewable but grants no effects.
 2. A private authority envelope below the operator home is a single-link regular file, directory mode
-   `0700`, file mode `0600`, writable only through the local operator CLI. It contains two independently
-   validatable and revocable records:
-   - the **provider-effect grant** binds a unique grant id; operator and environment owner; exact policy,
-     manifest, recipe, config-template, and candidate-scheduler hashes; exact trigger lanes and case ids;
+   `0700`, file mode `0600`, writable only through the local operator CLI. It contains three independently
+   validatable and revocable record types:
+   - a **one-shot characterization authorization** contains one or more exact, independently consumable
+     `characterization_once` entries. Each entry binds its batch-authorization id/hash plus a unique entry id,
+     generation, hash, and consumption nonce; operator and environment owner; exact policy, scheduled-case
+     row/hash, canonical
+     case-execution fingerprint, candidate-scheduler/config and normalized price/ranking-snapshot hashes,
+     proposed expected-effective identity, provider family, allowed registry/image/provider effects, and known
+     pre-R3d executable inventory; conservative token/cost/time/attempt caps, retry/fallback zero, the explicit characterization command,
+     `not_before`/`expires_at`, and its own revocation generation. One reviewed batch may enumerate the full
+     future schedule set, but an entry authorizes only its one exact fingerprint and cannot lend unused scope
+     or budget to another entry;
+   - the **provider-effect standing grant** binds a unique grant id; operator and environment owner; exact policy,
+     manifest, recipe, config-template, candidate-scheduler, and normalized price/ranking-snapshot hashes;
+     exact trigger lanes and case ids;
      allowed registry/image/provider effects; provider families; per-case, per-run, per-trigger-pool,
      per-provider, UTC-day, and rolling limits; the exact allowed launchd-label set plus each installed
      plist's canonical hash and trigger lane; `not_before`, `expires_at`, and provider-grant revocation
@@ -1265,30 +1287,34 @@ R3d adds one checked-in policy and one private authority envelope:
      independent `not_before`/`expires_at` and revocation generation, exact cold root, owner-approved
      `owner_icloud` replication mode, and opaque local FileProvider-domain identity.
 
-Cold-storage consent may outlive or be revoked independently of provider-effect authority and grants only
+Cold-storage consent may outlive or be revoked independently of either provider-effect authority and grants only
 cold publication/upload/verification/cloud-retention/hot-eviction operations over already-completed,
-locally sealed evidence. Neither record's validity implies the other's. The scheduler validates the
-provider-effect grant before credential access, registry/image/provider effects, or candidate spawn; the
-archive publisher validates cold-storage consent before any iCloud-root write.
+locally sealed evidence. No provider-effect record's validity implies storage consent or vice versa. The
+scheduler validates the selected provider-effect authority arm before credential access, registry/image/
+provider effects, or candidate spawn; the archive publisher validates cold-storage consent before any iCloud-
+root write.
 
-Missing, expired, revoked, wrong-owner, wrong-host, stale-hash, broadened-case, or cap mismatch in the
-provider-effect grant refuses scheduling with a typed zero-effect status. Policy changes invalidate the old
-provider-effect grant; neither the scheduler nor `serve` can mint, renew, widen, or repair it. Exact dates and
-numerical caps are operator rollout values derived from characterization, not code defaults and never
-auto-renewed.
+Missing, expired, revoked, consumed, wrong-owner, wrong-host, stale-hash, broadened-case, command/trigger
+mismatch, or cap mismatch in the selected provider-effect authority refuses admission with a typed zero-effect
+status. Policy or case-fingerprint changes invalidate an old one-shot entry and any standing grant that covered
+the old identity. Neither the scheduler nor `serve` can mint, renew, widen, or repair either authority. Exact
+dates and numerical caps are operator rollout values; one-shot characterization uses reviewed conservative
+caps, while standing-grant caps are derived from completed characterization. Neither auto-renews.
 
 Private-authority mutation and final admission share a short-lived authority-state lock distinct from the
-aggregate-wide admission lock. Under that lock, admission reopens and validates the provider-effect grant,
-proves
-`now + derived_terminal_deadline <= expires_at`, and atomically journals the exact provider-effect grant id,
-generation,
-hash, equivalent-work reservation, and budget reservation. Admission always acquires the aggregate-wide lock
-before the authority-state lock; authority mutation takes only the latter, so no path reverses the order. That
-durable reservation commit is the authority linearization point: revocation or expiry before it refuses the
-attempt; revocation after it prevents later admissions but does not kill or replay the already-admitted bounded
-attempt. The operator CLI increments revocation generation under the same lock. A launchd invocation must
-match one exact allowed label and the installed plist hash; the daily and test-merge-watcher labels are both bound
-explicitly rather than inferred from a singular name.
+aggregate-wide admission lock. Under that lock, admission reopens the envelope, requires exactly one tagged
+provider-effect arm, validates it, proves `now + derived_terminal_deadline <= expires_at`, and atomically
+journals its complete tagged-arm identity, the authority-bound admission-attempt fingerprint, equivalent-work
+reservation, and budget reservation. A `characterization_once` commit also consumes that exact entry/nonce;
+crash or ambiguity after the commit may reconcile evidence and charge but can never restore or replay it. A
+`standing_grant` commit binds the exact completed characterization id/hash required by that arm. Admission
+always acquires the aggregate-wide lock before the authority-state lock; authority mutation takes only the
+latter, so no path reverses the order. That durable reservation commit is the authority linearization point:
+revocation or expiry before it refuses the attempt; revocation after it prevents later admissions but does not
+kill or replay the already-admitted bounded attempt. The operator CLI increments each record's revocation
+generation under the same lock. A launchd invocation must use `standing_grant` and match one exact allowed label
+and installed plist hash; the daily and test-merge-watcher labels are both bound explicitly rather than inferred
+from a singular name.
 
 Cold archive publication has its own action-time consent fence under the authority-state lock. It revalidates
 the independently valid cold-storage-consent id/hash, owner/environment, time bounds, evidence class,
@@ -1300,8 +1326,8 @@ delete them implicitly. Read-only integrity reconciliation of already-retained e
 visible; removing cloud data is a separate explicit owner action.
 
 The initial trust domain is one named operator account on one named Mac. Locks, ledgers, and active indexes
-must reside on its local APFS filesystem, never iCloud or a network filesystem. The provider-effect grant's
-host identity plus `environment_owner` excludes distributed execution; R3d does not implement a distributed lease. A
+must reside on its local APFS filesystem, never iCloud or a network filesystem. The selected provider-effect
+authority's host identity plus `environment_owner` excludes distributed execution; R3d does not implement a distributed lease. A
 hostile same-UID/root actor and malicious code from an operator-approved same-repository author remain
 explicit non-goals. Candidate builds receive no credentials, and candidate runs receive only the one
 provider's narrow required credential set; no other operator or GitHub secrets are inherited.
@@ -1311,15 +1337,22 @@ acknowledgements and case selection. They share R3d's admission lock and account
 the provider-effect standing grant. That grant supersedes per-aggregate manual acknowledgement only for an
 exact scheduled or trusted-pre-merge request that binds the provider-effect grant in its evidence.
 
+The explicit characterization command is the sole manual-shaped exception: it accepts only a sealed
+`ScheduledExecutionSourceV1` carrying one valid `characterization_once` entry for an exact
+`characterization_required` fingerprint. It cannot accept `standing_grant`, an already consumed entry, a
+completed characterization for that fingerprint, or any scheduled/test-merge/main trigger. Generic manual
+compatibility acknowledgement cannot substitute for this entry.
+
 A manual command may reference only the authority envelope's cold-storage-consent id/hash after an explicit
 `archive-to-owner-icloud` acknowledgement for already-completed, secret-scanned evidence. That storage-only
 use grants no provider/registry/image/scheduler authority. Without it, manual full evidence remains hot and
 storage status may block later work rather than uploading implicitly.
 
-Retained pre-R3d binaries cannot participate in the new cooperative lock/ledger. Provider-effect grant activation therefore
-binds an inventory of their exact path, device/inode, hash, and allowed non-compatibility process identities;
-documents their compatibility subcommands as rollback-only/not authorized while scheduling is active; and
-requires a zero-live-legacy-compatibility observation. Preflight and the final pre-spawn fence enumerate
+Retained pre-R3d binaries cannot participate in the new cooperative lock/ledger. Issuing a one-shot
+characterization batch or activating a standing grant therefore binds an inventory of their exact path,
+device/inode, hash, and allowed non-compatibility process identities; documents their compatibility subcommands
+as rollback-only/not authorized while any R3d provider-effect authority can admit; and requires a zero-live-
+legacy-compatibility observation. Preflight and the final pre-spawn fence enumerate
 processes by exact executable/start identity and argv shape: the retained production `serve` process is
 allowed, but a legacy `compatibility` process or an ambiguous provider-capable legacy child creates a
 safety hold. A discovered earlier legacy aggregate is imported into the ledger from validated evidence; an
@@ -1345,8 +1378,8 @@ through the bounded catalog captured by an admitted smoke session, and evaluates
 price/ranking changes. It emits an advisory recommendation and never mutates a pin or grant. Deprecation
 blocks visibly without silent fallback.
 
-The checked-in policy names the price/ranking authority, normalization schema, and maximum age. The
-provider-effect grant binds the normalized snapshot hash, `observed_at`, and `valid_until`; stale, missing, ambiguous, or
+The checked-in policy names the price/ranking authority, normalization schema, and maximum age. Each selected
+provider-effect authority binds the normalized snapshot hash, `observed_at`, and `valid_until`; stale, missing, ambiguous, or
 currency-incompatible input blocks selection rather than choosing a model by name. Provider-reported quota
 is only an additional veto and never replaces this accounting or ranking authority.
 
@@ -1389,14 +1422,23 @@ and the schedule sidecar all bind this same fingerprint and schema version. Chan
 case to `characterization_required` and cannot reuse prior evidence. `claimed_support_gate` evidence never
 crosses an exact test-merge result SHA even when two results produce byte-identical candidates.
 
+Effect-authority ids are deliberately not fields in this reusable canonical case fingerprint: rotating an
+otherwise equivalent standing grant must not itself force recharacterization. Final admission instead derives
+an `admission_attempt_fingerprint` over the canonical case fingerprint plus the exact tagged admission-authority
+kind and complete arm identity: batch-authorization id/hash plus one-shot entry id/generation/hash/consumption
+nonce, or standing-grant id/generation/hash plus characterization id/hash. It also binds
+the trigger/window/attempt identity. The sealed source, equivalent-work and budget reservation, ledger,
+consumption record, and schedule sidecar bind both fingerprints. Authority rotation therefore prevents stale
+admission/replay without relabeling unchanged case evidence as a new case identity.
+
 The pre-admission fingerprint never contains a value learned only after admission. The result separately
 records the observed effective model/effort/mode from the admitted session. That observation must equal the
 characterized expected-effective identity before evidence is eligible for reuse or consumption. A mismatch
 is `candidate_unknown`, creates a safety hold for that fingerprint, and retains the original reservation and
 conservative charge; it never re-keys the admitted ledger/equivalent-work record after provider acceptance.
-For a first characterization, the one-run live authorization and reviewed scheduled-case row bind a proposed
-expected-effective identity before admission. It becomes the private characterized binding only after the
-observed result matches; mismatch remains non-reusable `candidate_unknown` evidence.
+For a first characterization, the exact `characterization_once` entry and reviewed scheduled-case row bind a
+proposed expected-effective identity before admission. It becomes the private characterized binding only after
+the observed result matches; mismatch remains non-reusable `candidate_unknown` evidence.
 
 R3d0 adds a separate strict versioned `compatibility/scheduled-cases.toml` registry for provider-minimal
 advisory probes. A row declares the exact case/config/template bindings above and starts at
@@ -1422,11 +1464,28 @@ scheduler. It is an owner-only, create-new/no-follow, content-hashed source unde
 binds:
 
 - the scheduled-case-registry schema/hash and exact row id/hash;
-- the scheduling policy, provider-effect-grant id/generation, characterization id/hash, and complete canonical
-  case-execution fingerprint;
+- the scheduling policy, complete canonical case-execution fingerprint, authority-bound
+  `admission_attempt_fingerprint`, and exactly one tagged `admission_authority` arm;
 - candidate binary/build provenance; exact package-set, adapter/SDK/CLI, image/base digest, config-template,
   generated-config, prerequisite, auth-path, environment, prompt, and artifact-policy identities; and
 - the row's exact requested raw and expected-effective model/effort/mode plus caps and retry zero.
+
+`admission_authority` is a strict tagged union with exactly two arms:
+
+- `characterization_once` binds the batch-authorization id/hash and one-shot entry id, generation, hash, and
+  consumption nonce;
+  the exact `characterization_required` row/fingerprint and proposed expected-effective identity; its reviewed
+  conservative caps and explicit characterization-command trigger; and typed absence of both a completed
+  characterization and any applicable standing grant for that fingerprint. It can be created only from an
+  unconsumed private authorization entry and is durably consumed at admission.
+- `standing_grant` binds the provider-effect-grant id, generation, and hash plus the completed private
+  characterization id/hash for the same canonical fingerprint. It carries typed absence of one-shot
+  authorization fields and is the only arm accepted for scheduled, main, or trusted test-merge triggers.
+
+Missing, unknown, or multiple arms; a mixed-arm payload; a stale/consumed one-shot entry; a one-shot entry for
+an already characterized or differently fingerprinted row; a standing grant without the exact completed
+characterization; or any noncanonical absence marker fails schema/validation before credential or provider-
+capable process access.
 
 Its generated execution manifest is still strict schema v1 lane `floating-current`, classification `canary`.
 Model/effort/mode may differ from a pinned support row only by equaling the exact scheduled registry row; no
@@ -1440,7 +1499,9 @@ reopens and rehashes every bound object, rederives the complete source, requires
 and fingerprint, and refuses before provider-capable spawn on any mismatch. Only `schedule-tick` or an
 explicit one-run characterization command may create/admit that source; a direct compatibility invocation,
 arbitrary manifest, production-support classification, unlisted model variance, changed package/config, or
-missing/revoked authority fails closed. R3d4 uses the existing pinned production-manifest route whenever a
+missing/revoked authority fails closed. The explicit characterization command requires `characterization_once`
+and refuses every unattended trigger; `schedule-tick`, main, and test-merge paths require `standing_grant` and
+refuse one-shot authority. R3d4 uses the existing pinned production-manifest route whenever a
 test-merge impact requires an exact claimed-support identity; it may select `RunSource::Scheduled` only for
 an explicitly classifier-proved provider-generic/advisory case. Daily advisory work and R3d5 characterization
 use the scheduled source. Old R3 binaries never parse this separate source.
@@ -1521,13 +1582,15 @@ quarantined, held, or suppressed aggregate status is degraded and non-promotable
 
 ### Non-billable preflights
 
-Immediately before admission, the trusted scheduler revalidates host owner/architecture, provider-effect grant
-and policy hashes, exact candidate/config/manifest/recipe identities, case characterization, quarantine/hold state,
-ledger headroom, OAuth runway, required environment bindings, the last characterized raw-model binding and
-expected-effective model/effort/mode binding, the bound pricing/ranking snapshot, local storage headroom, and
+Immediately before admission, the trusted scheduler revalidates host owner/architecture, the selected tagged
+effect authority and policy hashes, exact candidate/config/manifest/recipe identities, quarantine/hold state,
+ledger headroom, OAuth runway, required environment bindings, the bound pricing/ranking snapshot, local storage headroom, and
 the R3b container-start control for reader cases
 using an already-present pinned image with no pull. It also validates the scheduled-case registry/fingerprint
-and legacy executable/process inventory above. A non-OK preflight records
+and legacy executable/process inventory above. The `characterization_once` branch requires
+`characterization_required`, the exact proposed raw/expected-effective identity, and canonical absence of an
+exact completed characterization/applicable standing grant; the `standing_grant` branch requires the exact
+completed characterization's raw/expected-effective bindings. A non-OK preflight records
 `not_run(<typed-reason>)`, zero provider spend, status transition, and notification threshold progress. It
 never calls `models` or starts an adapter merely to diagnose the preflight; the fresh effective catalog is
 captured from the one already-authorized smoke session. Standing authority plus green preflights supersedes
@@ -1583,7 +1646,10 @@ contract, and required freshness bucket. Trigger, provider-effect grant, and req
 are not part of this key; the freshness bucket is canonical policy output, never a trigger-specific
 timestamp. The policy defines a closed evidence-purpose lattice: `claimed_support_gate` may satisfy
 `provider_path_advisory` only when every exact identity, prompt, cap, and freshness requirement is at least
-as strong, while `manual_diagnostic` is incomparable by default. A live reservation for the key refuses
+as strong, while `manual_diagnostic` is incomparable by default. `characterization` is also an execution-only
+consumer purpose: preexisting evidence cannot satisfy the first characterization, although its reviewed
+completed evidence may later satisfy `provider_path_advisory` under the ordinary exact-identity/freshness
+rules. A live reservation for the key refuses
 without queuing; valid completed evidence with an equal-or-stronger purpose is reused without another
 provider call and gains a new consumption record binding the requesting trigger and authority to the
 existing evidence hash. Because the canonical fingerprint includes exact test-merge/main identity and every
@@ -1607,12 +1673,13 @@ unreconciled evidence keeps the full charge. Subscription providers retain an at
 when USD is zero or absent. Derived USD uses a bound authoritative pricing snapshot; unknown currency or
 price keeps the cap charge.
 
-The attempt-idempotency key binds the canonical case-execution fingerprint, trigger, authorization id,
-window, and repeat nonce when explicitly present; the separate equivalent-work key above prevents sequential
+The attempt-idempotency key binds the complete `admission_attempt_fingerprint` plus the repeat nonce when
+explicitly present; the separate equivalent-work key above prevents sequential
 cross-trigger duplication. Journal and materialized snapshot updates are crash-consistent and replay
-idempotently. Scheduled background, test-merge gates, and manual commands have separate accounting classes
-beneath shared provider and global ceilings. No class borrows another class's protected allocation without a
-new provider-effect grant. Manual work retains explicit acknowledgement, may use only otherwise-unallocated
+idempotently. Characterization, scheduled background, test-merge gates, and generic manual commands have
+separate accounting classes beneath shared provider and global ceilings. A one-shot entry carries its own
+conservative characterization reservation; no class borrows another class's protected allocation without new
+matching effect authority. Manual work retains explicit acknowledgement, may use only otherwise-unallocated
 headroom after protected scheduled/test-merge reserves, records `manual_used`, and cannot borrow either
 protected pool; an intentional duplicate also requires the explicit repeat authorization above. Exhausted
 test-merge capacity leaves the required check blocked, not green. Manual acknowledgement alone cannot
@@ -1621,9 +1688,9 @@ Provider-reported remaining quota, when available, is an additional veto and nev
 ledger accounts for bridge compatibility activity only; it does not claim to measure interactive usage from
 other repositories or agents.
 
-Numerical values are derived from characterization evidence plus a documented margin and then written into
-the provider-effect grant. They do not inherit the current broad `500000` token / `$5` aggregate defaults and
-never auto-increase.
+Standing-grant numerical values are derived from characterization evidence plus a documented margin. One-shot
+entries use separately reviewed conservative caps before that evidence exists. Neither inherits the current
+broad `500000` token / `$5` aggregate defaults or auto-increases.
 
 ### D4 — evidence store, retention, visibility, and privacy
 
@@ -1924,8 +1991,11 @@ fields to them or claim that old `deny_unknown_fields` readers ignore additions.
 in a separate strict, independently versioned `ScheduleEvidenceRecord` JSON sidecar. It binds the aggregate
 SHA-256 when one exists plus trigger kind; repository/PR/base/head, exact test-merge SHA/ref/tree and ordered
 parents, the guarded observation id, or scheduled-main commit range; policy,
-provider-effect-grant, storage-consent, quarantine, and characterization ids/hashes; scheduled-case-registry
-hash and canonical case-execution fingerprint/version;
+the exact tagged admission-authority kind and complete arm identity—batch-authorization id/hash plus one-shot
+entry id/generation/hash/consumption nonce, or standing-grant id/generation/hash plus characterization id/hash—
+with canonical typed absences, storage-consent, quarantine, and characterization
+ids/hashes; scheduled-case-registry hash and canonical case-execution plus admission-attempt fingerprints/
+versions;
 window, attempt-idempotency, equivalent-work, consumption, and optional repeat ids; classifier version/hash
 and affected cases; complete deadline derivation; preflight results; admission lock holder; budget
 reservations/reconciliation; supervisor process identities/escalation/reap results; freshness observation;
@@ -1944,9 +2014,10 @@ unknown sidecar version fails schedule-specific consumption without making the u
 ### Dependency-ordered implementation slices
 
 1. **R3d0 — design/policy/schema foundation (non-billable).** Land this approved design; add checked-in
-   scheduling, provider-effect-grant, storage-consent, characterization, hold/quarantine, typed
+   scheduling, one-shot-characterization authorization, provider-effect-grant, tagged admission-authority,
+   storage-consent, characterization, hold/quarantine, typed
    failure/suppression, impact, ledger,
-   canonical case-execution fingerprint, equivalent-work/consumption, scheduled-case registry, strict
+   canonical case-execution and admission-attempt fingerprints, equivalent-work/consumption, scheduled-case registry, strict
    scheduled-execution-source, schedule-sidecar, publication-outbox, evidence-index, status, and routing
    schemas plus validators and docs. Add and review
    every exact provider-minimal advisory row/config intended for R3d5 characterization; keep it outside the
@@ -1955,9 +2026,11 @@ unknown sidecar version fails schedule-specific consumption without making the u
 2. **R3d1 — supervisor and signal parity (non-billable).** Add `schedule-tick` parent, SIGTERM parity,
    derived deadline, exact process-tree identity, TERM/grace/KILL/reap, repeated-cancel, recovery, and joined
    parent/child artifact contract using fake processes only.
-3. **R3d2 — authority, admission, preflights, and accounting (non-billable tests).** Add provider-effect-grant
-   and storage-consent validation with independent revocation linearization, the scheduled-source generator/
-   `RunSource::Scheduled` validator, owner-wide lock, equivalent-work reuse/refusal, characterization state,
+3. **R3d2 — authority, admission, preflights, and accounting (non-billable tests).** Add provider-effect-grant,
+   one-shot-characterization, and storage-consent validation with independent revocation linearization, the
+   mutually exclusive admission-authority reducer, scheduled-source generator/`RunSource::Scheduled`
+   validator, owner-wide lock, authority-bound attempt fingerprints, equivalent-work reuse/refusal,
+   characterization state,
    three control types, durable reserve/reconcile ledger, UTC/rolling windows, scheduled/test-merge/manual
    accounting classes, legacy executable/process detection and conservative import, and automated zero-effect
    preflights.
@@ -1973,9 +2046,10 @@ unknown sidecar version fails schedule-specific consumption without making the u
    protection, the dedicated required context and expected source, canonical test-merge production, and the
    invariant that the context never exists on a PR head. No schedule or required check is enabled by merge.
 6. **R3d5 — characterization and staged enablement (separate live authority).** Characterize all future
-   scheduled compatibility/advisory cases with the lower-cost models, finalize provisional hold/waste
-   classifications and exact caps, exercise the rollout ladder, then enable the provider-effect grant/timer
-   and enforced test-merge check only after the deterministic and review gates are green.
+   scheduled compatibility/advisory cases with the lower-cost models under exact single-use
+   `characterization_once` entries, finalize provisional hold/waste classifications and exact caps, exercise
+   the rollout ladder, then issue and enable the first post-characterization provider-effect standing grant/
+   timer and enforced test-merge check only after the deterministic and review gates are green.
 
 Each code slice must be reviewable and default-off. It may merge independently only when its own complete
 tests are green and no earlier invariant is weakened. The full R3d branch receives one Sol/xhigh adversarial
@@ -1986,8 +2060,8 @@ adversarial implementation/release lens is justified only after Sol is green, wi
 
 - Every new behavior has a regression that fails against its pre-change implementation plus a negative or
   edge case for every new path.
-- Policy/provider-grant absence, expiry, revocation before reservation, stale hashes, owner/host mismatch, broadened
-  cases, invalid caps, wrong label/plist hash, deadline past provider-grant expiry, and unauthorized trigger
+- Policy/effect-authority absence, expiry, revocation before reservation, stale hashes, owner/host mismatch, broadened
+  cases, invalid caps, wrong label/plist hash, deadline past selected effect-authority expiry, and unauthorized trigger
   all refuse before effects. Revocation after durable reservation blocks successors without killing the
   bounded admitted attempt. Missing/revoked/wrong-root/wrong-domain cold consent or a cold-publication bound
   past consent expiry keeps scheduled or explicitly acknowledged manual evidence hot with zero iCloud write.
@@ -1995,6 +2069,16 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   already-completed evidence, while valid provider authority plus expired/revoked storage consent cannot
   create a cold entry. Consent revocation before its publication journal blocks the write; revocation after
   that linearization permits only the already-admitted bounded copy and blocks every later archive/eviction.
+- Tagged-admission tests prove an exact `characterization_once` entry admits the explicit first
+  characterization while both completed characterization and applicable standing grant are absent, and that
+  the resulting exact characterization can later satisfy `standing_grant`. Missing/unknown/both arms, mixed
+  fields or noncanonical absences, stale/expired/revoked/already-consumed authorization, wrong row/fingerprint/
+  proposed identity/caps/command, prior characterization, standing grant before characterization, stale
+  characterization, and characterization authority presented by `schedule-tick`, main, or test-merge all
+  refuse before credential or provider-process access. Crash immediately before the durable consumption may
+  admit no effect; crash at or after it leaves the entry consumed with conservative reconciliation and never
+  replays. Exact one-shot and standing-arm positives bind distinct authority-bound attempt fingerprints,
+  reservations, ledger entries, and sidecars to the same unchanged canonical case fingerprint.
 - Fake children cover ignored TERM, SIGSTOP, exited runner with surviving descendant group, publication
   wedge, repeated cancellation, unproved exit, startup recovery, and unrelated-process survival.
 - Scheduled versus manual, test-merge versus daily, concurrent and sequential duplicates, and two-process races
@@ -2114,16 +2198,18 @@ are green:
 2. Run preflight-only controls including expired OAuth and degraded container start; prove typed not-run
    evidence, status/notification transitions, and zero spend. A fake/exact-fixture legacy compatibility
    process must hold admission while the retained production `serve` identity remains allowed.
-3. With one explicit no-retry/no-fallback live authorization, characterize every future scheduled
-   compatibility/advisory case using the exact approved low-cost provider/model/effort/environment/config
-   fingerprint. This is the
-   complete future schedule set, not obsolete historical/non-goal rows.
+3. Have the operator issue one reviewed no-retry/no-fallback `CharacterizationAuthorizationV1` batch whose
+   entries enumerate every future scheduled compatibility/advisory case exactly once. Invoke the explicit
+   characterization command once per entry using the exact approved low-cost provider/model/effort/
+   environment/config fingerprint. Each source binds and consumes its own `characterization_once` entry; the
+   batch grants no pooled retries or scope. This is the complete future schedule set, not obsolete historical/
+   non-goal rows.
 4. Review the aggregate once, classify known issues/inconclusive cases, set holds/suppressions/quarantines,
-   derive numerical caps, record legacy-manual quiescence, explicitly authorize the private owner-iCloud
-   cold boundary, and have the operator issue the first provider-effect grant plus independent cold-storage
-   consent. Do not rerun failures merely to obtain green.
+   derive numerical caps, record legacy-manual quiescence, explicitly authorize the private owner-iCloud cold
+   boundary, and only then have the operator issue the first `standing_grant` provider-effect authority plus
+   independent cold-storage consent. Do not rerun failures merely to obtain green.
 5. Keep calendar firing disabled, load the reviewed daily job for on-demand use, and invoke its exact label
-   once through `launchctl kickstart` under that provider-effect grant. Verify label/plist binding,
+   once through `launchctl kickstart` under that `standing_grant`. Verify label/plist binding,
    reservation/reconciliation, index, status, retention, and exact evidence binding, then unload it.
 6. Let one timer tick fire while the operator observes it. Deadline-kill remains fake-process-only.
 7. Run PR classification in shadow mode on one exact trusted PR base/head pair; it remains advisory and is
@@ -2153,18 +2239,20 @@ rollback target. Any code revert is a normal reviewed PR.
 
 **Restart point:** work from branch `agent/reliability-r3d-scheduled-canaries` based on merged main
 `98339842`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
-exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, and exact-`c50811f`
+exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, exact-`c50811f`, and
+exact-`fb8a2f4`
 Sol reviews are retained at the paths/hashes above.
 The Fable six `WRONG`/thirteen `SMELL`; first-Sol four `WRONG`/seven `SMELL`; first-closure three
 `WRONG`/three `SMELL`; second-closure two `WRONG`/three `SMELL`; third-closure two `WRONG`/zero new
 `SMELL`; fourth-closure one `WRONG`/one `SMELL`; fifth-closure zero `WRONG`/one `SMELL`; sixth-closure
 one `WRONG`/zero new `SMELL`; seventh-closure zero new `WRONG`/one `SMELL`; and eighth-closure one
-`WRONG`/zero new `SMELL` sets are folded into D1-D10 and the slices/gates above. The eighth closure marked
-multi-case convergence fixed before finding the repeated-unknown contradiction. All D1-D10 owner
+`WRONG`/zero new `SMELL`; and ninth-closure one `WRONG`/zero new `SMELL` sets are folded into D1-D10 and
+the slices/gates above. The ninth closure marked repeated-unknown handling fixed before finding the initial-
+characterization authority cycle. All D1-D10 owner
 decisions were approved on 2026-07-17. No implementation, schema, timer, private authority, live
 characterization, model discovery, registry/image effect, compatibility provider turn, GitHub check
 mutation, or production-operator action has been performed by this design fold; the only new provider
-activity was the nine recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
+activity was the ten recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
 this exact committed revision. If approved, publish the non-draft docs PR and start R3d0 only after merge.
 Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 

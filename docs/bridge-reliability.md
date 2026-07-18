@@ -153,12 +153,16 @@ plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
   and OpenCode as independent explicit provider increments before R4. Credentials remain environment-only;
   each integration must pass local fake/corpus gates before a separately authorized live smoke, and
   neither becomes an automatic fallback target.
-- Run only characterized, fixed minimal cases under a narrow private provider-effect standing grant, using the lowest-cost
+- Bootstrap each fixed minimal case under one exact, operator-issued, single-use characterization entry; only
+  after completed characterization may it run under a narrow private provider-effect standing grant. Use the
+  lowest-cost
   eligible model for a provider-generic adapter/capability probe. A model/effort/mode/alias/capability-
   specific PR must exercise the exact affected claimed-support identity; a cheap substitute cannot green
   that gate. New provider-minimal probes live in a separate non-support scheduled-case registry through
-  characterization; an R3d-only strict scheduled-execution source permits only the exact registry-bound
-  model variance without weakening R3c's support-baseline resolver. They remain advisory unless R4 promotes
+  characterization; an R3d-only strict scheduled-execution source binds exactly one tagged bootstrap or
+  standing-grant arm and permits only the exact registry-bound model variance without weakening R3c's support-
+  baseline resolver. A bootstrap arm cannot enter an unattended trigger, and a standing arm cannot exist
+  without the exact completed characterization. They remain advisory unless R4 promotes
   them deliberately. Scheduling uses fresh one-shot processes and never manipulates the long-lived operator.
 - Require a trusted local affected-case canary on the exact current GitHub test-merge result SHA
   (`merge_commit_sha` / `refs/pull/<n>/merge`) before merging a compatibility-impacting same-repo PR. GitHub
