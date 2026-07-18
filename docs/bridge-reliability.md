@@ -175,7 +175,8 @@ plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
   same-object update and never replays provider work or creates a second terminal check. A first transient
   failure remains `in_progress`; only a typed immutable failure, the authorized confirmation's pass, or its
   second identical complete failure terminalizes that same check. For multiple due cases, success waits for
-  every pass while any terminal case failure fails fast without spending unstarted confirmations.
+  every pass while any terminal case failure fails fast without spending unstarted confirmations. Repeated
+  non-waste unknowns only update audit and notification-dedup state; repetition alone never suppresses them.
 - Defer representative review scheduling until a separate owner-reviewed design defines a fixed Tier-2
   read-only fixture, prompt, scoring, caps, provider rotation, and evidence boundary. Review content is not
   compatibility or promotion evidence.

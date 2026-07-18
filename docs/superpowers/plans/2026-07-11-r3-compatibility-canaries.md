@@ -1106,7 +1106,7 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 
 - **Branch:** `agent/reliability-r3d-scheduled-canaries`
 - **Base:** merged R3c main `983398427c9f04861a2f1da501a7650c4a1cdd80`
-- **Status:** design of record revised from owner decisions and eight exact-commit Sol reviews;
+- **Status:** design of record revised from owner decisions and nine exact-commit Sol reviews;
   implementation not started; fresh Sol/xhigh closure review pending
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
@@ -1177,6 +1177,14 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   `/private/tmp/a2a-bridge-r3d-sol-closure-e0cc7dc.T4ns7v/review.md`, mode `0600`, 11,693 bytes,
   SHA-256 `de6fa68c1e893e4a02376581dcabb8b9302b2a36e3ed4ec01e3cfeacdd6936ea`. This revision adds the
   complete ordered due-set reducer and pass/pass, pass/fail, crash, and SHA-regeneration fixtures.
+- **Eighth closure review:** one fresh one-node bridge-mediated Sol/xhigh/read-only review of exact
+  `c50811f345718736f35411263b2351141db819c7` marked multi-case convergence `FIXED` and found no
+  regression in earlier closed mechanisms, then returned one repeated-unknown suppression `WRONG`, no new
+  `SMELL`, and `R3D DESIGN: REVISE`. Its fixed output is
+  `/private/tmp/a2a-bridge-r3d-sol-closure-c50811f.UZux95/review.md`, mode `0600`, 10,591 bytes,
+  SHA-256 `5b3be5b5ee762618a88a20bb5436c53057b4bd04d29bcf68c85eb6a6de0492a1`. This revision keeps repeated
+  non-waste `candidate_unknown` in its existing lifecycle and reserves suppression for independently typed
+  immutable waste or the second identical complete typed transient failure.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
 standing authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
@@ -1701,8 +1709,11 @@ SHA, and an evidence-record hash.
 
 Drift-red, safety hold, duplicate billing, or unreaped ownership notifies immediately. The first auth block,
 unknown result, storage block, or missed tick notifies once and deduplicates while the fingerprint is
-unchanged; a second consecutive identical unknown/waste result changes suppression state and notifies that
-transition. Recovery always notifies. Notification delivery failure is retained in status but never rewrites
+unchanged. A repeated identical non-waste `candidate_unknown` only increments its count/last-seen audit and
+remains in its existing unknown/hold/block lifecycle; it never enters confirmation or suppression merely by
+repetition. An independently typed immutable waste condition suppresses immediately, while the second
+identical complete typed transient failure changes suppression state under D6; each suppression transition
+notifies. Recovery always notifies. Notification delivery failure is retained in status but never rewrites
 the underlying canary outcome.
 
 ### D8 — floating freshness and garbage collection
@@ -2017,6 +2028,11 @@ adversarial implementation/release lens is justified only after Sol is green, wi
   separately authorized confirmation pass terminalizes the same check as success, while a second identical
   complete failure suppresses and terminalizes it as failure. Authority/quarantine/budget states never enter
   the waste machine or terminalize the check.
+- Repeated-unknown negatives feed two identical unavailable-catalog, publication-ambiguous, invalid-evidence,
+  and infrastructure `candidate_unknown` results through status/notification handling. They increment and
+  deduplicate audit/notification state but never create `confirmation_due` or suppression. A matched positive
+  control proves the second identical complete typed transient failure does suppress and notify, while an
+  independently typed immutable waste condition suppresses on its first observation.
 - Multi-case confirmation fakes put two ordered cases in `confirmation_due`. Pass/pass resolves in both
   orders; a crash after the first pass preserves `in_progress`, no terminal consumption, the resolved case,
   and the one still-unused nonce/charge, then the second pass creates exactly one success consumption binding
@@ -2137,18 +2153,18 @@ rollback target. Any code revert is a normal reviewed PR.
 
 **Restart point:** work from branch `agent/reliability-r3d-scheduled-canaries` based on merged main
 `98339842`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
-exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, and exact-`e0cc7dc` Sol reviews are
-retained at the paths/hashes above.
+exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, and exact-`c50811f`
+Sol reviews are retained at the paths/hashes above.
 The Fable six `WRONG`/thirteen `SMELL`; first-Sol four `WRONG`/seven `SMELL`; first-closure three
 `WRONG`/three `SMELL`; second-closure two `WRONG`/three `SMELL`; third-closure two `WRONG`/zero new
 `SMELL`; fourth-closure one `WRONG`/one `SMELL`; fifth-closure zero `WRONG`/one `SMELL`; sixth-closure
-one `WRONG`/zero new `SMELL`; and seventh-closure zero new `WRONG`/one `SMELL` sets are folded into D1-D10
-and the slices/gates above. The seventh closure found only the missing multi-case convergence proof. All
-D1-D10 owner
+one `WRONG`/zero new `SMELL`; seventh-closure zero new `WRONG`/one `SMELL`; and eighth-closure one
+`WRONG`/zero new `SMELL` sets are folded into D1-D10 and the slices/gates above. The eighth closure marked
+multi-case convergence fixed before finding the repeated-unknown contradiction. All D1-D10 owner
 decisions were approved on 2026-07-17. No implementation, schema, timer, private authority, live
 characterization, model discovery, registry/image effect, compatibility provider turn, GitHub check
 mutation, or production-operator action has been performed by this design fold; the only new provider
-activity was the eight recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
+activity was the nine recorded read-only Sol reviews. Next: run one fresh Sol/xhigh closure review against
 this exact committed revision. If approved, publish the non-draft docs PR and start R3d0 only after merge.
 Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 
