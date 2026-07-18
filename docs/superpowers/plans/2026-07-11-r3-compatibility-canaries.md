@@ -4,7 +4,7 @@
   **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at
   `983398427c9f04861a2f1da501a7650c4a1cdd80` by PR #33; R3d design is **APPROVED / MERGED**
   at exact design head `b54840a017b87521677f1f95c3f7be69de55361d` by PR #37, merge
-  `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is **IMPLEMENTED / REVIEW PENDING** on
+  `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is **REMEDIATED / CLOSURE REVIEW PENDING** on
   `agent/reliability-r3d0-foundation`; no live/timer/operator effect is in scope. Nine pinned rows are
   implemented. Exact
   `c458045cf3d0923457519e253d22dd545363f98d` Sol/xhigh review approved the pre-incident deterministic
@@ -1112,7 +1112,7 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 - **Base:** merged R3d design main `6eeea6ce553b792dc92cef95ee45f2234f7afe4e` (PR #37)
 - **Status:** design of record **APPROVED / MERGED** at exact design head
   `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 default-off policy/schema implementation is
-  **IMPLEMENTED / REVIEW PENDING** with no live/timer/operator effects
+  **REMEDIATED / CLOSURE REVIEW PENDING** with no live/timer/operator effects
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
   `/Users/wesleyjinks/.claude/plans/r3d-clean-room-adversarial-deep-hollerith.md`, mode `0644`, 40,180
@@ -2521,14 +2521,20 @@ one `WRONG`/zero new `SMELL`; seventh-closure zero new `WRONG`/one `SMELL`; and 
 regression, required no amendment, and returned `R3D DESIGN: APPROVE` at exact `b54840a`. All D1-D10 owner
 decisions were approved on 2026-07-17. PR #37 merged the approved design at `6eeea6ce`. R3d0 now owns only
 the checked-in non-authoritative policy, complete profile inventory, proposed advisory configs, canonical
-identity and inert record schemas/validators, plus routing/foundation docs. Its exact pre-review
-implementation passes foundation units **2/0**, schema units **11/0**, R3d0 CLI integration **11/0**, and
-the full serial workspace **2,189/0/12 ignored** across **71** test/doc-test executables; workspace check,
-warnings-denied Clippy, locked release build, repository hygiene, and all three compatibility validators are
-green. No timer, private authority issuance, live characterization, model discovery, credential access,
-registry/image effect, compatibility provider turn, GitHub check mutation, or production-operator action has
-been performed. Next: freeze this exact head for Sol/xhigh implementation review, then one Opus release/
-compatibility lens; fold any findings, rerun the complete deterministic gates, and publish its non-draft PR.
+identity and inert record schemas/validators, plus routing/foundation docs. Exact implementation commit
+`e7e5fa1` received a bridge-mediated Sol/xhigh/read-only review with eleven `WRONG`, two `SMELL`, and
+`R3D0 IMPLEMENTATION: REVISE`; its retained report is
+`/private/tmp/a2a-bridge-r3d0-sol-review-e7e5fa1/review.md`, SHA-256
+`ad2c5207b654269b2599b360aa88067521ef83abc9e09843a88bee5e9de57de5`. The current remediation closes
+all finding families and passes foundation units **3/0**, schema units **21/0**, R3d0 CLI integration
+**19/0**, and the full serial workspace **2,208/0/12 ignored** across **55** reported test binaries;
+workspace check, warnings-denied Clippy, locked release build, repository hygiene, and all three compatibility
+validators are green. The current bundle SHA-256 is
+`7f05ae73d34381814afce2ce21c561a19df145bcb1916f47cfc957d293e8a8fa`. No timer, private authority
+issuance, live characterization, model discovery, credential access, registry/image effect, compatibility
+provider turn, GitHub check mutation, or production-operator action has been performed. Next: commit and
+freeze this remediated head for a fresh Sol/xhigh closure review; only after approval run one Opus release/
+compatibility lens, fold any findings, rerun the complete deterministic gates, and publish its non-draft PR.
 Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 
 ## R3e — OpenRouter provider expansion

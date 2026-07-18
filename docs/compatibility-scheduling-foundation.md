@@ -24,17 +24,21 @@ Validate the complete set locally:
 a2a-bridge compatibility validate --schedule-foundation compatibility
 ```
 
-Validation uses bounded, regular-file/no-follow reads; rejects any resolved child path outside the canonical
-foundation root; applies strict TOML schemas and exact inventory coverage; checks config/row agreement; and
-derives canonical semantic profile projections plus a stable profile-policy-bundle hash. It reuses the
-existing strict production-manifest validator but does not change that manifest.
+Validation pins the foundation-root directory identity, uses bounded regular-file/no-follow reads, rejects
+any resolved child path outside that root, and rechecks every captured path and digest before returning. It
+raw-scans before parsing, never invokes the runtime config parser or expands environment variables, applies
+strict TOML/recipe schemas and exact inventory coverage, and checks provider, adapter/command, auth/pre-auth/
+API-key environment, resolution-recipe, config-template, and effect agreement. Claimed-support config bytes
+must match their exact production-manifest pin. The result is a canonical semantic profile-policy bundle:
+comments and set/row ordering do not affect it, while material policy, recipe, or template changes do.
 
 The profile-policy bundle deliberately excludes exact candidate bytes, test-merge/main targets, generated
 run manifests, package versions, and image/config digests. Those are execution identities. Changing an
 exact package or immutable-image pin therefore changes the future case-execution fingerprint without
 invalidating an unchanged characterized profile or standing grant. Changing model, effort, capability,
-environment/auth shape, prompt/template, policy/recipe constraint, artifact policy, or a maximum cap changes
-the profile and requires characterization again.
+expected status, evidence path/probe, allowed effects, environment/auth shape, prompt/template, semantic
+policy/recipe constraint, artifact policy, or a maximum cap changes the profile and requires
+characterization again.
 
 Claude's `haiku` and `sonnet` values are the raw selector ids advertised by the ACP adapter at this design
 baseline, even though they look like friendly aliases. Characterization must record and check the observed
@@ -58,12 +62,27 @@ Supported kinds are:
 - sealed sources and evidence: `scheduled-source`, `claimed-support-characterization-source`,
   `schedule-sidecar`, `publication-outbox`, `evidence-index`, `status`, `routing`.
 
-All records are versioned, deny unknown fields, reject secret-shaped string material, and use bounded local
-file reads. Reusable case-execution input contains the exact target/candidate/manifest/config/pin/resolution/
+All records are versioned, deny unknown fields, raw-scan every string for secret-shaped material, and use
+bounded local file reads. Git object identities are tagged SHA-1/SHA-256 object IDs rather than content
+SHA-256 digests, so current 40-character GitHub `merge_commit_sha` values are representable. Reusable
+case-execution input contains the exact target/candidate/manifest/config/pin/resolution/
 package/image/environment/cap bindings but structurally cannot contain a trigger or authority. The separate
 admission-attempt input binds that execution to exactly one tagged authority plus request/window/attempt and
 optional repeat identity. Optional security-relevant values use tagged `absent`/present forms instead of an
 omitted field.
+
+Provider grants require one exact label/plist binding for each daily or test-merge launchd trigger, and the
+component-wise sum of scheduled, test-merge, and manual-unallocated pools must fit both UTC-day and rolling
+ceilings. Generic manual authority is a closed direct-local-CLI `compatibility_run` record and cannot request
+characterization. Holds and quarantine have explicit immutable open/clear or open/close lifecycles; a second
+untyped failure remains conservatively retained rather than becoming suppressible.
+
+Impact records enforce the initial claimed-support due-case matrix: documentation/tests-only changes make no
+provider case due, container changes bind both reader profiles, ACP/core changes bind the full four-profile
+set, and new providers remain `characterization_required`. Evidence-index paths are portable normalized
+root-relative components bound to explicit hot/cold root identities. Status uses tagged window, authority,
+consent, hold, and quarantine state with expiry/lifecycle coherence. Routing records accept only the exact
+checked-in task matrix.
 
 The sealed scheduled and claimed-support sources embed both canonical records and cross-check their source
 row, identity, config, caps, authority, and trigger. The sidecar separately binds reservations, equivalent

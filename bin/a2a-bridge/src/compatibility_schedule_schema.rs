@@ -10,6 +10,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::compatibility_schedule::{
     EffectCapsV1, EffectClassV1, EvidencePurposeV1, ReplicationModeV1, TriggerKindV1,
+    EXPECTED_SUPPORT_PROFILES,
 };
 use crate::{compatibility, local_file, BoxError};
 
@@ -18,6 +19,8 @@ const MAX_ID_BYTES: usize = 128;
 const MAX_TEXT_BYTES: usize = 4096;
 const MAX_ITEMS: usize = 256;
 const MAX_CANDIDATE_BYTES: u64 = 256 * 1024 * 1024;
+const CLAIMED_SUPPORT_READER_CASE_IDS: [&str; 2] =
+    ["claude-reader-055-fable", "codex-reader-bridge-gpt56-sol"];
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -30,10 +33,36 @@ pub(super) struct FingerprintV1 {
 #[serde(deny_unknown_fields)]
 pub(super) struct EffectiveIdentityV1 {
     pub(super) model: String,
-    #[serde(default)]
-    pub(super) effort: Option<String>,
-    #[serde(default)]
-    pub(super) mode: Option<String>,
+    pub(super) effort: OptionalTextV1,
+    pub(super) mode: OptionalTextV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum OptionalTextV1 {
+    Absent,
+    Text { value: String },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum GitObjectAlgorithmV1 {
+    Sha1,
+    Sha256,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GitObjectIdV1 {
+    pub(super) algorithm: GitObjectAlgorithmV1,
+    pub(super) hex: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum OptionalGitObjectIdV1 {
+    Absent,
+    ObjectId { value: GitObjectIdV1 },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -55,19 +84,19 @@ pub(super) enum OptionalStableIdV1 {
 pub(super) enum ExactExecutionTargetV1 {
     RepositorySnapshot {
         repository: String,
-        head_sha256: String,
-        tree_sha256: String,
-        range_start_exclusive: OptionalSha256V1,
+        head_oid: GitObjectIdV1,
+        tree_oid: GitObjectIdV1,
+        range_start_exclusive: OptionalGitObjectIdV1,
     },
     TestMerge {
         repository: String,
         pull_request: u64,
-        base_sha256: String,
-        head_sha256: String,
-        merge_sha256: String,
+        base_oid: GitObjectIdV1,
+        head_oid: GitObjectIdV1,
+        merge_oid: GitObjectIdV1,
         merge_ref: String,
-        tree_sha256: String,
-        ordered_parents: Vec<String>,
+        tree_oid: GitObjectIdV1,
+        ordered_parents: Vec<GitObjectIdV1>,
     },
 }
 
@@ -346,7 +375,8 @@ pub(super) struct ManualAdmissionV1 {
     pub(super) case_execution: FingerprintV1,
     pub(super) evidence_purpose: EvidencePurposeV1,
     pub(super) freshness_bucket: String,
-    pub(super) command: String,
+    pub(super) source: ManualAdmissionSourceV1,
+    pub(super) command: ManualCommandV1,
     pub(super) caps: EffectCapsV1,
     pub(super) allowed_effects: Vec<EffectClassV1>,
     pub(super) retry_cap: u8,
@@ -354,6 +384,18 @@ pub(super) struct ManualAdmissionV1 {
     pub(super) acknowledged_billable: bool,
     pub(super) issued_at_ms: i64,
     pub(super) expires_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ManualAdmissionSourceV1 {
+    DirectLocalCli,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ManualCommandV1 {
+    CompatibilityRun,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -421,23 +463,42 @@ pub(super) struct SafetyHoldV1 {
     pub(super) case_execution: FingerprintV1,
     pub(super) reason: HoldReasonV1,
     pub(super) created_at_ms: i64,
-    #[serde(default)]
-    pub(super) cleared_at_ms: Option<i64>,
-    #[serde(default)]
-    pub(super) clearance_reason: Option<String>,
+    pub(super) lifecycle: HoldLifecycleV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(super) struct QuarantineV1 {
-    pub(super) schema_version: u16,
-    pub(super) quarantine_id: String,
-    pub(super) profile: FingerprintV1,
-    pub(super) operator: String,
-    pub(super) reason: String,
-    pub(super) created_at_ms: i64,
-    pub(super) expires_at_ms: i64,
-    pub(super) active: bool,
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum HoldLifecycleV1 {
+    Active,
+    Cleared {
+        cleared_at_ms: i64,
+        operator: String,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum QuarantineV1 {
+    Open {
+        schema_version: u16,
+        quarantine_id: String,
+        profile: FingerprintV1,
+        operator: String,
+        reason: String,
+        created_at_ms: i64,
+        expires_at_ms: i64,
+    },
+    Closed {
+        schema_version: u16,
+        quarantine_id: String,
+        profile: FingerprintV1,
+        opening_sha256: String,
+        operator: String,
+        reason: String,
+        created_at_ms: i64,
+        closed_at_ms: i64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -491,12 +552,12 @@ pub(super) enum ImpactClassV1 {
 pub(super) struct TestMergeIdentityV1 {
     pub(super) repository: String,
     pub(super) pull_request: u64,
-    pub(super) base_sha256: String,
-    pub(super) head_sha256: String,
-    pub(super) merge_sha256: String,
+    pub(super) base_oid: GitObjectIdV1,
+    pub(super) head_oid: GitObjectIdV1,
+    pub(super) merge_oid: GitObjectIdV1,
     pub(super) merge_ref: String,
-    pub(super) tree_sha256: String,
-    pub(super) ordered_parents: Vec<String>,
+    pub(super) tree_oid: GitObjectIdV1,
+    pub(super) ordered_parents: Vec<GitObjectIdV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -507,6 +568,7 @@ pub(super) struct ImpactRecordV1 {
     pub(super) target: TestMergeIdentityV1,
     pub(super) classes: Vec<ImpactClassV1>,
     pub(super) due_case_ids: Vec<String>,
+    pub(super) characterization_required_case_ids: Vec<String>,
     pub(super) no_impact_proved: bool,
 }
 
@@ -661,13 +723,7 @@ pub(super) enum OptionalRecordRefV1 {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum OptionalEffectiveIdentityV1 {
     Absent,
-    Identity {
-        model: String,
-        #[serde(default)]
-        effort: Option<String>,
-        #[serde(default)]
-        mode: Option<String>,
-    },
+    Identity { value: EffectiveIdentityV1 },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -765,7 +821,7 @@ pub(super) struct PublicationOutboxV1 {
     pub(super) state: PublicationOutboxStateV1,
     pub(super) repository: String,
     pub(super) pull_request: u64,
-    pub(super) test_merge_sha256: String,
+    pub(super) test_merge_oid: GitObjectIdV1,
     pub(super) context: String,
     pub(super) app_id: String,
     pub(super) external_id: String,
@@ -797,9 +853,8 @@ pub(super) struct EvidenceIndexEntryV1 {
     pub(super) evidence_class: EvidenceClassV1,
     pub(super) full_evidence_sha256: String,
     pub(super) compact_record_sha256: String,
-    pub(super) hot_path: String,
-    #[serde(default)]
-    pub(super) cold_path: Option<String>,
+    pub(super) hot_path: RelativeEvidencePathV1,
+    pub(super) cold_path: OptionalRelativeEvidencePathV1,
     pub(super) full_retain_until_ms: i64,
     pub(super) compact_retain_until_ms: i64,
     pub(super) pinned: bool,
@@ -808,10 +863,37 @@ pub(super) struct EvidenceIndexEntryV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub(super) struct RelativeEvidencePathV1 {
+    pub(super) components: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum OptionalRelativeEvidencePathV1 {
+    Absent,
+    RelativePath { value: RelativeEvidencePathV1 },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ColdStorageBindingV1 {
+    Absent,
+    OwnerIcloud {
+        consent_id: String,
+        consent_sha256: String,
+        root_sha256: String,
+        file_provider_domain_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EvidenceIndexV1 {
     pub(super) schema_version: u16,
     pub(super) index_id: String,
     pub(super) generation: u64,
+    pub(super) hot_root_sha256: String,
+    pub(super) cold_storage: ColdStorageBindingV1,
     pub(super) entries: Vec<EvidenceIndexEntryV1>,
 }
 
@@ -834,12 +916,63 @@ pub(super) enum ScheduleCaseLifecycleV1 {
 pub(super) struct ScheduleCaseStatusV1 {
     pub(super) case_id: String,
     pub(super) lifecycle: ScheduleCaseLifecycleV1,
-    #[serde(default)]
-    pub(super) last_outcome: Option<String>,
-    #[serde(default)]
-    pub(super) hold_id: Option<String>,
-    #[serde(default)]
-    pub(super) quarantine_id: Option<String>,
+    pub(super) last_outcome: OptionalTextV1,
+    pub(super) hold: OptionalRecordRefV1,
+    pub(super) quarantine: OptionalRecordRefV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum OptionalWindowV1 {
+    Absent,
+    Window { id: String, scheduled_at_ms: i64 },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AuthorityStateV1 {
+    Active,
+    Blocked,
+    Expired,
+    Revoked,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum OptionalAuthorityStatusV1 {
+    Absent,
+    Authority {
+        id: String,
+        sha256: String,
+        state: AuthorityStateV1,
+        expires_at_ms: i64,
+        revocation_generation: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum StorageStateV1 {
+    HotOnly,
+    ColdEligible,
+    Archiving,
+    Synchronized,
+    Blocked,
+    QuotaPressure,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum OneShotCompatibilityStateV1 {
+    Pass,
+    Fail,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum SharedOperatorHealthV1 {
+    NotEvaluated,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -848,15 +981,15 @@ pub(super) struct ScheduleStatusV1 {
     pub(super) schema_version: u16,
     pub(super) generated_at_ms: i64,
     pub(super) policy_sha256: String,
-    #[serde(default)]
-    pub(super) provider_grant_sha256: Option<String>,
-    #[serde(default)]
-    pub(super) storage_consent_sha256: Option<String>,
+    pub(super) last_window: OptionalWindowV1,
+    pub(super) next_window: OptionalWindowV1,
+    pub(super) provider_grant: OptionalAuthorityStatusV1,
+    pub(super) storage_consent: OptionalAuthorityStatusV1,
     pub(super) ledger_headroom_sha256: String,
-    pub(super) storage_state: String,
+    pub(super) storage_state: StorageStateV1,
     pub(super) missed_ticks: u64,
-    pub(super) fresh_one_shot_compatibility: String,
-    pub(super) shared_operator_health: String,
+    pub(super) fresh_one_shot_compatibility: OneShotCompatibilityStateV1,
+    pub(super) shared_operator_health: SharedOperatorHealthV1,
     pub(super) cases: Vec<ScheduleCaseStatusV1>,
 }
 
@@ -879,12 +1012,43 @@ pub(super) enum DogfoodTaskClassV1 {
 #[serde(deny_unknown_fields)]
 pub(super) struct DogfoodRoutingRuleV1 {
     pub(super) task_class: DogfoodTaskClassV1,
-    pub(super) primary_model_class: String,
-    pub(super) effort: String,
-    #[serde(default)]
-    pub(super) second_opinion: Option<String>,
-    pub(super) max_allowed: bool,
-    pub(super) fable_allowed_only_when_hard_complex: bool,
+    pub(super) primary_model_class: DogfoodPrimaryModelClassV1,
+    pub(super) effort: DogfoodEffortPolicyV1,
+    pub(super) second_opinion: DogfoodSecondOpinionV1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DogfoodPrimaryModelClassV1 {
+    InexpensiveEligible,
+    LunaOrSonnet,
+    Sol,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DogfoodEffortPolicyV1 {
+    LowOrMedium,
+    MediumOrHigh,
+    High,
+    HighOrXhigh,
+    Xhigh,
+    Max,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DogfoodSecondOpinionV1 {
+    SolWhenScopeExpands,
+    SolForCrossCuttingDifficult,
+    OpusIndependentArchitecture,
+    OpusAssumptionsAlternativesGapsCrossCutting,
+    OpusIndependentNoNestedHelpers,
+    OpusXhighThenFableHardComplex,
+    OpusOrFableAfterSolGreen,
+    OpusXhighThenFableRiskJustified,
+    OpusAlternativesThenFableHardComplex,
+    FableAdversarialWhenUseful,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -950,6 +1114,40 @@ fn optional_sha256(label: &str, value: &OptionalSha256V1) -> Result<(), BoxError
     Ok(())
 }
 
+fn optional_text(label: &str, value: &OptionalTextV1) -> Result<(), BoxError> {
+    if let OptionalTextV1::Text { value } = value {
+        bounded_text(label, value)?;
+    }
+    Ok(())
+}
+
+fn git_oid(label: &str, value: &GitObjectIdV1) -> Result<(), BoxError> {
+    let expected_len = match value.algorithm {
+        GitObjectAlgorithmV1::Sha1 => 40,
+        GitObjectAlgorithmV1::Sha256 => 64,
+    };
+    if value.hex.len() != expected_len
+        || !value
+            .hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "schedule schema: {label} must be a lowercase {}-character {:?} Git object id",
+            expected_len, value.algorithm
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn optional_git_oid(label: &str, value: &OptionalGitObjectIdV1) -> Result<(), BoxError> {
+    if let OptionalGitObjectIdV1::ObjectId { value } = value {
+        git_oid(label, value)?;
+    }
+    Ok(())
+}
+
 fn optional_stable_id(label: &str, value: &OptionalStableIdV1) -> Result<(), BoxError> {
     if let OptionalStableIdV1::StableId { value } = value {
         stable_id(label, value)?;
@@ -969,31 +1167,16 @@ fn optional_effective_identity(
     label: &str,
     value: &OptionalEffectiveIdentityV1,
 ) -> Result<(), BoxError> {
-    if let OptionalEffectiveIdentityV1::Identity {
-        model,
-        effort,
-        mode,
-    } = value
-    {
-        effective_identity(
-            label,
-            &EffectiveIdentityV1 {
-                model: model.clone(),
-                effort: effort.clone(),
-                mode: mode.clone(),
-            },
-        )?;
+    if let OptionalEffectiveIdentityV1::Identity { value } = value {
+        effective_identity(label, value)?;
     }
     Ok(())
 }
 
 fn effective_identity(label: &str, value: &EffectiveIdentityV1) -> Result<(), BoxError> {
     bounded_text(&format!("{label}.model"), &value.model)?;
-    for (field, value) in [("effort", &value.effort), ("mode", &value.mode)] {
-        if let Some(value) = value {
-            bounded_text(&format!("{label}.{field}"), value)?;
-        }
-    }
+    optional_text(&format!("{label}.effort"), &value.effort)?;
+    optional_text(&format!("{label}.mode"), &value.mode)?;
     Ok(())
 }
 
@@ -1007,37 +1190,37 @@ fn validate_execution_target(target: &ExactExecutionTargetV1) -> Result<(), BoxE
     match target {
         ExactExecutionTargetV1::RepositorySnapshot {
             repository,
-            head_sha256,
-            tree_sha256,
+            head_oid,
+            tree_oid,
             range_start_exclusive,
         } => {
             bounded_text("execution repository", repository)?;
-            sha256("execution head", head_sha256)?;
-            sha256("execution tree", tree_sha256)?;
-            optional_sha256("execution range start", range_start_exclusive)
+            git_oid("execution head", head_oid)?;
+            git_oid("execution tree", tree_oid)?;
+            optional_git_oid("execution range start", range_start_exclusive)
         }
         ExactExecutionTargetV1::TestMerge {
             repository,
             pull_request,
-            base_sha256,
-            head_sha256,
-            merge_sha256,
+            base_oid,
+            head_oid,
+            merge_oid,
             merge_ref,
-            tree_sha256,
+            tree_oid,
             ordered_parents,
         } => {
             bounded_text("test-merge repository", repository)?;
             for (label, value) in [
-                ("test-merge base", base_sha256),
-                ("test-merge head", head_sha256),
-                ("test-merge result", merge_sha256),
-                ("test-merge tree", tree_sha256),
+                ("test-merge base", base_oid),
+                ("test-merge head", head_oid),
+                ("test-merge result", merge_oid),
+                ("test-merge tree", tree_oid),
             ] {
-                sha256(label, value)?;
+                git_oid(label, value)?;
             }
             if *pull_request == 0
                 || merge_ref != &format!("refs/pull/{pull_request}/merge")
-                || ordered_parents != &[base_sha256.clone(), head_sha256.clone()]
+                || ordered_parents != &[base_oid.clone(), head_oid.clone()]
             {
                 return Err(
                     "schedule schema: execution test-merge identity is not canonical".into(),
@@ -1151,6 +1334,56 @@ fn validate_grant_budgets(
     ] {
         aggregate_budget_within(label, caps, &value.utc_day)?;
     }
+    let sum = |field: &str, values: [u64; 3]| -> Result<u64, BoxError> {
+        values
+            .into_iter()
+            .try_fold(0_u64, u64::checked_add)
+            .ok_or_else(|| format!("schedule schema: {field} pool allocation overflows").into())
+    };
+    let allocated = AggregateBudgetCapsV1 {
+        max_attempts: sum(
+            "attempt",
+            [
+                value.protected_scheduled.max_attempts,
+                value.protected_test_merge.max_attempts,
+                value.manual_unallocated.max_attempts,
+            ],
+        )?,
+        max_tokens: sum(
+            "token",
+            [
+                value.protected_scheduled.max_tokens,
+                value.protected_test_merge.max_tokens,
+                value.manual_unallocated.max_tokens,
+            ],
+        )?,
+        max_cost_microusd: sum(
+            "cost",
+            [
+                value.protected_scheduled.max_cost_microusd,
+                value.protected_test_merge.max_cost_microusd,
+                value.manual_unallocated.max_cost_microusd,
+            ],
+        )?,
+        max_time_secs: sum(
+            "time",
+            [
+                value.protected_scheduled.max_time_secs,
+                value.protected_test_merge.max_time_secs,
+                value.manual_unallocated.max_time_secs,
+            ],
+        )?,
+    };
+    aggregate_budget_within(
+        "combined protected/manual allocation",
+        &allocated,
+        &value.utc_day,
+    )?;
+    aggregate_budget_within(
+        "combined protected/manual rolling allocation",
+        &allocated,
+        &value.rolling_24h,
+    )?;
 
     let observed_cases = value
         .per_case
@@ -1502,6 +1735,23 @@ impl ValidateRecord for ProviderEffectGrantV1 {
             "launchd label",
             self.launchd.iter().map(|item| item.label.as_str()),
         )?;
+        let required_launchd = self
+            .triggers
+            .iter()
+            .filter(|trigger| matches!(trigger, TriggerKindV1::Daily | TriggerKindV1::TestMerge))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let observed_launchd = self
+            .launchd
+            .iter()
+            .map(|item| item.trigger)
+            .collect::<BTreeSet<_>>();
+        if observed_launchd != required_launchd || observed_launchd.len() != self.launchd.len() {
+            return Err(
+                "schedule schema: daily and test-merge grant triggers require exactly one launchd label/plist binding"
+                    .into(),
+            );
+        }
         for item in &self.launchd {
             sha256("launchd plist", &item.plist_sha256)?;
             if !self.triggers.contains(&item.trigger) {
@@ -1527,6 +1777,12 @@ impl ValidateRecord for ProviderEffectGrantV1 {
                 .within(&self.per_run_caps, "granted profile caps")?;
             if !profiles.insert(profile.characterization_profile.sha256.as_str()) {
                 return Err("schedule schema: provider grant repeats a profile".into());
+            }
+            if profile.source.row_id != profile.case_id {
+                return Err(
+                    "schedule schema: granted case id must match its characterized source row"
+                        .into(),
+                );
             }
             if !profile_cases.insert(profile.case_id.as_str()) {
                 return Err(
@@ -1562,10 +1818,10 @@ impl ValidateRecord for ManualAdmissionV1 {
         fingerprint("manual profile", &self.characterization_profile)?;
         fingerprint("manual execution", &self.case_execution)?;
         stable_id("manual freshness bucket", &self.freshness_bucket)?;
-        bounded_text("manual command", &self.command)?;
-        if self.command.contains("serve") || self.command.contains("schedule-tick") {
+        if self.evidence_purpose == EvidencePurposeV1::Characterization {
             return Err(
-                "schedule schema: manual admission cannot originate from serve or a timer".into(),
+                "schedule schema: generic manual admission cannot authorize characterization"
+                    .into(),
             );
         }
         self.caps.validate("manual caps")?;
@@ -1659,29 +1915,67 @@ impl ValidateRecord for SafetyHoldV1 {
         stable_id("hold id", &self.hold_id)?;
         fingerprint("held profile", &self.characterization_profile)?;
         fingerprint("held execution", &self.case_execution)?;
-        match (self.cleared_at_ms, self.clearance_reason.as_deref()) {
-            (None, None) => Ok(()),
-            (Some(time), Some(reason)) if time >= self.created_at_ms => {
+        match &self.lifecycle {
+            HoldLifecycleV1::Active => Ok(()),
+            HoldLifecycleV1::Cleared {
+                cleared_at_ms,
+                operator,
+                reason,
+            } if *cleared_at_ms >= self.created_at_ms => {
+                bounded_text("hold clearance operator", operator)?;
                 bounded_text("hold clearance reason", reason)
             }
-            _ => Err("schedule schema: hold clearance time and reason must appear together".into()),
+            HoldLifecycleV1::Cleared { .. } => {
+                Err("schedule schema: hold clearance predates the hold".into())
+            }
         }
     }
 }
 
 impl ValidateRecord for QuarantineV1 {
     fn validate(&self) -> Result<(), BoxError> {
-        if self.schema_version != 1 {
-            return Err("schedule schema: quarantine schema_version must be 1".into());
+        match self {
+            QuarantineV1::Open {
+                schema_version,
+                quarantine_id,
+                profile,
+                operator,
+                reason,
+                created_at_ms,
+                expires_at_ms,
+            } => {
+                if *schema_version != 1 {
+                    return Err("schedule schema: quarantine schema_version must be 1".into());
+                }
+                stable_id("quarantine id", quarantine_id)?;
+                fingerprint("quarantined profile", profile)?;
+                bounded_text("quarantine operator", operator)?;
+                bounded_text("quarantine reason", reason)?;
+                time_range("quarantine", *created_at_ms, *expires_at_ms)
+            }
+            QuarantineV1::Closed {
+                schema_version,
+                quarantine_id,
+                profile,
+                opening_sha256,
+                operator,
+                reason,
+                created_at_ms,
+                closed_at_ms,
+            } => {
+                if *schema_version != 1 || *created_at_ms <= 0 || *closed_at_ms < *created_at_ms {
+                    return Err(
+                        "schedule schema: quarantine closure has an invalid version or time range"
+                            .into(),
+                    );
+                }
+                stable_id("quarantine id", quarantine_id)?;
+                fingerprint("quarantined profile", profile)?;
+                sha256("quarantine opening", opening_sha256)?;
+                bounded_text("quarantine closure operator", operator)?;
+                bounded_text("quarantine closure reason", reason)
+            }
         }
-        stable_id("quarantine id", &self.quarantine_id)?;
-        fingerprint("quarantined profile", &self.profile)?;
-        bounded_text("quarantine reason", &self.reason)?;
-        time_range("quarantine", self.created_at_ms, self.expires_at_ms)?;
-        if !self.active {
-            return Err("schedule schema: an inactive quarantine must be represented by a separate closure record".into());
-        }
-        Ok(())
     }
 }
 
@@ -1720,6 +2014,10 @@ impl ValidateRecord for FailureDispositionV1 {
                 1,
                 FailureActionV1::ConfirmationDue
             ) | (
+                FailureKindV1::UntypedTransient,
+                2..,
+                FailureActionV1::UnknownRetained
+            ) | (
                 FailureKindV1::CandidateUnknown,
                 _,
                 FailureActionV1::UnknownRetained
@@ -1741,14 +2039,14 @@ fn validate_test_merge(target: &TestMergeIdentityV1) -> Result<(), BoxError> {
         return Err("schedule schema: test-merge identity is not canonical".into());
     }
     for (label, value) in [
-        ("base", &target.base_sha256),
-        ("head", &target.head_sha256),
-        ("merge", &target.merge_sha256),
-        ("tree", &target.tree_sha256),
+        ("base", &target.base_oid),
+        ("head", &target.head_oid),
+        ("merge", &target.merge_oid),
+        ("tree", &target.tree_oid),
     ] {
-        sha256(label, value)?;
+        git_oid(label, value)?;
     }
-    if target.ordered_parents != [target.base_sha256.clone(), target.head_sha256.clone()] {
+    if target.ordered_parents != [target.base_oid.clone(), target.head_oid.clone()] {
         return Err("schedule schema: test-merge ordered parents must be base then head".into());
     }
     Ok(())
@@ -1767,8 +2065,109 @@ impl ValidateRecord for ImpactRecordV1 {
             return Err("schedule schema: impact classes must be non-empty and unique".into());
         }
         unique_ids("due case id", self.due_case_ids.iter().map(String::as_str))?;
-        if self.no_impact_proved != self.due_case_ids.is_empty() {
-            return Err("schedule schema: no-impact proof and due cases contradict".into());
+        unique_ids(
+            "characterization-required case id",
+            self.characterization_required_case_ids
+                .iter()
+                .map(String::as_str),
+        )?;
+        let classes = self.classes.iter().copied().collect::<BTreeSet<_>>();
+        let production = classes.iter().any(|class| {
+            matches!(
+                class,
+                ImpactClassV1::AcpRuntime
+                    | ImpactClassV1::ContainerRuntime
+                    | ImpactClassV1::ModelCapability
+                    | ImpactClassV1::Authentication
+                    | ImpactClassV1::CompatibilityCore
+            )
+        });
+        if classes.contains(&ImpactClassV1::DocumentationOnly) && classes.len() != 1 {
+            return Err(
+                "schedule schema: documentation_only is exclusive and cannot make provider cases due"
+                    .into(),
+            );
+        }
+        if classes == BTreeSet::from([ImpactClassV1::DocumentationOnly])
+            || classes == BTreeSet::from([ImpactClassV1::TestsOnly])
+        {
+            if !self.due_case_ids.is_empty()
+                || !self.characterization_required_case_ids.is_empty()
+                || !self.no_impact_proved
+            {
+                return Err(
+                    "schedule schema: docs-only/tests-only impact must prove no provider impact"
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
+        if production == self.due_case_ids.is_empty() {
+            return Err(
+                "schedule schema: production impact classes and due provider cases contradict"
+                    .into(),
+            );
+        }
+        if classes.contains(&ImpactClassV1::NewProvider)
+            == self.characterization_required_case_ids.is_empty()
+        {
+            return Err(
+                "schedule schema: new-provider impact must be characterization-required, never immediately due"
+                .into(),
+            );
+        }
+        let due = self
+            .due_case_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let claimed_support = EXPECTED_SUPPORT_PROFILES
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let readers = CLAIMED_SUPPORT_READER_CASE_IDS
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if !due.is_subset(&claimed_support) {
+            return Err(
+                "schedule schema: due cases must be exact inventoried claimed-support profiles"
+                    .into(),
+            );
+        }
+        let requires_all = classes.contains(&ImpactClassV1::AcpRuntime)
+            || classes.contains(&ImpactClassV1::CompatibilityCore);
+        if requires_all && !claimed_support.is_subset(&due) {
+            return Err(
+                "schedule schema: ACP/core impact must make every claimed-support profile due"
+                    .into(),
+            );
+        }
+        if classes.contains(&ImpactClassV1::ContainerRuntime) && !readers.is_subset(&due) {
+            return Err(
+                "schedule schema: container impact must make both claimed-support reader profiles due"
+                    .into(),
+            );
+        }
+        let broad_case_class = classes.contains(&ImpactClassV1::AcpRuntime)
+            || classes.contains(&ImpactClassV1::CompatibilityCore)
+            || classes.contains(&ImpactClassV1::ModelCapability)
+            || classes.contains(&ImpactClassV1::Authentication);
+        if !broad_case_class && !due.is_subset(&readers) {
+            return Err(
+                "schedule schema: container-only impact cannot make host profiles due".into(),
+            );
+        }
+        if due.iter().any(|case| {
+            self.characterization_required_case_ids
+                .iter()
+                .any(|id| id == case)
+        }) {
+            return Err(
+                "schedule schema: one case cannot be both due and characterization-required".into(),
+            );
+        }
+        if self.no_impact_proved || (!production && !classes.contains(&ImpactClassV1::NewProvider))
+        {
+            return Err("schedule schema: impact reducer state is contradictory".into());
         }
         Ok(())
     }
@@ -2144,7 +2543,8 @@ impl ValidateRecord for PublicationOutboxV1 {
             return Err("schedule schema: publication outbox must be version 1 with a PR".into());
         }
         stable_id("outbox id", &self.outbox_id)?;
-        sha256("outbox test merge", &self.test_merge_sha256)?;
+        bounded_text("outbox repository", &self.repository)?;
+        git_oid("outbox test merge", &self.test_merge_oid)?;
         bounded_text("check context", &self.context)?;
         stable_id("App id", &self.app_id)?;
         stable_id("external id", &self.external_id)?;
@@ -2218,12 +2618,70 @@ impl ValidateRecord for PublicationOutboxV1 {
     }
 }
 
+fn portable_path_component(label: &str, value: &str) -> Result<(), BoxError> {
+    bounded_text(label, value)?;
+    let invalid_character = value.bytes().any(|byte| {
+        matches!(
+            byte,
+            b'/' | b'\\' | b':' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|'
+        )
+    });
+    let stem = value
+        .split_once('.')
+        .map_or(value, |(stem, _)| stem)
+        .to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+    if value == "." || value == ".." || value.ends_with([' ', '.']) || invalid_character || reserved
+    {
+        return Err(format!(
+            "schedule schema: {label} must be one normalized portable relative-path component"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn relative_evidence_path(label: &str, value: &RelativeEvidencePathV1) -> Result<(), BoxError> {
+    if value.components.is_empty() || value.components.len() > 64 {
+        return Err(format!(
+            "schedule schema: {label} must contain 1..=64 relative path components"
+        )
+        .into());
+    }
+    for component in &value.components {
+        portable_path_component(label, component)?;
+    }
+    Ok(())
+}
+
 impl ValidateRecord for EvidenceIndexV1 {
     fn validate(&self) -> Result<(), BoxError> {
-        if self.schema_version != 1 || self.entries.len() > MAX_ITEMS {
-            return Err("schedule schema: evidence index must be version 1 and bounded".into());
+        if self.schema_version != 1 || self.generation == 0 || self.entries.len() > MAX_ITEMS {
+            return Err(
+                "schedule schema: evidence index must be version 1 with a positive generation and bounded entries"
+                    .into(),
+            );
         }
         stable_id("evidence index id", &self.index_id)?;
+        sha256("hot evidence root", &self.hot_root_sha256)?;
+        let cold_enabled = match &self.cold_storage {
+            ColdStorageBindingV1::Absent => false,
+            ColdStorageBindingV1::OwnerIcloud {
+                consent_id,
+                consent_sha256,
+                root_sha256,
+                file_provider_domain_id,
+            } => {
+                stable_id("cold storage consent id", consent_id)?;
+                sha256("cold storage consent", consent_sha256)?;
+                sha256("cold storage root", root_sha256)?;
+                bounded_text("cold storage FileProvider domain", file_provider_domain_id)?;
+                true
+            }
+        };
         unique_ids(
             "evidence id",
             self.entries.iter().map(|entry| entry.evidence_id.as_str()),
@@ -2231,9 +2689,18 @@ impl ValidateRecord for EvidenceIndexV1 {
         for entry in &self.entries {
             sha256("full evidence", &entry.full_evidence_sha256)?;
             sha256("compact evidence", &entry.compact_record_sha256)?;
-            bounded_text("hot evidence path", &entry.hot_path)?;
-            if let Some(path) = &entry.cold_path {
-                bounded_text("cold evidence path", path)?;
+            relative_evidence_path("hot evidence path", &entry.hot_path)?;
+            match &entry.cold_path {
+                OptionalRelativeEvidencePathV1::Absent => {}
+                OptionalRelativeEvidencePathV1::RelativePath { value } if cold_enabled => {
+                    relative_evidence_path("cold evidence path", value)?;
+                }
+                OptionalRelativeEvidencePathV1::RelativePath { .. } => {
+                    return Err(
+                        "schedule schema: cold evidence path requires a bound cold-storage root"
+                            .into(),
+                    )
+                }
             }
             if entry.full_retain_until_ms <= 0
                 || entry.compact_retain_until_ms < entry.full_retain_until_ms
@@ -2246,6 +2713,51 @@ impl ValidateRecord for EvidenceIndexV1 {
     }
 }
 
+fn optional_window(label: &str, value: &OptionalWindowV1) -> Result<(), BoxError> {
+    if let OptionalWindowV1::Window {
+        id,
+        scheduled_at_ms,
+    } = value
+    {
+        stable_id(&format!("{label} id"), id)?;
+        if *scheduled_at_ms <= 0 {
+            return Err(format!("schedule schema: {label} time must be positive").into());
+        }
+    }
+    Ok(())
+}
+
+fn optional_authority_status(
+    label: &str,
+    value: &OptionalAuthorityStatusV1,
+    generated_at_ms: i64,
+) -> Result<(), BoxError> {
+    if let OptionalAuthorityStatusV1::Authority {
+        id,
+        sha256: value,
+        state,
+        expires_at_ms,
+        revocation_generation,
+    } = value
+    {
+        stable_id(&format!("{label} id"), id)?;
+        sha256(label, value)?;
+        if *expires_at_ms <= 0 || *revocation_generation == 0 {
+            return Err(
+                format!("schedule schema: {label} expiry/generation state is invalid").into(),
+            );
+        }
+        let expired = *expires_at_ms <= generated_at_ms;
+        if (*state == AuthorityStateV1::Expired) != expired {
+            return Err(format!(
+                "schedule schema: {label} expiry time and closed authority state disagree"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 impl ValidateRecord for ScheduleStatusV1 {
     fn validate(&self) -> Result<(), BoxError> {
         if self.schema_version != 1 || self.generated_at_ms <= 0 || self.cases.len() > MAX_ITEMS {
@@ -2254,25 +2766,65 @@ impl ValidateRecord for ScheduleStatusV1 {
             );
         }
         sha256("status policy", &self.policy_sha256)?;
-        sha256("ledger headroom", &self.ledger_headroom_sha256)?;
-        if let Some(value) = &self.provider_grant_sha256 {
-            sha256("provider grant", value)?;
-        }
-        if let Some(value) = &self.storage_consent_sha256 {
-            sha256("storage consent", value)?;
-        }
-        bounded_text("storage state", &self.storage_state)?;
-        if !matches!(
-            self.fresh_one_shot_compatibility.as_str(),
-            "pass" | "fail" | "unknown"
-        ) || self.shared_operator_health != "not_evaluated"
+        optional_window("last window", &self.last_window)?;
+        optional_window("next window", &self.next_window)?;
+        if let (
+            OptionalWindowV1::Window {
+                scheduled_at_ms: last,
+                ..
+            },
+            OptionalWindowV1::Window {
+                scheduled_at_ms: next,
+                ..
+            },
+        ) = (&self.last_window, &self.next_window)
         {
-            return Err("schedule schema: status must keep one-shot compatibility separate from operator health".into());
+            if next <= last {
+                return Err("schedule schema: next window must follow the last window".into());
+            }
         }
+        optional_authority_status("provider grant", &self.provider_grant, self.generated_at_ms)?;
+        optional_authority_status(
+            "storage consent",
+            &self.storage_consent,
+            self.generated_at_ms,
+        )?;
+        sha256("ledger headroom", &self.ledger_headroom_sha256)?;
         unique_ids(
             "status case id",
             self.cases.iter().map(|case| case.case_id.as_str()),
         )?;
+        for case in &self.cases {
+            optional_text("status last outcome", &case.last_outcome)?;
+            optional_record_ref("status hold", &case.hold)?;
+            optional_record_ref("status quarantine", &case.quarantine)?;
+            let held = matches!(case.hold, OptionalRecordRefV1::Record { .. });
+            let quarantined = matches!(case.quarantine, OptionalRecordRefV1::Record { .. });
+            if held && quarantined {
+                return Err(
+                    "schedule schema: a status case cannot be simultaneously held and quarantined"
+                        .into(),
+                );
+            }
+            if (case.lifecycle == ScheduleCaseLifecycleV1::OperatorQuarantined) != quarantined {
+                return Err(
+                    "schedule schema: operator-quarantined lifecycle requires exactly one quarantine reference"
+                        .into(),
+                );
+            }
+            if matches!(
+                case.lifecycle,
+                ScheduleCaseLifecycleV1::CharacterizationRequired
+                    | ScheduleCaseLifecycleV1::Deferred
+                    | ScheduleCaseLifecycleV1::Retired
+            ) && held
+            {
+                return Err(
+                    "schedule schema: inactive case lifecycles cannot carry a live safety hold"
+                        .into(),
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -2305,20 +2857,64 @@ impl ValidateRecord for DogfoodRoutingPolicyV1 {
             );
         }
         for rule in &self.rules {
-            bounded_text("primary model class", &rule.primary_model_class)?;
-            bounded_text("routing effort", &rule.effort)?;
-            if let Some(value) = &rule.second_opinion {
-                bounded_text("second opinion", value)?;
-            }
-            if rule.max_allowed
-                != (rule.task_class == DogfoodTaskClassV1::ConcurrencyTransactionCriticalProof)
-            {
-                return Err("schedule schema: max is reserved for the concurrency/transaction/critical-proof class".into());
-            }
-            if !rule.fable_allowed_only_when_hard_complex {
-                return Err(
-                    "schedule schema: Fable must remain limited to hard/complex work".into(),
-                );
+            let expected = match rule.task_class {
+                DogfoodTaskClassV1::BoundedSummaryDocsLightBrainstorm => (
+                    DogfoodPrimaryModelClassV1::InexpensiveEligible,
+                    DogfoodEffortPolicyV1::LowOrMedium,
+                    DogfoodSecondOpinionV1::SolWhenScopeExpands,
+                ),
+                DogfoodTaskClassV1::SmallSpecifiedImplementation => (
+                    DogfoodPrimaryModelClassV1::LunaOrSonnet,
+                    DogfoodEffortPolicyV1::MediumOrHigh,
+                    DogfoodSecondOpinionV1::SolForCrossCuttingDifficult,
+                ),
+                DogfoodTaskClassV1::NormalImplementation => (
+                    DogfoodPrimaryModelClassV1::Sol,
+                    DogfoodEffortPolicyV1::High,
+                    DogfoodSecondOpinionV1::OpusIndependentArchitecture,
+                ),
+                DogfoodTaskClassV1::SpecDesignArchitectureAuthoring => (
+                    DogfoodPrimaryModelClassV1::Sol,
+                    DogfoodEffortPolicyV1::HighOrXhigh,
+                    DogfoodSecondOpinionV1::OpusAssumptionsAlternativesGapsCrossCutting,
+                ),
+                DogfoodTaskClassV1::CleanroomSpecTechnicalDesign => (
+                    DogfoodPrimaryModelClassV1::Sol,
+                    DogfoodEffortPolicyV1::HighOrXhigh,
+                    DogfoodSecondOpinionV1::OpusIndependentNoNestedHelpers,
+                ),
+                DogfoodTaskClassV1::AdversarialDesignImplementationReview => (
+                    DogfoodPrimaryModelClassV1::Sol,
+                    DogfoodEffortPolicyV1::Xhigh,
+                    DogfoodSecondOpinionV1::OpusXhighThenFableHardComplex,
+                ),
+                DogfoodTaskClassV1::ReleaseCompatibilityReview => (
+                    DogfoodPrimaryModelClassV1::Sol,
+                    DogfoodEffortPolicyV1::Xhigh,
+                    DogfoodSecondOpinionV1::OpusOrFableAfterSolGreen,
+                ),
+                DogfoodTaskClassV1::FullBranchReview => (
+                    DogfoodPrimaryModelClassV1::Sol,
+                    DogfoodEffortPolicyV1::Xhigh,
+                    DogfoodSecondOpinionV1::OpusXhighThenFableRiskJustified,
+                ),
+                DogfoodTaskClassV1::RequirementsBrainstormAnalysisGrooming => (
+                    DogfoodPrimaryModelClassV1::Sol,
+                    DogfoodEffortPolicyV1::HighOrXhigh,
+                    DogfoodSecondOpinionV1::OpusAlternativesThenFableHardComplex,
+                ),
+                DogfoodTaskClassV1::ConcurrencyTransactionCriticalProof => (
+                    DogfoodPrimaryModelClassV1::Sol,
+                    DogfoodEffortPolicyV1::Max,
+                    DogfoodSecondOpinionV1::FableAdversarialWhenUseful,
+                ),
+            };
+            if (rule.primary_model_class, rule.effort, rule.second_opinion) != expected {
+                return Err(format!(
+                    "schedule schema: routing rule {:?} contradicts the approved task matrix",
+                    rule.task_class
+                )
+                .into());
             }
         }
         Ok(())
@@ -2329,6 +2925,32 @@ fn parse_and_validate<T: DeserializeOwned + ValidateRecord>(
     bytes: &[u8],
     label: &str,
 ) -> Result<(), BoxError> {
+    let raw = std::str::from_utf8(bytes)
+        .map_err(|_| format!("schedule schema: invalid {label}: JSON must be UTF-8"))?;
+    if compatibility::looks_like_secret(raw) {
+        return Err(format!("schedule schema: {label} contains secret-shaped material").into());
+    }
+    fn scan(value: &serde_json::Value, path: &str) -> Result<(), BoxError> {
+        match value {
+            serde_json::Value::String(value) => bounded_text(path, value),
+            serde_json::Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    scan(value, &format!("{path}[{index}]"))?;
+                }
+                Ok(())
+            }
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    scan(value, &format!("{path}.{key}"))?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    let untyped: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("schedule schema: invalid {label}: {error}"))?;
+    scan(&untyped, label)?;
     let value: T = serde_json::from_slice(bytes)
         .map_err(|error| format!("schedule schema: invalid {label}: {error}"))?;
     value.validate()
@@ -2392,6 +3014,119 @@ mod tests {
         }
     }
 
+    fn text(value: &str) -> OptionalTextV1 {
+        OptionalTextV1::Text {
+            value: value.into(),
+        }
+    }
+
+    fn sha1(ch: char) -> GitObjectIdV1 {
+        GitObjectIdV1 {
+            algorithm: GitObjectAlgorithmV1::Sha1,
+            hex: ch.to_string().repeat(40),
+        }
+    }
+
+    fn test_merge() -> TestMergeIdentityV1 {
+        let base = sha1('a');
+        let head = sha1('b');
+        TestMergeIdentityV1 {
+            repository: "shoedog/a2acp".into(),
+            pull_request: 37,
+            base_oid: base.clone(),
+            head_oid: head.clone(),
+            merge_oid: sha1('c'),
+            merge_ref: "refs/pull/37/merge".into(),
+            tree_oid: sha1('d'),
+            ordered_parents: vec![base, head],
+        }
+    }
+
+    fn routing_policy() -> DogfoodRoutingPolicyV1 {
+        use DogfoodEffortPolicyV1 as Effort;
+        use DogfoodPrimaryModelClassV1 as Model;
+        use DogfoodSecondOpinionV1 as Lens;
+        use DogfoodTaskClassV1 as Task;
+        let rules = [
+            (
+                Task::BoundedSummaryDocsLightBrainstorm,
+                Model::InexpensiveEligible,
+                Effort::LowOrMedium,
+                Lens::SolWhenScopeExpands,
+            ),
+            (
+                Task::SmallSpecifiedImplementation,
+                Model::LunaOrSonnet,
+                Effort::MediumOrHigh,
+                Lens::SolForCrossCuttingDifficult,
+            ),
+            (
+                Task::NormalImplementation,
+                Model::Sol,
+                Effort::High,
+                Lens::OpusIndependentArchitecture,
+            ),
+            (
+                Task::SpecDesignArchitectureAuthoring,
+                Model::Sol,
+                Effort::HighOrXhigh,
+                Lens::OpusAssumptionsAlternativesGapsCrossCutting,
+            ),
+            (
+                Task::CleanroomSpecTechnicalDesign,
+                Model::Sol,
+                Effort::HighOrXhigh,
+                Lens::OpusIndependentNoNestedHelpers,
+            ),
+            (
+                Task::AdversarialDesignImplementationReview,
+                Model::Sol,
+                Effort::Xhigh,
+                Lens::OpusXhighThenFableHardComplex,
+            ),
+            (
+                Task::ReleaseCompatibilityReview,
+                Model::Sol,
+                Effort::Xhigh,
+                Lens::OpusOrFableAfterSolGreen,
+            ),
+            (
+                Task::FullBranchReview,
+                Model::Sol,
+                Effort::Xhigh,
+                Lens::OpusXhighThenFableRiskJustified,
+            ),
+            (
+                Task::RequirementsBrainstormAnalysisGrooming,
+                Model::Sol,
+                Effort::HighOrXhigh,
+                Lens::OpusAlternativesThenFableHardComplex,
+            ),
+            (
+                Task::ConcurrencyTransactionCriticalProof,
+                Model::Sol,
+                Effort::Max,
+                Lens::FableAdversarialWhenUseful,
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(task_class, primary_model_class, effort, second_opinion)| DogfoodRoutingRuleV1 {
+                task_class,
+                primary_model_class,
+                effort,
+                second_opinion,
+            },
+        )
+        .collect();
+        DogfoodRoutingPolicyV1 {
+            schema_version: 1,
+            advisory_only: true,
+            audit_required: true,
+            rules,
+        }
+    }
+
     fn standing_authority() -> AdmissionAuthorityV1 {
         AdmissionAuthorityV1::StandingGrant(StandingGrantAuthorityV1 {
             grant_id: "grant-1".into(),
@@ -2427,9 +3162,9 @@ mod tests {
     fn aggregate_caps(attempts: u64) -> AggregateBudgetCapsV1 {
         AggregateBudgetCapsV1 {
             max_attempts: attempts,
-            max_tokens: 1_000,
-            max_cost_microusd: 1_000,
-            max_time_secs: 1_000,
+            max_tokens: attempts * 1_000,
+            max_cost_microusd: attempts * 1_000,
+            max_time_secs: attempts * 1_000,
         }
     }
 
@@ -2449,8 +3184,8 @@ mod tests {
             characterization_sha256: digest('4'),
             effective_identity: EffectiveIdentityV1 {
                 model: "model-1".into(),
-                effort: Some("low".into()),
-                mode: None,
+                effort: text("low"),
+                mode: OptionalTextV1::Absent,
             },
             caps: effect_caps(),
         };
@@ -2486,14 +3221,18 @@ mod tests {
                     id: "provider-1".into(),
                     caps: aggregate_caps(1),
                 }],
-                utc_day: aggregate_caps(2),
-                rolling_24h: aggregate_caps(2),
+                utc_day: aggregate_caps(3),
+                rolling_24h: aggregate_caps(3),
                 protected_scheduled: aggregate_caps(1),
                 protected_test_merge: aggregate_caps(1),
                 manual_unallocated: aggregate_caps(1),
             },
             confirmation_allowance: 1,
-            launchd: Vec::new(),
+            launchd: vec![LaunchdBindingV1 {
+                label: "com.a2a-bridge.compatibility.daily".into(),
+                plist_sha256: digest('0'),
+                trigger: TriggerKindV1::Daily,
+            }],
             profiles: vec![profile],
             not_before_ms: 1,
             expires_at_ms: 100,
@@ -2508,7 +3247,7 @@ mod tests {
             state: PublicationOutboxStateV1::RemotePending,
             repository: "shoedog/a2acp".into(),
             pull_request: 37,
-            test_merge_sha256: digest('a'),
+            test_merge_oid: sha1('a'),
             context: "a2a-bridge/r3d".into(),
             app_id: "app-1".into(),
             external_id: "external-1".into(),
@@ -2534,9 +3273,9 @@ mod tests {
             characterization_profile: profile,
             target: ExactExecutionTargetV1::RepositorySnapshot {
                 repository: "shoedog/a2acp".into(),
-                head_sha256: digest('a'),
-                tree_sha256: digest('b'),
-                range_start_exclusive: OptionalSha256V1::Absent,
+                head_oid: sha1('a'),
+                tree_oid: sha1('b'),
+                range_start_exclusive: OptionalGitObjectIdV1::Absent,
             },
             candidate: CandidateBinaryIdentityV1 {
                 sha256: digest('c'),
@@ -2623,6 +3362,55 @@ mod tests {
     }
 
     #[test]
+    fn git_object_ids_accept_real_sha1_and_reject_algorithm_length_mismatch() {
+        let target = ExactExecutionTargetV1::RepositorySnapshot {
+            repository: "shoedog/a2acp".into(),
+            head_oid: GitObjectIdV1 {
+                algorithm: GitObjectAlgorithmV1::Sha1,
+                hex: "e7e5fa14da127511c080e802625afbcc455d94e1".into(),
+            },
+            tree_oid: sha1('a'),
+            range_start_exclusive: OptionalGitObjectIdV1::ObjectId { value: sha1('b') },
+        };
+        validate_execution_target(&target).unwrap();
+
+        let mut invalid = sha1('c');
+        invalid.algorithm = GitObjectAlgorithmV1::Sha256;
+        assert!(git_oid("mismatched oid", &invalid).is_err());
+
+        let merge = test_merge();
+        validate_test_merge(&merge).unwrap();
+        let mut wrong_parents = merge;
+        wrong_parents.ordered_parents.reverse();
+        assert!(validate_test_merge(&wrong_parents).is_err());
+    }
+
+    #[test]
+    fn effective_identity_requires_explicit_tagged_absences() {
+        let valid = serde_json::json!({
+            "model": "gpt-5.6-luna",
+            "effort": {"kind": "text", "value": "low"},
+            "mode": {"kind": "absent"}
+        });
+        let identity: EffectiveIdentityV1 = serde_json::from_value(valid).unwrap();
+        effective_identity("identity", &identity).unwrap();
+        assert!(
+            serde_json::from_value::<EffectiveIdentityV1>(serde_json::json!({
+                "model": "gpt-5.6-luna",
+                "effort": null,
+                "mode": null
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<EffectiveIdentityV1>(serde_json::json!({
+                "model": "gpt-5.6-luna"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn grant_budget_dimensions_require_exact_coverage_and_bounded_pools() {
         let case_ids = BTreeSet::from(["case-1"]);
         let provider_families = BTreeSet::from(["provider-1"]);
@@ -2640,8 +3428,8 @@ mod tests {
                 id: "provider-1".into(),
                 caps: aggregate_caps(1),
             }],
-            utc_day: aggregate_caps(2),
-            rolling_24h: aggregate_caps(2),
+            utc_day: aggregate_caps(3),
+            rolling_24h: aggregate_caps(3),
             protected_scheduled: aggregate_caps(1),
             protected_test_merge: aggregate_caps(1),
             manual_unallocated: aggregate_caps(1),
@@ -2656,19 +3444,62 @@ mod tests {
                 .contains("per-provider")
         );
         budgets.per_provider.push(provider);
-        budgets.protected_test_merge.max_attempts = 3;
+        budgets.utc_day.max_attempts = 2;
+        budgets.rolling_24h.max_attempts = 2;
         assert!(
             validate_grant_budgets(&budgets, &case_ids, &provider_families, &triggers)
                 .unwrap_err()
                 .to_string()
-                .contains("exceeds")
+                .contains("combined")
         );
+
+        for field in ["tokens", "cost", "time"] {
+            let mut budgets = provider_grant().budgets;
+            match field {
+                "tokens" => {
+                    budgets.utc_day.max_tokens -= 1;
+                    budgets.rolling_24h.max_tokens -= 1;
+                }
+                "cost" => {
+                    budgets.utc_day.max_cost_microusd -= 1;
+                    budgets.rolling_24h.max_cost_microusd -= 1;
+                }
+                "time" => {
+                    budgets.utc_day.max_time_secs -= 1;
+                    budgets.rolling_24h.max_time_secs -= 1;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_grant_budgets(&budgets, &case_ids, &provider_families, &triggers)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("combined"),
+                "{field} allocation unexpectedly fit"
+            );
+        }
     }
 
     #[test]
-    fn provider_grant_rejects_two_profiles_for_one_case() {
+    fn provider_grant_rejects_duplicate_cases_and_source_row_substitution() {
         let mut grant = provider_grant();
         grant.validate().unwrap();
+
+        let mut missing_launchd = provider_grant();
+        missing_launchd.launchd.clear();
+        assert!(missing_launchd
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("launchd"));
+
+        let mut wrong_row = provider_grant();
+        wrong_row.profiles[0].source.row_id = "case-2".into();
+        assert!(wrong_row
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("source row"));
 
         let mut duplicate_case = grant.profiles[0].clone();
         duplicate_case.characterization_profile = fingerprint_value('b');
@@ -2687,8 +3518,8 @@ mod tests {
     fn characterization_requires_one_shot_authority_and_matching_identity() {
         let identity = EffectiveIdentityV1 {
             model: "gpt-5.6-luna".into(),
-            effort: Some("low".into()),
-            mode: None,
+            effort: text("low"),
+            mode: OptionalTextV1::Absent,
         };
         let mut record = CharacterizationRecordV1 {
             schema_version: 1,
@@ -2727,6 +3558,144 @@ mod tests {
     }
 
     #[test]
+    fn characterization_authorization_and_hold_quarantine_lifecycles_are_closed() {
+        let source = ProfileSourceRefV1 {
+            kind: ProfileSourceKindV1::ScheduledAdvisory,
+            schema_version: 1,
+            source_sha256: digest('a'),
+            row_id: "case-1".into(),
+            row_sha256: digest('b'),
+        };
+        let entry = OneShotCharacterizationEntryV1 {
+            entry_id: "entry-1".into(),
+            generation: 1,
+            entry_sha256: digest('c'),
+            consumption_nonce: "nonce-1".into(),
+            source,
+            characterization_profile: fingerprint_value('d'),
+            characterization_execution: fingerprint_value('e'),
+            proposed_effective_identity: EffectiveIdentityV1 {
+                model: "gpt-5.6-luna".into(),
+                effort: text("low"),
+                mode: OptionalTextV1::Absent,
+            },
+            provider_family: "openai-codex".into(),
+            allowed_effects: vec![EffectClassV1::ProviderPrompt],
+            caps: effect_caps(),
+            command: "compatibility characterize".into(),
+            not_before_ms: 1,
+            expires_at_ms: 3,
+            revocation_generation: 1,
+        };
+        let mut authorization = CharacterizationAuthorizationV1 {
+            schema_version: 1,
+            authorization_id: "authorization-1".into(),
+            authorization_sha256: digest('f'),
+            operator: "Wesley Jinks".into(),
+            environment_owner: "wesley-macbook".into(),
+            host_identity_sha256: digest('1'),
+            profile_policy_bundle_sha256: digest('2'),
+            scheduler_binary_sha256: digest('3'),
+            price_snapshot_sha256: digest('4'),
+            legacy_inventory_sha256: digest('5'),
+            issued_at_ms: 1,
+            entries: vec![entry],
+        };
+        authorization.validate().unwrap();
+        authorization.entries[0].command = "compatibility run".into();
+        assert!(authorization.validate().is_err());
+
+        let mut hold = SafetyHoldV1 {
+            schema_version: 1,
+            hold_id: "hold-1".into(),
+            characterization_profile: fingerprint_value('6'),
+            case_execution: fingerprint_value('7'),
+            reason: HoldReasonV1::ProcessExitUnproved,
+            created_at_ms: 2,
+            lifecycle: HoldLifecycleV1::Active,
+        };
+        hold.validate().unwrap();
+        hold.lifecycle = HoldLifecycleV1::Cleared {
+            cleared_at_ms: 3,
+            operator: "Wesley Jinks".into(),
+            reason: "process exit proved".into(),
+        };
+        hold.validate().unwrap();
+        if let HoldLifecycleV1::Cleared { cleared_at_ms, .. } = &mut hold.lifecycle {
+            *cleared_at_ms = 1;
+        }
+        assert!(hold.validate().is_err());
+
+        let open = QuarantineV1::Open {
+            schema_version: 1,
+            quarantine_id: "quarantine-1".into(),
+            profile: fingerprint_value('8'),
+            operator: "Wesley Jinks".into(),
+            reason: "owner review".into(),
+            created_at_ms: 1,
+            expires_at_ms: 10,
+        };
+        open.validate().unwrap();
+        let mut closed = QuarantineV1::Closed {
+            schema_version: 1,
+            quarantine_id: "quarantine-1".into(),
+            profile: fingerprint_value('8'),
+            opening_sha256: digest('9'),
+            operator: "Wesley Jinks".into(),
+            reason: "owner cleared".into(),
+            created_at_ms: 1,
+            closed_at_ms: 2,
+        };
+        closed.validate().unwrap();
+        if let QuarantineV1::Closed { closed_at_ms, .. } = &mut closed {
+            *closed_at_ms = 0;
+        }
+        assert!(closed.validate().is_err());
+    }
+
+    #[test]
+    fn impact_reducer_enforces_docs_tests_production_and_new_provider_states() {
+        let mut record = ImpactRecordV1 {
+            schema_version: 1,
+            classifier_sha256: digest('a'),
+            target: test_merge(),
+            classes: vec![ImpactClassV1::DocumentationOnly],
+            due_case_ids: Vec::new(),
+            characterization_required_case_ids: Vec::new(),
+            no_impact_proved: true,
+        };
+        record.validate().unwrap();
+        record
+            .due_case_ids
+            .push("codex-host-bridge-gpt56-sol".into());
+        record.no_impact_proved = false;
+        assert!(record.validate().is_err());
+
+        record.classes = vec![ImpactClassV1::TestsOnly, ImpactClassV1::CompatibilityCore];
+        record.due_case_ids = EXPECTED_SUPPORT_PROFILES.map(str::to_owned).to_vec();
+        record.no_impact_proved = false;
+        record.validate().unwrap();
+
+        record.classes = vec![ImpactClassV1::NewProvider];
+        record.due_case_ids.clear();
+        record.characterization_required_case_ids = vec!["openrouter-new".into()];
+        record.validate().unwrap();
+        record.characterization_required_case_ids.clear();
+        assert!(record.validate().is_err());
+
+        record.classes = vec![ImpactClassV1::CompatibilityCore];
+        assert!(record.validate().is_err());
+
+        record.classes = vec![ImpactClassV1::ContainerRuntime];
+        record.due_case_ids = vec![
+            "claude-reader-055-fable".into(),
+            "codex-reader-bridge-gpt56-sol".into(),
+            "codex-host-bridge-gpt56-sol".into(),
+        ];
+        assert!(record.validate().is_err());
+    }
+
+    #[test]
     fn manual_and_storage_records_remain_narrowly_scoped() {
         let mut manual = ManualAdmissionV1 {
             schema_version: 1,
@@ -2739,7 +3708,8 @@ mod tests {
             case_execution: fingerprint_value('d'),
             evidence_purpose: EvidencePurposeV1::ManualDiagnostic,
             freshness_bucket: "manual-1".into(),
-            command: "compatibility run".into(),
+            source: ManualAdmissionSourceV1::DirectLocalCli,
+            command: ManualCommandV1::CompatibilityRun,
             caps: effect_caps(),
             allowed_effects: vec![EffectClassV1::ProviderPrompt],
             retry_cap: 0,
@@ -2749,8 +3719,18 @@ mod tests {
             expires_at_ms: 2,
         };
         manual.validate().unwrap();
-        manual.command = "serve compatibility".into();
-        assert!(manual.validate().is_err());
+        let mut arbitrary = serde_json::to_value(&manual).unwrap();
+        arbitrary["command"] = serde_json::json!("implement");
+        assert!(serde_json::from_value::<ManualAdmissionV1>(arbitrary).is_err());
+        let mut remote = serde_json::to_value(&manual).unwrap();
+        remote["source"] = serde_json::json!("serve");
+        assert!(serde_json::from_value::<ManualAdmissionV1>(remote).is_err());
+        manual.evidence_purpose = EvidencePurposeV1::Characterization;
+        assert!(manual
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot authorize characterization"));
 
         let mut consent = StorageConsentV1 {
             schema_version: 1,
@@ -2823,6 +3803,153 @@ mod tests {
     }
 
     #[test]
+    fn ledger_reservation_and_equivalent_work_records_bind_all_identity_layers() {
+        let authority = standing_authority();
+        let reservation = LedgerRecordV1::Reservation(LedgerReservationV1 {
+            schema_version: 1,
+            reservation_id: "reservation-1".into(),
+            attempt_idempotency_key: digest('a'),
+            accounting_class: AccountingClassV1::Scheduled,
+            characterization_profile: fingerprint_value('b'),
+            case_execution: fingerprint_value('c'),
+            admission_attempt: fingerprint_value('d'),
+            authority: authority.clone(),
+            equivalent_work_key: digest('e'),
+            evidence_purpose: EvidencePurposeV1::ProviderPathAdvisory,
+            freshness_bucket: "window-1".into(),
+            repeat_nonce: OptionalStableIdV1::Absent,
+            caps: effect_caps(),
+            utc_day_id: "2026-07-18".into(),
+            rolling_window_id: "rolling-1".into(),
+            reserved_at_ms: 1,
+        });
+        reservation.validate().unwrap();
+
+        let mut equivalent = EquivalentWorkReservationV1 {
+            schema_version: 1,
+            reservation_id: "equivalent-1".into(),
+            equivalent_work_key: digest('f'),
+            characterization_profile: fingerprint_value('1'),
+            case_execution: fingerprint_value('2'),
+            admission_attempt: fingerprint_value('3'),
+            evidence_purpose: EvidencePurposeV1::ProviderPathAdvisory,
+            freshness_bucket: "window-1".into(),
+            authority,
+            reserved_at_ms: 1,
+        };
+        equivalent.validate().unwrap();
+        equivalent.equivalent_work_key = "not-a-digest".into();
+        assert!(equivalent.validate().is_err());
+    }
+
+    #[test]
+    fn claimed_support_source_and_schedule_sidecar_validate_cross_layer_bindings() {
+        let claimed_source = ProfileSourceRefV1 {
+            kind: ProfileSourceKindV1::ClaimedSupportGate,
+            schema_version: 1,
+            source_sha256: digest('a'),
+            row_id: "case-1".into(),
+            row_sha256: digest('b'),
+        };
+        let profile = fingerprint_value('c');
+        let identity = EffectiveIdentityV1 {
+            model: "gpt-5.6-sol".into(),
+            effort: text("xhigh"),
+            mode: text("read-only"),
+        };
+        let caps = effect_caps();
+        let execution = execution_record(
+            profile.clone(),
+            claimed_source.source_sha256.clone(),
+            claimed_source.row_sha256.clone(),
+            identity.clone(),
+            caps.clone(),
+        );
+        let authority = one_shot_authority();
+        let admission = admission_record(
+            profile.clone(),
+            execution.fingerprint.clone(),
+            authority.clone(),
+            TriggerSourceV1::ManualCharacterizationCli,
+            TriggerKindV1::ManualCharacterization,
+        );
+        let mut claimed = ClaimedSupportCharacterizationSourceV1 {
+            schema_version: 1,
+            source_sha256: digest('d'),
+            source: claimed_source,
+            production_manifest_sha256: digest('a'),
+            profile_policy_bundle_sha256: digest('e'),
+            characterization_profile: profile,
+            characterization_execution: execution,
+            admission_attempt: admission,
+            authority,
+            trigger: TriggerKindV1::ManualCharacterization,
+            pinned_config_sha256: digest('f'),
+            requested_identity: identity.clone(),
+            expected_effective_identity: identity,
+            caps,
+        };
+        claimed.validate().unwrap();
+        claimed.pinned_config_sha256 = digest('9');
+        assert!(claimed.validate().is_err());
+
+        let mut sidecar = ScheduleEvidenceRecordV1 {
+            schema_version: 1,
+            schedule_record_id: "schedule-1".into(),
+            trigger: TriggerKindV1::Daily,
+            source: ProfileSourceRefV1 {
+                kind: ProfileSourceKindV1::ScheduledAdvisory,
+                schema_version: 1,
+                source_sha256: digest('1'),
+                row_id: "case-1".into(),
+                row_sha256: digest('2'),
+            },
+            profile_policy_bundle_sha256: digest('3'),
+            characterization_profile: fingerprint_value('4'),
+            case_execution: fingerprint_value('5'),
+            admission_attempt: fingerprint_value('6'),
+            authority: standing_authority(),
+            aggregate: OptionalSha256V1::Absent,
+            evidence_index_id: "index-1".into(),
+            check: CheckBindingV1::Absent,
+            storage_consent: OptionalRecordRefV1::Absent,
+            quarantine: OptionalRecordRefV1::Absent,
+            characterization: OptionalRecordRefV1::Absent,
+            window_id: "window-1".into(),
+            attempt_idempotency_key: digest('7'),
+            equivalent_work_key: digest('8'),
+            consumption: OptionalRecordRefV1::Absent,
+            repeat_nonce: OptionalStableIdV1::Absent,
+            ledger_reservation_id: "reservation-1".into(),
+            budget_reservation_sha256: digest('9'),
+            ledger_reconciliation: OptionalSha256V1::Absent,
+            deadline_derivation_sha256: digest('a'),
+            preflight_results_sha256: digest('b'),
+            admission_lock_holder_sha256: digest('c'),
+            supervisor_record_sha256: digest('d'),
+            freshness_observation_sha256: digest('e'),
+            requested_identity: EffectiveIdentityV1 {
+                model: "gpt-5.6-luna".into(),
+                effort: text("low"),
+                mode: OptionalTextV1::Absent,
+            },
+            expected_effective_identity: EffectiveIdentityV1 {
+                model: "gpt-5.6-luna".into(),
+                effort: text("low"),
+                mode: OptionalTextV1::Absent,
+            },
+            observed_effective_identity: OptionalEffectiveIdentityV1::Absent,
+            publication_outbox: OptionalRecordRefV1::Absent,
+            status_publication: OptionalSha256V1::Absent,
+            affected_case_ids: vec!["case-1".into()],
+            created_at_ms: 1,
+        };
+        sidecar.validate().unwrap();
+        sidecar.trigger = TriggerKindV1::TestMerge;
+        assert!(sidecar.validate().is_err());
+    }
+
+    #[test]
     fn failure_disposition_keeps_unknown_out_of_confirmation_and_suppression() {
         let base = FailureDispositionV1 {
             schema_version: 1,
@@ -2860,10 +3987,15 @@ mod tests {
 
         let second_untyped = FailureDispositionV1 {
             identical_complete_occurrences: 2,
-            action: FailureActionV1::Suppressed,
+            action: FailureActionV1::UnknownRetained,
             ..first_untyped
         };
-        assert!(second_untyped.validate().is_err());
+        second_untyped.validate().unwrap();
+        let suppressed = FailureDispositionV1 {
+            action: FailureActionV1::Suppressed,
+            ..second_untyped
+        };
+        assert!(suppressed.validate().is_err());
     }
 
     #[test]
@@ -2878,8 +4010,8 @@ mod tests {
         let profile = fingerprint_value('2');
         let identity = EffectiveIdentityV1 {
             model: "haiku".into(),
-            effort: Some("low".into()),
-            mode: None,
+            effort: text("low"),
+            mode: OptionalTextV1::Absent,
         };
         let caps = effect_caps();
         let case_execution = execution_record(
@@ -2995,6 +4127,141 @@ mod tests {
     }
 
     #[test]
+    fn evidence_paths_are_root_bound_normalized_and_portable() {
+        let entry = EvidenceIndexEntryV1 {
+            evidence_id: "evidence-1".into(),
+            evidence_class: EvidenceClassV1::RoutineGreen,
+            full_evidence_sha256: digest('a'),
+            compact_record_sha256: digest('b'),
+            hot_path: RelativeEvidencePathV1 {
+                components: vec!["2026".into(), "evidence-1.json".into()],
+            },
+            cold_path: OptionalRelativeEvidencePathV1::Absent,
+            full_retain_until_ms: 10,
+            compact_retain_until_ms: 20,
+            pinned: false,
+            lease_count: 0,
+        };
+        let mut index = EvidenceIndexV1 {
+            schema_version: 1,
+            index_id: "index-1".into(),
+            generation: 1,
+            hot_root_sha256: digest('c'),
+            cold_storage: ColdStorageBindingV1::Absent,
+            entries: vec![entry],
+        };
+        index.validate().unwrap();
+
+        index.entries[0].hot_path.components[0] = "..".into();
+        assert!(index.validate().is_err());
+        index.entries[0].hot_path.components[0] = "CON".into();
+        assert!(index.validate().is_err());
+        index.entries[0].hot_path.components[0] = "2026".into();
+        index.entries[0].cold_path = OptionalRelativeEvidencePathV1::RelativePath {
+            value: RelativeEvidencePathV1 {
+                components: vec!["archive".into(), "evidence-1.json".into()],
+            },
+        };
+        assert!(index.validate().is_err());
+        index.cold_storage = ColdStorageBindingV1::OwnerIcloud {
+            consent_id: "consent-1".into(),
+            consent_sha256: digest('d'),
+            root_sha256: digest('e'),
+            file_provider_domain_id: "icloud-drive".into(),
+        };
+        index.validate().unwrap();
+    }
+
+    #[test]
+    fn status_enforces_windows_authority_expiry_and_case_control_coherence() {
+        let authority = OptionalAuthorityStatusV1::Authority {
+            id: "grant-1".into(),
+            sha256: digest('a'),
+            state: AuthorityStateV1::Active,
+            expires_at_ms: 100,
+            revocation_generation: 1,
+        };
+        let mut status = ScheduleStatusV1 {
+            schema_version: 1,
+            generated_at_ms: 10,
+            policy_sha256: digest('b'),
+            last_window: OptionalWindowV1::Window {
+                id: "window-1".into(),
+                scheduled_at_ms: 5,
+            },
+            next_window: OptionalWindowV1::Window {
+                id: "window-2".into(),
+                scheduled_at_ms: 20,
+            },
+            provider_grant: authority,
+            storage_consent: OptionalAuthorityStatusV1::Absent,
+            ledger_headroom_sha256: digest('c'),
+            storage_state: StorageStateV1::HotOnly,
+            missed_ticks: 0,
+            fresh_one_shot_compatibility: OneShotCompatibilityStateV1::Unknown,
+            shared_operator_health: SharedOperatorHealthV1::NotEvaluated,
+            cases: vec![ScheduleCaseStatusV1 {
+                case_id: "case-1".into(),
+                lifecycle: ScheduleCaseLifecycleV1::ScheduledActive,
+                last_outcome: OptionalTextV1::Absent,
+                hold: OptionalRecordRefV1::Absent,
+                quarantine: OptionalRecordRefV1::Absent,
+            }],
+        };
+        status.validate().unwrap();
+
+        status.cases[0].hold = OptionalRecordRefV1::Record {
+            id: "hold-1".into(),
+            sha256: digest('d'),
+        };
+        status.cases[0].quarantine = OptionalRecordRefV1::Record {
+            id: "quarantine-1".into(),
+            sha256: digest('e'),
+        };
+        assert!(status.validate().is_err());
+        status.cases[0].hold = OptionalRecordRefV1::Absent;
+        status.cases[0].lifecycle = ScheduleCaseLifecycleV1::OperatorQuarantined;
+        status.validate().unwrap();
+        status.cases[0].quarantine = OptionalRecordRefV1::Absent;
+        assert!(status.validate().is_err());
+        status.cases[0].lifecycle = ScheduleCaseLifecycleV1::ScheduledActive;
+
+        let OptionalAuthorityStatusV1::Authority {
+            state,
+            expires_at_ms,
+            ..
+        } = &mut status.provider_grant
+        else {
+            unreachable!()
+        };
+        *state = AuthorityStateV1::Active;
+        *expires_at_ms = 9;
+        assert!(status.validate().is_err());
+    }
+
+    #[test]
+    fn routing_policy_is_the_exact_approved_matrix() {
+        let mut policy = routing_policy();
+        policy.validate().unwrap();
+        let normal = policy
+            .rules
+            .iter_mut()
+            .find(|rule| rule.task_class == DogfoodTaskClassV1::NormalImplementation)
+            .unwrap();
+        normal.primary_model_class = DogfoodPrimaryModelClassV1::InexpensiveEligible;
+        assert!(policy.validate().is_err());
+
+        let mut policy = routing_policy();
+        let release = policy
+            .rules
+            .iter_mut()
+            .find(|rule| rule.task_class == DogfoodTaskClassV1::ReleaseCompatibilityReview)
+            .unwrap();
+        release.effort = DogfoodEffortPolicyV1::LowOrMedium;
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
     fn record_parser_rejects_unknown_fields_before_validation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("record.json");
@@ -3018,5 +4285,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn record_parser_secret_scans_every_string_before_typed_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let mut outbox = serde_json::to_value(publication_outbox()).unwrap();
+        outbox["repository"] = serde_json::json!("sk-live-abcdefghijklmnopqrstuvwxyz123456");
+        std::fs::write(&path, serde_json::to_vec(&outbox).unwrap()).unwrap();
+        let error = validate_schedule_record("publication-outbox", &path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("secret-shaped"), "{error}");
     }
 }

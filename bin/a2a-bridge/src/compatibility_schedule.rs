@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{compatibility, local_file, BoxError};
+use crate::{compatibility, compatibility_resolution, local_file, BoxError};
 
 const MAX_FOUNDATION_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
@@ -21,7 +21,7 @@ const MAX_DEFERRED_PROFILES: usize = 32;
 const MAX_TIMEOUT_SECS: u64 = 900;
 const MAX_TOKENS: u64 = 1_000_000;
 const MAX_COST_MICROUSD: u64 = 100_000_000;
-const EXPECTED_SUPPORT_PROFILES: [&str; 4] = [
+pub(super) const EXPECTED_SUPPORT_PROFILES: [&str; 4] = [
     "claude-host-acp-044-fable",
     "claude-reader-055-fable",
     "codex-host-bridge-gpt56-sol",
@@ -164,6 +164,15 @@ enum ScheduledClassificationV1 {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+enum ExpectedStatusV1 {
+    Pass,
+    Fail,
+    Unknown,
+    Stale,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum EvidencePurposeV1 {
     ProviderPathAdvisory,
@@ -219,6 +228,9 @@ struct ScheduledCaseV1 {
     lane: ScheduledLaneV1,
     classification: ScheduledClassificationV1,
     evidence_purpose: EvidencePurposeV1,
+    evidence_path: String,
+    probe: String,
+    expected_status: ExpectedStatusV1,
     execution_mode: ScheduleExecutionModeV1,
     os: String,
     architecture: String,
@@ -296,6 +308,9 @@ struct CanonicalProfileInputV1 {
     lane: String,
     classification: String,
     evidence_purpose: EvidencePurposeV1,
+    evidence_path: String,
+    probe: String,
+    expected_status: ExpectedStatusV1,
     execution_mode: String,
     provider_family: String,
     agent: String,
@@ -318,7 +333,8 @@ struct CanonicalProfileInputV1 {
     expected_effective_mode: Option<String>,
     config_template: String,
     config_template_sha256: String,
-    resolution_constraint: Option<String>,
+    resolution_constraint_sha256: Option<String>,
+    allowed_effects: Vec<EffectClassV1>,
     fixed_prompt_contract: String,
     artifact_template: String,
     artifact_retention_days: u16,
@@ -343,8 +359,13 @@ struct CanonicalSandboxTemplateV1 {
 struct CanonicalConfigTemplateV1 {
     schema_version: u16,
     template_id: String,
+    default_agent: String,
+    agent_id: String,
     kind: String,
     command_family: Option<String>,
+    model: String,
+    effort: Option<String>,
+    mode: Option<String>,
     base_url: Option<String>,
     api_key_env: Option<String>,
     pre_authenticated: bool,
@@ -352,6 +373,7 @@ struct CanonicalConfigTemplateV1 {
     allowed_cwd_root: Option<String>,
     sandbox: Option<CanonicalSandboxTemplateV1>,
     allowed_commands: Vec<String>,
+    server_addr: String,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -374,8 +396,8 @@ struct ProfilePolicyBundleInputV1 {
 #[derive(Debug)]
 struct LoadedToml<T> {
     value: T,
-    sha256: String,
     canonical_path: PathBuf,
+    sha256: String,
 }
 
 #[derive(Debug)]
@@ -383,6 +405,14 @@ pub(super) struct LoadedScheduleFoundation {
     pub(super) scheduled_profile_count: usize,
     pub(super) claimed_support_profile_count: usize,
     pub(super) profile_policy_bundle_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+struct CapturedFoundationFile {
+    canonical_path: PathBuf,
+    sha256: String,
+    label: String,
+    max_bytes: u64,
 }
 
 fn bounded_text(label: &str, value: &str) -> Result<(), BoxError> {
@@ -453,12 +483,15 @@ fn load_toml<T: DeserializeOwned>(path: &Path, label: &str) -> Result<LoadedToml
     let snapshot = local_file::read_regular_file_bounded(path, label, MAX_FOUNDATION_FILE_BYTES)?;
     let text = std::str::from_utf8(&snapshot.bytes)
         .map_err(|_| format!("schedule foundation: {label} must be UTF-8"))?;
+    if compatibility::looks_like_secret(text) {
+        return Err(format!("schedule foundation: {label} contains secret-shaped material").into());
+    }
     let value = toml::from_str(text)
         .map_err(|error| format!("schedule foundation: invalid {label}: {error}"))?;
     Ok(LoadedToml {
         value,
-        sha256: snapshot.sha256,
         canonical_path: snapshot.canonical_path,
+        sha256: snapshot.sha256,
     })
 }
 
@@ -508,13 +541,6 @@ fn exact_toml_keys(
     Ok(())
 }
 
-fn validate_runtime_config(text: &str, label: &str) -> Result<(), BoxError> {
-    crate::config::RegistryConfig::parse(text)
-        .and_then(crate::config::RegistryConfig::into_snapshot)
-        .map(|_| ())
-        .map_err(|error| format!("schedule foundation: invalid {label}: {error}").into())
-}
-
 fn optional_toml_string(
     table: &toml::map::Map<String, toml::Value>,
     field: &str,
@@ -555,7 +581,7 @@ fn canonical_config_template_hash(
     template_id: &str,
     image_family: Option<&str>,
     value: &toml::Value,
-) -> Result<String, BoxError> {
+) -> Result<(String, CanonicalConfigTemplateV1), BoxError> {
     stable_id("config template id", template_id)?;
     let root = value
         .as_table()
@@ -571,6 +597,11 @@ fn canonical_config_template_hash(
         ],
         "config root",
     )?;
+    let default = root
+        .get("default")
+        .and_then(toml::Value::as_str)
+        .ok_or("schedule foundation: config.default must be a string")?;
+    stable_id("config default agent", default)?;
     let agents = root
         .get("agents")
         .and_then(toml::Value::as_array)
@@ -598,8 +629,19 @@ fn canonical_config_template_hash(
         ],
         "agent",
     )?;
+    let agent_id = optional_toml_string(agent, "id", "agent")?
+        .ok_or("schedule foundation: agent.id is required")?;
+    stable_id("config agent id", &agent_id)?;
+    if agent_id != default {
+        return Err("schedule foundation: config default and sole agent id disagree".into());
+    }
     let kind = optional_toml_string(agent, "kind", "agent")?.unwrap_or_else(|| "acp".into());
     let command_family = optional_toml_string(agent, "cmd", "agent")?;
+    let model = optional_toml_string(agent, "model", "agent")?
+        .ok_or("schedule foundation: agent.model is required")?;
+    bounded_text("config agent model", &model)?;
+    let effort = optional_toml_string(agent, "effort", "agent")?;
+    let mode = optional_toml_string(agent, "mode", "agent")?;
     let base_url = optional_toml_string(agent, "base_url", "agent")?;
     let api_key_env = optional_toml_string(agent, "api_key_env", "agent")?;
     if api_key_env.as_deref().is_some_and(|name| !env_name(name)) {
@@ -663,16 +705,23 @@ fn canonical_config_template_hash(
     }
     let mut allowed_commands = root
         .get("registry")
-        .and_then(toml::Value::as_table)
-        .map(|table| {
+        .map(|value| {
+            let table = value
+                .as_table()
+                .ok_or("schedule foundation: config.registry must be a table")?;
             exact_toml_keys(table, &["allowed_cmds"], "registry")?;
             toml_string_array(table, "allowed_cmds", "registry")
         })
         .transpose()?
         .unwrap_or_default();
-    if let Some(server) = root.get("server").and_then(toml::Value::as_table) {
-        exact_toml_keys(server, &["addr"], "server")?;
-    }
+    let server = root
+        .get("server")
+        .and_then(toml::Value::as_table)
+        .ok_or("schedule foundation: config.server must be a table")?;
+    exact_toml_keys(server, &["addr"], "server")?;
+    let server_addr = optional_toml_string(server, "addr", "server")?
+        .ok_or("schedule foundation: server.addr is required")?;
+    bounded_text("server.addr", &server_addr)?;
     allowed_commands.sort();
     if allowed_commands.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err("schedule foundation: registry allowed commands must be unique".into());
@@ -680,8 +729,13 @@ fn canonical_config_template_hash(
     let projection = CanonicalConfigTemplateV1 {
         schema_version: 1,
         template_id: template_id.to_owned(),
+        default_agent: default.to_owned(),
+        agent_id,
         kind,
         command_family,
+        model,
+        effort,
+        mode,
         base_url,
         api_key_env,
         pre_authenticated,
@@ -689,8 +743,10 @@ fn canonical_config_template_hash(
         allowed_cwd_root,
         sandbox,
         allowed_commands,
+        server_addr,
     };
-    canonical_hash("config template", &projection)
+    let hash = canonical_hash("config template", &projection)?;
+    Ok((hash, projection))
 }
 
 fn validate_policy(policy: &SchedulePolicyV1) -> Result<(), BoxError> {
@@ -857,6 +913,16 @@ fn validate_scheduled_case(
         )
         .into());
     }
+    if case.evidence_path != "bridge_smoke"
+        || case.probe != "minimal"
+        || case.expected_status != ExpectedStatusV1::Pass
+    {
+        return Err(format!(
+            "schedule foundation: case {:?} must use the reviewed bridge_smoke/minimal/PASS contract",
+            case.id
+        )
+        .into());
+    }
     if case.environment_owner != policy.environment_owner {
         return Err(format!(
             "schedule foundation: case {:?} has the wrong environment owner",
@@ -939,6 +1005,14 @@ fn validate_scheduled_case(
         )
         .into());
     }
+    let expected_effects = expected_effects(case.execution_mode);
+    if effects != expected_effects {
+        return Err(format!(
+            "schedule foundation: case {:?} effect classes do not match its execution mode",
+            case.id
+        )
+        .into());
+    }
     match case.execution_mode {
         ScheduleExecutionModeV1::ContainerRo if case.image_family.is_none() => {
             return Err(format!(
@@ -981,7 +1055,106 @@ fn validate_scheduled_case(
     Ok(())
 }
 
-fn validate_config(root: &Path, case: &ScheduledCaseV1) -> Result<(String, toml::Value), BoxError> {
+fn expected_effects(mode: ScheduleExecutionModeV1) -> BTreeSet<EffectClassV1> {
+    match mode {
+        ScheduleExecutionModeV1::Host => {
+            BTreeSet::from([EffectClassV1::ProviderPrompt, EffectClassV1::RegistryRead])
+        }
+        ScheduleExecutionModeV1::ContainerRo => BTreeSet::from([
+            EffectClassV1::ProviderPrompt,
+            EffectClassV1::RegistryRead,
+            EffectClassV1::ImageInspect,
+            EffectClassV1::ImageBuild,
+        ]),
+        ScheduleExecutionModeV1::RemoteApi => BTreeSet::from([EffectClassV1::ProviderPrompt]),
+    }
+}
+
+fn validate_config_cross_bindings(
+    case: &ScheduledCaseV1,
+    config: &CanonicalConfigTemplateV1,
+) -> Result<(), BoxError> {
+    let (expected_kind, expected_command, expected_adapter, expected_cli) =
+        match case.provider_family.as_str() {
+            "openai-codex" => (
+                "acp",
+                Some("codex-acp"),
+                "@agentclientprotocol/codex-acp",
+                "@openai/codex",
+            ),
+            "anthropic-claude" => (
+                "acp",
+                Some("claude-agent-acp"),
+                "@agentclientprotocol/claude-agent-acp",
+                "@anthropic-ai/claude-agent-sdk",
+            ),
+            "ollama-local" => ("api", None, "bridge-api-openai-compatible", "ollama-server"),
+            provider => {
+                return Err(format!(
+                    "schedule foundation: case {:?} uses unknown provider family {provider:?}",
+                    case.id
+                )
+                .into())
+            }
+        };
+    if config.kind != expected_kind
+        || config.command_family.as_deref() != expected_command
+        || case.adapter_family != expected_adapter
+        || case.agent_cli_family != expected_cli
+    {
+        return Err(format!(
+            "schedule foundation: case {:?} provider/adapter/command families disagree",
+            case.id
+        )
+        .into());
+    }
+    let auth_matches = match case.auth_path {
+        ScheduleAuthPathV1::PreAuthenticated => {
+            config.pre_authenticated
+                && config.api_key_env.is_none()
+                && case.credential_env.is_none()
+        }
+        ScheduleAuthPathV1::Automatic => {
+            !config.pre_authenticated
+                && config.api_key_env.is_none()
+                && case.credential_env.is_none()
+        }
+        ScheduleAuthPathV1::ApiKeyEnv => {
+            !config.pre_authenticated
+                && config.api_key_env.as_deref() == case.credential_env.as_deref()
+        }
+    };
+    if !auth_matches {
+        return Err(format!(
+            "schedule foundation: case {:?} auth/pre-auth/API-key bindings disagree",
+            case.id
+        )
+        .into());
+    }
+    let expected_commands = match case.execution_mode {
+        ScheduleExecutionModeV1::Host => expected_command.into_iter().collect::<Vec<_>>(),
+        ScheduleExecutionModeV1::ContainerRo => vec!["docker"],
+        ScheduleExecutionModeV1::RemoteApi => Vec::new(),
+    };
+    if config.allowed_commands
+        != expected_commands
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    {
+        return Err(format!(
+            "schedule foundation: case {:?} registry command allowance disagrees",
+            case.id
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_config(
+    root: &Path,
+    case: &ScheduledCaseV1,
+) -> Result<(String, toml::Value, CapturedFoundationFile), BoxError> {
     let path = root.join(&case.config);
     let snapshot = local_file::read_regular_file_bounded(
         &path,
@@ -995,7 +1168,13 @@ fn validate_config(root: &Path, case: &ScheduledCaseV1) -> Result<(String, toml:
     )?;
     let text = std::str::from_utf8(&snapshot.bytes)
         .map_err(|_| format!("schedule foundation: config {:?} must be UTF-8", case.id))?;
-    validate_runtime_config(text, &format!("config {:?}", case.id))?;
+    if compatibility::looks_like_secret(text) {
+        return Err(format!(
+            "schedule foundation: config {:?} contains secret-shaped material",
+            case.id
+        )
+        .into());
+    }
     let value: toml::Value = toml::from_str(text)
         .map_err(|error| format!("schedule foundation: invalid config {:?}: {error}", case.id))?;
     let table = value.as_table().ok_or_else(|| {
@@ -1091,19 +1270,29 @@ fn validate_config(root: &Path, case: &ScheduledCaseV1) -> Result<(String, toml:
         }
         _ => {}
     }
-    let template_sha256 = canonical_config_template_hash(
+    let (template_sha256, config_projection) = canonical_config_template_hash(
         &case.config_template,
         case.image_family.as_deref(),
         &value,
     )?;
-    Ok((template_sha256, value))
+    validate_config_cross_bindings(case, &config_projection)?;
+    let captured = CapturedFoundationFile {
+        canonical_path: snapshot.canonical_path,
+        sha256: snapshot.sha256,
+        label: format!("scheduled config {:?}", case.id),
+        max_bytes: MAX_CONFIG_BYTES,
+    };
+    Ok((template_sha256, value, captured))
 }
 
 fn scheduled_profile(
     policy: &SchedulePolicyV1,
     case: &ScheduledCaseV1,
     config_sha256: String,
+    resolution_constraint_sha256: Option<String>,
 ) -> CanonicalProfileInputV1 {
+    let mut allowed_effects = case.allowed_effects.clone();
+    allowed_effects.sort();
     CanonicalProfileInputV1 {
         schema_version: 1,
         source_kind: ProfileSourceKindV1::ScheduledAdvisory,
@@ -1113,6 +1302,9 @@ fn scheduled_profile(
         lane: "floating-current".into(),
         classification: "canary".into(),
         evidence_purpose: case.evidence_purpose,
+        evidence_path: case.evidence_path.clone(),
+        probe: case.probe.clone(),
+        expected_status: case.expected_status,
         execution_mode: match case.execution_mode {
             ScheduleExecutionModeV1::Host => "host",
             ScheduleExecutionModeV1::ContainerRo => "container_ro",
@@ -1145,7 +1337,8 @@ fn scheduled_profile(
         expected_effective_mode: case.expected_effective_mode.clone(),
         config_template: case.config_template.clone(),
         config_template_sha256: config_sha256,
-        resolution_constraint: case.resolution_case.clone(),
+        resolution_constraint_sha256,
+        allowed_effects,
         fixed_prompt_contract: policy.fixed_prompt_contract.clone(),
         artifact_template: policy.artifact_template.clone(),
         artifact_retention_days: case.artifact.retention_days,
@@ -1154,10 +1347,159 @@ fn scheduled_profile(
     }
 }
 
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalRecipeConstraintV1<'a> {
+    schema_version: u16,
+    case: &'a compatibility_resolution::FloatingCaseRecipe,
+    package_set: &'a compatibility_resolution::PackageSetRecipe,
+    image: Option<CanonicalRecipeImageV1<'a>>,
+    limits: &'a compatibility_resolution::ResolutionLimits,
+    artifact: &'a compatibility_resolution::ResolutionArtifactPolicy,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalRecipeImageV1<'a> {
+    id: &'a str,
+    template: compatibility_resolution::ImageTemplate,
+    base: &'a str,
+    package_sets: Vec<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalSupportResolutionConstraintV1<'a> {
+    schema_version: u16,
+    policy: &'static str,
+    adapter_family: &'a str,
+    agent_cli_family: &'a str,
+    image_family: Option<&'a str>,
+}
+
+fn config_template_id(value: compatibility_resolution::ConfigTemplate) -> &'static str {
+    match value {
+        compatibility_resolution::ConfigTemplate::CodexHostReadOnlyV1 => "codex-host-read-only-v1",
+        compatibility_resolution::ConfigTemplate::CodexReaderReadOnlyV1 => {
+            "codex-reader-read-only-v1"
+        }
+        compatibility_resolution::ConfigTemplate::ClaudeHostReadOnlyV1 => {
+            "claude-host-read-only-v1"
+        }
+        compatibility_resolution::ConfigTemplate::ClaudeReaderReadOnlyV1 => {
+            "claude-reader-read-only-v1"
+        }
+    }
+}
+
+fn recipe_constraint_sha256(
+    recipes: &compatibility_resolution::FloatingRecipeManifest,
+    case: &ScheduledCaseV1,
+) -> Result<Option<String>, BoxError> {
+    let Some(resolution_case) = &case.resolution_case else {
+        if case.execution_mode != ScheduleExecutionModeV1::RemoteApi {
+            return Err(format!(
+                "schedule foundation: case {:?} lacks its required resolution case",
+                case.id
+            )
+            .into());
+        }
+        return Ok(None);
+    };
+    let recipe = recipes
+        .cases
+        .iter()
+        .find(|recipe| &recipe.id == resolution_case)
+        .ok_or_else(|| {
+            format!(
+                "schedule foundation: case {:?} references unknown resolution case {:?}",
+                case.id, resolution_case
+            )
+        })?;
+    let package_set = recipes
+        .package_sets
+        .iter()
+        .find(|package| package.id == recipe.package_set)
+        .ok_or_else(|| {
+            format!(
+                "schedule foundation: resolution case {:?} has no package set",
+                recipe.id
+            )
+        })?;
+    let image = recipe
+        .image
+        .as_ref()
+        .map(|image_id| {
+            recipes
+                .images
+                .iter()
+                .find(|image| &image.id == image_id)
+                .ok_or_else(|| {
+                    format!(
+                        "schedule foundation: resolution case {:?} has no image",
+                        recipe.id
+                    )
+                })
+        })
+        .transpose()?;
+    let canonical_image = image.map(|image| {
+        let mut package_sets = image
+            .package_sets
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        package_sets.sort();
+        CanonicalRecipeImageV1 {
+            id: &image.id,
+            template: image.template,
+            base: &image.base,
+            package_sets,
+        }
+    });
+    let expected_target = match case.execution_mode {
+        ScheduleExecutionModeV1::Host => compatibility_resolution::FloatingTarget::HostPackageTree,
+        ScheduleExecutionModeV1::ContainerRo => {
+            compatibility_resolution::FloatingTarget::ContainerRoImage
+        }
+        ScheduleExecutionModeV1::RemoteApi => {
+            return Err(format!(
+                "schedule foundation: API case {:?} must not use a resolution recipe",
+                case.id
+            )
+            .into())
+        }
+    };
+    if recipe.target != expected_target
+        || config_template_id(recipe.config_template) != case.config_template
+        || package_set.adapter != case.adapter_family
+        || package_set.agent_cli != case.agent_cli_family
+        || recipe.image.as_deref() != case.image_family.as_deref().map(|_| "reader-current")
+    {
+        return Err(format!(
+            "schedule foundation: case {:?} and its semantic resolution recipe disagree",
+            case.id
+        )
+        .into());
+    }
+    canonical_hash(
+        "profile resolution constraint",
+        &CanonicalRecipeConstraintV1 {
+            schema_version: 1,
+            case: recipe,
+            package_set,
+            image: canonical_image,
+            limits: &recipes.limits,
+            artifact: &recipes.artifact,
+        },
+    )
+    .map(Some)
+}
+
 fn support_profiles(
     policy: &SchedulePolicyV1,
     root: &Path,
     manifest_bytes: &[u8],
+    captures: &mut Vec<CapturedFoundationFile>,
 ) -> Result<Vec<CanonicalProfileInputV1>, BoxError> {
     let text = std::str::from_utf8(manifest_bytes)
         .map_err(|_| "schedule foundation: production manifest must be UTF-8")?;
@@ -1185,7 +1527,13 @@ fn support_profiles(
         if table.get("classification").and_then(toml::Value::as_str) != Some("support") {
             continue;
         }
-        result.push(support_profile(policy, root, table, default_max_cost_usd)?);
+        result.push(support_profile(
+            policy,
+            root,
+            table,
+            default_max_cost_usd,
+            captures,
+        )?);
     }
     Ok(result)
 }
@@ -1195,6 +1543,7 @@ fn support_profile(
     root: &Path,
     case: &toml::map::Map<String, toml::Value>,
     default_max_cost_usd: f64,
+    captures: &mut Vec<CapturedFoundationFile>,
 ) -> Result<CanonicalProfileInputV1, BoxError> {
     let required = |name: &str| -> Result<String, BoxError> {
         case.get(name)
@@ -1222,13 +1571,37 @@ fn support_profile(
     )?;
     let config_text = std::str::from_utf8(&config_snapshot.bytes)
         .map_err(|_| format!("schedule foundation: support config {id:?} must be UTF-8"))?;
-    validate_runtime_config(config_text, &format!("support config {id:?}"))?;
+    if compatibility::looks_like_secret(config_text) {
+        return Err(format!(
+            "schedule foundation: support config {id:?} contains secret-shaped material"
+        )
+        .into());
+    }
+    captures.push(CapturedFoundationFile {
+        canonical_path: config_snapshot.canonical_path.clone(),
+        sha256: config_snapshot.sha256.clone(),
+        label: format!("support config {id:?}"),
+        max_bytes: MAX_CONFIG_BYTES,
+    });
     let config_value: toml::Value = toml::from_str(config_text)
         .map_err(|error| format!("schedule foundation: invalid support config {id:?}: {error}"))?;
     let pins = case
         .get("pins")
         .and_then(toml::Value::as_table)
         .ok_or_else(|| format!("schedule foundation: support case {id:?} has no pins"))?;
+    let pinned_config_sha256 = pins
+        .get("config_sha256")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| {
+            format!("schedule foundation: support case {id:?} has no config_sha256 pin")
+        })?;
+    validate_sha256("support config_sha256 pin", pinned_config_sha256)?;
+    if pinned_config_sha256 != config_snapshot.sha256 {
+        return Err(format!(
+            "schedule foundation: support case {id:?} config bytes do not match its exact manifest pin"
+        )
+        .into());
+    }
     let package_family = |name: &str| -> Result<String, BoxError> {
         let value = pins
             .get(name)
@@ -1324,8 +1697,74 @@ fn support_profile(
         }
     };
     let image_family = (execution_mode == "container_ro").then(|| "node-acp-reader-v1".into());
-    let config_template_sha256 =
+    let (config_template_sha256, config_projection) =
         canonical_config_template_hash(config_template, image_family.as_deref(), &config_value)?;
+    let config_root = config_value
+        .as_table()
+        .ok_or_else(|| format!("schedule foundation: support config {id:?} is not a table"))?;
+    let config_agent = config_root
+        .get("agents")
+        .and_then(toml::Value::as_array)
+        .and_then(|agents| agents.first())
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| format!("schedule foundation: support config {id:?} has no agent"))?;
+    let config_field = |name: &str| config_agent.get(name).and_then(toml::Value::as_str);
+    let expected_command = match provider_family {
+        "openai-codex" => "codex-acp",
+        "anthropic-claude" => "claude-agent-acp",
+        _ => unreachable!("provider family was closed above"),
+    };
+    let auth_path = required("auth_path")?;
+    let expected_pre_authenticated = auth_path == "pre_authenticated";
+    let expected_commands = if execution_mode == "container_ro" {
+        vec!["docker".to_owned()]
+    } else {
+        vec![expected_command.to_owned()]
+    };
+    if config_root.get("default").and_then(toml::Value::as_str) != Some(agent.as_str())
+        || config_field("id") != Some(agent.as_str())
+        || config_field("model") != Some(model.as_str())
+        || config_field("effort") != optional("effort").as_deref()
+        || config_field("mode") != optional("mode").as_deref()
+        || config_projection.kind != "acp"
+        || config_projection.command_family.as_deref() != Some(expected_command)
+        || config_projection.pre_authenticated != expected_pre_authenticated
+        || config_projection.api_key_env.is_some()
+        || config_projection.allowed_commands != expected_commands
+        || !matches!(auth_path.as_str(), "automatic" | "pre_authenticated")
+    {
+        return Err(format!(
+            "schedule foundation: support case {id:?} config/provider/auth bindings disagree"
+        )
+        .into());
+    }
+    let expected_status = match required("expected_status")?.as_str() {
+        "PASS" => ExpectedStatusV1::Pass,
+        "FAIL" => ExpectedStatusV1::Fail,
+        "UNKNOWN" => ExpectedStatusV1::Unknown,
+        "STALE" => ExpectedStatusV1::Stale,
+        value => {
+            return Err(format!(
+                "schedule foundation: support case {id:?} has invalid expected_status {value:?}"
+            )
+            .into())
+        }
+    };
+    let resolution_constraint_sha256 = canonical_hash(
+        "claimed-support resolution constraint",
+        &CanonicalSupportResolutionConstraintV1 {
+            schema_version: 1,
+            policy: "exact-pins-bound-only-in-case-execution",
+            adapter_family: &adapter_family,
+            agent_cli_family: &agent_cli_family,
+            image_family: image_family.as_deref(),
+        },
+    )?;
+    let allowed_effects = if execution_mode == "container_ro" {
+        vec![EffectClassV1::ProviderPrompt, EffectClassV1::ImageInspect]
+    } else {
+        vec![EffectClassV1::ProviderPrompt]
+    };
     Ok(CanonicalProfileInputV1 {
         schema_version: 1,
         source_kind: ProfileSourceKindV1::ClaimedSupportGate,
@@ -1335,6 +1774,9 @@ fn support_profile(
         lane: required("lane")?,
         classification: "support".into(),
         evidence_purpose: EvidencePurposeV1::ClaimedSupportGate,
+        evidence_path: required("evidence_path")?,
+        probe: required("probe")?,
+        expected_status,
         execution_mode: execution_mode.clone(),
         provider_family: provider_family.into(),
         agent,
@@ -1342,7 +1784,7 @@ fn support_profile(
         adapter_family,
         agent_cli_family,
         image_family,
-        auth_path: required("auth_path")?,
+        auth_path,
         credential_env_name: optional("credential_env"),
         required_env,
         environment_owner: required("environment_owner")?,
@@ -1357,7 +1799,8 @@ fn support_profile(
         expected_effective_mode: optional("mode"),
         config_template: config_template.into(),
         config_template_sha256,
-        resolution_constraint: Some("pinned-exact-within-profile".into()),
+        resolution_constraint_sha256: Some(resolution_constraint_sha256),
+        allowed_effects,
         fixed_prompt_contract: policy.fixed_prompt_contract.clone(),
         artifact_template: policy.artifact_template.clone(),
         artifact_retention_days: retention_days,
@@ -1451,6 +1894,58 @@ fn validate_inventory(
     Ok(())
 }
 
+fn canonical_policy_sha256(policy: &SchedulePolicyV1) -> Result<String, BoxError> {
+    let mut value = policy.clone();
+    value.allowed_triggers.sort();
+    value.allowed_effects.sort();
+    value.deferred_profiles.sort();
+    canonical_hash("scheduling policy", &value)
+}
+
+fn canonical_floating_recipes_sha256(
+    recipes: &compatibility_resolution::FloatingRecipeManifest,
+) -> Result<String, BoxError> {
+    let mut value = recipes.clone();
+    value
+        .package_sets
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    value.images.sort_by(|left, right| left.id.cmp(&right.id));
+    for image in &mut value.images {
+        image.package_sets.sort();
+    }
+    value.cases.sort_by(|left, right| left.id.cmp(&right.id));
+    canonical_hash("floating recipe constraints", &value)
+}
+
+fn recheck_foundation_files(captures: &[CapturedFoundationFile]) -> Result<(), BoxError> {
+    let mut seen = BTreeMap::<&Path, &str>::new();
+    for capture in captures {
+        if let Some(previous) = seen.insert(&capture.canonical_path, &capture.sha256) {
+            if previous != capture.sha256 {
+                return Err(format!(
+                    "schedule foundation: {:?} was observed with conflicting identities",
+                    capture.canonical_path
+                )
+                .into());
+            }
+            continue;
+        }
+        let current = local_file::read_regular_file_bounded(
+            &capture.canonical_path,
+            &format!("{} final recheck", capture.label),
+            capture.max_bytes,
+        )?;
+        if current.canonical_path != capture.canonical_path || current.sha256 != capture.sha256 {
+            return Err(format!(
+                "schedule foundation: {} changed during the multi-file snapshot",
+                capture.label
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoundation, BoxError> {
     if root.as_os_str().is_empty() {
         return Err("schedule foundation: root must be non-empty".into());
@@ -1460,12 +1955,21 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
     if !root.is_dir() {
         return Err("schedule foundation: root must be a directory".into());
     }
+    let planned_root = local_file::snapshot_directory(&root, "schedule foundation root")?;
+    let pinned_root = local_file::PinnedDirectory::open(
+        &root,
+        &planned_root.canonical_cwd,
+        &planned_root.identity,
+        "schedule foundation root",
+    )?;
+    let root = pinned_root.canonical_path();
     let policy = load_foundation_toml::<SchedulePolicyV1>(
         &root,
         &root.join("scheduling-policy.toml"),
         "scheduling policy",
     )?;
     validate_policy(&policy.value)?;
+    let policy_semantic_sha256 = canonical_policy_sha256(&policy.value)?;
     let registry = load_foundation_toml::<ScheduledCaseRegistryV1>(
         &root,
         &root.join(&policy.value.scheduled_registry),
@@ -1477,34 +1981,74 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
         &root.join(&policy.value.characterization_inventory),
         "characterization profile inventory",
     )?;
+    let mut captures = vec![
+        CapturedFoundationFile {
+            canonical_path: policy.canonical_path.clone(),
+            sha256: policy.sha256.clone(),
+            label: "scheduling policy".into(),
+            max_bytes: MAX_FOUNDATION_FILE_BYTES,
+        },
+        CapturedFoundationFile {
+            canonical_path: registry.canonical_path.clone(),
+            sha256: registry.sha256.clone(),
+            label: "scheduled case registry".into(),
+            max_bytes: MAX_FOUNDATION_FILE_BYTES,
+        },
+        CapturedFoundationFile {
+            canonical_path: inventory.canonical_path.clone(),
+            sha256: inventory.sha256.clone(),
+            label: "characterization profile inventory".into(),
+            max_bytes: MAX_FOUNDATION_FILE_BYTES,
+        },
+    ];
 
-    let (
-        production_manifest_bytes,
-        _production_manifest_sha256,
-        production_manifest_canonical_path,
-    ) = compatibility::validated_manifest_snapshot(&root.join(&policy.value.production_manifest))?;
+    let (production_manifest_bytes, production_manifest_sha256, production_manifest_canonical_path) =
+        compatibility::validated_manifest_snapshot(&root.join(&policy.value.production_manifest))?;
     ensure_snapshot_within_root(
         &root,
         &production_manifest_canonical_path,
         "production manifest",
     )?;
-    let floating = local_file::read_regular_file_bounded(
-        &root.join(&policy.value.floating_recipes),
-        "floating recipes",
-        MAX_FOUNDATION_FILE_BYTES,
-    )?;
+    captures.push(CapturedFoundationFile {
+        canonical_path: production_manifest_canonical_path,
+        sha256: production_manifest_sha256,
+        label: "production manifest".into(),
+        max_bytes: MAX_FOUNDATION_FILE_BYTES,
+    });
+    let floating =
+        compatibility_resolution::load_recipes(&root.join(&policy.value.floating_recipes))?;
     ensure_snapshot_within_root(&root, &floating.canonical_path, "floating recipes")?;
+    if floating.recipes.production_manifest != policy.value.production_manifest {
+        return Err(
+            "schedule foundation: floating recipes and policy name different production manifests"
+                .into(),
+        );
+    }
+    let floating_recipes_semantic_sha256 = canonical_floating_recipes_sha256(&floating.recipes)?;
+    captures.push(CapturedFoundationFile {
+        canonical_path: floating.canonical_path.clone(),
+        sha256: floating.sha256.clone(),
+        label: "floating recipes".into(),
+        max_bytes: MAX_FOUNDATION_FILE_BYTES,
+    });
 
     let mut expected = BTreeMap::new();
     let mut scheduled_hashes = BTreeMap::new();
     let mut config_hashes = BTreeMap::new();
     for case in &registry.value.cases {
-        let (config_sha256, _) = validate_config(&root, case)?;
+        let (config_sha256, _, capture) = validate_config(&root, case)?;
+        captures.push(capture);
         config_hashes.insert(
             case.config.to_string_lossy().into_owned(),
             config_sha256.clone(),
         );
-        let profile = scheduled_profile(&policy.value, case, config_sha256);
+        let resolution_constraint_sha256 = recipe_constraint_sha256(&floating.recipes, case)?;
+        let profile = scheduled_profile(
+            &policy.value,
+            case,
+            config_sha256,
+            resolution_constraint_sha256,
+        );
         let hash = canonical_hash("scheduled characterization profile", &profile)?;
         expected.insert(
             (ProfileSourceKindV1::ScheduledAdvisory, case.id.clone()),
@@ -1513,7 +2057,12 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
         scheduled_hashes.insert(case.id.clone(), hash);
     }
 
-    let support = support_profiles(&policy.value, &root, &production_manifest_bytes)?;
+    let support = support_profiles(
+        &policy.value,
+        &root,
+        &production_manifest_bytes,
+        &mut captures,
+    )?;
     let support_ids = support
         .iter()
         .map(|profile| profile.source_id.as_str())
@@ -1542,12 +2091,26 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
     }
     validate_inventory(&inventory.value, &expected)?;
 
+    let registry_semantic_sha256 = canonical_hash("scheduled profile set", &scheduled_hashes)?;
+    let inventory_projection = expected
+        .iter()
+        .map(|((kind, id), hash)| {
+            let kind = match kind {
+                ProfileSourceKindV1::ScheduledAdvisory => "scheduled_advisory",
+                ProfileSourceKindV1::ClaimedSupportGate => "claimed_support_gate",
+            };
+            (format!("{kind}:{id}"), hash.clone())
+        })
+        .collect::<BTreeMap<_, _>>();
+    let inventory_semantic_sha256 =
+        canonical_hash("characterization profile inventory", &inventory_projection)?;
+
     let bundle = ProfilePolicyBundleInputV1 {
         schema_version: 1,
-        policy_sha256: policy.sha256,
-        registry_sha256: registry.sha256,
-        inventory_sha256: inventory.sha256,
-        floating_recipes_sha256: floating.sha256,
+        policy_sha256: policy_semantic_sha256,
+        registry_sha256: registry_semantic_sha256,
+        inventory_sha256: inventory_semantic_sha256,
+        floating_recipes_sha256: floating_recipes_semantic_sha256,
         scheduled_profiles: scheduled_hashes.clone(),
         claimed_support_profiles: support_hashes.clone(),
         config_templates: config_hashes,
@@ -1557,6 +2120,10 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
         artifact_template: policy.value.artifact_template,
     };
     let bundle_sha256 = canonical_hash("profile policy bundle", &bundle)?;
+    recheck_foundation_files(&captures)?;
+    if !pinned_root.current_path_matches() {
+        return Err("schedule foundation: root identity changed during validation".into());
+    }
     Ok(LoadedScheduleFoundation {
         scheduled_profile_count: scheduled_hashes.len(),
         claimed_support_profile_count: support_hashes.len(),
@@ -1606,5 +2173,30 @@ mod tests {
             ..maximum.clone()
         };
         assert!(widened.within(&maximum, "widened").is_err());
+    }
+
+    #[test]
+    fn final_snapshot_recheck_rejects_mid_validation_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("foundation.toml");
+        std::fs::write(&path, b"schema_version = 1\n").unwrap();
+        let snapshot = local_file::read_regular_file_bounded(
+            &path,
+            "foundation recheck fixture",
+            MAX_FOUNDATION_FILE_BYTES,
+        )
+        .unwrap();
+        let capture = CapturedFoundationFile {
+            canonical_path: snapshot.canonical_path,
+            sha256: snapshot.sha256,
+            label: "foundation recheck fixture".into(),
+            max_bytes: MAX_FOUNDATION_FILE_BYTES,
+        };
+        recheck_foundation_files(std::slice::from_ref(&capture)).unwrap();
+        std::fs::write(&path, b"schema_version = 2\n").unwrap();
+        assert!(recheck_foundation_files(&[capture])
+            .unwrap_err()
+            .to_string()
+            .contains("changed during"));
     }
 }

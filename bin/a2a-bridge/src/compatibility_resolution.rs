@@ -93,7 +93,7 @@ pub(super) enum ResolutionRedactionPolicy {
     Strict,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ResolutionArtifactPolicy {
     pub(super) retention_days: u16,
@@ -132,7 +132,7 @@ pub(super) struct FloatingCaseRecipe {
     pub(super) image: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct FloatingRecipeManifest {
     pub(super) schema_version: u16,

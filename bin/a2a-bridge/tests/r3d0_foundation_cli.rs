@@ -40,6 +40,31 @@ fn copy_foundation(destination: &Path) {
     }
 }
 
+fn rotate_array_table_section(text: &str, header: &str, next_header: Option<&str>) -> String {
+    let start = text.find(header).expect("array-table header must exist");
+    let end = next_header
+        .and_then(|next| text[start..].find(next).map(|offset| start + offset))
+        .unwrap_or(text.len());
+    let prefix = &text[..start];
+    let suffix = &text[end..];
+    let section = &text[start..end];
+    let starts = section
+        .match_indices(header)
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    assert!(starts.len() > 1, "section must have multiple blocks");
+    let mut blocks = starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            let end = starts.get(index + 1).copied().unwrap_or(section.len());
+            &section[*start..end]
+        })
+        .collect::<Vec<_>>();
+    blocks.rotate_left(1);
+    format!("{prefix}{}{suffix}", blocks.concat())
+}
+
 fn validate_foundation(root: &Path) -> std::process::Output {
     compatibility_command()
         .arg("validate")
@@ -83,8 +108,8 @@ fn case_execution_record_json(fingerprint: &str) -> serde_json::Value {
             "target": {
                 "kind": "repository_snapshot",
                 "repository": "shoedog/a2acp",
-                "head_sha256": digest('b'),
-                "tree_sha256": digest('c'),
+                "head_oid": {"algorithm": "sha1", "hex": "b".repeat(40)},
+                "tree_oid": {"algorithm": "sha1", "hex": "c".repeat(40)},
                 "range_start_exclusive": {"kind": "absent"}
             },
             "candidate": {
@@ -105,8 +130,16 @@ fn case_execution_record_json(fingerprint: &str) -> serde_json::Value {
                 "environment_sha256": digest('6'),
                 "prerequisites_sha256": digest('7')
             },
-            "requested_identity": {"model": "gpt-5.6-luna", "effort": "low"},
-            "expected_effective_identity": {"model": "gpt-5.6-luna", "effort": "low"},
+            "requested_identity": {
+                "model": "gpt-5.6-luna",
+                "effort": {"kind": "text", "value": "low"},
+                "mode": {"kind": "absent"}
+            },
+            "expected_effective_identity": {
+                "model": "gpt-5.6-luna",
+                "effort": {"kind": "text", "value": "low"},
+                "mode": {"kind": "absent"}
+            },
             "actual_caps": caps_json()
         },
         "fingerprint": {"schema_version": 1, "sha256": fingerprint}
@@ -212,6 +245,91 @@ fn r3d0_schedule_foundation_rejects_hidden_config_behavior() {
     );
 }
 
+#[test]
+fn r3d0_foundation_rejects_forbidden_config_before_environment_expansion() {
+    let temp = tempfile::tempdir().unwrap();
+    copy_foundation(temp.path());
+    let path = temp.path().join("configs/codex-luna-host.toml");
+    let config = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        format!(
+            "{config}\n[delegation]\npeer_url = \"http://127.0.0.1:9\"\nauth = \"${{REAL_SECRET_ENV}}\"\n"
+        ),
+    )
+    .unwrap();
+
+    let output = compatibility_command()
+        .arg("validate")
+        .arg("--schedule-foundation")
+        .arg(temp.path())
+        .env_remove("REAL_SECRET_ENV")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown fields"), "stderr: {stderr}");
+    assert!(!stderr.contains("REAL_SECRET_ENV"), "stderr: {stderr}");
+}
+
+#[test]
+fn r3d0_foundation_rejects_config_row_cross_binding_mutations() {
+    let mutations = [
+        (
+            "scheduled-cases.toml",
+            "credential_env = \"OLLAMA_API_KEY\"",
+            "credential_env = \"OTHER_API_KEY\"",
+            "auth/pre-auth/API-key bindings disagree",
+        ),
+        (
+            "scheduled-cases.toml",
+            "adapter_family = \"@agentclientprotocol/codex-acp\"",
+            "adapter_family = \"@agentclientprotocol/claude-agent-acp\"",
+            "provider/adapter/command families disagree",
+        ),
+        (
+            "scheduled-cases.toml",
+            "resolution_case = \"codex-host-floating-current\"",
+            "resolution_case = \"claude-host-floating-current\"",
+            "semantic resolution recipe disagree",
+        ),
+        (
+            "scheduled-cases.toml",
+            "allowed_effects = [\"registry_read\", \"provider_prompt\"]",
+            "allowed_effects = [\"provider_prompt\"]",
+            "effect classes do not match",
+        ),
+        (
+            "configs/codex-luna-host.toml",
+            "cmd = \"codex-acp\"",
+            "cmd = \"claude-agent-acp\"",
+            "provider/adapter/command families disagree",
+        ),
+        (
+            "configs/codex-luna-host.toml",
+            "pre_authenticated = true",
+            "pre_authenticated = false",
+            "auth/pre-auth/API-key bindings disagree",
+        ),
+    ];
+    for (relative, from, to, expected) in mutations {
+        let temp = tempfile::tempdir().unwrap();
+        copy_foundation(temp.path());
+        let path = temp.path().join(relative);
+        let original = fs::read_to_string(&path).unwrap();
+        let changed = original.replacen(from, to, 1);
+        assert_ne!(changed, original, "mutation did not apply: {relative}");
+        fs::write(path, changed).unwrap();
+        let output = validate_foundation(temp.path());
+        assert!(
+            !output.status.success(),
+            "{relative} unexpectedly validated"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{relative}: {stderr}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn r3d0_schedule_foundation_rejects_parent_symlink_escape() {
@@ -270,6 +388,179 @@ fn r3d0_execution_only_pins_do_not_change_profile_policy_bundle() {
         String::from_utf8_lossy(&image_result.stderr)
     );
     assert_eq!(bundle_sha256(&image_result), baseline_bundle);
+}
+
+#[test]
+fn r3d0_semantic_bundle_ignores_comments_but_validates_recipe_constraints() {
+    let baseline = validate_foundation(&compatibility_root());
+    assert!(baseline.status.success());
+    let baseline_bundle = bundle_sha256(&baseline);
+
+    let comment_temp = tempfile::tempdir().unwrap();
+    copy_foundation(comment_temp.path());
+    for relative in [
+        "scheduling-policy.toml",
+        "characterization-profiles.toml",
+        "scheduled-cases.toml",
+        "manifest.toml",
+        "floating-current.toml",
+        "configs/codex-luna-host.toml",
+    ] {
+        let path = comment_temp.path().join(relative);
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(path, format!("# semantics-preserving comment\n{original}")).unwrap();
+        let comments = validate_foundation(comment_temp.path());
+        assert!(
+            comments.status.success(),
+            "comment in {relative} changed semantics: {}",
+            String::from_utf8_lossy(&comments.stderr)
+        );
+        assert_eq!(bundle_sha256(&comments), baseline_bundle, "{relative}");
+    }
+    let comments = validate_foundation(comment_temp.path());
+    assert!(
+        comments.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&comments.stderr)
+    );
+    assert_eq!(bundle_sha256(&comments), baseline_bundle);
+
+    let constraint_temp = tempfile::tempdir().unwrap();
+    copy_foundation(constraint_temp.path());
+    let recipe_path = constraint_temp.path().join("floating-current.toml");
+    let recipe = fs::read_to_string(&recipe_path).unwrap().replacen(
+        "timeout_secs = 900",
+        "timeout_secs = 899",
+        1,
+    );
+    fs::write(recipe_path, recipe).unwrap();
+    let changed_constraint = validate_foundation(constraint_temp.path());
+    assert!(!changed_constraint.status.success());
+    assert!(
+        String::from_utf8_lossy(&changed_constraint.stderr)
+            .contains("characterization fingerprint mismatch"),
+        "stderr: {}",
+        String::from_utf8_lossy(&changed_constraint.stderr)
+    );
+
+    let malformed_temp = tempfile::tempdir().unwrap();
+    copy_foundation(malformed_temp.path());
+    let recipe_path = malformed_temp.path().join("floating-current.toml");
+    let recipe = fs::read_to_string(&recipe_path).unwrap();
+    fs::write(recipe_path, format!("this is not valid TOML\n{recipe}")).unwrap();
+    let malformed = validate_foundation(malformed_temp.path());
+    assert!(!malformed.status.success());
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr).contains("floating recipes"),
+        "stderr: {}",
+        String::from_utf8_lossy(&malformed.stderr)
+    );
+}
+
+#[test]
+fn r3d0_semantic_bundle_ignores_set_and_row_order() {
+    let baseline = validate_foundation(&compatibility_root());
+    assert!(baseline.status.success());
+    let baseline_bundle = bundle_sha256(&baseline);
+
+    let temp = tempfile::tempdir().unwrap();
+    copy_foundation(temp.path());
+
+    let inventory_path = temp.path().join("characterization-profiles.toml");
+    let inventory = fs::read_to_string(&inventory_path).unwrap();
+    fs::write(
+        &inventory_path,
+        rotate_array_table_section(&inventory, "[[profiles]]", None),
+    )
+    .unwrap();
+
+    let registry_path = temp.path().join("scheduled-cases.toml");
+    let registry = fs::read_to_string(&registry_path).unwrap();
+    fs::write(
+        &registry_path,
+        rotate_array_table_section(&registry, "[[cases]]", None),
+    )
+    .unwrap();
+
+    let policy_path = temp.path().join("scheduling-policy.toml");
+    let policy = fs::read_to_string(&policy_path).unwrap().replace(
+        "allowed_triggers = [\"manual_characterization\", \"manual_compatibility\", \"daily\", \"scheduled_main\", \"test_merge\"]",
+        "allowed_triggers = [\"test_merge\", \"scheduled_main\", \"daily\", \"manual_compatibility\", \"manual_characterization\"]",
+    );
+    fs::write(policy_path, policy).unwrap();
+
+    let recipes_path = temp.path().join("floating-current.toml");
+    let recipes = fs::read_to_string(&recipes_path).unwrap();
+    let recipes = rotate_array_table_section(&recipes, "[[package_sets]]", Some("[[images]]"));
+    let recipes = rotate_array_table_section(&recipes, "[[cases]]", None);
+    fs::write(recipes_path, recipes).unwrap();
+
+    let reordered = validate_foundation(temp.path());
+    assert!(
+        reordered.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&reordered.stderr)
+    );
+    assert_eq!(bundle_sha256(&reordered), baseline_bundle);
+}
+
+#[test]
+fn r3d0_support_expected_status_changes_the_profile_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    copy_foundation(temp.path());
+    let manifest_path = temp.path().join("manifest.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap().replacen(
+        "expected_status = \"PASS\"",
+        "expected_status = \"FAIL\"",
+        1,
+    );
+    fs::write(manifest_path, manifest).unwrap();
+    let changed = validate_foundation(temp.path());
+    assert!(!changed.status.success());
+    assert!(
+        String::from_utf8_lossy(&changed.stderr).contains("characterization fingerprint mismatch"),
+        "stderr: {}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+}
+
+#[test]
+fn r3d0_claimed_support_config_bytes_must_match_the_manifest_pin() {
+    let temp = tempfile::tempdir().unwrap();
+    copy_foundation(temp.path());
+    let config_path = temp.path().join("configs/codex-host.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(config_path, format!("# changed execution bytes\n{config}")).unwrap();
+    let changed = validate_foundation(temp.path());
+    assert!(!changed.status.success());
+    assert!(
+        String::from_utf8_lossy(&changed.stderr).contains("exact manifest pin"),
+        "stderr: {}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+}
+
+#[test]
+fn r3d0_foundation_rejects_secret_shaped_comments() {
+    for relative in ["scheduling-policy.toml", "configs/codex-luna-host.toml"] {
+        let temp = tempfile::tempdir().unwrap();
+        copy_foundation(temp.path());
+        let path = temp.path().join(relative);
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(
+            path,
+            format!("# accidental sk-not-a-real-secret\n{original}"),
+        )
+        .unwrap();
+
+        let output = validate_foundation(temp.path());
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("secret-shaped"),
+            "{relative} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
@@ -348,7 +639,7 @@ fn r3d0_case_and_admission_fingerprint_records_are_supported() {
         (
             "case-execution-fingerprint",
             case_execution_record_json(
-                "8c3aecf5677b69493a24db7693ddffb4fe7485fb8569b72dfd5ad8b7c8fcb379",
+                "b54b484b884757815a60772d91da7d5696f2d03a9b7ad8d2eff23f485eeb6c12",
             ),
         ),
         (
@@ -378,7 +669,7 @@ fn r3d0_case_and_admission_fingerprint_records_are_supported() {
 #[test]
 fn r3d0_fingerprint_layers_reject_drift_and_cross_layer_fields() {
     let temp = tempfile::tempdir().unwrap();
-    let case_hash = "8c3aecf5677b69493a24db7693ddffb4fe7485fb8569b72dfd5ad8b7c8fcb379";
+    let case_hash = "b54b484b884757815a60772d91da7d5696f2d03a9b7ad8d2eff23f485eeb6c12";
 
     let mut trigger_leak = case_execution_record_json(case_hash);
     trigger_leak["input"]["trigger"] = serde_json::json!({"kind": "daily"});
@@ -559,5 +850,125 @@ fn r3d0_schedule_record_rejects_prompt_material_and_wrong_suppression() {
             .contains("confirmation and suppression policy"),
         "stderr: {}",
         String::from_utf8_lossy(&premature_suppression.stderr)
+    );
+}
+
+#[test]
+fn r3d0_schedule_records_reject_invalid_identity_and_generation_fields() {
+    let temp = tempfile::tempdir().unwrap();
+    let records = [
+        (
+            "publication-outbox",
+            serde_json::json!({
+                "schema_version": 1,
+                "outbox_id": "outbox-1",
+                "state": "create_intent",
+                "repository": "",
+                "pull_request": 37,
+                "test_merge_oid": {"algorithm": "sha1", "hex": "a".repeat(40)},
+                "context": "a2a-bridge/r3d",
+                "app_id": "app-1",
+                "external_id": "external-1",
+                "check_run": {"kind": "absent"},
+                "terminal_consumption": {"kind": "absent"},
+                "desired_conclusion": {"kind": "absent"},
+                "evidence_set": {"kind": "absent"},
+                "final_guard": {"kind": "absent"},
+                "remote_observation": {"kind": "absent"},
+                "remote_observation_attempts": 0
+            }),
+        ),
+        (
+            "quarantine",
+            serde_json::json!({
+                "state": "open",
+                "schema_version": 1,
+                "quarantine_id": "quarantine-1",
+                "profile": fingerprint_json('a'),
+                "operator": "",
+                "reason": "owner requested quarantine",
+                "created_at_ms": 1,
+                "expires_at_ms": 2
+            }),
+        ),
+        (
+            "status",
+            serde_json::json!({
+                "schema_version": 1,
+                "generated_at_ms": 1,
+                "policy_sha256": digest('a'),
+                "last_window": {"kind": "absent"},
+                "next_window": {"kind": "absent"},
+                "provider_grant": {"kind": "absent"},
+                "storage_consent": {"kind": "absent"},
+                "ledger_headroom_sha256": digest('b'),
+                "storage_state": "hot_only",
+                "missed_ticks": 0,
+                "fresh_one_shot_compatibility": "unknown",
+                "shared_operator_health": "not_evaluated",
+                "cases": [{
+                    "case_id": "case-1",
+                    "lifecycle": "scheduled_active",
+                    "last_outcome": {"kind": "text", "value": ""},
+                    "hold": {"kind": "absent"},
+                    "quarantine": {"kind": "absent"}
+                }]
+            }),
+        ),
+        (
+            "evidence-index",
+            serde_json::json!({
+                "schema_version": 1,
+                "index_id": "index-1",
+                "generation": 0,
+                "hot_root_sha256": digest('a'),
+                "cold_storage": {"kind": "absent"},
+                "entries": []
+            }),
+        ),
+    ];
+
+    for (kind, record) in records {
+        let path = temp.path().join(format!("invalid-{kind}.json"));
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let output = compatibility_command()
+            .arg("validate")
+            .arg("--schedule-record")
+            .arg(kind)
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{kind} unexpectedly passed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    let valid_index_path = temp.path().join("valid-evidence-index.json");
+    fs::write(
+        &valid_index_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "index_id": "index-1",
+            "generation": 1,
+            "hot_root_sha256": digest('a'),
+            "cold_storage": {"kind": "absent"},
+            "entries": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let valid_index = compatibility_command()
+        .arg("validate")
+        .arg("--schedule-record")
+        .arg("evidence-index")
+        .arg(valid_index_path)
+        .output()
+        .unwrap();
+    assert!(
+        valid_index.status.success(),
+        "valid evidence index failed: {}",
+        String::from_utf8_lossy(&valid_index.stderr)
     );
 }
