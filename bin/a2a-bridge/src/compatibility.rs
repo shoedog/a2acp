@@ -48,7 +48,8 @@ const INHERITED_SCRATCH_FD_ENV: &str = "_A2A_BRIDGE_INTERNAL_COMPAT_SCRATCH_FD";
 
 pub(crate) const USAGE: &str = "\
 usage: a2a-bridge compatibility validate
-              [--manifest <path> | --recipes <path>]
+              [--manifest <path> | --recipes <path> | --schedule-foundation <directory>
+               | --schedule-record <kind> <path>]
        a2a-bridge compatibility resolve [--recipes <path>]
               (--case <id>... | --all)
               --environment-owner <id> --runtime docker|podman
@@ -1011,6 +1012,18 @@ fn load_manifest(path: &Path) -> Result<LoadedManifest, BoxError> {
     })
 }
 
+pub(super) fn validated_manifest_snapshot(
+    path: &Path,
+) -> Result<(Vec<u8>, String, PathBuf), BoxError> {
+    let loaded = load_manifest(path)?;
+    let snapshot =
+        local_file::read_regular_file_bounded(path, "compatibility manifest", MAX_MANIFEST_BYTES)?;
+    if snapshot.sha256 != loaded.sha256 {
+        return Err("compatibility manifest: changed during schedule-foundation validation".into());
+    }
+    Ok((snapshot.bytes, snapshot.sha256, snapshot.canonical_path))
+}
+
 fn parse_manifest_text(raw: &str) -> Result<CompatibilityManifest, BoxError> {
     // Scan before TOML parsing so comments and parse-error source snippets cannot carry a credential
     // into a checked-in manifest or diagnostic.
@@ -1105,6 +1118,8 @@ fn load_recipes_with_pinned_manifest(
 enum ValidateSource {
     Manifest(PathBuf),
     Recipes(PathBuf),
+    ScheduleFoundation(PathBuf),
+    ScheduleRecord { kind: String, path: PathBuf },
 }
 
 #[derive(Debug)]
@@ -1115,6 +1130,8 @@ struct ValidateArgs {
 fn parse_validate_args(args: &[String]) -> Result<ValidateArgs, BoxError> {
     let mut manifest = None;
     let mut recipes = None;
+    let mut schedule_foundation = None;
+    let mut schedule_record = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -1136,6 +1153,28 @@ fn parse_validate_args(args: &[String]) -> Result<ValidateArgs, BoxError> {
                         .ok_or("compatibility validate: --recipes requires a path")?,
                 ));
             }
+            "--schedule-foundation" if schedule_foundation.is_some() => {
+                return Err("compatibility validate: duplicate --schedule-foundation".into())
+            }
+            "--schedule-foundation" => {
+                schedule_foundation = Some(PathBuf::from(it.next().ok_or(
+                    "compatibility validate: --schedule-foundation requires a directory",
+                )?));
+            }
+            "--schedule-record" if schedule_record.is_some() => {
+                return Err("compatibility validate: duplicate --schedule-record".into())
+            }
+            "--schedule-record" => {
+                let kind = it
+                    .next()
+                    .ok_or("compatibility validate: --schedule-record requires a kind and path")?
+                    .to_owned();
+                let path =
+                    PathBuf::from(it.next().ok_or(
+                        "compatibility validate: --schedule-record requires a kind and path",
+                    )?);
+                schedule_record = Some((kind, path));
+            }
             other => {
                 return Err(
                     format!("compatibility validate: unknown argument {other:?}\n{USAGE}").into(),
@@ -1143,10 +1182,33 @@ fn parse_validate_args(args: &[String]) -> Result<ValidateArgs, BoxError> {
             }
         }
     }
-    if manifest.is_some() && recipes.is_some() {
+    if usize::from(manifest.is_some())
+        + usize::from(recipes.is_some())
+        + usize::from(schedule_foundation.is_some())
+        + usize::from(schedule_record.is_some())
+        > 1
+    {
         return Err(
-            "compatibility validate: --manifest and --recipes are mutually exclusive".into(),
+            "compatibility validate: --manifest, --recipes, --schedule-foundation, and --schedule-record are mutually exclusive".into(),
         );
+    }
+    if let Some((kind, path)) = schedule_record {
+        if kind.is_empty() || path.as_os_str().is_empty() {
+            return Err(
+                "compatibility validate: --schedule-record kind and path must be non-empty".into(),
+            );
+        }
+        return Ok(ValidateArgs {
+            source: ValidateSource::ScheduleRecord { kind, path },
+        });
+    }
+    if let Some(root) = schedule_foundation {
+        if root.as_os_str().is_empty() {
+            return Err("compatibility validate: --schedule-foundation must be non-empty".into());
+        }
+        return Ok(ValidateArgs {
+            source: ValidateSource::ScheduleFoundation(root),
+        });
     }
     if let Some(recipes) = recipes {
         if recipes.as_os_str().is_empty() {
@@ -4707,6 +4769,19 @@ pub(crate) async fn compatibility_cmd(args: &[String]) -> Result<(), BoxError> {
                         },
                         loaded.sha256
                     );
+                }
+                ValidateSource::ScheduleFoundation(root) => {
+                    let loaded = crate::compatibility_schedule::load_schedule_foundation(&root)?;
+                    println!(
+                        "schedule foundation valid: {} scheduled advisory profiles, {} claimed-support profiles (profile-policy-bundle sha256 {})",
+                        loaded.scheduled_profile_count,
+                        loaded.claimed_support_profile_count,
+                        loaded.profile_policy_bundle_sha256
+                    );
+                }
+                ValidateSource::ScheduleRecord { kind, path } => {
+                    crate::compatibility_schedule_schema::validate_schedule_record(&kind, &path)?;
+                    println!("schedule record valid: {kind}");
                 }
             }
             Ok(())

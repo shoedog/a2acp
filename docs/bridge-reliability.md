@@ -2,6 +2,9 @@
 
 - **Status:** active P0 as of 2026-07-11
 - **Compatibility baseline:** [`compatibility.md`](compatibility.md)
+- **Compatibility/dogfooding routing:** [`compatibility-routing.md`](compatibility-routing.md)
+- **Default-off scheduling schemas:**
+  [`compatibility-scheduling-foundation.md`](compatibility-scheduling-foundation.md)
 - **Execution and handoff cursor:**
   [`reliability-execution-roadmap.md`](reliability-execution-roadmap.md)
 - **Operator workflow:** [`../skills/a2a-bridge-operator/SKILL.md`](../skills/a2a-bridge-operator/SKILL.md)

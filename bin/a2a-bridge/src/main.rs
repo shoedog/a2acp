@@ -37,6 +37,8 @@
 mod catalog_probe;
 mod compatibility;
 mod compatibility_resolution;
+mod compatibility_schedule;
+mod compatibility_schedule_schema;
 mod config;
 mod containers;
 mod doctor;

@@ -12,10 +12,13 @@ authentication, and container failures without guessing.
 
 1. Read [`../../docs/compatibility.md`](../../docs/compatibility.md) for the current tested matrix and
    open incidents.
-2. Read [`../../docs/onboarding.md`](../../docs/onboarding.md) for host setup, config, and credentials.
-3. For a sandboxed entry, also read
+2. Read the checked-in
+   [`../../docs/compatibility-routing.md`](../../docs/compatibility-routing.md) before selecting a provider,
+   model, effort, or independent review lens.
+3. Read [`../../docs/onboarding.md`](../../docs/onboarding.md) for host setup, config, and credentials.
+4. For a sandboxed entry, also read
    [`../../docs/containerized-agents.md`](../../docs/containerized-agents.md).
-4. For current priorities and planned reliability work, read
+5. For current priorities and planned reliability work, read
    [`../../docs/bridge-reliability.md`](../../docs/bridge-reliability.md) and resume from the canonical
    [`../../docs/reliability-execution-roadmap.md`](../../docs/reliability-execution-roadmap.md).
 

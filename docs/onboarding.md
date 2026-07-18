@@ -2,7 +2,9 @@
 
 > **Agent/operator preflight:** use the
 > [`a2a-bridge-operator` skill](../skills/a2a-bridge-operator/SKILL.md) and check the current
-> [`compatibility matrix`](compatibility.md) before spending a live agent turn.
+> [`compatibility matrix`](compatibility.md) before spending a live agent turn. Use
+> [Compatibility and dogfooding routing](compatibility-routing.md) before selecting a provider, model,
+> effort, or independent review lens.
 
 The bridge is an A2A↔ACP server: it fronts one or more agent CLIs (kiro, codex,
 claude) — or an OpenAI-compatible HTTP backend — behind the A2A protocol, and can

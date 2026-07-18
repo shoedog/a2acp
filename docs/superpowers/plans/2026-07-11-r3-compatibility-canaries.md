@@ -2,9 +2,11 @@
 
 - **Status:** overall R3 **ACTIVE**; R3a **MERGED** at `3927df3f` by PR #31; R3b
   **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at
-  `983398427c9f04861a2f1da501a7650c4a1cdd80` by PR #33; R3d design is **APPROVED / PENDING
-  MERGE** at exact `b54840a017b87521677f1f95c3f7be69de55361d` on
-  `agent/reliability-r3d-scheduled-canaries`. Nine pinned rows are implemented. Exact
+  `983398427c9f04861a2f1da501a7650c4a1cdd80` by PR #33; R3d design is **APPROVED / MERGED**
+  at exact design head `b54840a017b87521677f1f95c3f7be69de55361d` by PR #37, merge
+  `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is **IMPLEMENTED / REVIEW PENDING** on
+  `agent/reliability-r3d0-foundation`; no live/timer/operator effect is in scope. Nine pinned rows are
+  implemented. Exact
   `c458045cf3d0923457519e253d22dd545363f98d` Sol/xhigh review approved the pre-incident deterministic
   tree. Authorized attempt 1 remains non-promotable stale-auth evidence; authorized attempt 2 passed both
   host paths and failed both reader paths before prompt acceptance when their runtime objects never started.
@@ -26,7 +28,8 @@
   ended `GATE: APPROVE`. This docs fold closes its non-USD cost wording gap; all other verification/fault
   boundaries remain accepted/nonblocking. No Fable re-review will run.
 - **Prerequisite:** R2c/R2d merged (`a6fec94c`, PR #29); R3a merged (`3927df3f`, PR #31);
-  R3b merged (`504c1e43`, PR #32); R3c merged (`98339842`, PR #33)
+  R3b merged (`504c1e43`, PR #32); R3c merged (`98339842`, PR #33); R3d design merged
+  (`6eeea6ce`, PR #37)
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Completion shape:** R3a local manifest/runner, R3b pinned lane, R3c floating lane, R3d scheduling,
@@ -1105,10 +1108,11 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 
 ## R3d — owner-bound scheduling and evidence retention
 
-- **Branch:** `agent/reliability-r3d-scheduled-canaries`
-- **Base:** merged R3c main `983398427c9f04861a2f1da501a7650c4a1cdd80`
-- **Status:** design of record **APPROVED** at exact `b54840a017b87521677f1f95c3f7be69de55361d`
-  after owner decisions and fifteen exact-commit Sol reviews; implementation not started; non-draft docs PR next
+- **Branch:** `agent/reliability-r3d0-foundation`
+- **Base:** merged R3d design main `6eeea6ce553b792dc92cef95ee45f2234f7afe4e` (PR #37)
+- **Status:** design of record **APPROVED / MERGED** at exact design head
+  `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 default-off policy/schema implementation is
+  **IMPLEMENTED / REVIEW PENDING** with no live/timer/operator effects
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
   `/Users/wesleyjinks/.claude/plans/r3d-clean-room-adversarial-deep-hollerith.md`, mode `0644`, 40,180
@@ -2501,8 +2505,8 @@ Rollback does not revert evidence, erase ledger charges, delete pins/tombstones,
 operator, or run missed windows on re-enable. The last reviewed immutable scheduler binary remains the code
 rollback target. Any code revert is a normal reviewed PR.
 
-**Restart point:** work from branch `agent/reliability-r3d-scheduled-canaries` based on merged main
-`98339842`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
+**Restart point:** continue R3d0 from branch `agent/reliability-r3d0-foundation` based on merged main
+`6eeea6ce`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
 exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, exact-`c50811f`, and
 exact-`fb8a2f4`, exact-`ae9db39`, exact-`2eb242a`, exact-`8dc6054`, exact-`cc01a52`, and exact-`b54840a`
 Sol reviews are retained at the paths/hashes above.
@@ -2515,11 +2519,16 @@ one `WRONG`/zero new `SMELL`; seventh-closure zero new `WRONG`/one `SMELL`; and 
 `SMELL`; thirteenth-closure one inherited `PARTIAL`/zero new findings; and fourteenth-closure one inherited
 `FIXED`/zero new findings are folded into D1-D10 and the slices/gates above. The fourteenth closure found no
 regression, required no amendment, and returned `R3D DESIGN: APPROVE` at exact `b54840a`. All D1-D10 owner
-decisions were approved on 2026-07-17. No implementation, schema, timer, private authority, live
-characterization, model discovery, registry/image effect, compatibility provider turn, GitHub check
-mutation, or production-operator action has been performed by this design fold; the only new provider
-activity was the fifteen recorded read-only Sol reviews. Next: publish the non-draft docs PR; start R3d0 only
-after that design PR merges.
+decisions were approved on 2026-07-17. PR #37 merged the approved design at `6eeea6ce`. R3d0 now owns only
+the checked-in non-authoritative policy, complete profile inventory, proposed advisory configs, canonical
+identity and inert record schemas/validators, plus routing/foundation docs. Its exact pre-review
+implementation passes foundation units **2/0**, schema units **11/0**, R3d0 CLI integration **11/0**, and
+the full serial workspace **2,189/0/12 ignored** across **71** test/doc-test executables; workspace check,
+warnings-denied Clippy, locked release build, repository hygiene, and all three compatibility validators are
+green. No timer, private authority issuance, live characterization, model discovery, credential access,
+registry/image effect, compatibility provider turn, GitHub check mutation, or production-operator action has
+been performed. Next: freeze this exact head for Sol/xhigh implementation review, then one Opus release/
+compatibility lens; fold any findings, rerun the complete deterministic gates, and publish its non-draft PR.
 Preserve R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
 
 ## R3e — OpenRouter provider expansion

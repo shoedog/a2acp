@@ -1,0 +1,63 @@
+# R3d0 complete initial characterization inventory. Fingerprints are canonical profile projections,
+# not execution identities or effect authority.
+schema_version = 1
+
+[[profiles]]
+id = "codex-host-luna-low"
+source_kind = "scheduled_advisory"
+source_id = "codex-host-luna-low"
+profile_sha256 = "077f6a076abc1b0bff12544878365e8f66e7cc06be2a1d65e057f95cd6e06050"
+
+[[profiles]]
+id = "codex-reader-luna-low"
+source_kind = "scheduled_advisory"
+source_id = "codex-reader-luna-low"
+profile_sha256 = "006cad8cceaf32339e33b0c924aabdb388ec125364f66b9e6ef04325340809e3"
+
+[[profiles]]
+id = "claude-host-haiku-low"
+source_kind = "scheduled_advisory"
+source_id = "claude-host-haiku-low"
+profile_sha256 = "3b2caa12c318e0722be06be971426d42558f6550166838cf8b10b98ec5eff2d6"
+
+[[profiles]]
+id = "claude-reader-haiku-low"
+source_kind = "scheduled_advisory"
+source_id = "claude-reader-haiku-low"
+profile_sha256 = "ab3c79f9ad3749a6f1e96eb6ea13178de986bd282878e15b73de03852da56867"
+
+[[profiles]]
+id = "claude-host-sonnet-low-effort"
+source_kind = "scheduled_advisory"
+source_id = "claude-host-sonnet-low-effort"
+profile_sha256 = "e23f038736bf6e1ad8b9708156b013b57ef00c84ef5251485465450e626abc37"
+
+[[profiles]]
+id = "ollama-local-qwen35-9b"
+source_kind = "scheduled_advisory"
+source_id = "ollama-local-qwen35-9b"
+profile_sha256 = "4abeb771ec5cac802352d8c372b4634e7f8e6492fd5316d59d8608d57c48ccf8"
+
+[[profiles]]
+id = "codex-host-bridge-gpt56-sol"
+source_kind = "claimed_support_gate"
+source_id = "codex-host-bridge-gpt56-sol"
+profile_sha256 = "f2d259abb79f4bebbac9e0b974ab275cb6ebd0aca4284ab659b3f6531ee66be9"
+
+[[profiles]]
+id = "codex-reader-bridge-gpt56-sol"
+source_kind = "claimed_support_gate"
+source_id = "codex-reader-bridge-gpt56-sol"
+profile_sha256 = "392745725a1caa33e59391fbbe47cfafca322a983833c76df66c42cb62e6122b"
+
+[[profiles]]
+id = "claude-host-acp-044-fable"
+source_kind = "claimed_support_gate"
+source_id = "claude-host-acp-044-fable"
+profile_sha256 = "5d03d98b57ebca3d371edb1db9069f43a41b055c85de1d31852614bde7a45735"
+
+[[profiles]]
+id = "claude-reader-055-fable"
+source_kind = "claimed_support_gate"
+source_id = "claude-reader-055-fable"
+profile_sha256 = "5c4310ca926c16f99376036066380720e97762dd5e94d371544bdaf5cb377975"

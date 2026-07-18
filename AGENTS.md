@@ -3,7 +3,9 @@
 > **Start here:** read the
 > [`a2a-bridge-operator` skill](skills/a2a-bridge-operator/SKILL.md) before running or diagnosing an
 > agent workflow. Check [`docs/compatibility.md`](docs/compatibility.md) for tested versions and incident
-> dispositions; do not infer host support from a container result or vice versa.
+> dispositions, and use the checked-in
+> [compatibility and dogfooding routing reference](docs/compatibility-routing.md) when selecting a model or
+> review lens. Do not infer host support from a container result or vice versa.
 
 `a2a-bridge` is an A2A↔ACP bridge **and** a multi-agent workflow runner. You can use it as a **tool** to run
 clean-room **design**, **code/spec/plan review**, or autonomous **implement** passes against *any* repo —

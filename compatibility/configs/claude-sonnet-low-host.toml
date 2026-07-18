@@ -1,0 +1,14 @@
+# R3d0 characterization-required Claude effort-setting control. It grants no execution authority.
+default = "claude-sonnet-low-host"
+
+[[agents]]
+id = "claude-sonnet-low-host"
+cmd = "claude-agent-acp"
+model = "sonnet"
+effort = "low"
+
+[registry]
+allowed_cmds = ["claude-agent-acp"]
+
+[server]
+addr = "127.0.0.1:8080"

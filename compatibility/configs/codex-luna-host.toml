@@ -1,0 +1,17 @@
+# R3d0 characterization-required provider-minimal host profile. It grants no execution authority.
+default = "codex-luna-host"
+
+[[agents]]
+id = "codex-luna-host"
+cmd = "codex-acp"
+pre_authenticated = true
+model = "gpt-5.6-luna"
+effort = "low"
+mode = "read-only"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+
+[registry]
+allowed_cmds = ["codex-acp"]
+
+[server]
+addr = "127.0.0.1:8080"
