@@ -109,12 +109,20 @@
   bundle remains `aed0e9b224d84624220a6091e51601a677b13d254091a12bc3b1879e36bf5e81`; the
   provider-unexercised release binary is 26,480,544 bytes at SHA-256
   `f2869caa4ccdc5b8fc055a803e462a05a2354cd53f4fa5b5aeaed71ea64efd28`.
-  No timer, private authority issuance, live characterization, credential access, registry/image effect,
-  compatibility provider turn, GitHub check mutation, or production-operator action has occurred. Status is
-  **FOURTH REMEDIATION COMPLETE / FOURTH CLOSURE REVIEW PENDING**. Next: freeze the cursor fold and run a fresh
-  Sol/xhigh closure rereview of that exact head; only after Sol approval run one Opus release/compatibility
-  lens, fold any findings, and publish the R3d0 PR. No Fable review is planned unless a genuinely hard or
-  complex unresolved problem justifies it.
+  Exact cursor `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4` then received the fourth fresh
+  bridge-mediated Sol/xhigh/read-only closure review: both inherited families `FIXED`, no new `WRONG`, one
+  nonblocking proof-isolation `SMELL`, and `R3D0 IMPLEMENTATION: APPROVE`. Its retained report is
+  `/private/tmp/a2a-bridge-r3d0-sol-closure-b6f5c9e/review.md`, mode `0644`, 12,224 bytes, SHA-256
+  `aa7b1051b83b94d84dc36273cf302419ffe2ecc41d20282001cffb530898374a`. Proof-only commit
+  `e771067f4a7e742ad813368f01018b011e86bbce` isolates the explicit equality guard with an aligned
+  ordinary-name CLI fixture; removing only that guard makes the test fail because the fixture is accepted
+  after inventory re-pin. Fresh post-fold gates retain the same totals and byte identities above. No timer,
+  private authority issuance, live characterization, credential access, registry/image effect, compatibility
+  provider turn, GitHub check mutation, or production-operator action has occurred. Status is **SOL APPROVED /
+  PROOF FOLD CONFIRMATION PENDING**. Next: run one narrow fresh Sol/xhigh exact-head confirmation of the
+  proof/docs-only fold; only after confirmation run one Opus/xhigh release/compatibility lens, fold any
+  findings, and publish the R3d0 PR. No Fable review is planned unless a genuinely hard or complex unresolved
+  problem justifies it.
 - **Last merged R3c deterministic gate:** code head
   `4bd63f3f129a08586742c3c3e946fecfa02839ba` completes all four implementation slices and seven
   adversarial-review rounds. The initial Sol/xhigh review of exact `a5dfef8` returned nine `WRONG`, no
@@ -407,7 +415,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (three incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`. D1-D10 and all sixteen design-review sets are folded. R3d0 is **FOURTH REMEDIATION COMPLETE / FOURTH CLOSURE REVIEW PENDING** on `agent/reliability-r3d0-foundation`: exact cursor `be9d8a7` received a third fresh Sol/xhigh closure review that marked six inherited families `FIXED`, trusted cwd `PARTIAL`, found one new `WRONG`, no new `SMELL`, and returned `REVISE`; exact remediation `5baeeb3` closes symlink-mediated cwd escape plus credential-shaped/duplicated scheduled prerequisites. Focused gates are **9/0**, **23/0**, and **31/0**; full serial workspace is **2,228/0/12 ignored** across **55** binaries; all deterministic release/validator gates are green. No timer, private authority, live characterization, provider/registry/image effect, GitHub check mutation, or operator lifecycle action has run. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | Run a fresh Sol/xhigh closure rereview; only after approval run one Opus release/compatibility lens, fold findings, rerun gates, then publish the non-draft R3d0 PR. R3d never touches the long-lived operator. |
+| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`. D1-D10 and all sixteen design-review sets are folded. R3d0 is **SOL APPROVED / PROOF FOLD CONFIRMATION PENDING** on `agent/reliability-r3d0-foundation`: exact cursor `b6f5c9e` received a fourth fresh Sol/xhigh closure review that marked both inherited families `FIXED`, found no new `WRONG`, found one nonblocking proof-isolation `SMELL`, and returned `APPROVE`; proof-only `e771067` makes the equality branch mutation-isolated. Focused gates are **9/0**, **23/0**, and **31/0**; full serial workspace is **2,228/0/12 ignored** across **55** binaries; all deterministic release/validator gates are green. No timer, private authority, live characterization, provider/registry/image effect, GitHub check mutation, or operator lifecycle action has run. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | Run one narrow Sol/xhigh exact-head confirmation of the proof/docs fold; only after confirmation run one Opus/xhigh release/compatibility lens, fold findings, rerun affected gates, then publish the non-draft R3d0 PR. R3d never touches the long-lived operator. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
