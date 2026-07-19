@@ -3,8 +3,8 @@
 - **Status:** ACTIVE — R3d2a through R3d2e are implemented. Sol/xhigh reviews one through three returned `REVISE`
   at `1373985`, `28e7d28`, and `d082b49`; exact-head review four returned `REVISE` at `c418df4` after resolving all
   ten inherited items, with two new `WRONG` and one new `SMELL`. Mechanism commit `5a01ce7` closes the three fresh
-  findings with pre-change-red regressions. Exact-head full deterministic gates, a fresh Sol closure re-review,
-  and the post-Sol Fable lens remain pending
+  findings with pre-change-red regressions. Exact post-remediation candidate `9fda91b` passes the complete
+  deterministic gate. A fresh Sol closure re-review and the post-Sol Fable lens remain pending
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -826,11 +826,17 @@ create/open/sync relative to the retained descriptor, and verifies that the cano
 object before and after journal operations. The replacement regression returns no admitted capability and leaves
 both the replacement and retained directories empty.
 
-Post-remediation focused gates are admission **17/0**, supervisor **41/0**, and transaction **22/0**; format/diff,
-warning-denied workspace all-target/all-feature check, and the three isolated regressions are green. The complete
-exact-head deterministic gate has not yet been rerun after this mechanism change. The next semantic action is that
-full gate, followed by a fresh Sol/xhigh closure re-review explicitly adjudicating these three findings. Fable
-remains blocked until Sol approves.
+Post-remediation focused gates are admission **17/0**, supervisor **41/0**, and transaction **22/0**; all three
+isolated regressions are green. Exact candidate `9fda91b07b71b8457242fdd94b8e1bfc4662d060` then passed the complete
+deterministic gate: format and diff checks; warnings-denied workspace all-target/all-feature check and Clippy;
+locked release build; dependency policy; repository hygiene **37 tracked artifacts / 7 configs**; manifest
+**9 cases**; recipes **4 cases**; foundation **6 scheduled / 4 claimed-support**; compatibility CLI **22/0**;
+complete binary **648/0/0**; and full serial workspace **2,385 passed / 0 failed / 12 ignored** across **72** result
+groups, **55** nonempty. The 200,708-byte full-suite log is retained at
+`/private/tmp/a2a-bridge-r3d2-full-9fda91b.log`, SHA-256
+`9157138c5459260aa92d78c2fc7b97c281e1eb1d4b9af603ce858e0ece023fbd`. The release binary is 26,604,912 bytes,
+SHA-256 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`. The next semantic action is a fresh
+Sol/xhigh closure re-review explicitly adjudicating these three findings. Fable remains blocked until Sol approves.
 
 ## Verification and review gates
 
@@ -867,12 +873,13 @@ on a prior `/private/tmp` worktree or review mirror. The branch is based on merg
 `cbcfd1f06b914064456d1798be71bacdc294f3d5`. Fourth review of exact `c418df4` resolved all ten inherited items and
 returned `REVISE` with two new `WRONG` plus one retained-directory `SMELL`; mechanism commit `5a01ce7` closes all
 three with demonstrated pre-change-red regressions and focused admission/supervisor/transaction gates
-**17/0 + 41/0 + 22/0**. Read
+**17/0 + 41/0 + 22/0**. Exact post-remediation candidate `9fda91b` passes the complete deterministic gate, including
+binary **648/0/0** and full serial workspace **2,385/0/12 ignored** across **72** result groups, **55** nonempty. Read
 this plan, the R3d design of record, the durable roadmap, `AGENTS.md`, and
 `skills/a2a-bridge-operator/SKILL.md` before editing. Preserve the single R3d2 merge boundary, the
 owner-wide-then-authority lock order, the single admission linearization point, the zero-effect default, and the
-separation between provider authority and storage consent. The next semantic action is the complete exact-head
-deterministic gate, then a fresh Sol/xhigh closure re-review explicitly adjudicating the clock-rollback, manual-reuse,
-and retained-supervisor-directory findings. Its prompt must carry the frozen exact boundary and gate evidence. Run
+separation between provider authority and storage consent. The next semantic action is a fresh Sol/xhigh closure
+re-review explicitly adjudicating the clock-rollback, manual-reuse, and retained-supervisor-directory findings. Its
+prompt must carry the frozen exact boundary and gate evidence. Run
 the single Fable lens only after Sol approves; then fold final evidence, rerun exact-final gates, and publish the
 non-draft PR.

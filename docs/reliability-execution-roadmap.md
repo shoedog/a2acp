@@ -8,7 +8,7 @@
   `agent/reliability-r3d2-authority-admission`, based directly on `cbcfd1f`; it is non-billable and uses only
   fake clocks/process inventories/effect controls and owner-private temporary state roots in tests
 - **Current R3d2 implementation gate:** **R3D2A-R3D2E IMPLEMENTED / FOURTH SOL REVIEW REVISE / ALL TEN INHERITED
-  RESOLVED / TWO NEW WRONG + ONE SMELL REMEDIATED / FULL GATE THEN SOL CLOSURE REREVIEW NEXT**. The restart contract is
+  RESOLVED / TWO NEW WRONG + ONE SMELL REMEDIATED / EXACT GATE GREEN / SOL CLOSURE REREVIEW NEXT**. The restart contract is
   [`2026-07-19-r3d2-authority-admission-accounting.md`](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md).
   R3d2a closes the three inherited R3d1 integration smells, owns cancellation before `Running`, retains the
   exact runner child for exit proof, and adds the private local state-root plus nonblocking lock primitives.
@@ -60,9 +60,12 @@
   bytes at SHA-256 `70467885...e6a`. All three regressions failed **0/1** on the reviewed mechanism. Commit `5a01ce7`
   adds the evidence-availability watermark, permits only exact manual advisory reuse while consuming its nonce once,
   and keeps supervisor journal I/O descriptor-relative to the retained scheduler directory while refusing pathname
-  replacement. Focused admission/supervisor/transaction gates are **17/0 + 41/0 + 22/0**; format/diff and the
-  warning-denied workspace check are green. Full exact-head deterministic gates and fresh Sol closure review remain
-  pending. R3d2 still has one merge boundary and
+  replacement. Focused admission/supervisor/transaction gates are **17/0 + 41/0 + 22/0**. Exact post-remediation
+  candidate `9fda91b` passed the complete binary **648/0/0** and full serial workspace **2,385/0/12 ignored** across
+  **72** result groups, **55** nonempty. Format/diff, warnings-denied workspace check/Clippy, locked release,
+  dependency policy, hygiene **37/7**, manifest **9**, recipes **4**, foundation **6 scheduled / 4 claimed-support**,
+  and compatibility CLI **22/0** are green. The release binary remains 26,604,912 bytes at SHA-256
+  `5454b5eb...f584`. Fresh Sol closure review remains pending. R3d2 still has one merge boundary and
   five internal subincrements: R3d1 integration hardening/local state; private
   authority and source reducers; exact identities/equivalent work/control reducers; ledger/legacy/preflights; then
   the shared transaction/default-off integration. No internal commit independently enables effects. The only
@@ -479,8 +482,8 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** run the complete deterministic gate on the exact post-fourth-review remediation/docs head. Then
-  freeze head/base/merge-base/changed paths and run one fresh bridge-mediated Sol/xhigh closure re-review that
+- **Next action:** freeze head/base/merge-base/changed paths and run one fresh bridge-mediated Sol/xhigh closure
+  re-review that
   explicitly adjudicates the clock-rollback, manual-reuse, and retained-supervisor-directory findings. Supply the
   exact-head gate evidence in its prompt. After Sol is green, spend the single design-approved
   Fable/xhigh adversarial implementation plus release/compatibility lens, with no Fable re-review loop, then publish
