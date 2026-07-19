@@ -168,7 +168,11 @@ required check.
 ## Later slices
 
 - R3d1 implements provider-free one-shot supervision and signal parity with fake-process proof.
-- R3d2 implements private authority, admission, preflights, equivalent-work, and durable accounting.
+- R3d2 implements private authority, admission, preflights, equivalent-work, and durable accounting. Before it wires
+  the R3d1 mechanism to a production control implementation, it also makes Darwin zero/error group enumeration
+  errno-aware for absence proof, owns cancellation before `Running`, supplies an exact-runner-exit primitive,
+  preserves whichever SIGINT/SIGTERM registration succeeds if the other fails, and either excludes `.` from
+  externally derived supervisor record ids or gives every record a private journal directory.
 - R3d3 implements evidence storage, retention, status, and crash-consistent publication state.
 - R3d4 implements disabled-by-default launchd and trusted test-merge/main triggers.
 - R3d5 separately characterizes every inventory row under single-use owner authority before any staged

@@ -6,13 +6,15 @@
   at exact design head `b54840a017b87521677f1f95c3f7be69de55361d` by PR #37, merge
   `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is
   **MERGED** by PR #38 at merge commit `c2d147fb1f0df275f3c6452cdd212e185c002d08`. R3d1 is
-  **IN REVIEW** on `agent/reliability-r3d1-supervisor`; initial exact candidate `01438c34` and first closure head
+  **APPROVED FOR PR** on `agent/reliability-r3d1-supervisor`; initial exact candidate `01438c34` and first closure head
   `e81ebbb` each received Sol/xhigh `REVISE`. Second closure head `8feda4d` marked all four requested topology/cursor
   residuals `FIXED`, found one new post-anchor-retention `WRONG / High`, no new `SMELL`, and returned `REVISE`.
   Third closure head `7fafe79` marked that item `FIXED`, confirmed prior residuals closed, found two new `WRONG`
   (`High` and `Minor`), no new `SMELL`, and returned `REVISE`. Fourth closure head `b55c17d` marked both inherited
   retained-capability findings `FIXED`, found one new signal-capable anchor-lifecycle `WRONG / High`, no new
-  `SMELL`, and returned `REVISE`. The fifth remediation is deterministic-green pending exact-head closure; its
+  `SMELL`, and returned `REVISE`. Exact fifth-remediation head `b511d6c` received Sol/xhigh implementation
+  `APPROVE` with no new finding, then the single Fable/xhigh release/compatibility lens returned `APPROVE` with no
+  `WRONG` and three nonblocking Minor `SMELL`s. Its
   candidate release binary is 26,574,640 bytes at SHA-256
   `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. Its focused restart plan is
   [`2026-07-19-r3d1-supervisor-signal-parity.md`](2026-07-19-r3d1-supervisor-signal-parity.md).
@@ -2434,7 +2436,10 @@ unknown sidecar version fails schedule-specific consumption without making the u
    accounting classes, legacy executable/process detection and conservative import, and automated zero-effect
    preflights. Immediately before admission, re-resolve the trusted owner root and requested cwd as real
    filesystem objects and fail closed unless the cwd remains contained; an R3d0 offline/static validation is
-   never sufficient for that action-time check.
+   never sufficient for that action-time check. Before wiring R3d1 to a production control implementation, make
+   Darwin zero/error group enumeration errno-aware for absence proof, own cancellation before `Running`, supply an
+   exact-runner-exit primitive, preserve whichever SIGINT/SIGTERM registration succeeds if the other fails, and
+   either exclude `.` from externally derived supervisor record ids or give each record a private journal directory.
 4. **R3d3 — evidence, status, and retention.** Add hot/cold stores, index, sealing, pins, tombstones, quotas,
    leases, bundle/image GC, local CLI/status/notifications, strict schedule-sidecar plus unchanged-aggregate
    compatibility, crash-consistent publication-outbox journal storage, explicit owner-iCloud upload/offload
@@ -2820,9 +2825,17 @@ mechanisms remain closed, found one new `WRONG / High`, no new `SMELL`, and retu
 `3472273ff438cb58b1ceb8eeba69bc3ed6ee0dbd2fb5faaddaf471292489c634`. The fifth remediation requires retained
 anchors through every signal-capable phase, permits release or ambiguity only in the corresponding no-later-signal
 phase, and rejects a non-retained `start_running`. The schema, start, and transition tests all failed on `b55c17d`
-before the fix. Run the required exact-head Sol/xhigh closure review; use the
-single design-approved Fable/xhigh implementation/release lens only after Sol approval. Preserve R3c/R4 inputs,
-keep R2f operator lifecycle work out of R3d, and never touch the long-lived operator lifecycle from this slice.
+before the fix. Exact fifth-remediation head `b511d6ce490590e54aae87dccad57e99fbe59a5a` received Sol/xhigh
+`R3D1 IMPLEMENTATION: APPROVE` with no new finding; its retained report is
+`/private/tmp/a2a-bridge-r3d1-sol-closure-b511d6c/review.md`, 5,023 bytes, SHA-256
+`1bf7bf1873c224b0da0067e53a440295c02be7ec677f82553525e5d808840b6d`. The single Fable/xhigh adversarial
+implementation and release/compatibility lens then found no `WRONG`, three nonblocking Minor `SMELL`s, and returned
+`R3D1 RELEASE/COMPATIBILITY: APPROVE`; its retained report is
+`/private/tmp/a2a-bridge-r3d1-fable-lens-review/review.md`, 7,837 bytes, SHA-256
+`088676af7e11beb4d33f1c4410dcf5bfc4a0e55dc1eaa689288934a04de01bed`. No post-approval mechanism change
+occurred; this fold only records review evidence and carries the three integration-hardening smells into R3d2.
+Run exact-final deterministic gates and publish a non-draft R3d1 PR. Preserve R3c/R4 inputs, keep R2f operator
+lifecycle work out of R3d, and never touch the long-lived operator lifecycle from this slice.
 
 ## R3e — OpenRouter provider expansion
 

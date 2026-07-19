@@ -6,7 +6,7 @@
 - **Completed through:** R3d0 **MERGED** at `c2d147fb`; R2e remains deferred and off the critical path
 - **Active slice:** R3d1 supervisor and signal parity on `agent/reliability-r3d1-supervisor`, based directly on
   `c2d147fb`; it is non-billable and uses local fake child processes only
-- **Current R3d1 implementation gate:** **IN REVIEW**. Initial exact candidate `01438c34` received a fresh
+- **Current R3d1 implementation gate:** **APPROVED FOR PR**. Initial exact candidate `01438c34` received a fresh
   bridge-mediated Sol/xhigh/read-only review: eight `WRONG`, two `SMELL`, and
   `R3D1 IMPLEMENTATION: REVISE`. The remediation enforces deadline-first phase-local caps with complete later-phase
   reservation; keeps cleanup signal authority in the retained child handle; revalidates exact ancestry/topology;
@@ -38,9 +38,10 @@
   **2,279/0/12 ignored** across **56** test binaries. Format/diff, workspace check, warnings-denied Clippy, locked
   release, dependency policy, hygiene **37/7**, manifest **9**, recipes **4**, and foundation **6/4** are green. The
   candidate release binary is **26,574,640 bytes**, SHA-256
-  `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. An exact-head Sol closure remains before
-  the design-approved single Fable/xhigh lens. No live compatibility gate or production-operator lifecycle action
-  occurred.
+  `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. Exact fifth-remediation head `b511d6c`
+  then received Sol/xhigh `R3D1 IMPLEMENTATION: APPROVE` with no new finding and the single Fable/xhigh lens returned
+  `R3D1 RELEASE/COMPATIBILITY: APPROVE` with no `WRONG` and three nonblocking Minor `SMELL`s. The post-review fold is
+  docs-only; no mechanism changed. No live compatibility gate or production-operator lifecycle action occurred.
 - **Current R3d design gate:** **APPROVED / MERGED** by PR #37. The initial Fable/xhigh clean-room review
   of exact merged base `98339842`
   returned six `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. After D1-D10 owner approval, a
@@ -413,12 +414,10 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** from the committed fifth-remediation head, run one fresh bridge-mediated Sol/xhigh closure review
-  of the phase-constrained anchor lifecycle fix and its three red-before-green regressions while confirming all prior
-  residuals remain closed. Run the one design-approved Fable/xhigh
-  implementation/release lens only after Sol approval. Publish a non-draft R3d1 PR only when both review gates and
-  deterministic gates are green. No live compatibility gate is authorized; R3d1 must not perform any production-
-  operator lifecycle action. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
+- **Next action:** run the exact-final deterministic gates on the docs-only review fold, publish a non-draft R3d1 PR,
+  and wait for its required checks. Both exact-code review gates are approved; do not spend another Fable turn or
+  change the approved mechanism before publication. No live compatibility gate is authorized; R3d1 must not perform
+  any production-operator lifecycle action. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**
@@ -471,7 +470,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (three incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`; R3d0 **MERGED** by PR #38 at `c2d147fb`. R3d1 is **IN REVIEW** on `agent/reliability-r3d1-supervisor`: initial exact `01438c34` Sol/xhigh review returned eight `WRONG`, two `SMELL`, and `REVISE`; exact `e81ebbb` closure marked nine items `FIXED`, topology/cursor `PARTIAL`, no new findings, and `REVISE`; exact `8feda4d` closure marked all four requested residuals `FIXED`, found one new post-anchor-retention `WRONG / High`, no new `SMELL`, and returned `REVISE`; exact `7fafe79` closure marked that item `FIXED`, confirmed prior residuals closed, found two new `WRONG` (`High` and `Minor`), no new `SMELL`, and returned `REVISE`; exact `b55c17d` closure marked both inherited retained-capability findings `FIXED`, found one new signal-capable anchor-lifecycle `WRONG / High`, no new `SMELL`, and returned `REVISE`. The fifth remediation requires retained anchors through every signal-capable phase and permits release or ambiguity only in the corresponding no-later-signal phase. Focused gates are **6/0**, **1/0**, **31/0**, **33/0**, **4/0**, **21/0**, and **2/0**; full serial workspace is **2,279/0/12 ignored** across **56** binaries, and all complete deterministic release/validator gates are green. Candidate release SHA-256 is `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. No live compatibility gate or production-operator lifecycle action occurred. | [R3d1 implementation plan](superpowers/plans/2026-07-19-r3d1-supervisor-signal-parity.md) | Run exact-head Sol/xhigh closure, then the single Fable/xhigh lens only after Sol approval; publish a non-draft PR only when green. R3d never touches the long-lived operator lifecycle. |
+| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`; R3d0 **MERGED** by PR #38 at `c2d147fb`. R3d1 is **APPROVED FOR PR** on `agent/reliability-r3d1-supervisor`: initial exact `01438c34` Sol/xhigh review returned eight `WRONG`, two `SMELL`, and `REVISE`; exact `e81ebbb`, `8feda4d`, `7fafe79`, and `b55c17d` closures drove four remediations; exact fifth-remediation head `b511d6c` received Sol/xhigh implementation `APPROVE` with no new finding, then the single Fable/xhigh release/compatibility lens returned `APPROVE` with no `WRONG` and three nonblocking Minor `SMELL`s. The approved mechanism requires retained anchors through every signal-capable phase and permits release or ambiguity only in the corresponding no-later-signal phase. Focused gates are **6/0**, **1/0**, **31/0**, **33/0**, **4/0**, **21/0**, and **2/0**; full serial workspace is **2,279/0/12 ignored** across **56** binaries, and all complete deterministic release/validator gates are green. Candidate release SHA-256 is `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. No live compatibility gate or production-operator lifecycle action occurred. | [R3d1 implementation plan](superpowers/plans/2026-07-19-r3d1-supervisor-signal-parity.md) | Rerun exact-final deterministic gates on the docs-only evidence fold and publish a non-draft PR. R3d never touches the long-lived operator lifecycle. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -875,7 +874,18 @@ Next action:
   allowed a released or ambiguous anchor in a signal-capable phase. The fifth remediation requires `RetainedLive`
   anchors in `Prepared`, `Running`, `TermGrace`, and `KillJournaled`; release only on entry to `Reaping`, or ambiguity
   only on entry to `SafetyHold`, after later signals are forbidden; and a retained capability at `start_running`.
-  Its schema, start, and transition tests all failed on `b55c17d` before the fix. Current
+  Its schema, start, and transition tests all failed on `b55c17d` before the fix. Exact fifth-remediation head
+  `b511d6ce490590e54aae87dccad57e99fbe59a5a` then received Sol/xhigh implementation `APPROVE`: the inherited
+  finding was `FIXED`, all earlier mechanisms remained closed, and there was no new `WRONG` or `SMELL`. The retained
+  report is `/private/tmp/a2a-bridge-r3d1-sol-closure-b511d6c/review.md`, mode `0644`, 5,023 bytes, SHA-256
+  `1bf7bf1873c224b0da0067e53a440295c02be7ec677f82553525e5d808840b6d`. The single design-approved Fable/xhigh
+  adversarial implementation and release/compatibility lens on the same head found no `WRONG`, three nonblocking
+  Minor `SMELL`s, and returned `APPROVE`. Its retained report is
+  `/private/tmp/a2a-bridge-r3d1-fable-lens-review/review.md`, mode `0644`, 7,837 bytes, SHA-256
+  `088676af7e11beb4d33f1c4410dcf5bfc4a0e55dc1eaa689288934a04de01bed`. The smells are carried to R3d2 before
+  production integration: errno-aware Darwin zero/error enumeration, independent viable shutdown-signal
+  registration, and collision-free externally derived record-id storage; R3d2 also owns pre-`Running` cancellation
+  and exact-runner-exit control. No post-approval mechanism change occurred. Current
   focused gates are **6/0**, **1/0**, **31/0**, **33/0**, **4/0**,
   **21/0**, and **2/0**;
   full serial workspace is **2,279/0/12 ignored** across **56** binaries. Real OS-delivered SIGINT/SIGTERM

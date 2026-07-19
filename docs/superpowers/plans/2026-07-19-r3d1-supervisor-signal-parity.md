@@ -1,7 +1,7 @@
 # R3d1 — supervisor and signal-parity implementation plan
 
-- **Status:** IN REVIEW — initial plus first, second, third, and fourth closure Sol/xhigh reviews `REVISE`; fifth
-  remediation implemented; exact-head closure review pending
+- **Status:** APPROVED FOR PR — exact fifth-remediation head `b511d6c` received Sol/xhigh implementation
+  `APPROVE` and the single Fable/xhigh release/compatibility `APPROVE`; this post-review fold changes docs only
 - **Branch:** `agent/reliability-r3d1-supervisor`
 - **Base:** `origin/main` at `c2d147fb1f0df275f3c6452cdd212e185c002d08`
   (PR #38 merged R3d0)
@@ -248,6 +248,25 @@ Required tests:
   ambiguous, so a later allowed signal had no retained capability. The fifth remediation makes the schema and
   runtime transition enforce the phase-constrained lifecycle above and makes `start_running` reject a non-retained
   capability. The schema, `start_running`, and transition-layer regressions all failed on `b55c17d` before the fix.
+- Exact fifth-remediation closure review of `b511d6ce490590e54aae87dccad57e99fbe59a5a` marked the inherited
+  lifecycle finding `FIXED`, confirmed all earlier mechanisms remain closed, found no new `WRONG` or `SMELL`, and
+  returned `R3D1 IMPLEMENTATION: APPROVE`. Its retained report is
+  `/private/tmp/a2a-bridge-r3d1-sol-closure-b511d6c/review.md`, mode `0644`, 5,023 bytes, SHA-256
+  `1bf7bf1873c224b0da0067e53a440295c02be7ec677f82553525e5d808840b6d`. It accepted the supplied exact-head
+  gates and ran no test, build, validator, or functional probe.
+- The design-approved single Fable/xhigh adversarial implementation and release/compatibility lens independently
+  reviewed the same exact `b511d6c` head, found no `WRONG`, reported three nonblocking `SMELL / Minor` items, and
+  returned `R3D1 RELEASE/COMPATIBILITY: APPROVE`. Its retained report is
+  `/private/tmp/a2a-bridge-r3d1-fable-lens-review/review.md`, mode `0644`, 7,837 bytes, SHA-256
+  `088676af7e11beb4d33f1c4410dcf5bfc4a0e55dc1eaa689288934a04de01bed`. It accepted the supplied gates and ran
+  only git/report-identity inspection plus a deleted `/private/tmp` Darwin `proc_listpgrppids` semantics probe; no
+  checkout, provider-compatibility, credential, container, GitHub, or operator effect occurred. The three smells are
+  explicitly deferred to R3d2 integration rather than changing the approved R3d1 mechanism: make Darwin zero/error
+  group enumeration errno-aware before using it as a production absence proof; preserve any successfully registered
+  shutdown-signal path if the other registration fails; and exclude `.` from externally derived record ids or give
+  each record a private journal directory. R3d2 must also own cancellation before `Running` and supply an exact
+  runner-exit primitive when it wires the production control implementation. These are fail-closed or bounded integration
+  hardening items with no demonstrated R3d1 incorrect behavior.
 - Current focused gates: process-group **6/0**, resolver compatibility **1/0**, schedule-schema **31/0**,
   supervisor **33/0**, cancellation **4/0**, compatibility CLI **21/0**, and R3d1 CLI **2/0**. The complete binary
   suite is **543/0/0**; the full serial workspace is **2,279 passed / 0 failed / 12 ignored** across **56** test
@@ -271,7 +290,8 @@ Continue in `/private/tmp/a2a-bridge-r3d1-supervisor` on branch
 central reliability roadmap. Freeze `HEAD`, `origin/main`, merge base, cleanliness, and changed paths before
 review or publication. The initial candidate at exact `01438c34` has already received the Sol/xhigh `REVISE`
 recorded above; first closure head `e81ebbb`, second closure head `8feda4d`, third closure head `7fafe79`, and fourth
-closure head `b55c17d` each received `REVISE`. The fifth remediation is committed in the frozen review head. The next
-action is an exact-head Sol/xhigh closure of the phase-constrained anchor lifecycle fix and its three
-red-before-green regressions while confirming every prior mechanism remains closed. Run the single design-approved Fable/xhigh
-implementation/release lens only after Sol approval. Never touch the long-lived operator lifecycle during R3d1.
+closure head `b55c17d` each received `REVISE`. Exact fifth-remediation head `b511d6c` received Sol/xhigh
+implementation `APPROVE`, then the single Fable/xhigh release/compatibility lens returned `APPROVE`; no later
+mechanism change occurred. This commit folds only those review records, verdicts, and deferred-integration notes.
+Run the exact-final deterministic gates, publish a non-draft R3d1 PR, and never touch the long-lived operator
+lifecycle during R3d1.
