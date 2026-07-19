@@ -210,8 +210,12 @@ impl AuthorizedEffectEnvelopeV1 {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum AuthorityCommitActionV1 {
     Standing,
-    OneShot { entry_id: String },
-    Manual { admission: SealedManualAdmissionV1 },
+    OneShot {
+        entry_id: String,
+    },
+    Manual {
+        admission: Box<SealedManualAdmissionV1>,
+    },
 }
 
 impl AuthorityCommitActionV1 {
@@ -287,9 +291,9 @@ impl AuthorityCommitActionV1 {
 pub(super) enum AdmissionDispositionV1 {
     Reserved {
         equivalent_work: EquivalentWorkReservationV1,
-        ledger: LedgerReservationV1,
+        ledger: Box<LedgerReservationV1>,
         ledger_sha256: String,
-        supervisor: SupervisorRecordV1,
+        supervisor: Box<SupervisorRecordV1>,
         supervisor_sha256: String,
     },
     Reused {
@@ -355,7 +359,7 @@ pub(super) enum AdmissionTerminalDispositionV1 {
         evidence_sha256: String,
     },
     ValidTerminal {
-        evidence: CompletedEquivalentEvidenceV1,
+        evidence: Box<CompletedEquivalentEvidenceV1>,
         usage: UsageChargeV1,
         prompt_was_accepted: bool,
     },
@@ -508,7 +512,7 @@ fn validate_terminal_against_state(
             }
             expected
                 .equivalent_work
-                .record_completed(evidence.clone())?;
+                .record_completed(evidence.as_ref().clone())?;
         }
         AdmissionTerminalDispositionV1::Conservative {
             evidence_sha256, ..
@@ -977,7 +981,7 @@ fn rederive_manual_source_against_state(
         source_sha256: manual.record.input_source_sha256.clone(),
         context,
         authority_action: AuthorityCommitActionV1::Manual {
-            admission: manual.clone(),
+            admission: Box::new(manual.clone()),
         },
         effect_envelope,
         budget_authority: LedgerBudgetAuthorityV1::ManualUnallocated {
@@ -1205,8 +1209,8 @@ pub(super) fn build_admission_commit(
                 equivalent_work,
                 ledger_sha256: prepared_reservation_sha256(&ledger)?,
                 supervisor_sha256: supervisor_record_sha256(&supervisor)?,
-                ledger,
-                supervisor,
+                ledger: Box::new(ledger),
+                supervisor: Box::new(supervisor),
             }
         }
         (EquivalentWorkDecisionV1::Reused(consumption), None, None) => {
@@ -1276,7 +1280,7 @@ pub(super) fn build_admission_commit(
         }
         AuthorityCommitActionV1::Manual { admission } => {
             authority_state_after.consume_manual_admission(
-                admission.clone(),
+                admission.as_ref().clone(),
                 &commit.commit_identity_sha256,
                 commit.recorded_at_ms,
             )?;
@@ -1336,8 +1340,8 @@ where
         } => {
             let mut opened_ledger = FileCompatibilityLedger::open(capability)?;
             let (_outcome, published) =
-                opened_ledger.commit_prepared_reservation(ledger.clone())?;
-            if &published != ledger {
+                opened_ledger.commit_prepared_reservation(ledger.as_ref().clone())?;
+            if &published != ledger.as_ref() {
                 return Err("schedule transaction: published ledger reservation diverged".into());
             }
             let supervisor_directory = capability.supervisor_directory().canonical_path();
@@ -1469,7 +1473,9 @@ fn build_admission_terminal(
             ))?;
         }
         AdmissionTerminalDispositionV1::ValidTerminal { evidence, .. } => {
-            after.equivalent_work.record_completed(evidence.clone())?;
+            after
+                .equivalent_work
+                .record_completed(evidence.as_ref().clone())?;
         }
         AdmissionTerminalDispositionV1::Conservative { .. } => {}
     }
@@ -1581,8 +1587,8 @@ impl AdmittedRunCapabilityV1 {
 }
 
 pub(super) enum PublishedAdmissionV1 {
-    Admitted(AdmittedRunCapabilityV1),
-    Reused(ConsumptionRecordV1),
+    Admitted(Box<AdmittedRunCapabilityV1>),
+    Reused(Box<ConsumptionRecordV1>),
 }
 
 /// The caller must derive and reselect the source, authority, and budget policy while retaining the
@@ -1610,18 +1616,20 @@ where
     }
     match (&commit.disposition, published_supervisor) {
         (AdmissionDispositionV1::Reserved { supervisor, .. }, Some(latest_supervisor))
-            if &latest_supervisor == supervisor =>
+            if &latest_supervisor == supervisor.as_ref() =>
         {
-            Ok(PublishedAdmissionV1::Admitted(AdmittedRunCapabilityV1 {
-                commit_identity_sha256: commit.commit_identity_sha256,
-                context: commit.context,
-                effect_envelope: commit.effect_envelope,
-                supervisor_record_id: supervisor.supervisor_record_id.clone(),
-                action_directories,
-            }))
+            Ok(PublishedAdmissionV1::Admitted(Box::new(
+                AdmittedRunCapabilityV1 {
+                    commit_identity_sha256: commit.commit_identity_sha256,
+                    context: commit.context,
+                    effect_envelope: commit.effect_envelope,
+                    supervisor_record_id: supervisor.supervisor_record_id.clone(),
+                    action_directories,
+                },
+            )))
         }
         (AdmissionDispositionV1::Reused { consumption }, None) => {
-            Ok(PublishedAdmissionV1::Reused(consumption.clone()))
+            Ok(PublishedAdmissionV1::Reused(Box::new(consumption.clone())))
         }
         _ => Err("schedule transaction: publication did not stop at the expected phase".into()),
     }
@@ -2483,7 +2491,9 @@ mod tests {
                 allowed_effects: manual.record.allowed_effects.clone(),
                 caps: manual.record.caps.clone(),
             },
-            authority_action: AuthorityCommitActionV1::Manual { admission: manual },
+            authority_action: AuthorityCommitActionV1::Manual {
+                admission: Box::new(manual),
+            },
             ledger: Some(reservation),
             supervisor: Some(supervisor),
             initial_preflight,
@@ -3336,7 +3346,7 @@ mod tests {
         assert!(reconcile_pending_admission(
             &locks,
             AdmissionTerminalDispositionV1::ValidTerminal {
-                evidence: mismatched,
+                evidence: Box::new(mismatched),
                 usage: valid_usage.clone(),
                 prompt_was_accepted: true,
             },
@@ -3353,7 +3363,7 @@ mod tests {
         assert!(reconcile_pending_admission(
             &locks,
             AdmissionTerminalDispositionV1::ValidTerminal {
-                evidence: evidence.clone(),
+                evidence: Box::new(evidence.clone()),
                 usage: zero_attempts,
                 prompt_was_accepted: true,
             },
@@ -3370,7 +3380,7 @@ mod tests {
         assert!(reconcile_pending_admission(
             &locks,
             AdmissionTerminalDispositionV1::ValidTerminal {
-                evidence: evidence.clone(),
+                evidence: Box::new(evidence.clone()),
                 usage: over_cap,
                 prompt_was_accepted: true,
             },
@@ -3385,7 +3395,7 @@ mod tests {
         reconcile_pending_admission(
             &locks,
             AdmissionTerminalDispositionV1::ValidTerminal {
-                evidence,
+                evidence: Box::new(evidence),
                 usage: valid_usage,
                 prompt_was_accepted: true,
             },
@@ -3556,7 +3566,7 @@ mod tests {
             panic!("manual fixture must create a new admission");
         };
         let mut runner = CountingRunner { handoffs: 0 };
-        let commit_identity = handoff_admitted(capability, &mut runner).unwrap();
+        let commit_identity = handoff_admitted(*capability, &mut runner).unwrap();
         assert!(local_file::valid_sha256(&commit_identity));
         assert_eq!(runner.handoffs, 1);
         drop(locks);
