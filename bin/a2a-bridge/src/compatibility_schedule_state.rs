@@ -19,7 +19,17 @@ const STATE_DIRECTORY_MODE: u32 = 0o700;
 const STATE_FILE_MODE: u32 = 0o600;
 const MAX_LOCK_HOLDER_BYTES: usize = 512;
 const MAX_PASSWD_BUFFER_BYTES: usize = 1024 * 1024;
-const STATE_SUBDIRECTORIES: [&str; 5] = ["authority", "admission", "ledger", "supervisor", "locks"];
+const STATE_SUBDIRECTORIES: [&str; 9] = [
+    "authority",
+    "admission",
+    "ledger",
+    "supervisor",
+    "evidence-index",
+    "publication-outbox",
+    "status",
+    "migration",
+    "locks",
+];
 const PRODUCTION_STATE_COMPONENTS: [&str; 5] = [
     "Library",
     "Application Support",
@@ -67,6 +77,10 @@ struct StateRootInner {
     admission: PinnedDirectory,
     ledger: PinnedDirectory,
     supervisor: PinnedDirectory,
+    evidence_index: PinnedDirectory,
+    publication_outbox: PinnedDirectory,
+    status: PinnedDirectory,
+    migration: PinnedDirectory,
     locks: PinnedDirectory,
     process_lock_state: Mutex<ProcessLockState>,
 }
@@ -109,6 +123,16 @@ pub(super) trait AdmissionStateCapability {
     fn admission_directory(&self) -> &PinnedDirectory;
     fn ledger_directory(&self) -> &PinnedDirectory;
     fn supervisor_directory(&self) -> &PinnedDirectory;
+}
+
+/// Capability for R3d3 evidence/index/status state. Only the owner-wide admission guards implement
+/// it, so retention, deletion, migration, and local publication cannot run outside the same
+/// cross-process owner lock used by admission.
+pub(super) trait EvidenceStateCapability {
+    fn evidence_index_directory(&self) -> &PinnedDirectory;
+    fn publication_outbox_directory(&self) -> &PinnedDirectory;
+    fn status_directory(&self) -> &PinnedDirectory;
+    fn migration_directory(&self) -> &PinnedDirectory;
 }
 
 fn invalid(error: impl std::fmt::Display) -> SchedulerStateError {
@@ -498,7 +522,17 @@ impl SchedulerStateRoot {
         for name in STATE_SUBDIRECTORIES {
             children.push(open_or_create_private_child(&root, name)?);
         }
-        let [authority, admission, ledger, supervisor, locks]: [PinnedDirectory; 5] =
+        let [
+            authority,
+            admission,
+            ledger,
+            supervisor,
+            evidence_index,
+            publication_outbox,
+            status,
+            migration,
+            locks,
+        ]: [PinnedDirectory; 9] =
             children.try_into().map_err(|_| {
                 SchedulerStateError::Invalid("scheduler state layout is incomplete".into())
             })?;
@@ -509,6 +543,10 @@ impl SchedulerStateRoot {
                 admission,
                 ledger,
                 supervisor,
+                evidence_index,
+                publication_outbox,
+                status,
+                migration,
                 locks,
                 process_lock_state: Mutex::new(ProcessLockState::default()),
             }),
@@ -622,13 +660,17 @@ impl SchedulerStateRoot {
     }
 
     #[cfg(test)]
-    fn directory_paths(&self) -> [std::path::PathBuf; 6] {
+    fn directory_paths(&self) -> [std::path::PathBuf; 10] {
         [
             self.inner.root.canonical_path(),
             self.inner.authority.canonical_path(),
             self.inner.admission.canonical_path(),
             self.inner.ledger.canonical_path(),
             self.inner.supervisor.canonical_path(),
+            self.inner.evidence_index.canonical_path(),
+            self.inner.publication_outbox.canonical_path(),
+            self.inner.status.canonical_path(),
+            self.inner.migration.canonical_path(),
             self.inner.locks.canonical_path(),
         ]
     }
@@ -691,6 +733,24 @@ impl AdmissionStateCapability for OwnerAdmissionLock {
     }
 }
 
+impl EvidenceStateCapability for OwnerAdmissionLock {
+    fn evidence_index_directory(&self) -> &PinnedDirectory {
+        &self.inner.evidence_index
+    }
+
+    fn publication_outbox_directory(&self) -> &PinnedDirectory {
+        &self.inner.publication_outbox
+    }
+
+    fn status_directory(&self) -> &PinnedDirectory {
+        &self.inner.status
+    }
+
+    fn migration_directory(&self) -> &PinnedDirectory {
+        &self.inner.migration
+    }
+}
+
 impl Drop for OwnerAdmissionLock {
     fn drop(&mut self) {
         // SAFETY: this guard uniquely owns both locked descriptors. Release the nested authority
@@ -734,6 +794,24 @@ impl AdmissionStateCapability for AdmissionAuthorityLocks {
 
     fn supervisor_directory(&self) -> &PinnedDirectory {
         &self._owner.inner.supervisor
+    }
+}
+
+impl EvidenceStateCapability for AdmissionAuthorityLocks {
+    fn evidence_index_directory(&self) -> &PinnedDirectory {
+        &self._owner.inner.evidence_index
+    }
+
+    fn publication_outbox_directory(&self) -> &PinnedDirectory {
+        &self._owner.inner.publication_outbox
+    }
+
+    fn status_directory(&self) -> &PinnedDirectory {
+        &self._owner.inner.status
+    }
+
+    fn migration_directory(&self) -> &PinnedDirectory {
+        &self._owner.inner.migration
     }
 }
 

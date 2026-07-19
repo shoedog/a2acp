@@ -3651,7 +3651,7 @@ fn portable_path_component(label: &str, value: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
-fn portable_evidence_path_key(value: &RelativeEvidencePathV1) -> String {
+pub(super) fn portable_evidence_path_key(value: &RelativeEvidencePathV1) -> String {
     value
         .components
         .iter()
@@ -3660,7 +3660,10 @@ fn portable_evidence_path_key(value: &RelativeEvidencePathV1) -> String {
         .join("/")
 }
 
-fn relative_evidence_path(label: &str, value: &RelativeEvidencePathV1) -> Result<(), BoxError> {
+pub(super) fn relative_evidence_path(
+    label: &str,
+    value: &RelativeEvidencePathV1,
+) -> Result<(), BoxError> {
     if value.components.is_empty() || value.components.len() > 64 {
         return Err(format!(
             "schedule schema: {label} must contain 1..=64 relative path components"
