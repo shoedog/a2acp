@@ -423,6 +423,7 @@ pub(super) struct FoundationProfileBindingV1 {
     pub(super) source: ProfileSourceRefV1,
     pub(super) characterization_profile: FingerprintV1,
     pub(super) provider_family: String,
+    pub(super) evidence_purpose: EvidencePurposeV1,
     pub(super) requested_identity: EffectiveIdentityV1,
     pub(super) expected_effective_identity: EffectiveIdentityV1,
     pub(super) maximum_caps: EffectCapsV1,
@@ -460,6 +461,7 @@ fn foundation_profile_binding(
             sha256: profile_sha256,
         },
         provider_family: profile.provider_family.clone(),
+        evidence_purpose: profile.evidence_purpose,
         requested_identity: EffectiveIdentityV1 {
             model: profile.requested_model.clone(),
             effort: optional_identity_text(&profile.requested_effort),
@@ -2641,6 +2643,223 @@ mod tests {
         let profile = canonical_hash("scheduled characterization profile", &value).unwrap();
         let bundle = canonical_hash("profile policy bundle", &value).unwrap();
         assert_ne!(profile, bundle);
+    }
+
+    #[test]
+    fn every_canonical_profile_field_changes_recharacterization_identity() {
+        let sha = |ch: char| ch.to_string().repeat(64);
+        let profile = CanonicalProfileInputV1 {
+            schema_version: 1,
+            source_kind: ProfileSourceKindV1::ScheduledAdvisory,
+            source_id: "case-1".into(),
+            repository: "shoedog/a2acp".into(),
+            source_schema_version: 1,
+            lane: "floating-current".into(),
+            classification: "canary".into(),
+            evidence_purpose: EvidencePurposeV1::ProviderPathAdvisory,
+            evidence_path: "host".into(),
+            probe: "health".into(),
+            expected_status: ExpectedStatusV1::Pass,
+            execution_mode: "host".into(),
+            provider_family: "openai-codex".into(),
+            agent: "codex-host".into(),
+            capability: "provider-path".into(),
+            adapter_family: "codex-acp".into(),
+            agent_cli_family: "codex".into(),
+            image_family: Some("node-acp-reader-v1".into()),
+            auth_path: "pre_authenticated".into(),
+            credential_env_name: Some("OPENAI_API_KEY".into()),
+            required_env: vec![RequiredEnvironmentV1 {
+                name: "PATH".into(),
+                one_of: vec!["/opt/homebrew/bin".into()],
+            }],
+            environment_owner: "wesleyjinks".into(),
+            os: "macos".into(),
+            architecture: "aarch64".into(),
+            session_cwd: "/Users/wesleyjinks/code/a2a-bridge".into(),
+            requested_model: "gpt-5.6-luna".into(),
+            requested_effort: Some("low".into()),
+            requested_mode: None,
+            expected_effective_model: "gpt-5.6-luna".into(),
+            expected_effective_effort: Some("low".into()),
+            expected_effective_mode: None,
+            config_template: "codex-host-read-only-v1".into(),
+            config_template_sha256: sha('1'),
+            exact_config_sha256: sha('2'),
+            resolution_constraint_sha256: Some(sha('3')),
+            allowed_effects: vec![EffectClassV1::ProviderPrompt],
+            fixed_prompt_contract: "compatibility-smoke-v1".into(),
+            artifact_template: "compatibility-evidence-v1".into(),
+            artifact_retention_days: 180,
+            artifact_redaction: "strict".into(),
+            maximum_caps: EffectCapsV1 {
+                timeout_secs: 60,
+                max_tokens: 1000,
+                max_cost_microusd: 1000,
+                attempts: 1,
+                retry_cap: 0,
+                fallback_cap: 0,
+            },
+        };
+        let base = canonical_hash("scheduled characterization profile", &profile).unwrap();
+        macro_rules! changes_profile {
+            ($name:literal, |$value:ident| $body:block) => {{
+                let mut $value = profile.clone();
+                $body
+                assert_ne!(
+                    canonical_hash("scheduled characterization profile", &$value).unwrap(),
+                    base,
+                    "{}",
+                    $name
+                );
+            }};
+        }
+        changes_profile!("schema_version", |value| {
+            value.schema_version = 2;
+        });
+        changes_profile!("source_kind", |value| {
+            value.source_kind = ProfileSourceKindV1::ClaimedSupportGate;
+        });
+        changes_profile!("source_id", |value| {
+            value.source_id = "case-2".into();
+        });
+        changes_profile!("repository", |value| {
+            value.repository = "shoedog/other".into();
+        });
+        changes_profile!("source_schema_version", |value| {
+            value.source_schema_version = 2;
+        });
+        changes_profile!("lane", |value| {
+            value.lane = "support".into();
+        });
+        changes_profile!("classification", |value| {
+            value.classification = "support".into();
+        });
+        changes_profile!("evidence_purpose", |value| {
+            value.evidence_purpose = EvidencePurposeV1::ClaimedSupportGate;
+        });
+        changes_profile!("evidence_path", |value| {
+            value.evidence_path = "reader".into();
+        });
+        changes_profile!("probe", |value| {
+            value.probe = "catalog".into();
+        });
+        changes_profile!("expected_status", |value| {
+            value.expected_status = ExpectedStatusV1::Fail;
+        });
+        changes_profile!("execution_mode", |value| {
+            value.execution_mode = "container_ro".into();
+        });
+        changes_profile!("provider_family", |value| {
+            value.provider_family = "anthropic-claude".into();
+        });
+        changes_profile!("agent", |value| {
+            value.agent = "codex-reader".into();
+        });
+        changes_profile!("capability", |value| {
+            value.capability = "claimed-support".into();
+        });
+        changes_profile!("adapter_family", |value| {
+            value.adapter_family = "claude-agent-acp".into();
+        });
+        changes_profile!("agent_cli_family", |value| {
+            value.agent_cli_family = "claude".into();
+        });
+        changes_profile!("image_family", |value| {
+            value.image_family = None;
+        });
+        changes_profile!("auth_path", |value| {
+            value.auth_path = "automatic".into();
+        });
+        changes_profile!("credential_env_name", |value| {
+            value.credential_env_name = None;
+        });
+        changes_profile!("required_env_name", |value| {
+            value.required_env[0].name = "HOME".into();
+        });
+        changes_profile!("required_env_constraint", |value| {
+            value.required_env[0].one_of[0] = "/usr/bin".into();
+        });
+        changes_profile!("environment_owner", |value| {
+            value.environment_owner = "other".into();
+        });
+        changes_profile!("os", |value| {
+            value.os = "linux".into();
+        });
+        changes_profile!("architecture", |value| {
+            value.architecture = "x86_64".into();
+        });
+        changes_profile!("session_cwd", |value| {
+            value.session_cwd = "/Users/wesleyjinks/code/stockTrading".into();
+        });
+        changes_profile!("requested_model", |value| {
+            value.requested_model = "gpt-5.6-sol".into();
+        });
+        changes_profile!("requested_effort", |value| {
+            value.requested_effort = Some("medium".into());
+        });
+        changes_profile!("requested_mode", |value| {
+            value.requested_mode = Some("plan".into());
+        });
+        changes_profile!("expected_effective_model", |value| {
+            value.expected_effective_model = "gpt-5.6-sol".into();
+        });
+        changes_profile!("expected_effective_effort", |value| {
+            value.expected_effective_effort = Some("medium".into());
+        });
+        changes_profile!("expected_effective_mode", |value| {
+            value.expected_effective_mode = Some("plan".into());
+        });
+        changes_profile!("config_template", |value| {
+            value.config_template = "codex-reader-read-only-v1".into();
+        });
+        changes_profile!("config_template_sha256", |value| {
+            value.config_template_sha256 = sha('4');
+        });
+        changes_profile!("resolution_constraint_sha256", |value| {
+            value.resolution_constraint_sha256 = Some(sha('5'));
+        });
+        changes_profile!("allowed_effects", |value| {
+            value.allowed_effects = vec![EffectClassV1::RegistryRead];
+        });
+        changes_profile!("fixed_prompt_contract", |value| {
+            value.fixed_prompt_contract = "compatibility-smoke-v2".into();
+        });
+        changes_profile!("artifact_template", |value| {
+            value.artifact_template = "compatibility-evidence-v2".into();
+        });
+        changes_profile!("artifact_retention_days", |value| {
+            value.artifact_retention_days += 1;
+        });
+        changes_profile!("artifact_redaction", |value| {
+            value.artifact_redaction = "strict-v2".into();
+        });
+        changes_profile!("maximum_timeout", |value| {
+            value.maximum_caps.timeout_secs += 1;
+        });
+        changes_profile!("maximum_tokens", |value| {
+            value.maximum_caps.max_tokens += 1;
+        });
+        changes_profile!("maximum_cost", |value| {
+            value.maximum_caps.max_cost_microusd += 1;
+        });
+        changes_profile!("maximum_attempts", |value| {
+            value.maximum_caps.attempts += 1;
+        });
+        changes_profile!("maximum_retry", |value| {
+            value.maximum_caps.retry_cap += 1;
+        });
+        changes_profile!("maximum_fallback", |value| {
+            value.maximum_caps.fallback_cap += 1;
+        });
+
+        let mut execution_only = profile;
+        execution_only.exact_config_sha256 = sha('6');
+        assert_eq!(
+            canonical_hash("scheduled characterization profile", &execution_only).unwrap(),
+            base,
+            "exact config bytes are deliberately case-execution identity, not profile identity"
+        );
     }
 
     #[test]

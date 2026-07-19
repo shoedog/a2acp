@@ -1430,7 +1430,6 @@ fn canonical_input_sha256<T: Serialize>(label: &str, value: &T) -> Result<String
     Ok(local_file::sha256_hex(&domain_separated))
 }
 
-#[cfg(test)]
 pub(super) fn seal_case_execution_fingerprint(
     input: CaseExecutionFingerprintInputV1,
 ) -> Result<CaseExecutionFingerprintRecordV1, BoxError> {
@@ -1447,7 +1446,6 @@ pub(super) fn seal_case_execution_fingerprint(
     Ok(value)
 }
 
-#[cfg(test)]
 pub(super) fn seal_admission_attempt_fingerprint(
     input: AdmissionAttemptFingerprintInputV1,
 ) -> Result<AdmissionAttemptFingerprintRecordV1, BoxError> {
@@ -1532,7 +1530,7 @@ struct SafetyHoldOpeningIdentityV1<'a> {
     created_at_ms: i64,
 }
 
-fn safety_hold_opening_sha256(value: &SafetyHoldV1) -> Result<String, BoxError> {
+pub(super) fn safety_hold_opening_sha256(value: &SafetyHoldV1) -> Result<String, BoxError> {
     canonical_input_sha256(
         "safety-hold opening",
         &SafetyHoldOpeningIdentityV1 {
@@ -1554,6 +1552,26 @@ struct SafetyHoldClearanceIdentityV1<'a> {
     cleared_at_ms: i64,
     operator: &'a str,
     reason: &'a str,
+}
+
+pub(super) fn safety_hold_clearance_action_sha256(
+    opening_sha256: &str,
+    clearance_action_id: &str,
+    cleared_at_ms: i64,
+    operator: &str,
+    reason: &str,
+) -> Result<String, BoxError> {
+    canonical_input_sha256(
+        "safety-hold clearance action",
+        &SafetyHoldClearanceIdentityV1 {
+            schema_version: 1,
+            opening_sha256,
+            clearance_action_id,
+            cleared_at_ms,
+            operator,
+            reason,
+        },
+    )
 }
 
 #[derive(Serialize)]
@@ -2790,16 +2808,12 @@ impl ValidateRecord for SafetyHoldV1 {
                             .into(),
                     );
                 }
-                let expected_clearance = canonical_input_sha256(
-                    "safety-hold clearance action",
-                    &SafetyHoldClearanceIdentityV1 {
-                        schema_version: 1,
-                        opening_sha256,
-                        clearance_action_id,
-                        cleared_at_ms: *cleared_at_ms,
-                        operator,
-                        reason,
-                    },
+                let expected_clearance = safety_hold_clearance_action_sha256(
+                    opening_sha256,
+                    clearance_action_id,
+                    *cleared_at_ms,
+                    operator,
+                    reason,
                 )?;
                 if clearance_action_sha256 != &expected_clearance {
                     return Err(
@@ -3204,7 +3218,12 @@ impl ValidateRecord for ConsumptionRecordV1 {
                     && self.satisfied_purpose == EvidencePurposeV1::Characterization
             }
         };
-        if !purpose_allowed || self.requested_purpose == EvidencePurposeV1::Characterization {
+        if !purpose_allowed
+            || matches!(
+                self.requested_purpose,
+                EvidencePurposeV1::Characterization | EvidencePurposeV1::ManualDiagnostic
+            )
+        {
             return Err("schedule schema: evidence-purpose reuse is not equal-or-stronger".into());
         }
         Ok(())

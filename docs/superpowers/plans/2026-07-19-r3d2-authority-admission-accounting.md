@@ -1,7 +1,7 @@
 # R3d2 — authority, admission, preflights, and accounting implementation plan
 
-- **Status:** ACTIVE — R3d2a and R3d2b are implemented with focused/full deterministic gates green but not
-  independently reviewed; R3d2c is next
+- **Status:** ACTIVE — R3d2a through R3d2c are implemented with focused/full deterministic gates green but not
+  independently reviewed; R3d2d is next
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -311,6 +311,69 @@ Required tests and red proof:
 - immutable, first transient, second identical transient, recovered confirmation, repeated unknown, safety hold,
   quarantine, and budget-blocked outcomes take only their approved reducer path;
 - observed-effective mismatch retains the original identities and cannot become successful evidence.
+
+#### R3d2c checkpoint evidence — 2026-07-19
+
+Implemented mechanism:
+
+- The final fence validates the sealed scheduled, claimed-support, or direct-manual source, independently reloads
+  the checked-in foundation where applicable, and rederives the profile, trigger-independent case execution,
+  tagged-authority admission attempt, evidence-purpose/freshness equivalent-work key, and repeat-bound attempt
+  idempotency key. Trigger/request/window/attempt/repeat, Daily versus ScheduledMain, standing-grant rotation, and
+  standing versus manual authority change admission identity without changing exact execution/equivalent work.
+- Equivalent-work state is copy-validate-commit and validates both directions of every materialized index. One live
+  exact execution refuses rather than queues. Terminal equal/stronger evidence creates a new authority/trigger-bound
+  consumption; claimed-support and explicitly reviewed characterization may satisfy advisory work. First
+  characterization and generic manual diagnostic never reuse. A consumption must dereference exact completed
+  evidence, and malformed, identity-drifted, or unreviewed characterization evidence cannot become reusable.
+- Characterization history is append-only and self-hashed. A matched green or known-issue terminal record may be the
+  sole current characterization for its exact profile; inconclusive or observed-identity-mismatched records remain
+  immutable history without promotion, and ids/profiles cannot be rebound.
+- Safety-hold openings and explicit clearances, quarantine openings and explicit closures, and exact-execution
+  waste/confirmation state are independent immutable histories with complete reverse indexes. Holds never expire;
+  quarantine expiry remains blocked until explicit owner closure. Authority, budget, and quarantine blocks do not
+  enter waste state.
+- Typed immutable failure suppresses immediately. A first typed/untyped transient becomes `confirmation_due`; any
+  later attempt for that exact execution requires the one separately authorized next window, repeat nonce, same
+  evidence purpose/freshness/equivalent-work identity, and same standing-grant authority. A second identical typed
+  transient suppresses, an identical untyped or nonidentical transient remains unknown, and a pass records recovery.
+  Repeated `candidate_unknown` only advances count/time audit state and never creates confirmation or suppression.
+- Observed-effective drift atomically records nonreusable `candidate_unknown` plus
+  `identity_drift_after_effect` hold while retaining the original profile, execution, admission, and equivalent-work
+  identities. A reusable terminal record with expected/observed drift is invalid.
+- `compatibility_schedule_state.rs` required no R3d2c edit: R3d2c owns provider-free reducer models only; their
+  create-new journal/commit integration under the existing owner lock remains the explicit R3d2e transaction.
+
+Pre-change and mutation red proof:
+
+- At R3d2b checkpoint `b8b5a13`, the admission module, identity rederivation, equivalent-work/characterization/control
+  reducers, and their tests did not exist, so the new module/tests are compile-red there.
+- Removing only the confirmation's same-standing-grant comparison made
+  `immutable_transient_confirmation_recovery_and_unknown_paths_are_disjoint` fail **0/1** at the wrong-generation
+  negative; restoring it passes the exact test **1/0**.
+- Removing only the global `confirmation_due` authorization guard made
+  `unauthorized_repeat_and_untyped_confirmation_never_suppress` fail **0/1** because an un-authorized repeat was
+  accepted; restoring it passes the exact test **1/0**.
+- The typed profile mutation proof changes every serialized profile field independently, including nested
+  environment and cap fields, and each changes the profile hash. Changing only exact config bytes intentionally
+  leaves profile identity stable; the exact-execution mutation test proves generated-config bytes change execution
+  and equivalent-work identity instead. Test-merge fields, scheduled-main range, candidate, every exact binding,
+  requested/expected identity, and within-profile actual-cap mutations are likewise non-equivalent.
+
+Deterministic gates:
+
+- `cargo fmt --all -- --check`, tracked/untracked whitespace checks, workspace all-target/all-feature check, and
+  workspace all-target/all-feature Clippy with warnings denied are green.
+- Focused admission/identity/equivalent-work/characterization/control tests are **16/0**; the independent canonical
+  profile-field sensitivity test is **1/0**.
+- The complete `a2a-bridge` binary is **596/0/0**. The exact full serial workspace is
+  **2,332/0/12 ignored**; ignored cases are the existing explicitly authenticated/live Kiro and local-Ollama tests.
+
+Not verified or authorized at this checkpoint: a real authority/admission/confirmation, real manual CLI route,
+durable shared admission commit, provider/model/credential/registry/image/runtime/GitHub/iCloud effect, timer/watcher
+installation, real production state root, production-operator lifecycle action, source-schema compatibility review,
+or independent implementation review. R3d2c is not independently activatable, and `schedule-tick` retains its typed
+no-effects refusal.
 
 ### R3d2d — durable ledger, legacy reconciliation, and zero-effect preflights
 
