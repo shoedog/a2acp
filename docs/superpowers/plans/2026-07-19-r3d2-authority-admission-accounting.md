@@ -4,9 +4,9 @@
   at `1373985`, `28e7d28`, `d082b49`, `c418df4`, and `3e4508a`. Sixth review of exact `8d75069` marked eleven of
   thirteen inherited items `RESOLVED`, left the literal next-action cursor and sibling-visible preflight-pass API
   `UNRESOLVED`, found no fresh finding, and returned `REVISE`. Mechanism commit `2d1640d` closes the pass API with
-  a pre-change-red boundary regression; the current fold closes the cursor. Focused gates are green; exact
-  post-remediation deterministic gates and a fresh Sol closure rereview remain pending. The single Fable lens stays
-  gated on Sol approval
+  a pre-change-red boundary regression; the current fold closes the cursor. Exact candidate `4133d0a` passes the
+  complete deterministic gate at binary **655/0/0** and canonical full workspace **2,392/0/12 ignored**. A fresh
+  Sol closure rereview remains pending. The single Fable lens stays gated on Sol approval
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -937,10 +937,19 @@ preflight module; and preserves the canonical serialized pass shape and
 proof controls moved with the mechanism, and a direct canonical-hash control was added. The current docs fold
 closes the cursor residual by naming all four fifth-review residuals and recording the sixth review's disposition.
 
-Post-remediation format and diff checks, warnings-denied workspace all-target/all-feature check, preflight **8/0**,
-and transaction **27/0** are green. The exact-final deterministic gate remains pending on the post-remediation docs
-head. After that gate, run one fresh Sol/xhigh closure rereview explicitly adjudicating the two sixth-review
-residuals. Fable remains blocked until Sol approves.
+Post-remediation exact candidate `4133d0a8305df7d7af45e5bf88f539d815a929e5` passes format and diff checks;
+warnings-denied workspace all-target/all-feature check and Clippy; locked release build; dependency policy;
+repository hygiene **37 tracked artifacts / 7 configs**; manifest **9 cases**; recipes **4 cases**; foundation
+**6 scheduled / 4 claimed-support**; issue-intake live labels and local **6 runs / 19 assertions**; compatibility
+CLI **22/0**; foundation CLI **31/0**; supervisor CLI **2/0**; legacy boundary **1/0**; preflight **8/0**;
+transaction **27/0**; state **19/0**; supervisor **42/0**; complete binary **655/0/0**; and canonical full serial
+workspace **2,392 passed / 0 failed / 12 ignored** across **72** result groups, **55** nonempty. The ignored set
+remains the existing explicitly live/authenticated provider integrations; none ran. The mode-`0644`, 201,503-byte
+full-suite log is retained at `/private/tmp/a2a-bridge-r3d2-full-4133d0a.log`, SHA-256
+`f2e32c46169d77e2a758e90f881cd16030eb41596868811e50b895968c6db930`. The release binary remains 26,604,912
+bytes at SHA-256 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`. Run one fresh
+Sol/xhigh closure rereview explicitly adjudicating the two sixth-review residuals. Fable remains blocked until Sol
+approves.
 
 ## Verification and review gates
 
@@ -978,12 +987,12 @@ on a prior `/private/tmp` worktree or review mirror. The branch is based on merg
 fifth-review residuals, marked eleven of thirteen inherited items `RESOLVED`, left the cursor and preflight-pass API
 boundary `UNRESOLVED`, found no fresh finding, and returned `REVISE`. The boundary regression failed **0/1** on
 that reviewed head. Mechanism commit `2d1640d` closes the API boundary; this fold closes the cursor. Focused
-preflight/transaction gates are **8/0 + 27/0**, with warnings-denied check, format, and diff green. Exact
-post-remediation deterministic gates are pending. Read this plan, the R3d design of record, the durable roadmap,
-`AGENTS.md`, and
+preflight/transaction gates are **8/0 + 27/0**. Exact candidate `4133d0a` passes complete binary **655/0/0**,
+canonical full workspace **2,392/0/12 ignored** across **72** result groups, **55** nonempty, and every deterministic
+release/validator gate. Read this plan, the R3d design of record, the durable roadmap, `AGENTS.md`, and
 `skills/a2a-bridge-operator/SKILL.md` before editing. Preserve the single R3d2 merge boundary, the
 owner-wide-then-authority lock order, the single admission linearization point, the zero-effect default, and the
-separation between provider authority and storage consent. The next action is the exact-final deterministic gate,
-then a fresh Sol/xhigh closure rereview explicitly adjudicating the cursor and transaction-private preflight-pass
-residuals. Its prompt must carry the frozen exact boundary and gate evidence. Run the single Fable lens only after
+separation between provider authority and storage consent. The next action is a fresh Sol/xhigh closure rereview
+explicitly adjudicating the cursor and transaction-private preflight-pass residuals. Its prompt must carry the
+frozen exact boundary and gate evidence. Run the single Fable lens only after
 Sol approves; then fold final evidence, rerun exact-final gates, and publish the non-draft PR.
