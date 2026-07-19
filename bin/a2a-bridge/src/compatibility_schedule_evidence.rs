@@ -246,6 +246,199 @@ pub(super) struct EvidenceTombstoneV1 {
     pub(super) lifecycle: TombstoneLifecycleV1,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum FileProviderMaterializationV1 {
+    Materialized,
+    Offloaded,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum FileProviderSynchronizationV1 {
+    NotUploaded,
+    Uploading,
+    Synchronized,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum FileProviderObjectStateV1 {
+    Known {
+        materialization: FileProviderMaterializationV1,
+        synchronization: FileProviderSynchronizationV1,
+    },
+    Unavailable {
+        reason_code: String,
+    },
+    Unknown {
+        reason_code: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FileProviderObservationV1 {
+    pub(super) cold_root_sha256: String,
+    pub(super) file_provider_domain_id: String,
+    pub(super) object_path: OptionalRelativeEvidencePathV1,
+    pub(super) state: FileProviderObjectStateV1,
+    pub(super) observed_at_ms: i64,
+}
+
+impl FileProviderObservationV1 {
+    pub(super) fn validate(&self) -> Result<(), BoxError> {
+        require_sha256("FileProvider cold root", &self.cold_root_sha256)?;
+        bounded_text(
+            "FileProvider domain identity",
+            &self.file_provider_domain_id,
+        )?;
+        if self.observed_at_ms <= 0 {
+            return Err("schedule evidence: FileProvider observation time is invalid".into());
+        }
+        if let OptionalRelativeEvidencePathV1::RelativePath { value } = &self.object_path {
+            relative_evidence_path("FileProvider object path", value)?;
+        }
+        match &self.state {
+            FileProviderObjectStateV1::Known { .. } => {}
+            FileProviderObjectStateV1::Unavailable { reason_code }
+            | FileProviderObjectStateV1::Unknown { reason_code } => {
+                stable_id("FileProvider state reason", reason_code)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ColdCopyLifecycleV1 {
+    Admitted,
+    Abandoned {
+        abandoned_at_ms: i64,
+        reason_code: String,
+    },
+    Published {
+        published_at_ms: i64,
+        archive_observation: FileProviderObservationV1,
+        manifest_observation: FileProviderObservationV1,
+        last_content_verified_at_ms: i64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ColdCopyRecordV1 {
+    pub(super) copy_id: String,
+    pub(super) evidence_id: String,
+    pub(super) archive_sha256: String,
+    pub(super) archive_bytes: u64,
+    pub(super) manifest_sha256: String,
+    pub(super) manifest_bytes: u64,
+    pub(super) consent_id: String,
+    pub(super) consent_sha256: String,
+    pub(super) consent_revocation_generation: u64,
+    pub(super) cold_root_sha256: String,
+    pub(super) file_provider_domain_id: String,
+    pub(super) archive_path: RelativeEvidencePathV1,
+    pub(super) manifest_path: RelativeEvidencePathV1,
+    pub(super) deadline_ms: i64,
+    pub(super) admitted_at_ms: i64,
+    pub(super) lifecycle: ColdCopyLifecycleV1,
+}
+
+impl ColdCopyRecordV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        stable_id("cold-copy id", &self.copy_id)?;
+        stable_id("cold-copy evidence id", &self.evidence_id)?;
+        stable_id("cold-copy consent id", &self.consent_id)?;
+        require_sha256("cold-copy archive", &self.archive_sha256)?;
+        require_sha256("cold-copy manifest", &self.manifest_sha256)?;
+        require_sha256("cold-copy consent", &self.consent_sha256)?;
+        require_sha256("cold-copy root", &self.cold_root_sha256)?;
+        bounded_text(
+            "cold-copy FileProvider domain",
+            &self.file_provider_domain_id,
+        )?;
+        relative_evidence_path("cold-copy archive path", &self.archive_path)?;
+        relative_evidence_path("cold-copy manifest path", &self.manifest_path)?;
+        if portable_evidence_path_key(&self.archive_path)
+            == portable_evidence_path_key(&self.manifest_path)
+            || self.archive_bytes == 0
+            || self.manifest_bytes == 0
+            || self.consent_revocation_generation == 0
+            || self.admitted_at_ms <= 0
+            || self.deadline_ms <= self.admitted_at_ms
+        {
+            return Err("schedule evidence: cold-copy identity or bound is invalid".into());
+        }
+        if let ColdCopyLifecycleV1::Published {
+            published_at_ms,
+            archive_observation,
+            manifest_observation,
+            last_content_verified_at_ms,
+        } = &self.lifecycle
+        {
+            archive_observation.validate()?;
+            manifest_observation.validate()?;
+            if *published_at_ms < self.admitted_at_ms
+                || *published_at_ms > self.deadline_ms
+                || *last_content_verified_at_ms < *published_at_ms
+                || *last_content_verified_at_ms > archive_observation.observed_at_ms
+                || *last_content_verified_at_ms > manifest_observation.observed_at_ms
+                || archive_observation.cold_root_sha256 != self.cold_root_sha256
+                || manifest_observation.cold_root_sha256 != self.cold_root_sha256
+                || archive_observation.file_provider_domain_id != self.file_provider_domain_id
+                || manifest_observation.file_provider_domain_id != self.file_provider_domain_id
+                || archive_observation.object_path
+                    != (OptionalRelativeEvidencePathV1::RelativePath {
+                        value: self.archive_path.clone(),
+                    })
+                || manifest_observation.object_path
+                    != (OptionalRelativeEvidencePathV1::RelativePath {
+                        value: self.manifest_path.clone(),
+                    })
+            {
+                return Err("schedule evidence: published cold-copy state is unbound".into());
+            }
+        }
+        if let ColdCopyLifecycleV1::Abandoned {
+            abandoned_at_ms,
+            reason_code,
+        } = &self.lifecycle
+        {
+            stable_id("cold-copy abandonment reason", reason_code)?;
+            if *abandoned_at_ms <= self.deadline_ms {
+                return Err(
+                    "schedule evidence: cold-copy abandonment does not follow its deadline".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StorageIntegrityHoldV1 {
+    pub(super) hold_id: String,
+    pub(super) evidence_id: String,
+    pub(super) reason_code: String,
+    pub(super) detected_at_ms: i64,
+}
+
+impl StorageIntegrityHoldV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        stable_id("storage-integrity hold id", &self.hold_id)?;
+        stable_id("storage-integrity evidence id", &self.evidence_id)?;
+        stable_id("storage-integrity reason", &self.reason_code)?;
+        if self.detected_at_ms <= 0 {
+            return Err("schedule evidence: storage-integrity hold time is invalid".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct EvidenceStateModelV1 {
@@ -255,6 +448,10 @@ pub(super) struct EvidenceStateModelV1 {
     pub(super) pins: BTreeMap<String, EvidencePinV1>,
     pub(super) tombstones: BTreeMap<String, EvidenceTombstoneV1>,
     pub(super) retired_evidence_ids: BTreeSet<String>,
+    #[serde(default)]
+    pub(super) cold_copies: BTreeMap<String, ColdCopyRecordV1>,
+    #[serde(default)]
+    pub(super) storage_integrity_holds: BTreeMap<String, StorageIntegrityHoldV1>,
 }
 
 impl EvidenceStateModelV1 {
@@ -269,6 +466,8 @@ impl EvidenceStateModelV1 {
             pins: BTreeMap::new(),
             tombstones: BTreeMap::new(),
             retired_evidence_ids: BTreeSet::new(),
+            cold_copies: BTreeMap::new(),
+            storage_integrity_holds: BTreeMap::new(),
         };
         value.validate()?;
         Ok(value)
@@ -280,6 +479,8 @@ impl EvidenceStateModelV1 {
             || self.pins.len() > MAX_EVIDENCE_ITEMS * 4
             || self.tombstones.len() > MAX_EVIDENCE_ITEMS * 4
             || self.retired_evidence_ids.len() > MAX_EVIDENCE_ITEMS * 4
+            || self.cold_copies.len() > MAX_EVIDENCE_ITEMS * 4
+            || self.storage_integrity_holds.len() > MAX_EVIDENCE_ITEMS * 4
         {
             return Err("schedule evidence: state collections exceed their bounds".into());
         }
@@ -464,6 +665,149 @@ impl EvidenceStateModelV1 {
             }
         }
 
+        let cold_root_and_domain = match &self.cold_storage {
+            ColdStorageBindingV1::Absent => None,
+            ColdStorageBindingV1::OwnerIcloud {
+                root_sha256,
+                file_provider_domain_id,
+                ..
+            } => Some((root_sha256, file_provider_domain_id)),
+        };
+        let mut active_copy_evidence = BTreeSet::new();
+        let mut published_evidence = BTreeSet::new();
+        for (id, copy) in &self.cold_copies {
+            if id != &copy.copy_id
+                || (!matches!(copy.lifecycle, ColdCopyLifecycleV1::Abandoned { .. })
+                    && !active_copy_evidence.insert(copy.evidence_id.clone()))
+            {
+                return Err(
+                    "schedule evidence: cold-copy key or evidence target is duplicated".into(),
+                );
+            }
+            copy.validate()?;
+            let Some((root_sha256, domain_id)) = cold_root_and_domain else {
+                return Err("schedule evidence: cold-copy history has no bound cold root".into());
+            };
+            if &copy.cold_root_sha256 != root_sha256 || &copy.file_provider_domain_id != domain_id {
+                return Err("schedule evidence: cold-copy root or domain diverges".into());
+            }
+            let (
+                archive_sha256,
+                archive_bytes,
+                manifest_sha256,
+                manifest_bytes,
+                cold_path,
+                terminal_at_ms,
+            ) = if let Some(entry) = self.entries.get(&copy.evidence_id) {
+                (
+                    &entry.full_evidence_sha256,
+                    entry.archive_bytes,
+                    &entry.manifest_sha256,
+                    entry.manifest_bytes,
+                    &entry.cold_path,
+                    entry.terminal_at_ms,
+                )
+            } else {
+                let tombstone = self
+                    .tombstones
+                    .values()
+                    .find(|value| {
+                        value.evidence_id == copy.evidence_id
+                            && matches!(
+                                value.lifecycle,
+                                TombstoneLifecycleV1::FullEvidenceUnlinked { .. }
+                            )
+                    })
+                    .ok_or("schedule evidence: cold-copy target disappeared")?;
+                (
+                    &tombstone.full_evidence_sha256,
+                    tombstone.archive_bytes,
+                    &tombstone.manifest_sha256,
+                    tombstone.manifest_bytes,
+                    &tombstone.cold_path,
+                    tombstone.terminal_at_ms,
+                )
+            };
+            if &copy.archive_sha256 != archive_sha256
+                || copy.archive_bytes != archive_bytes
+                || &copy.manifest_sha256 != manifest_sha256
+                || copy.manifest_bytes != manifest_bytes
+                || copy.admitted_at_ms < terminal_at_ms
+            {
+                return Err("schedule evidence: cold-copy content identity diverges".into());
+            }
+            match &copy.lifecycle {
+                ColdCopyLifecycleV1::Admitted => {
+                    if !self.entries.contains_key(&copy.evidence_id)
+                        || !matches!(cold_path, OptionalRelativeEvidencePathV1::Absent)
+                    {
+                        return Err("schedule evidence: admitted cold copy is not pending".into());
+                    }
+                }
+                ColdCopyLifecycleV1::Abandoned { .. } => {}
+                ColdCopyLifecycleV1::Published { .. } => {
+                    if !published_evidence.insert(copy.evidence_id.clone())
+                        || cold_path
+                            != &(OptionalRelativeEvidencePathV1::RelativePath {
+                                value: copy.archive_path.clone(),
+                            })
+                    {
+                        return Err("schedule evidence: published cold copy is not indexed".into());
+                    }
+                }
+            }
+        }
+        for entry in self.entries.values() {
+            if matches!(
+                entry.cold_path,
+                OptionalRelativeEvidencePathV1::RelativePath { .. }
+            ) && !published_evidence.contains(&entry.evidence_id)
+            {
+                return Err("schedule evidence: indexed cold path has no published copy".into());
+            }
+            if !entry.hot_present {
+                let copy = self
+                    .cold_copies
+                    .values()
+                    .find(|copy| {
+                        copy.evidence_id == entry.evidence_id
+                            && matches!(copy.lifecycle, ColdCopyLifecycleV1::Published { .. })
+                    })
+                    .ok_or("schedule evidence: cold-only entry has no copy record")?;
+                let ColdCopyLifecycleV1::Published {
+                    archive_observation,
+                    manifest_observation,
+                    ..
+                } = &copy.lifecycle
+                else {
+                    return Err("schedule evidence: cold-only entry is not published".into());
+                };
+                for observation in [archive_observation, manifest_observation] {
+                    if !matches!(
+                        observation.state,
+                        FileProviderObjectStateV1::Known {
+                            synchronization: FileProviderSynchronizationV1::Synchronized,
+                            ..
+                        }
+                    ) {
+                        return Err(
+                            "schedule evidence: cold-only entry is not known synchronized".into(),
+                        );
+                    }
+                }
+            }
+        }
+
+        for (id, hold) in &self.storage_integrity_holds {
+            if id != &hold.hold_id
+                || (!self.entries.contains_key(&hold.evidence_id)
+                    && !self.retired_evidence_ids.contains(&hold.evidence_id))
+            {
+                return Err("schedule evidence: storage-integrity hold target is invalid".into());
+            }
+            hold.validate()?;
+        }
+
         for retired in &self.retired_evidence_ids {
             stable_id("retired evidence id", retired)?;
             if !self.tombstones.values().any(|tombstone| {
@@ -529,6 +873,213 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    pub(super) fn admit_cold_copy(
+        &mut self,
+        binding: ColdStorageBindingV1,
+        copy: ColdCopyRecordV1,
+    ) -> Result<(), BoxError> {
+        let mut candidate = self.clone();
+        copy.validate()?;
+        let ColdStorageBindingV1::OwnerIcloud {
+            consent_id,
+            consent_sha256,
+            root_sha256,
+            file_provider_domain_id,
+        } = &binding
+        else {
+            return Err("schedule evidence: cold-copy admission needs owner-iCloud binding".into());
+        };
+        if copy.consent_id != *consent_id
+            || copy.consent_sha256 != *consent_sha256
+            || copy.cold_root_sha256 != *root_sha256
+            || copy.file_provider_domain_id != *file_provider_domain_id
+            || copy.lifecycle != ColdCopyLifecycleV1::Admitted
+            || candidate.cold_copies.contains_key(&copy.copy_id)
+            || candidate.cold_copies.values().any(|value| {
+                value.evidence_id == copy.evidence_id
+                    && !matches!(value.lifecycle, ColdCopyLifecycleV1::Abandoned { .. })
+            })
+        {
+            return Err(
+                "schedule evidence: cold-copy admission identity is invalid or reused".into(),
+            );
+        }
+        let entry = candidate
+            .entries
+            .get(&copy.evidence_id)
+            .ok_or("schedule evidence: cold-copy target does not exist")?;
+        if !entry.hot_present
+            || !matches!(entry.cold_path, OptionalRelativeEvidencePathV1::Absent)
+            || entry.full_evidence_sha256 != copy.archive_sha256
+            || entry.archive_bytes != copy.archive_bytes
+            || entry.manifest_sha256 != copy.manifest_sha256
+            || entry.manifest_bytes != copy.manifest_bytes
+        {
+            return Err("schedule evidence: cold-copy target identity is invalid".into());
+        }
+        match &candidate.cold_storage {
+            ColdStorageBindingV1::Absent => {}
+            ColdStorageBindingV1::OwnerIcloud {
+                root_sha256: current_root,
+                file_provider_domain_id: current_domain,
+                ..
+            } if current_root == root_sha256 && current_domain == file_provider_domain_id => {}
+            ColdStorageBindingV1::OwnerIcloud { .. } => {
+                return Err("schedule evidence: cold-copy admission changes root or domain".into())
+            }
+        }
+        candidate.cold_storage = binding;
+        candidate.cold_copies.insert(copy.copy_id.clone(), copy);
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(super) fn abandon_cold_copy(
+        &mut self,
+        copy_id: &str,
+        reason_code: &str,
+        abandoned_at_ms: i64,
+    ) -> Result<(), BoxError> {
+        let mut candidate = self.clone();
+        let copy = candidate
+            .cold_copies
+            .get_mut(copy_id)
+            .ok_or("schedule evidence: cold-copy admission does not exist")?;
+        if copy.lifecycle != ColdCopyLifecycleV1::Admitted {
+            return Err("schedule evidence: only an admitted cold copy can be abandoned".into());
+        }
+        if abandoned_at_ms <= copy.deadline_ms {
+            return Err("schedule evidence: cold-copy admission has not expired".into());
+        }
+        copy.lifecycle = ColdCopyLifecycleV1::Abandoned {
+            abandoned_at_ms,
+            reason_code: reason_code.into(),
+        };
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(super) fn publish_cold_copy(
+        &mut self,
+        copy_id: &str,
+        archive_observation: FileProviderObservationV1,
+        manifest_observation: FileProviderObservationV1,
+        published_at_ms: i64,
+    ) -> Result<(), BoxError> {
+        let mut candidate = self.clone();
+        let (evidence_id, archive_path) = {
+            let copy = candidate
+                .cold_copies
+                .get_mut(copy_id)
+                .ok_or("schedule evidence: cold-copy admission does not exist")?;
+            if copy.lifecycle != ColdCopyLifecycleV1::Admitted {
+                return Err("schedule evidence: cold copy is already published".into());
+            }
+            let evidence_id = copy.evidence_id.clone();
+            let archive_path = copy.archive_path.clone();
+            copy.lifecycle = ColdCopyLifecycleV1::Published {
+                published_at_ms,
+                archive_observation,
+                manifest_observation,
+                last_content_verified_at_ms: published_at_ms,
+            };
+            (evidence_id, archive_path)
+        };
+        let entry = candidate
+            .entries
+            .get_mut(&evidence_id)
+            .ok_or("schedule evidence: cold-copy target disappeared")?;
+        if !matches!(entry.cold_path, OptionalRelativeEvidencePathV1::Absent) {
+            return Err("schedule evidence: cold-copy target already has a cold path".into());
+        }
+        entry.cold_path = OptionalRelativeEvidencePathV1::RelativePath {
+            value: archive_path,
+        };
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(super) fn update_published_cold_copy(
+        &mut self,
+        copy_id: &str,
+        archive_observation: FileProviderObservationV1,
+        manifest_observation: FileProviderObservationV1,
+        content_verified_at_ms: Option<i64>,
+    ) -> Result<(), BoxError> {
+        let mut candidate = self.clone();
+        let copy = candidate
+            .cold_copies
+            .get_mut(copy_id)
+            .ok_or("schedule evidence: published cold copy does not exist")?;
+        let ColdCopyLifecycleV1::Published {
+            published_at_ms,
+            last_content_verified_at_ms,
+            ..
+        } = &copy.lifecycle
+        else {
+            return Err("schedule evidence: cold copy is not published".into());
+        };
+        let published_at_ms = *published_at_ms;
+        let last_content_verified_at_ms = content_verified_at_ms
+            .unwrap_or(*last_content_verified_at_ms)
+            .max(*last_content_verified_at_ms);
+        copy.lifecycle = ColdCopyLifecycleV1::Published {
+            published_at_ms,
+            archive_observation,
+            manifest_observation,
+            last_content_verified_at_ms,
+        };
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(super) fn mark_hot_evidence_absent(&mut self, evidence_id: &str) -> Result<(), BoxError> {
+        let mut candidate = self.clone();
+        if candidate.has_active_pin(evidence_id) {
+            return Err("schedule evidence: pinned hot evidence cannot be evicted".into());
+        }
+        let entry = candidate
+            .entries
+            .get_mut(evidence_id)
+            .ok_or("schedule evidence: hot-eviction target does not exist")?;
+        if !entry.hot_present
+            || !matches!(
+                entry.cold_path,
+                OptionalRelativeEvidencePathV1::RelativePath { .. }
+            )
+        {
+            return Err("schedule evidence: hot-eviction target is not eligible".into());
+        }
+        entry.hot_present = false;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(super) fn add_storage_integrity_hold(
+        &mut self,
+        hold: StorageIntegrityHoldV1,
+    ) -> Result<(), BoxError> {
+        let mut candidate = self.clone();
+        hold.validate()?;
+        if candidate
+            .storage_integrity_holds
+            .contains_key(&hold.hold_id)
+        {
+            return Err("schedule evidence: storage-integrity hold already exists".into());
+        }
+        candidate
+            .storage_integrity_holds
+            .insert(hold.hold_id.clone(), hold);
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
     pub(super) fn pin(&mut self, pin: EvidencePinV1) -> Result<(), BoxError> {
         let mut candidate = self.clone();
         if candidate.pins.contains_key(&pin.pin_id) || pin.lifecycle != PinLifecycleV1::Active {
@@ -579,7 +1130,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
-    fn has_active_pin(&self, evidence_id: &str) -> bool {
+    pub(super) fn has_active_pin(&self, evidence_id: &str) -> bool {
         self.pins
             .values()
             .any(|pin| pin.evidence_id == evidence_id && pin.lifecycle == PinLifecycleV1::Active)
@@ -701,6 +1252,81 @@ fn tombstone_transition_allowed(
             ))
 }
 
+fn cold_storage_transition_allowed(
+    previous: &ColdStorageBindingV1,
+    next: &ColdStorageBindingV1,
+) -> bool {
+    previous == next
+        || matches!(
+            (previous, next),
+            (
+                ColdStorageBindingV1::Absent,
+                ColdStorageBindingV1::OwnerIcloud { .. }
+            )
+        )
+        || matches!(
+            (previous, next),
+            (
+                ColdStorageBindingV1::OwnerIcloud {
+                    root_sha256: previous_root,
+                    file_provider_domain_id: previous_domain,
+                    ..
+                },
+                ColdStorageBindingV1::OwnerIcloud {
+                    root_sha256: next_root,
+                    file_provider_domain_id: next_domain,
+                    ..
+                }
+            ) if previous_root == next_root && previous_domain == next_domain
+        )
+}
+
+fn cold_copy_transition_allowed(previous: &ColdCopyRecordV1, next: &ColdCopyRecordV1) -> bool {
+    let immutable = previous.copy_id == next.copy_id
+        && previous.evidence_id == next.evidence_id
+        && previous.archive_sha256 == next.archive_sha256
+        && previous.archive_bytes == next.archive_bytes
+        && previous.manifest_sha256 == next.manifest_sha256
+        && previous.manifest_bytes == next.manifest_bytes
+        && previous.consent_id == next.consent_id
+        && previous.consent_sha256 == next.consent_sha256
+        && previous.consent_revocation_generation == next.consent_revocation_generation
+        && previous.cold_root_sha256 == next.cold_root_sha256
+        && previous.file_provider_domain_id == next.file_provider_domain_id
+        && previous.archive_path == next.archive_path
+        && previous.manifest_path == next.manifest_path
+        && previous.deadline_ms == next.deadline_ms
+        && previous.admitted_at_ms == next.admitted_at_ms;
+    if !immutable {
+        return false;
+    }
+    match (&previous.lifecycle, &next.lifecycle) {
+        (left, right) if left == right => true,
+        (ColdCopyLifecycleV1::Admitted, ColdCopyLifecycleV1::Published { .. }) => true,
+        (ColdCopyLifecycleV1::Admitted, ColdCopyLifecycleV1::Abandoned { .. }) => true,
+        (
+            ColdCopyLifecycleV1::Published {
+                published_at_ms: previous_published,
+                archive_observation: previous_archive,
+                manifest_observation: previous_manifest,
+                last_content_verified_at_ms: previous_verified,
+            },
+            ColdCopyLifecycleV1::Published {
+                published_at_ms: next_published,
+                archive_observation: next_archive,
+                manifest_observation: next_manifest,
+                last_content_verified_at_ms: next_verified,
+            },
+        ) => {
+            previous_published == next_published
+                && next_archive.observed_at_ms >= previous_archive.observed_at_ms
+                && next_manifest.observed_at_ms >= previous_manifest.observed_at_ms
+                && next_verified >= previous_verified
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct EvidenceStateSnapshotV1 {
@@ -786,6 +1412,33 @@ impl EvidenceStateSnapshotV1 {
                             if *unlinked_at_ms > self.recorded_at_ms
                     )
             })
+            || self.state.cold_copies.values().any(|value| {
+                value.admitted_at_ms > self.recorded_at_ms
+                    || matches!(
+                        &value.lifecycle,
+                        ColdCopyLifecycleV1::Abandoned {
+                            abandoned_at_ms,
+                            ..
+                        } if *abandoned_at_ms > self.recorded_at_ms
+                    )
+                    || matches!(
+                        &value.lifecycle,
+                        ColdCopyLifecycleV1::Published {
+                            published_at_ms,
+                            archive_observation,
+                            manifest_observation,
+                            last_content_verified_at_ms,
+                        } if *published_at_ms > self.recorded_at_ms
+                            || archive_observation.observed_at_ms > self.recorded_at_ms
+                            || manifest_observation.observed_at_ms > self.recorded_at_ms
+                            || *last_content_verified_at_ms > self.recorded_at_ms
+                    )
+            })
+            || self
+                .state
+                .storage_integrity_holds
+                .values()
+                .any(|value| value.detected_at_ms > self.recorded_at_ms)
         {
             return Err("schedule evidence: state event postdates its snapshot".into());
         }
@@ -821,7 +1474,7 @@ pub(super) fn validate_evidence_state_transition(
                 value: evidence_state_snapshot_sha256(previous)?,
             })
         || next.state.hot_root_sha256 != previous.state.hot_root_sha256
-        || next.state.cold_storage != previous.state.cold_storage
+        || !cold_storage_transition_allowed(&previous.state.cold_storage, &next.state.cold_storage)
     {
         return Err("schedule evidence: snapshot chain/root transition is invalid".into());
     }
@@ -831,6 +1484,26 @@ pub(super) fn validate_evidence_state_transition(
         .is_subset(&next.state.retired_evidence_ids)
     {
         return Err("schedule evidence: retired evidence history was removed".into());
+    }
+    if next.state.cold_storage != previous.state.cold_storage {
+        let ColdStorageBindingV1::OwnerIcloud {
+            consent_id,
+            consent_sha256,
+            root_sha256,
+            file_provider_domain_id,
+        } = &next.state.cold_storage
+        else {
+            return Err("schedule evidence: cold storage binding was removed".into());
+        };
+        if !next.state.cold_copies.values().any(|copy| {
+            !previous.state.cold_copies.contains_key(&copy.copy_id)
+                && copy.consent_id == *consent_id
+                && copy.consent_sha256 == *consent_sha256
+                && copy.cold_root_sha256 == *root_sha256
+                && copy.file_provider_domain_id == *file_provider_domain_id
+        }) {
+            return Err("schedule evidence: cold binding changed without a new admission".into());
+        }
     }
     for (id, prior) in &previous.state.pins {
         let current = next
@@ -886,6 +1559,83 @@ pub(super) fn validate_evidence_state_transition(
             return Err(
                 "schedule evidence: new tombstone is backdated or skips pending state".into(),
             );
+        }
+    }
+    for (id, prior) in &previous.state.cold_copies {
+        let current = next
+            .state
+            .cold_copies
+            .get(id)
+            .ok_or("schedule evidence: cold-copy history was removed")?;
+        if !cold_copy_transition_allowed(prior, current) {
+            return Err("schedule evidence: cold-copy state changed nonmonotonically".into());
+        }
+        match (&prior.lifecycle, &current.lifecycle) {
+            (
+                ColdCopyLifecycleV1::Admitted,
+                ColdCopyLifecycleV1::Abandoned {
+                    abandoned_at_ms, ..
+                },
+            ) if *abandoned_at_ms <= previous.recorded_at_ms => {
+                return Err("schedule evidence: cold-copy abandonment was backdated".into())
+            }
+            (
+                ColdCopyLifecycleV1::Admitted,
+                ColdCopyLifecycleV1::Published {
+                    published_at_ms,
+                    archive_observation,
+                    manifest_observation,
+                    ..
+                },
+            ) if *published_at_ms <= previous.recorded_at_ms
+                || archive_observation.observed_at_ms <= previous.recorded_at_ms
+                || manifest_observation.observed_at_ms <= previous.recorded_at_ms =>
+            {
+                return Err("schedule evidence: cold publication was backdated".into())
+            }
+            (
+                ColdCopyLifecycleV1::Published {
+                    archive_observation: previous_archive,
+                    manifest_observation: previous_manifest,
+                    last_content_verified_at_ms: previous_verified,
+                    ..
+                },
+                ColdCopyLifecycleV1::Published {
+                    archive_observation: current_archive,
+                    manifest_observation: current_manifest,
+                    last_content_verified_at_ms: current_verified,
+                    ..
+                },
+            ) if (current_archive != previous_archive
+                && current_archive.observed_at_ms <= previous.recorded_at_ms)
+                || (current_manifest != previous_manifest
+                    && current_manifest.observed_at_ms <= previous.recorded_at_ms)
+                || (current_verified != previous_verified
+                    && *current_verified <= previous.recorded_at_ms) =>
+            {
+                return Err("schedule evidence: cold verification was backdated".into())
+            }
+            _ => {}
+        }
+    }
+    for (id, current) in &next.state.cold_copies {
+        if !previous.state.cold_copies.contains_key(id)
+            && (current.admitted_at_ms <= previous.recorded_at_ms
+                || current.lifecycle != ColdCopyLifecycleV1::Admitted)
+        {
+            return Err("schedule evidence: cold-copy admission was backdated".into());
+        }
+    }
+    for (id, prior) in &previous.state.storage_integrity_holds {
+        if next.state.storage_integrity_holds.get(id) != Some(prior) {
+            return Err("schedule evidence: storage-integrity hold history changed".into());
+        }
+    }
+    for (id, current) in &next.state.storage_integrity_holds {
+        if !previous.state.storage_integrity_holds.contains_key(id)
+            && current.detected_at_ms <= previous.recorded_at_ms
+        {
+            return Err("schedule evidence: storage-integrity hold was backdated".into());
         }
     }
     for (id, prior) in &previous.state.entries {
@@ -1009,6 +1759,30 @@ impl<'lock> FileEvidenceJournal<'lock> {
         Ok((value, snapshot.sha256))
     }
 
+    fn persisted_bytes(directory: &local_file::PinnedDirectory) -> Result<u64, BoxError> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let mut bytes = 0_u64;
+        for (_, name) in Self::generation_entries(directory)? {
+            let file =
+                directory.open_regular_file(OsStr::new(&name), "evidence state generation")?;
+            let metadata = file.metadata()?;
+            if metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o777 != STATE_FILE_MODE
+                || metadata.len() > MAX_STATE_RECORD_BYTES
+            {
+                return Err(
+                    "schedule evidence: state generation is not a bounded owner-only mode-0600 file"
+                        .into(),
+                );
+            }
+            bytes = bytes
+                .checked_add(metadata.len())
+                .ok_or("schedule evidence: state journal byte accounting overflow")?;
+        }
+        Ok(bytes)
+    }
+
     pub(super) fn initialize<C: EvidenceStateCapability + ?Sized>(
         capability: &'lock C,
         state: &EvidenceStateModelV1,
@@ -1089,6 +1863,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
         if bytes.len() as u64 > MAX_STATE_RECORD_BYTES {
             return Err("schedule evidence: state generation exceeds the byte bound".into());
         }
+        reserve_state_journal_bytes(Self::persisted_bytes(self.directory)?, bytes.len() as u64)?;
         let name = Self::generation_name(snapshot.generation);
         let mut file = self.directory.create_new_file(
             OsStr::new(&name),
@@ -1308,6 +2083,19 @@ pub(super) fn reserve_hot_bytes(
         .ok_or("schedule evidence: hot allocation overflow")?;
     if *used > cap || next.total().is_none_or(|total| total > caps.total_bytes) {
         return Err("schedule evidence: hot storage quota pressure".into());
+    }
+    Ok(next)
+}
+
+fn reserve_state_journal_bytes(current_bytes: u64, new_bytes: u64) -> Result<u64, BoxError> {
+    if new_bytes == 0 {
+        return Err("schedule evidence: state journal reservation must be positive".into());
+    }
+    let next = current_bytes
+        .checked_add(new_bytes)
+        .ok_or("schedule evidence: state journal byte accounting overflow")?;
+    if next > HOT_STATE_CAP_BYTES {
+        return Err("schedule evidence: state journal exceeds the hot state quota".into());
     }
     Ok(next)
 }
@@ -2067,6 +2855,10 @@ impl EvidenceHotStoreV1 {
     pub(super) fn root_sha256(&self) -> &str {
         self.root.object_sha256()
     }
+
+    pub(super) fn sealed_directory(&self) -> &local_file::PinnedDirectory {
+        &self.sealed
+    }
 }
 
 impl PreparedSealedEvidenceV1 {
@@ -2498,6 +3290,68 @@ mod tests {
 
     fn model() -> EvidenceStateModelV1 {
         EvidenceStateModelV1::new(digest('c'), ColdStorageBindingV1::Absent).unwrap()
+    }
+
+    fn publish_test_cold_copy(
+        state: &mut EvidenceStateModelV1,
+        evidence_id: &str,
+        admitted_at_ms: i64,
+    ) {
+        let binding = state.cold_storage.clone();
+        let ColdStorageBindingV1::OwnerIcloud {
+            consent_id,
+            consent_sha256,
+            root_sha256,
+            file_provider_domain_id,
+        } = &binding
+        else {
+            panic!("test cold copy needs a cold binding")
+        };
+        let entry = state.entries[evidence_id].clone();
+        let archive_path = relative(&format!("{evidence_id}.tar.gz"));
+        let manifest_path = relative(&format!("{evidence_id}.manifest.json"));
+        let copy_id = format!("cold-copy-{evidence_id}");
+        state
+            .admit_cold_copy(
+                binding.clone(),
+                ColdCopyRecordV1 {
+                    copy_id: copy_id.clone(),
+                    evidence_id: evidence_id.into(),
+                    archive_sha256: entry.full_evidence_sha256,
+                    archive_bytes: entry.archive_bytes,
+                    manifest_sha256: entry.manifest_sha256,
+                    manifest_bytes: entry.manifest_bytes,
+                    consent_id: consent_id.clone(),
+                    consent_sha256: consent_sha256.clone(),
+                    consent_revocation_generation: 1,
+                    cold_root_sha256: root_sha256.clone(),
+                    file_provider_domain_id: file_provider_domain_id.clone(),
+                    archive_path: archive_path.clone(),
+                    manifest_path: manifest_path.clone(),
+                    deadline_ms: admitted_at_ms + 100,
+                    admitted_at_ms,
+                    lifecycle: ColdCopyLifecycleV1::Admitted,
+                },
+            )
+            .unwrap();
+        let observation = |path: RelativeEvidencePathV1| FileProviderObservationV1 {
+            cold_root_sha256: root_sha256.clone(),
+            file_provider_domain_id: file_provider_domain_id.clone(),
+            object_path: OptionalRelativeEvidencePathV1::RelativePath { value: path },
+            state: FileProviderObjectStateV1::Known {
+                materialization: FileProviderMaterializationV1::Materialized,
+                synchronization: FileProviderSynchronizationV1::Synchronized,
+            },
+            observed_at_ms: admitted_at_ms + 1,
+        };
+        state
+            .publish_cold_copy(
+                &copy_id,
+                observation(archive_path),
+                observation(manifest_path),
+                admitted_at_ms + 1,
+            )
+            .unwrap();
     }
 
     fn fingerprint(ch: char) -> FingerprintV1 {
@@ -2992,12 +3846,10 @@ mod tests {
             },
         )
         .unwrap();
-        let mut evidence = entry("evidence-1", terminal, 512);
-        evidence.cold_path = OptionalRelativeEvidencePathV1::RelativePath {
-            value: relative("evidence-1.tar.gz"),
-        };
+        let evidence = entry("evidence-1", terminal, 512);
         let full_retain_until_ms = evidence.full_retain_until_ms;
         state.insert_entry(evidence).unwrap();
+        publish_test_cold_copy(&mut state, "evidence-1", terminal + 1);
 
         assert!(state
             .begin_tombstone(
@@ -3115,6 +3967,42 @@ mod tests {
             sealed_bytes: 0,
         };
         assert!(reserve_hot_bytes(&caps, &already_over_cap, HotAllocationV1::Sealed, 1).is_err());
+
+        assert_eq!(
+            reserve_state_journal_bytes(HOT_STATE_CAP_BYTES - 1, 1).unwrap(),
+            HOT_STATE_CAP_BYTES
+        );
+        assert!(reserve_state_journal_bytes(HOT_STATE_CAP_BYTES, 1).is_err());
+        assert!(reserve_state_journal_bytes(u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn evidence_journal_enforces_the_aggregate_state_cap_before_create() {
+        let root = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let lock = scheduler
+            .try_owner_admission("test/evidence-journal-cap")
+            .unwrap();
+        let state = model();
+        let opened = FileEvidenceJournal::initialize(&lock, &state, 1).unwrap();
+
+        for generation in 100..164 {
+            let file = lock
+                .evidence_index_directory()
+                .create_new_file(
+                    OsStr::new(&FileEvidenceJournal::generation_name(generation)),
+                    STATE_FILE_MODE,
+                    "test oversized evidence journal",
+                )
+                .unwrap();
+            file.set_len(MAX_STATE_RECORD_BYTES).unwrap();
+        }
+        let successor = opened.snapshot.successor(state, 2).unwrap();
+        assert!(opened.journal.persist(&successor).is_err());
+        assert!(!root
+            .path()
+            .join("evidence-index/evidence-state.00000000000000000002.json")
+            .exists());
     }
 
     #[test]
@@ -3130,21 +4018,15 @@ mod tests {
             },
         )
         .unwrap();
-        let mut oldest = entry("oldest", 1, 300);
-        oldest.cold_path = OptionalRelativeEvidencePathV1::RelativePath {
-            value: relative("oldest.tar.gz"),
-        };
-        let mut pinned = entry("pinned", 2, 400);
-        pinned.cold_path = OptionalRelativeEvidencePathV1::RelativePath {
-            value: relative("pinned.tar.gz"),
-        };
-        let mut fresh = entry("fresh", now, 1_000);
-        fresh.cold_path = OptionalRelativeEvidencePathV1::RelativePath {
-            value: relative("fresh.tar.gz"),
-        };
+        let oldest = entry("oldest", 1, 300);
+        let pinned = entry("pinned", 2, 400);
+        let fresh = entry("fresh", now, 1_000);
         state.insert_entry(oldest).unwrap();
         state.insert_entry(pinned).unwrap();
         state.insert_entry(fresh).unwrap();
+        publish_test_cold_copy(&mut state, "oldest", now + 1);
+        publish_test_cold_copy(&mut state, "pinned", now + 3);
+        publish_test_cold_copy(&mut state, "fresh", now + 5);
         state
             .pin(EvidencePinV1 {
                 pin_id: "pin-pinned".into(),
@@ -3929,6 +4811,158 @@ mod tests {
                 full_retain_until_ms,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn cold_copy_transition_binds_consent_root_and_allows_one_way_cache_eviction() {
+        let mut state = model();
+        state.insert_entry(entry("evidence-1", 1, 512)).unwrap();
+        let first = EvidenceStateSnapshotV1::first(state.clone(), 20_000_000_000).unwrap();
+        let archive_path = RelativeEvidencePathV1 {
+            components: vec!["evidence-1.tar.gz".into()],
+        };
+        let manifest_path = RelativeEvidencePathV1 {
+            components: vec!["evidence-1.manifest.json".into()],
+        };
+        let binding = ColdStorageBindingV1::OwnerIcloud {
+            consent_id: "consent-1".into(),
+            consent_sha256: digest('d'),
+            root_sha256: digest('e'),
+            file_provider_domain_id: "icloud-domain-1".into(),
+        };
+        state
+            .admit_cold_copy(
+                binding,
+                ColdCopyRecordV1 {
+                    copy_id: "cold-copy-1".into(),
+                    evidence_id: "evidence-1".into(),
+                    archive_sha256: digest('a'),
+                    archive_bytes: 512,
+                    manifest_sha256: digest('b'),
+                    manifest_bytes: 128,
+                    consent_id: "consent-1".into(),
+                    consent_sha256: digest('d'),
+                    consent_revocation_generation: 1,
+                    cold_root_sha256: digest('e'),
+                    file_provider_domain_id: "icloud-domain-1".into(),
+                    archive_path: archive_path.clone(),
+                    manifest_path: manifest_path.clone(),
+                    deadline_ms: 20_000_000_100,
+                    admitted_at_ms: 20_000_000_001,
+                    lifecycle: ColdCopyLifecycleV1::Admitted,
+                },
+            )
+            .unwrap();
+        let admitted = first.successor(state.clone(), 20_000_000_002).unwrap();
+        validate_evidence_state_transition(&first, &admitted).unwrap();
+
+        assert!(state
+            .abandon_cold_copy("cold-copy-1", "deadline_expired", 20_000_000_050,)
+            .is_err());
+
+        let observation = |path: RelativeEvidencePathV1| FileProviderObservationV1 {
+            cold_root_sha256: digest('e'),
+            file_provider_domain_id: "icloud-domain-1".into(),
+            object_path: OptionalRelativeEvidencePathV1::RelativePath { value: path },
+            state: FileProviderObjectStateV1::Known {
+                materialization: FileProviderMaterializationV1::Materialized,
+                synchronization: FileProviderSynchronizationV1::Synchronized,
+            },
+            observed_at_ms: 20_000_000_003,
+        };
+        state
+            .publish_cold_copy(
+                "cold-copy-1",
+                observation(archive_path.clone()),
+                observation(manifest_path),
+                20_000_000_003,
+            )
+            .unwrap();
+        let published = admitted.successor(state.clone(), 20_000_000_004).unwrap();
+        validate_evidence_state_transition(&admitted, &published).unwrap();
+        assert_eq!(
+            state.entries["evidence-1"].cold_path,
+            OptionalRelativeEvidencePathV1::RelativePath {
+                value: archive_path
+            }
+        );
+
+        state.mark_hot_evidence_absent("evidence-1").unwrap();
+        let evicted = published.successor(state.clone(), 20_000_000_005).unwrap();
+        validate_evidence_state_transition(&published, &evicted).unwrap();
+        assert!(!state.entries["evidence-1"].hot_present);
+
+        let mut resurrected = state;
+        resurrected
+            .entries
+            .get_mut("evidence-1")
+            .unwrap()
+            .hot_present = true;
+        let resurrected = evicted.successor(resurrected, 20_000_000_006).unwrap();
+        assert!(validate_evidence_state_transition(&evicted, &resurrected).is_err());
+    }
+
+    #[test]
+    fn cold_only_validation_uses_the_published_replacement_after_abandonment() {
+        let mut state = model();
+        state.insert_entry(entry("evidence-1", 1, 512)).unwrap();
+        let binding = ColdStorageBindingV1::OwnerIcloud {
+            consent_id: "consent-1".into(),
+            consent_sha256: digest('d'),
+            root_sha256: digest('e'),
+            file_provider_domain_id: "icloud-domain-1".into(),
+        };
+        let copy = |copy_id: &str, admitted_at_ms: i64, deadline_ms: i64| ColdCopyRecordV1 {
+            copy_id: copy_id.into(),
+            evidence_id: "evidence-1".into(),
+            archive_sha256: digest('a'),
+            archive_bytes: 512,
+            manifest_sha256: digest('b'),
+            manifest_bytes: 128,
+            consent_id: "consent-1".into(),
+            consent_sha256: digest('d'),
+            consent_revocation_generation: 1,
+            cold_root_sha256: digest('e'),
+            file_provider_domain_id: "icloud-domain-1".into(),
+            archive_path: RelativeEvidencePathV1 {
+                components: vec![format!("{copy_id}.tar.gz")],
+            },
+            manifest_path: RelativeEvidencePathV1 {
+                components: vec![format!("{copy_id}.manifest.json")],
+            },
+            deadline_ms,
+            admitted_at_ms,
+            lifecycle: ColdCopyLifecycleV1::Admitted,
+        };
+        state
+            .admit_cold_copy(binding.clone(), copy("cold-copy-1", 10, 20))
+            .unwrap();
+        state
+            .abandon_cold_copy("cold-copy-1", "deadline_expired", 21)
+            .unwrap();
+        let replacement = copy("cold-copy-2", 22, 30);
+        let archive_path = replacement.archive_path.clone();
+        let manifest_path = replacement.manifest_path.clone();
+        state.admit_cold_copy(binding, replacement).unwrap();
+        let observation = |path: RelativeEvidencePathV1| FileProviderObservationV1 {
+            cold_root_sha256: digest('e'),
+            file_provider_domain_id: "icloud-domain-1".into(),
+            object_path: OptionalRelativeEvidencePathV1::RelativePath { value: path },
+            state: FileProviderObjectStateV1::Known {
+                materialization: FileProviderMaterializationV1::Materialized,
+                synchronization: FileProviderSynchronizationV1::Synchronized,
+            },
+            observed_at_ms: 23,
+        };
+        state
+            .publish_cold_copy(
+                "cold-copy-2",
+                observation(archive_path),
+                observation(manifest_path),
+                23,
+            )
+            .unwrap();
+        state.mark_hot_evidence_absent("evidence-1").unwrap();
     }
 
     #[test]

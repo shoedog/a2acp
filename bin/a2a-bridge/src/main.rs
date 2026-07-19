@@ -44,6 +44,7 @@ mod compatibility_schedule_authority;
 mod compatibility_schedule_evidence;
 mod compatibility_schedule_ledger;
 mod compatibility_schedule_preflight;
+mod compatibility_schedule_retention;
 mod compatibility_schedule_schema;
 mod compatibility_schedule_state;
 mod compatibility_schedule_supervisor;

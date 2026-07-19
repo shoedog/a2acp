@@ -363,6 +363,36 @@ pub(crate) struct DirectorySnapshot {
     pub(crate) identity: DirectoryIdentity,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChildMetadataSnapshot {
+    mode: u32,
+    link_count: u64,
+    owner_uid: u32,
+    length: u64,
+}
+
+impl ChildMetadataSnapshot {
+    pub(crate) fn is_regular(self) -> bool {
+        self.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+    }
+
+    pub(crate) fn link_count(self) -> u64 {
+        self.link_count
+    }
+
+    pub(crate) fn owner_uid(self) -> u32 {
+        self.owner_uid
+    }
+
+    pub(crate) fn permission_mode(self) -> u32 {
+        self.mode & 0o777
+    }
+
+    pub(crate) fn length(self) -> u64 {
+        self.length
+    }
+}
+
 /// An open directory object whose descriptor is retained through the host ACP
 /// process lifetime. The parent descriptor remains close-on-exec; the forked
 /// child binds its cwd with `fchdir` and may retain only its copy when the OS
@@ -564,6 +594,56 @@ impl PinnedDirectory {
         )
         .ok()
         .is_some_and(|(_file, snapshot)| snapshot.identity == self.identity)
+    }
+
+    /// Inspect one direct child without following a final symlink and without re-resolving the
+    /// retained parent directory pathname.
+    pub(crate) fn child_metadata_no_follow(
+        &self,
+        name: &OsStr,
+        label: &str,
+    ) -> Result<Option<ChildMetadataSnapshot>, BoxError> {
+        #[cfg(unix)]
+        {
+            use std::mem::MaybeUninit;
+            use std::os::fd::AsRawFd as _;
+
+            let name = child_name_cstring(name, label)?;
+            let mut stat = MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: the retained directory descriptor, validated child name, and writable stat
+            // buffer are live. AT_SYMLINK_NOFOLLOW reports the directory entry itself.
+            if unsafe {
+                libc::fstatat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == -1
+            {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ENOENT) {
+                    return Ok(None);
+                }
+                return Err(
+                    format!("{label}: cannot inspect descriptor-relative child: {error}").into(),
+                );
+            }
+            // SAFETY: successful fstatat initialized the complete stat value.
+            let stat = unsafe { stat.assume_init() };
+            Ok(Some(ChildMetadataSnapshot {
+                mode: stat.st_mode as u32,
+                link_count: stat.st_nlink as u64,
+                owner_uid: stat.st_uid as u32,
+                length: u64::try_from(stat.st_size)
+                    .map_err(|_| format!("{label}: child has a negative length"))?,
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            Err(format!("{label}: descriptor-relative child inspection is unsupported").into())
+        }
     }
 
     /// Create one owner-private regular file relative to the retained directory object. The effect
@@ -988,6 +1068,130 @@ impl PinnedDirectory {
         {
             let _ = (name, directory);
             Err(format!("{label}: descriptor-relative removal is unsupported").into())
+        }
+    }
+
+    /// Remove one retained regular child only while its descriptor still matches the same name
+    /// beneath this retained directory. Callers serialize the final comparison and unlink under
+    /// their owner lock.
+    pub(crate) fn remove_regular_child(
+        &self,
+        child: RegularChildRef<'_>,
+        label: &str,
+    ) -> Result<(), BoxError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+
+            let name = child_name_cstring(child.name, label)?;
+            let reopened = self.open_regular_file(child.name, label)?;
+            let retained_metadata = child
+                .file
+                .metadata()
+                .map_err(|error| format!("{label}: cannot inspect retained child: {error}"))?;
+            if !same_file(&reopened.metadata()?, &retained_metadata) {
+                return Err(format!("{label}: child identity changed before removal").into());
+            }
+            // SAFETY: the live retained parent descriptor and validated child name identify the
+            // entry just compared under the caller's owner lock.
+            if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) } == -1 {
+                return Err(format!(
+                    "{label}: cannot remove verified descriptor-relative child: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child;
+            Err(format!("{label}: verified descriptor-relative removal is unsupported").into())
+        }
+    }
+
+    /// Atomically publish one already-synced, retained regular child at a new name in this exact
+    /// directory. The target must be absent; callers serialize the check and rename under their
+    /// owner lock. A directory-sync error is reported as an ambiguous publication so recovery can
+    /// inspect the final name rather than retrying blindly.
+    pub(crate) fn publish_new_regular_child(
+        &self,
+        source: RegularChildRef<'_>,
+        target_name: &OsStr,
+        label: &str,
+    ) -> Result<(), BoxError> {
+        #[cfg(unix)]
+        {
+            use std::mem::MaybeUninit;
+            use std::os::fd::AsRawFd as _;
+
+            let source_name = child_name_cstring(source.name, label)?;
+            let target_c = child_name_cstring(target_name, label)?;
+            if source_name.as_bytes() == target_c.as_bytes() {
+                return Err(format!("{label}: source and target names must differ").into());
+            }
+            let opened_source = self.open_regular_file(source.name, label)?;
+            let retained_metadata = source
+                .file
+                .metadata()
+                .map_err(|error| format!("{label}: cannot inspect retained source: {error}"))?;
+            if !same_file(&opened_source.metadata()?, &retained_metadata) {
+                return Err(format!("{label}: source identity changed before publication").into());
+            }
+
+            let mut target_metadata = MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: the retained directory descriptor, target C string, and output pointer are
+            // valid for this no-follow existence check.
+            let target_result = unsafe {
+                libc::fstatat(
+                    self.file.as_raw_fd(),
+                    target_c.as_ptr(),
+                    target_metadata.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if target_result == 0 {
+                return Err(format!("{label}: publication target already exists").into());
+            }
+            let target_error = std::io::Error::last_os_error();
+            if target_error.raw_os_error() != Some(libc::ENOENT) {
+                return Err(format!(
+                    "{label}: cannot prove publication target absence: {target_error}"
+                )
+                .into());
+            }
+
+            // SAFETY: both names are validated single components beneath the same retained
+            // directory descriptor. The caller's owner lock excludes internal target creation
+            // between the absence check and this atomic rename.
+            if unsafe {
+                libc::renameat(
+                    self.file.as_raw_fd(),
+                    source_name.as_ptr(),
+                    self.file.as_raw_fd(),
+                    target_c.as_ptr(),
+                )
+            } == -1
+            {
+                return Err(format!(
+                    "{label}: cannot atomically publish new regular child: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            self.sync().map_err(|error| {
+                format!("{label}: publication renamed but directory sync is ambiguous: {error}")
+            })?;
+            let opened_target = self.open_regular_file(target_name, label)?;
+            if !same_file(&opened_target.metadata()?, &retained_metadata) {
+                return Err(format!("{label}: published target identity diverged").into());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (source, target_name);
+            Err(format!("{label}: descriptor-relative publication is unsupported").into())
         }
     }
 
@@ -1510,6 +1714,64 @@ mod tests {
             .unwrap();
         pin.remove_child(OsStr::new("evidence.json"), false, "test evidence cleanup")
             .unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn descriptor_relative_new_publication_is_atomic_and_never_clobbers() {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_directory(dir.path(), "test publication root").unwrap();
+        let pin = PinnedDirectory::open(
+            dir.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test publication root",
+        )
+        .unwrap();
+        let partial_name = OsStr::new("archive.partial");
+        let final_name = OsStr::new("archive.tar.gz");
+        let mut partial = pin
+            .create_new_file(partial_name, 0o600, "test publication partial")
+            .unwrap();
+        partial.write_all(b"new bytes").unwrap();
+        partial.sync_all().unwrap();
+
+        let mut existing = pin
+            .create_new_file(final_name, 0o600, "test existing final")
+            .unwrap();
+        existing.write_all(b"old bytes").unwrap();
+        existing.sync_all().unwrap();
+        assert!(pin
+            .publish_new_regular_child(
+                RegularChildRef::new(partial_name, &partial),
+                final_name,
+                "test cold publication",
+            )
+            .is_err());
+        assert_eq!(fs::read(dir.path().join(final_name)).unwrap(), b"old bytes");
+        assert_eq!(
+            fs::read(dir.path().join(partial_name)).unwrap(),
+            b"new bytes"
+        );
+
+        drop(existing);
+        pin.remove_child(final_name, false, "test existing final cleanup")
+            .unwrap();
+        pin.publish_new_regular_child(
+            RegularChildRef::new(partial_name, &partial),
+            final_name,
+            "test cold publication",
+        )
+        .unwrap();
+        assert!(!dir.path().join(partial_name).exists());
+        assert_eq!(fs::read(dir.path().join(final_name)).unwrap(), b"new bytes");
+        assert_eq!(
+            fs::metadata(dir.path().join(final_name)).unwrap().nlink(),
+            1
+        );
     }
 
     #[cfg(unix)]
