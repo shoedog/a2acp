@@ -8,6 +8,7 @@ use std::path::Path;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+use crate::compatibility_process_group::{ProcessIdentityV1, ProcessStartMarkerV1};
 use crate::compatibility_schedule::{
     EffectCapsV1, EffectClassV1, EvidencePurposeV1, ReplicationModeV1, TriggerKindV1,
     EXPECTED_SUPPORT_PROFILES,
@@ -19,6 +20,7 @@ const MAX_ID_BYTES: usize = 128;
 const MAX_TEXT_BYTES: usize = 4096;
 const MAX_ITEMS: usize = 256;
 const MAX_CANDIDATE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SUPERVISOR_DEADLINE_MS: u64 = 24 * 60 * 60 * 1_000;
 const CLAIMED_SUPPORT_READER_CASE_IDS: [&str; 2] =
     ["claude-reader-055-fable", "codex-reader-bridge-gpt56-sol"];
 
@@ -27,6 +29,177 @@ const CLAIMED_SUPPORT_READER_CASE_IDS: [&str; 2] =
 pub(super) struct FingerprintV1 {
     pub(super) schema_version: u16,
     pub(super) sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CaseDeadlineBudgetV1 {
+    pub(super) case_id: String,
+    pub(super) timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DeadlinePhaseBudgetsV1 {
+    pub(super) metadata_fetch_ms: u64,
+    pub(super) checkout_candidate_build_ms: u64,
+    pub(super) preflight_ms: u64,
+    pub(super) resolution_materialization_ms: u64,
+    pub(super) selected_cases: Vec<CaseDeadlineBudgetV1>,
+    pub(super) evidence_publication_ms: u64,
+    pub(super) cold_archive_handoff_ms: u64,
+    pub(super) cleanup_grace_ms: u64,
+    pub(super) fixed_margin_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DeadlineContainmentV1 {
+    pub(super) schedule_window_remaining_ms: u64,
+    pub(super) grant_remaining_ms: u64,
+    pub(super) time_budget_remaining_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DeadlineDerivationInputV1 {
+    pub(super) schema_version: u16,
+    pub(super) run_id: String,
+    pub(super) window_id: String,
+    pub(super) process_entry_elapsed_ms: u64,
+    pub(super) budgets: DeadlinePhaseBudgetsV1,
+    pub(super) total_bound_ms: u64,
+    pub(super) remaining_at_derivation_ms: u64,
+    pub(super) containment: DeadlineContainmentV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DeadlineDerivationV1 {
+    pub(super) schema_version: u16,
+    pub(super) input: DeadlineDerivationInputV1,
+    pub(super) derivation: FingerprintV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum OptionalProcessIdentityV1 {
+    Absent,
+    Process { value: ProcessIdentityV1 },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AnchorLifecycleV1 {
+    RetainedLive,
+    ReleasedReaped,
+    Ambiguous,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AnchoredProcessGroupRecordV1 {
+    pub(super) process_group: i32,
+    pub(super) session_id: i32,
+    pub(super) anchor: ProcessIdentityV1,
+    pub(super) workloads: Vec<ProcessIdentityV1>,
+    pub(super) anchor_lifecycle: AnchorLifecycleV1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum SupervisorPhaseV1 {
+    Prepared,
+    Running,
+    TermGrace,
+    KillJournaled,
+    Reaping,
+    Complete,
+    SafetyHold,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum SupervisorTerminalOutcomeV1 {
+    Completed,
+    Cancelled,
+    KilledAfterDeadline,
+    SafetyHold,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum OptionalSupervisorOutcomeV1 {
+    Absent,
+    Outcome { value: SupervisorTerminalOutcomeV1 },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum OptionalElapsedMsV1 {
+    Absent,
+    ElapsedMs { value: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum SafetyHoldReasonV1 {
+    AnchorAcquisitionFailed,
+    AnchorNotLive,
+    NewSessionEscape,
+    SignalJournalAmbiguous,
+    ExitUnproved,
+    StartupReconciliationIncomplete,
+    ProcessIdentityUnavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum OptionalSafetyHoldReasonV1 {
+    Absent,
+    Reason { value: SafetyHoldReasonV1 },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ChildArtifactRefV1 {
+    pub(super) record_id: String,
+    pub(super) run_id: String,
+    pub(super) window_id: String,
+    pub(super) artifact_sha256: String,
+    pub(super) aggregate_sha256: OptionalSha256V1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum OptionalChildArtifactRefV1 {
+    Absent,
+    Artifact { value: ChildArtifactRefV1 },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SupervisorRecordV1 {
+    pub(super) schema_version: u16,
+    pub(super) supervisor_record_id: String,
+    pub(super) generation: u64,
+    pub(super) previous_record: OptionalSha256V1,
+    pub(super) run_id: String,
+    pub(super) window_id: String,
+    pub(super) trigger: TriggerKindV1,
+    pub(super) deadline_derivation_sha256: String,
+    pub(super) scheduler: ProcessIdentityV1,
+    pub(super) runner: OptionalProcessIdentityV1,
+    pub(super) groups: Vec<AnchoredProcessGroupRecordV1>,
+    pub(super) container_run_labels: Vec<String>,
+    pub(super) phase: SupervisorPhaseV1,
+    pub(super) term_journal_elapsed_ms: OptionalElapsedMsV1,
+    pub(super) kill_journal_elapsed_ms: OptionalElapsedMsV1,
+    pub(super) later_group_signal_permitted: bool,
+    pub(super) outcome: OptionalSupervisorOutcomeV1,
+    pub(super) safety_hold: OptionalSafetyHoldReasonV1,
+    pub(super) child_artifact: OptionalChildArtifactRefV1,
+    pub(super) recorded_at_ms: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1226,6 +1399,64 @@ fn canonical_input_sha256<T: Serialize>(label: &str, value: &T) -> Result<String
     Ok(local_file::sha256_hex(&domain_separated))
 }
 
+pub(super) fn deadline_derivation_input_sha256(
+    value: &DeadlineDerivationInputV1,
+) -> Result<String, BoxError> {
+    let canonical = serde_json::to_vec(value).map_err(|error| {
+        format!("schedule schema: cannot canonicalize deadline derivation input: {error}")
+    })?;
+    let mut domain_separated = b"a2a-bridge:r3d1:deadline-derivation-input:v1\0".to_vec();
+    domain_separated.extend_from_slice(&canonical);
+    Ok(local_file::sha256_hex(&domain_separated))
+}
+
+fn validate_process_identity(label: &str, value: &ProcessIdentityV1) -> Result<(), BoxError> {
+    if value.pid <= 0 || value.parent_pid < 0 || value.process_group <= 0 || value.session_id <= 0 {
+        return Err(format!("schedule schema: {label} has a non-positive process identity").into());
+    }
+    match &value.start {
+        ProcessStartMarkerV1::LinuxBootTicks {
+            boot_id,
+            start_ticks,
+        } => {
+            let valid_boot = boot_id.len() == 36
+                && boot_id.bytes().enumerate().all(|(index, byte)| {
+                    if matches!(index, 8 | 13 | 18 | 23) {
+                        byte == b'-'
+                    } else {
+                        byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                    }
+                })
+                && boot_id
+                    .bytes()
+                    .any(|byte| matches!(byte, b'1'..=b'9' | b'a'..=b'f'));
+            if !valid_boot || *start_ticks == 0 {
+                return Err(
+                    format!("schedule schema: {label} has an invalid Linux start marker").into(),
+                );
+            }
+        }
+        ProcessStartMarkerV1::MacosEpochMicros {
+            seconds,
+            microseconds,
+        } => {
+            if *seconds == 0 || *microseconds >= 1_000_000 {
+                return Err(
+                    format!("schedule schema: {label} has an invalid macOS start marker").into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn optional_elapsed(value: &OptionalElapsedMsV1) -> Option<u64> {
+    match value {
+        OptionalElapsedMsV1::Absent => None,
+        OptionalElapsedMsV1::ElapsedMs { value } => Some(*value),
+    }
+}
+
 #[derive(Serialize)]
 struct SafetyHoldOpeningIdentityV1<'a> {
     schema_version: u16,
@@ -1591,6 +1822,343 @@ fn validate_authority(authority: &AdmissionAuthorityV1) -> Result<(), BoxError> 
 
 trait ValidateRecord {
     fn validate(&self) -> Result<(), BoxError>;
+}
+
+impl ValidateRecord for DeadlineDerivationV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        if self.schema_version != 1 || self.input.schema_version != 1 {
+            return Err("schedule schema: deadline derivation versions must be 1".into());
+        }
+        stable_id("deadline run id", &self.input.run_id)?;
+        stable_id("deadline window id", &self.input.window_id)?;
+        if self.input.budgets.selected_cases.len() > MAX_ITEMS {
+            return Err("schedule schema: deadline contains too many selected cases".into());
+        }
+        let mut selected = BTreeSet::new();
+        let mut total = 0_u64;
+        let mut add = |label: &str, value: u64| -> Result<(), BoxError> {
+            if value > MAX_SUPERVISOR_DEADLINE_MS {
+                return Err(
+                    format!("schedule schema: deadline {label} exceeds the hard bound").into(),
+                );
+            }
+            total = total.checked_add(value).ok_or_else(|| -> BoxError {
+                "schedule schema: deadline phase sum overflows".into()
+            })?;
+            Ok(())
+        };
+        add("metadata fetch", self.input.budgets.metadata_fetch_ms)?;
+        add(
+            "checkout/candidate build",
+            self.input.budgets.checkout_candidate_build_ms,
+        )?;
+        add("preflight", self.input.budgets.preflight_ms)?;
+        add(
+            "resolution/materialization",
+            self.input.budgets.resolution_materialization_ms,
+        )?;
+        for case in &self.input.budgets.selected_cases {
+            stable_id("deadline case id", &case.case_id)?;
+            if case.timeout_ms == 0 || !selected.insert(case.case_id.as_str()) {
+                return Err(
+                    "schedule schema: selected deadline cases must be unique with positive timeouts"
+                        .into(),
+                );
+            }
+            add("selected case", case.timeout_ms)?;
+        }
+        add(
+            "evidence publication",
+            self.input.budgets.evidence_publication_ms,
+        )?;
+        add(
+            "cold archive handoff",
+            self.input.budgets.cold_archive_handoff_ms,
+        )?;
+        if self.input.budgets.cleanup_grace_ms == 0 || self.input.budgets.fixed_margin_ms == 0 {
+            return Err(
+                "schedule schema: deadline cleanup grace and fixed margin must be positive".into(),
+            );
+        }
+        add("cleanup grace", self.input.budgets.cleanup_grace_ms)?;
+        add("fixed margin", self.input.budgets.fixed_margin_ms)?;
+        if total == 0
+            || total > MAX_SUPERVISOR_DEADLINE_MS
+            || total != self.input.total_bound_ms
+            || self.input.process_entry_elapsed_ms >= total
+            || self.input.remaining_at_derivation_ms != total - self.input.process_entry_elapsed_ms
+        {
+            return Err(
+                "schedule schema: deadline total, elapsed derivation, and remaining bound disagree"
+                    .into(),
+            );
+        }
+        let remaining = self.input.remaining_at_derivation_ms;
+        if [
+            self.input.containment.schedule_window_remaining_ms,
+            self.input.containment.grant_remaining_ms,
+            self.input.containment.time_budget_remaining_ms,
+        ]
+        .into_iter()
+        .any(|available| available < remaining)
+        {
+            return Err(
+                "schedule schema: deadline does not fit every containing authority/window budget"
+                    .into(),
+            );
+        }
+        fingerprint("deadline derivation", &self.derivation)?;
+        let expected = deadline_derivation_input_sha256(&self.input)?;
+        if self.derivation.sha256 != expected {
+            return Err("schedule schema: deadline derivation fingerprint mismatch".into());
+        }
+        Ok(())
+    }
+}
+
+impl ValidateRecord for SupervisorRecordV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        if self.schema_version != 1 || self.generation == 0 || self.recorded_at_ms <= 0 {
+            return Err(
+                "schedule schema: supervisor record must be version 1, timestamped, and generated"
+                    .into(),
+            );
+        }
+        stable_id("supervisor record id", &self.supervisor_record_id)?;
+        stable_id("supervisor run id", &self.run_id)?;
+        stable_id("supervisor window id", &self.window_id)?;
+        sha256(
+            "supervisor deadline derivation",
+            &self.deadline_derivation_sha256,
+        )?;
+        match (&self.previous_record, self.generation) {
+            (OptionalSha256V1::Absent, 1) => {}
+            (OptionalSha256V1::Sha256 { value }, generation) if generation > 1 => {
+                sha256("previous supervisor record", value)?;
+            }
+            _ => {
+                return Err(
+                    "schedule schema: supervisor generation and previous record disagree".into(),
+                )
+            }
+        }
+        validate_process_identity("scheduler", &self.scheduler)?;
+        let runner = match &self.runner {
+            OptionalProcessIdentityV1::Absent => None,
+            OptionalProcessIdentityV1::Process { value } => {
+                validate_process_identity("runner", value)?;
+                Some(value)
+            }
+        };
+        if self.groups.len() > MAX_ITEMS || self.container_run_labels.len() > MAX_ITEMS {
+            return Err(
+                "schedule schema: supervisor process/container inventory is too large".into(),
+            );
+        }
+        let mut groups = BTreeSet::new();
+        let mut identities = BTreeSet::from([(
+            self.scheduler.pid,
+            serde_json::to_string(&self.scheduler.start)?,
+        )]);
+        let mut runner_bound = runner.is_none();
+        for (index, group) in self.groups.iter().enumerate() {
+            if group.process_group <= 0
+                || group.session_id <= 0
+                || !groups.insert(group.process_group)
+            {
+                return Err(
+                    "schedule schema: supervisor groups must have unique positive identities"
+                        .into(),
+                );
+            }
+            validate_process_identity(&format!("group[{index}] anchor"), &group.anchor)?;
+            if group.anchor.process_group != group.process_group
+                || group.anchor.session_id != group.session_id
+            {
+                return Err(
+                    "schedule schema: supervisor anchor does not bind its exact group/session"
+                        .into(),
+                );
+            }
+            let anchor_key = (
+                group.anchor.pid,
+                serde_json::to_string(&group.anchor.start)?,
+            );
+            if !identities.insert(anchor_key) {
+                return Err("schedule schema: supervisor process identities must be unique".into());
+            }
+            if group.workloads.len() > MAX_ITEMS {
+                return Err("schedule schema: supervisor group has too many workloads".into());
+            }
+            for (workload_index, workload) in group.workloads.iter().enumerate() {
+                validate_process_identity(
+                    &format!("group[{index}] workload[{workload_index}]"),
+                    workload,
+                )?;
+                if workload.process_group != group.process_group
+                    || workload.session_id != group.session_id
+                {
+                    return Err(
+                        "schedule schema: supervised workload escaped its anchored group/session"
+                            .into(),
+                    );
+                }
+                let workload_key = (workload.pid, serde_json::to_string(&workload.start)?);
+                if !identities.insert(workload_key) {
+                    return Err(
+                        "schedule schema: supervisor process identities must be unique".into(),
+                    );
+                }
+                runner_bound |= runner == Some(workload);
+            }
+        }
+        if !runner_bound {
+            return Err(
+                "schedule schema: runner is not bound to an anchored workload group".into(),
+            );
+        }
+        unique_ids(
+            "container run label",
+            self.container_run_labels.iter().map(String::as_str),
+        )?;
+        let term = optional_elapsed(&self.term_journal_elapsed_ms);
+        let kill = optional_elapsed(&self.kill_journal_elapsed_ms);
+        if kill.is_some_and(|kill| term.is_none_or(|term| kill < term))
+            || term.is_some_and(|elapsed| elapsed > MAX_SUPERVISOR_DEADLINE_MS)
+            || kill.is_some_and(|elapsed| elapsed > MAX_SUPERVISOR_DEADLINE_MS)
+        {
+            return Err("schedule schema: supervisor signal journal ordering is invalid".into());
+        }
+        let outcome = match self.outcome {
+            OptionalSupervisorOutcomeV1::Absent => None,
+            OptionalSupervisorOutcomeV1::Outcome { value } => Some(value),
+        };
+        let hold = match self.safety_hold {
+            OptionalSafetyHoldReasonV1::Absent => None,
+            OptionalSafetyHoldReasonV1::Reason { value } => Some(value),
+        };
+        let child = match &self.child_artifact {
+            OptionalChildArtifactRefV1::Absent => None,
+            OptionalChildArtifactRefV1::Artifact { value } => {
+                stable_id("child artifact record id", &value.record_id)?;
+                stable_id("child artifact run id", &value.run_id)?;
+                stable_id("child artifact window id", &value.window_id)?;
+                sha256("child artifact", &value.artifact_sha256)?;
+                optional_sha256("child aggregate", &value.aggregate_sha256)?;
+                if value.run_id != self.run_id || value.window_id != self.window_id {
+                    return Err(
+                        "schedule schema: child artifact does not join the supervisor run/window"
+                            .into(),
+                    );
+                }
+                Some(value)
+            }
+        };
+        match self.phase {
+            SupervisorPhaseV1::Prepared => {
+                if runner.is_some()
+                    || term.is_some()
+                    || kill.is_some()
+                    || outcome.is_some()
+                    || hold.is_some()
+                    || child.is_some()
+                    || !self.later_group_signal_permitted
+                {
+                    return Err("schedule schema: prepared supervisor state is inconsistent".into());
+                }
+            }
+            SupervisorPhaseV1::Running => {
+                if runner.is_none()
+                    || self.groups.is_empty()
+                    || term.is_some()
+                    || kill.is_some()
+                    || outcome.is_some()
+                    || hold.is_some()
+                    || child.is_some()
+                    || !self.later_group_signal_permitted
+                {
+                    return Err("schedule schema: running supervisor state is inconsistent".into());
+                }
+            }
+            SupervisorPhaseV1::TermGrace => {
+                if runner.is_none()
+                    || term.is_none()
+                    || kill.is_some()
+                    || outcome.is_some()
+                    || hold.is_some()
+                    || !self.later_group_signal_permitted
+                {
+                    return Err(
+                        "schedule schema: TERM-grace supervisor state is inconsistent".into(),
+                    );
+                }
+            }
+            SupervisorPhaseV1::KillJournaled => {
+                if runner.is_none()
+                    || term.is_none()
+                    || kill.is_none()
+                    || outcome.is_some()
+                    || hold.is_some()
+                    || !self.later_group_signal_permitted
+                {
+                    return Err(
+                        "schedule schema: KILL-journaled supervisor state is inconsistent".into(),
+                    );
+                }
+            }
+            SupervisorPhaseV1::Reaping => {
+                if runner.is_none()
+                    || outcome.is_some()
+                    || hold.is_some()
+                    || self.later_group_signal_permitted
+                {
+                    return Err("schedule schema: reaping supervisor state is inconsistent".into());
+                }
+            }
+            SupervisorPhaseV1::Complete => {
+                let signal_shape = match outcome {
+                    Some(SupervisorTerminalOutcomeV1::Completed) => {
+                        term.is_none() && kill.is_none()
+                    }
+                    Some(SupervisorTerminalOutcomeV1::Cancelled) => term.is_some(),
+                    Some(SupervisorTerminalOutcomeV1::KilledAfterDeadline) => {
+                        term.is_some() && kill.is_some()
+                    }
+                    _ => false,
+                };
+                if !signal_shape
+                    || hold.is_some()
+                    || child.is_none()
+                    || self.later_group_signal_permitted
+                    || self
+                        .groups
+                        .iter()
+                        .any(|group| group.anchor_lifecycle != AnchorLifecycleV1::ReleasedReaped)
+                {
+                    return Err("schedule schema: complete supervisor state is inconsistent".into());
+                }
+            }
+            SupervisorPhaseV1::SafetyHold => {
+                if outcome != Some(SupervisorTerminalOutcomeV1::SafetyHold)
+                    || hold.is_none()
+                    || self.later_group_signal_permitted
+                {
+                    return Err(
+                        "schedule schema: safety-hold supervisor state is inconsistent".into(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn validate_deadline_derivation(value: &DeadlineDerivationV1) -> Result<(), BoxError> {
+    value.validate()
+}
+
+pub(super) fn validate_supervisor_record(value: &SupervisorRecordV1) -> Result<(), BoxError> {
+    value.validate()
 }
 
 impl ValidateRecord for CaseExecutionFingerprintRecordV1 {
@@ -3297,6 +3865,8 @@ pub(super) fn validate_schedule_record(kind: &str, path: &Path) -> Result<(), Bo
     let snapshot =
         local_file::read_regular_file_bounded(path, "schedule record", MAX_RECORD_BYTES)?;
     match kind {
+        "deadline-derivation" => parse_and_validate::<DeadlineDerivationV1>(&snapshot.bytes, kind),
+        "supervisor" => parse_and_validate::<SupervisorRecordV1>(&snapshot.bytes, kind),
         "case-execution-fingerprint" => {
             parse_and_validate::<CaseExecutionFingerprintRecordV1>(&snapshot.bytes, kind)
         }
@@ -3501,6 +4071,197 @@ mod tests {
             retry_cap: 0,
             fallback_cap: 0,
         }
+    }
+
+    fn process_identity_value(pid: i32, process_group: i32) -> ProcessIdentityV1 {
+        ProcessIdentityV1 {
+            pid,
+            parent_pid: 1,
+            process_group,
+            session_id: 41,
+            start: ProcessStartMarkerV1::LinuxBootTicks {
+                boot_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+                start_ticks: pid as u64 * 10,
+            },
+        }
+    }
+
+    fn deadline_derivation() -> DeadlineDerivationV1 {
+        let input = DeadlineDerivationInputV1 {
+            schema_version: 1,
+            run_id: "run-1".into(),
+            window_id: "window-1".into(),
+            process_entry_elapsed_ms: 5,
+            budgets: DeadlinePhaseBudgetsV1 {
+                metadata_fetch_ms: 10,
+                checkout_candidate_build_ms: 20,
+                preflight_ms: 30,
+                resolution_materialization_ms: 40,
+                selected_cases: vec![CaseDeadlineBudgetV1 {
+                    case_id: "case-1".into(),
+                    timeout_ms: 50,
+                }],
+                evidence_publication_ms: 60,
+                cold_archive_handoff_ms: 0,
+                cleanup_grace_ms: 70,
+                fixed_margin_ms: 80,
+            },
+            total_bound_ms: 360,
+            remaining_at_derivation_ms: 355,
+            containment: DeadlineContainmentV1 {
+                schedule_window_remaining_ms: 355,
+                grant_remaining_ms: 400,
+                time_budget_remaining_ms: 500,
+            },
+        };
+        let sha256 = deadline_derivation_input_sha256(&input).unwrap();
+        DeadlineDerivationV1 {
+            schema_version: 1,
+            input,
+            derivation: FingerprintV1 {
+                schema_version: 1,
+                sha256,
+            },
+        }
+    }
+
+    fn completed_supervisor() -> SupervisorRecordV1 {
+        let anchor = process_identity_value(43, 43);
+        SupervisorRecordV1 {
+            schema_version: 1,
+            supervisor_record_id: "supervisor-1".into(),
+            generation: 4,
+            previous_record: OptionalSha256V1::Sha256 { value: digest('9') },
+            run_id: "run-1".into(),
+            window_id: "window-1".into(),
+            trigger: TriggerKindV1::Daily,
+            deadline_derivation_sha256: deadline_derivation().derivation.sha256,
+            scheduler: process_identity_value(42, 42),
+            runner: OptionalProcessIdentityV1::Process {
+                value: process_identity_value(44, 43),
+            },
+            groups: vec![AnchoredProcessGroupRecordV1 {
+                process_group: 43,
+                session_id: 41,
+                anchor,
+                workloads: vec![process_identity_value(44, 43)],
+                anchor_lifecycle: AnchorLifecycleV1::ReleasedReaped,
+            }],
+            container_run_labels: vec!["a2a-compat-run-1".into()],
+            phase: SupervisorPhaseV1::Complete,
+            term_journal_elapsed_ms: OptionalElapsedMsV1::Absent,
+            kill_journal_elapsed_ms: OptionalElapsedMsV1::Absent,
+            later_group_signal_permitted: false,
+            outcome: OptionalSupervisorOutcomeV1::Outcome {
+                value: SupervisorTerminalOutcomeV1::Completed,
+            },
+            safety_hold: OptionalSafetyHoldReasonV1::Absent,
+            child_artifact: OptionalChildArtifactRefV1::Artifact {
+                value: ChildArtifactRefV1 {
+                    record_id: "aggregate-1".into(),
+                    run_id: "run-1".into(),
+                    window_id: "window-1".into(),
+                    artifact_sha256: digest('a'),
+                    aggregate_sha256: OptionalSha256V1::Sha256 { value: digest('b') },
+                },
+            },
+            recorded_at_ms: 100,
+        }
+    }
+
+    #[test]
+    fn deadline_derivation_checks_sum_elapsed_containment_and_hash() {
+        let valid = deadline_derivation();
+        valid.validate().unwrap();
+
+        let mut wrong_sum = valid.clone();
+        wrong_sum.input.total_bound_ms += 1;
+        assert!(wrong_sum.validate().is_err());
+
+        let mut consumed = valid.clone();
+        consumed.input.process_entry_elapsed_ms = consumed.input.total_bound_ms;
+        consumed.input.remaining_at_derivation_ms = 0;
+        assert!(consumed.validate().is_err());
+
+        let mut short_window = valid.clone();
+        short_window.input.containment.schedule_window_remaining_ms = 354;
+        assert!(short_window.validate().is_err());
+
+        let mut duplicate_case = valid;
+        duplicate_case
+            .input
+            .budgets
+            .selected_cases
+            .push(duplicate_case.input.budgets.selected_cases[0].clone());
+        assert!(duplicate_case.validate().is_err());
+    }
+
+    #[test]
+    fn deadline_derivation_rejects_overflow_and_hidden_absence_allowance() {
+        let mut overflow = deadline_derivation();
+        overflow.input.budgets.metadata_fetch_ms = u64::MAX;
+        assert!(overflow.validate().is_err());
+
+        let mut zero_case = deadline_derivation();
+        zero_case.input.budgets.selected_cases[0].timeout_ms = 0;
+        assert!(zero_case.validate().is_err());
+
+        let mut explicit_absence = deadline_derivation();
+        explicit_absence.input.budgets.cold_archive_handoff_ms = 1;
+        explicit_absence.input.total_bound_ms += 1;
+        explicit_absence.input.remaining_at_derivation_ms += 1;
+        explicit_absence
+            .input
+            .containment
+            .schedule_window_remaining_ms += 1;
+        explicit_absence.derivation.sha256 =
+            deadline_derivation_input_sha256(&explicit_absence.input).unwrap();
+        explicit_absence.validate().unwrap();
+    }
+
+    #[test]
+    fn supervisor_terminal_state_requires_exact_child_join_and_released_anchors() {
+        let valid = completed_supervisor();
+        valid.validate().unwrap();
+
+        let mut wrong_window = valid.clone();
+        let OptionalChildArtifactRefV1::Artifact { value } = &mut wrong_window.child_artifact
+        else {
+            unreachable!()
+        };
+        value.window_id = "other-window".into();
+        assert!(wrong_window.validate().is_err());
+
+        let mut retained = valid.clone();
+        retained.groups[0].anchor_lifecycle = AnchorLifecycleV1::RetainedLive;
+        assert!(retained.validate().is_err());
+
+        let mut later_signal = valid;
+        later_signal.later_group_signal_permitted = true;
+        assert!(later_signal.validate().is_err());
+    }
+
+    #[test]
+    fn supervisor_hold_requires_reason_and_forbids_numeric_group_retry() {
+        let mut held = completed_supervisor();
+        held.phase = SupervisorPhaseV1::SafetyHold;
+        held.outcome = OptionalSupervisorOutcomeV1::Outcome {
+            value: SupervisorTerminalOutcomeV1::SafetyHold,
+        };
+        held.safety_hold = OptionalSafetyHoldReasonV1::Reason {
+            value: SafetyHoldReasonV1::SignalJournalAmbiguous,
+        };
+        held.child_artifact = OptionalChildArtifactRefV1::Absent;
+        held.groups[0].anchor_lifecycle = AnchorLifecycleV1::Ambiguous;
+        held.validate().unwrap();
+
+        held.later_group_signal_permitted = true;
+        assert!(held.validate().is_err());
+
+        let mut missing_reason = held;
+        missing_reason.later_group_signal_permitted = false;
+        missing_reason.safety_hold = OptionalSafetyHoldReasonV1::Absent;
+        assert!(missing_reason.validate().is_err());
     }
 
     fn aggregate_caps(attempts: u64) -> AggregateBudgetCapsV1 {

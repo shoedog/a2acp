@@ -5,7 +5,10 @@
   `983398427c9f04861a2f1da501a7650c4a1cdd80` by PR #33; R3d design is **APPROVED / MERGED**
   at exact design head `b54840a017b87521677f1f95c3f7be69de55361d` by PR #37, merge
   `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is
-  **RELEASE/COMPATIBILITY APPROVED / PR READY** on
+  **MERGED** by PR #38 at merge commit `c2d147fb1f0df275f3c6452cdd212e185c002d08`. R3d1 is
+  **IN REVIEW** on `agent/reliability-r3d1-supervisor`; its focused restart plan is
+  [`2026-07-19-r3d1-supervisor-signal-parity.md`](2026-07-19-r3d1-supervisor-signal-parity.md).
+  The merged R3d0 implementation was
   `agent/reliability-r3d0-foundation`: the fourth closure review approved exact cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test commit
   `e771067f4a7e742ad813368f01018b011e86bbce` isolates its sole nonblocking `SMELL`; exact
@@ -2665,8 +2668,10 @@ Rollback does not revert evidence, erase ledger charges, delete pins/tombstones,
 operator, or run missed windows on re-enable. The last reviewed immutable scheduler binary remains the code
 rollback target. Any code revert is a normal reviewed PR.
 
-**Restart point:** continue R3d0 from branch `agent/reliability-r3d0-foundation` based on merged main
-`6eeea6ce`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
+**Restart point:** continue R3d1 from `/private/tmp/a2a-bridge-r3d1-supervisor` on branch
+`agent/reliability-r3d1-supervisor`, based on merged R3d0 main
+`c2d147fb1f0df275f3c6452cdd212e185c002d08`. The initial exact-base Fable review plus
+exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
 exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, exact-`c50811f`, and
 exact-`fb8a2f4`, exact-`ae9db39`, exact-`2eb242a`, exact-`8dc6054`, exact-`cc01a52`, and exact-`b54840a`
 Sol reviews are retained at the paths/hashes above.
@@ -2679,9 +2684,10 @@ one `WRONG`/zero new `SMELL`; seventh-closure zero new `WRONG`/one `SMELL`; and 
 `SMELL`; thirteenth-closure one inherited `PARTIAL`/zero new findings; and fourteenth-closure one inherited
 `FIXED`/zero new findings are folded into D1-D10 and the slices/gates above. The fourteenth closure found no
 regression, required no amendment, and returned `R3D DESIGN: APPROVE` at exact `b54840a`. All D1-D10 owner
-decisions were approved on 2026-07-17. PR #37 merged the approved design at `6eeea6ce`. R3d0 now owns only
-the checked-in non-authoritative policy, complete profile inventory, proposed advisory configs, canonical
-identity and inert record schemas/validators, plus routing/foundation docs. Exact implementation commit
+decisions were approved on 2026-07-17. PR #37 merged the approved design at `6eeea6ce`. R3d0 delivered the
+checked-in non-authoritative policy, complete profile inventory, proposed advisory configs, canonical identity,
+inert record schemas/validators, and routing/foundation docs; PR #38 merged it at `c2d147fb`. Exact implementation
+commit
 `e7e5fa1` received a bridge-mediated Sol/xhigh/read-only review with eleven `WRONG`, two `SMELL`, and
 `R3D0 IMPLEMENTATION: REVISE`; its retained report is
 `/private/tmp/a2a-bridge-r3d0-sol-review-e7e5fa1/review.md`, SHA-256
@@ -2741,9 +2747,11 @@ lens retained at `/private/tmp/a2a-bridge-r3d0-opus-lens/review.md`, SHA-256
 `f7a8e55f540ec9dd318b2f788c6d05f61f1641cff6b8f5851b271b64dafe0a64`; it found no `WRONG`, four
 nonblocking `SMELL`, required no pre-PR remediation, and returned `R3D0 RELEASE/COMPATIBILITY: APPROVE`.
 The deterministic owner-host validator and release-artifact check reconciled S4's stale prompt hashes to the
-branch's documented values; S1-S3 remain accepted intentional constraints. Publish the non-draft R3d0 PR; let
-GitHub gates run; do not merge until those gates are green and the owner directs the merge. Preserve R3c/R4
-inputs and keep R2f operator lifecycle work out of R3d.
+branch's documented values; S1-S3 remain accepted intentional constraints. R3d1 now implements only the
+default-off exact-identity supervisor/signal mechanism and typed no-effects parent boundary. Its focused and full
+deterministic gates are green; freeze the exact candidate, run the required Sol/xhigh implementation review, then
+the single design-approved Fable/xhigh implementation/release lens only after Sol approval. Preserve R3c/R4 inputs,
+keep R2f operator lifecycle work out of R3d, and never touch the long-lived operator lifecycle from this slice.
 
 ## R3e — OpenRouter provider expansion
 

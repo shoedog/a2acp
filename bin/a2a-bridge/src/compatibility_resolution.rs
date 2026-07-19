@@ -14,6 +14,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+use crate::compatibility_process_group::{
+    AnchorDropPolicy, AnchoredGroupSignal, AnchoredProcessGroup,
+};
 use crate::{compatibility, local_file, BoxError};
 
 pub(super) const DEFAULT_RECIPES: &str = "compatibility/floating-current.toml";
@@ -2130,87 +2133,17 @@ fn set_child_file_size_limit(command: &mut std::process::Command, max_bytes: u64
 }
 
 #[cfg(unix)]
-struct CommandProcessGroupGuard {
-    process_group: Option<libc::pid_t>,
-    anchor: Option<tokio::process::Child>,
-    anchor_stdin: Option<tokio::process::ChildStdin>,
-}
-
-#[cfg(unix)]
-impl CommandProcessGroupGuard {
-    fn start() -> Result<Self, ()> {
-        use std::os::unix::process::CommandExt as _;
-
-        // A live, bridge-owned leader keeps the process-group identity allocated until cleanup.
-        // Without it, reaping a short-lived resolver can free the PGID before the later group kill,
-        // allowing that kill to hit an unrelated resolver that received the recycled identity.
-        let mut command = tokio::process::Command::new("/bin/cat");
-        command
-            .current_dir("/")
-            .env_clear()
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        command.as_std_mut().process_group(0);
-        let mut anchor = command.spawn().map_err(|_| ())?;
-        let process_group = anchor.id().ok_or(())?;
-        let process_group = libc::pid_t::try_from(process_group).map_err(|_| ())?;
-        if process_group <= 0 {
-            return Err(());
-        }
-        let anchor_stdin = anchor.stdin.take().ok_or(())?;
-        Ok(Self {
-            process_group: Some(process_group),
-            anchor: Some(anchor),
-            anchor_stdin: Some(anchor_stdin),
-        })
-    }
-
-    fn id(&self) -> Result<libc::pid_t, ()> {
-        self.process_group.ok_or(())
-    }
-
-    fn kill(&self) {
-        let Some(process_group) = self.process_group else {
-            return;
-        };
-        // SAFETY: every real resolver command joins the fresh group led by the retained anchor.
-        // Negating that positive anchor pid targets only the resolver-owned group.
-        unsafe {
-            libc::kill(-process_group, libc::SIGKILL);
-        }
-    }
-
-    async fn settle(&mut self) {
-        // Keep the anchor alive while targeting the group, then reap it before releasing the PGID.
-        // Closing stdin is also sufficient if the signal raced with anchor startup.
-        self.kill();
-        self.anchor_stdin.take();
-        if let Some(mut anchor) = self.anchor.take() {
-            let _ = anchor.wait().await;
-        }
-        self.process_group = None;
-    }
-}
-
-#[cfg(unix)]
-impl Drop for CommandProcessGroupGuard {
-    fn drop(&mut self) {
-        // Async cancellation drops this guard. Killing the resolver-owned group synchronously here
-        // prevents grandchildren from surviving while Child::kill_on_drop handles the direct child.
-        self.kill();
-    }
-}
-
-#[cfg(unix)]
 async fn terminate_command_process_group(
     child: &mut tokio::process::Child,
-    process_group: &mut CommandProcessGroupGuard,
+    process_group: &mut AnchoredProcessGroup,
 ) {
-    process_group.kill();
+    if process_group.signal(AnchoredGroupSignal::Kill).is_err() {
+        // The direct tokio Child still identifies the exact spawned process. If anchor identity
+        // verification fails, kill only that child and never fall back to a stale numeric PGID.
+        let _ = child.start_kill();
+    }
     let _ = child.wait().await;
-    process_group.settle().await;
+    let _ = process_group.release_and_reap().await;
 }
 
 async fn execute_bounded_command(
@@ -2264,13 +2197,11 @@ async fn execute_bounded_command(
             .npm_limits
             .as_ref()
             .map(|_| NpmBudgetWatchGuard::start(spec.clone()));
-        let mut process_group = CommandProcessGroupGuard::start()
-            .map_err(|()| spec.failure_code(CommandFailure::Spawn))?;
-        command.as_std_mut().process_group(
-            process_group
-                .id()
-                .map_err(|()| spec.failure_code(CommandFailure::Spawn))?,
-        );
+        let mut process_group = AnchoredProcessGroup::start_leader(AnchorDropPolicy::KillGroup)
+            .map_err(|_| spec.failure_code(CommandFailure::Spawn))?;
+        command
+            .as_std_mut()
+            .process_group(process_group.process_group());
         let mut child = command
             .spawn()
             .map_err(|_| spec.failure_code(CommandFailure::Spawn))?;
@@ -9890,8 +9821,8 @@ addr = "127.0.0.1:8080"
     async fn process_group_identity_remains_owned_after_the_resolver_leader_is_reaped() {
         use std::os::unix::process::CommandExt as _;
 
-        let mut guard = CommandProcessGroupGuard::start().unwrap();
-        let process_group = guard.id().unwrap();
+        let mut guard = AnchoredProcessGroup::start_leader(AnchorDropPolicy::KillGroup).unwrap();
+        let process_group = guard.process_group();
         let mut command = tokio::process::Command::new("/usr/bin/true");
         command.as_std_mut().process_group(process_group);
         let mut child = command.spawn().unwrap();
@@ -9900,7 +9831,8 @@ addr = "127.0.0.1:8080"
         // SAFETY: signal zero only probes whether the positive process-group identity is still
         // occupied; it does not deliver a signal.
         assert_eq!(unsafe { libc::kill(-process_group, 0) }, 0);
-        guard.settle().await;
+        guard.signal(AnchoredGroupSignal::Kill).unwrap();
+        guard.release_and_reap().await.unwrap();
     }
 
     #[cfg(unix)]

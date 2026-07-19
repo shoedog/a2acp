@@ -5,6 +5,31 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[test]
+fn schedule_tick_is_recognized_but_refuses_before_provider_capable_spawn() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("provider-spawned");
+    let trap = directory.path().join("codex");
+    fs::write(&trap, format!("#!/bin/sh\n: > {:?}\nexit 99\n", marker)).unwrap();
+    fs::set_permissions(&trap, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+        .arg("compatibility")
+        .arg("schedule-tick")
+        .env("PATH", directory.path())
+        .env("OPENAI_API_KEY", "must-not-be-read")
+        .env("ANTHROPIC_API_KEY", "must-not-be-read")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("r3d2_authority_admission_not_implemented"));
+    assert!(stderr.contains("no_effects"));
+    assert!(!stderr.contains("must-not-be-read"));
+    assert!(!marker.exists(), "schedule-tick spawned the provider trap");
+}
+
 fn write_manifest(dir: &Path) -> PathBuf {
     let manifest = dir.join("manifest.toml");
     fs::write(

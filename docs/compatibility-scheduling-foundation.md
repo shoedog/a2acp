@@ -70,12 +70,25 @@ a2a-bridge compatibility validate --schedule-record <kind> /absolute/path/to/rec
 
 Supported kinds are:
 
+- supervision: `deadline-derivation`, `supervisor`;
 - canonical identities: `case-execution-fingerprint`, `admission-attempt-fingerprint`;
 - authority and controls: `characterization-authorization`, `provider-effect-grant`, `manual-admission`,
   `storage-consent`, `characterization`, `safety-hold`, `quarantine`, `failure-disposition`;
 - classification and accounting: `impact`, `ledger`, `equivalent-work`, `consumption`;
 - sealed sources and evidence: `scheduled-source`, `claimed-support-characterization-source`,
   `schedule-sidecar`, `publication-outbox`, `evidence-index`, `status`, `routing`.
+
+The R3d1 deadline record binds one checked sum of metadata, build, preflight, resolution/materialization,
+per-selected-case, publication, cold-handoff, cleanup-grace, and fixed-margin maxima to the elapsed time since
+the process-entry monotonic origin. The record refuses overflow, a consumed deadline, duplicate/zero case
+timeouts, or a schedule/grant/accounting window shorter than the remaining hard bound. The R3d1 supervisor
+record binds exact PID/start/parent/group/session identities, retained-anchor lifecycle, journaled TERM/KILL
+ordering, the no-later-group-signal mark, safety holds, exact container run labels, and the child artifact's
+run/window/hash join. The standalone `supervisor` validator checks one snapshot. The runtime journal additionally
+requires a prepared generation 1, a contiguous hash chain, strictly advancing record time, an explicit monotonic
+phase graph, immutable run/deadline/scheduler/container identity, append-only exact groups, one-way anchor
+lifecycle, and write-once signal/artifact/outcome fields both on append and startup reopen. These schemas and
+journal checks do not themselves authorize or execute work.
 
 All records are versioned, deny unknown fields, raw-scan every decoded object key and string for secret-shaped
 material, and use bounded local file reads. Git object identities are non-null tagged SHA-1/SHA-256 object IDs rather than
