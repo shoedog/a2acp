@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::compatibility_schedule::{
     load_schedule_foundation, EffectCapsV1, EffectClassV1, EvidencePurposeV1,
-    FoundationProfileBindingV1, TriggerKindV1,
+    FoundationProfileBindingV1, LoadedScheduleFoundation, TriggerKindV1,
 };
 use crate::compatibility_schedule_schema::{
     AdmissionAttemptFingerprintRecordV1, AdmissionAuthorityV1, CaseExecutionFingerprintRecordV1,
@@ -231,13 +231,20 @@ pub(super) fn validate_scheduled_execution_source(
     foundation_root: &Path,
     value: &ScheduledExecutionSourceV1,
 ) -> Result<(), BoxError> {
+    let foundation = load_schedule_foundation(foundation_root)?;
+    validate_scheduled_execution_source_against_foundation(&foundation, value)
+}
+
+pub(super) fn validate_scheduled_execution_source_against_foundation(
+    foundation: &LoadedScheduleFoundation,
+    value: &ScheduledExecutionSourceV1,
+) -> Result<(), BoxError> {
     value.validate()?;
     if value.source_sha256 != scheduled_execution_source_sha256(value)? {
         return Err(
             "schedule authority: scheduled source is noncanonical or has a stale hash".into(),
         );
     }
-    let foundation = load_schedule_foundation(foundation_root)?;
     let binding = foundation
         .scheduled_profiles
         .get(&value.source.row_id)
@@ -307,13 +314,20 @@ pub(super) fn validate_claimed_support_characterization_source(
     foundation_root: &Path,
     value: &ClaimedSupportCharacterizationSourceV1,
 ) -> Result<(), BoxError> {
+    let foundation = load_schedule_foundation(foundation_root)?;
+    validate_claimed_support_characterization_source_against_foundation(&foundation, value)
+}
+
+pub(super) fn validate_claimed_support_characterization_source_against_foundation(
+    foundation: &LoadedScheduleFoundation,
+    value: &ClaimedSupportCharacterizationSourceV1,
+) -> Result<(), BoxError> {
     value.validate()?;
     if value.source_sha256 != claimed_support_source_sha256(value)? {
         return Err(
             "schedule authority: claimed-support source is noncanonical or has a stale hash".into(),
         );
     }
-    let foundation = load_schedule_foundation(foundation_root)?;
     let binding = foundation
         .claimed_support_profiles
         .get(&value.source.row_id)
@@ -393,6 +407,8 @@ pub(super) struct ManualAdmissionBindingsV1 {
     pub(super) environment_owner: String,
     pub(super) scheduler_binary_sha256: String,
     pub(super) input_source_sha256: String,
+    pub(super) case_id: String,
+    pub(super) provider_family: String,
     pub(super) characterization_profile: crate::compatibility_schedule_schema::FingerprintV1,
     pub(super) case_execution: crate::compatibility_schedule_schema::FingerprintV1,
     pub(super) evidence_purpose: EvidencePurposeV1,
@@ -489,6 +505,8 @@ pub(super) fn derive_manual_admission<N: ManualNonceSource + ?Sized>(
         environment_owner: bindings.environment_owner,
         scheduler_binary_sha256: bindings.scheduler_binary_sha256,
         input_source_sha256: bindings.input_source_sha256,
+        case_id: bindings.case_id,
+        provider_family: bindings.provider_family,
         characterization_profile: bindings.characterization_profile,
         case_execution: bindings.case_execution,
         evidence_purpose: bindings.evidence_purpose,
@@ -2051,6 +2069,8 @@ mod tests {
             environment_owner: "wesley-macbook".into(),
             scheduler_binary_sha256: digest('3'),
             input_source_sha256: digest('4'),
+            case_id: "case-1".into(),
+            provider_family: "provider-1".into(),
             characterization_profile: fingerprint('5'),
             case_execution: fingerprint('6'),
             evidence_purpose: EvidencePurposeV1::ManualDiagnostic,
@@ -2379,6 +2399,13 @@ mod tests {
         let mut mutated = sealed.clone();
         mutated.record.input_source_sha256 = digest('9');
         assert!(validate_sealed_manual_admission(&mutated).is_err());
+
+        let mut relabeled = sealed.clone();
+        relabeled.record.case_id = "different-case".into();
+        assert!(validate_sealed_manual_admission(&relabeled).is_err());
+        let mut reprovided = sealed.clone();
+        reprovided.record.provider_family = "different-provider".into();
+        assert!(validate_sealed_manual_admission(&reprovided).is_err());
 
         let mut characterization = manual_bindings();
         characterization.evidence_purpose = EvidencePurposeV1::Characterization;

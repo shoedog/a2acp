@@ -89,6 +89,15 @@ pub(super) trait AuthorityStateCapability {
     fn authority_directory(&self) -> &PinnedDirectory;
 }
 
+/// Capability for state that participates in the single owner-wide admission transaction.
+/// It is deliberately implemented only by guards that retain the owner admission lock.
+#[allow(dead_code)] // Admission/supervisor journals are wired together in R3d2e.
+pub(super) trait AdmissionStateCapability {
+    fn admission_directory(&self) -> &PinnedDirectory;
+    fn ledger_directory(&self) -> &PinnedDirectory;
+    fn supervisor_directory(&self) -> &PinnedDirectory;
+}
+
 fn invalid(error: impl std::fmt::Display) -> SchedulerStateError {
     SchedulerStateError::Invalid(error.to_string())
 }
@@ -430,6 +439,20 @@ impl OwnerAdmissionLock {
     }
 }
 
+impl AdmissionStateCapability for OwnerAdmissionLock {
+    fn admission_directory(&self) -> &PinnedDirectory {
+        &self.inner.admission
+    }
+
+    fn ledger_directory(&self) -> &PinnedDirectory {
+        &self.inner.ledger
+    }
+
+    fn supervisor_directory(&self) -> &PinnedDirectory {
+        &self.inner.supervisor
+    }
+}
+
 impl Drop for OwnerAdmissionLock {
     fn drop(&mut self) {
         // SAFETY: this guard uniquely owns the locked descriptor.
@@ -453,6 +476,20 @@ impl Drop for AdmissionAuthorityLocks {
 impl AuthorityStateCapability for AdmissionAuthorityLocks {
     fn authority_directory(&self) -> &PinnedDirectory {
         &self._owner.inner.authority
+    }
+}
+
+impl AdmissionStateCapability for AdmissionAuthorityLocks {
+    fn admission_directory(&self) -> &PinnedDirectory {
+        &self._owner.inner.admission
+    }
+
+    fn ledger_directory(&self) -> &PinnedDirectory {
+        &self._owner.inner.ledger
+    }
+
+    fn supervisor_directory(&self) -> &PinnedDirectory {
+        &self._owner.inner.supervisor
     }
 }
 

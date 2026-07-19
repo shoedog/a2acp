@@ -573,6 +573,8 @@ pub(super) struct ManualAdmissionV1 {
     pub(super) environment_owner: String,
     pub(super) scheduler_binary_sha256: String,
     pub(super) input_source_sha256: String,
+    pub(super) case_id: String,
+    pub(super) provider_family: String,
     pub(super) characterization_profile: FingerprintV1,
     pub(super) case_execution: FingerprintV1,
     pub(super) evidence_purpose: EvidencePurposeV1,
@@ -810,6 +812,10 @@ pub(super) struct LedgerReservationV1 {
     pub(super) reservation_id: String,
     pub(super) attempt_idempotency_key: String,
     pub(super) accounting_class: AccountingClassV1,
+    pub(super) case_id: String,
+    pub(super) provider_family: String,
+    pub(super) trigger: TriggerKindV1,
+    pub(super) accounting_policy_sha256: String,
     pub(super) characterization_profile: FingerprintV1,
     pub(super) case_execution: FingerprintV1,
     pub(super) admission_attempt: FingerprintV1,
@@ -829,6 +835,7 @@ pub(super) struct LedgerReservationV1 {
 pub(super) struct LedgerReconciliationV1 {
     pub(super) schema_version: u16,
     pub(super) reservation_id: String,
+    pub(super) reservation_sha256: String,
     pub(super) characterization_profile: FingerprintV1,
     pub(super) case_execution: FingerprintV1,
     pub(super) admission_attempt: FingerprintV1,
@@ -836,6 +843,7 @@ pub(super) struct LedgerReconciliationV1 {
     pub(super) equivalent_work_key: String,
     pub(super) terminal_evidence_sha256: String,
     pub(super) disposition: LedgerDispositionV1,
+    pub(super) reason_code: String,
     pub(super) charged_usage: UsageChargeV1,
     pub(super) prompt_may_have_been_accepted: bool,
     pub(super) reconciled_at_ms: i64,
@@ -2686,6 +2694,8 @@ impl ValidateRecord for ManualAdmissionV1 {
         stable_id("manual environment owner", &self.environment_owner)?;
         sha256("scheduler binary", &self.scheduler_binary_sha256)?;
         sha256("manual input source", &self.input_source_sha256)?;
+        stable_id("manual case id", &self.case_id)?;
+        stable_id("manual provider family", &self.provider_family)?;
         fingerprint("manual profile", &self.characterization_profile)?;
         fingerprint("manual execution", &self.case_execution)?;
         stable_id("manual freshness bucket", &self.freshness_bucket)?;
@@ -3084,6 +3094,9 @@ impl ValidateRecord for LedgerRecordV1 {
                 }
                 stable_id("ledger reservation id", &value.reservation_id)?;
                 sha256("attempt idempotency key", &value.attempt_idempotency_key)?;
+                stable_id("ledger case id", &value.case_id)?;
+                stable_id("ledger provider family", &value.provider_family)?;
+                sha256("ledger accounting policy", &value.accounting_policy_sha256)?;
                 fingerprint("ledger profile", &value.characterization_profile)?;
                 fingerprint("ledger execution", &value.case_execution)?;
                 fingerprint("ledger admission attempt", &value.admission_attempt)?;
@@ -3105,12 +3118,14 @@ impl ValidateRecord for LedgerRecordV1 {
                     );
                 }
                 stable_id("ledger reservation id", &value.reservation_id)?;
+                sha256("ledger reservation", &value.reservation_sha256)?;
                 fingerprint("reconciled profile", &value.characterization_profile)?;
                 fingerprint("reconciled execution", &value.case_execution)?;
                 fingerprint("reconciled admission", &value.admission_attempt)?;
                 validate_authority(&value.authority)?;
                 sha256("reconciled equivalent-work key", &value.equivalent_work_key)?;
                 sha256("terminal evidence", &value.terminal_evidence_sha256)?;
+                stable_id("ledger reconciliation reason", &value.reason_code)?;
                 let usage = &value.charged_usage;
                 if usage.attempts > 1
                     || usage.tokens > 1_000_000
@@ -5235,6 +5250,8 @@ mod tests {
             environment_owner: "wesley-macbook".into(),
             scheduler_binary_sha256: digest('a'),
             input_source_sha256: digest('b'),
+            case_id: "case-1".into(),
+            provider_family: "provider-1".into(),
             characterization_profile: fingerprint_value('c'),
             case_execution: fingerprint_value('d'),
             evidence_purpose: EvidencePurposeV1::ManualDiagnostic,
@@ -5250,6 +5267,9 @@ mod tests {
             expires_at_ms: 2,
         };
         manual.validate().unwrap();
+        let mut missing_dimension = manual.clone();
+        missing_dimension.case_id.clear();
+        assert!(missing_dimension.validate().is_err());
         let mut arbitrary = serde_json::to_value(&manual).unwrap();
         arbitrary["command"] = serde_json::json!("implement");
         assert!(serde_json::from_value::<ManualAdmissionV1>(arbitrary).is_err());
@@ -5292,6 +5312,7 @@ mod tests {
         let mut reconciliation = LedgerRecordV1::Reconciliation(LedgerReconciliationV1 {
             schema_version: 1,
             reservation_id: "reservation-1".into(),
+            reservation_sha256: digest('9'),
             characterization_profile: fingerprint_value('a'),
             case_execution: fingerprint_value('b'),
             admission_attempt: fingerprint_value('c'),
@@ -5299,6 +5320,7 @@ mod tests {
             equivalent_work_key: digest('d'),
             terminal_evidence_sha256: digest('e'),
             disposition: LedgerDispositionV1::ReleasedPreEffect,
+            reason_code: "proved-pre-effect".into(),
             charged_usage: UsageChargeV1 {
                 attempts: 0,
                 tokens: 0,
@@ -5370,6 +5392,10 @@ mod tests {
             reservation_id: "reservation-1".into(),
             attempt_idempotency_key: digest('a'),
             accounting_class: AccountingClassV1::Scheduled,
+            case_id: "case-1".into(),
+            provider_family: "provider-1".into(),
+            trigger: TriggerKindV1::Daily,
+            accounting_policy_sha256: digest('9'),
             characterization_profile: fingerprint_value('b'),
             case_execution: fingerprint_value('c'),
             admission_attempt: fingerprint_value('d'),

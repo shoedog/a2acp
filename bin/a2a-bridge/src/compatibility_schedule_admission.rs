@@ -11,14 +11,18 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::compatibility_schedule::{load_schedule_foundation, EvidencePurposeV1, TriggerKindV1};
+use crate::compatibility_schedule::{
+    load_schedule_foundation, EvidencePurposeV1, LoadedScheduleFoundation, TriggerKindV1,
+};
 use crate::compatibility_schedule_authority::{
-    characterization_record_sha256, validate_claimed_support_characterization_source,
-    validate_scheduled_execution_source, validate_sealed_manual_admission, SealedManualAdmissionV1,
+    characterization_record_sha256,
+    validate_claimed_support_characterization_source_against_foundation,
+    validate_scheduled_execution_source_against_foundation, validate_sealed_manual_admission,
+    SealedManualAdmissionV1,
 };
 use crate::compatibility_schedule_schema::{
     safety_hold_clearance_action_sha256, safety_hold_opening_sha256,
-    seal_admission_attempt_fingerprint, seal_case_execution_fingerprint,
+    seal_admission_attempt_fingerprint, seal_case_execution_fingerprint, AccountingClassV1,
     AdmissionAttemptFingerprintInputV1, AdmissionAttemptFingerprintRecordV1, AdmissionAuthorityV1,
     AdmissionTriggerIdentityV1, CaseExecutionFingerprintInputV1, CaseExecutionFingerprintRecordV1,
     CharacterizationOutcomeV1, CharacterizationRecordV1, ClaimedSupportCharacterizationSourceV1,
@@ -112,6 +116,14 @@ pub(super) struct DerivedAdmissionIdentitiesV1 {
     pub(super) freshness_bucket: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DerivedLedgerAdmissionContextV1 {
+    pub(super) identities: DerivedAdmissionIdentitiesV1,
+    pub(super) accounting_class: AccountingClassV1,
+    pub(super) case_id: String,
+    pub(super) provider_family: String,
+}
+
 fn derive_admission_identities(
     expected_profile: &FingerprintV1,
     case_execution_input: CaseExecutionFingerprintInputV1,
@@ -157,8 +169,19 @@ pub(super) fn rederive_scheduled_identities(
     source: &ScheduledExecutionSourceV1,
     freshness_bucket: String,
 ) -> Result<DerivedAdmissionIdentitiesV1, BoxError> {
-    validate_scheduled_execution_source(foundation_root, source)?;
     let foundation = load_schedule_foundation(foundation_root)?;
+    Ok(
+        rederive_scheduled_ledger_context_from_foundation(&foundation, source, freshness_bucket)?
+            .identities,
+    )
+}
+
+fn rederive_scheduled_ledger_context_from_foundation(
+    foundation: &LoadedScheduleFoundation,
+    source: &ScheduledExecutionSourceV1,
+    freshness_bucket: String,
+) -> Result<DerivedLedgerAdmissionContextV1, BoxError> {
+    validate_scheduled_execution_source_against_foundation(foundation, source)?;
     let binding = foundation
         .scheduled_profiles
         .get(&source.source.row_id)
@@ -181,7 +204,29 @@ pub(super) fn rederive_scheduled_identities(
     {
         return Err("schedule admission: scheduled source fingerprints were not rederived".into());
     }
-    Ok(derived)
+    let accounting_class = match source.trigger {
+        TriggerKindV1::ManualCharacterization => AccountingClassV1::Characterization,
+        TriggerKindV1::Daily | TriggerKindV1::ScheduledMain => AccountingClassV1::Scheduled,
+        TriggerKindV1::TestMerge => AccountingClassV1::TestMerge,
+        TriggerKindV1::ManualCompatibility => {
+            return Err("schedule admission: scheduled source cannot be generic manual work".into())
+        }
+    };
+    Ok(DerivedLedgerAdmissionContextV1 {
+        identities: derived,
+        accounting_class,
+        case_id: binding.source.row_id.clone(),
+        provider_family: binding.provider_family.clone(),
+    })
+}
+
+pub(super) fn rederive_scheduled_ledger_context(
+    foundation_root: &Path,
+    source: &ScheduledExecutionSourceV1,
+    freshness_bucket: String,
+) -> Result<DerivedLedgerAdmissionContextV1, BoxError> {
+    let foundation = load_schedule_foundation(foundation_root)?;
+    rederive_scheduled_ledger_context_from_foundation(&foundation, source, freshness_bucket)
 }
 
 pub(super) fn rederive_claimed_support_identities(
@@ -189,7 +234,25 @@ pub(super) fn rederive_claimed_support_identities(
     source: &ClaimedSupportCharacterizationSourceV1,
     freshness_bucket: String,
 ) -> Result<DerivedAdmissionIdentitiesV1, BoxError> {
-    validate_claimed_support_characterization_source(foundation_root, source)?;
+    let foundation = load_schedule_foundation(foundation_root)?;
+    Ok(rederive_claimed_support_ledger_context_from_foundation(
+        &foundation,
+        source,
+        freshness_bucket,
+    )?
+    .identities)
+}
+
+fn rederive_claimed_support_ledger_context_from_foundation(
+    foundation: &LoadedScheduleFoundation,
+    source: &ClaimedSupportCharacterizationSourceV1,
+    freshness_bucket: String,
+) -> Result<DerivedLedgerAdmissionContextV1, BoxError> {
+    validate_claimed_support_characterization_source_against_foundation(foundation, source)?;
+    let binding = foundation
+        .claimed_support_profiles
+        .get(&source.source.row_id)
+        .ok_or("schedule admission: claimed-support profile disappeared during rederivation")?;
     let derived = derive_admission_identities(
         &source.characterization_profile,
         source.characterization_execution.input.clone(),
@@ -203,7 +266,21 @@ pub(super) fn rederive_claimed_support_identities(
     {
         return Err("schedule admission: claimed-support fingerprints were not rederived".into());
     }
-    Ok(derived)
+    Ok(DerivedLedgerAdmissionContextV1 {
+        identities: derived,
+        accounting_class: AccountingClassV1::Characterization,
+        case_id: binding.source.row_id.clone(),
+        provider_family: binding.provider_family.clone(),
+    })
+}
+
+pub(super) fn rederive_claimed_support_ledger_context(
+    foundation_root: &Path,
+    source: &ClaimedSupportCharacterizationSourceV1,
+    freshness_bucket: String,
+) -> Result<DerivedLedgerAdmissionContextV1, BoxError> {
+    let foundation = load_schedule_foundation(foundation_root)?;
+    rederive_claimed_support_ledger_context_from_foundation(&foundation, source, freshness_bucket)
 }
 
 pub(super) fn rederive_manual_identities(
@@ -231,6 +308,20 @@ pub(super) fn rederive_manual_identities(
         return Err("schedule admission: manual case-execution fingerprint drifted".into());
     }
     Ok(derived)
+}
+
+pub(super) fn rederive_manual_ledger_context(
+    manual: &SealedManualAdmissionV1,
+    case_execution_input: CaseExecutionFingerprintInputV1,
+    trigger: AdmissionTriggerIdentityV1,
+) -> Result<DerivedLedgerAdmissionContextV1, BoxError> {
+    let identities = rederive_manual_identities(manual, case_execution_input, trigger)?;
+    Ok(DerivedLedgerAdmissionContextV1 {
+        identities,
+        accounting_class: AccountingClassV1::Manual,
+        case_id: manual.record.case_id.clone(),
+        provider_family: manual.record.provider_family.clone(),
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1918,6 +2009,21 @@ mod tests {
             .unwrap(),
             scheduled_ids
         );
+        let scheduled_context = rederive_scheduled_ledger_context(
+            &foundation_root,
+            &scheduled,
+            "freshness-scheduled".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            scheduled_context.accounting_class,
+            AccountingClassV1::Scheduled
+        );
+        assert_eq!(scheduled_context.case_id, scheduled_case.as_str());
+        assert_eq!(
+            scheduled_context.provider_family,
+            scheduled_binding.provider_family.as_str()
+        );
 
         let (claimed_case, claimed_binding) =
             foundation.claimed_support_profiles.iter().next().unwrap();
@@ -1950,6 +2056,21 @@ mod tests {
             .unwrap(),
             claimed_ids
         );
+        let claimed_context = rederive_claimed_support_ledger_context(
+            &foundation_root,
+            &claimed,
+            "freshness-characterize".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            claimed_context.accounting_class,
+            AccountingClassV1::Characterization
+        );
+        assert_eq!(claimed_context.case_id, claimed_case.as_str());
+        assert_eq!(
+            claimed_context.provider_family,
+            claimed_binding.provider_family.as_str()
+        );
 
         let manual_profile = fingerprint('2');
         let manual_input = execution_input(&manual_profile);
@@ -1964,6 +2085,8 @@ mod tests {
                 environment_owner: "wesleyjinks".into(),
                 scheduler_binary_sha256: digest('3'),
                 input_source_sha256: digest('4'),
+                case_id: "manual-case-1".into(),
+                provider_family: "manual-provider-1".into(),
                 characterization_profile: manual_profile,
                 case_execution: manual_execution.fingerprint,
                 evidence_purpose: EvidencePurposeV1::ManualDiagnostic,
@@ -1976,7 +2099,9 @@ mod tests {
         )
         .unwrap();
         let manual_trigger = manual_trigger(&manual.record.request_nonce, "manual-attempt");
-        let manual_ids = rederive_manual_identities(&manual, manual_input, manual_trigger).unwrap();
+        let manual_context =
+            rederive_manual_ledger_context(&manual, manual_input, manual_trigger).unwrap();
+        let manual_ids = &manual_context.identities;
         assert_eq!(
             manual_ids.characterization_profile,
             manual.record.characterization_profile
@@ -1989,6 +2114,9 @@ mod tests {
             manual_ids.admission_attempt.input.authority,
             manual.authority
         );
+        assert_eq!(manual_context.accounting_class, AccountingClassV1::Manual);
+        assert_eq!(manual_context.case_id, "manual-case-1");
+        assert_eq!(manual_context.provider_family, "manual-provider-1");
     }
 
     #[test]

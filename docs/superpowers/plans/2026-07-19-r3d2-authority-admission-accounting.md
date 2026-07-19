@@ -1,7 +1,7 @@
 # R3d2 — authority, admission, preflights, and accounting implementation plan
 
-- **Status:** ACTIVE — R3d2a through R3d2c are implemented with focused/full deterministic gates green but not
-  independently reviewed; R3d2d is next
+- **Status:** ACTIVE — R3d2a through R3d2d are implemented with focused/full deterministic gates green but not
+  independently reviewed; R3d2e shared-transaction integration is next
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -418,6 +418,89 @@ Required tests and red proof:
   prove zero calls;
 - action-time root/cwd symlink swap, rename, replacement, outside target, missing directory, wrong owner/mode, or
   identity drift refuses even when the earlier static foundation validated.
+
+#### R3d2d checkpoint evidence — 2026-07-19
+
+Implemented mechanism:
+
+- The owner-wide lock now grants the only ledger/admission/supervisor state capability. The ledger rebuilds its
+  authoritative view from separate create-new, single-link mode-`0600` reservation, reconciliation, and legacy-
+  import records; a mutable projection cannot create headroom. Canonical record bytes, derived filenames, record
+  hashes, reservation/reconciliation crosslinks, attempt/equivalent-work identities, accounting-policy hash,
+  source-derived case/provider, trigger, class, UTC admission day, and rolling-window identity are revalidated on
+  every open. A partial, noncanonical, rebound, orphaned, duplicated, broadened, or unknown record holds.
+- Admission reserves the exact one-attempt token/cost/time maximum before spawn. An absent reconciliation and every
+  typed spawn/prompt/KILL/crash/usage/price/currency/evidence ambiguity remain a full conservative charge. Only an
+  explicit proved-pre-effect terminal releases all dimensions. Valid terminal evidence may reconcile token/cost/
+  time downward, while the provider attempt remains charged even for a zero-USD subscription observation. A
+  regenerated execution is eligible only after the proved-pre-effect disposition; possible acceptance never
+  auto-replays.
+- Rebuilt views enforce current UTC-day and rolling-24-hour caps plus exact per-case, per-provider, and per-trigger
+  ceilings. Characterization uses its sealed one-shot conservative maximum. Scheduled and test-merge work consume
+  only their protected pools. Generic manual work uses only the active accounting grant's explicit
+  `manual_unallocated` allocation and cannot borrow either protected pool. A clock rollback behind durable state
+  refuses. The reservation remains charged to its admission day across midnight.
+- Generic manual authority now seals canonical `case_id` and `provider_family` alongside its execution fingerprint.
+  Scheduled and claimed-support final rederivation validate identities and derive case/provider accounting labels
+  from the same reopened multi-file foundation snapshot; manual labels come from the same sealed manual record as
+  its identities. Each path returns one source-derived ledger context, and the ledger's external request constructor
+  accepts that context rather than caller-supplied accounting labels.
+- Validated legacy aggregates and conservative/unknown-initial-window ceilings are immutable ledger imports. The
+  unknown initial charge ages out only after its exact rolling window. Both legacy fences compare full PID/start/
+  parent/group/session identity, executable path/device/inode/hash, and complete argv against the sealed inventory.
+  They allow the exact current scheduler, the exact retained production `serve`, and explicitly inventoried
+  non-compatibility processes; a live legacy `compatibility`, divergent bridge executable, unapproved bridge
+  process/descendant, missing or drifted required process, inventory-authority mismatch, or missing import creates
+  a typed safety hold. This path has no signal/kill capability.
+- Initial and final fences execute the same closed 18-item local checklist: owner/architecture, effect authority and
+  policy, candidate/config/manifest/recipe/registry, controls/characterization, ledger, OAuth/environment,
+  price/ranking, storage, present-image/no-pull control, legacy inventory, supervisor recovery, and action
+  directories. The protocol exposes no provider, model-discovery, registry-effect, image-pull, or agent-spawn
+  capability; every malformed proof or typed local refusal records zero such calls. Preflight identities use one
+  domain separator plus one canonical payload, and a read-only platform regression exercises current-process PID,
+  executable, argv, process-group, session, and start-identity discovery on supported hosts.
+- Action-time trusted-root and requested-cwd bindings reject aliases during planning, then re-snapshot and
+  descriptor-pin the exact objects. Every containment component is reopened no-follow relative to the retained root,
+  checked for exact ownership and non-writable group/world mode, retained/rechecked, and matched to the independently
+  pinned cwd. Symlink swap, rename, replacement, outside/missing target, wrong owner/mode, or identity drift refuses.
+
+Pre-change and mutation red proof:
+
+- At R3d2c checkpoint `71e39a1`, neither ledger/preflight module nor their focused tests existed, the state guard did
+  not expose a lock-scoped ledger capability, and manual authority did not seal case/provider accounting dimensions;
+  the new module/tests are compile-red there.
+- Replacing the unreconciled-reservation full charge with zero made
+  `reservation_restart_and_reconciliation_crash_points_are_conservative_and_idempotent` fail **0/1**, observing
+  `0/0/0/0` instead of `1 attempt / 100 tokens / 1000 microusd / 30 seconds`; restoring it passes **1/0**.
+- Pointing the manual class at the deliberately larger protected-scheduled pool made
+  `accounting_classes_use_disjoint_pools_and_manual_never_borrows` fail **0/1** because the second manual request was
+  admitted instead of returning `ManualUnallocatedExhausted`; restoring the manual pool passes **1/0**.
+- Comparing a legacy allowance by numeric PID alone made
+  `missing_drifted_or_unreconciled_legacy_state_holds_without_process_action` fail **0/1**: a changed start identity
+  returned `Clear` instead of `AllowedProcessIdentityDrift`; restoring the full process identity passes **1/0**.
+- Re-appending the canonical payload in `preflight_hash` made
+  `preflight_hash_is_one_domain_separated_canonical_payload` fail **0/1**, observing
+  `209320cb...60d61f` instead of the single-payload `d3cc35b9...5e99b`; restoring the single append passes **1/0**.
+- Independent negatives also prove manual case/provider mutation invalidates its seal; all eight conservative reason
+  codes preserve every cap; each case/provider/trigger and protected/manual dimension refuses independently; a torn
+  reservation or reconciliation holds on restart; and every checklist item refuses at both fences with fake
+  provider/model/registry/runtime counters still zero.
+
+Deterministic gates:
+
+- `cargo fmt --all -- --check`, tracked/untracked whitespace checks, workspace all-target/all-feature check, and
+  workspace all-target/all-feature Clippy with warnings denied are green.
+- Focused R3d2d gates are ledger **12/0**, preflight/legacy/action-directory/platform **11/0**, and source-context
+  integration **1/0**. The complete `a2a-bridge` binary is **619/0/0**.
+- The exact full serial workspace is **2,355/0/12 ignored**; ignored cases are the existing explicitly
+  authenticated/live Kiro and local-Ollama tests.
+
+Not verified or authorized at this checkpoint: a real authority/admission/ledger record, full host process inventory
+against a sealed legacy plan, manual CLI route, shared admission commit,
+provider/model/credential/registry/image/runtime/GitHub/iCloud effect,
+timer/watcher installation, real production state root, production-operator lifecycle action, source-schema
+compatibility review, or independent implementation review. R3d2d is not independently activatable, and
+`schedule-tick` retains its typed no-effects refusal.
 
 ### R3d2e — shared transaction and default-off entrypoint integration
 
