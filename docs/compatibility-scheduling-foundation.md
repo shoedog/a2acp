@@ -189,6 +189,13 @@ required check.
   before `Running`, supplies an exact-runner-exit primitive, preserves whichever SIGINT/SIGTERM registration succeeds
   if the other fails, excludes `.` from externally derived supervisor record ids, and adds the local state/lock
   primitives. None of those primitives activates a provider-capable route.
+- R3d2 also implements the shared create-new admission transaction, authority/source/accounting revalidation,
+  opaque one-shot supervisor handoff capability, and crash-idempotent terminal reconciliation. These mechanisms are
+  still unreachable from live routes. `schedule-tick` accepts no source input and returns
+  `r3d5_activation_not_enabled; no_effects`. The acknowledged legacy manual path remains available only while the
+  fixed production scheduler root is absent. That root is resolved from the effective account's passwd home, not
+  `$HOME`; once present it is the fail-closed private-control takeover marker and legacy manual execution cannot
+  bypass the shared transaction. R3d5 alone may create that production root and activate trusted triggers.
 - R3d3 implements evidence storage, retention, status, and crash-consistent publication state.
 - R3d4 implements disabled-by-default launchd and trusted test-merge/main triggers.
 - R3d5 separately characterizes every inventory row under single-use owner authority before any staged

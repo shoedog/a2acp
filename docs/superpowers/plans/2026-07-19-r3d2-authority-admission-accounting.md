@@ -1,7 +1,7 @@
 # R3d2 — authority, admission, preflights, and accounting implementation plan
 
-- **Status:** ACTIVE — R3d2a through R3d2d are implemented with focused/full deterministic gates green but not
-  independently reviewed; R3d2e shared-transaction integration is next
+- **Status:** ACTIVE — R3d2a through R3d2e are implemented and exact-final deterministic gates are green; both
+  independent review lenses are pending
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -22,10 +22,10 @@ serialization, exact-execution deduplication, durable reserve/reconcile accounti
 process reconciliation, and the three automatic control reducers. It does not own R3d3 evidence retention/status,
 R3d4 launchd/GitHub triggers, or R3d5 live characterization and activation.
 
-No internal commit is independently activatable. Until the final integration subincrement, `schedule-tick` keeps
-the R3d1 typed `r3d2_authority_admission_not_implemented; no_effects` refusal. At the completed R3d2 boundary it
-may parse and validate a scheduler request, but it cannot reach a provider-capable spawn unless one shared
-transaction has already:
+No internal commit is independently activatable. At the completed R3d2 boundary, `schedule-tick` accepts no source
+arguments and returns the typed `r3d5_activation_not_enabled; no_effects` refusal. No live route can construct an
+admitted capability. The internal transaction mechanism used by deterministic tests—and available only to future
+R3d5 activation code—cannot transfer a provider-capable spawn unless one shared transaction has already:
 
 1. acquired the nonblocking owner-wide admission lock;
 2. reconciled every incomplete supervisor, authority, equivalent-work, and ledger record;
@@ -565,6 +565,92 @@ Required tests and red proof:
 - CLI/static tests prove no `serve` endpoint, A2A caller, timer, watcher, source-file mutation, or production-operator
   lifecycle action can manufacture authority or bypass the shared transaction;
 - the unchanged default checkout has no authority and all R3d2 entrypoints remain zero-effect.
+
+#### R3d2e implementation checkpoint — 2026-07-19
+
+Implemented mechanism:
+
+- `11e892a` adds the owner-lock-scoped, canonical create-new admission journal and the single durable commit point.
+  Each hash-chained commit binds the rederived source and exact identities, one authority action and previewed
+  authority generation, equivalent-work disposition, prepared ledger reservation, both zero-effect fences,
+  descriptor-planned action roots, and the exact R3d1 `Prepared` supervisor generation. A torn, skipped,
+  noncanonical, state-mutated, authority-divergent, or partially published commit holds on reopen. Recovery
+  idempotently publishes authority, ledger, and `Prepared` state but has no runner argument and cannot replay an
+  effect.
+- The safe transaction session first reconciles every prior complete commit while retaining owner-wide then
+  authority-state locks, snapshots the exact resulting authority head, and requires source rederivation,
+  preparation, final fencing, and commit under that same non-cloneable capability. Scheduled standing,
+  claimed-support one-shot, and R3-aware generic-manual paths reopen their authoritative records, derive accounting
+  only from the selected record, and reach the same commit reducer with distinct tagged authority identities. Raw
+  prepare/commit helpers remain module-private.
+- A successful reserved publication yields one opaque, non-`Clone` admitted capability bound to the exact commit,
+  effect envelope, supervisor id, identities, and pinned action directories. Only the injected one-shot handoff
+  trait may consume it. Static reachability inspection finds every constructor and handoff reference inside
+  `compatibility_schedule_transaction.rs` and its tests; no CLI, `serve`/A2A, timer, watcher, or operator lifecycle
+  path references it.
+- `8da4171` adds a same-generation canonical terminal journal. Exact `cancelled_before_running` proof releases the
+  ledger and nonreusable equivalent-work reservation; a safety hold or possible acceptance keeps the full charge and
+  blocks a successor; exact completed evidence requires one attempt, usage within every cap, and expected/observed
+  effective-identity equality before it can reconcile downward. One-shot lifecycle reconciliation binds the
+  immutable terminal-file hash. Every recovery reopens the R3d1 journal and requires the terminal's complete
+  supervisor record and tail hash to equal its actual immutable tail before changing ledger or authority state.
+- `f3bbee0` closes the default-off boundary. `schedule-tick` accepts no source arguments and returns the typed
+  `r3d5_activation_not_enabled; no_effects` refusal. The fixed production state root is derived from the effective
+  account's passwd home rather than `$HOME`; presence probing is read-only and rejects a broadened, symlinked,
+  nonlocal, or identity-swapped root. Absence preserves the explicitly acknowledged legacy manual command. Presence
+  marks private R3d takeover and refuses that legacy command before manifest/resolution/output or provider access;
+  ambiguous state also refuses. Only R3d5 may initialize production state or activate trusted triggers.
+
+Pre-change and mutation red proof:
+
+- At R3d2d checkpoint `f832604`, the admission commit/terminal journals, safe transaction session, admitted
+  capability, shared source joins, and all 16 transaction tests were absent, so the focused e1-e3 suite is
+  compile-red there. The stale/revoked/effect-mismatched source negatives, torn/skipped/noncanonical commit
+  negatives, duplicate-handoff refusal, cancellation/hold/completed terminal paths, zero-attempt/over-cap/effective-
+  identity negatives, pre-terminal successor refusal, reducer-state mutation, and supervisor-tail mutation each
+  target a distinct new branch.
+- Without the actual supervisor-tail comparison, `terminal_supervisor_tail_mutation_holds_recovery` accepts the
+  canonical mutated terminal during recovery. Without exact expected/observed equality,
+  `completed_terminal_requires_exact_identity_and_valid_usage_before_it_commits` terminalizes
+  `unexpected-model`; permitting zero attempts or cap overflow likewise writes a terminal before ledger refusal.
+- Before the fixed-root guard, an acknowledged legacy run could proceed regardless of private R3d state and the root
+  opener accepted a final-component symlink after canonicalization. The new presence/authority-boundary tests are
+  compile-red before `f3bbee0`; removing either root identity check or the boundary refusal makes its positive or
+  negative assertion fail. The argument-bearing `schedule-tick` test also fails against the prior R3d2-pending
+  status contract.
+- The first warnings-denied exact-final Clippy run found four `large_enum_variant` failures in the new transaction
+  records. `f6a33af` boxes only the large payloads (and both published-result arms); Serde remains transparent, and
+  all 16 canonical journal/recovery tests remained green. The first complete binary run then exposed a pre-existing
+  R3d2d idempotency contradiction: **638/1/0**, with
+  `reservation_restart_and_reconciliation_crash_points_are_conservative_and_idempotent` rejecting its same-request
+  reopen as `attempt id was rebound`. An isolated rerun failed **0/1**, ruling out test ordering. `2b333ba` makes
+  `prepare_reservation` return the durable original record after `check_headroom` proves an identical request, while
+  a new same-attempt/different-case assertion still refuses. The exact regression is now **1/0**, full ledger is
+  **12/0**, binary is **639/0/0**, and the full workspace is green.
+
+Exact-final deterministic evidence:
+
+- Format and tracked whitespace checks, workspace all-target/all-feature compilation with `RUSTFLAGS=-D warnings`,
+  warnings-denied all-target/all-feature Clippy, locked release build, and dependency policy are green. `cargo deny`
+  reports its configured duplicate-version warnings and ends `advisories ok, bans ok, licenses ok, sources ok`.
+- Repository hygiene is **37 tracked artifacts / 7 validated example configs**. The pinned manifest validates at
+  **9 cases**, floating recipes at **4 cases**, and the schedule foundation at **6 scheduled advisory / 4 claimed-
+  support profiles** with profile-policy-bundle SHA-256
+  `aed0e9b224d84624220a6091e51601a677b13d254091a12bc3b1879e36bf5e81`.
+- Transaction/journal/source/recovery/terminal tests are **16/0**; local state/root/lock tests are **13/0**; the
+  pure legacy authority boundary is **1/0**; and the complete compatibility CLI integration suite is **22/0**.
+- The complete `a2a-bridge` binary suite is **639 passed / 0 failed / 0 ignored**. The full serial workspace is
+  **2,376 passed / 0 failed / 12 ignored** across **72** reported test/doc-test targets. The ignored set is the
+  existing explicitly live/authenticated Codex, Kiro, Claude, Gemini, and local-Ollama integration tests; none was
+  unignored or invoked.
+- The locked release binary is **26,617,024 bytes**, SHA-256
+  `a11af936e077706dc7a9c670d8249f371a5ec754c5e904202fb2dc2e40751e67`.
+
+Not verified or authorized at this checkpoint: any real authority issuance, production scheduler root creation,
+live admitted runner handoff, provider/model/credential/registry/image/runtime/GitHub/iCloud effect, timer/watcher/
+launchd installation, production-operator lifecycle action, evidence/status/retention publication, or independent
+implementation/release review. R3d2 is mechanically complete but deliberately non-activatable; R3d5 remains the
+sole activation owner.
 
 ## Verification and review gates
 

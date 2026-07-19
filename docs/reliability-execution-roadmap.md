@@ -7,7 +7,7 @@
 - **Active slice:** R3d2 authority, admission, preflights, and accounting on
   `agent/reliability-r3d2-authority-admission`, based directly on `cbcfd1f`; it is non-billable and uses only
   fake clocks/process inventories/effect controls and owner-private temporary state roots in tests
-- **Current R3d2 implementation gate:** **R3D2A-R3D2D IMPLEMENTED / DETERMINISTIC GATES GREEN / UNREVIEWED**. The restart contract is
+- **Current R3d2 implementation gate:** **R3D2A-R3D2E IMPLEMENTED / EXACT-FINAL GREEN / UNREVIEWED**. The restart contract is
   [`2026-07-19-r3d2-authority-admission-accounting.md`](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md).
   R3d2a closes the three inherited R3d1 integration smells, owns cancellation before `Running`, retains the
   exact runner child for exit proof, and adds the private local state-root plus nonblocking lock primitives.
@@ -15,14 +15,22 @@
   issuance exclusion, exact standing/characterization selection, and independently rederived scheduled and
   claimed-support sources. R3d2c adds exact final identities, equivalent-work/characterization reducers, and
   disjoint hold/waste/quarantine controls. R3d2d adds crash-conservative append-only accounting, legacy-inventory
-  holds, action-directory pinning, and the same closed zero-effect preflight checklist at both fences. Its focused
-  ledger/preflight/source-context gates are **12/0 + 11/0 + 1/0**; the complete binary is **619/0/0**, and the current
-  full serial workspace is **2,355/0/12 ignored**. It has not received an independent implementation review. R3d2 still has one merge boundary and
+  holds, action-directory pinning, and the same closed zero-effect preflight checklist at both fences. R3d2e adds
+  one canonical admission linearization point, same-capability authority/source/accounting revalidation, opaque
+  one-shot supervisor handoff, crash-idempotent terminal reconciliation, and a fixed-root fail-closed legacy
+  boundary. `schedule-tick` remains typed `r3d5_activation_not_enabled; no_effects`; no live route references the
+  admitted capability. Current e-focused gates are transaction **16/0**, state/root/locks **13/0**, legacy boundary
+  **1/0**, and complete compatibility CLI **22/0**. Format/diff, warnings-denied check/Clippy, locked release,
+  dependency policy, hygiene **37/7**, and all checked-in compatibility validators are green. The complete binary is
+  **639/0/0** and full serial workspace is **2,376/0/12 ignored** across **72** targets. The first full binary gate
+  exposed and `2b333ba` fixed same-attempt ledger timestamp re-derivation; the isolated regression and all 12 ledger
+  tests are green. It has not received an independent implementation review. R3d2 still has one merge boundary and
   five internal subincrements: R3d1 integration hardening/local state; private
   authority and source reducers; exact identities/equivalent work/control reducers; ledger/legacy/preflights; then
   the shared transaction/default-off integration. No internal commit independently enables effects. The only
   admission lock order is owner-wide then authority-state, and one durable commit binds authority consumption,
-  admission identity, equivalent-work disposition, and budget reservation before supervisor handoff. R3d2 does not
+  admission identity, equivalent-work disposition, and budget reservation before supervisor handoff. The fixed
+  production scheduler root remains absent and was not created. R3d2 does not
   issue real authority or perform a provider, registry, image, runtime, GitHub, iCloud, timer, or production-operator
   effect.
 - **R3d1 closure:** **MERGED** by PR #40 at `cbcfd1f`. Initial exact candidate `01438c34` received a fresh
@@ -433,14 +441,16 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** run the exact-final deterministic gates on the docs-only review fold, publish a non-draft R3d1 PR,
-  and wait for its required checks. Both exact-code review gates are approved; do not spend another Fable turn or
-  change the approved mechanism before publication. No live compatibility gate is authorized; R3d1 must not perform
-  any production-operator lifecycle action. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
+- **Next action:** commit this exact-final evidence fold, freeze exact head/base/merge-base/changed paths, then run
+  one bridge-mediated Sol/xhigh adversarial implementation review. Fold every `WRONG` and adjudicate every `SMELL`;
+  after Sol is green, spend the single
+  design-approved Fable/xhigh adversarial implementation plus release/compatibility lens. Rerun exact-final gates
+  after the docs/review fold and publish one non-draft R3d2 PR. No live compatibility/provider gate or production-
+  operator lifecycle action is authorized. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**
-  [`superpowers/plans/2026-07-19-r3d1-supervisor-signal-parity.md`](superpowers/plans/2026-07-19-r3d1-supervisor-signal-parity.md)
+  [`superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md`](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md)
 - **Operating runbook:**
   [`../skills/a2a-bridge-operator/SKILL.md`](../skills/a2a-bridge-operator/SKILL.md)
 
@@ -462,7 +472,8 @@ R2a provenance (MERGED)
   -> R2c explicit one-turn billable smoke (MERGED)
        -> R2d local non-billable fallback plan (MERGED)
             -> R3 compatibility manifest + pinned/floating canaries + OpenRouter/OpenCode
-               (IN REVIEW: R3a/R3b/R3c/R3d0 MERGED; R3d DESIGN MERGED; R3d1 IMPLEMENTATION REVIEW)
+               (ACTIVE: R3a/R3b/R3c/R3d0/R3d1 MERGED; R3d DESIGN MERGED;
+                R3d2 IMPLEMENTED / EXACT-FINAL GREEN / REVIEW PENDING)
                  -> R4 reproducible dependency/image pins + release promotion gate
 
 R2e authenticated in-process fallback is DEFERRED and off the critical path.
@@ -489,7 +500,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (three incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`. R3d2 is **ACTIVE / R3D2A-R3D2D IMPLEMENTED / DETERMINISTIC GATES GREEN / UNREVIEWED** on `agent/reliability-r3d2-authority-admission`, with one merge boundary. R3d2d focused ledger/preflight/source-context gates are **12/0 + 11/0 + 1/0**; its complete binary is **619/0/0** and current full serial workspace is **2,355/0/12 ignored**. R3d1 exact fifth-remediation head `b511d6c` received Sol/xhigh implementation `APPROVE` with no new finding, then the single Fable/xhigh release/compatibility lens returned `APPROVE` with no `WRONG` and three nonblocking Minor `SMELL`s now closed by R3d2a. No live compatibility gate or production-operator lifecycle action occurred. | [R3d2 implementation plan](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md) | Complete R3d2e shared transaction/default-off integration, exact-final deterministic gates, Sol/xhigh review, and the single post-Sol Fable/xhigh release lens before one non-draft PR. R3d never touches the long-lived operator lifecycle. |
+| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`. R3d2 is **ACTIVE / R3D2A-R3D2E IMPLEMENTED / EXACT-FINAL GREEN / UNREVIEWED** on `agent/reliability-r3d2-authority-admission`, with one merge boundary. R3d2e focused transaction/state/boundary/CLI gates are **16/0 + 13/0 + 1/0 + 22/0**; format/diff, warnings-denied check/Clippy, locked release, dependency policy, hygiene **37/7**, and all validators are green. The complete binary is **639/0/0** and full serial workspace is **2,376/0/12 ignored** across **72** targets. R3d1 exact fifth-remediation head `b511d6c` received Sol/xhigh implementation `APPROVE` with no new finding, then the single Fable/xhigh release/compatibility lens returned `APPROVE` with no `WRONG` and three nonblocking Minor `SMELL`s now closed by R3d2a. No live compatibility gate, production state-root creation, or production-operator lifecycle action occurred. | [R3d2 implementation plan](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md) | Run Sol/xhigh implementation review and the single post-Sol Fable/xhigh release lens before one non-draft PR. R3d never touches the long-lived operator lifecycle. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -764,8 +775,12 @@ Next action:
   at `504c1e434fd5845bc6745e0b0a0aae95427afbdd`. R3c merged through PR #33 at
   `983398427c9f04861a2f1da501a7650c4a1cdd80`. R3d design merged through PR #37 at
   `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`; R3d0 merged through PR #38 at
-  `c2d147fb1f0df275f3c6452cdd212e185c002d08`. R3d1 is in review on
-  `agent/reliability-r3d1-supervisor`, based directly on that merge. The manifest still contains nine
+  `c2d147fb1f0df275f3c6452cdd212e185c002d08`; R3d1 merged through PR #40 at
+  `cbcfd1f06b914064456d1798be71bacdc294f3d5`. R3d2a-e are implemented on
+  `agent/reliability-r3d2-authority-admission`, based directly on that merge, through code checkpoint
+  `2b333ba`. Exact-final deterministic gates are green at **639/0/0** binary and **2,376/0/12 ignored** full
+  workspace; both independent review lenses remain pending. No production state root, authority, trigger, live
+  effect, or operator lifecycle action was created. The manifest still contains nine
   exact pinned rows: four release-blocking minimal bridge-smoke support cases and five explicit
   historical/non-goal controls. Every config is checked in and SHA-bound before provider spawn. The two
   supported reader cases and the stale Kiro reader control use the separately tagged immutable image
