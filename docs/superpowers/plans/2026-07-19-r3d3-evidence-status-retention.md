@@ -1,8 +1,8 @@
 # R3d3 — evidence, status, and retention implementation plan
 
-**Status:** R3d3a and R3d3b are checkpointed at `21427e6` and `739495a` on
+**Status:** R3d3a, R3d3b, and R3d3c are checkpointed at `21427e6`, `739495a`, and `7ed0446` on
 `agent/reliability-r3d3-evidence-retention` from merged R3d2 `origin/main`
-`06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41); R3d3c is next. This slice is local,
+`06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41); R3d3d is next. This slice is local,
 non-billable, default-off, and has one merge boundary.
 
 The approved design of record is
@@ -172,6 +172,18 @@ Pre-change-red/edge proof: consent absent/revoked/expired/wrong class/root/domai
 revoked; consent revoked immediately before/after copy journal; symlink/hard-link/replacement/placeholder; partial
 copy/hash mismatch; not uploaded; offloaded before eviction; domain drift; corruption during rotating verification;
 and hot source survival for every failure.
+
+Checkpoint `7ed0446` implements independent cold-copy admission, crash-safe partial/final publication, closed
+FileProvider observations, weekly reconciliation, bounded rotating content verification, and action-time hot
+eviction with retryable exact-hash cleanup. Its fail-first regressions demonstrated missing cold APIs; publication
+that could strand one final plus one partial between renames; non-retryable abandoned-partial and hot-cache cleanup;
+zero-window admissions; pre-deadline abandonment; abandoned history selected instead of a published replacement;
+fabricated empty snapshot identity for an existing integrity hold; and caller-only state-quota accounting. The
+corrected implementation uses descriptor-relative no-follow inspection and verified removal, enforces the aggregate
+1 GiB state-journal cap at persistence, retains hot evidence for all pre-eviction failures, and refuses eviction
+after the admission consent is revoked. Focused gates are cold retention **11/0**, evidence **33/0**,
+descriptor-local file **12/0**, authority **15/0**, strict schema **32/0**, and retained state **19/0**; format and
+diff checks are green. Full-workspace and release gates remain deferred until the complete R3d3 review candidate.
 
 ### R3d3d — reconstructible bundle/image GC and incident migration
 
