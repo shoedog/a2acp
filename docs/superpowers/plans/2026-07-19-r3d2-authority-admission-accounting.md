@@ -1,8 +1,9 @@
 # R3d2 — authority, admission, preflights, and accounting implementation plan
 
 - **Status:** ACTIVE — R3d2a through R3d2e are implemented; the first exact-head Sol/xhigh implementation review
-  returned `REVISE` at `1373985`, its four `WRONG` findings are remediated in `f481f39`, `f700cde`, and `cdf833a`,
-  exact-final deterministic gates are green, and Sol closure re-review plus the post-Sol Fable lens remain pending
+  returned `REVISE` at `1373985`, and closure review of exact `28e7d28` returned `REVISE` with three new `WRONG`
+  findings plus a stale-cursor residual. Mechanism commit `f18e74a` closes the three new findings; focused gates are
+  green, while the new exact-head full gate, Sol closure re-review, and post-Sol Fable lens remain pending
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -700,7 +701,51 @@ manifest **9**, recipes **4**, foundation **6/4**, compatibility CLI **22/0**, a
 are green. The release binary is **26,604,912 bytes**, SHA-256
 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`. The earlier **639/0/0** and
 **2,376/0/12 ignored** totals remain labeled reviewed-candidate evidence rather than being conflated with this
-changed head. Sol closure re-review is the next gate.
+changed head. The Sol closure result and its subsequent remediation are recorded next.
+
+#### Second Sol closure review and remediation — 2026-07-19
+
+The bridge-mediated `gpt-5.6-sol`/xhigh/read-only closure review froze exact candidate
+`28e7d28a3759d38cb98eea63e68bba9000ac5138` against merged R3d1 base
+`cbcfd1f06b914064456d1798be71bacdc294f3d5` and returned `R3D2 IMPLEMENTATION: REVISE`. Its report is retained
+at `/private/tmp/a2a-bridge-r3d2-sol-closure-28e7d28/review.md`, 16,277 bytes, SHA-256
+`5d51097976a691aa52eddc6fb68262d4b876f6ad1c676ed69b2fd824ab560162`. It independently reran transaction
+**17/0**, state/root/locks **14/0**, preflight **11/0**, compatibility CLI **22/0**, and the exact diff/boundary.
+It marked the terminal-child proof, safe reuse, fixed-root traversal, and standalone-resolver scope `RESOLVED`; it
+left the release cursor `UNRESOLVED` and found three new mechanism failures:
+
+1. valid preflight passes for source A could be replayed into distinct admission/source B because the pass carried
+   no subject, authority-head, directory, or commit-time binding and the transaction accepted caller-built passes;
+2. admission accepted only an arbitrary supervisor deadline digest, not the validated derivation or executable
+   authority-contained `HardDeadline`; and
+3. the same-process owner/authority check-then-increment sequences could interleave and return both lock
+   capabilities.
+
+All three pre-change regressions failed on the reviewed mechanism before remediation:
+
+- `preflight_passes_cannot_be_replayed_across_admissions` admitted source B using source A's valid passes;
+- `arbitrary_deadline_digest_cannot_admit` accepted a syntactically valid arbitrary digest; and
+- `concurrent_owner_and_authority_publication_cannot_return_both_capabilities` forced the interleaving with a
+  barrier and observed both guards returned.
+
+Mechanism commit `f18e74aa970a0b30f84ede376ae51e2f214f3f9b` closes those failures. Each preflight pass now binds a canonical
+digest of the exact selected source/admission, authority snapshot, effect envelope, ledger/supervisor/deadline
+records, action-directory identities, authority terminal deadline, and commit time. The session exposes one
+`admit` operation that runs both fences internally and commits without returning a pass or proposal to its caller.
+`PreparedSupervisorV1` now owns the full validated supervisor record plus its non-`Clone` executable
+`HardDeadline`; admission verifies exact run/window/case identity, selected-case ledger timeout, and remaining time
+against the authority terminal window, persists the full derivation in the commit, revalidates it on reopen, and
+moves the same deadline into the admitted handoff capability. The owner and authority-only same-process
+transitions now serialize check, nonblocking file lock, and holder publication under one process-local mutex;
+cross-process exclusion remains the existing nonblocking `flock` boundary.
+
+The added negative matrix rejects a mutually self-consistent deadline/supervisor pair for the wrong run, wrong
+window, wrong case, over-cap case timeout, or overlong authority window. The positive handoff proves it carries the
+same live derivation that admission committed. After formatting, focused gates are preflight **11/0**,
+state/root/locks **15/0**, supervisor **41/0**, and transaction **20/0**; `git diff --check` and all-target
+`cargo check -p a2a-bridge` are green. These are mechanism-checkpoint totals, not an exact-final full-suite claim.
+The next gate is the complete deterministic suite on the docs-fold head, followed by a fresh Sol/xhigh closure
+re-review. Fable remains blocked until Sol approves.
 
 ## Verification and review gates
 
@@ -732,11 +777,13 @@ changed head. Sol closure re-review is the next gate.
 
 ## Restart contract
 
-Resume from `/private/tmp/a2a-bridge-r3d2-authority-admission` on branch
-`agent/reliability-r3d2-authority-admission`, based on merged R3d1 main
-`cbcfd1f06b914064456d1798be71bacdc294f3d5`. Read this plan, the R3d design of record, the durable roadmap,
-`AGENTS.md`, and `skills/a2a-bridge-operator/SKILL.md` before editing. Preserve the single R3d2 merge boundary,
-the owner-wide-then-authority lock order, the single admission linearization point, the zero-effect default, and
-the separation between provider authority and storage consent. The next action is to commit this evidence/cursor,
-rerun the full suite on that docs-only exact head, freeze it, and ask Sol/xhigh to adjudicate the four inherited
-`WRONG` findings and one `SMELL` before any Fable turn or PR.
+Resume branch `agent/reliability-r3d2-authority-admission` in a newly verified clean trusted worktree; do not depend
+on a prior `/private/tmp` worktree or review mirror. The branch is based on merged R3d1 main
+`cbcfd1f06b914064456d1798be71bacdc294f3d5`, and mechanism commit `f18e74a` closes the three findings from the
+second Sol review. Read this plan, the R3d design of record, the durable roadmap, `AGENTS.md`, and
+`skills/a2a-bridge-operator/SKILL.md` before editing. Preserve the single R3d2 merge boundary, the
+owner-wide-then-authority lock order, the single admission linearization point, the zero-effect default, and the
+separation between provider authority and storage consent. The next action is to commit this evidence/cursor, run
+the complete deterministic gate on that exact head, freeze head/base/merge-base/changed paths, and ask Sol/xhigh to
+adjudicate the stale-cursor residual plus all three second-review `WRONG` findings. Run the single Fable lens only
+after Sol approves; then fold final evidence, rerun exact-final gates, and publish the non-draft PR.
