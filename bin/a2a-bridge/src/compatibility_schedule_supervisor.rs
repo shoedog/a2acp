@@ -326,6 +326,47 @@ pub(super) struct SupervisorAnchorSet {
     groups: BTreeMap<i32, AnchoredProcessGroup>,
 }
 
+/// Retains the exact direct runner child capability used to prove exit. Process-table absence is
+/// useful corroboration for descendants, but it cannot replace this waitable child identity.
+#[cfg(unix)]
+pub(super) struct RetainedRunnerExit {
+    identity: ProcessIdentityV1,
+    child: tokio::process::Child,
+    terminal_status: Option<std::process::ExitStatus>,
+}
+
+#[cfg(unix)]
+impl RetainedRunnerExit {
+    pub(super) fn bind(child: tokio::process::Child) -> Result<Self, BoxError> {
+        let pid = child
+            .id()
+            .ok_or("schedule supervisor: runner child has no retained pid")?;
+        let pid = i32::try_from(pid)
+            .map_err(|_| "schedule supervisor: runner child pid does not fit pid_t")?;
+        let identity = crate::compatibility_process_group::capture_spawned_identity(pid)?;
+        Ok(Self {
+            identity,
+            child,
+            terminal_status: None,
+        })
+    }
+
+    pub(super) fn identity(&self) -> &ProcessIdentityV1 {
+        &self.identity
+    }
+
+    pub(super) fn exact_exited(&mut self, expected: &ProcessIdentityV1) -> Result<bool, BoxError> {
+        if expected != &self.identity {
+            return Err("schedule supervisor: runner exit identity mismatch".into());
+        }
+        if self.terminal_status.is_some() {
+            return Ok(true);
+        }
+        self.terminal_status = self.child.try_wait()?;
+        Ok(self.terminal_status.is_some())
+    }
+}
+
 #[cfg(unix)]
 impl SupervisorAnchorSet {
     pub(super) fn new() -> Self {
@@ -558,6 +599,7 @@ fn validate_supervisor_transition(
     let phase_allowed = matches!(
         (previous.phase, next.phase),
         (SupervisorPhaseV1::Prepared, SupervisorPhaseV1::Running)
+            | (SupervisorPhaseV1::Prepared, SupervisorPhaseV1::Reaping)
             | (SupervisorPhaseV1::Prepared, SupervisorPhaseV1::SafetyHold)
             | (SupervisorPhaseV1::Running, SupervisorPhaseV1::Running)
             | (SupervisorPhaseV1::Running, SupervisorPhaseV1::TermGrace)
@@ -669,7 +711,7 @@ impl FileSupervisorJournal {
             || !bytes.all(|byte| {
                 byte.is_ascii_lowercase()
                     || byte.is_ascii_digit()
-                    || matches!(byte, b'-' | b'_' | b'.' | b':')
+                    || matches!(byte, b'-' | b'_' | b':')
             })
         {
             return Err("schedule supervisor: journal record id is not a stable id".into());
@@ -1310,6 +1352,107 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
         self.transition(candidate)
     }
 
+    fn cancel_before_running<C: SupervisorControl>(
+        &mut self,
+        control: &mut C,
+    ) -> Result<(), BoxError> {
+        let groups = self.record.groups.clone();
+        for group in &groups {
+            let members = control.non_anchor_members(group);
+            if !self
+                .control_or_hold(members, SafetyHoldReasonV1::StartupReconciliationIncomplete)?
+                .is_empty()
+            {
+                return self.enter_hold(SafetyHoldReasonV1::StartupReconciliationIncomplete);
+            }
+        }
+
+        let mut candidate = self.record.clone();
+        candidate.phase = SupervisorPhaseV1::Reaping;
+        candidate.later_group_signal_permitted = false;
+        self.transition(candidate)?;
+
+        self.complete_pre_running_reaping(control)
+    }
+
+    fn complete_pre_running_reaping<C: SupervisorControl>(
+        &mut self,
+        control: &mut C,
+    ) -> Result<(), BoxError> {
+        if self.record.phase != SupervisorPhaseV1::Reaping
+            || !matches!(self.record.runner, OptionalProcessIdentityV1::Absent)
+            || self
+                .record
+                .groups
+                .iter()
+                .any(|group| !group.workloads.is_empty())
+        {
+            return Err("schedule supervisor: state is not a pre-running cancellation".into());
+        }
+
+        let groups = self.record.groups.clone();
+        for group in &groups {
+            if group.anchor_lifecycle == AnchorLifecycleV1::RetainedLive {
+                let members = control.non_anchor_members(group);
+                if !self
+                    .control_or_hold(members, SafetyHoldReasonV1::StartupReconciliationIncomplete)?
+                    .is_empty()
+                {
+                    return self.enter_hold(SafetyHoldReasonV1::StartupReconciliationIncomplete);
+                }
+                let anchor_live = control.exact_anchor_live(group);
+                if self
+                    .control_or_hold(anchor_live, SafetyHoldReasonV1::ProcessIdentityUnavailable)?
+                {
+                    if let Err(error) = control.release_and_reap_anchor(group) {
+                        self.enter_hold_with_group_lifecycle(
+                            SafetyHoldReasonV1::AnchorNotLive,
+                            Some((group.process_group, AnchorLifecycleV1::Ambiguous)),
+                        )?;
+                        return Err(error);
+                    }
+                } else {
+                    let absent = control.group_absent(group.process_group);
+                    if !self
+                        .control_or_hold(absent, SafetyHoldReasonV1::ProcessIdentityUnavailable)?
+                    {
+                        return self.enter_hold_with_group_lifecycle(
+                            SafetyHoldReasonV1::AnchorNotLive,
+                            Some((group.process_group, AnchorLifecycleV1::Ambiguous)),
+                        );
+                    }
+                }
+                self.mark_group_released(group.process_group)?;
+            }
+            let absent = control.group_absent(group.process_group);
+            if !self.control_or_hold(absent, SafetyHoldReasonV1::ProcessIdentityUnavailable)? {
+                return self.enter_hold(SafetyHoldReasonV1::ExitUnproved);
+            }
+        }
+
+        let labels = self.record.container_run_labels.clone();
+        let container_reap = control.reap_exact_containers(&labels);
+        self.control_or_hold(
+            container_reap,
+            SafetyHoldReasonV1::StartupReconciliationIncomplete,
+        )?;
+        let containers_absent = control.exact_containers_absent(&labels);
+        if !self.control_or_hold(
+            containers_absent,
+            SafetyHoldReasonV1::StartupReconciliationIncomplete,
+        )? {
+            return self.enter_hold(SafetyHoldReasonV1::ExitUnproved);
+        }
+
+        let mut candidate = self.record.clone();
+        candidate.phase = SupervisorPhaseV1::Complete;
+        candidate.outcome = OptionalSupervisorOutcomeV1::Outcome {
+            value: SupervisorTerminalOutcomeV1::CancelledBeforeRunning,
+        };
+        candidate.later_group_signal_permitted = false;
+        self.transition(candidate)
+    }
+
     pub(super) fn request_cancel<C: SupervisorControl>(
         &mut self,
         control: &mut C,
@@ -1322,8 +1465,8 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
                 elapsed_ms,
                 SupervisorKillCauseV1::RepeatedCancellation,
             ),
-            SupervisorPhaseV1::Prepared
-            | SupervisorPhaseV1::KillJournaled
+            SupervisorPhaseV1::Prepared => self.cancel_before_running(control),
+            SupervisorPhaseV1::KillJournaled
             | SupervisorPhaseV1::Reaping
             | SupervisorPhaseV1::Complete
             | SupervisorPhaseV1::SafetyHold => Ok(()),
@@ -1548,6 +1691,16 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
             // Reaping has already durably forbidden later group signals. The caller may supply the
             // recovered child artifact to `finish_after_exit`, which performs only absence proofs,
             // exact-label container cleanup, and anchor release/reap.
+            SupervisorPhaseV1::Reaping
+                if matches!(self.record.runner, OptionalProcessIdentityV1::Absent) =>
+            {
+                self.complete_pre_running_reaping(control)?;
+                Ok(if self.record.phase == SupervisorPhaseV1::Complete {
+                    RecoveryDisposition::Complete
+                } else {
+                    RecoveryDisposition::SafetyHold
+                })
+            }
             SupervisorPhaseV1::Reaping => Ok(RecoveryDisposition::ReconcileWithoutSignal),
             SupervisorPhaseV1::Complete => Ok(RecoveryDisposition::Complete),
             SupervisorPhaseV1::SafetyHold => Ok(RecoveryDisposition::SafetyHold),
@@ -2360,6 +2513,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn file_journal_rejects_path_collision_record_ids() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        for record_id in [".", "..", "supervisor.1"] {
+            assert!(
+                FileSupervisorJournal::create(directory.path(), record_id).is_err(),
+                "record id {record_id:?} must not share or alias the journal root"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn file_journal_rejects_a_valid_hash_chained_phase_rollback() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -2440,6 +2608,239 @@ mod tests {
             assert_eq!(supervisor.record().phase, SupervisorPhaseV1::Prepared);
             assert_eq!(supervisor.journal().records.len(), 1);
         }
+    }
+
+    #[test]
+    fn cancellation_before_running_is_owned_and_terminalized_without_a_workload() {
+        let mut supervisor =
+            ScheduleSupervisor::initialize(prepared_record(), MemoryJournal::default()).unwrap();
+        let mut control = fake_control(false, BTreeMap::new());
+
+        supervisor.request_cancel(&mut control, 1).unwrap();
+
+        assert_eq!(supervisor.record().phase, SupervisorPhaseV1::Complete);
+        assert_eq!(
+            supervisor.record().outcome,
+            OptionalSupervisorOutcomeV1::Outcome {
+                value: SupervisorTerminalOutcomeV1::CancelledBeforeRunning,
+            }
+        );
+        assert!(supervisor
+            .record()
+            .groups
+            .iter()
+            .all(|group| group.anchor_lifecycle == AnchorLifecycleV1::ReleasedReaped));
+        assert!(control.signals.is_empty());
+    }
+
+    #[test]
+    fn cancellation_before_running_holds_on_possible_workload_or_cleanup_ambiguity() {
+        let mut possible_workload =
+            ScheduleSupervisor::initialize(prepared_record(), MemoryJournal::default()).unwrap();
+        let mut members = BTreeMap::new();
+        members.insert(43, vec![identity(44, 43)]);
+        let mut workload_control = fake_control(false, members);
+        possible_workload
+            .request_cancel(&mut workload_control, 1)
+            .unwrap();
+        assert_eq!(
+            possible_workload.record().phase,
+            SupervisorPhaseV1::SafetyHold
+        );
+        assert!(workload_control.signals.is_empty());
+
+        let mut release_failure =
+            ScheduleSupervisor::initialize(prepared_record(), MemoryJournal::default()).unwrap();
+        let mut release_control = fake_control(false, BTreeMap::new());
+        release_control.fail_anchor_release = true;
+        assert!(release_failure
+            .request_cancel(&mut release_control, 1)
+            .is_err());
+        assert_eq!(
+            release_failure.record().phase,
+            SupervisorPhaseV1::SafetyHold
+        );
+        assert_eq!(
+            release_failure.record().groups[0].anchor_lifecycle,
+            AnchorLifecycleV1::Ambiguous
+        );
+        assert!(release_control.signals.is_empty());
+
+        let mut container_failure =
+            ScheduleSupervisor::initialize(prepared_record(), MemoryJournal::default()).unwrap();
+        let mut container_control = fake_control(false, BTreeMap::new());
+        container_control.fail_container_reap = true;
+        assert!(container_failure
+            .request_cancel(&mut container_control, 1)
+            .is_err());
+        assert_eq!(
+            container_failure.record().phase,
+            SupervisorPhaseV1::SafetyHold
+        );
+        assert!(container_control.signals.is_empty());
+    }
+
+    #[test]
+    fn pre_running_cancellation_recovery_completes_before_or_after_anchor_release() {
+        for already_released in [false, true] {
+            let mut supervisor =
+                ScheduleSupervisor::initialize(prepared_record(), MemoryJournal::default())
+                    .unwrap();
+            let mut reaping = supervisor.record().clone();
+            reaping.phase = SupervisorPhaseV1::Reaping;
+            reaping.later_group_signal_permitted = false;
+            if already_released {
+                reaping.groups[0].anchor_lifecycle = AnchorLifecycleV1::ReleasedReaped;
+            }
+            supervisor.transition(reaping).unwrap();
+            let latest = supervisor.record().clone();
+            let latest_sha256 = supervisor.current_record_sha256.clone();
+            let mut recovered = ScheduleSupervisor::resume_existing(
+                latest,
+                latest_sha256,
+                MemoryJournal::default(),
+            )
+            .unwrap();
+            let mut control = fake_control(false, BTreeMap::new());
+            if already_released {
+                control.released_groups.insert(43);
+            }
+
+            assert_eq!(
+                recovered.recover(&mut control).unwrap(),
+                RecoveryDisposition::Complete
+            );
+            assert_eq!(recovered.record().phase, SupervisorPhaseV1::Complete);
+            assert_eq!(
+                recovered.record().outcome,
+                OptionalSupervisorOutcomeV1::Outcome {
+                    value: SupervisorTerminalOutcomeV1::CancelledBeforeRunning,
+                }
+            );
+            assert!(control.signals.is_empty());
+        }
+    }
+
+    #[test]
+    fn pre_running_cancellation_recovery_holds_on_cleanup_failure() {
+        let mut supervisor =
+            ScheduleSupervisor::initialize(prepared_record(), MemoryJournal::default()).unwrap();
+        let mut reaping = supervisor.record().clone();
+        reaping.phase = SupervisorPhaseV1::Reaping;
+        reaping.later_group_signal_permitted = false;
+        supervisor.transition(reaping).unwrap();
+        let mut control = fake_control(false, BTreeMap::new());
+        control.fail_anchor_release = true;
+
+        assert!(supervisor.recover(&mut control).is_err());
+        assert_eq!(supervisor.record().phase, SupervisorPhaseV1::SafetyHold);
+        assert_eq!(
+            supervisor.record().groups[0].anchor_lifecycle,
+            AnchorLifecycleV1::Ambiguous
+        );
+        assert!(control.signals.is_empty());
+    }
+
+    #[test]
+    fn pre_running_cancellation_recovery_retains_anchor_when_a_workload_appears() {
+        let mut supervisor =
+            ScheduleSupervisor::initialize(prepared_record(), MemoryJournal::default()).unwrap();
+        let mut reaping = supervisor.record().clone();
+        reaping.phase = SupervisorPhaseV1::Reaping;
+        reaping.later_group_signal_permitted = false;
+        supervisor.transition(reaping).unwrap();
+        let mut members = BTreeMap::new();
+        members.insert(43, vec![identity(44, 43)]);
+        let mut control = fake_control(false, members);
+
+        assert_eq!(
+            supervisor.recover(&mut control).unwrap(),
+            RecoveryDisposition::SafetyHold
+        );
+        assert_eq!(supervisor.record().phase, SupervisorPhaseV1::SafetyHold);
+        assert_eq!(
+            supervisor.record().groups[0].anchor_lifecycle,
+            AnchorLifecycleV1::RetainedLive
+        );
+        assert!(control.released_groups.is_empty());
+        assert!(control.signals.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_runner_child_is_the_exact_exit_proof() {
+        let mut child = tokio::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let mut retained = RetainedRunnerExit::bind(child).unwrap();
+        let identity = retained.identity().clone();
+        assert!(!retained.exact_exited(&identity).unwrap());
+
+        let mut wrong = identity.clone();
+        wrong.parent_pid = wrong.parent_pid.saturating_add(1);
+        assert!(retained.exact_exited(&wrong).is_err());
+
+        drop(stdin);
+        let mut exited = false;
+        for _ in 0..200 {
+            if retained.exact_exited(&identity).unwrap() {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(exited, "the retained exact child did not report exit");
+        assert!(retained.exact_exited(&identity).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_runner_exit_is_independent_of_a_live_descendant() {
+        use tokio::io::AsyncBufReadExt as _;
+
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 1 </dev/null >/dev/null 2>&1 & echo $!")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut retained = RetainedRunnerExit::bind(child).unwrap();
+        let identity = retained.identity().clone();
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut descendant_pid = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader.read_line(&mut descendant_pid),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let descendant_pid = descendant_pid.trim().parse::<i32>().unwrap();
+        let descendant =
+            crate::compatibility_process_group::capture_spawned_identity(descendant_pid).unwrap();
+
+        let mut runner_exited = false;
+        for _ in 0..200 {
+            if retained.exact_exited(&identity).unwrap() {
+                runner_exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(runner_exited, "the exact direct runner did not report exit");
+        let observed_descendant = process_identity(descendant_pid).unwrap().unwrap();
+        assert_eq!(observed_descendant.pid, descendant.pid);
+        assert_eq!(observed_descendant.start, descendant.start);
+        assert_ne!(observed_descendant.parent_pid, identity.pid);
     }
 
     #[test]

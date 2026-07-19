@@ -1142,7 +1142,7 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 - **Base:** merged R3d1 main `cbcfd1f06b914064456d1798be71bacdc294f3d5` (PR #40)
 - **Status:** design of record **APPROVED / MERGED** at exact design head
   `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 and R3d1 are merged, and R3d2 is
-  **ACTIVE / FOCUSED PLAN LOCKED** with no implementation yet. The R3d0 default-off policy/schema mechanism was
+  **ACTIVE / R3D2A IMPLEMENTED / DETERMINISTIC GATES GREEN / UNREVIEWED** before R3d2b. The R3d0 default-off policy/schema mechanism was
   approved at exact mechanism commit
   `5baeeb3f47183ea2a47d2cdc5ffce26f1df7dbfb`, approved cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test head
@@ -2705,7 +2705,7 @@ Rollback does not revert evidence, erase ledger charges, delete pins/tombstones,
 operator, or run missed windows on re-enable. The last reviewed immutable scheduler binary remains the code
 rollback target. Any code revert is a normal reviewed PR.
 
-**Restart point:** continue R3d2 from `/private/tmp/a2a-bridge-r3d2-authority-admission` on branch
+**Restart point:** continue R3d2b from `/private/tmp/a2a-bridge-r3d2-authority-admission` on branch
 `agent/reliability-r3d2-authority-admission`, based on merged R3d1 main
 `cbcfd1f06b914064456d1798be71bacdc294f3d5`, using the focused
 [`2026-07-19-r3d2-authority-admission-accounting.md`](2026-07-19-r3d2-authority-admission-accounting.md)

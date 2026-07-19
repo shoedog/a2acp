@@ -122,6 +122,7 @@ pub(super) enum SupervisorPhaseV1 {
 #[serde(rename_all = "snake_case")]
 pub(super) enum SupervisorTerminalOutcomeV1 {
     Completed,
+    CancelledBeforeRunning,
     Cancelled,
     KilledAfterDeadline,
     KilledAfterCancellation,
@@ -2179,7 +2180,12 @@ impl ValidateRecord for SupervisorRecordV1 {
                 }
             }
             SupervisorPhaseV1::Reaping => {
-                if runner.is_none()
+                let pre_running_cancellation = runner.is_none()
+                    && self.groups.iter().all(|group| group.workloads.is_empty())
+                    && term.is_none()
+                    && kill.is_none()
+                    && child.is_none();
+                if (!pre_running_cancellation && runner.is_none())
                     || self.groups.is_empty()
                     || outcome.is_some()
                     || hold.is_some()
@@ -2189,30 +2195,48 @@ impl ValidateRecord for SupervisorRecordV1 {
                 }
             }
             SupervisorPhaseV1::Complete => {
-                let signal_shape = match outcome {
+                let terminal_shape = match outcome {
+                    Some(SupervisorTerminalOutcomeV1::CancelledBeforeRunning) => {
+                        runner.is_none()
+                            && self.groups.iter().all(|group| group.workloads.is_empty())
+                            && term.is_none()
+                            && kill.is_none()
+                            && kill_cause.is_none()
+                            && child.is_none()
+                    }
                     Some(SupervisorTerminalOutcomeV1::Completed) => {
-                        term.is_none() && kill.is_none() && kill_cause.is_none()
+                        runner.is_some()
+                            && term.is_none()
+                            && kill.is_none()
+                            && kill_cause.is_none()
+                            && child.is_some()
                     }
                     Some(SupervisorTerminalOutcomeV1::Cancelled) => {
-                        term.is_some() && kill.is_none() && kill_cause.is_none()
+                        runner.is_some()
+                            && term.is_some()
+                            && kill.is_none()
+                            && kill_cause.is_none()
+                            && child.is_some()
                     }
                     Some(SupervisorTerminalOutcomeV1::KilledAfterDeadline) => {
-                        term.is_some()
+                        runner.is_some()
+                            && term.is_some()
                             && kill.is_some()
                             && kill_cause == Some(SupervisorKillCauseV1::Deadline)
+                            && child.is_some()
                     }
                     Some(SupervisorTerminalOutcomeV1::KilledAfterCancellation) => {
-                        term.is_some()
+                        runner.is_some()
+                            && term.is_some()
                             && kill.is_some()
                             && kill_cause == Some(SupervisorKillCauseV1::RepeatedCancellation)
+                            && child.is_some()
                     }
                     _ => false,
                 };
-                if runner.is_none()
-                    || self.groups.is_empty()
-                    || !signal_shape
+                if self.groups.is_empty()
+                    || !terminal_shape
                     || hold.is_some()
-                    || child.is_none()
                     || self.later_group_signal_permitted
                     || self
                         .groups
@@ -4441,6 +4465,38 @@ mod tests {
 
         prepared.groups.clear();
         assert!(prepared.validate().is_err());
+    }
+
+    #[test]
+    fn cancelled_before_running_is_terminal_without_runner_signals_or_child_artifact() {
+        let mut cancelled = completed_supervisor();
+        cancelled.runner = OptionalProcessIdentityV1::Absent;
+        cancelled.groups[0].workloads.clear();
+        cancelled.term_journal_elapsed_ms = OptionalElapsedMsV1::Absent;
+        cancelled.kill_journal_elapsed_ms = OptionalElapsedMsV1::Absent;
+        cancelled.kill_cause = OptionalSupervisorKillCauseV1::Absent;
+        cancelled.outcome = OptionalSupervisorOutcomeV1::Outcome {
+            value: SupervisorTerminalOutcomeV1::CancelledBeforeRunning,
+        };
+        cancelled.child_artifact = OptionalChildArtifactRefV1::Absent;
+        cancelled.validate().unwrap();
+
+        let mut retained = cancelled.clone();
+        retained.groups[0].anchor_lifecycle = AnchorLifecycleV1::RetainedLive;
+        assert!(retained.validate().is_err());
+
+        let mut with_runner = cancelled.clone();
+        with_runner.runner = OptionalProcessIdentityV1::Process {
+            value: process_identity_value(44, 43),
+        };
+        with_runner.groups[0]
+            .workloads
+            .push(process_identity_value(44, 43));
+        assert!(with_runner.validate().is_err());
+
+        let mut with_child = cancelled;
+        with_child.child_artifact = completed_supervisor().child_artifact;
+        assert!(with_child.validate().is_err());
     }
 
     #[test]

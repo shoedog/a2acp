@@ -4405,18 +4405,58 @@ where
     }
 }
 
+async fn select_registered_compatibility_shutdown_signal<I, T>(
+    interrupt: std::io::Result<I>,
+    terminate: std::io::Result<T>,
+) -> std::io::Result<CompatibilityShutdownSignal>
+where
+    I: std::future::Future<Output = std::io::Result<()>>,
+    T: std::future::Future<Output = std::io::Result<()>>,
+{
+    match (interrupt, terminate) {
+        (Ok(interrupt), Ok(terminate)) => {
+            select_compatibility_shutdown_signal(interrupt, terminate).await
+        }
+        (Ok(interrupt), Err(_)) => {
+            interrupt.await?;
+            Ok(CompatibilityShutdownSignal::Interrupt)
+        }
+        (Err(_), Ok(terminate)) => {
+            terminate.await?;
+            Ok(CompatibilityShutdownSignal::Terminate)
+        }
+        (Err(interrupt), Err(terminate)) => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "cannot register either compatibility shutdown signal: SIGINT: {interrupt}; SIGTERM: {terminate}"
+            ),
+        )),
+    }
+}
+
 #[cfg(unix)]
 async fn wait_for_compatibility_shutdown_signal() -> std::io::Result<CompatibilityShutdownSignal> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    select_compatibility_shutdown_signal(tokio::signal::ctrl_c(), async move {
-        terminate.recv().await.map(|_| ()).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "SIGTERM stream closed before a signal",
-            )
-        })
-    })
-    .await
+    let interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).map(
+        |mut signal| async move {
+            signal.recv().await.map(|_| ()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "SIGINT stream closed before a signal",
+                )
+            })
+        },
+    );
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map(
+        |mut signal| async move {
+            signal.recv().await.map(|_| ()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "SIGTERM stream closed before a signal",
+                )
+            })
+        },
+    );
+    select_registered_compatibility_shutdown_signal(interrupt, terminate).await
 }
 
 #[cfg(not(unix))]
@@ -7027,6 +7067,39 @@ agent_cli = "@openai/codex=0.144.1"
         assert!(request_compatibility_cancellation(&cancellation));
         assert!(!request_compatibility_cancellation(&cancellation));
         assert!(cancellation.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn one_viable_shutdown_signal_registration_survives_the_other_failure() {
+        let registration_error = || {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected signal registration failure",
+            )
+        };
+
+        let interrupt = select_registered_compatibility_shutdown_signal(
+            Ok(std::future::ready(Ok(()))),
+            Err::<std::future::Ready<std::io::Result<()>>, _>(registration_error()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(interrupt, CompatibilityShutdownSignal::Interrupt);
+
+        let terminate = select_registered_compatibility_shutdown_signal(
+            Err::<std::future::Ready<std::io::Result<()>>, _>(registration_error()),
+            Ok(std::future::ready(Ok(()))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(terminate, CompatibilityShutdownSignal::Terminate);
+
+        assert!(select_registered_compatibility_shutdown_signal(
+            Err::<std::future::Ready<std::io::Result<()>>, _>(registration_error()),
+            Err::<std::future::Ready<std::io::Result<()>>, _>(registration_error()),
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

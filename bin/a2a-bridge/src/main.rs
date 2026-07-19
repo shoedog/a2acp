@@ -40,6 +40,7 @@ mod compatibility_process_group;
 mod compatibility_resolution;
 mod compatibility_schedule;
 mod compatibility_schedule_schema;
+mod compatibility_schedule_state;
 mod compatibility_schedule_supervisor;
 mod config;
 mod containers;

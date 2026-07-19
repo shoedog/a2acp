@@ -114,10 +114,26 @@ without a numeric-group signal and makes the already-journaled attempt an ambigu
 registration revalidates every exact runner, workload, and anchor identity before trusting numeric parent links.
 Prepared recovery resumes only when its
 retained group is still exact and contains no possible workload; any observed member or ambiguity becomes a durable
-hold. Before success, the supervisor descriptor-pins and hashes the actual child join and optional aggregate bytes,
+hold. Cancellation while still `Prepared` journals a no-later-signal `Reaping` generation, rechecks for possible
+work immediately before releasing any retained anchor, proves group and exact-label container absence, and ends as
+`cancelled_before_running` without a runner or child artifact. Recovery completes that same cleanup without a group
+signal; a possible workload, observation error, or cleanup ambiguity becomes a durable hold while the retained
+capability is still available. Once a runner exists, direct-runner exit is observed from the retained waitable child
+and not inferred from a mutable process-table snapshot; a surviving, reparented descendant therefore cannot make the
+direct runner look live. Before success, the supervisor descriptor-pins and hashes the actual child join and optional aggregate bytes,
 checks their run/window/hash bindings, parses and validates the unchanged aggregate, and releases anchors only after
 that private verified-artifact capability exists. These schemas and journal checks do not themselves authorize or
 execute work.
+
+R3d2 scheduler control state uses the fixed operator-local APFS root below
+`~/Library/Application Support/a2a-bridge/operator/compatibility-scheduler/`. The existing root and its `authority`,
+`admission`, `ledger`, `supervisor`, and `locks` children must be owner-owned mode-`0700` directories retained by
+descriptor; existing broadened entries, symlinks, and special files are rejected rather than repaired. Lock files are
+single-link owner-owned mode-`0600` regular files opened relative to the retained `locks` directory. The nonblocking
+owner-wide admission guard consumes itself into one combined capability when it takes the authority-state lock, so
+the nested authority lock always releases before the still-live owner lock. Operator-only issuance or revocation
+takes a separate authority-only capability. Reversed same-root acquisition refuses, contention never queues a billable caller, and kernel
+lock release after exit or crash grants no authority without durable-state reconciliation.
 
 All records are versioned, deny unknown fields, raw-scan every decoded object key and string for secret-shaped
 material, and use bounded local file reads. Git object identities are non-null tagged SHA-1/SHA-256 object IDs rather than
@@ -168,11 +184,11 @@ required check.
 ## Later slices
 
 - R3d1 implements provider-free one-shot supervision and signal parity with fake-process proof.
-- R3d2 implements private authority, admission, preflights, equivalent-work, and durable accounting. Before it wires
-  the R3d1 mechanism to a production control implementation, it also makes Darwin zero/error group enumeration
-  errno-aware for absence proof, owns cancellation before `Running`, supplies an exact-runner-exit primitive,
-  preserves whichever SIGINT/SIGTERM registration succeeds if the other fails, and either excludes `.` from
-  externally derived supervisor record ids or gives every record a private journal directory.
+- R3d2 implements private authority, admission, preflights, equivalent-work, and durable accounting. Its first
+  internal checkpoint makes Darwin zero/error group enumeration errno-aware for absence proof, owns cancellation
+  before `Running`, supplies an exact-runner-exit primitive, preserves whichever SIGINT/SIGTERM registration succeeds
+  if the other fails, excludes `.` from externally derived supervisor record ids, and adds the local state/lock
+  primitives. None of those primitives activates a provider-capable route.
 - R3d3 implements evidence storage, retention, status, and crash-consistent publication state.
 - R3d4 implements disabled-by-default launchd and trusted test-merge/main triggers.
 - R3d5 separately characterizes every inventory row under single-use owner authority before any staged

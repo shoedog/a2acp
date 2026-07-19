@@ -1,6 +1,7 @@
 # R3d2 — authority, admission, preflights, and accounting implementation plan
 
-- **Status:** ACTIVE — focused implementation plan; no R3d2 mechanism has been implemented or reviewed yet
+- **Status:** ACTIVE — R3d2a implemented with focused/full deterministic gates green but not independently
+  reviewed; R3d2b is next
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -57,7 +58,8 @@ The state root separates:
   manual-admission nonce consumption, and characterization index;
 - `admission/`: committed admission records and equivalent-work reservations/consumptions;
 - `ledger/`: append-only reservation/reconciliation records plus rebuilt materialized UTC/rolling views;
-- `supervisor/`: R3d1 private per-record journals, now collision-free for every externally derived id; and
+- `supervisor/`: R3d1 owner-private journals with collision-free generation prefixes for every externally
+  derived id; and
 - `locks/`: the owner-wide admission lock and the narrower authority-state lock.
 
 The only admission lock order is owner-wide then authority-state. Operator-only issuance/revocation that cannot
@@ -91,8 +93,8 @@ Work:
    clearing and inspecting `errno`; only proved absence can release production ownership.
 2. Register SIGINT and SIGTERM independently and preserve whichever registration succeeds; fail closed only when
    neither viable shutdown path exists.
-3. Give every supervisor record a private directory and reject `.`/`..`/separator-bearing or otherwise
-   noncanonical externally derived ids.
+3. Exclude `.` from the already bounded externally derived supervisor ids, in addition to rejecting `.`/`..`,
+   separators, and other noncanonical bytes, so prefix-style generation names cannot alias another record.
 4. Add supervisor-owned cancellation while still `Prepared`; cancellation before `Running` cannot strand a child
    or create an unjournaled provider-capable spawn.
 5. Add an exact-runner-exit control primitive that observes the retained child capability rather than inferring
@@ -104,12 +106,66 @@ Required tests and red proof:
 
 - injected Darwin empty/error/resize results separate absence from ambiguity;
 - one failed signal registration preserves the other, while two failures refuse;
-- `.` and all path-collision mutations fail; two valid record ids cannot share a journal directory;
+- `.` and all path-collision mutations fail; two valid record ids cannot alias a journal generation prefix;
 - cancellation before and during the Prepared-to-Running boundary produces no unowned workload;
 - an exited runner with a retained descendant is not confused with a live runner, and a live retained runner is
   not declared exited after an observation error;
 - two processes contend on the owner-wide lock and exactly one obtains it without queuing;
 - wrong modes, symlinks, special files, network/nonlocal roots where detectable, and reversed lock order fail.
+
+#### R3d2a checkpoint evidence — 2026-07-19
+
+Implemented mechanism:
+
+- Darwin group enumeration clears/captures thread-local `errno` around both `proc_listpgrppids` calls; only
+  zero with zero `errno` proves an empty group. The Apple wrapper returns PID counts and can collapse its
+  underlying `-1 / sizeof(int)` to zero while preserving `errno`.
+- SIGINT and SIGTERM registrations are independent; either viable stream remains usable when the other
+  registration fails, and two failures refuse.
+- Supervisor ids no longer accept `.`, closing generation-prefix aliasing without changing the shared
+  owner-private journal directory layout.
+- `Prepared` cancellation durably enters no-later-signal `Reaping`, fences possible workloads both before the
+  transition and immediately before retained-anchor release, performs only exact cleanup/absence proofs, and
+  ends as `cancelled_before_running`. Recovery resumes the same cleanup without a numeric-group signal.
+- `RetainedRunnerExit` owns the waitable direct child and exact identity. Its tests distinguish a live runner,
+  a mismatched identity, cached terminal status, and a runner exit while a same-start descendant remains live
+  after reparenting.
+- The fixed local-APFS production state-root model retains `0700` root/child descriptors, opens verified `0600`
+  single-link lock files relative to the retained lock directory, refuses broadened/symlink/special objects,
+  uses nonblocking cross-process `flock`, releases on normal or abrupt process exit, and exposes only a combined
+  admission capability that owns both locks until authority-before-owner release plus a separate authority-only
+  operator-mutation capability.
+
+Pre-change red proof:
+
+- `supervisor.1` was accepted as a record id and collided with the prefix grammar.
+- cancellation requested in `Prepared` remained `Prepared` and did not own cleanup.
+- one injected signal-registration failure discarded the other viable signal path.
+- a Darwin zero return with `EIO` was accepted as absence.
+- the recovery race regression observed `ReleasedReaped` instead of `RetainedLive` when a possible workload
+  appeared after the `Reaping` journal generation; the just-before-release fence makes it green.
+- the first nested-lock type allowed the owner guard to be dropped while its authority guard remained live;
+  `run-2` then acquired the owner lock. The combined admission capability keeps both locks live and closes that
+  concrete overlap.
+- the retained-runner and scheduler-state APIs were absent at the R3d1 base, so their behavioral test modules
+  were compile-red there.
+
+Deterministic gates:
+
+- `cargo fmt --all -- --check`, tracked/untracked diff checks, and
+  `RUSTFLAGS='-D warnings' cargo check -p a2a-bridge --all-targets` are green.
+- Focused tests are process group **7/0**, independent signal registration **1/0**, schedule schema **32/0**,
+  supervisor **41/0**, and scheduler state/locks **8/0**.
+- The complete `a2a-bridge` binary is **562/0/0**. Its first run was **559/1** because the new retained-child
+  test used scheduler yields with no wall-clock allowance; bounded 10 ms polling passed **10/0** repeatedly,
+  the descendant edge passed **3/0** repeatedly, and the complete rerun is green.
+- The exact post-lock-fix full serial workspace is **2,298/0/12 ignored** across **72** reported test/doc-test
+  result groups, **55** of them nonempty.
+
+Not verified or authorized at this checkpoint: real OS-delivered SIGINT/SIGTERM, a nonlocal production root,
+creation or mutation of the real operator state root, a provider/model/registry/image/GitHub/iCloud effect,
+timer installation, production-operator lifecycle action, or an independent implementation review. R3d2a is
+not independently activatable, and `schedule-tick` retains its typed no-effects refusal.
 
 ### R3d2b — private authority state, revocation, and source reducers
 
