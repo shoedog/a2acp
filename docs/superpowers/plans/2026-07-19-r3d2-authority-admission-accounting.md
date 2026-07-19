@@ -3,7 +3,8 @@
 - **Status:** ACTIVE — R3d2a through R3d2e are implemented; the first exact-head Sol/xhigh implementation review
   returned `REVISE` at `1373985`, and closure review of exact `28e7d28` returned `REVISE` with three new `WRONG`
   findings plus a stale-cursor residual. Mechanism commit `f18e74a` closes the three new findings; focused gates are
-  green, while the new exact-head full gate, Sol closure re-review, and post-Sol Fable lens remain pending
+  green, exact docs-fold candidate `840f486` passed the complete deterministic gate, and Sol closure re-review plus
+  the post-Sol Fable lens remain pending
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -743,9 +744,20 @@ The added negative matrix rejects a mutually self-consistent deadline/supervisor
 window, wrong case, over-cap case timeout, or overlong authority window. The positive handoff proves it carries the
 same live derivation that admission committed. After formatting, focused gates are preflight **11/0**,
 state/root/locks **15/0**, supervisor **41/0**, and transaction **20/0**; `git diff --check` and all-target
-`cargo check -p a2a-bridge` are green. These are mechanism-checkpoint totals, not an exact-final full-suite claim.
-The next gate is the complete deterministic suite on the docs-fold head, followed by a fresh Sol/xhigh closure
-re-review. Fable remains blocked until Sol approves.
+`cargo check -p a2a-bridge` are green.
+
+Exact docs-fold candidate `840f486ab24bf53848b985d76d845e8274db91d9` then passed the complete deterministic
+gate. Format/diff, warnings-denied workspace all-target/all-feature check and Clippy, locked release build,
+dependency policy, repository hygiene **37/7**, manifest **9**, floating recipes **4**, schedule foundation
+**6/4**, and the complete binary **645/0/0** are green. The one-job/one-thread full workspace is
+**2,382/0/12 ignored** across **72** result groups, **55** nonempty. The ignored set remains the existing explicitly
+live/authenticated provider integrations; none was unignored or invoked. The release binary remains byte-identical
+at **26,604,912 bytes**, SHA-256
+`5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`, consistent with the internal mechanism
+remaining unreachable from production routes. The previously reported unrelated
+`warm_streaming_records_usage_without_emitting_usage_frame` raw-substring/UUID flake did not recur; no unrelated
+test was rebaselined or changed. After this evidence-only fold, rerun the full suite on the resulting exact head,
+freeze its boundary, and request a fresh Sol/xhigh closure rereview. Fable remains blocked until Sol approves.
 
 ## Verification and review gates
 
@@ -780,10 +792,11 @@ re-review. Fable remains blocked until Sol approves.
 Resume branch `agent/reliability-r3d2-authority-admission` in a newly verified clean trusted worktree; do not depend
 on a prior `/private/tmp` worktree or review mirror. The branch is based on merged R3d1 main
 `cbcfd1f06b914064456d1798be71bacdc294f3d5`, and mechanism commit `f18e74a` closes the three findings from the
-second Sol review. Read this plan, the R3d design of record, the durable roadmap, `AGENTS.md`, and
+second Sol review. Exact candidate `840f486` passed the complete gate before the current evidence-only fold. Read
+this plan, the R3d design of record, the durable roadmap, `AGENTS.md`, and
 `skills/a2a-bridge-operator/SKILL.md` before editing. Preserve the single R3d2 merge boundary, the
 owner-wide-then-authority lock order, the single admission linearization point, the zero-effect default, and the
-separation between provider authority and storage consent. The next action is to commit this evidence/cursor, run
-the complete deterministic gate on that exact head, freeze head/base/merge-base/changed paths, and ask Sol/xhigh to
+separation between provider authority and storage consent. The next action is to commit this evidence/cursor, rerun
+the full suite on that exact docs-only head, freeze head/base/merge-base/changed paths, and ask Sol/xhigh to
 adjudicate the stale-cursor residual plus all three second-review `WRONG` findings. Run the single Fable lens only
 after Sol approves; then fold final evidence, rerun exact-final gates, and publish the non-draft PR.

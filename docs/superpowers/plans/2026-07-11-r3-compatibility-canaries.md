@@ -25,8 +25,9 @@
   passed **641/0/0** binary and **2,378/0/12 ignored** serial workspace, then closure review returned `REVISE` with
   three new `WRONG` plus a stale-cursor residual. Commit `f18e74a` closes cross-admission preflight replay, joins the
   executable authority-contained deadline to durable admission and handoff, and serializes same-process lock-state
-  publication. Focused preflight/state/supervisor/transaction gates are **11/0 + 15/0 + 41/0 + 20/0**; the new
-  exact-head full gate and Sol closure rereview remain pending.
+  publication. Focused preflight/state/supervisor/transaction gates are **11/0 + 15/0 + 41/0 + 20/0**. Exact
+  docs-fold candidate `840f486` passed binary **645/0/0**, full workspace **2,382/0/12 ignored** across **72**
+  result groups, and every deterministic release/validator gate; Sol closure rereview remains pending.
   The merged R3d0 implementation was
   `agent/reliability-r3d0-foundation`: the fourth closure review approved exact cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test commit
@@ -1157,11 +1158,12 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 - **Base:** merged R3d1 main `cbcfd1f06b914064456d1798be71bacdc294f3d5` (PR #40)
 - **Status:** design of record **APPROVED / MERGED** at exact design head
   `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 and R3d1 are merged, and R3d2 is
-  **ACTIVE / R3D2A-R3D2E IMPLEMENTED / SECOND SOL REVIEW REVISE / REMEDIATION FOLDED / FOCUSED GREEN / FULL GATE
-  PENDING**. Exact candidate `1373985` received four `WRONG` and one `SMELL`; remediation candidate `28e7d28`
+  **ACTIVE / R3D2A-R3D2E IMPLEMENTED / SECOND SOL REVIEW REVISE / REMEDIATION FOLDED / FULL GATE GREEN / SOL
+  CLOSURE REREVIEW PENDING**. Exact candidate `1373985` received four `WRONG` and one `SMELL`; remediation candidate `28e7d28`
   received three new `WRONG` plus a stale-cursor residual. Commit `f18e74a` closes preflight replay, executable
   deadline proof/handoff, and same-process lock publication. Focused gates are green at preflight/state/supervisor/
-  transaction **11/0 + 15/0 + 41/0 + 20/0**; the new complete exact-head gate and Sol closure rereview are pending.
+  transaction **11/0 + 15/0 + 41/0 + 20/0**; exact candidate `840f486` passed binary **645/0/0**, workspace
+  **2,382/0/12 ignored**, and all deterministic release/validator gates. Sol closure rereview remains pending.
   The R3d0 default-off policy/schema mechanism was
   approved at exact mechanism commit
   `5baeeb3f47183ea2a47d2cdc5ffce26f1df7dbfb`, approved cursor
@@ -2731,8 +2733,9 @@ merged R3d1 main `cbcfd1f06b914064456d1798be71bacdc294f3d5`; use the focused
 [`2026-07-19-r3d2-authority-admission-accounting.md`](2026-07-19-r3d2-authority-admission-accounting.md)
 restart contract. R3d1 merged by PR #40 at that base. R3d2's first review froze `1373985`; its closure candidate
 `28e7d28` received three new `WRONG` and the stale-cursor residual, all mechanism findings are remediated by
-`f18e74a`, and focused gates are green. Commit this evidence fold, run the complete deterministic gate, freeze the
-new exact boundary, and run Sol closure rereview before the single Fable release/compatibility lens. The initial exact-base Fable design review plus
+`f18e74a`; exact candidate `840f486` passed the complete deterministic gate. Commit this evidence fold, rerun the
+full suite on the resulting docs-only head, freeze the new exact boundary, and run Sol closure rereview before the
+single Fable release/compatibility lens. The initial exact-base Fable design review plus
 exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
 exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, exact-`c50811f`, and
 exact-`fb8a2f4`, exact-`ae9db39`, exact-`2eb242a`, exact-`8dc6054`, exact-`cc01a52`, and exact-`b54840a`
