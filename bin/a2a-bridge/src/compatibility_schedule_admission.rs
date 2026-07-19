@@ -413,6 +413,15 @@ fn purpose_satisfies(
     }
 }
 
+fn evidence_available_at_ms(evidence: &CompletedEquivalentEvidenceV1) -> i64 {
+    match &evidence.provenance {
+        ConsumptionEvidenceProvenanceV1::Ordinary => evidence.terminal_at_ms,
+        ConsumptionEvidenceProvenanceV1::ReviewedCharacterization { reviewed_at_ms, .. } => {
+            evidence.terminal_at_ms.max(*reviewed_at_ms)
+        }
+    }
+}
+
 impl EquivalentWorkStateV1 {
     pub(super) fn new() -> Self {
         Self::default()
@@ -542,6 +551,7 @@ impl EquivalentWorkStateV1 {
                         &evidence.freshness_bucket,
                     )
                     .is_ok_and(|key| key == consumption.equivalent_work_key)
+                    && consumption.consumed_at_ms >= evidence_available_at_ms(evidence)
             });
             if consumption_id != &consumption.consumption_id
                 || consumption_id != &expected_id
@@ -601,6 +611,12 @@ impl EquivalentWorkStateV1 {
             return Err("schedule admission: equivalent-work authority/time mismatch".into());
         }
         if let Some(evidence) = self.eligible_evidence(identities).cloned() {
+            if reserved_at_ms < evidence_available_at_ms(&evidence) {
+                return Err(
+                    "schedule admission: reusable evidence is newer than the admission clock"
+                        .into(),
+                );
+            }
             let consumption_hash = admission_hash(
                 "equivalent-work-consumption-id",
                 &(
@@ -2551,6 +2567,59 @@ mod tests {
         );
         assert_eq!(state.consumptions.len(), 1);
         state.validate().unwrap();
+    }
+
+    #[test]
+    fn equivalent_work_refuses_reuse_when_clock_precedes_selected_evidence() {
+        let profile = fingerprint('2');
+        let input = execution_input(&profile);
+        let first = derive(
+            input.clone(),
+            standing_authority(1),
+            daily_trigger(
+                "request-1",
+                "window-1",
+                "attempt-1",
+                OptionalStableIdV1::Absent,
+            ),
+            EvidencePurposeV1::ClaimedSupportGate,
+            "freshness-1",
+        );
+        let mut state = EquivalentWorkStateV1::new();
+        let reservation = reserved(
+            state
+                .reserve_or_reuse(&first, first.admission_attempt.input.authority.clone(), 10)
+                .unwrap(),
+        );
+        state
+            .record_completed(completed(
+                &reservation,
+                EvidencePurposeV1::ClaimedSupportGate,
+                ConsumptionEvidenceProvenanceV1::Ordinary,
+                true,
+                '3',
+                15,
+            ))
+            .unwrap();
+
+        let rolled_back = ordinary_ids(&input, "request-2", "window-2", "attempt-2");
+        let before = state.clone();
+        assert!(state
+            .reserve_or_reuse(
+                &rolled_back,
+                rolled_back.admission_attempt.input.authority.clone(),
+                14,
+            )
+            .is_err());
+        assert_eq!(state, before);
+
+        let later = ordinary_ids(&input, "request-3", "window-3", "attempt-3");
+        assert!(matches!(
+            state
+                .reserve_or_reuse(&later, later.admission_attempt.input.authority.clone(), 16)
+                .unwrap(),
+            EquivalentWorkDecisionV1::Reused(_)
+        ));
     }
 
     #[test]

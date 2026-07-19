@@ -15,7 +15,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::compatibility_schedule::{
-    load_schedule_foundation, EffectCapsV1, EffectClassV1, TriggerKindV1,
+    load_schedule_foundation, EffectCapsV1, EffectClassV1, EvidencePurposeV1, TriggerKindV1,
 };
 use crate::compatibility_schedule_admission::{
     rederive_claimed_support_ledger_context_from_foundation, rederive_manual_ledger_context,
@@ -756,13 +756,23 @@ fn validate_commit_against_state(
             AdmissionDispositionV1::Reused { consumption },
             EquivalentWorkDecisionV1::Reused(expected),
         ) if consumption == &expected => {
-            if !matches!(
-                value.context.identities.admission_attempt.input.authority,
-                AdmissionAuthorityV1::StandingGrant(_)
-            ) || !matches!(value.authority_action, AuthorityCommitActionV1::Standing)
-            {
+            let authority = &value.context.identities.admission_attempt.input.authority;
+            let reuse_authority_matches = match (authority, &value.authority_action) {
+                (AdmissionAuthorityV1::StandingGrant(_), AuthorityCommitActionV1::Standing) => true,
+                (
+                    AdmissionAuthorityV1::ManualAcknowledgement(_),
+                    AuthorityCommitActionV1::Manual { admission },
+                ) => {
+                    consumption.requested_purpose == EvidencePurposeV1::ProviderPathAdvisory
+                        && admission.record.evidence_purpose
+                            == EvidencePurposeV1::ProviderPathAdvisory
+                        && &admission.authority == authority
+                }
+                _ => false,
+            };
+            if !reuse_authority_matches {
                 return Err(
-                    "schedule transaction: one-shot/manual work cannot reuse evidence".into(),
+                    "schedule transaction: authority is not permitted to reuse evidence".into(),
                 );
             }
         }
@@ -1659,9 +1669,8 @@ where
             if &published != ledger.as_ref() {
                 return Err("schedule transaction: published ledger reservation diverged".into());
             }
-            let supervisor_directory = capability.supervisor_directory().canonical_path();
             let (latest, _latest_sha256) =
-                ensure_prepared_supervisor(&supervisor_directory, supervisor)?;
+                ensure_prepared_supervisor(capability.supervisor_directory(), supervisor)?;
             Ok(Some(latest))
         }
         AdmissionDispositionV1::Reused { .. } => Ok(None),
@@ -1716,8 +1725,8 @@ where
     else {
         return Err("schedule transaction: reused commit cannot publish a terminal".into());
     };
-    let supervisor_directory = capability.supervisor_directory().canonical_path();
-    let (latest, latest_sha256) = ensure_prepared_supervisor(&supervisor_directory, prepared)?;
+    let (latest, latest_sha256) =
+        ensure_prepared_supervisor(capability.supervisor_directory(), prepared)?;
     if latest != terminal.supervisor || latest_sha256 != terminal.supervisor_journal_sha256 {
         return Err("schedule transaction: terminal supervisor tail diverged".into());
     }
@@ -1965,8 +1974,8 @@ where
     let AdmissionDispositionV1::Reserved { supervisor, .. } = &commit.disposition else {
         return Err("schedule transaction: reused admission cannot be reconciled".into());
     };
-    let supervisor_directory = capability.supervisor_directory().canonical_path();
-    let (latest, latest_sha256) = ensure_prepared_supervisor(&supervisor_directory, supervisor)?;
+    let (latest, latest_sha256) =
+        ensure_prepared_supervisor(capability.supervisor_directory(), supervisor)?;
     let disposition = durable_terminal_disposition(&commit, &latest, proof, recorded_at_ms)?;
     if pending.is_none() {
         let existing = existing.expect("the no-pending branch selected an existing terminal");
@@ -3303,9 +3312,9 @@ mod tests {
         capability: &impl AdmissionStateCapability,
         supervisor_record_id: &str,
     ) {
-        let directory = capability.supervisor_directory().canonical_path();
+        let directory = capability.supervisor_directory();
         let (mut journal, prepared, prepared_sha256) =
-            FileSupervisorJournal::open_existing(&directory, supervisor_record_id).unwrap();
+            FileSupervisorJournal::open_existing(directory, supervisor_record_id).unwrap();
         let mut reaping = prepared;
         reaping.generation = 2;
         reaping.previous_record = OptionalSha256V1::Sha256 {
@@ -3338,13 +3347,13 @@ mod tests {
         };
         complete.recorded_at_ms = 13;
         journal.persist(&complete).unwrap();
-        FileSupervisorJournal::open_existing(&directory, supervisor_record_id).unwrap();
+        FileSupervisorJournal::open_existing(directory, supervisor_record_id).unwrap();
     }
 
     fn persist_safety_hold(capability: &impl AdmissionStateCapability, supervisor_record_id: &str) {
-        let directory = capability.supervisor_directory().canonical_path();
+        let directory = capability.supervisor_directory();
         let (mut journal, prepared, prepared_sha256) =
-            FileSupervisorJournal::open_existing(&directory, supervisor_record_id).unwrap();
+            FileSupervisorJournal::open_existing(directory, supervisor_record_id).unwrap();
         let mut held = prepared;
         held.generation = 2;
         held.previous_record = OptionalSha256V1::Sha256 {
@@ -3360,7 +3369,7 @@ mod tests {
         };
         held.recorded_at_ms = 11;
         journal.persist(&held).unwrap();
-        FileSupervisorJournal::open_existing(&directory, supervisor_record_id).unwrap();
+        FileSupervisorJournal::open_existing(directory, supervisor_record_id).unwrap();
     }
 
     fn persist_completed(
@@ -3368,9 +3377,9 @@ mod tests {
         supervisor_record_id: &str,
         child_artifact: ChildArtifactRefV1,
     ) {
-        let directory = capability.supervisor_directory().canonical_path();
+        let directory = capability.supervisor_directory();
         let (mut journal, prepared, prepared_sha256) =
-            FileSupervisorJournal::open_existing(&directory, supervisor_record_id).unwrap();
+            FileSupervisorJournal::open_existing(directory, supervisor_record_id).unwrap();
         let runner = ProcessIdentityV1 {
             pid: 44,
             parent_pid: 42,
@@ -3429,7 +3438,7 @@ mod tests {
         };
         complete.recorded_at_ms = 14;
         journal.persist(&complete).unwrap();
-        FileSupervisorJournal::open_existing(&directory, supervisor_record_id).unwrap();
+        FileSupervisorJournal::open_existing(directory, supervisor_record_id).unwrap();
     }
 
     fn optional_text_value(value: &OptionalTextV1) -> Option<String> {
@@ -3788,8 +3797,8 @@ mod tests {
     }
 
     #[test]
-    fn completed_standing_work_reuses_without_new_ledger_or_supervisor() {
-        let (state, source, environment, request, _binding) = standing_source_fixture();
+    fn completed_work_reuses_for_standing_and_manual_authority_without_new_effects() {
+        let (state, source, environment, request, binding) = standing_source_fixture();
         let (_state_temp, scheduler) = state_root();
         let (_action_temp, trusted_root, requested_cwd) = action_bindings();
         let locks = scheduler
@@ -3905,8 +3914,8 @@ mod tests {
             .admit(
                 selected,
                 Some(supervisor),
-                trusted_root,
-                requested_cwd,
+                trusted_root.clone(),
+                requested_cwd.clone(),
                 16,
                 &mut PassingChecks,
                 &mut PassingChecks,
@@ -3934,6 +3943,140 @@ mod tests {
             admission.commits.last().unwrap().0.disposition,
             AdmissionDispositionV1::Reused { .. }
         ));
+        drop(admission);
+        drop(session);
+
+        let input = foundation_execution(&binding).input;
+        let execution = seal_case_execution_fingerprint(input.clone()).unwrap();
+        let manual = derive_manual_admission(
+            ManualAdmissionOriginV1::DirectLocalCompatibilityCli,
+            true,
+            None,
+            &FixedNonce,
+            ManualAdmissionBindingsV1 {
+                operator: environment.operator.clone(),
+                environment_owner: environment.environment_owner.clone(),
+                scheduler_binary_sha256: environment.scheduler_binary_sha256.clone(),
+                input_source_sha256: digest('f'),
+                case_id: binding.source.row_id.clone(),
+                provider_family: binding.provider_family.clone(),
+                characterization_profile: binding.characterization_profile.clone(),
+                case_execution: execution.fingerprint,
+                evidence_purpose: EvidencePurposeV1::ProviderPathAdvisory,
+                freshness_bucket: "freshness-reuse".into(),
+                caps: input.actual_caps.clone(),
+                allowed_effects: binding.allowed_effects.clone(),
+                issued_at_ms: 2,
+                expires_at_ms: AUTHORITY_EXPIRES_AT_MS,
+            },
+        )
+        .unwrap();
+        let request_nonce = manual.record.request_nonce.clone();
+        let manual_trigger = AdmissionTriggerIdentityV1 {
+            source: TriggerSourceV1::ManualCompatibilityCli,
+            kind: TriggerKindV1::ManualCompatibility,
+            request_id: request_nonce.clone(),
+            window_id: "window-manual-reuse".into(),
+            attempt_id: "attempt-manual-reuse".into(),
+            repeat_nonce: OptionalStableIdV1::Absent,
+        };
+        let mut manual_environment = environment.clone();
+        manual_environment.now_ms = 17;
+        let session = begin_admission_transaction(&locks).unwrap();
+        let selected = session
+            .rederive_manual_source(
+                manual.clone(),
+                input.clone(),
+                manual_trigger.clone(),
+                &manual_environment,
+                "grant-1",
+            )
+            .unwrap();
+        let supervisor = prepared_supervisor(&selected.context);
+        let published = session
+            .admit(
+                selected,
+                Some(supervisor),
+                trusted_root.clone(),
+                requested_cwd.clone(),
+                17,
+                &mut PassingChecks,
+                &mut PassingChecks,
+            )
+            .unwrap();
+        assert!(matches!(published, PublishedAdmissionV1::Reused(_)));
+        assert_eq!(
+            std::fs::read_dir(locks.ledger_directory().canonical_path())
+                .unwrap()
+                .count(),
+            ledger_entries_before
+        );
+        assert_eq!(
+            std::fs::read_dir(locks.supervisor_directory().canonical_path())
+                .unwrap()
+                .count(),
+            supervisor_entries_before
+        );
+        let authority = FileAuthorityJournal::open_existing(&locks).unwrap();
+        assert!(authority
+            .snapshot
+            .state
+            .manual_admissions
+            .contains_key(&request_nonce));
+        drop(authority);
+        drop(session);
+
+        let replay = begin_admission_transaction(&locks).unwrap();
+        let replay_selected = replay
+            .rederive_manual_source(
+                manual,
+                input,
+                manual_trigger,
+                &manual_environment,
+                "grant-1",
+            )
+            .unwrap();
+        let replay_supervisor = prepared_supervisor(&replay_selected.context);
+        let commit_count_before_replay = FileAdmissionJournal::open(&locks).unwrap().commits.len();
+        assert!(replay
+            .admit(
+                replay_selected,
+                Some(replay_supervisor),
+                trusted_root,
+                requested_cwd,
+                17,
+                &mut PassingChecks,
+                &mut PassingChecks,
+            )
+            .is_err());
+        assert_eq!(
+            FileAdmissionJournal::open(&locks).unwrap().commits.len(),
+            commit_count_before_replay
+        );
+    }
+
+    #[test]
+    fn supervisor_directory_replacement_refuses_publication_without_a_capability() {
+        let (_state_temp, scheduler) = state_root();
+        let (_action_temp, trusted_root, requested_cwd) = action_bindings();
+        let locks = scheduler
+            .try_owner_admission("test:supervisor-directory-replacement")
+            .unwrap()
+            .try_authority_state("test:supervisor-directory-replacement")
+            .unwrap();
+        FileAuthorityJournal::initialize(&locks, 1).unwrap();
+        let proposal = manual_proposal(&locks, trusted_root, requested_cwd);
+
+        let supervisor_path = locks.supervisor_directory().canonical_path();
+        let retained_path = supervisor_path.with_file_name("supervisor-retained");
+        std::fs::rename(&supervisor_path, &retained_path).unwrap();
+        std::fs::create_dir(&supervisor_path).unwrap();
+        std::fs::set_permissions(&supervisor_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = commit_prevalidated_proposal_for_capability(&locks, proposal);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(&supervisor_path).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&retained_path).unwrap().count(), 0);
     }
 
     #[test]
@@ -4131,7 +4274,7 @@ mod tests {
                 .is_file());
             let (_journal, latest, _sha256) =
                 crate::compatibility_schedule_supervisor::FileSupervisorJournal::open_existing(
-                    &locks.supervisor_directory().canonical_path(),
+                    locks.supervisor_directory(),
                     &supervisor_record_id,
                 )
                 .unwrap();

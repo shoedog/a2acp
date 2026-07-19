@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::compatibility::{
@@ -27,6 +27,7 @@ use crate::compatibility_schedule_schema::{
     OptionalSupervisorKillCauseV1, OptionalSupervisorOutcomeV1, SafetyHoldReasonV1,
     SupervisorKillCauseV1, SupervisorPhaseV1, SupervisorRecordV1, SupervisorTerminalOutcomeV1,
 };
+use crate::local_file::PinnedDirectory;
 use crate::BoxError;
 
 #[derive(Debug)]
@@ -768,8 +769,7 @@ fn validate_supervisor_transition(
 
 #[cfg(unix)]
 pub(super) struct FileSupervisorJournal {
-    directory: PathBuf,
-    directory_handle: std::fs::File,
+    directory: PinnedDirectory,
     record_id: String,
     next_generation: u64,
     previous_sha256: Option<String>,
@@ -796,26 +796,10 @@ impl FileSupervisorJournal {
         Ok(())
     }
 
-    fn open_directory(directory: &Path) -> Result<(PathBuf, std::fs::File), BoxError> {
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    fn validate_directory(directory: &PinnedDirectory) -> Result<(), BoxError> {
+        use std::os::unix::fs::MetadataExt as _;
 
-        let canonical = std::fs::canonicalize(directory).map_err(|error| {
-            format!(
-                "schedule supervisor: cannot resolve journal directory {}: {error}",
-                directory.display()
-            )
-        })?;
-        let handle = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(&canonical)
-            .map_err(|error| {
-                format!(
-                    "schedule supervisor: cannot open journal directory {}: {error}",
-                    canonical.display()
-                )
-            })?;
-        let metadata = handle.metadata()?;
+        let metadata = directory.file_handle().metadata()?;
         if !metadata.is_dir()
             || metadata.uid() != unsafe { libc::geteuid() }
             || metadata.mode() & 0o077 != 0
@@ -825,19 +809,21 @@ impl FileSupervisorJournal {
                     .into(),
             );
         }
-        Ok((canonical, handle))
+        if !directory.current_path_matches() {
+            return Err("schedule supervisor: journal directory identity changed".into());
+        }
+        Ok(())
     }
 
     fn generation_name(record_id: &str, generation: u64) -> String {
         format!("{record_id}.{generation:020}.json")
     }
 
-    pub(super) fn create(directory: &Path, record_id: &str) -> Result<Self, BoxError> {
+    pub(super) fn create(directory: &PinnedDirectory, record_id: &str) -> Result<Self, BoxError> {
         Self::validate_record_id(record_id)?;
-        let (directory, directory_handle) = Self::open_directory(directory)?;
+        Self::validate_directory(directory)?;
         let mut journal = Self {
-            directory,
-            directory_handle,
+            directory: directory.clone(),
             record_id: record_id.to_owned(),
             next_generation: 1,
             previous_sha256: None,
@@ -849,16 +835,10 @@ impl FileSupervisorJournal {
     }
 
     fn generation_entries(&mut self) -> Result<Vec<(u64, String)>, BoxError> {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let expected = self.directory_handle.metadata()?;
-        let before = std::fs::metadata(&self.directory)?;
-        if expected.dev() != before.dev() || expected.ino() != before.ino() {
-            return Err("schedule supervisor: journal directory identity changed".into());
-        }
+        Self::validate_directory(&self.directory)?;
         let prefix = format!("{}.", self.record_id);
         let mut paths = Vec::new();
-        for entry in std::fs::read_dir(&self.directory)? {
+        for entry in std::fs::read_dir(self.directory.acp_session_cwd())? {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
@@ -881,41 +861,19 @@ impl FileSupervisorJournal {
         if paths.len() > Self::MAX_JOURNAL_GENERATIONS {
             return Err("schedule supervisor: journal generation count exceeds the bound".into());
         }
-        let after = std::fs::metadata(&self.directory)?;
-        if expected.dev() != after.dev() || expected.ino() != after.ino() {
-            return Err(
-                "schedule supervisor: journal directory identity changed during scan".into(),
-            );
-        }
+        Self::validate_directory(&self.directory)?;
         paths.sort_by_key(|(generation, _)| *generation);
         Ok(paths)
     }
 
     fn read_generation(&self, name: &str) -> Result<(Vec<u8>, String), BoxError> {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
         use std::os::unix::fs::MetadataExt as _;
 
-        let c_name = std::ffi::CString::new(name.as_bytes())
-            .map_err(|_| "schedule supervisor: journal generation name contains NUL")?;
-        // SAFETY: the retained directory descriptor and single-component name are live. O_NOFOLLOW
-        // rejects a retargeted final component and O_NONBLOCK prevents a special file from parking
-        // the recovery scan before the regular-file check.
-        let fd = unsafe {
-            libc::openat(
-                self.directory_handle.as_raw_fd(),
-                c_name.as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            )
-        };
-        if fd == -1 {
-            return Err(format!(
-                "schedule supervisor: cannot open journal generation {name}: {}",
-                std::io::Error::last_os_error()
-            )
-            .into());
-        }
-        // SAFETY: openat returned this descriptor uniquely.
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        Self::validate_directory(&self.directory)?;
+        let mut file = self.directory.open_regular_file(
+            std::ffi::OsStr::new(name),
+            "schedule supervisor journal generation",
+        )?;
         let before = file.metadata()?;
         if !before.is_file()
             || before.nlink() != 1
@@ -947,19 +905,19 @@ impl FileSupervisorJournal {
         {
             return Err("schedule supervisor: journal generation changed during read".into());
         }
+        Self::validate_directory(&self.directory)?;
         let sha256 = crate::local_file::sha256_hex(&bytes);
         Ok((bytes, sha256))
     }
 
     pub(super) fn open_existing(
-        directory: &Path,
+        directory: &PinnedDirectory,
         record_id: &str,
     ) -> Result<(Self, SupervisorRecordV1, String), BoxError> {
         Self::validate_record_id(record_id)?;
-        let (directory, directory_handle) = Self::open_directory(directory)?;
+        Self::validate_directory(directory)?;
         let mut journal = Self {
-            directory,
-            directory_handle,
+            directory: directory.clone(),
             record_id: record_id.to_owned(),
             next_generation: 1,
             previous_sha256: None,
@@ -1023,7 +981,7 @@ impl FileSupervisorJournal {
 /// This recovery primitive cannot start a runner or signal a process group.
 #[cfg(unix)]
 pub(super) fn ensure_prepared_supervisor(
-    directory: &Path,
+    directory: &PinnedDirectory,
     prepared: &SupervisorRecordV1,
 ) -> Result<(SupervisorRecordV1, String), BoxError> {
     if prepared.generation != 1 || prepared.phase != SupervisorPhaseV1::Prepared {
@@ -1049,9 +1007,9 @@ pub(super) fn ensure_prepared_supervisor(
 #[cfg(unix)]
 impl SupervisorJournal for FileSupervisorJournal {
     fn persist(&mut self, record: &SupervisorRecordV1) -> Result<String, BoxError> {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
         use std::os::unix::fs::MetadataExt as _;
 
+        Self::validate_directory(&self.directory)?;
         validate_supervisor_record(record)?;
         if record.supervisor_record_id != self.record_id
             || record.generation != self.next_generation
@@ -1069,37 +1027,11 @@ impl SupervisorJournal for FileSupervisorJournal {
             return Err("schedule supervisor: journal generation exceeds the byte bound".into());
         }
         let name = Self::generation_name(&self.record_id, record.generation);
-        let c_name = std::ffi::CString::new(name.as_bytes())
-            .map_err(|_| "schedule supervisor: journal generation name contains NUL")?;
-        // SAFETY: the retained directory descriptor and NUL-terminated single-component name are
-        // live. O_EXCL/O_NOFOLLOW prevent replacement, and the returned descriptor is uniquely owned.
-        let fd = unsafe {
-            libc::openat(
-                self.directory_handle.as_raw_fd(),
-                c_name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0o600,
-            )
-        };
-        if fd == -1 {
-            return Err(format!(
-                "schedule supervisor: cannot create journal generation {name}: {}",
-                std::io::Error::last_os_error()
-            )
-            .into());
-        }
-        // SAFETY: `fd` was returned uniquely by openat above.
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        // SAFETY: the newly created descriptor is exclusively owned and remains live for both calls.
-        if unsafe { libc::fchown(file.as_raw_fd(), libc::geteuid(), libc::getegid()) } == -1
-            || unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } == -1
-        {
-            return Err(format!(
-                "schedule supervisor: cannot bind journal generation ownership/mode: {}",
-                std::io::Error::last_os_error()
-            )
-            .into());
-        }
+        let mut file = self.directory.create_new_file(
+            std::ffi::OsStr::new(&name),
+            0o600,
+            "schedule supervisor journal generation",
+        )?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         let metadata = file.metadata()?;
@@ -1113,7 +1045,8 @@ impl SupervisorJournal for FileSupervisorJournal {
                     .into(),
             );
         }
-        self.directory_handle.sync_all()?;
+        self.directory.sync()?;
+        Self::validate_directory(&self.directory)?;
         let sha256 = crate::local_file::sha256_hex(&bytes);
         self.next_generation = self
             .next_generation
@@ -2055,6 +1988,22 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn pinned_temp_directory(directory: &tempfile::TempDir) -> PinnedDirectory {
+        let snapshot = crate::local_file::snapshot_directory(
+            directory.path(),
+            "schedule supervisor test directory",
+        )
+        .unwrap();
+        PinnedDirectory::open(
+            directory.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "schedule supervisor test directory",
+        )
+        .unwrap()
+    }
+
     fn running_fake_supervisor(
         term_exits: bool,
     ) -> (ScheduleSupervisor<MemoryJournal>, FakeControl) {
@@ -2577,7 +2526,8 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let journal = FileSupervisorJournal::create(directory.path(), "supervisor-1").unwrap();
+        let pinned = pinned_temp_directory(&directory);
+        let journal = FileSupervisorJournal::create(&pinned, "supervisor-1").unwrap();
         let mut supervisor = ScheduleSupervisor::initialize(prepared_record(), journal).unwrap();
         let runner = identity(44, 43);
         supervisor
@@ -2595,7 +2545,7 @@ mod tests {
         drop(supervisor);
 
         let (journal, latest, latest_sha256) =
-            FileSupervisorJournal::open_existing(directory.path(), "supervisor-1").unwrap();
+            FileSupervisorJournal::open_existing(&pinned, "supervisor-1").unwrap();
         assert_eq!(latest.generation, 2);
         assert_eq!(latest.phase, SupervisorPhaseV1::Running);
         assert_eq!(latest_sha256.len(), 64);
@@ -2612,7 +2562,7 @@ mod tests {
         drop(recovered);
 
         let (_journal, latest, _latest_sha256) =
-            FileSupervisorJournal::open_existing(directory.path(), "supervisor-1").unwrap();
+            FileSupervisorJournal::open_existing(&pinned, "supervisor-1").unwrap();
         assert_eq!(latest.generation, 3);
         assert_eq!(latest.phase, SupervisorPhaseV1::TermGrace);
 
@@ -2623,7 +2573,7 @@ mod tests {
             b"truncated",
         )
         .unwrap();
-        assert!(FileSupervisorJournal::open_existing(directory.path(), "supervisor-1").is_err());
+        assert!(FileSupervisorJournal::open_existing(&pinned, "supervisor-1").is_err());
     }
 
     #[cfg(unix)]
@@ -2633,9 +2583,10 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pinned = pinned_temp_directory(&directory);
         for record_id in [".", "..", "supervisor.1"] {
             assert!(
-                FileSupervisorJournal::create(directory.path(), record_id).is_err(),
+                FileSupervisorJournal::create(&pinned, record_id).is_err(),
                 "record id {record_id:?} must not share or alias the journal root"
             );
         }
@@ -2648,7 +2599,8 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let journal = FileSupervisorJournal::create(directory.path(), "supervisor-1").unwrap();
+        let pinned = pinned_temp_directory(&directory);
+        let journal = FileSupervisorJournal::create(&pinned, "supervisor-1").unwrap();
         let mut supervisor = ScheduleSupervisor::initialize(prepared_record(), journal).unwrap();
         let runner = identity(44, 43);
         supervisor
@@ -2666,7 +2618,7 @@ mod tests {
         drop(supervisor);
 
         let (journal, latest, latest_sha256) =
-            FileSupervisorJournal::open_existing(directory.path(), "supervisor-1").unwrap();
+            FileSupervisorJournal::open_existing(&pinned, "supervisor-1").unwrap();
         drop(journal);
         assert_eq!(latest.phase, SupervisorPhaseV1::Running);
         let mut rollback = prepared_record();
@@ -2684,7 +2636,7 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-        assert!(FileSupervisorJournal::open_existing(directory.path(), "supervisor-1").is_err());
+        assert!(FileSupervisorJournal::open_existing(&pinned, "supervisor-1").is_err());
     }
 
     #[test]
