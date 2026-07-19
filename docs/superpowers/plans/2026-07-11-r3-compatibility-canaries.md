@@ -4,7 +4,8 @@
   **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at
   `983398427c9f04861a2f1da501a7650c4a1cdd80` by PR #33; R3d design is **APPROVED / MERGED**
   at exact design head `b54840a017b87521677f1f95c3f7be69de55361d` by PR #37, merge
-  `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is **SOL CONFIRMED / OPUS LENS PENDING** on
+  `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is
+  **RELEASE/COMPATIBILITY APPROVED / PR READY** on
   `agent/reliability-r3d0-foundation`: the fourth closure review approved exact cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test commit
   `e771067f4a7e742ad813368f01018b011e86bbce` isolates its sole nonblocking `SMELL`; exact
@@ -13,7 +14,12 @@
   `e9d030f07d4c623ad2d00d0c918d02486d32fb7b` marked the wording `FIXED` and handoff `PARTIAL`
   only on conditional publication language, with no new finding; exact
   `1d2fb80a2804a53b6f4076f10f4d4aea61a48f21` marked that remainder `FIXED`, found no new
-  `WRONG` or `SMELL`, and returned `R3D0 DOCS REMEDIATION: APPROVE`.
+  `WRONG` or `SMELL`, and returned `R3D0 DOCS REMEDIATION: APPROVE`; exact
+  `d61176ca0c248fe884cffd320f34b073738729d0` received the independent Opus/xhigh release/
+  compatibility lens, found no `WRONG`, four nonblocking `SMELL`, required no pre-PR remediation, and
+  returned `R3D0 RELEASE/COMPATIBILITY: APPROVE`. The post-review deterministic owner-host validator and
+  release-artifact check reconciled S4's stale prompt evidence to the branch's documented hashes; S1-S3 are
+  accepted intentional constraints.
   No timer, private authority issuance, live characterization, model discovery, credential
   access, container/runtime access, registry/image effect, compatibility provider turn, GitHub check mutation,
   or production-operator lifecycle action has occurred. Nine pinned rows are
@@ -1123,16 +1129,17 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 - **Base:** merged R3d design main `6eeea6ce553b792dc92cef95ee45f2234f7afe4e` (PR #37)
 - **Status:** design of record **APPROVED / MERGED** at exact design head
   `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 default-off policy/schema implementation is
-  **SOL CONFIRMED / OPUS LENS PENDING** at exact mechanism commit
+  **RELEASE/COMPATIBILITY APPROVED / PR READY** at exact mechanism commit
   `5baeeb3f47183ea2a47d2cdc5ffce26f1df7dbfb`, approved cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test head
   `e771067f4a7e742ad813368f01018b011e86bbce`; exact proof-confirmation cursor
   `c548dc0edcc1b21bfb14aa3e78736d633ce0fdc7` found docs-only remediation, and exact second-
   confirmation cursor `e9d030f07d4c623ad2d00d0c918d02486d32fb7b` left only conditional publication
   wording; exact final Sol cursor `1d2fb80a2804a53b6f4076f10f4d4aea61a48f21` approved that docs
-  remediation. No timer, private
+  remediation, and exact Opus/xhigh cursor `d61176ca0c248fe884cffd320f34b073738729d0` approved the
+  release/compatibility lens. No timer, private
   authority issuance, live characterization, model discovery, credential access, container/runtime access,
-  registry/image effect, compatibility provider turn, GitHub check mutation, or production-operator lifecycle
+  registry/image effect, compatibility execution turn, GitHub check mutation, or production-operator lifecycle
   action has occurred
 - **Initial review:** one clean-room Fable/xhigh/plan review of exact base `98339842` returned six
   `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. Its retained local report is
@@ -1368,9 +1375,22 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   `FIXED`, found no new `WRONG` or `SMELL`, required no remediation, and returned
   `R3D0 DOCS REMEDIATION: APPROVE`. Its retained output is
   `/private/tmp/a2a-bridge-r3d0-sol-confirm-1d2fb80/review.md`, mode `0644`, 5,136 bytes, SHA-256
-  `0bfe50a90056f2db8a14404ca02c526bc9e55be9d7f3772c098d9539f39f4fed`. Run the Opus/xhigh
-  release/compatibility lens; fold any findings and rerun affected deterministic gates; publish the non-draft
-  R3d0 PR only if the resulting release/compatibility disposition and affected gates are green.
+  `0bfe50a90056f2db8a14404ca02c526bc9e55be9d7f3772c098d9539f39f4fed`.
+- **R3d0 release/compatibility lens:** one independently routed bridge-mediated Opus/xhigh/read-only review
+  of exact cursor `d61176ca0c248fe884cffd320f34b073738729d0` inspected every changed path plus the
+  release, upgrade, provider-drift, platform, security, default-off, and later-increment seams. It found no
+  `WRONG`, four nonblocking `SMELL`, required no pre-PR remediation, and returned
+  `R3D0 RELEASE/COMPATIBILITY: APPROVE`. Its retained output is
+  `/private/tmp/a2a-bridge-r3d0-opus-lens/review.md`, mode `0644`, 9,836 bytes, SHA-256
+  `f7a8e55f540ec9dd318b2f788c6d05f61f1641cff6b8f5851b271b64dafe0a64`. S1-S3 record the
+  intentional owner-host, strict-authoring, and owner-pinned portability constraints and require no current
+  change. S4 identified stale prompt hashes, not a branch defect: the post-review owner-host validator
+  reproduced profile-policy bundle SHA-256
+  `aed0e9b224d84624220a6091e51601a677b13d254091a12bc3b1879e36bf5e81`, and the local
+  26,480,544-byte release artifact reproduced SHA-256
+  `f2869caa4ccdc5b8fc055a803e462a05a2354cd53f4fa5b5aeaed71ea64efd28`. Publish the
+  non-draft R3d0 PR; let GitHub gates run; do not merge until those gates are green and the owner directs the
+  merge.
 
 R3d makes the already-bounded pinned and floating compatibility machinery safe to invoke under a narrow
 tagged effect authorization. It adds scheduling, supervision, admission, accounting, retention, visibility,
@@ -2715,10 +2735,15 @@ closed that remainder. Exact cursor `1d2fb80a2804a53b6f4076f10f4d4aea61a48f21` t
 publication-tail item `FIXED`, found no new `WRONG` or `SMELL`, required no remediation, and returned
 `R3D0 DOCS REMEDIATION: APPROVE`; its retained report is
 `/private/tmp/a2a-bridge-r3d0-sol-confirm-1d2fb80/review.md`, SHA-256
-`0bfe50a90056f2db8a14404ca02c526bc9e55be9d7f3772c098d9539f39f4fed`. Run the Opus/xhigh
-release/compatibility lens; fold any findings and rerun affected deterministic gates; publish the non-draft
-R3d0 PR only if the resulting release/compatibility disposition and affected gates are green. Preserve
-R3c/R4 inputs and keep R2f operator lifecycle work out of R3d.
+`0bfe50a90056f2db8a14404ca02c526bc9e55be9d7f3772c098d9539f39f4fed`. Exact cursor
+`d61176ca0c248fe884cffd320f34b073738729d0` then received the Opus/xhigh release/compatibility
+lens retained at `/private/tmp/a2a-bridge-r3d0-opus-lens/review.md`, SHA-256
+`f7a8e55f540ec9dd318b2f788c6d05f61f1641cff6b8f5851b271b64dafe0a64`; it found no `WRONG`, four
+nonblocking `SMELL`, required no pre-PR remediation, and returned `R3D0 RELEASE/COMPATIBILITY: APPROVE`.
+The deterministic owner-host validator and release-artifact check reconciled S4's stale prompt hashes to the
+branch's documented values; S1-S3 remain accepted intentional constraints. Publish the non-draft R3d0 PR; let
+GitHub gates run; do not merge until those gates are green and the owner directs the merge. Preserve R3c/R4
+inputs and keep R2f operator lifecycle work out of R3d.
 
 ## R3e — OpenRouter provider expansion
 
