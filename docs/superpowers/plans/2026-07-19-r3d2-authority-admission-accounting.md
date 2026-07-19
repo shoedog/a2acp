@@ -1,10 +1,10 @@
 # R3d2 — authority, admission, preflights, and accounting implementation plan
 
-- **Status:** ACTIVE — R3d2a through R3d2e are implemented. The first Sol/xhigh review returned `REVISE` at
-  `1373985`; the second returned `REVISE` at `28e7d28` with three new `WRONG` plus a stale cursor; and the third
-  returned `REVISE` at `d082b49` with no new `WRONG`, two cursor residuals, and one deadline-handoff `SMELL`.
-  Mechanism commits `f18e74a` and `248e373` close every mechanism finding, this fold closes the cursor residuals,
-  and a fresh Sol closure re-review plus the post-Sol Fable lens remain pending
+- **Status:** ACTIVE — R3d2a through R3d2e are implemented. Sol/xhigh reviews one through three returned `REVISE`
+  at `1373985`, `28e7d28`, and `d082b49`; exact-head review four returned `REVISE` at `c418df4` after resolving all
+  ten inherited items, with two new `WRONG` and one new `SMELL`. Mechanism commit `5a01ce7` closes the three fresh
+  findings with pre-change-red regressions. Exact-head full deterministic gates, a fresh Sol closure re-review,
+  and the post-Sol Fable lens remain pending
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -785,9 +785,52 @@ pending reservation for later reconciliation. The regression, existing positive 
 module are green at **1/0 + 1/0 + 21/0**; format and diff checks are green. This docs fold closes both literal cursor
 residuals without changing the mechanism.
 
-The next semantic gate is a fresh Sol/xhigh closure re-review of the exact cursor-remediation head. Immediately
-before launch, the controller must freeze head/base/merge-base/changed paths and supply exact-head full deterministic
-gate evidence in the review request. Fable remains blocked until Sol approves.
+That remediation made a fresh Sol/xhigh closure re-review of the exact cursor-remediation head the next semantic
+gate. The controller froze head/base/merge-base/changed paths and supplied exact-head full deterministic evidence;
+the resulting fourth review is recorded below. Fable remained blocked because that review did not approve.
+
+#### Fourth Sol closure review and remediation — 2026-07-19
+
+The bridge-mediated `gpt-5.6-sol`/xhigh/read-only closure re-review froze exact candidate
+`c418df41a209391e1600a441faed27bad3a055d0` against merged R3d1 base
+`cbcfd1f06b914064456d1798be71bacdc294f3d5` and returned `R3D2 IMPLEMENTATION: REVISE`. Its prompt is retained at
+`/private/tmp/a2a-bridge-r3d2-sol-closure-c418df4/review-task.md`, 11,027 bytes, SHA-256
+`a5363563e15acd870488a8992db490df27f74b01db099711dc727882bafd5f15`; its mode-`0644` report is retained at
+`/private/tmp/a2a-bridge-r3d2-sol-closure-c418df4/review.md`, 18,784 bytes, SHA-256
+`704678853b95b2b17577affba573917823b5347f8c4a95ef4f2884235b98be6a`. It marked all ten inherited findings
+`RESOLVED`, confirmed the branch/status boundary was literally consistent, and found:
+
+1. `WRONG / Medium`: standing reuse could consume evidence at a clock time earlier than the evidence terminal time
+   because reuse skipped the ledger's durable rollback fence;
+2. `WRONG / Medium`: exact advisory evidence selected for a direct-local manual request was rejected by transaction
+   validation instead of consuming the one-run manual authority; and
+3. `SMELL / Medium`: supervisor publication dropped the retained state-directory capability to a pathname and could
+   split authority/admission/ledger state from supervisor state after directory replacement.
+
+All three deterministic regressions failed on the reviewed mechanism before remediation:
+
+- `equivalent_work_refuses_reuse_when_clock_precedes_selected_evidence` terminalized at 15, attempted reuse at 14,
+  and failed **0/1** because reuse succeeded instead of leaving state unchanged; its time-16 positive remains green;
+- `completed_work_reuses_for_standing_and_manual_authority_without_new_effects` failed **0/1** with
+  `one-shot/manual work cannot reuse evidence` after the reducer selected exact reusable advisory evidence; and
+- `supervisor_directory_replacement_refuses_publication_without_a_capability` failed **0/1** because publication
+  returned a capability and wrote the pathname replacement.
+
+Mechanism commit `5a01ce768f2e8d9a77d68d111d7314085f1513e8` closes them. Equivalent-work validation now binds every consumption
+to an evidence-availability watermark (terminal time, or the later review time for reviewed characterization) and
+atomically refuses rollback. Reused dispositions now permit only the exact standing/standing pair or an exact
+`ManualAcknowledgement` plus manual action for `ProviderPathAdvisory`; characterization and `ManualDiagnostic`
+remain non-reusable, the manual nonce is durably consumed once, and replay fails before a second commit.
+`FileSupervisorJournal` now owns the scheduler's `PinnedDirectory`, scans through its stable object path, performs
+create/open/sync relative to the retained descriptor, and verifies that the canonical pathname still names that
+object before and after journal operations. The replacement regression returns no admitted capability and leaves
+both the replacement and retained directories empty.
+
+Post-remediation focused gates are admission **17/0**, supervisor **41/0**, and transaction **22/0**; format/diff,
+warning-denied workspace all-target/all-feature check, and the three isolated regressions are green. The complete
+exact-head deterministic gate has not yet been rerun after this mechanism change. The next semantic action is that
+full gate, followed by a fresh Sol/xhigh closure re-review explicitly adjudicating these three findings. Fable
+remains blocked until Sol approves.
 
 ## Verification and review gates
 
@@ -821,14 +864,15 @@ gate evidence in the review request. Fable remains blocked until Sol approves.
 
 Resume branch `agent/reliability-r3d2-authority-admission` in a newly verified clean trusted worktree; do not depend
 on a prior `/private/tmp` worktree or review mirror. The branch is based on merged R3d1 main
-`cbcfd1f06b914064456d1798be71bacdc294f3d5`. Mechanism commit `f18e74a` closes the three findings from the second
-Sol review; exact candidate `840f486` passed the complete deterministic gate; third review of `d082b49` found no
-new `WRONG`, retained two cursor residuals, and raised one deadline-handoff `SMELL`; and `248e373` closes that smell
-with a deterministic pre-change-red regression. Read
+`cbcfd1f06b914064456d1798be71bacdc294f3d5`. Fourth review of exact `c418df4` resolved all ten inherited items and
+returned `REVISE` with two new `WRONG` plus one retained-directory `SMELL`; mechanism commit `5a01ce7` closes all
+three with demonstrated pre-change-red regressions and focused admission/supervisor/transaction gates
+**17/0 + 41/0 + 22/0**. Read
 this plan, the R3d design of record, the durable roadmap, `AGENTS.md`, and
 `skills/a2a-bridge-operator/SKILL.md` before editing. Preserve the single R3d2 merge boundary, the
 owner-wide-then-authority lock order, the single admission linearization point, the zero-effect default, and the
-separation between provider authority and storage consent. The next semantic action is a fresh Sol/xhigh closure
-re-review that explicitly adjudicates both cursor residuals and the deadline-handoff `SMELL`; its prompt must carry
-the frozen exact boundary and exact-head full deterministic gate evidence. Run the single Fable lens only after Sol
-approves; then fold final evidence, rerun exact-final gates, and publish the non-draft PR.
+separation between provider authority and storage consent. The next semantic action is the complete exact-head
+deterministic gate, then a fresh Sol/xhigh closure re-review explicitly adjudicating the clock-rollback, manual-reuse,
+and retained-supervisor-directory findings. Its prompt must carry the frozen exact boundary and gate evidence. Run
+the single Fable lens only after Sol approves; then fold final evidence, rerun exact-final gates, and publish the
+non-draft PR.

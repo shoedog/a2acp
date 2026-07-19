@@ -28,9 +28,12 @@
   publication. Focused preflight/state/supervisor/transaction gates are **11/0 + 15/0 + 41/0 + 20/0**. Exact
   docs-fold candidate `840f486` passed binary **645/0/0**, full workspace **2,382/0/12 ignored** across **72**
   result groups, and every deterministic release/validator gate. Third Sol review of exact `d082b49` resolved every
-  mechanism item, found no new `WRONG`, retained two cursor residuals, and reported one deadline-handoff `SMELL`.
-  Commit `248e373` closes that smell with a deterministic pre-change-red regression; this fold closes the cursor
-  residuals, and a fresh Sol closure rereview remains pending.
+  mechanism item, found no new `WRONG`, retained two cursor residuals, and reported one deadline-handoff `SMELL`;
+  `248e373` and the next docs fold closed those items. Fourth Sol review of exact `c418df4` marked all ten inherited
+  findings `RESOLVED` and returned `REVISE` with two new `WRONG` plus one `SMELL`: clock-rollback reuse, rejected
+  manual advisory reuse, and supervisor directory-capability downgrade. All three regressions failed on that reviewed
+  mechanism. Commit `5a01ce7` closes them; focused admission/supervisor/transaction gates are
+  **17/0 + 41/0 + 22/0**. Full exact-head gates and a fresh Sol closure rereview remain pending.
   The merged R3d0 implementation was
   `agent/reliability-r3d0-foundation`: the fourth closure review approved exact cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test commit
@@ -1161,15 +1164,18 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 - **Base:** merged R3d1 main `cbcfd1f06b914064456d1798be71bacdc294f3d5` (PR #40)
 - **Status:** design of record **APPROVED / MERGED** at exact design head
   `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 and R3d1 are merged, and R3d2 is
-  **ACTIVE / R3D2A-R3D2E IMPLEMENTED / THIRD SOL REVIEW REVISE / NO NEW WRONG / CURSOR AND DEADLINE-HANDOFF
-  SMELL REMEDIATED / SOL CLOSURE REREVIEW NEXT**. Exact candidate `1373985` received four `WRONG` and one `SMELL`; remediation candidate `28e7d28`
+  **ACTIVE / R3D2A-R3D2E IMPLEMENTED / FOURTH SOL REVIEW REVISE / ALL TEN INHERITED RESOLVED / TWO NEW WRONG +
+  ONE SMELL REMEDIATED / FULL GATE THEN SOL CLOSURE REREVIEW NEXT**. Exact candidate `1373985` received four `WRONG` and one `SMELL`; remediation candidate `28e7d28`
   received three new `WRONG` plus a stale-cursor residual. Commit `f18e74a` closes preflight replay, executable
   deadline proof/handoff, and same-process lock publication. Focused gates are green at preflight/state/supervisor/
   transaction **11/0 + 15/0 + 41/0 + 20/0**; exact candidate `840f486` passed binary **645/0/0**, workspace
   **2,382/0/12 ignored**, and all deterministic release/validator gates. Third review of `d082b49` resolved every
   mechanism item, found no new `WRONG`, retained two cursor residuals, and raised one post-publication
-  deadline-handoff `SMELL`; `248e373` closes it and the transaction module is **21/0**. This fold closes the cursor
-  residuals; fresh Sol closure rereview remains next.
+  deadline-handoff `SMELL`; `248e373` closes it and the transaction module is **21/0**. The next fold closed the cursor
+  residuals. Fourth review of `c418df4` resolved all ten inherited items, then found clock-rollback reuse and rejected
+  manual advisory reuse as `WRONG`, plus retained-supervisor-directory downgrade as a `SMELL`. `5a01ce7` closes all
+  three with pre-change-red regressions; admission/supervisor/transaction are **17/0 + 41/0 + 22/0**. Full exact-head
+  gates and fresh Sol closure rereview remain next.
   The R3d0 default-off policy/schema mechanism was
   approved at exact mechanism commit
   `5baeeb3f47183ea2a47d2cdc5ffce26f1df7dbfb`, approved cursor
@@ -2741,9 +2747,12 @@ restart contract. R3d1 merged by PR #40 at that base. R3d2's first review froze 
 `28e7d28` received three new `WRONG` and the stale-cursor residual, all mechanism findings are remediated by
 `f18e74a`; exact candidate `840f486` passed the complete deterministic gate. Third review of `d082b49` found no new
 `WRONG`, left two literal cursor residuals, and raised one post-publication deadline-handoff `SMELL`; `248e373`
-closes the smell with a deterministic pre-change-red regression and this fold closes the cursors. The next semantic
-gate is a fresh Sol closure rereview supplied with the frozen exact boundary and exact-head full deterministic gate
-evidence, before the single Fable release/compatibility lens. The initial exact-base Fable design review plus
+closed the smell with a deterministic pre-change-red regression and the next fold closed the cursors. Fourth review
+of exact `c418df4` resolved all ten inherited items and returned `REVISE` with two new `WRONG` plus one `SMELL`;
+`5a01ce7` closes the clock-rollback, manual-reuse, and retained-supervisor-directory findings with three
+pre-change-red regressions. The next semantic gate is the complete exact-head deterministic suite, followed by a
+fresh Sol closure rereview supplied with the frozen exact boundary and gate evidence, before the single Fable
+release/compatibility lens. The initial exact-base Fable design review plus
 exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
 exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, exact-`c50811f`, and
 exact-`fb8a2f4`, exact-`ae9db39`, exact-`2eb242a`, exact-`8dc6054`, exact-`cc01a52`, and exact-`b54840a`

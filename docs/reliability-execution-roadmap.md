@@ -7,8 +7,8 @@
 - **Active slice:** R3d2 authority, admission, preflights, and accounting on
   `agent/reliability-r3d2-authority-admission`, based directly on `cbcfd1f`; it is non-billable and uses only
   fake clocks/process inventories/effect controls and owner-private temporary state roots in tests
-- **Current R3d2 implementation gate:** **R3D2A-R3D2E IMPLEMENTED / THIRD SOL REVIEW REVISE / NO NEW WRONG /
-  CURSOR AND DEADLINE-HANDOFF SMELL REMEDIATED / SOL CLOSURE REREVIEW NEXT**. The restart contract is
+- **Current R3d2 implementation gate:** **R3D2A-R3D2E IMPLEMENTED / FOURTH SOL REVIEW REVISE / ALL TEN INHERITED
+  RESOLVED / TWO NEW WRONG + ONE SMELL REMEDIATED / FULL GATE THEN SOL CLOSURE REREVIEW NEXT**. The restart contract is
   [`2026-07-19-r3d2-authority-admission-accounting.md`](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md).
   R3d2a closes the three inherited R3d1 integration smells, owns cancellation before `Running`, retains the
   exact runner child for exit proof, and adds the private local state-root plus nonblocking lock primitives.
@@ -51,8 +51,18 @@
   `UNRESOLVED`, no new `WRONG` was found, and one Medium `SMELL` identified expiry between durable publication and
   runner invocation. The new regression failed on the reviewed mechanism by invoking the runner after forced
   post-publication expiry. Commit `248e373` adds the final capability deadline check; the regression, positive
-  handoff, and complete transaction module are green at **1/0 + 1/0 + 21/0**. This docs fold closes the two cursor
-  residuals. R3d2 still has one merge boundary and
+  handoff, and complete transaction module are green at **1/0 + 1/0 + 21/0**. The docs fold closed the two cursor
+  residuals. Fourth Sol review of exact `c418df4` marked all ten inherited items `RESOLVED`, confirmed the docs/status
+  boundary was literally consistent, and returned `REVISE` with two new `WRONG / Medium` plus one `SMELL / Medium`:
+  reuse admitted a clock earlier than its selected evidence terminal, eligible manual advisory reuse was rejected
+  instead of consuming its one-run authority, and supervisor publication downgraded its retained directory
+  capability to a pathname. Its prompt is 11,027 bytes at SHA-256 `a5363563...f15`; its mode-`0644` report is 18,784
+  bytes at SHA-256 `70467885...e6a`. All three regressions failed **0/1** on the reviewed mechanism. Commit `5a01ce7`
+  adds the evidence-availability watermark, permits only exact manual advisory reuse while consuming its nonce once,
+  and keeps supervisor journal I/O descriptor-relative to the retained scheduler directory while refusing pathname
+  replacement. Focused admission/supervisor/transaction gates are **17/0 + 41/0 + 22/0**; format/diff and the
+  warning-denied workspace check are green. Full exact-head deterministic gates and fresh Sol closure review remain
+  pending. R3d2 still has one merge boundary and
   five internal subincrements: R3d1 integration hardening/local state; private
   authority and source reducers; exact identities/equivalent work/control reducers; ledger/legacy/preflights; then
   the shared transaction/default-off integration. No internal commit independently enables effects. The only
@@ -469,10 +479,10 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** the next semantic gate is one fresh bridge-mediated Sol/xhigh closure re-review of the exact
-  cursor-remediation head. Before launch, supply its prompt with exact-head full deterministic gate evidence plus
-  frozen head/base/merge-base and changed paths; require explicit adjudication of both third-review cursor residuals
-  and the deadline-handoff `SMELL`. After Sol is green, spend the single design-approved
+- **Next action:** run the complete deterministic gate on the exact post-fourth-review remediation/docs head. Then
+  freeze head/base/merge-base/changed paths and run one fresh bridge-mediated Sol/xhigh closure re-review that
+  explicitly adjudicates the clock-rollback, manual-reuse, and retained-supervisor-directory findings. Supply the
+  exact-head gate evidence in its prompt. After Sol is green, spend the single design-approved
   Fable/xhigh adversarial implementation plus release/compatibility lens, with no Fable re-review loop, then publish
   one non-draft R3d2 PR. No live compatibility/provider gate or production-operator lifecycle action is authorized.
   OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
@@ -502,7 +512,7 @@ R2a provenance (MERGED)
        -> R2d local non-billable fallback plan (MERGED)
             -> R3 compatibility manifest + pinned/floating canaries + OpenRouter/OpenCode
                (ACTIVE: R3a/R3b/R3c/R3d0/R3d1 MERGED; R3d DESIGN MERGED;
-                R3d2 IMPLEMENTED / THIRD SOL REVISE / NO NEW WRONG / ALL FINDINGS REMEDIATED)
+                R3d2 IMPLEMENTED / FOURTH SOL REVISE / NEW FINDINGS REMEDIATED / FULL GATE NEXT)
                  -> R4 reproducible dependency/image pins + release promotion gate
 
 R2e authenticated in-process fallback is DEFERRED and off the critical path.
@@ -529,7 +539,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (three incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`. R3d2 is **ACTIVE / R3D2A-R3D2E IMPLEMENTED / THIRD SOL REVIEW REVISE / NO NEW WRONG / CURSOR AND DEADLINE-HANDOFF SMELL REMEDIATED / SOL CLOSURE REREVIEW NEXT** on `agent/reliability-r3d2-authority-admission`, with one merge boundary. First reviewed candidate `1373985` received four `WRONG` and one `SMELL`; its remediation head `28e7d28` passed binary **641/0/0** and workspace **2,378/0/12 ignored**, then closure review returned three new `WRONG` plus a stale-cursor residual. Commit `f18e74a` closes preflight replay, deadline-proof, and same-process lock-publication failures. Exact docs-fold candidate `840f486` passed binary **645/0/0** and workspace **2,382/0/12 ignored** across **72** groups; all deterministic release/validator gates are green. Third Sol review of `d082b49` resolved every mechanism item, found no new `WRONG`, retained two cursor residuals, and raised one deadline-handoff `SMELL`; `248e373` closes that smell with a pre-change-red regression and transaction **21/0**. No live compatibility gate, production state-root creation, or production-operator lifecycle action occurred. | [R3d2 implementation plan](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md) | Supply the fresh Sol closure review with exact-head full-gate evidence, then run the single Fable/xhigh release lens before one non-draft PR. R3d never touches the long-lived operator lifecycle. |
+| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at `b54840a` by PR #37; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`. R3d2 is **ACTIVE / R3D2A-R3D2E IMPLEMENTED / FOURTH SOL REVIEW REVISE / ALL TEN INHERITED RESOLVED / TWO NEW WRONG + ONE SMELL REMEDIATED** on `agent/reliability-r3d2-authority-admission`, with one merge boundary. Fourth review froze `c418df4`; all three fresh regressions failed on that mechanism, and `5a01ce7` closes clock-rollback reuse, manual advisory reuse/consumption, and retained supervisor-directory publication. Focused admission/supervisor/transaction gates are **17/0 + 41/0 + 22/0**. No live compatibility gate, production state-root creation, or production-operator lifecycle action occurred. | [R3d2 implementation plan](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md) | Run exact-head full deterministic gates, then fresh Sol closure review; only after approval run the single Fable/xhigh lens before one non-draft PR. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -818,9 +828,13 @@ Next action:
   `RESOLVED`, left the two cursor items `UNRESOLVED`, found no new `WRONG`, and reported one Medium `SMELL`: the
   committed capability could expire immediately before runner invocation. Its deterministic regression failed on
   that reviewed mechanism; `248e373` adds the final refusal, keeps the conservative reservation, and passes the
-  regression, positive handoff, and full transaction module at **1/0 + 1/0 + 21/0**. The cursor fold is complete;
-  exact-head full-gate evidence must accompany the fresh Sol closure rereview, and the later Fable lens remains
-  pending. No production state root, authority, trigger, live effect, or operator lifecycle action was created. The
+  regression, positive handoff, and full transaction module at **1/0 + 1/0 + 21/0**. The cursor fold completed;
+  fourth review of exact `c418df4` then resolved all ten inherited items and found two new `WRONG` plus one `SMELL`.
+  All three focused regressions failed on that reviewed mechanism; `5a01ce7` closes clock-rollback reuse, manual
+  advisory reuse/one-run consumption, and retained supervisor-directory publication. Focused admission/supervisor/
+  transaction gates are **17/0 + 41/0 + 22/0**. Exact-head full gates must precede and accompany the fresh Sol
+  closure rereview; the later Fable lens remains pending. No production state root, authority, trigger, live effect,
+  or operator lifecycle action was created. The
   manifest still contains nine
   exact pinned rows: four release-blocking minimal bridge-smoke support cases and five explicit
   historical/non-goal controls. Every config is checked in and SHA-bound before provider spawn. The two
