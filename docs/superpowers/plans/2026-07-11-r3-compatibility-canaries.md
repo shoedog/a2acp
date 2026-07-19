@@ -10,10 +10,11 @@
   `e81ebbb` each received Sol/xhigh `REVISE`. Second closure head `8feda4d` marked all four requested topology/cursor
   residuals `FIXED`, found one new post-anchor-retention `WRONG / High`, no new `SMELL`, and returned `REVISE`.
   Third closure head `7fafe79` marked that item `FIXED`, confirmed prior residuals closed, found two new `WRONG`
-  (`High` and `Minor`), no new `SMELL`, and returned `REVISE`. The fourth remediation is deterministic-green pending
-  exact-head closure; its
-  candidate release binary is 26,574,128 bytes at SHA-256
-  `5be952d4f6491aea3c1b193d1571c671191547763090b57190e57a22be8133af`. Its focused restart plan is
+  (`High` and `Minor`), no new `SMELL`, and returned `REVISE`. Fourth closure head `b55c17d` marked both inherited
+  retained-capability findings `FIXED`, found one new signal-capable anchor-lifecycle `WRONG / High`, no new
+  `SMELL`, and returned `REVISE`. The fifth remediation is deterministic-green pending exact-head closure; its
+  candidate release binary is 26,574,640 bytes at SHA-256
+  `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. Its focused restart plan is
   [`2026-07-19-r3d1-supervisor-signal-parity.md`](2026-07-19-r3d1-supervisor-signal-parity.md).
   The merged R3d0 implementation was
   `agent/reliability-r3d0-foundation`: the fourth closure review approved exact cursor
@@ -1959,7 +1960,10 @@ TERM/KILL journals before the effect and then uses that retained capability dire
 on another fallible liveness observation. An absent or mismatched capability refuses without a numeric-group signal
 and moves the already-journaled attempt to an ambiguous safety hold.
 A non-hold supervisor record binds the scheduler, runner, and every anchored group to one exact session. A safety
-hold retains at least one anchored-group record even when its runner identity is unavailable. Once the supervisor
+hold retains at least one anchored-group record even when its runner identity is unavailable. `Prepared`, `Running`,
+`TermGrace`, and `KillJournaled` require every anchor to remain `RetainedLive`. An anchor may become
+`ReleasedReaped` only on entry to `Reaping` after later group signals are forbidden, or `Ambiguous` only on entry
+to `SafetyHold` after later group signals are forbidden. Once the supervisor
 has acquired a descendant-group anchor, it retains the exact live capability and serializable record before any
 fallible workload observation. Registration then revalidates the runner and every workload; any session, ancestry,
 liveness, or identity-observation failure appends that exact acquired group to the durable hold before disabling
@@ -2786,11 +2790,11 @@ report is `/private/tmp/a2a-bridge-r3d1-sol-closure-e81ebbb/review.md`, 10,258 b
 `fa6b12a67e65df7438cb00ab953792e307b0e0b3748a5c9c37e170d96c088a24`. The second remediation rejects
 topology-free holds and cross-session operational snapshots and durably inventories an already-acquired group
 before a session, ancestry, liveness, or identity-observation hold. All three failures were observed red on
-`e81ebbb`. Focused gates are **6/0**, **1/0**, **30/0**, **31/0**, **4/0**, **21/0**, and **2/0**; the complete
-binary suite is **540/0/0**, and full serial workspace is **2,276/0/12 ignored** across **56** binaries. Format and
+`e81ebbb`. Focused gates are **6/0**, **1/0**, **31/0**, **33/0**, **4/0**, **21/0**, and **2/0**; the complete
+binary suite is **543/0/0**, and full serial workspace is **2,279/0/12 ignored** across **56** binaries. Format and
 diff checks, workspace check, warnings-denied Clippy, locked release, dependency policy, hygiene **37/7**, manifest **9**,
-recipes **4**, and foundation **6/4** are green. The candidate release binary is **26,574,128 bytes**, SHA-256
-`5be952d4f6491aea3c1b193d1571c671191547763090b57190e57a22be8133af`.
+recipes **4**, and foundation **6/4** are green. The candidate release binary is **26,574,640 bytes**, SHA-256
+`7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`.
 Second closure review of exact `8feda4d93c22ebe2c5e8867d46e006af50b8899f` marked all four requested
 topology/cursor residuals `FIXED`, found one new `WRONG / High`, no new `SMELL`, and returned
 `R3D1 IMPLEMENTATION: REVISE`; its retained report is
@@ -2808,7 +2812,15 @@ remain closed, found two new `WRONG` (`High` and `Minor`), no new `SMELL`, and r
 fallible liveness preflight only from TERM/KILL, uses the retained capability after durable journal publication, and
 makes an actually missing/recycled capability fail closed into `SignalJournalAmbiguous` without a numeric signal.
 It also corrects the focused status generation. The observation-error TERM/KILL and recycled-capability negative
-tests both failed on `7fafe79` before the fix. Run the required exact-head Sol/xhigh closure review; use the
+tests both failed on `7fafe79` before the fix. Fourth closure review of exact
+`b55c17d390861b5afa86a5f812b7727f38f630a0` marked both inherited findings `FIXED`, confirmed the earlier
+mechanisms remain closed, found one new `WRONG / High`, no new `SMELL`, and returned
+`R3D1 IMPLEMENTATION: REVISE`; its retained report is
+`/private/tmp/a2a-bridge-r3d1-sol-closure-b55c17d/review.md`, 5,866 bytes, SHA-256
+`3472273ff438cb58b1ceb8eeba69bc3ed6ee0dbd2fb5faaddaf471292489c634`. The fifth remediation requires retained
+anchors through every signal-capable phase, permits release or ambiguity only in the corresponding no-later-signal
+phase, and rejects a non-retained `start_running`. The schema, start, and transition tests all failed on `b55c17d`
+before the fix. Run the required exact-head Sol/xhigh closure review; use the
 single design-approved Fable/xhigh implementation/release lens only after Sol approval. Preserve R3c/R4 inputs,
 keep R2f operator lifecycle work out of R3d, and never touch the long-lived operator lifecycle from this slice.
 

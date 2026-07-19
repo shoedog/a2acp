@@ -2058,6 +2058,25 @@ impl ValidateRecord for SupervisorRecordV1 {
                     .into(),
             );
         }
+        if self
+            .groups
+            .iter()
+            .any(|group| match group.anchor_lifecycle {
+                AnchorLifecycleV1::RetainedLive => false,
+                AnchorLifecycleV1::ReleasedReaped => !matches!(
+                    self.phase,
+                    SupervisorPhaseV1::Reaping
+                        | SupervisorPhaseV1::Complete
+                        | SupervisorPhaseV1::SafetyHold
+                ),
+                AnchorLifecycleV1::Ambiguous => self.phase != SupervisorPhaseV1::SafetyHold,
+            })
+        {
+            return Err(
+                "schedule schema: supervisor anchor lifecycle is incompatible with its phase"
+                    .into(),
+            );
+        }
         unique_ids(
             "container run label",
             self.container_run_labels.iter().map(String::as_str),
@@ -4341,6 +4360,42 @@ mod tests {
         });
 
         assert!(cross_session.validate().is_err());
+    }
+
+    #[test]
+    fn signal_capable_supervisor_phases_require_retained_anchors() {
+        let mut running = completed_supervisor();
+        running.phase = SupervisorPhaseV1::Running;
+        running.groups[0].anchor_lifecycle = AnchorLifecycleV1::RetainedLive;
+        running.term_journal_elapsed_ms = OptionalElapsedMsV1::Absent;
+        running.kill_journal_elapsed_ms = OptionalElapsedMsV1::Absent;
+        running.kill_cause = OptionalSupervisorKillCauseV1::Absent;
+        running.later_group_signal_permitted = true;
+        running.outcome = OptionalSupervisorOutcomeV1::Absent;
+        running.safety_hold = OptionalSafetyHoldReasonV1::Absent;
+        running.child_artifact = OptionalChildArtifactRefV1::Absent;
+
+        let mut term_grace = running.clone();
+        term_grace.phase = SupervisorPhaseV1::TermGrace;
+        term_grace.term_journal_elapsed_ms = OptionalElapsedMsV1::ElapsedMs { value: 10 };
+        let mut kill_journaled = term_grace.clone();
+        kill_journaled.phase = SupervisorPhaseV1::KillJournaled;
+        kill_journaled.kill_journal_elapsed_ms = OptionalElapsedMsV1::ElapsedMs { value: 20 };
+        kill_journaled.kill_cause = OptionalSupervisorKillCauseV1::Cause {
+            value: SupervisorKillCauseV1::Deadline,
+        };
+
+        for record in [running, term_grace, kill_journaled] {
+            record.validate().unwrap();
+            for lifecycle in [
+                AnchorLifecycleV1::ReleasedReaped,
+                AnchorLifecycleV1::Ambiguous,
+            ] {
+                let mut invalid = record.clone();
+                invalid.groups[0].anchor_lifecycle = lifecycle;
+                assert!(invalid.validate().is_err());
+            }
+        }
     }
 
     #[test]

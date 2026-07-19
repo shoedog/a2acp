@@ -607,25 +607,23 @@ fn validate_supervisor_transition(
         } else {
             previous_group.workloads == next_group.workloads
         };
+        let lifecycle_is_safe = match (previous_group.anchor_lifecycle, next_group.anchor_lifecycle)
+        {
+            (AnchorLifecycleV1::RetainedLive, AnchorLifecycleV1::RetainedLive)
+            | (AnchorLifecycleV1::ReleasedReaped, AnchorLifecycleV1::ReleasedReaped)
+            | (AnchorLifecycleV1::Ambiguous, AnchorLifecycleV1::Ambiguous) => true,
+            (AnchorLifecycleV1::RetainedLive, AnchorLifecycleV1::ReleasedReaped) => {
+                next.phase == SupervisorPhaseV1::Reaping && !next.later_group_signal_permitted
+            }
+            (AnchorLifecycleV1::RetainedLive, AnchorLifecycleV1::Ambiguous) => {
+                next.phase == SupervisorPhaseV1::SafetyHold && !next.later_group_signal_permitted
+            }
+            _ => false,
+        };
         if previous_group.session_id != next_group.session_id
             || previous_group.anchor != next_group.anchor
             || !workloads_are_safe
-            || !matches!(
-                (previous_group.anchor_lifecycle, next_group.anchor_lifecycle),
-                (
-                    AnchorLifecycleV1::RetainedLive,
-                    AnchorLifecycleV1::RetainedLive
-                ) | (
-                    AnchorLifecycleV1::RetainedLive,
-                    AnchorLifecycleV1::ReleasedReaped
-                ) | (
-                    AnchorLifecycleV1::RetainedLive,
-                    AnchorLifecycleV1::Ambiguous
-                ) | (
-                    AnchorLifecycleV1::ReleasedReaped,
-                    AnchorLifecycleV1::ReleasedReaped
-                ) | (AnchorLifecycleV1::Ambiguous, AnchorLifecycleV1::Ambiguous)
-            )
+            || !lifecycle_is_safe
         {
             return Err(
                 "schedule supervisor: anchored group identity/lifecycle changed unsafely".into(),
@@ -2420,6 +2418,67 @@ mod tests {
         validate_supervisor_record(&held).unwrap();
 
         assert!(ScheduleSupervisor::initialize(held, MemoryJournal::default()).is_err());
+    }
+
+    #[test]
+    fn start_running_rejects_nonretained_anchor_capabilities() {
+        for lifecycle in [
+            AnchorLifecycleV1::ReleasedReaped,
+            AnchorLifecycleV1::Ambiguous,
+        ] {
+            let initial = prepared_record();
+            let mut running_group = initial.groups[0].clone();
+            let runner = identity(44, running_group.process_group);
+            running_group.workloads = vec![runner.clone()];
+            running_group.anchor_lifecycle = lifecycle;
+            let mut supervisor =
+                ScheduleSupervisor::initialize(initial, MemoryJournal::default()).unwrap();
+
+            assert!(supervisor
+                .start_running(runner, vec![running_group])
+                .is_err());
+            assert_eq!(supervisor.record().phase, SupervisorPhaseV1::Prepared);
+            assert_eq!(supervisor.journal().records.len(), 1);
+        }
+    }
+
+    #[test]
+    fn journal_transition_releases_anchors_only_after_signaling_is_forbidden() {
+        let (supervisor, _control) = running_fake_supervisor(false);
+        let previous = supervisor.record().clone();
+        let successor = |mut record: SupervisorRecordV1| {
+            record.generation = previous.generation + 1;
+            record.previous_record = OptionalSha256V1::Sha256 {
+                value: record_sha256(&previous),
+            };
+            record.recorded_at_ms = previous.recorded_at_ms + 1;
+            record
+        };
+
+        let mut released_hold = previous.clone();
+        released_hold.phase = SupervisorPhaseV1::SafetyHold;
+        released_hold.groups[0].anchor_lifecycle = AnchorLifecycleV1::ReleasedReaped;
+        released_hold.later_group_signal_permitted = false;
+        released_hold.outcome = OptionalSupervisorOutcomeV1::Outcome {
+            value: SupervisorTerminalOutcomeV1::SafetyHold,
+        };
+        released_hold.safety_hold = OptionalSafetyHoldReasonV1::Reason {
+            value: SafetyHoldReasonV1::AnchorNotLive,
+        };
+        let released_hold = successor(released_hold);
+        validate_supervisor_record(&released_hold).unwrap();
+        assert!(validate_supervisor_transition(&previous, &released_hold).is_err());
+
+        let mut ambiguous_hold = released_hold.clone();
+        ambiguous_hold.groups[0].anchor_lifecycle = AnchorLifecycleV1::Ambiguous;
+        validate_supervisor_transition(&previous, &ambiguous_hold).unwrap();
+
+        let mut reaping = previous.clone();
+        reaping.phase = SupervisorPhaseV1::Reaping;
+        reaping.groups[0].anchor_lifecycle = AnchorLifecycleV1::ReleasedReaped;
+        reaping.later_group_signal_permitted = false;
+        let reaping = successor(reaping);
+        validate_supervisor_transition(&previous, &reaping).unwrap();
     }
 
     #[test]
