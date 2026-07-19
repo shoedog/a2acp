@@ -4,9 +4,8 @@
   at `1373985`, `28e7d28`, `d082b49`, and `c418df4`. Fifth review of exact `3e4508a` marked nine of thirteen
   inherited items `RESOLVED`, left four `UNRESOLVED`, found no fresh finding, and returned `REVISE`. Mechanism
   commit `1b07c80` closes the three code residuals with four pre-change-red regressions; the current fold closes the
-  literal cursor residual.
-  Exact-head full deterministic gates and a fresh Sol closure re-review remain pending; the single Fable lens stays
-  gated on Sol approval
+  literal cursor residual. Exact post-remediation candidate `68be708` passes the complete deterministic gate. A
+  fresh Sol closure re-review remains pending; the single Fable lens stays gated on Sol approval
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -889,8 +888,19 @@ root handles share one exclusion domain; and supervisor postcheck failure remove
 generation through the retained descriptor. Invalid nested-holder and poisoned-transition edges fail closed and
 release the relevant locks. The current docs fold closes the literal cursor residual. Focused gates are state/locks
 **19/0**, supervisor **42/0**, transaction **23/0**, and preflight **11/0**; warnings-denied all-target/all-feature
-check, format, and diff checks are green. Exact-head full deterministic gates must now run before the fresh Sol
-closure re-review. Fable remains blocked until Sol approves.
+check, format, and diff checks are green.
+
+Exact post-remediation candidate `68be70801468291b0a3bb2e4cb67f264372dc5e1` then passed the complete
+deterministic gate: format and diff; warnings-denied workspace all-target/all-feature check and Clippy; locked
+release build; dependency policy; repository hygiene **37 tracked artifacts / 7 configs**; manifest **9 cases**;
+recipes **4 cases**; foundation **6 scheduled / 4 claimed-support**; compatibility CLI **22/0**; foundation CLI
+**31/0**; supervisor CLI **2/0**; legacy boundary **1/0**; complete binary **654/0/0**; and canonical full serial
+workspace **2,391 passed / 0 failed / 12 ignored** across **72** result groups, **55** nonempty. Issue-intake
+validation passed against live repository labels, and its local suite passed **6 runs / 19 assertions**. The
+201,273-byte full-suite log is retained at `/private/tmp/a2a-bridge-r3d2-full-68be708.log`, SHA-256
+`896eeac2ab41f81727c56a080e0c78b4f9815a1693d1867f9ebd0f9471f6d317`. The release binary remains 26,604,912
+bytes at SHA-256 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`. A fresh Sol/xhigh closure re-review
+explicitly adjudicating the four fifth-review residuals is next. Fable remains blocked until Sol approves.
 
 ## Verification and review gates
 
@@ -929,10 +939,12 @@ items `RESOLVED`, left the cursor, effect-API, independent-open locking, and mid
 `UNRESOLVED`, found no fresh finding, and returned `REVISE`. Mechanism commit `1b07c80` closes the three code
 residuals with demonstrated pre-change-red regressions; this fold closes the literal cursor. Focused
 state/supervisor/transaction/preflight gates are **19/0 + 42/0 + 23/0 + 11/0**, with warnings-denied check, format,
-and diff green. Read this plan, the R3d design of record, the durable roadmap, `AGENTS.md`, and
+and diff green. Exact candidate `68be708` passes the complete binary **654/0/0** and canonical full serial workspace
+**2,391/0/12 ignored** across **72** result groups, **55** nonempty, with every deterministic release/validator gate
+green. Read this plan, the R3d design of record, the durable roadmap, `AGENTS.md`, and
 `skills/a2a-bridge-operator/SKILL.md` before editing. Preserve the single R3d2 merge boundary, the
 owner-wide-then-authority lock order, the single admission linearization point, the zero-effect default, and the
-separation between provider authority and storage consent. The next action is exact-head full deterministic gates;
-then run a fresh Sol/xhigh closure re-review explicitly adjudicating all four fifth-review residuals. Its prompt must
-carry the frozen exact boundary and gate evidence. Run the single Fable lens only after Sol approves; then fold final
-evidence, rerun exact-final gates, and publish the non-draft PR.
+separation between provider authority and storage consent. The next action is a fresh Sol/xhigh closure re-review
+explicitly adjudicating all four fifth-review residuals. Its prompt must carry the frozen exact boundary and gate
+evidence. Run the single Fable lens only after Sol approves; then fold final evidence, rerun exact-final gates, and
+publish the non-draft PR.
