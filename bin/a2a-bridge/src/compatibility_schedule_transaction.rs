@@ -36,9 +36,9 @@ use crate::compatibility_schedule_ledger::{
     ReconciliationDecisionV1,
 };
 use crate::compatibility_schedule_preflight::{
-    pin_action_directories, preflight_pass_sha256, run_zero_effect_preflight,
-    validate_planned_directory_binding, PinnedActionDirectoriesV1, PlannedDirectoryBindingV1,
-    PreflightBindingV1, PreflightFenceV1, PreflightPassV1, ZeroEffectPreflightChecks,
+    pin_action_directories, validate_planned_directory_binding, LocalPreflightProofV1,
+    PinnedActionDirectoriesV1, PlannedDirectoryBindingV1, PreflightCheckV1,
+    ZeroEffectPreflightChecks, ORDERED_CHECKS,
 };
 use crate::compatibility_schedule_schema::{
     validate_supervisor_record, AdmissionAuthorityV1, AdmissionTriggerIdentityV1,
@@ -59,6 +59,197 @@ const MAX_COMMIT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_COMMIT_GENERATIONS: usize = 100_000;
 const COMMIT_PREFIX: &str = "admission-commit.";
 const TERMINAL_PREFIX: &str = "admission-terminal.";
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PreflightFenceV1 {
+    Initial,
+    Final,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PreflightBindingV1 {
+    schema_version: u16,
+    admission_subject_sha256: String,
+    authority_snapshot_sha256: String,
+    trusted_root_binding_sha256: String,
+    requested_cwd_binding_sha256: String,
+    commit_at_ms: i64,
+}
+
+impl PreflightBindingV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        if self.schema_version != 1
+            || self.commit_at_ms <= 0
+            || [
+                &self.admission_subject_sha256,
+                &self.authority_snapshot_sha256,
+                &self.trusted_root_binding_sha256,
+                &self.requested_cwd_binding_sha256,
+            ]
+            .into_iter()
+            .any(|value| !local_file::valid_sha256(value))
+        {
+            return Err("schedule preflight: admission binding is malformed".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PreflightPassV1 {
+    schema_version: u16,
+    fence: PreflightFenceV1,
+    binding: PreflightBindingV1,
+    proofs: Vec<LocalPreflightProofV1>,
+    completed_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PreflightRefusalV1 {
+    schema_version: u16,
+    fence: PreflightFenceV1,
+    failed_check: PreflightCheckV1,
+    code: String,
+    evidence_sha256: String,
+    observed_at_ms: i64,
+    provider_calls: u64,
+    model_calls: u64,
+    registry_effect_calls: u64,
+    runtime_effect_calls: u64,
+}
+
+fn preflight_pass_sha256(value: &PreflightPassV1) -> Result<String, BoxError> {
+    value.binding.validate()?;
+    if value.schema_version != 1
+        || value.proofs.len() != ORDERED_CHECKS.len()
+        || value
+            .proofs
+            .iter()
+            .zip(ORDERED_CHECKS)
+            .any(|(proof, expected)| {
+                proof.check != expected
+                    || !local_file::valid_sha256(&proof.evidence_sha256)
+                    || proof.observed_at_ms <= 0
+                    || proof.observed_at_ms > value.binding.commit_at_ms
+            })
+        || value.completed_at_ms
+            != value
+                .proofs
+                .iter()
+                .map(|proof| proof.observed_at_ms)
+                .max()
+                .unwrap_or(1)
+    {
+        return Err("schedule preflight: pass record is malformed or incomplete".into());
+    }
+    let canonical = serde_json::to_vec(value).map_err(|error| {
+        format!("schedule preflight: cannot canonicalize preflight-pass: {error}")
+    })?;
+    let mut bytes = b"a2a-bridge:r3d2:preflight:preflight-pass:v1\0".to_vec();
+    bytes.extend_from_slice(&canonical);
+    Ok(local_file::sha256_hex(&bytes))
+}
+
+fn valid_preflight_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && matches!(value.as_bytes().first(), Some(b'a'..=b'z'))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn run_zero_effect_preflight<C: ZeroEffectPreflightChecks>(
+    fence: PreflightFenceV1,
+    binding: PreflightBindingV1,
+    checks: &mut C,
+) -> Result<PreflightPassV1, PreflightRefusalV1> {
+    if binding.validate().is_err() {
+        return Err(PreflightRefusalV1 {
+            schema_version: 1,
+            fence,
+            failed_check: PreflightCheckV1::OwnerAndArchitecture,
+            code: "malformed_admission_binding".into(),
+            evidence_sha256: local_file::sha256_hex(b"malformed-preflight-admission-binding"),
+            observed_at_ms: binding.commit_at_ms.max(1),
+            provider_calls: 0,
+            model_calls: 0,
+            registry_effect_calls: 0,
+            runtime_effect_calls: 0,
+        });
+    }
+    let mut proofs = Vec::with_capacity(ORDERED_CHECKS.len());
+    for expected in ORDERED_CHECKS {
+        match checks.revalidate(expected) {
+            Ok(proof)
+                if proof.check == expected
+                    && local_file::valid_sha256(&proof.evidence_sha256)
+                    && proof.observed_at_ms > 0 =>
+            {
+                proofs.push(proof)
+            }
+            Ok(proof) => {
+                return Err(PreflightRefusalV1 {
+                    schema_version: 1,
+                    fence,
+                    failed_check: expected,
+                    code: "malformed_local_proof".into(),
+                    evidence_sha256: if local_file::valid_sha256(&proof.evidence_sha256) {
+                        proof.evidence_sha256
+                    } else {
+                        local_file::sha256_hex(b"malformed-local-preflight-proof")
+                    },
+                    observed_at_ms: proof.observed_at_ms.max(1),
+                    provider_calls: 0,
+                    model_calls: 0,
+                    registry_effect_calls: 0,
+                    runtime_effect_calls: 0,
+                })
+            }
+            Err(refusal) => {
+                let well_formed = valid_preflight_code(&refusal.code)
+                    && local_file::valid_sha256(&refusal.evidence_sha256)
+                    && refusal.observed_at_ms > 0;
+                return Err(PreflightRefusalV1 {
+                    schema_version: 1,
+                    fence,
+                    failed_check: expected,
+                    code: if well_formed {
+                        refusal.code
+                    } else {
+                        "malformed_local_refusal".into()
+                    },
+                    evidence_sha256: if local_file::valid_sha256(&refusal.evidence_sha256) {
+                        refusal.evidence_sha256
+                    } else {
+                        local_file::sha256_hex(b"malformed-local-preflight-refusal")
+                    },
+                    observed_at_ms: refusal.observed_at_ms.max(1),
+                    provider_calls: 0,
+                    model_calls: 0,
+                    registry_effect_calls: 0,
+                    runtime_effect_calls: 0,
+                });
+            }
+        }
+    }
+    let completed_at_ms = proofs
+        .iter()
+        .map(|proof| proof.observed_at_ms)
+        .max()
+        .unwrap_or(1);
+    Ok(PreflightPassV1 {
+        schema_version: 1,
+        fence,
+        binding,
+        proofs,
+        completed_at_ms,
+    })
+}
 
 fn transaction_hash<T: Serialize>(label: &str, value: &T) -> Result<String, BoxError> {
     let canonical = serde_json::to_vec(value)
@@ -352,8 +543,8 @@ pub(super) struct AdmissionCommitV1 {
     pub(super) admission_state_before_sha256: String,
     pub(super) admission_state_after: AdmissionStateV1,
     pub(super) disposition: AdmissionDispositionV1,
-    pub(super) initial_preflight: PreflightPassV1,
-    pub(super) final_preflight: PreflightPassV1,
+    initial_preflight: PreflightPassV1,
+    final_preflight: PreflightPassV1,
     pub(super) trusted_root: PlannedDirectoryBindingV1,
     pub(super) requested_cwd: PlannedDirectoryBindingV1,
     pub(super) terminal_deadline_ms: i64,
@@ -2438,6 +2629,7 @@ mod tests {
     #[test]
     fn admission_effect_products_are_transaction_private() {
         const TRANSACTION: &str = include_str!("compatibility_schedule_transaction.rs");
+        const PREFLIGHT: &str = include_str!("compatibility_schedule_preflight.rs");
 
         for forbidden in [
             concat!("pub(super) struct AdmissionCommit", "ProposalV1"),
@@ -2449,10 +2641,36 @@ mod tests {
                 "CommitV1"
             ),
             concat!("pub(super) fn append_", "terminal"),
+            concat!("pub(super) struct Preflight", "BindingV1"),
+            concat!("pub(super) struct Preflight", "PassV1"),
+            concat!("pub(super) struct Preflight", "RefusalV1"),
+            concat!("pub(super) fn preflight_pass_", "sha256"),
+            concat!("pub(super) fn run_zero_effect_", "preflight"),
         ] {
             assert!(
                 !TRANSACTION.contains(forbidden),
                 "admission effect product remains sibling-visible: {forbidden}"
+            );
+            assert!(
+                !PREFLIGHT.contains(forbidden),
+                "preflight effect product remains sibling-visible: {forbidden}"
+            );
+        }
+
+        for required_private in [
+            concat!("struct Preflight", "BindingV1"),
+            concat!("struct Preflight", "PassV1"),
+            concat!("struct Preflight", "RefusalV1"),
+            concat!("fn preflight_pass_", "sha256"),
+            concat!("fn run_zero_effect_", "preflight"),
+        ] {
+            assert!(
+                TRANSACTION.contains(required_private),
+                "transaction-private preflight product is absent: {required_private}"
+            );
+            assert!(
+                !PREFLIGHT.contains(required_private),
+                "preflight module still owns transaction effect product: {required_private}"
             );
         }
     }
@@ -2477,8 +2695,8 @@ mod tests {
         FileCompatibilityLedger, LedgerBudgetAuthorityV1, LedgerReservationRequestV1,
     };
     use crate::compatibility_schedule_preflight::{
-        plan_directory_binding, run_zero_effect_preflight, LocalPreflightProofV1,
-        LocalPreflightRefusalV1, PreflightCheckV1, ZeroEffectPreflightChecks,
+        plan_directory_binding, LocalPreflightProofV1, LocalPreflightRefusalV1, PreflightCheckV1,
+        ZeroEffectPreflightChecks,
     };
     use crate::compatibility_schedule_schema::{
         seal_admission_attempt_fingerprint, seal_case_execution_fingerprint,
@@ -2856,6 +3074,160 @@ mod tests {
                 observed_at_ms: COMMIT_AT_MS - 1,
             })
         }
+    }
+
+    fn preflight_binding_fixture() -> PreflightBindingV1 {
+        PreflightBindingV1 {
+            schema_version: 1,
+            admission_subject_sha256: digest('1'),
+            authority_snapshot_sha256: digest('2'),
+            trusted_root_binding_sha256: digest('3'),
+            requested_cwd_binding_sha256: digest('4'),
+            commit_at_ms: 11,
+        }
+    }
+
+    #[derive(Default)]
+    struct ForbiddenEffects {
+        provider: u64,
+        models: u64,
+        registry: u64,
+        runtime: u64,
+    }
+
+    struct RecordingChecks {
+        fail: Option<PreflightCheckV1>,
+        malformed: Option<PreflightCheckV1>,
+        observed: Vec<PreflightCheckV1>,
+        forbidden: ForbiddenEffects,
+    }
+
+    impl RecordingChecks {
+        fn new(fail: Option<PreflightCheckV1>) -> Self {
+            Self {
+                fail,
+                malformed: None,
+                observed: Vec::new(),
+                forbidden: ForbiddenEffects::default(),
+            }
+        }
+    }
+
+    impl ZeroEffectPreflightChecks for RecordingChecks {
+        fn revalidate(
+            &mut self,
+            check: PreflightCheckV1,
+        ) -> Result<LocalPreflightProofV1, LocalPreflightRefusalV1> {
+            self.observed.push(check);
+            if self.fail == Some(check) {
+                return Err(LocalPreflightRefusalV1 {
+                    code: format!("{:?}_blocked", check).to_ascii_lowercase(),
+                    evidence_sha256: digest('a'),
+                    observed_at_ms: 10,
+                });
+            }
+            Ok(LocalPreflightProofV1 {
+                check,
+                evidence_sha256: if self.malformed == Some(check) {
+                    "bad".into()
+                } else {
+                    digest('b')
+                },
+                observed_at_ms: 10,
+            })
+        }
+    }
+
+    #[test]
+    fn initial_and_final_fences_run_the_same_complete_zero_effect_checklist() {
+        for fence in [PreflightFenceV1::Initial, PreflightFenceV1::Final] {
+            let mut checks = RecordingChecks::new(None);
+            let pass =
+                run_zero_effect_preflight(fence, preflight_binding_fixture(), &mut checks).unwrap();
+            assert_eq!(checks.observed, ORDERED_CHECKS);
+            assert_eq!(pass.proofs.len(), ORDERED_CHECKS.len());
+            assert_eq!(pass.fence, fence);
+            assert_eq!(
+                (
+                    checks.forbidden.provider,
+                    checks.forbidden.models,
+                    checks.forbidden.registry,
+                    checks.forbidden.runtime,
+                ),
+                (0, 0, 0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_private_preflight_pass_preserves_the_canonical_hash_domain() {
+        let mut checks = RecordingChecks::new(None);
+        let pass = run_zero_effect_preflight(
+            PreflightFenceV1::Initial,
+            preflight_binding_fixture(),
+            &mut checks,
+        )
+        .unwrap();
+        let canonical = serde_json::to_vec(&pass).unwrap();
+        let mut expected = b"a2a-bridge:r3d2:preflight:preflight-pass:v1\0".to_vec();
+        expected.extend_from_slice(&canonical);
+
+        assert_eq!(
+            preflight_pass_sha256(&pass).unwrap(),
+            local_file::sha256_hex(&expected)
+        );
+    }
+
+    #[test]
+    fn every_preflight_failure_is_typed_and_has_zero_effect_calls_at_both_fences() {
+        for fence in [PreflightFenceV1::Initial, PreflightFenceV1::Final] {
+            for failed in ORDERED_CHECKS {
+                let mut checks = RecordingChecks::new(Some(failed));
+                let refusal =
+                    run_zero_effect_preflight(fence, preflight_binding_fixture(), &mut checks)
+                        .unwrap_err();
+                assert_eq!(refusal.failed_check, failed);
+                assert_eq!(refusal.fence, fence);
+                assert!(valid_preflight_code(&refusal.code));
+                assert_eq!(
+                    (
+                        refusal.provider_calls,
+                        refusal.model_calls,
+                        refusal.registry_effect_calls,
+                        refusal.runtime_effect_calls,
+                        checks.forbidden.provider,
+                        checks.forbidden.models,
+                        checks.forbidden.registry,
+                        checks.forbidden.runtime,
+                    ),
+                    (0, 0, 0, 0, 0, 0, 0, 0)
+                );
+                assert_eq!(checks.observed.last(), Some(&failed));
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_local_proof_fails_closed_without_skipping_to_an_effect() {
+        let mut checks = RecordingChecks::new(None);
+        checks.malformed = Some(PreflightCheckV1::LedgerHeadroom);
+        let refusal = run_zero_effect_preflight(
+            PreflightFenceV1::Final,
+            preflight_binding_fixture(),
+            &mut checks,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.failed_check, PreflightCheckV1::LedgerHeadroom);
+        assert_eq!(refusal.code, "malformed_local_proof");
+        assert_eq!(
+            (
+                checks.forbidden.provider,
+                checks.forbidden.models,
+                checks.forbidden.registry,
+                checks.forbidden.runtime,
+            ),
+            (0, 0, 0, 0)
+        );
     }
 
     fn identity(pid: i32, group: i32) -> ProcessIdentityV1 {

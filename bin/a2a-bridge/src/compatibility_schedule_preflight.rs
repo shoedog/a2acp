@@ -14,13 +14,6 @@ use serde::{Deserialize, Serialize};
 use crate::compatibility_process_group::{self, ProcessIdentityV1};
 use crate::{local_file, BoxError};
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum PreflightFenceV1 {
-    Initial,
-    Final,
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum PreflightCheckV1 {
@@ -44,7 +37,7 @@ pub(super) enum PreflightCheckV1 {
     ActionDirectories,
 }
 
-const ORDERED_CHECKS: [PreflightCheckV1; 18] = [
+pub(super) const ORDERED_CHECKS: [PreflightCheckV1; 18] = [
     PreflightCheckV1::OwnerAndArchitecture,
     PreflightCheckV1::EffectAuthorityAndPolicy,
     PreflightCheckV1::CandidateBinary,
@@ -86,185 +79,6 @@ pub(super) trait ZeroEffectPreflightChecks {
         &mut self,
         check: PreflightCheckV1,
     ) -> Result<LocalPreflightProofV1, LocalPreflightRefusalV1>;
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(super) struct PreflightBindingV1 {
-    pub(super) schema_version: u16,
-    pub(super) admission_subject_sha256: String,
-    pub(super) authority_snapshot_sha256: String,
-    pub(super) trusted_root_binding_sha256: String,
-    pub(super) requested_cwd_binding_sha256: String,
-    pub(super) commit_at_ms: i64,
-}
-
-impl PreflightBindingV1 {
-    fn validate(&self) -> Result<(), BoxError> {
-        if self.schema_version != 1
-            || self.commit_at_ms <= 0
-            || [
-                &self.admission_subject_sha256,
-                &self.authority_snapshot_sha256,
-                &self.trusted_root_binding_sha256,
-                &self.requested_cwd_binding_sha256,
-            ]
-            .into_iter()
-            .any(|value| !local_file::valid_sha256(value))
-        {
-            return Err("schedule preflight: admission binding is malformed".into());
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(super) struct PreflightPassV1 {
-    pub(super) schema_version: u16,
-    pub(super) fence: PreflightFenceV1,
-    pub(super) binding: PreflightBindingV1,
-    pub(super) proofs: Vec<LocalPreflightProofV1>,
-    pub(super) completed_at_ms: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(super) struct PreflightRefusalV1 {
-    pub(super) schema_version: u16,
-    pub(super) fence: PreflightFenceV1,
-    pub(super) failed_check: PreflightCheckV1,
-    pub(super) code: String,
-    pub(super) evidence_sha256: String,
-    pub(super) observed_at_ms: i64,
-    pub(super) provider_calls: u64,
-    pub(super) model_calls: u64,
-    pub(super) registry_effect_calls: u64,
-    pub(super) runtime_effect_calls: u64,
-}
-
-pub(super) fn preflight_pass_sha256(value: &PreflightPassV1) -> Result<String, BoxError> {
-    value.binding.validate()?;
-    if value.schema_version != 1
-        || value.proofs.len() != ORDERED_CHECKS.len()
-        || value
-            .proofs
-            .iter()
-            .zip(ORDERED_CHECKS)
-            .any(|(proof, expected)| {
-                proof.check != expected
-                    || !local_file::valid_sha256(&proof.evidence_sha256)
-                    || proof.observed_at_ms <= 0
-                    || proof.observed_at_ms > value.binding.commit_at_ms
-            })
-        || value.completed_at_ms
-            != value
-                .proofs
-                .iter()
-                .map(|proof| proof.observed_at_ms)
-                .max()
-                .unwrap_or(1)
-    {
-        return Err("schedule preflight: pass record is malformed or incomplete".into());
-    }
-    preflight_hash("preflight-pass", value)
-}
-
-fn valid_code(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && matches!(value.as_bytes().first(), Some(b'a'..=b'z'))
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-}
-
-pub(super) fn run_zero_effect_preflight<C: ZeroEffectPreflightChecks>(
-    fence: PreflightFenceV1,
-    binding: PreflightBindingV1,
-    checks: &mut C,
-) -> Result<PreflightPassV1, PreflightRefusalV1> {
-    if binding.validate().is_err() {
-        return Err(PreflightRefusalV1 {
-            schema_version: 1,
-            fence,
-            failed_check: PreflightCheckV1::OwnerAndArchitecture,
-            code: "malformed_admission_binding".into(),
-            evidence_sha256: local_file::sha256_hex(b"malformed-preflight-admission-binding"),
-            observed_at_ms: binding.commit_at_ms.max(1),
-            provider_calls: 0,
-            model_calls: 0,
-            registry_effect_calls: 0,
-            runtime_effect_calls: 0,
-        });
-    }
-    let mut proofs = Vec::with_capacity(ORDERED_CHECKS.len());
-    for expected in ORDERED_CHECKS {
-        match checks.revalidate(expected) {
-            Ok(proof)
-                if proof.check == expected
-                    && local_file::valid_sha256(&proof.evidence_sha256)
-                    && proof.observed_at_ms > 0 =>
-            {
-                proofs.push(proof)
-            }
-            Ok(proof) => {
-                return Err(PreflightRefusalV1 {
-                    schema_version: 1,
-                    fence,
-                    failed_check: expected,
-                    code: "malformed_local_proof".into(),
-                    evidence_sha256: if local_file::valid_sha256(&proof.evidence_sha256) {
-                        proof.evidence_sha256
-                    } else {
-                        local_file::sha256_hex(b"malformed-local-preflight-proof")
-                    },
-                    observed_at_ms: proof.observed_at_ms.max(1),
-                    provider_calls: 0,
-                    model_calls: 0,
-                    registry_effect_calls: 0,
-                    runtime_effect_calls: 0,
-                })
-            }
-            Err(refusal) => {
-                let well_formed = valid_code(&refusal.code)
-                    && local_file::valid_sha256(&refusal.evidence_sha256)
-                    && refusal.observed_at_ms > 0;
-                return Err(PreflightRefusalV1 {
-                    schema_version: 1,
-                    fence,
-                    failed_check: expected,
-                    code: if well_formed {
-                        refusal.code
-                    } else {
-                        "malformed_local_refusal".into()
-                    },
-                    evidence_sha256: if local_file::valid_sha256(&refusal.evidence_sha256) {
-                        refusal.evidence_sha256
-                    } else {
-                        local_file::sha256_hex(b"malformed-local-preflight-refusal")
-                    },
-                    observed_at_ms: refusal.observed_at_ms.max(1),
-                    provider_calls: 0,
-                    model_calls: 0,
-                    registry_effect_calls: 0,
-                    runtime_effect_calls: 0,
-                });
-            }
-        }
-    }
-    let completed_at_ms = proofs
-        .iter()
-        .map(|proof| proof.observed_at_ms)
-        .max()
-        .unwrap_or(1);
-    Ok(PreflightPassV1 {
-        schema_version: 1,
-        fence,
-        binding,
-        proofs,
-        completed_at_ms,
-    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1134,68 +948,6 @@ mod tests {
         ch.to_string().repeat(64)
     }
 
-    fn preflight_binding() -> PreflightBindingV1 {
-        PreflightBindingV1 {
-            schema_version: 1,
-            admission_subject_sha256: digest('1'),
-            authority_snapshot_sha256: digest('2'),
-            trusted_root_binding_sha256: digest('3'),
-            requested_cwd_binding_sha256: digest('4'),
-            commit_at_ms: 11,
-        }
-    }
-
-    #[derive(Default)]
-    struct ForbiddenEffects {
-        provider: u64,
-        models: u64,
-        registry: u64,
-        runtime: u64,
-    }
-
-    struct FakeChecks {
-        fail: Option<PreflightCheckV1>,
-        malformed: Option<PreflightCheckV1>,
-        observed: Vec<PreflightCheckV1>,
-        forbidden: ForbiddenEffects,
-    }
-
-    impl FakeChecks {
-        fn new(fail: Option<PreflightCheckV1>) -> Self {
-            Self {
-                fail,
-                malformed: None,
-                observed: Vec::new(),
-                forbidden: ForbiddenEffects::default(),
-            }
-        }
-    }
-
-    impl ZeroEffectPreflightChecks for FakeChecks {
-        fn revalidate(
-            &mut self,
-            check: PreflightCheckV1,
-        ) -> Result<LocalPreflightProofV1, LocalPreflightRefusalV1> {
-            self.observed.push(check);
-            if self.fail == Some(check) {
-                return Err(LocalPreflightRefusalV1 {
-                    code: format!("{:?}_blocked", check).to_ascii_lowercase(),
-                    evidence_sha256: digest('a'),
-                    observed_at_ms: 10,
-                });
-            }
-            Ok(LocalPreflightProofV1 {
-                check,
-                evidence_sha256: if self.malformed == Some(check) {
-                    "bad".into()
-                } else {
-                    digest('b')
-                },
-                observed_at_ms: 10,
-            })
-        }
-    }
-
     #[test]
     fn preflight_hash_is_one_domain_separated_canonical_payload() {
         let value = vec!["alpha", "beta"];
@@ -1229,74 +981,6 @@ mod tests {
         assert_eq!(identity.pid, pid);
         assert!(identity.process_group > 0);
         assert!(identity.session_id > 0);
-    }
-
-    #[test]
-    fn initial_and_final_fences_run_the_same_complete_zero_effect_checklist() {
-        for fence in [PreflightFenceV1::Initial, PreflightFenceV1::Final] {
-            let mut checks = FakeChecks::new(None);
-            let pass = run_zero_effect_preflight(fence, preflight_binding(), &mut checks).unwrap();
-            assert_eq!(checks.observed, ORDERED_CHECKS);
-            assert_eq!(pass.proofs.len(), ORDERED_CHECKS.len());
-            assert_eq!(pass.fence, fence);
-            assert_eq!(
-                (
-                    checks.forbidden.provider,
-                    checks.forbidden.models,
-                    checks.forbidden.registry,
-                    checks.forbidden.runtime,
-                ),
-                (0, 0, 0, 0)
-            );
-        }
-    }
-
-    #[test]
-    fn every_preflight_failure_is_typed_and_has_zero_effect_calls_at_both_fences() {
-        for fence in [PreflightFenceV1::Initial, PreflightFenceV1::Final] {
-            for failed in ORDERED_CHECKS {
-                let mut checks = FakeChecks::new(Some(failed));
-                let refusal =
-                    run_zero_effect_preflight(fence, preflight_binding(), &mut checks).unwrap_err();
-                assert_eq!(refusal.failed_check, failed);
-                assert_eq!(refusal.fence, fence);
-                assert!(valid_code(&refusal.code));
-                assert_eq!(
-                    (
-                        refusal.provider_calls,
-                        refusal.model_calls,
-                        refusal.registry_effect_calls,
-                        refusal.runtime_effect_calls,
-                        checks.forbidden.provider,
-                        checks.forbidden.models,
-                        checks.forbidden.registry,
-                        checks.forbidden.runtime,
-                    ),
-                    (0, 0, 0, 0, 0, 0, 0, 0)
-                );
-                assert_eq!(checks.observed.last(), Some(&failed));
-            }
-        }
-    }
-
-    #[test]
-    fn malformed_local_proof_fails_closed_without_skipping_to_an_effect() {
-        let mut checks = FakeChecks::new(None);
-        checks.malformed = Some(PreflightCheckV1::LedgerHeadroom);
-        let refusal =
-            run_zero_effect_preflight(PreflightFenceV1::Final, preflight_binding(), &mut checks)
-                .unwrap_err();
-        assert_eq!(refusal.failed_check, PreflightCheckV1::LedgerHeadroom);
-        assert_eq!(refusal.code, "malformed_local_proof");
-        assert_eq!(
-            (
-                checks.forbidden.provider,
-                checks.forbidden.models,
-                checks.forbidden.registry,
-                checks.forbidden.runtime,
-            ),
-            (0, 0, 0, 0)
-        );
     }
 
     fn private_directory(path: &Path) {
@@ -1474,7 +1158,7 @@ mod tests {
     #[test]
     fn exact_production_serve_is_allowed_at_both_legacy_fences() {
         let (sealed, observed, imports) = legacy_fixture();
-        for _fence in [PreflightFenceV1::Initial, PreflightFenceV1::Final] {
+        for _fence in 0..2 {
             assert_eq!(
                 evaluate_legacy_inventory(&sealed, &sealed.inventory_sha256, &observed, &imports,)
                     .unwrap(),
