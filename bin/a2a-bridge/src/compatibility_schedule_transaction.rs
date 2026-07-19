@@ -36,20 +36,22 @@ use crate::compatibility_schedule_ledger::{
     ReconciliationDecisionV1,
 };
 use crate::compatibility_schedule_preflight::{
-    pin_action_directories, preflight_pass_sha256, validate_planned_directory_binding,
-    PinnedActionDirectoriesV1, PlannedDirectoryBindingV1, PreflightFenceV1, PreflightPassV1,
+    pin_action_directories, preflight_pass_sha256, run_zero_effect_preflight,
+    validate_planned_directory_binding, PinnedActionDirectoriesV1, PlannedDirectoryBindingV1,
+    PreflightBindingV1, PreflightFenceV1, PreflightPassV1, ZeroEffectPreflightChecks,
 };
 use crate::compatibility_schedule_schema::{
     validate_supervisor_record, AdmissionAuthorityV1, AdmissionTriggerIdentityV1,
     CaseExecutionFingerprintInputV1, ClaimedSupportCharacterizationSourceV1,
-    ConsumptionEvidenceProvenanceV1, ConsumptionRecordV1, EffectiveIdentityV1,
-    EquivalentWorkReservationV1, LedgerReservationV1, OptionalChildArtifactRefV1, OptionalSha256V1,
-    OptionalSupervisorOutcomeV1, OptionalTextV1, ScheduledExecutionSourceV1, SupervisorPhaseV1,
-    SupervisorRecordV1, SupervisorTerminalOutcomeV1, UsageChargeV1,
+    ConsumptionEvidenceProvenanceV1, ConsumptionRecordV1, DeadlineDerivationV1,
+    EffectiveIdentityV1, EquivalentWorkReservationV1, LedgerReservationV1,
+    OptionalChildArtifactRefV1, OptionalSha256V1, OptionalSupervisorOutcomeV1, OptionalTextV1,
+    ScheduledExecutionSourceV1, SupervisorPhaseV1, SupervisorRecordV1, SupervisorTerminalOutcomeV1,
+    UsageChargeV1, ValidateRecord,
 };
 use crate::compatibility_schedule_state::{AdmissionStateCapability, AuthorityStateCapability};
 use crate::compatibility_schedule_supervisor::{
-    ensure_prepared_supervisor, VerifiedChildTerminalProofV1,
+    ensure_prepared_supervisor, HardDeadline, PreparedSupervisorV1, VerifiedChildTerminalProofV1,
 };
 use crate::{local_file, BoxError};
 
@@ -296,6 +298,7 @@ pub(super) enum AdmissionDispositionV1 {
         equivalent_work: EquivalentWorkReservationV1,
         ledger: Box<LedgerReservationV1>,
         ledger_sha256: String,
+        deadline_derivation: Box<DeadlineDerivationV1>,
         supervisor: Box<SupervisorRecordV1>,
         supervisor_sha256: String,
     },
@@ -326,6 +329,7 @@ struct AdmissionCommitIdentityInputV1<'a> {
     final_preflight_sha256: &'a str,
     trusted_root: &'a PlannedDirectoryBindingV1,
     requested_cwd: &'a PlannedDirectoryBindingV1,
+    terminal_deadline_ms: i64,
     recorded_at_ms: i64,
 }
 
@@ -352,6 +356,7 @@ pub(super) struct AdmissionCommitV1 {
     pub(super) final_preflight: PreflightPassV1,
     pub(super) trusted_root: PlannedDirectoryBindingV1,
     pub(super) requested_cwd: PlannedDirectoryBindingV1,
+    pub(super) terminal_deadline_ms: i64,
     pub(super) recorded_at_ms: i64,
 }
 
@@ -574,6 +579,7 @@ fn commit_identity_sha256(
             final_preflight_sha256,
             trusted_root: &value.trusted_root,
             requested_cwd: &value.requested_cwd,
+            terminal_deadline_ms: value.terminal_deadline_ms,
             recorded_at_ms: value.recorded_at_ms,
         },
     )
@@ -583,7 +589,11 @@ fn validate_commit_against_state(
     value: &AdmissionCommitV1,
     before: &AdmissionStateV1,
 ) -> Result<(), BoxError> {
-    if value.schema_version != 1 || value.generation == 0 || value.recorded_at_ms <= 0 {
+    if value.schema_version != 1
+        || value.generation == 0
+        || value.recorded_at_ms <= 0
+        || value.terminal_deadline_ms < value.recorded_at_ms
+    {
         return Err("schedule transaction: commit header is malformed".into());
     }
     stable_id("commit id", &value.commit_id)?;
@@ -606,8 +616,38 @@ fn validate_commit_against_state(
     value.admission_state_after.validate()?;
     validate_planned_directory_binding(&value.trusted_root)?;
     validate_planned_directory_binding(&value.requested_cwd)?;
+    let (preflight_ledger, preflight_supervisor, preflight_deadline) = match &value.disposition {
+        AdmissionDispositionV1::Reserved {
+            ledger,
+            supervisor,
+            deadline_derivation,
+            ..
+        } => (
+            Some(ledger.as_ref()),
+            Some(supervisor.as_ref()),
+            Some(deadline_derivation.as_ref()),
+        ),
+        AdmissionDispositionV1::Reused { .. } => (None, None, None),
+    };
+    let expected_preflight_binding = admission_preflight_binding(
+        value.source_kind,
+        &value.source_sha256,
+        &value.context,
+        &value.authority_action,
+        &value.effect_envelope,
+        &value.authority_before_snapshot_sha256,
+        preflight_ledger,
+        preflight_supervisor,
+        preflight_deadline,
+        &value.trusted_root,
+        &value.requested_cwd,
+        value.terminal_deadline_ms,
+        value.recorded_at_ms,
+    )?;
     if value.initial_preflight.fence != PreflightFenceV1::Initial
         || value.final_preflight.fence != PreflightFenceV1::Final
+        || value.initial_preflight.binding != expected_preflight_binding
+        || value.final_preflight.binding != expected_preflight_binding
         || value.initial_preflight.completed_at_ms > value.final_preflight.completed_at_ms
         || value.final_preflight.completed_at_ms > value.recorded_at_ms
     {
@@ -674,12 +714,21 @@ fn validate_commit_against_state(
                 equivalent_work,
                 ledger,
                 ledger_sha256,
+                deadline_derivation,
                 supervisor,
                 supervisor_sha256,
             },
             EquivalentWorkDecisionV1::Reserved(expected),
         ) if equivalent_work == &expected => {
             validate_prepared_reservation_context(ledger, &value.context)?;
+            validate_deadline_record_binding(
+                &value.context,
+                ledger,
+                supervisor,
+                deadline_derivation,
+                value.terminal_deadline_ms,
+                value.recorded_at_ms,
+            )?;
             if ledger.reserved_at_ms != value.recorded_at_ms
                 || ledger_sha256 != &prepared_reservation_sha256(ledger)?
                 || supervisor_sha256 != &supervisor_record_sha256(supervisor)?
@@ -727,16 +776,155 @@ fn validate_commit_against_state(
 pub(super) struct AdmissionCommitProposalV1 {
     pub(super) source_kind: InternalAdmissionSourceKindV1,
     pub(super) source_sha256: String,
+    pub(super) authority_snapshot_sha256: String,
     pub(super) context: DerivedLedgerAdmissionContextV1,
     pub(super) authority_action: AuthorityCommitActionV1,
     pub(super) effect_envelope: AuthorizedEffectEnvelopeV1,
     pub(super) ledger: Option<LedgerReservationV1>,
-    pub(super) supervisor: Option<SupervisorRecordV1>,
+    pub(super) supervisor: Option<PreparedSupervisorV1>,
     pub(super) initial_preflight: PreflightPassV1,
     pub(super) final_preflight: PreflightPassV1,
     pub(super) trusted_root: PlannedDirectoryBindingV1,
     pub(super) requested_cwd: PlannedDirectoryBindingV1,
+    pub(super) terminal_deadline_ms: i64,
     pub(super) recorded_at_ms: i64,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionPreflightSubjectInputV1<'a> {
+    schema_version: u16,
+    source_kind: InternalAdmissionSourceKindV1,
+    source_sha256: &'a str,
+    context: &'a DerivedLedgerAdmissionContextV1,
+    authority_action: &'a AuthorityCommitActionV1,
+    effect_envelope: &'a AuthorizedEffectEnvelopeV1,
+    authority_snapshot_sha256: &'a str,
+    ledger_sha256: Option<&'a str>,
+    supervisor_sha256: Option<&'a str>,
+    deadline_derivation_sha256: Option<&'a str>,
+    trusted_root: &'a PlannedDirectoryBindingV1,
+    requested_cwd: &'a PlannedDirectoryBindingV1,
+    terminal_deadline_ms: i64,
+    commit_at_ms: i64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admission_preflight_binding(
+    source_kind: InternalAdmissionSourceKindV1,
+    source_sha256: &str,
+    context: &DerivedLedgerAdmissionContextV1,
+    authority_action: &AuthorityCommitActionV1,
+    effect_envelope: &AuthorizedEffectEnvelopeV1,
+    authority_snapshot_sha256: &str,
+    ledger: Option<&LedgerReservationV1>,
+    supervisor: Option<&SupervisorRecordV1>,
+    deadline_derivation: Option<&DeadlineDerivationV1>,
+    trusted_root: &PlannedDirectoryBindingV1,
+    requested_cwd: &PlannedDirectoryBindingV1,
+    terminal_deadline_ms: i64,
+    commit_at_ms: i64,
+) -> Result<PreflightBindingV1, BoxError> {
+    if !local_file::valid_sha256(authority_snapshot_sha256)
+        || commit_at_ms <= 0
+        || terminal_deadline_ms < commit_at_ms
+    {
+        return Err("schedule transaction: preflight authority/time binding is malformed".into());
+    }
+    validate_planned_directory_binding(trusted_root)?;
+    validate_planned_directory_binding(requested_cwd)?;
+    let ledger_sha256 = ledger.map(prepared_reservation_sha256).transpose()?;
+    let supervisor_sha256 = supervisor.map(supervisor_record_sha256).transpose()?;
+    let deadline_derivation_sha256 = deadline_derivation
+        .map(|value| {
+            value.validate()?;
+            Ok::<_, BoxError>(value.derivation.sha256.clone())
+        })
+        .transpose()?;
+    let subject = AdmissionPreflightSubjectInputV1 {
+        schema_version: 1,
+        source_kind,
+        source_sha256,
+        context,
+        authority_action,
+        effect_envelope,
+        authority_snapshot_sha256,
+        ledger_sha256: ledger_sha256.as_deref(),
+        supervisor_sha256: supervisor_sha256.as_deref(),
+        deadline_derivation_sha256: deadline_derivation_sha256.as_deref(),
+        trusted_root,
+        requested_cwd,
+        terminal_deadline_ms,
+        commit_at_ms,
+    };
+    Ok(PreflightBindingV1 {
+        schema_version: 1,
+        admission_subject_sha256: transaction_hash("preflight-admission-subject", &subject)?,
+        authority_snapshot_sha256: authority_snapshot_sha256.to_owned(),
+        trusted_root_binding_sha256: transaction_hash("preflight-trusted-root", trusted_root)?,
+        requested_cwd_binding_sha256: transaction_hash("preflight-requested-cwd", requested_cwd)?,
+        commit_at_ms,
+    })
+}
+
+fn validate_deadline_record_binding(
+    context: &DerivedLedgerAdmissionContextV1,
+    ledger: &LedgerReservationV1,
+    supervisor: &SupervisorRecordV1,
+    record: &DeadlineDerivationV1,
+    terminal_deadline_ms: i64,
+    recorded_at_ms: i64,
+) -> Result<(), BoxError> {
+    record.validate()?;
+    validate_supervisor_record(supervisor)?;
+    let trigger = &context.identities.admission_attempt.input.trigger;
+    let authority_remaining_ms = terminal_deadline_ms
+        .checked_sub(recorded_at_ms)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or("schedule transaction: authority terminal deadline is already exhausted")?;
+    let selected = &record.input.budgets.selected_cases;
+    let case_timeout_cap_ms = ledger
+        .caps
+        .timeout_secs
+        .checked_mul(1_000)
+        .ok_or("schedule transaction: ledger case timeout overflows")?;
+    if supervisor.run_id != trigger.attempt_id
+        || supervisor.window_id != trigger.window_id
+        || record.input.run_id != supervisor.run_id
+        || record.input.window_id != supervisor.window_id
+        || supervisor.deadline_derivation_sha256 != record.derivation.sha256
+        || selected.len() != 1
+        || selected[0].case_id != context.case_id
+        || selected[0].timeout_ms > case_timeout_cap_ms
+        || record.input.remaining_at_derivation_ms > authority_remaining_ms
+    {
+        return Err(
+            "schedule transaction: supervisor deadline is not contained by this admission".into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_admission_deadline(
+    context: &DerivedLedgerAdmissionContextV1,
+    ledger: &LedgerReservationV1,
+    supervisor: &SupervisorRecordV1,
+    deadline: &HardDeadline,
+    terminal_deadline_ms: i64,
+    recorded_at_ms: i64,
+) -> Result<(), BoxError> {
+    validate_deadline_record_binding(
+        context,
+        ledger,
+        supervisor,
+        deadline.record(),
+        terminal_deadline_ms,
+        recorded_at_ms,
+    )?;
+    if deadline.remaining().is_zero() {
+        return Err("schedule transaction: executable hard deadline is already exhausted".into());
+    }
+    Ok(())
 }
 
 pub(super) struct RederivedSourceAdmissionV1 {
@@ -747,6 +935,7 @@ pub(super) struct RederivedSourceAdmissionV1 {
     effect_envelope: AuthorizedEffectEnvelopeV1,
     budget_authority: LedgerBudgetAuthorityV1,
     selected_at_ms: i64,
+    terminal_deadline_ms: i64,
     authority_snapshot_sha256: String,
 }
 
@@ -850,6 +1039,7 @@ fn rederive_scheduled_standing_source_against_state(
             budgets: grant.budgets.clone(),
         },
         selected_at_ms: environment.now_ms,
+        terminal_deadline_ms: environment.terminal_deadline_ms,
         authority_snapshot_sha256: String::new(),
     })
 }
@@ -908,6 +1098,7 @@ fn rederive_scheduled_characterization_source_against_state(
         },
         budget_authority,
         selected_at_ms: environment.now_ms,
+        terminal_deadline_ms: environment.terminal_deadline_ms,
         authority_snapshot_sha256: String::new(),
     })
 }
@@ -966,6 +1157,7 @@ fn rederive_claimed_support_characterization_source_against_state(
         },
         budget_authority,
         selected_at_ms: environment.now_ms,
+        terminal_deadline_ms: environment.terminal_deadline_ms,
         authority_snapshot_sha256: String::new(),
     })
 }
@@ -1008,23 +1200,26 @@ fn rederive_manual_source_against_state(
             budgets: grant.budgets.clone(),
         },
         selected_at_ms: environment.now_ms,
+        terminal_deadline_ms: environment.terminal_deadline_ms,
         authority_snapshot_sha256: String::new(),
     })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_source_proposal_for_capability<C>(
+fn prepare_source_proposal_for_capability<C, I, F>(
     capability: &C,
     selected: RederivedSourceAdmissionV1,
-    supervisor: Option<SupervisorRecordV1>,
-    initial_preflight: PreflightPassV1,
-    final_preflight: PreflightPassV1,
+    supervisor: Option<PreparedSupervisorV1>,
     trusted_root: PlannedDirectoryBindingV1,
     requested_cwd: PlannedDirectoryBindingV1,
     recorded_at_ms: i64,
+    initial_checks: &mut I,
+    final_checks: &mut F,
 ) -> Result<AdmissionCommitProposalV1, BoxError>
 where
     C: AdmissionStateCapability + AuthorityStateCapability + ?Sized,
+    I: ZeroEffectPreflightChecks,
+    F: ZeroEffectPreflightChecks,
 {
     if selected.selected_at_ms != recorded_at_ms
         || !local_file::valid_sha256(&selected.authority_snapshot_sha256)
@@ -1065,9 +1260,47 @@ where
         }
         EquivalentWorkDecisionV1::Reused(_) => (None, None),
     };
+    let preflight_binding = admission_preflight_binding(
+        selected.source_kind,
+        &selected.source_sha256,
+        &selected.context,
+        &selected.authority_action,
+        &selected.effect_envelope,
+        &selected.authority_snapshot_sha256,
+        ledger.as_ref(),
+        supervisor.as_ref().map(PreparedSupervisorV1::record),
+        supervisor
+            .as_ref()
+            .map(PreparedSupervisorV1::deadline)
+            .map(HardDeadline::record),
+        &trusted_root,
+        &requested_cwd,
+        selected.terminal_deadline_ms,
+        recorded_at_ms,
+    )?;
+    let initial_preflight = run_zero_effect_preflight(
+        PreflightFenceV1::Initial,
+        preflight_binding.clone(),
+        initial_checks,
+    )
+    .map_err(|refusal| {
+        format!(
+            "schedule transaction: initial preflight refused: {}",
+            refusal.code
+        )
+    })?;
+    let final_preflight =
+        run_zero_effect_preflight(PreflightFenceV1::Final, preflight_binding, final_checks)
+            .map_err(|refusal| {
+                format!(
+                    "schedule transaction: final preflight refused: {}",
+                    refusal.code
+                )
+            })?;
     Ok(AdmissionCommitProposalV1 {
         source_kind: selected.source_kind,
         source_sha256: selected.source_sha256,
+        authority_snapshot_sha256: selected.authority_snapshot_sha256,
         context: selected.context,
         authority_action: selected.authority_action,
         effect_envelope: selected.effect_envelope,
@@ -1077,6 +1310,7 @@ where
         final_preflight,
         trusted_root,
         requested_cwd,
+        terminal_deadline_ms: selected.terminal_deadline_ms,
         recorded_at_ms,
     })
 }
@@ -1189,32 +1423,30 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn prepare_proposal(
+    pub(super) fn admit<I, F>(
         &self,
         selected: RederivedSourceAdmissionV1,
-        supervisor: Option<SupervisorRecordV1>,
-        initial_preflight: PreflightPassV1,
-        final_preflight: PreflightPassV1,
+        supervisor: Option<PreparedSupervisorV1>,
         trusted_root: PlannedDirectoryBindingV1,
         requested_cwd: PlannedDirectoryBindingV1,
         recorded_at_ms: i64,
-    ) -> Result<AdmissionCommitProposalV1, BoxError> {
-        prepare_source_proposal_for_capability(
+        initial_checks: &mut I,
+        final_checks: &mut F,
+    ) -> Result<PublishedAdmissionV1, BoxError>
+    where
+        I: ZeroEffectPreflightChecks,
+        F: ZeroEffectPreflightChecks,
+    {
+        let proposal = prepare_source_proposal_for_capability(
             self.capability,
             selected,
             supervisor,
-            initial_preflight,
-            final_preflight,
             trusted_root,
             requested_cwd,
             recorded_at_ms,
-        )
-    }
-
-    pub(super) fn commit(
-        &self,
-        proposal: AdmissionCommitProposalV1,
-    ) -> Result<PublishedAdmissionV1, BoxError> {
+            initial_checks,
+            final_checks,
+        )?;
         commit_prevalidated_proposal_for_capability(self.capability, proposal)
     }
 }
@@ -1223,10 +1455,40 @@ pub(super) fn build_admission_commit(
     admission: &FileAdmissionJournal<'_>,
     authority: &AuthorityJournalOpen<'_>,
     proposal: AdmissionCommitProposalV1,
-) -> Result<AdmissionCommitV1, BoxError> {
+) -> Result<(AdmissionCommitV1, Option<HardDeadline>), BoxError> {
     proposal.context.identities.validate()?;
-    if proposal.recorded_at_ms <= 0 || !local_file::valid_sha256(&proposal.source_sha256) {
+    if proposal.recorded_at_ms <= 0
+        || !local_file::valid_sha256(&proposal.source_sha256)
+        || proposal.authority_snapshot_sha256 != authority.snapshot_sha256
+    {
         return Err("schedule transaction: proposal time/source binding is invalid".into());
+    }
+    let expected_preflight_binding = admission_preflight_binding(
+        proposal.source_kind,
+        &proposal.source_sha256,
+        &proposal.context,
+        &proposal.authority_action,
+        &proposal.effect_envelope,
+        &proposal.authority_snapshot_sha256,
+        proposal.ledger.as_ref(),
+        proposal
+            .supervisor
+            .as_ref()
+            .map(PreparedSupervisorV1::record),
+        proposal
+            .supervisor
+            .as_ref()
+            .map(PreparedSupervisorV1::deadline)
+            .map(HardDeadline::record),
+        &proposal.trusted_root,
+        &proposal.requested_cwd,
+        proposal.terminal_deadline_ms,
+        proposal.recorded_at_ms,
+    )?;
+    if proposal.initial_preflight.binding != expected_preflight_binding
+        || proposal.final_preflight.binding != expected_preflight_binding
+    {
+        return Err("schedule transaction: preflight result belongs to another admission".into());
     }
     let mut admission_state_after = admission.state().clone();
     let decision = admission_state_after.equivalent_work.reserve_or_reuse(
@@ -1241,20 +1503,32 @@ pub(super) fn build_admission_commit(
         proposal.recorded_at_ms,
     )?;
     admission_state_after.validate()?;
-    let disposition = match (decision, proposal.ledger, proposal.supervisor) {
+    let (disposition, hard_deadline) = match (decision, proposal.ledger, proposal.supervisor) {
         (EquivalentWorkDecisionV1::Reserved(equivalent_work), Some(ledger), Some(supervisor)) => {
+            let (supervisor, deadline) = supervisor.into_parts();
             validate_prepared_reservation_context(&ledger, &proposal.context)?;
-            validate_supervisor_record(&supervisor)?;
-            AdmissionDispositionV1::Reserved {
-                equivalent_work,
-                ledger_sha256: prepared_reservation_sha256(&ledger)?,
-                supervisor_sha256: supervisor_record_sha256(&supervisor)?,
-                ledger: Box::new(ledger),
-                supervisor: Box::new(supervisor),
-            }
+            validate_admission_deadline(
+                &proposal.context,
+                &ledger,
+                &supervisor,
+                &deadline,
+                proposal.terminal_deadline_ms,
+                proposal.recorded_at_ms,
+            )?;
+            (
+                AdmissionDispositionV1::Reserved {
+                    equivalent_work,
+                    ledger_sha256: prepared_reservation_sha256(&ledger)?,
+                    deadline_derivation: Box::new(deadline.record().clone()),
+                    supervisor_sha256: supervisor_record_sha256(&supervisor)?,
+                    ledger: Box::new(ledger),
+                    supervisor: Box::new(supervisor),
+                },
+                Some(deadline),
+            )
         }
         (EquivalentWorkDecisionV1::Reused(consumption), None, None) => {
-            AdmissionDispositionV1::Reused { consumption }
+            (AdmissionDispositionV1::Reused { consumption }, None)
         }
         _ => return Err(
             "schedule transaction: reserved work requires ledger/supervisor and reuse forbids them"
@@ -1290,6 +1564,7 @@ pub(super) fn build_admission_commit(
         final_preflight: proposal.final_preflight,
         trusted_root: proposal.trusted_root,
         requested_cwd: proposal.requested_cwd,
+        terminal_deadline_ms: proposal.terminal_deadline_ms,
         recorded_at_ms: proposal.recorded_at_ms,
     };
     commit.commit_identity_sha256 = commit_identity_sha256(
@@ -1332,7 +1607,7 @@ pub(super) fn build_admission_commit(
     commit.authority_after_snapshot = authority_after_snapshot;
     commit.authority_after_snapshot_sha256 = authority_after_snapshot_sha256;
     validate_commit_against_state(&commit, admission.state())?;
-    Ok(commit)
+    Ok((commit, hard_deadline))
 }
 
 fn publish_authority_commit<C>(capability: &C, commit: &AdmissionCommitV1) -> Result<(), BoxError>
@@ -1745,6 +2020,7 @@ pub(super) struct AdmittedRunCapabilityV1 {
     effect_envelope: AuthorizedEffectEnvelopeV1,
     supervisor_record_id: String,
     action_directories: PinnedActionDirectoriesV1,
+    hard_deadline: HardDeadline,
 }
 
 impl AdmittedRunCapabilityV1 {
@@ -1767,6 +2043,10 @@ impl AdmittedRunCapabilityV1 {
     pub(super) fn action_directories(&self) -> &PinnedActionDirectoriesV1 {
         &self.action_directories
     }
+
+    pub(super) fn hard_deadline(&self) -> &HardDeadline {
+        &self.hard_deadline
+    }
 }
 
 pub(super) enum PublishedAdmissionV1 {
@@ -1788,7 +2068,7 @@ where
     let mut admission = FileAdmissionJournal::open(capability)?;
     let action_directories =
         pin_action_directories(&proposal.trusted_root, &proposal.requested_cwd)?;
-    let commit = build_admission_commit(&admission.journal, &authority, proposal)?;
+    let (commit, hard_deadline) = build_admission_commit(&admission.journal, &authority, proposal)?;
     admission.journal.append(commit.clone())?;
     drop(authority);
     let published_supervisor = publish_committed_state(capability, &commit)?;
@@ -1808,6 +2088,9 @@ where
                     effect_envelope: commit.effect_envelope,
                     supervisor_record_id: supervisor.supervisor_record_id.clone(),
                     action_directories,
+                    hard_deadline: hard_deadline.ok_or(
+                        "schedule transaction: admitted reservation lost its hard deadline",
+                    )?,
                 },
             )))
         }
@@ -2141,6 +2424,7 @@ impl<'lock> FileAdmissionJournal<'lock> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::time::Instant;
 
     use crate::compatibility::{child_terminal_aggregate_fixture, ChildTerminalAggregateFixtureV1};
     use crate::compatibility_process_group::{ProcessIdentityV1, ProcessStartMarkerV1};
@@ -2169,25 +2453,27 @@ mod tests {
         seal_admission_attempt_fingerprint, seal_case_execution_fingerprint,
         AdmissionAttemptFingerprintInputV1, AdmissionAuthorityV1, AdmissionTriggerIdentityV1,
         AggregateBudgetCapsV1, AnchorLifecycleV1, AnchoredProcessGroupRecordV1,
-        CandidateBinaryIdentityV1, CaseExecutionFingerprintInputV1,
+        CandidateBinaryIdentityV1, CaseDeadlineBudgetV1, CaseExecutionFingerprintInputV1,
         CharacterizationAuthorizationV1, CharacterizationOnceAuthorityV1,
         CharacterizationOutcomeV1, CharacterizationRecordV1, CharacterizedGrantProfileV1,
-        ChildArtifactJoinV1, ChildArtifactRefV1, EffectiveIdentityV1, ExactExecutionBindingsV1,
-        ExactExecutionTargetV1, FingerprintV1, GitObjectAlgorithmV1, GitObjectIdV1,
-        GrantBudgetPolicyV1, LaunchdBindingV1, NamedBudgetCapsV1, OneShotCharacterizationEntryV1,
-        OptionalChildArtifactRefV1, OptionalElapsedMsV1, OptionalGitObjectIdV1,
-        OptionalProcessIdentityV1, OptionalRecordRefV1, OptionalSafetyHoldReasonV1,
-        OptionalSha256V1, OptionalStableIdV1, OptionalSupervisorKillCauseV1,
-        OptionalSupervisorOutcomeV1, OptionalTextV1, ProviderEffectGrantV1, SupervisorPhaseV1,
-        TriggerBudgetCapsV1, TriggerSourceV1,
+        ChildArtifactJoinV1, ChildArtifactRefV1, DeadlineContainmentV1, DeadlinePhaseBudgetsV1,
+        EffectiveIdentityV1, ExactExecutionBindingsV1, ExactExecutionTargetV1, FingerprintV1,
+        GitObjectAlgorithmV1, GitObjectIdV1, GrantBudgetPolicyV1, LaunchdBindingV1,
+        NamedBudgetCapsV1, OneShotCharacterizationEntryV1, OptionalChildArtifactRefV1,
+        OptionalElapsedMsV1, OptionalGitObjectIdV1, OptionalProcessIdentityV1, OptionalRecordRefV1,
+        OptionalSafetyHoldReasonV1, OptionalSha256V1, OptionalStableIdV1,
+        OptionalSupervisorKillCauseV1, OptionalSupervisorOutcomeV1, OptionalTextV1,
+        ProviderEffectGrantV1, SupervisorPhaseV1, TriggerBudgetCapsV1, TriggerSourceV1,
     };
     use crate::compatibility_schedule_state::{AdmissionStateCapability, SchedulerStateRoot};
     use crate::compatibility_schedule_supervisor::{
-        FileSupervisorJournal, SupervisorJournal, VerifiedChildArtifact,
-        VerifiedChildTerminalProofV1,
+        FileSupervisorJournal, HardDeadline, PreparedSupervisorV1, SupervisorJournal,
+        VerifiedChildArtifact, VerifiedChildTerminalProofV1,
     };
 
     const COMMIT_AT_MS: i64 = 10;
+    const TERMINAL_DEADLINE_MS: i64 = 50_000;
+    const AUTHORITY_EXPIRES_AT_MS: i64 = 100_000;
 
     fn digest(ch: char) -> String {
         ch.to_string().repeat(64)
@@ -2378,7 +2664,7 @@ mod tests {
             price_snapshot_sha256: digest('4'),
             legacy_inventory_sha256: digest('5'),
             now_ms: COMMIT_AT_MS,
-            terminal_deadline_ms: 50,
+            terminal_deadline_ms: TERMINAL_DEADLINE_MS,
         }
     }
 
@@ -2413,7 +2699,7 @@ mod tests {
                 caps: execution.input.actual_caps.clone(),
                 command: "compatibility characterize".into(),
                 not_before_ms: 2,
-                expires_at_ms: 100,
+                expires_at_ms: AUTHORITY_EXPIRES_AT_MS,
                 revocation_generation: 1,
                 prior_entry: OptionalRecordRefV1::Absent,
                 reissue_reason: OptionalTextV1::Absent,
@@ -2468,7 +2754,7 @@ mod tests {
             scheduler_binary_sha256: digest('e'),
             price_snapshot_sha256: digest('4'),
             price_snapshot_observed_at_ms: 2,
-            price_snapshot_valid_until_ms: 100,
+            price_snapshot_valid_until_ms: AUTHORITY_EXPIRES_AT_MS,
             legacy_inventory_sha256: digest('5'),
             triggers: vec![TriggerKindV1::Daily],
             case_ids: vec![case_id.into()],
@@ -2511,7 +2797,7 @@ mod tests {
                 caps: binding.maximum_caps.clone(),
             }],
             not_before_ms: 2,
-            expires_at_ms: 100,
+            expires_at_ms: AUTHORITY_EXPIRES_AT_MS,
             revocation_generation: 1,
         })
         .unwrap()
@@ -2554,14 +2840,56 @@ mod tests {
         }
     }
 
-    fn prepared_supervisor(context: &DerivedLedgerAdmissionContextV1) -> SupervisorRecordV1 {
+    fn deadline_budgets(context: &DerivedLedgerAdmissionContextV1) -> DeadlinePhaseBudgetsV1 {
+        DeadlinePhaseBudgetsV1 {
+            metadata_fetch_ms: 100,
+            checkout_candidate_build_ms: 100,
+            preflight_ms: 100,
+            resolution_materialization_ms: 100,
+            selected_cases: vec![CaseDeadlineBudgetV1 {
+                case_id: context.case_id.clone(),
+                timeout_ms: 1_000,
+            }],
+            evidence_publication_ms: 100,
+            cold_archive_handoff_ms: 0,
+            cleanup_grace_ms: 100,
+            fixed_margin_ms: 100,
+        }
+    }
+
+    fn hard_deadline(context: &DerivedLedgerAdmissionContextV1) -> HardDeadline {
+        let trigger = &context.identities.admission_attempt.input.trigger;
+        HardDeadline::derive(
+            Instant::now(),
+            trigger.attempt_id.clone(),
+            trigger.window_id.clone(),
+            deadline_budgets(context),
+            DeadlineContainmentV1 {
+                schedule_window_remaining_ms: 40_000,
+                grant_remaining_ms: 40_000,
+                time_budget_remaining_ms: 40_000,
+            },
+        )
+        .unwrap()
+    }
+
+    fn prepared_supervisor_record(
+        context: &DerivedLedgerAdmissionContextV1,
+        deadline_derivation_sha256: String,
+    ) -> SupervisorRecordV1 {
         let trigger = context.identities.admission_attempt.input.trigger.kind;
         SupervisorRecordV1 {
             schema_version: 1,
             supervisor_record_id: "supervisor-1".into(),
             generation: 1,
             previous_record: OptionalSha256V1::Absent,
-            run_id: "run-1".into(),
+            run_id: context
+                .identities
+                .admission_attempt
+                .input
+                .trigger
+                .attempt_id
+                .clone(),
             window_id: context
                 .identities
                 .admission_attempt
@@ -2570,7 +2898,7 @@ mod tests {
                 .window_id
                 .clone(),
             trigger,
-            deadline_derivation_sha256: digest('d'),
+            deadline_derivation_sha256,
             scheduler: identity(42, 42),
             runner: OptionalProcessIdentityV1::Absent,
             groups: vec![AnchoredProcessGroupRecordV1 {
@@ -2591,6 +2919,39 @@ mod tests {
             child_artifact: OptionalChildArtifactRefV1::Absent,
             recorded_at_ms: COMMIT_AT_MS,
         }
+    }
+
+    fn prepared_supervisor(context: &DerivedLedgerAdmissionContextV1) -> PreparedSupervisorV1 {
+        let deadline = hard_deadline(context);
+        let record =
+            prepared_supervisor_record(context, deadline.record().derivation.sha256.clone());
+        PreparedSupervisorV1::bind(record, deadline).unwrap()
+    }
+
+    fn deadline_and_supervisor_for(
+        context: &DerivedLedgerAdmissionContextV1,
+        run_id: String,
+        window_id: String,
+        budgets: DeadlinePhaseBudgetsV1,
+        containment_ms: u64,
+    ) -> (SupervisorRecordV1, HardDeadline) {
+        let deadline = HardDeadline::derive(
+            Instant::now(),
+            run_id.clone(),
+            window_id.clone(),
+            budgets,
+            DeadlineContainmentV1 {
+                schedule_window_remaining_ms: containment_ms,
+                grant_remaining_ms: containment_ms,
+                time_budget_remaining_ms: containment_ms,
+            },
+        )
+        .unwrap();
+        let mut supervisor =
+            prepared_supervisor_record(context, deadline.record().derivation.sha256.clone());
+        supervisor.run_id = run_id;
+        supervisor.window_id = window_id;
+        (supervisor, deadline)
     }
 
     fn state_root() -> (tempfile::TempDir, SchedulerStateRoot) {
@@ -2615,10 +2976,13 @@ mod tests {
         (action, root_binding, cwd_binding)
     }
 
-    fn manual_proposal<C: AdmissionStateCapability + ?Sized>(
+    fn manual_proposal_for_source<
+        C: AdmissionStateCapability + AuthorityStateCapability + ?Sized,
+    >(
         capability: &C,
         trusted_root: PlannedDirectoryBindingV1,
         requested_cwd: PlannedDirectoryBindingV1,
+        input_source_sha256: String,
     ) -> AdmissionCommitProposalV1 {
         let input = execution_input();
         let execution = seal_case_execution_fingerprint(input.clone()).unwrap();
@@ -2631,7 +2995,7 @@ mod tests {
                 operator: "operator".into(),
                 environment_owner: "wesleyjinks".into(),
                 scheduler_binary_sha256: digest('e'),
-                input_source_sha256: digest('f'),
+                input_source_sha256,
                 case_id: "case-1".into(),
                 provider_family: "provider-1".into(),
                 characterization_profile: input.characterization_profile.clone(),
@@ -2641,7 +3005,7 @@ mod tests {
                 caps: caps(),
                 allowed_effects: vec![EffectClassV1::ProviderPrompt],
                 issued_at_ms: 2,
-                expires_at_ms: 100,
+                expires_at_ms: AUTHORITY_EXPIRES_AT_MS,
             },
         )
         .unwrap();
@@ -2667,13 +3031,43 @@ mod tests {
             )
             .unwrap();
         let supervisor = prepared_supervisor(&context);
-        let initial_preflight =
-            run_zero_effect_preflight(PreflightFenceV1::Initial, &mut PassingChecks).unwrap();
+        let authority_snapshot_sha256 = FileAuthorityJournal::open_existing(capability)
+            .unwrap()
+            .snapshot_sha256;
+        let binding = admission_preflight_binding(
+            InternalAdmissionSourceKindV1::GenericManual,
+            &manual.record.input_source_sha256,
+            &context,
+            &AuthorityCommitActionV1::Manual {
+                admission: Box::new(manual.clone()),
+            },
+            &AuthorizedEffectEnvelopeV1 {
+                allowed_effects: manual.record.allowed_effects.clone(),
+                caps: manual.record.caps.clone(),
+            },
+            &authority_snapshot_sha256,
+            Some(&reservation),
+            Some(supervisor.record()),
+            Some(supervisor.deadline().record()),
+            &trusted_root,
+            &requested_cwd,
+            TERMINAL_DEADLINE_MS,
+            COMMIT_AT_MS,
+        )
+        .unwrap();
+        let initial_preflight = run_zero_effect_preflight(
+            PreflightFenceV1::Initial,
+            binding.clone(),
+            &mut PassingChecks,
+        )
+        .unwrap();
         let final_preflight =
-            run_zero_effect_preflight(PreflightFenceV1::Final, &mut PassingChecks).unwrap();
+            run_zero_effect_preflight(PreflightFenceV1::Final, binding, &mut PassingChecks)
+                .unwrap();
         AdmissionCommitProposalV1 {
             source_kind: InternalAdmissionSourceKindV1::GenericManual,
             source_sha256: manual.record.input_source_sha256.clone(),
+            authority_snapshot_sha256,
             context,
             effect_envelope: AuthorizedEffectEnvelopeV1 {
                 allowed_effects: manual.record.allowed_effects.clone(),
@@ -2688,8 +3082,17 @@ mod tests {
             final_preflight,
             trusted_root,
             requested_cwd,
+            terminal_deadline_ms: TERMINAL_DEADLINE_MS,
             recorded_at_ms: COMMIT_AT_MS,
         }
+    }
+
+    fn manual_proposal<C: AdmissionStateCapability + AuthorityStateCapability + ?Sized>(
+        capability: &C,
+        trusted_root: PlannedDirectoryBindingV1,
+        requested_cwd: PlannedDirectoryBindingV1,
+    ) -> AdmissionCommitProposalV1 {
+        manual_proposal_for_source(capability, trusted_root, requested_cwd, digest('f'))
     }
 
     fn claimed_source_fixture() -> (
@@ -2837,7 +3240,8 @@ mod tests {
         let authority = FileAuthorityJournal::initialize(&locks, 1).unwrap();
         let admission = FileAdmissionJournal::open(&locks).unwrap();
         let proposal = manual_proposal(&locks, trusted_root, requested_cwd);
-        let commit = build_admission_commit(&admission.journal, &authority, proposal).unwrap();
+        let (commit, _deadline) =
+            build_admission_commit(&admission.journal, &authority, proposal).unwrap();
         drop(locks);
         (state_temp, action_temp, state, commit)
     }
@@ -2862,19 +3266,15 @@ mod tests {
         let (_snapshot, authority_sha256) = authority.journal.append(&authority_state, 2).unwrap();
         let selected = selected.bind_authority_snapshot(&authority_sha256).unwrap();
         let supervisor = prepared_supervisor(&selected.context);
-        let initial =
-            run_zero_effect_preflight(PreflightFenceV1::Initial, &mut PassingChecks).unwrap();
-        let final_ =
-            run_zero_effect_preflight(PreflightFenceV1::Final, &mut PassingChecks).unwrap();
         let proposal = prepare_source_proposal_for_capability(
             &locks,
             selected,
             Some(supervisor),
-            initial,
-            final_,
             trusted_root,
             requested_cwd,
             COMMIT_AT_MS,
+            &mut PassingChecks,
+            &mut PassingChecks,
         )
         .unwrap();
         let published = commit_prevalidated_proposal_for_capability(&locks, proposal).unwrap();
@@ -3084,6 +3484,157 @@ mod tests {
     }
 
     #[test]
+    fn preflight_passes_cannot_be_replayed_across_admissions() {
+        let (_state_temp, scheduler) = state_root();
+        let (_action_temp, trusted_root, requested_cwd) = action_bindings();
+        let locks = scheduler
+            .try_owner_admission("test:preflight-replay")
+            .unwrap()
+            .try_authority_state("test:preflight-replay")
+            .unwrap();
+        let authority = FileAuthorityJournal::initialize(&locks, 1).unwrap();
+        let admission = FileAdmissionJournal::open(&locks).unwrap();
+
+        let source_a = manual_proposal_for_source(
+            &locks,
+            trusted_root.clone(),
+            requested_cwd.clone(),
+            digest('6'),
+        );
+        let mut source_b =
+            manual_proposal_for_source(&locks, trusted_root, requested_cwd, digest('7'));
+        source_b.initial_preflight = source_a.initial_preflight;
+        source_b.final_preflight = source_a.final_preflight;
+
+        assert!(
+            build_admission_commit(&admission.journal, &authority, source_b).is_err(),
+            "source A's valid preflight passes must not admit distinct source B"
+        );
+    }
+
+    #[test]
+    fn arbitrary_deadline_digest_cannot_admit() {
+        let (_state_temp, scheduler) = state_root();
+        let (_action_temp, trusted_root, requested_cwd) = action_bindings();
+        let locks = scheduler
+            .try_owner_admission("test:deadline-binding")
+            .unwrap()
+            .try_authority_state("test:deadline-binding")
+            .unwrap();
+        FileAuthorityJournal::initialize(&locks, 1).unwrap();
+        let proposal = manual_proposal(&locks, trusted_root, requested_cwd);
+        let deadline = hard_deadline(&proposal.context);
+        let record = prepared_supervisor_record(&proposal.context, digest('9'));
+
+        assert!(
+            PreparedSupervisorV1::bind(record, deadline).is_err(),
+            "an arbitrary syntactically valid deadline digest must not admit"
+        );
+    }
+
+    #[test]
+    fn deadline_admission_join_rejects_wrong_run_window_case_cap_and_authority_window() {
+        let (_state_temp, scheduler) = state_root();
+        let (_action_temp, trusted_root, requested_cwd) = action_bindings();
+        let locks = scheduler
+            .try_owner_admission("test:deadline-join")
+            .unwrap()
+            .try_authority_state("test:deadline-join")
+            .unwrap();
+        FileAuthorityJournal::initialize(&locks, 1).unwrap();
+        let proposal = manual_proposal(&locks, trusted_root, requested_cwd);
+        let context = &proposal.context;
+        let ledger = proposal.ledger.as_ref().unwrap();
+        let trigger = &context.identities.admission_attempt.input.trigger;
+        let assert_refused =
+            |label: &str, supervisor: &SupervisorRecordV1, deadline: &HardDeadline| {
+                assert!(
+                    validate_deadline_record_binding(
+                        context,
+                        ledger,
+                        supervisor,
+                        deadline.record(),
+                        TERMINAL_DEADLINE_MS,
+                        COMMIT_AT_MS,
+                    )
+                    .is_err(),
+                    "{label} must not admit"
+                );
+            };
+
+        let (wrong_run_supervisor, wrong_run_deadline) = deadline_and_supervisor_for(
+            context,
+            "another-run".into(),
+            trigger.window_id.clone(),
+            deadline_budgets(context),
+            40_000,
+        );
+        assert_refused(
+            "a deadline for another run",
+            &wrong_run_supervisor,
+            &wrong_run_deadline,
+        );
+
+        let (wrong_window_supervisor, wrong_window_deadline) = deadline_and_supervisor_for(
+            context,
+            trigger.attempt_id.clone(),
+            "another-window".into(),
+            deadline_budgets(context),
+            40_000,
+        );
+        assert_refused(
+            "a deadline for another schedule window",
+            &wrong_window_supervisor,
+            &wrong_window_deadline,
+        );
+
+        let mut wrong_case_budgets = deadline_budgets(context);
+        wrong_case_budgets.selected_cases[0].case_id = "another-case".into();
+        let (wrong_case_supervisor, wrong_case_deadline) = deadline_and_supervisor_for(
+            context,
+            trigger.attempt_id.clone(),
+            trigger.window_id.clone(),
+            wrong_case_budgets,
+            40_000,
+        );
+        assert_refused(
+            "a deadline for another selected case",
+            &wrong_case_supervisor,
+            &wrong_case_deadline,
+        );
+
+        let mut over_cap_budgets = deadline_budgets(context);
+        over_cap_budgets.selected_cases[0].timeout_ms = 30_001;
+        let (over_cap_supervisor, over_cap_deadline) = deadline_and_supervisor_for(
+            context,
+            trigger.attempt_id.clone(),
+            trigger.window_id.clone(),
+            over_cap_budgets,
+            40_000,
+        );
+        assert_refused(
+            "a selected-case deadline above the ledger cap",
+            &over_cap_supervisor,
+            &over_cap_deadline,
+        );
+
+        let mut overlong_budgets = deadline_budgets(context);
+        overlong_budgets.fixed_margin_ms = 60_000;
+        let (overlong_supervisor, overlong_deadline) = deadline_and_supervisor_for(
+            context,
+            trigger.attempt_id.clone(),
+            trigger.window_id.clone(),
+            overlong_budgets,
+            70_000,
+        );
+        assert_refused(
+            "a deadline outside the authority terminal window",
+            &overlong_supervisor,
+            &overlong_deadline,
+        );
+    }
+
+    #[test]
     fn claimed_support_one_shot_reselects_foundation_effects_and_revocation() {
         let (state, source, environment, request) = claimed_source_fixture();
         let mut wrong_effects = request.clone();
@@ -3213,18 +3764,17 @@ mod tests {
             .unwrap();
         let expected_effects = selected.effect_envelope.allowed_effects.clone();
         let supervisor = prepared_supervisor(&selected.context);
-        let proposal = session
-            .prepare_proposal(
+        let published = session
+            .admit(
                 selected,
                 Some(supervisor),
-                run_zero_effect_preflight(PreflightFenceV1::Initial, &mut PassingChecks).unwrap(),
-                run_zero_effect_preflight(PreflightFenceV1::Final, &mut PassingChecks).unwrap(),
                 trusted_root,
                 requested_cwd,
                 COMMIT_AT_MS,
+                &mut PassingChecks,
+                &mut PassingChecks,
             )
             .unwrap();
-        let published = session.commit(proposal).unwrap();
         let PublishedAdmissionV1::Admitted(capability) = published else {
             panic!("standing source must reserve");
         };
@@ -3259,18 +3809,18 @@ mod tests {
             )
             .unwrap();
         let supervisor = prepared_supervisor(&selected.context);
-        let proposal = session
-            .prepare_proposal(
+        let published = session
+            .admit(
                 selected,
                 Some(supervisor),
-                run_zero_effect_preflight(PreflightFenceV1::Initial, &mut PassingChecks).unwrap(),
-                run_zero_effect_preflight(PreflightFenceV1::Final, &mut PassingChecks).unwrap(),
                 trusted_root.clone(),
                 requested_cwd.clone(),
                 COMMIT_AT_MS,
+                &mut PassingChecks,
+                &mut PassingChecks,
             )
             .unwrap();
-        let PublishedAdmissionV1::Admitted(first) = session.commit(proposal).unwrap() else {
+        let PublishedAdmissionV1::Admitted(first) = published else {
             panic!("first standing request must reserve");
         };
         let supervisor_record_id = first.supervisor_record_id().to_owned();
@@ -3348,18 +3898,18 @@ mod tests {
         // The prepared supervisor is intentionally supplied. Preview must discard it once the
         // completed evidence proves that this request is a safe-session reuse.
         let supervisor = prepared_supervisor(&selected.context);
-        let proposal = session
-            .prepare_proposal(
+        let published = session
+            .admit(
                 selected,
                 Some(supervisor),
-                run_zero_effect_preflight(PreflightFenceV1::Initial, &mut PassingChecks).unwrap(),
-                run_zero_effect_preflight(PreflightFenceV1::Final, &mut PassingChecks).unwrap(),
                 trusted_root,
                 requested_cwd,
                 16,
+                &mut PassingChecks,
+                &mut PassingChecks,
             )
             .unwrap();
-        let PublishedAdmissionV1::Reused(consumption) = session.commit(proposal).unwrap() else {
+        let PublishedAdmissionV1::Reused(consumption) = published else {
             panic!("equivalent standing request must reuse");
         };
         assert_eq!(consumption.evidence_sha256, evidence.evidence_sha256);
@@ -3407,7 +3957,7 @@ mod tests {
                 caps: input.actual_caps.clone(),
                 allowed_effects: binding.allowed_effects.clone(),
                 issued_at_ms: 2,
-                expires_at_ms: 100,
+                expires_at_ms: AUTHORITY_EXPIRES_AT_MS,
             },
         )
         .unwrap();
@@ -3999,11 +4549,25 @@ mod tests {
             .unwrap();
         FileAuthorityJournal::initialize(&locks, 1).unwrap();
         let proposal = manual_proposal(&locks, trusted_root, requested_cwd);
+        let expected_deadline_sha256 = proposal
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .deadline()
+            .record()
+            .derivation
+            .sha256
+            .clone();
         let PublishedAdmissionV1::Admitted(capability) =
             commit_prevalidated_proposal_for_capability(&locks, proposal).unwrap()
         else {
             panic!("manual fixture must create a new admission");
         };
+        assert_eq!(
+            capability.hard_deadline().record().derivation.sha256,
+            expected_deadline_sha256
+        );
+        assert!(!capability.hard_deadline().remaining().is_zero());
         let mut runner = CountingRunner { handoffs: 0 };
         let commit_identity = handoff_admitted(*capability, &mut runner).unwrap();
         assert!(local_file::valid_sha256(&commit_identity));

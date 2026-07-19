@@ -90,9 +90,40 @@ pub(super) trait ZeroEffectPreflightChecks {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub(super) struct PreflightBindingV1 {
+    pub(super) schema_version: u16,
+    pub(super) admission_subject_sha256: String,
+    pub(super) authority_snapshot_sha256: String,
+    pub(super) trusted_root_binding_sha256: String,
+    pub(super) requested_cwd_binding_sha256: String,
+    pub(super) commit_at_ms: i64,
+}
+
+impl PreflightBindingV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        if self.schema_version != 1
+            || self.commit_at_ms <= 0
+            || [
+                &self.admission_subject_sha256,
+                &self.authority_snapshot_sha256,
+                &self.trusted_root_binding_sha256,
+                &self.requested_cwd_binding_sha256,
+            ]
+            .into_iter()
+            .any(|value| !local_file::valid_sha256(value))
+        {
+            return Err("schedule preflight: admission binding is malformed".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(super) struct PreflightPassV1 {
     pub(super) schema_version: u16,
     pub(super) fence: PreflightFenceV1,
+    pub(super) binding: PreflightBindingV1,
     pub(super) proofs: Vec<LocalPreflightProofV1>,
     pub(super) completed_at_ms: i64,
 }
@@ -113,6 +144,7 @@ pub(super) struct PreflightRefusalV1 {
 }
 
 pub(super) fn preflight_pass_sha256(value: &PreflightPassV1) -> Result<String, BoxError> {
+    value.binding.validate()?;
     if value.schema_version != 1
         || value.proofs.len() != ORDERED_CHECKS.len()
         || value
@@ -123,6 +155,7 @@ pub(super) fn preflight_pass_sha256(value: &PreflightPassV1) -> Result<String, B
                 proof.check != expected
                     || !local_file::valid_sha256(&proof.evidence_sha256)
                     || proof.observed_at_ms <= 0
+                    || proof.observed_at_ms > value.binding.commit_at_ms
             })
         || value.completed_at_ms
             != value
@@ -148,8 +181,23 @@ fn valid_code(value: &str) -> bool {
 
 pub(super) fn run_zero_effect_preflight<C: ZeroEffectPreflightChecks>(
     fence: PreflightFenceV1,
+    binding: PreflightBindingV1,
     checks: &mut C,
 ) -> Result<PreflightPassV1, PreflightRefusalV1> {
+    if binding.validate().is_err() {
+        return Err(PreflightRefusalV1 {
+            schema_version: 1,
+            fence,
+            failed_check: PreflightCheckV1::OwnerAndArchitecture,
+            code: "malformed_admission_binding".into(),
+            evidence_sha256: local_file::sha256_hex(b"malformed-preflight-admission-binding"),
+            observed_at_ms: binding.commit_at_ms.max(1),
+            provider_calls: 0,
+            model_calls: 0,
+            registry_effect_calls: 0,
+            runtime_effect_calls: 0,
+        });
+    }
     let mut proofs = Vec::with_capacity(ORDERED_CHECKS.len());
     for expected in ORDERED_CHECKS {
         match checks.revalidate(expected) {
@@ -213,6 +261,7 @@ pub(super) fn run_zero_effect_preflight<C: ZeroEffectPreflightChecks>(
     Ok(PreflightPassV1 {
         schema_version: 1,
         fence,
+        binding,
         proofs,
         completed_at_ms,
     })
@@ -1085,6 +1134,17 @@ mod tests {
         ch.to_string().repeat(64)
     }
 
+    fn preflight_binding() -> PreflightBindingV1 {
+        PreflightBindingV1 {
+            schema_version: 1,
+            admission_subject_sha256: digest('1'),
+            authority_snapshot_sha256: digest('2'),
+            trusted_root_binding_sha256: digest('3'),
+            requested_cwd_binding_sha256: digest('4'),
+            commit_at_ms: 11,
+        }
+    }
+
     #[derive(Default)]
     struct ForbiddenEffects {
         provider: u64,
@@ -1175,7 +1235,7 @@ mod tests {
     fn initial_and_final_fences_run_the_same_complete_zero_effect_checklist() {
         for fence in [PreflightFenceV1::Initial, PreflightFenceV1::Final] {
             let mut checks = FakeChecks::new(None);
-            let pass = run_zero_effect_preflight(fence, &mut checks).unwrap();
+            let pass = run_zero_effect_preflight(fence, preflight_binding(), &mut checks).unwrap();
             assert_eq!(checks.observed, ORDERED_CHECKS);
             assert_eq!(pass.proofs.len(), ORDERED_CHECKS.len());
             assert_eq!(pass.fence, fence);
@@ -1196,7 +1256,8 @@ mod tests {
         for fence in [PreflightFenceV1::Initial, PreflightFenceV1::Final] {
             for failed in ORDERED_CHECKS {
                 let mut checks = FakeChecks::new(Some(failed));
-                let refusal = run_zero_effect_preflight(fence, &mut checks).unwrap_err();
+                let refusal =
+                    run_zero_effect_preflight(fence, preflight_binding(), &mut checks).unwrap_err();
                 assert_eq!(refusal.failed_check, failed);
                 assert_eq!(refusal.fence, fence);
                 assert!(valid_code(&refusal.code));
@@ -1222,7 +1283,9 @@ mod tests {
     fn malformed_local_proof_fails_closed_without_skipping_to_an_effect() {
         let mut checks = FakeChecks::new(None);
         checks.malformed = Some(PreflightCheckV1::LedgerHeadroom);
-        let refusal = run_zero_effect_preflight(PreflightFenceV1::Final, &mut checks).unwrap_err();
+        let refusal =
+            run_zero_effect_preflight(PreflightFenceV1::Final, preflight_binding(), &mut checks)
+                .unwrap_err();
         assert_eq!(refusal.failed_check, PreflightCheckV1::LedgerHeadroom);
         assert_eq!(refusal.code, "malformed_local_proof");
         assert_eq!(

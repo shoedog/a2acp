@@ -11,8 +11,7 @@ use std::fs::File;
 use std::io::{Seek as _, Write as _};
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::local_file::{self, PinnedDirectory};
 
@@ -69,8 +68,13 @@ struct StateRootInner {
     ledger: PinnedDirectory,
     supervisor: PinnedDirectory,
     locks: PinnedDirectory,
-    admission_holders: AtomicUsize,
-    authority_only_holders: AtomicUsize,
+    process_lock_state: Mutex<ProcessLockState>,
+}
+
+#[derive(Default)]
+struct ProcessLockState {
+    admission_holders: usize,
+    authority_only_holders: usize,
 }
 
 #[derive(Clone)]
@@ -499,8 +503,7 @@ impl SchedulerStateRoot {
                 ledger,
                 supervisor,
                 locks,
-                admission_holders: AtomicUsize::new(0),
-                authority_only_holders: AtomicUsize::new(0),
+                process_lock_state: Mutex::new(ProcessLockState::default()),
             }),
         })
     }
@@ -528,7 +531,19 @@ impl SchedulerStateRoot {
         &self,
         holder: &str,
     ) -> Result<OwnerAdmissionLock, SchedulerStateError> {
-        if self.inner.authority_only_holders.load(Ordering::SeqCst) != 0 {
+        self.try_owner_admission_inner(holder, || {})
+    }
+
+    fn try_owner_admission_inner<F>(
+        &self,
+        holder: &str,
+        before_counter_publication: F,
+    ) -> Result<OwnerAdmissionLock, SchedulerStateError>
+    where
+        F: FnOnce(),
+    {
+        let mut process_state = try_process_lock_state(&self.inner)?;
+        if process_state.authority_only_holders != 0 {
             return Err(SchedulerStateError::LockOrder);
         }
         let file = try_lock(
@@ -537,22 +552,39 @@ impl SchedulerStateRoot {
             "owner-wide compatibility admission lock",
             holder,
         )?;
-        if self.inner.authority_only_holders.load(Ordering::SeqCst) != 0 {
-            drop(file);
-            return Err(SchedulerStateError::LockOrder);
-        }
-        self.inner.admission_holders.fetch_add(1, Ordering::SeqCst);
+        before_counter_publication();
+        process_state.admission_holders = process_state
+            .admission_holders
+            .checked_add(1)
+            .ok_or_else(|| {
+                SchedulerStateError::Invalid(
+                    "scheduler owner-admission holder count overflowed".into(),
+                )
+            })?;
         Ok(OwnerAdmissionLock {
             inner: Arc::clone(&self.inner),
             file,
         })
     }
 
+    #[cfg(test)]
+    fn try_owner_admission_with_hook<F>(
+        &self,
+        holder: &str,
+        before_counter_publication: F,
+    ) -> Result<OwnerAdmissionLock, SchedulerStateError>
+    where
+        F: FnOnce(),
+    {
+        self.try_owner_admission_inner(holder, before_counter_publication)
+    }
+
     pub(super) fn try_authority_mutation(
         &self,
         holder: &str,
     ) -> Result<AuthorityMutationLock, SchedulerStateError> {
-        if self.inner.admission_holders.load(Ordering::SeqCst) != 0 {
+        let mut process_state = try_process_lock_state(&self.inner)?;
+        if process_state.admission_holders != 0 {
             return Err(SchedulerStateError::LockOrder);
         }
         let file = try_lock(
@@ -561,13 +593,14 @@ impl SchedulerStateRoot {
             "authority-state lock",
             holder,
         )?;
-        if self.inner.admission_holders.load(Ordering::SeqCst) != 0 {
-            drop(file);
-            return Err(SchedulerStateError::LockOrder);
-        }
-        self.inner
+        process_state.authority_only_holders = process_state
             .authority_only_holders
-            .fetch_add(1, Ordering::SeqCst);
+            .checked_add(1)
+            .ok_or_else(|| {
+                SchedulerStateError::Invalid(
+                    "scheduler authority-only holder count overflowed".into(),
+                )
+            })?;
         Ok(AuthorityMutationLock {
             inner: Arc::clone(&self.inner),
             file,
@@ -585,6 +618,27 @@ impl SchedulerStateRoot {
             self.inner.locks.canonical_path(),
         ]
     }
+}
+
+fn try_process_lock_state(
+    inner: &StateRootInner,
+) -> Result<MutexGuard<'_, ProcessLockState>, SchedulerStateError> {
+    match inner.process_lock_state.try_lock() {
+        Ok(state) => Ok(state),
+        Err(TryLockError::WouldBlock) => Err(SchedulerStateError::LockBusy(
+            "process-local scheduler lock transition",
+        )),
+        Err(TryLockError::Poisoned(_)) => Err(SchedulerStateError::Invalid(
+            "process-local scheduler lock transition was poisoned".into(),
+        )),
+    }
+}
+
+fn process_lock_state_after_drop(inner: &StateRootInner) -> MutexGuard<'_, ProcessLockState> {
+    inner
+        .process_lock_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl OwnerAdmissionLock {
@@ -625,7 +679,9 @@ impl Drop for OwnerAdmissionLock {
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
-        self.inner.admission_holders.fetch_sub(1, Ordering::SeqCst);
+        let mut state = process_lock_state_after_drop(&self.inner);
+        debug_assert!(state.admission_holders > 0);
+        state.admission_holders = state.admission_holders.saturating_sub(1);
     }
 }
 
@@ -665,9 +721,9 @@ impl Drop for AuthorityMutationLock {
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
-        self.inner
-            .authority_only_holders
-            .fetch_sub(1, Ordering::SeqCst);
+        let mut state = process_lock_state_after_drop(&self.inner);
+        debug_assert!(state.authority_only_holders > 0);
+        state.authority_only_holders = state.authority_only_holders.saturating_sub(1);
     }
 }
 
@@ -906,6 +962,42 @@ mod tests {
             state.try_owner_admission("run-1:daily"),
             Err(SchedulerStateError::LockOrder)
         ));
+    }
+
+    #[test]
+    fn concurrent_owner_and_authority_publication_cannot_return_both_capabilities() {
+        let root = root();
+        let state = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let owner_state = state.clone();
+        let (hook_ready_tx, hook_ready_rx) = std::sync::mpsc::channel();
+        let (release_hook_tx, release_hook_rx) = std::sync::mpsc::channel();
+        let (owner_result_tx, owner_result_rx) = std::sync::mpsc::channel();
+        let (release_owner_tx, release_owner_rx) = std::sync::mpsc::channel();
+
+        let owner_thread = std::thread::spawn(move || {
+            let owner = owner_state.try_owner_admission_with_hook("run-race:owner", || {
+                hook_ready_tx.send(()).unwrap();
+                release_hook_rx.recv().unwrap();
+            });
+            owner_result_tx.send(owner.is_ok()).unwrap();
+            if let Ok(_owner) = owner {
+                release_owner_rx.recv().unwrap();
+            }
+        });
+
+        hook_ready_rx.recv().unwrap();
+        let authority = state.try_authority_mutation("run-race:authority");
+        release_hook_tx.send(()).unwrap();
+        let owner_acquired = owner_result_rx.recv().unwrap();
+        let both_acquired = owner_acquired && authority.is_ok();
+        release_owner_tx.send(()).unwrap();
+        drop(authority);
+        owner_thread.join().unwrap();
+
+        assert!(
+            !both_acquired,
+            "owner-wide and authority-only capabilities must never be returned concurrently"
+        );
     }
 
     #[test]

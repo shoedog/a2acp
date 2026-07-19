@@ -36,6 +36,44 @@ pub(super) struct HardDeadline {
     record: DeadlineDerivationV1,
 }
 
+#[derive(Debug)]
+pub(super) struct PreparedSupervisorV1 {
+    record: SupervisorRecordV1,
+    deadline: HardDeadline,
+}
+
+impl PreparedSupervisorV1 {
+    pub(super) fn bind(
+        record: SupervisorRecordV1,
+        deadline: HardDeadline,
+    ) -> Result<Self, BoxError> {
+        validate_supervisor_record(&record)?;
+        validate_deadline_derivation(deadline.record())?;
+        if record.phase != SupervisorPhaseV1::Prepared
+            || record.run_id != deadline.record().input.run_id
+            || record.window_id != deadline.record().input.window_id
+            || record.deadline_derivation_sha256 != deadline.record().derivation.sha256
+        {
+            return Err(
+                "schedule supervisor: prepared record and executable deadline diverged".into(),
+            );
+        }
+        Ok(Self { record, deadline })
+    }
+
+    pub(super) fn record(&self) -> &SupervisorRecordV1 {
+        &self.record
+    }
+
+    pub(super) fn deadline(&self) -> &HardDeadline {
+        &self.deadline
+    }
+
+    pub(super) fn into_parts(self) -> (SupervisorRecordV1, HardDeadline) {
+        (self.record, self.deadline)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DeadlinePhase {
     MetadataFetch,
