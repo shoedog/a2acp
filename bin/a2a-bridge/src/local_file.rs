@@ -740,6 +740,17 @@ impl PinnedDirectory {
     /// Reopen one existing child directory relative to the retained parent object. Each path
     /// component is therefore traversed without following a replacement symlink.
     pub(crate) fn open_child_directory(&self, name: &OsStr, label: &str) -> Result<Self, BoxError> {
+        self.open_child_directory_optional(name, label)?
+            .ok_or_else(|| format!("{label}: descriptor-relative directory is absent").into())
+    }
+
+    /// As [`Self::open_child_directory`], but preserve a genuinely absent child as `None` so a
+    /// read-only presence probe can distinguish absence from a symlink or other unsafe object.
+    pub(crate) fn open_child_directory_optional(
+        &self,
+        name: &OsStr,
+        label: &str,
+    ) -> Result<Option<Self>, BoxError> {
         #[cfg(unix)]
         {
             use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -755,9 +766,13 @@ impl PinnedDirectory {
                 )
             };
             if fd == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(None);
+                }
                 return Err(format!(
                     "{label}: cannot open descriptor-relative directory: {}",
-                    std::io::Error::last_os_error()
+                    error
                 )
                 .into());
             }
@@ -775,13 +790,13 @@ impl PinnedDirectory {
             let canonical_child = Path::new(self.canonical_cwd.as_str()).join(name);
             let canonical_cwd = SessionCwd::parse(&canonical_child.to_string_lossy())
                 .map_err(|_| format!("{label}: child directory is not a valid session cwd"))?;
-            Ok(Self {
+            Ok(Some(Self {
                 file: Arc::new(file),
                 canonical_cwd,
                 identity,
                 acp_session_cwd,
                 retain_descriptor_after_exec,
-            })
+            }))
         }
         #[cfg(not(unix))]
         {
@@ -867,6 +882,74 @@ impl PinnedDirectory {
                 acp_session_cwd,
                 retain_descriptor_after_exec,
             })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (name, mode);
+            Err(format!("{label}: descriptor-relative directory creation is unsupported").into())
+        }
+    }
+
+    /// Open an existing child directory or create it owner-private beneath this retained parent.
+    /// Existing entries are never chmod-repaired: callers can inspect and reject a broadened mode.
+    pub(crate) fn open_or_create_child_directory(
+        &self,
+        name: &OsStr,
+        mode: u32,
+        label: &str,
+    ) -> Result<Self, BoxError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+
+            let c_name = child_name_cstring(name, label)?;
+            // SAFETY: the retained parent descriptor and single-component name are live.
+            let created = if unsafe {
+                libc::mkdirat(self.file.as_raw_fd(), c_name.as_ptr(), mode as libc::mode_t)
+            } == 0
+            {
+                true
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(format!(
+                        "{label}: cannot create descriptor-relative directory: {error}"
+                    )
+                    .into());
+                }
+                false
+            };
+
+            let child = match self.open_child_directory(name, label) {
+                Ok(child) => child,
+                Err(error) => {
+                    if created {
+                        // SAFETY: best-effort cleanup uses the same retained parent/name pair.
+                        unsafe {
+                            libc::unlinkat(
+                                self.file.as_raw_fd(),
+                                c_name.as_ptr(),
+                                libc::AT_REMOVEDIR,
+                            );
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+            if created {
+                let handle = child.file_handle();
+                set_effective_owner(&handle, label)?;
+                // SAFETY: the retained child descriptor is live and `mode` is a permission mask.
+                if unsafe { libc::fchmod(handle.as_raw_fd(), mode as libc::mode_t) } == -1 {
+                    return Err(format!(
+                        "{label}: cannot set owner-only directory permissions: {}",
+                        std::io::Error::last_os_error()
+                    )
+                    .into());
+                }
+                self.sync()?;
+            }
+            Ok(child)
         }
         #[cfg(not(unix))]
         {

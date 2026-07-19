@@ -256,6 +256,77 @@ pub(super) fn process_identity(pid: libc::pid_t) -> std::io::Result<Option<Proce
     }
 }
 
+#[cfg(target_os = "macos")]
+fn macos_process_group_count(
+    returned: libc::c_int,
+    captured_errno: libc::c_int,
+) -> std::io::Result<usize> {
+    if returned == 0 && captured_errno == 0 {
+        return Ok(0);
+    }
+    if returned <= 0 {
+        return Err(std::io::Error::from_raw_os_error(if captured_errno == 0 {
+            libc::EIO
+        } else {
+            captured_errno
+        }));
+    }
+    usize::try_from(returned).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macOS process inventory count does not fit usize",
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_list_process_group_pids(process_group: libc::pid_t) -> std::io::Result<Vec<libc::pid_t>> {
+    fn call(
+        process_group: libc::pid_t,
+        buffer: *mut libc::c_void,
+        bytes: libc::c_int,
+    ) -> (libc::c_int, libc::c_int) {
+        // SAFETY: `__error` returns this thread's errno slot. Clear it because an empty group and
+        // a failed query can both return zero; only the errno-free zero is an absence proof.
+        unsafe {
+            let errno = libc::__error();
+            *errno = 0;
+            let returned = libc::proc_listpgrppids(process_group, buffer, bytes);
+            (returned, *errno)
+        }
+    }
+
+    let (returned, errno) = call(process_group, std::ptr::null_mut(), 0);
+    let count = macos_process_group_count(returned, errno)?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if count > 1_000_000 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macOS process inventory count is unbounded",
+        ));
+    }
+    let mut values = vec![0 as libc::pid_t; count];
+    let bytes =
+        libc::c_int::try_from(values.len() * std::mem::size_of::<libc::pid_t>()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "macOS process inventory byte size overflows",
+            )
+        })?;
+    let (returned, errno) = call(process_group, values.as_mut_ptr().cast(), bytes);
+    let returned = macos_process_group_count(returned, errno)?;
+    if returned > values.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "macOS process inventory changed beyond its captured bound",
+        ));
+    }
+    values.truncate(returned);
+    Ok(values)
+}
+
 pub(super) fn process_group_members(
     process_group: libc::pid_t,
 ) -> std::io::Result<Vec<ProcessIdentityV1>> {
@@ -282,42 +353,7 @@ pub(super) fn process_group_members(
         values
     };
     #[cfg(target_os = "macos")]
-    let pids = {
-        // SAFETY: a null/zero query returns the current count. The second call receives a writable
-        // pid_t buffer with its exact byte size; the kernel cannot write beyond that bound.
-        let count = unsafe { libc::proc_listpgrppids(process_group, std::ptr::null_mut(), 0) };
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        if !(0..=1_000_000).contains(&count) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "macOS process inventory count is unavailable or unbounded",
-            ));
-        }
-        let mut values = vec![0 as libc::pid_t; count as usize];
-        let bytes =
-            i32::try_from(values.len() * std::mem::size_of::<libc::pid_t>()).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "macOS process inventory byte size overflows",
-                )
-            })?;
-        // SAFETY: `values` is initialized writable storage of exactly `bytes` bytes.
-        let returned =
-            unsafe { libc::proc_listpgrppids(process_group, values.as_mut_ptr().cast(), bytes) };
-        if returned == 0 {
-            return Ok(Vec::new());
-        }
-        if returned < 0 || returned as usize > values.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "macOS process inventory changed beyond its captured bound",
-            ));
-        }
-        values.truncate(returned as usize);
-        values
-    };
+    let pids = macos_list_process_group_pids(process_group)?;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let pids: Vec<libc::pid_t> = {
         return Err(std::io::Error::new(
@@ -339,7 +375,7 @@ pub(super) fn process_group_members(
     Ok(members)
 }
 
-fn capture_spawned_identity(pid: libc::pid_t) -> std::io::Result<ProcessIdentityV1> {
+pub(super) fn capture_spawned_identity(pid: libc::pid_t) -> std::io::Result<ProcessIdentityV1> {
     let mut last_error = None;
     for _ in 0..32 {
         match process_identity(pid) {
@@ -683,5 +719,18 @@ mod tests {
         assert!(identity.parent_pid > 0);
         assert!(identity.process_group > 0);
         assert!(identity.session_id > 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_zero_process_group_result_requires_errno_free_absence() {
+        assert_eq!(macos_process_group_count(0, 0).unwrap(), 0);
+        assert_eq!(
+            macos_process_group_count(0, libc::EIO)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert!(macos_process_group_count(-1, libc::ESRCH).is_err());
     }
 }

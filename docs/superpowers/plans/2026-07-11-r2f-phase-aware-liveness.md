@@ -22,17 +22,20 @@ separate those alternatives before changing timeout behavior.
 
 ## Shared-operator evidence and limits
 
-The long-lived production operator returned immediate Codex `AgentCrashed` twice before observable prompt
+The long-lived production operator has repeatedly returned immediate Codex `AgentCrashed` before observable prompt
 start while its bridge, ACP adapter, and Codex app-server processes remained alive. Fresh isolated one-shot
 operators completed the same package/model/effort/mode and review shape. The old app server had observed 15
 distinct session thread ids and no close notifications; bridge release removed its local session entry
-without sending a capability-gated ACP close, while codex-acp retained sessions until close.
+without sending a capability-gated ACP close, while codex-acp retained sessions until close. On 2026-07-19 the same
+boundary recurred against R3d2 exact `3e4508a`: no task/session/turn row or prompt/usage evidence was created, the
+roughly two-day-old warm process tree remained alive, and the same release binary completed the review through one
+fresh one-shot bridge without touching the production generation.
 
 This rules out a general package/model/auth/cwd incompatibility for those incidents, but does not distinguish
 a capacity ceiling/session leak from a poisoned long-lived transport. Fifteen is evidence, not a threshold.
 No running turn, warm session, backend, image, or production operator was stopped or restarted, and no
 failed request was replayed. R2f owns this investigation and every lifecycle remedy. R3d only records that
-its fresh one-shot canary did not evaluate the shared operator.
+its fresh one-shot executions did not evaluate shared-operator health.
 
 ## R2f0 — Reproduction and meaningful-progress vocabulary
 

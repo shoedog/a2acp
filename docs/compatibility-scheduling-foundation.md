@@ -114,10 +114,31 @@ without a numeric-group signal and makes the already-journaled attempt an ambigu
 registration revalidates every exact runner, workload, and anchor identity before trusting numeric parent links.
 Prepared recovery resumes only when its
 retained group is still exact and contains no possible workload; any observed member or ambiguity becomes a durable
-hold. Before success, the supervisor descriptor-pins and hashes the actual child join and optional aggregate bytes,
+hold. Cancellation while still `Prepared` journals a no-later-signal `Reaping` generation, rechecks for possible
+work immediately before releasing any retained anchor, proves group and exact-label container absence, and ends as
+`cancelled_before_running` without a runner or child artifact. Recovery completes that same cleanup without a group
+signal; a possible workload, observation error, or cleanup ambiguity becomes a durable hold while the retained
+capability is still available. Once a runner exists, direct-runner exit is observed from the retained waitable child
+and not inferred from a mutable process-table snapshot; a surviving, reparented descendant therefore cannot make the
+direct runner look live. Before success, the supervisor descriptor-pins and hashes the actual child join and optional aggregate bytes,
 checks their run/window/hash bindings, parses and validates the unchanged aggregate, and releases anchors only after
-that private verified-artifact capability exists. These schemas and journal checks do not themselves authorize or
-execute work.
+that private verified-artifact capability exists. Completed admission reconciliation accepts only an opaque terminal
+proof created from that joined immutable one-case aggregate; requested/effective identity, candidate/manifest
+identity, prompt acceptance, terminal time, elapsed time, and usage come from those bytes. Missing token or cost observations charge
+the reservation cap, while inconsistent counters/totals, identity drift, or cap overflow refuse. These schemas and
+journal checks do not themselves authorize or execute work.
+
+R3d2 scheduler control state uses the fixed operator-local APFS root below
+`~/Library/Application Support/a2a-bridge/operator/compatibility-scheduler/`. The existing root and its `authority`,
+`admission`, `ledger`, `supervisor`, and `locks` children must be owner-owned mode-`0700` directories retained by
+descriptor. Starting from the passwd-derived operator-home descriptor, every fixed suffix component is opened
+descriptor-relatively with no-follow; an intermediate or final symlink, existing broadened entry, or special file is
+rejected rather than repaired. Lock files are
+single-link owner-owned mode-`0600` regular files opened relative to the retained `locks` directory. The nonblocking
+owner-wide admission guard consumes itself into one combined capability when it takes the authority-state lock, so
+the nested authority lock always releases before the still-live owner lock. Operator-only issuance or revocation
+takes a separate authority-only capability. Reversed same-root acquisition refuses, contention never queues a billable caller, and kernel
+lock release after exit or crash grants no authority without durable-state reconciliation.
 
 All records are versioned, deny unknown fields, raw-scan every decoded object key and string for secret-shaped
 material, and use bounded local file reads. Git object identities are non-null tagged SHA-1/SHA-256 object IDs rather than
@@ -168,11 +189,21 @@ required check.
 ## Later slices
 
 - R3d1 implements provider-free one-shot supervision and signal parity with fake-process proof.
-- R3d2 implements private authority, admission, preflights, equivalent-work, and durable accounting. Before it wires
-  the R3d1 mechanism to a production control implementation, it also makes Darwin zero/error group enumeration
-  errno-aware for absence proof, owns cancellation before `Running`, supplies an exact-runner-exit primitive,
-  preserves whichever SIGINT/SIGTERM registration succeeds if the other fails, and either excludes `.` from
-  externally derived supervisor record ids or gives every record a private journal directory.
+- R3d2 implements private authority, admission, preflights, equivalent-work, and durable accounting. Its first
+  internal checkpoint makes Darwin zero/error group enumeration errno-aware for absence proof, owns cancellation
+  before `Running`, supplies an exact-runner-exit primitive, preserves whichever SIGINT/SIGTERM registration succeeds
+  if the other fails, excludes `.` from externally derived supervisor record ids, and adds the local state/lock
+  primitives. None of those primitives activates a provider-capable route.
+- R3d2 also implements the shared create-new admission transaction, authority/source/accounting revalidation,
+  opaque one-shot supervisor handoff capability, and crash-idempotent terminal reconciliation. These mechanisms are
+  still unreachable from live routes. `schedule-tick` accepts no source input and returns
+  `r3d5_activation_not_enabled; no_effects`. The acknowledged legacy manual path remains available only while the
+  fixed production scheduler root is absent. That root is resolved from the effective account's passwd home, not
+  `$HOME`; once present it is the fail-closed private-control takeover marker and legacy manual execution cannot
+  bypass the shared transaction. Standalone R3c `compatibility resolve` remains a separate provider-free
+  registry/image action under its own explicit acknowledgement; it cannot authorize a prompt or admitted capability.
+  Scheduler-owned resolution in R3d5 must use the shared admission/effect envelope. R3d5 alone may create that
+  production root and activate trusted triggers.
 - R3d3 implements evidence storage, retention, status, and crash-consistent publication state.
 - R3d4 implements disabled-by-default launchd and trusted test-merge/main triggers.
 - R3d5 separately characterizes every inventory row under single-use owner authority before any staged

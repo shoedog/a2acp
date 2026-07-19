@@ -1,15 +1,19 @@
 //! R3d1 deadline and supervision state machine.
 //!
-//! The mechanism is deliberately default-off until R3d2 supplies authority, admission, and accounting.
-//! R3d1 tests it only with local fake controls; every signal-producing transition is journaled first.
+//! The mechanism is deliberately default-off until R3d5 issues authority and activates trusted triggers.
+//! R3d1/R3d2 test it only with local fake controls; every signal-producing transition is journaled first.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::compatibility::{
+    validate_child_aggregate_bytes, validate_child_aggregate_terminal_bytes,
+    ValidatedChildAggregateTerminalV1,
+};
 use crate::compatibility_process_group::{
     process_group_members, AnchorDropPolicy, AnchoredGroupSignal, AnchoredProcessGroup,
     ProcessIdentityV1,
@@ -23,6 +27,7 @@ use crate::compatibility_schedule_schema::{
     OptionalSupervisorKillCauseV1, OptionalSupervisorOutcomeV1, SafetyHoldReasonV1,
     SupervisorKillCauseV1, SupervisorPhaseV1, SupervisorRecordV1, SupervisorTerminalOutcomeV1,
 };
+use crate::local_file::PinnedDirectory;
 use crate::BoxError;
 
 #[derive(Debug)]
@@ -30,6 +35,44 @@ pub(super) struct HardDeadline {
     process_entry: Instant,
     absolute: Instant,
     record: DeadlineDerivationV1,
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedSupervisorV1 {
+    record: SupervisorRecordV1,
+    deadline: HardDeadline,
+}
+
+impl PreparedSupervisorV1 {
+    pub(super) fn bind(
+        record: SupervisorRecordV1,
+        deadline: HardDeadline,
+    ) -> Result<Self, BoxError> {
+        validate_supervisor_record(&record)?;
+        validate_deadline_derivation(deadline.record())?;
+        if record.phase != SupervisorPhaseV1::Prepared
+            || record.run_id != deadline.record().input.run_id
+            || record.window_id != deadline.record().input.window_id
+            || record.deadline_derivation_sha256 != deadline.record().derivation.sha256
+        {
+            return Err(
+                "schedule supervisor: prepared record and executable deadline diverged".into(),
+            );
+        }
+        Ok(Self { record, deadline })
+    }
+
+    pub(super) fn record(&self) -> &SupervisorRecordV1 {
+        &self.record
+    }
+
+    pub(super) fn deadline(&self) -> &HardDeadline {
+        &self.deadline
+    }
+
+    pub(super) fn into_parts(self) -> (SupervisorRecordV1, HardDeadline) {
+        (self.record, self.deadline)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +90,23 @@ pub(super) enum DeadlinePhase {
 #[derive(Debug)]
 pub(super) struct VerifiedChildArtifact {
     reference: ChildArtifactRefV1,
+    terminal: Option<ValidatedChildAggregateTerminalV1>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct VerifiedChildTerminalProofV1 {
+    reference: ChildArtifactRefV1,
+    terminal: ValidatedChildAggregateTerminalV1,
+}
+
+impl VerifiedChildTerminalProofV1 {
+    pub(super) fn child_reference(&self) -> &ChildArtifactRefV1 {
+        &self.reference
+    }
+
+    pub(super) fn aggregate(&self) -> &ValidatedChildAggregateTerminalV1 {
+        &self.terminal
+    }
 }
 
 impl VerifiedChildArtifact {
@@ -64,8 +124,8 @@ impl VerifiedChildArtifact {
                 format!("schedule supervisor: invalid child artifact join: {error}")
             })?;
         validate_child_artifact_join(&join)?;
-        match (&join.aggregate_sha256, aggregate_path) {
-            (OptionalSha256V1::Absent, None) => {}
+        let terminal = match (&join.aggregate_sha256, aggregate_path) {
+            (OptionalSha256V1::Absent, None) => None,
             (OptionalSha256V1::Sha256 { value }, Some(path)) => {
                 let aggregate = crate::local_file::read_regular_file_bounded(
                     path,
@@ -78,7 +138,8 @@ impl VerifiedChildArtifact {
                             .into(),
                     );
                 }
-                crate::compatibility::validate_child_aggregate_bytes(&aggregate.bytes)?;
+                validate_child_aggregate_bytes(&aggregate.bytes)?;
+                validate_child_aggregate_terminal_bytes(&aggregate.bytes)?
             }
             (OptionalSha256V1::Absent, Some(_)) => {
                 return Err(
@@ -88,7 +149,7 @@ impl VerifiedChildArtifact {
             (OptionalSha256V1::Sha256 { .. }, None) => {
                 return Err("schedule supervisor: joined child aggregate is missing".into())
             }
-        }
+        };
         Ok(Self {
             reference: ChildArtifactRefV1 {
                 record_id: join.record_id,
@@ -97,6 +158,18 @@ impl VerifiedChildArtifact {
                 artifact_sha256: join_snapshot.sha256,
                 aggregate_sha256: join.aggregate_sha256,
             },
+            terminal,
+        })
+    }
+
+    pub(super) fn terminal_proof(&self) -> Result<VerifiedChildTerminalProofV1, BoxError> {
+        let terminal = self
+            .terminal
+            .clone()
+            .ok_or("schedule supervisor: child artifact has no exact successful terminal proof")?;
+        Ok(VerifiedChildTerminalProofV1 {
+            reference: self.reference.clone(),
+            terminal,
         })
     }
 
@@ -124,11 +197,11 @@ pub(super) fn schedule_tick_parent(
     let _entry_elapsed_ms = duration_ms_ceil(process_entry.elapsed())?;
     if !args.is_empty() {
         return Err(
-            "compatibility schedule-tick: r3d2_authority_admission_not_implemented; no_effects; arguments are disabled"
+            "compatibility schedule-tick: r3d5_activation_not_enabled; no_effects; arguments are disabled"
                 .into(),
         );
     }
-    Err("compatibility schedule-tick: r3d2_authority_admission_not_implemented; no_effects".into())
+    Err("compatibility schedule-tick: r3d5_activation_not_enabled; no_effects".into())
 }
 
 fn sum_deadline_budgets(budgets: &DeadlinePhaseBudgetsV1) -> Result<u64, BoxError> {
@@ -216,6 +289,11 @@ impl HardDeadline {
 
     pub(super) fn remaining(&self) -> Duration {
         self.absolute.saturating_duration_since(Instant::now())
+    }
+
+    #[cfg(test)]
+    pub(super) fn expire_for_test(&mut self) {
+        self.absolute = Instant::now();
     }
 
     fn phase_budget_and_reserved_after(
@@ -324,6 +402,47 @@ impl HardDeadline {
 #[cfg(unix)]
 pub(super) struct SupervisorAnchorSet {
     groups: BTreeMap<i32, AnchoredProcessGroup>,
+}
+
+/// Retains the exact direct runner child capability used to prove exit. Process-table absence is
+/// useful corroboration for descendants, but it cannot replace this waitable child identity.
+#[cfg(unix)]
+pub(super) struct RetainedRunnerExit {
+    identity: ProcessIdentityV1,
+    child: tokio::process::Child,
+    terminal_status: Option<std::process::ExitStatus>,
+}
+
+#[cfg(unix)]
+impl RetainedRunnerExit {
+    pub(super) fn bind(child: tokio::process::Child) -> Result<Self, BoxError> {
+        let pid = child
+            .id()
+            .ok_or("schedule supervisor: runner child has no retained pid")?;
+        let pid = i32::try_from(pid)
+            .map_err(|_| "schedule supervisor: runner child pid does not fit pid_t")?;
+        let identity = crate::compatibility_process_group::capture_spawned_identity(pid)?;
+        Ok(Self {
+            identity,
+            child,
+            terminal_status: None,
+        })
+    }
+
+    pub(super) fn identity(&self) -> &ProcessIdentityV1 {
+        &self.identity
+    }
+
+    pub(super) fn exact_exited(&mut self, expected: &ProcessIdentityV1) -> Result<bool, BoxError> {
+        if expected != &self.identity {
+            return Err("schedule supervisor: runner exit identity mismatch".into());
+        }
+        if self.terminal_status.is_some() {
+            return Ok(true);
+        }
+        self.terminal_status = self.child.try_wait()?;
+        Ok(self.terminal_status.is_some())
+    }
 }
 
 #[cfg(unix)]
@@ -558,6 +677,7 @@ fn validate_supervisor_transition(
     let phase_allowed = matches!(
         (previous.phase, next.phase),
         (SupervisorPhaseV1::Prepared, SupervisorPhaseV1::Running)
+            | (SupervisorPhaseV1::Prepared, SupervisorPhaseV1::Reaping)
             | (SupervisorPhaseV1::Prepared, SupervisorPhaseV1::SafetyHold)
             | (SupervisorPhaseV1::Running, SupervisorPhaseV1::Running)
             | (SupervisorPhaseV1::Running, SupervisorPhaseV1::TermGrace)
@@ -649,11 +769,12 @@ fn validate_supervisor_transition(
 
 #[cfg(unix)]
 pub(super) struct FileSupervisorJournal {
-    directory: PathBuf,
-    directory_handle: std::fs::File,
+    directory: PinnedDirectory,
     record_id: String,
     next_generation: u64,
     previous_sha256: Option<String>,
+    #[cfg(test)]
+    before_create_hook: Option<Box<dyn FnOnce()>>,
 }
 
 #[cfg(unix)]
@@ -669,7 +790,7 @@ impl FileSupervisorJournal {
             || !bytes.all(|byte| {
                 byte.is_ascii_lowercase()
                     || byte.is_ascii_digit()
-                    || matches!(byte, b'-' | b'_' | b'.' | b':')
+                    || matches!(byte, b'-' | b'_' | b':')
             })
         {
             return Err("schedule supervisor: journal record id is not a stable id".into());
@@ -677,26 +798,10 @@ impl FileSupervisorJournal {
         Ok(())
     }
 
-    fn open_directory(directory: &Path) -> Result<(PathBuf, std::fs::File), BoxError> {
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    fn validate_directory(directory: &PinnedDirectory) -> Result<(), BoxError> {
+        use std::os::unix::fs::MetadataExt as _;
 
-        let canonical = std::fs::canonicalize(directory).map_err(|error| {
-            format!(
-                "schedule supervisor: cannot resolve journal directory {}: {error}",
-                directory.display()
-            )
-        })?;
-        let handle = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(&canonical)
-            .map_err(|error| {
-                format!(
-                    "schedule supervisor: cannot open journal directory {}: {error}",
-                    canonical.display()
-                )
-            })?;
-        let metadata = handle.metadata()?;
+        let metadata = directory.file_handle().metadata()?;
         if !metadata.is_dir()
             || metadata.uid() != unsafe { libc::geteuid() }
             || metadata.mode() & 0o077 != 0
@@ -706,22 +811,54 @@ impl FileSupervisorJournal {
                     .into(),
             );
         }
-        Ok((canonical, handle))
+        if !directory.current_path_matches() {
+            return Err("schedule supervisor: journal directory identity changed".into());
+        }
+        Ok(())
+    }
+
+    fn rollback_generation_after_directory_change(
+        &self,
+        name: &std::ffi::OsStr,
+        identity_error: BoxError,
+    ) -> BoxError {
+        let remove = self.directory.remove_child(
+            name,
+            false,
+            "schedule supervisor journal identity-change rollback",
+        );
+        let sync = self.directory.sync();
+        match (remove, sync) {
+            (Ok(()), Ok(())) => identity_error,
+            (Err(remove_error), Ok(())) => format!(
+                "{identity_error}; schedule supervisor rollback removal failed: {remove_error}"
+            )
+            .into(),
+            (Ok(()), Err(sync_error)) => format!(
+                "{identity_error}; schedule supervisor rollback directory sync failed: {sync_error}"
+            )
+            .into(),
+            (Err(remove_error), Err(sync_error)) => format!(
+                "{identity_error}; schedule supervisor rollback removal failed: {remove_error}; directory sync failed: {sync_error}"
+            )
+            .into(),
+        }
     }
 
     fn generation_name(record_id: &str, generation: u64) -> String {
         format!("{record_id}.{generation:020}.json")
     }
 
-    pub(super) fn create(directory: &Path, record_id: &str) -> Result<Self, BoxError> {
+    pub(super) fn create(directory: &PinnedDirectory, record_id: &str) -> Result<Self, BoxError> {
         Self::validate_record_id(record_id)?;
-        let (directory, directory_handle) = Self::open_directory(directory)?;
+        Self::validate_directory(directory)?;
         let mut journal = Self {
-            directory,
-            directory_handle,
+            directory: directory.clone(),
             record_id: record_id.to_owned(),
             next_generation: 1,
             previous_sha256: None,
+            #[cfg(test)]
+            before_create_hook: None,
         };
         if !journal.generation_entries()?.is_empty() {
             return Err("schedule supervisor: journal already contains this record id".into());
@@ -730,16 +867,10 @@ impl FileSupervisorJournal {
     }
 
     fn generation_entries(&mut self) -> Result<Vec<(u64, String)>, BoxError> {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let expected = self.directory_handle.metadata()?;
-        let before = std::fs::metadata(&self.directory)?;
-        if expected.dev() != before.dev() || expected.ino() != before.ino() {
-            return Err("schedule supervisor: journal directory identity changed".into());
-        }
+        Self::validate_directory(&self.directory)?;
         let prefix = format!("{}.", self.record_id);
         let mut paths = Vec::new();
-        for entry in std::fs::read_dir(&self.directory)? {
+        for entry in std::fs::read_dir(self.directory.acp_session_cwd())? {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
@@ -762,41 +893,19 @@ impl FileSupervisorJournal {
         if paths.len() > Self::MAX_JOURNAL_GENERATIONS {
             return Err("schedule supervisor: journal generation count exceeds the bound".into());
         }
-        let after = std::fs::metadata(&self.directory)?;
-        if expected.dev() != after.dev() || expected.ino() != after.ino() {
-            return Err(
-                "schedule supervisor: journal directory identity changed during scan".into(),
-            );
-        }
+        Self::validate_directory(&self.directory)?;
         paths.sort_by_key(|(generation, _)| *generation);
         Ok(paths)
     }
 
     fn read_generation(&self, name: &str) -> Result<(Vec<u8>, String), BoxError> {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
         use std::os::unix::fs::MetadataExt as _;
 
-        let c_name = std::ffi::CString::new(name.as_bytes())
-            .map_err(|_| "schedule supervisor: journal generation name contains NUL")?;
-        // SAFETY: the retained directory descriptor and single-component name are live. O_NOFOLLOW
-        // rejects a retargeted final component and O_NONBLOCK prevents a special file from parking
-        // the recovery scan before the regular-file check.
-        let fd = unsafe {
-            libc::openat(
-                self.directory_handle.as_raw_fd(),
-                c_name.as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-            )
-        };
-        if fd == -1 {
-            return Err(format!(
-                "schedule supervisor: cannot open journal generation {name}: {}",
-                std::io::Error::last_os_error()
-            )
-            .into());
-        }
-        // SAFETY: openat returned this descriptor uniquely.
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        Self::validate_directory(&self.directory)?;
+        let mut file = self.directory.open_regular_file(
+            std::ffi::OsStr::new(name),
+            "schedule supervisor journal generation",
+        )?;
         let before = file.metadata()?;
         if !before.is_file()
             || before.nlink() != 1
@@ -828,22 +937,24 @@ impl FileSupervisorJournal {
         {
             return Err("schedule supervisor: journal generation changed during read".into());
         }
+        Self::validate_directory(&self.directory)?;
         let sha256 = crate::local_file::sha256_hex(&bytes);
         Ok((bytes, sha256))
     }
 
     pub(super) fn open_existing(
-        directory: &Path,
+        directory: &PinnedDirectory,
         record_id: &str,
     ) -> Result<(Self, SupervisorRecordV1, String), BoxError> {
         Self::validate_record_id(record_id)?;
-        let (directory, directory_handle) = Self::open_directory(directory)?;
+        Self::validate_directory(directory)?;
         let mut journal = Self {
-            directory,
-            directory_handle,
+            directory: directory.clone(),
             record_id: record_id.to_owned(),
             next_generation: 1,
             previous_sha256: None,
+            #[cfg(test)]
+            before_create_hook: None,
         };
         let entries = journal.generation_entries()?;
         if entries.is_empty() {
@@ -887,14 +998,52 @@ impl FileSupervisorJournal {
         journal.previous_sha256 = Some(latest_sha256.clone());
         Ok((journal, latest, latest_sha256))
     }
+
+    fn read_initial_record(&self) -> Result<SupervisorRecordV1, BoxError> {
+        let name = Self::generation_name(&self.record_id, 1);
+        let (bytes, _sha256) = self.read_generation(&name)?;
+        let record: SupervisorRecordV1 = serde_json::from_slice(&bytes).map_err(|error| {
+            format!("schedule supervisor: invalid initial journal generation: {error}")
+        })?;
+        validate_supervisor_record(&record)?;
+        Ok(record)
+    }
+}
+
+/// Makes the commit-bound Prepared generation durable exactly once. Existing later generations are
+/// accepted only when their immutable generation one is byte-equivalent to the supplied record.
+/// This recovery primitive cannot start a runner or signal a process group.
+#[cfg(unix)]
+pub(super) fn ensure_prepared_supervisor(
+    directory: &PinnedDirectory,
+    prepared: &SupervisorRecordV1,
+) -> Result<(SupervisorRecordV1, String), BoxError> {
+    if prepared.generation != 1 || prepared.phase != SupervisorPhaseV1::Prepared {
+        return Err("schedule supervisor: prepared publication requires generation one".into());
+    }
+    match FileSupervisorJournal::create(directory, &prepared.supervisor_record_id) {
+        Ok(journal) => {
+            ScheduleSupervisor::initialize(prepared.clone(), journal)?;
+        }
+        Err(_create_error) => {
+            // An existing generation is the normal crash-recovery path. Reopen validates the
+            // complete chain; a malformed object or unrelated create failure remains an error.
+        }
+    }
+    let (journal, latest, latest_sha256) =
+        FileSupervisorJournal::open_existing(directory, &prepared.supervisor_record_id)?;
+    if journal.read_initial_record()? != *prepared {
+        return Err("schedule supervisor: existing journal is rebound to another admission".into());
+    }
+    Ok((latest, latest_sha256))
 }
 
 #[cfg(unix)]
 impl SupervisorJournal for FileSupervisorJournal {
     fn persist(&mut self, record: &SupervisorRecordV1) -> Result<String, BoxError> {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
         use std::os::unix::fs::MetadataExt as _;
 
+        Self::validate_directory(&self.directory)?;
         validate_supervisor_record(record)?;
         if record.supervisor_record_id != self.record_id
             || record.generation != self.next_generation
@@ -912,37 +1061,15 @@ impl SupervisorJournal for FileSupervisorJournal {
             return Err("schedule supervisor: journal generation exceeds the byte bound".into());
         }
         let name = Self::generation_name(&self.record_id, record.generation);
-        let c_name = std::ffi::CString::new(name.as_bytes())
-            .map_err(|_| "schedule supervisor: journal generation name contains NUL")?;
-        // SAFETY: the retained directory descriptor and NUL-terminated single-component name are
-        // live. O_EXCL/O_NOFOLLOW prevent replacement, and the returned descriptor is uniquely owned.
-        let fd = unsafe {
-            libc::openat(
-                self.directory_handle.as_raw_fd(),
-                c_name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                0o600,
-            )
-        };
-        if fd == -1 {
-            return Err(format!(
-                "schedule supervisor: cannot create journal generation {name}: {}",
-                std::io::Error::last_os_error()
-            )
-            .into());
+        #[cfg(test)]
+        if let Some(hook) = self.before_create_hook.take() {
+            hook();
         }
-        // SAFETY: `fd` was returned uniquely by openat above.
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        // SAFETY: the newly created descriptor is exclusively owned and remains live for both calls.
-        if unsafe { libc::fchown(file.as_raw_fd(), libc::geteuid(), libc::getegid()) } == -1
-            || unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } == -1
-        {
-            return Err(format!(
-                "schedule supervisor: cannot bind journal generation ownership/mode: {}",
-                std::io::Error::last_os_error()
-            )
-            .into());
-        }
+        let mut file = self.directory.create_new_file(
+            std::ffi::OsStr::new(&name),
+            0o600,
+            "schedule supervisor journal generation",
+        )?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         let metadata = file.metadata()?;
@@ -956,7 +1083,14 @@ impl SupervisorJournal for FileSupervisorJournal {
                     .into(),
             );
         }
-        self.directory_handle.sync_all()?;
+        self.directory.sync()?;
+        if let Err(identity_error) = Self::validate_directory(&self.directory) {
+            drop(file);
+            return Err(self.rollback_generation_after_directory_change(
+                std::ffi::OsStr::new(&name),
+                identity_error,
+            ));
+        }
         let sha256 = crate::local_file::sha256_hex(&bytes);
         self.next_generation = self
             .next_generation
@@ -1310,6 +1444,107 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
         self.transition(candidate)
     }
 
+    fn cancel_before_running<C: SupervisorControl>(
+        &mut self,
+        control: &mut C,
+    ) -> Result<(), BoxError> {
+        let groups = self.record.groups.clone();
+        for group in &groups {
+            let members = control.non_anchor_members(group);
+            if !self
+                .control_or_hold(members, SafetyHoldReasonV1::StartupReconciliationIncomplete)?
+                .is_empty()
+            {
+                return self.enter_hold(SafetyHoldReasonV1::StartupReconciliationIncomplete);
+            }
+        }
+
+        let mut candidate = self.record.clone();
+        candidate.phase = SupervisorPhaseV1::Reaping;
+        candidate.later_group_signal_permitted = false;
+        self.transition(candidate)?;
+
+        self.complete_pre_running_reaping(control)
+    }
+
+    fn complete_pre_running_reaping<C: SupervisorControl>(
+        &mut self,
+        control: &mut C,
+    ) -> Result<(), BoxError> {
+        if self.record.phase != SupervisorPhaseV1::Reaping
+            || !matches!(self.record.runner, OptionalProcessIdentityV1::Absent)
+            || self
+                .record
+                .groups
+                .iter()
+                .any(|group| !group.workloads.is_empty())
+        {
+            return Err("schedule supervisor: state is not a pre-running cancellation".into());
+        }
+
+        let groups = self.record.groups.clone();
+        for group in &groups {
+            if group.anchor_lifecycle == AnchorLifecycleV1::RetainedLive {
+                let members = control.non_anchor_members(group);
+                if !self
+                    .control_or_hold(members, SafetyHoldReasonV1::StartupReconciliationIncomplete)?
+                    .is_empty()
+                {
+                    return self.enter_hold(SafetyHoldReasonV1::StartupReconciliationIncomplete);
+                }
+                let anchor_live = control.exact_anchor_live(group);
+                if self
+                    .control_or_hold(anchor_live, SafetyHoldReasonV1::ProcessIdentityUnavailable)?
+                {
+                    if let Err(error) = control.release_and_reap_anchor(group) {
+                        self.enter_hold_with_group_lifecycle(
+                            SafetyHoldReasonV1::AnchorNotLive,
+                            Some((group.process_group, AnchorLifecycleV1::Ambiguous)),
+                        )?;
+                        return Err(error);
+                    }
+                } else {
+                    let absent = control.group_absent(group.process_group);
+                    if !self
+                        .control_or_hold(absent, SafetyHoldReasonV1::ProcessIdentityUnavailable)?
+                    {
+                        return self.enter_hold_with_group_lifecycle(
+                            SafetyHoldReasonV1::AnchorNotLive,
+                            Some((group.process_group, AnchorLifecycleV1::Ambiguous)),
+                        );
+                    }
+                }
+                self.mark_group_released(group.process_group)?;
+            }
+            let absent = control.group_absent(group.process_group);
+            if !self.control_or_hold(absent, SafetyHoldReasonV1::ProcessIdentityUnavailable)? {
+                return self.enter_hold(SafetyHoldReasonV1::ExitUnproved);
+            }
+        }
+
+        let labels = self.record.container_run_labels.clone();
+        let container_reap = control.reap_exact_containers(&labels);
+        self.control_or_hold(
+            container_reap,
+            SafetyHoldReasonV1::StartupReconciliationIncomplete,
+        )?;
+        let containers_absent = control.exact_containers_absent(&labels);
+        if !self.control_or_hold(
+            containers_absent,
+            SafetyHoldReasonV1::StartupReconciliationIncomplete,
+        )? {
+            return self.enter_hold(SafetyHoldReasonV1::ExitUnproved);
+        }
+
+        let mut candidate = self.record.clone();
+        candidate.phase = SupervisorPhaseV1::Complete;
+        candidate.outcome = OptionalSupervisorOutcomeV1::Outcome {
+            value: SupervisorTerminalOutcomeV1::CancelledBeforeRunning,
+        };
+        candidate.later_group_signal_permitted = false;
+        self.transition(candidate)
+    }
+
     pub(super) fn request_cancel<C: SupervisorControl>(
         &mut self,
         control: &mut C,
@@ -1322,8 +1557,8 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
                 elapsed_ms,
                 SupervisorKillCauseV1::RepeatedCancellation,
             ),
-            SupervisorPhaseV1::Prepared
-            | SupervisorPhaseV1::KillJournaled
+            SupervisorPhaseV1::Prepared => self.cancel_before_running(control),
+            SupervisorPhaseV1::KillJournaled
             | SupervisorPhaseV1::Reaping
             | SupervisorPhaseV1::Complete
             | SupervisorPhaseV1::SafetyHold => Ok(()),
@@ -1548,6 +1783,16 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
             // Reaping has already durably forbidden later group signals. The caller may supply the
             // recovered child artifact to `finish_after_exit`, which performs only absence proofs,
             // exact-label container cleanup, and anchor release/reap.
+            SupervisorPhaseV1::Reaping
+                if matches!(self.record.runner, OptionalProcessIdentityV1::Absent) =>
+            {
+                self.complete_pre_running_reaping(control)?;
+                Ok(if self.record.phase == SupervisorPhaseV1::Complete {
+                    RecoveryDisposition::Complete
+                } else {
+                    RecoveryDisposition::SafetyHold
+                })
+            }
             SupervisorPhaseV1::Reaping => Ok(RecoveryDisposition::ReconcileWithoutSignal),
             SupervisorPhaseV1::Complete => Ok(RecoveryDisposition::Complete),
             SupervisorPhaseV1::SafetyHold => Ok(RecoveryDisposition::SafetyHold),
@@ -1785,6 +2030,22 @@ mod tests {
             child_artifact: OptionalChildArtifactRefV1::Absent,
             recorded_at_ms: 1,
         }
+    }
+
+    #[cfg(unix)]
+    fn pinned_temp_directory(directory: &tempfile::TempDir) -> PinnedDirectory {
+        let snapshot = crate::local_file::snapshot_directory(
+            directory.path(),
+            "schedule supervisor test directory",
+        )
+        .unwrap();
+        PinnedDirectory::open(
+            directory.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "schedule supervisor test directory",
+        )
+        .unwrap()
     }
 
     fn running_fake_supervisor(
@@ -2309,7 +2570,8 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let journal = FileSupervisorJournal::create(directory.path(), "supervisor-1").unwrap();
+        let pinned = pinned_temp_directory(&directory);
+        let journal = FileSupervisorJournal::create(&pinned, "supervisor-1").unwrap();
         let mut supervisor = ScheduleSupervisor::initialize(prepared_record(), journal).unwrap();
         let runner = identity(44, 43);
         supervisor
@@ -2327,7 +2589,7 @@ mod tests {
         drop(supervisor);
 
         let (journal, latest, latest_sha256) =
-            FileSupervisorJournal::open_existing(directory.path(), "supervisor-1").unwrap();
+            FileSupervisorJournal::open_existing(&pinned, "supervisor-1").unwrap();
         assert_eq!(latest.generation, 2);
         assert_eq!(latest.phase, SupervisorPhaseV1::Running);
         assert_eq!(latest_sha256.len(), 64);
@@ -2344,7 +2606,7 @@ mod tests {
         drop(recovered);
 
         let (_journal, latest, _latest_sha256) =
-            FileSupervisorJournal::open_existing(directory.path(), "supervisor-1").unwrap();
+            FileSupervisorJournal::open_existing(&pinned, "supervisor-1").unwrap();
         assert_eq!(latest.generation, 3);
         assert_eq!(latest.phase, SupervisorPhaseV1::TermGrace);
 
@@ -2355,7 +2617,50 @@ mod tests {
             b"truncated",
         )
         .unwrap();
-        assert!(FileSupervisorJournal::open_existing(directory.path(), "supervisor-1").is_err());
+        assert!(FileSupervisorJournal::open_existing(&pinned, "supervisor-1").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_journal_mid_publication_replacement_rolls_back_retained_generation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pinned = pinned_temp_directory(&directory);
+        let mut journal = FileSupervisorJournal::create(&pinned, "supervisor-1").unwrap();
+        let canonical = directory.path().to_path_buf();
+        let retained = canonical.with_file_name(format!(
+            "{}-retained-mid-publication",
+            canonical.file_name().unwrap().to_string_lossy()
+        ));
+        let retained_for_hook = retained.clone();
+        journal.before_create_hook = Some(Box::new(move || {
+            std::fs::rename(&canonical, &retained_for_hook).unwrap();
+            std::fs::create_dir(&canonical).unwrap();
+            std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }));
+
+        assert!(journal.persist(&prepared_record()).is_err());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&retained).unwrap().count(), 0);
+        std::fs::remove_dir(&retained).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_journal_rejects_path_collision_record_ids() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pinned = pinned_temp_directory(&directory);
+        for record_id in [".", "..", "supervisor.1"] {
+            assert!(
+                FileSupervisorJournal::create(&pinned, record_id).is_err(),
+                "record id {record_id:?} must not share or alias the journal root"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -2365,7 +2670,8 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let journal = FileSupervisorJournal::create(directory.path(), "supervisor-1").unwrap();
+        let pinned = pinned_temp_directory(&directory);
+        let journal = FileSupervisorJournal::create(&pinned, "supervisor-1").unwrap();
         let mut supervisor = ScheduleSupervisor::initialize(prepared_record(), journal).unwrap();
         let runner = identity(44, 43);
         supervisor
@@ -2383,7 +2689,7 @@ mod tests {
         drop(supervisor);
 
         let (journal, latest, latest_sha256) =
-            FileSupervisorJournal::open_existing(directory.path(), "supervisor-1").unwrap();
+            FileSupervisorJournal::open_existing(&pinned, "supervisor-1").unwrap();
         drop(journal);
         assert_eq!(latest.phase, SupervisorPhaseV1::Running);
         let mut rollback = prepared_record();
@@ -2401,7 +2707,7 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-        assert!(FileSupervisorJournal::open_existing(directory.path(), "supervisor-1").is_err());
+        assert!(FileSupervisorJournal::open_existing(&pinned, "supervisor-1").is_err());
     }
 
     #[test]
@@ -2440,6 +2746,239 @@ mod tests {
             assert_eq!(supervisor.record().phase, SupervisorPhaseV1::Prepared);
             assert_eq!(supervisor.journal().records.len(), 1);
         }
+    }
+
+    #[test]
+    fn cancellation_before_running_is_owned_and_terminalized_without_a_workload() {
+        let mut supervisor =
+            ScheduleSupervisor::initialize(prepared_record(), MemoryJournal::default()).unwrap();
+        let mut control = fake_control(false, BTreeMap::new());
+
+        supervisor.request_cancel(&mut control, 1).unwrap();
+
+        assert_eq!(supervisor.record().phase, SupervisorPhaseV1::Complete);
+        assert_eq!(
+            supervisor.record().outcome,
+            OptionalSupervisorOutcomeV1::Outcome {
+                value: SupervisorTerminalOutcomeV1::CancelledBeforeRunning,
+            }
+        );
+        assert!(supervisor
+            .record()
+            .groups
+            .iter()
+            .all(|group| group.anchor_lifecycle == AnchorLifecycleV1::ReleasedReaped));
+        assert!(control.signals.is_empty());
+    }
+
+    #[test]
+    fn cancellation_before_running_holds_on_possible_workload_or_cleanup_ambiguity() {
+        let mut possible_workload =
+            ScheduleSupervisor::initialize(prepared_record(), MemoryJournal::default()).unwrap();
+        let mut members = BTreeMap::new();
+        members.insert(43, vec![identity(44, 43)]);
+        let mut workload_control = fake_control(false, members);
+        possible_workload
+            .request_cancel(&mut workload_control, 1)
+            .unwrap();
+        assert_eq!(
+            possible_workload.record().phase,
+            SupervisorPhaseV1::SafetyHold
+        );
+        assert!(workload_control.signals.is_empty());
+
+        let mut release_failure =
+            ScheduleSupervisor::initialize(prepared_record(), MemoryJournal::default()).unwrap();
+        let mut release_control = fake_control(false, BTreeMap::new());
+        release_control.fail_anchor_release = true;
+        assert!(release_failure
+            .request_cancel(&mut release_control, 1)
+            .is_err());
+        assert_eq!(
+            release_failure.record().phase,
+            SupervisorPhaseV1::SafetyHold
+        );
+        assert_eq!(
+            release_failure.record().groups[0].anchor_lifecycle,
+            AnchorLifecycleV1::Ambiguous
+        );
+        assert!(release_control.signals.is_empty());
+
+        let mut container_failure =
+            ScheduleSupervisor::initialize(prepared_record(), MemoryJournal::default()).unwrap();
+        let mut container_control = fake_control(false, BTreeMap::new());
+        container_control.fail_container_reap = true;
+        assert!(container_failure
+            .request_cancel(&mut container_control, 1)
+            .is_err());
+        assert_eq!(
+            container_failure.record().phase,
+            SupervisorPhaseV1::SafetyHold
+        );
+        assert!(container_control.signals.is_empty());
+    }
+
+    #[test]
+    fn pre_running_cancellation_recovery_completes_before_or_after_anchor_release() {
+        for already_released in [false, true] {
+            let mut supervisor =
+                ScheduleSupervisor::initialize(prepared_record(), MemoryJournal::default())
+                    .unwrap();
+            let mut reaping = supervisor.record().clone();
+            reaping.phase = SupervisorPhaseV1::Reaping;
+            reaping.later_group_signal_permitted = false;
+            if already_released {
+                reaping.groups[0].anchor_lifecycle = AnchorLifecycleV1::ReleasedReaped;
+            }
+            supervisor.transition(reaping).unwrap();
+            let latest = supervisor.record().clone();
+            let latest_sha256 = supervisor.current_record_sha256.clone();
+            let mut recovered = ScheduleSupervisor::resume_existing(
+                latest,
+                latest_sha256,
+                MemoryJournal::default(),
+            )
+            .unwrap();
+            let mut control = fake_control(false, BTreeMap::new());
+            if already_released {
+                control.released_groups.insert(43);
+            }
+
+            assert_eq!(
+                recovered.recover(&mut control).unwrap(),
+                RecoveryDisposition::Complete
+            );
+            assert_eq!(recovered.record().phase, SupervisorPhaseV1::Complete);
+            assert_eq!(
+                recovered.record().outcome,
+                OptionalSupervisorOutcomeV1::Outcome {
+                    value: SupervisorTerminalOutcomeV1::CancelledBeforeRunning,
+                }
+            );
+            assert!(control.signals.is_empty());
+        }
+    }
+
+    #[test]
+    fn pre_running_cancellation_recovery_holds_on_cleanup_failure() {
+        let mut supervisor =
+            ScheduleSupervisor::initialize(prepared_record(), MemoryJournal::default()).unwrap();
+        let mut reaping = supervisor.record().clone();
+        reaping.phase = SupervisorPhaseV1::Reaping;
+        reaping.later_group_signal_permitted = false;
+        supervisor.transition(reaping).unwrap();
+        let mut control = fake_control(false, BTreeMap::new());
+        control.fail_anchor_release = true;
+
+        assert!(supervisor.recover(&mut control).is_err());
+        assert_eq!(supervisor.record().phase, SupervisorPhaseV1::SafetyHold);
+        assert_eq!(
+            supervisor.record().groups[0].anchor_lifecycle,
+            AnchorLifecycleV1::Ambiguous
+        );
+        assert!(control.signals.is_empty());
+    }
+
+    #[test]
+    fn pre_running_cancellation_recovery_retains_anchor_when_a_workload_appears() {
+        let mut supervisor =
+            ScheduleSupervisor::initialize(prepared_record(), MemoryJournal::default()).unwrap();
+        let mut reaping = supervisor.record().clone();
+        reaping.phase = SupervisorPhaseV1::Reaping;
+        reaping.later_group_signal_permitted = false;
+        supervisor.transition(reaping).unwrap();
+        let mut members = BTreeMap::new();
+        members.insert(43, vec![identity(44, 43)]);
+        let mut control = fake_control(false, members);
+
+        assert_eq!(
+            supervisor.recover(&mut control).unwrap(),
+            RecoveryDisposition::SafetyHold
+        );
+        assert_eq!(supervisor.record().phase, SupervisorPhaseV1::SafetyHold);
+        assert_eq!(
+            supervisor.record().groups[0].anchor_lifecycle,
+            AnchorLifecycleV1::RetainedLive
+        );
+        assert!(control.released_groups.is_empty());
+        assert!(control.signals.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_runner_child_is_the_exact_exit_proof() {
+        let mut child = tokio::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let mut retained = RetainedRunnerExit::bind(child).unwrap();
+        let identity = retained.identity().clone();
+        assert!(!retained.exact_exited(&identity).unwrap());
+
+        let mut wrong = identity.clone();
+        wrong.parent_pid = wrong.parent_pid.saturating_add(1);
+        assert!(retained.exact_exited(&wrong).is_err());
+
+        drop(stdin);
+        let mut exited = false;
+        for _ in 0..200 {
+            if retained.exact_exited(&identity).unwrap() {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(exited, "the retained exact child did not report exit");
+        assert!(retained.exact_exited(&identity).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_runner_exit_is_independent_of_a_live_descendant() {
+        use tokio::io::AsyncBufReadExt as _;
+
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 1 </dev/null >/dev/null 2>&1 & echo $!")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut retained = RetainedRunnerExit::bind(child).unwrap();
+        let identity = retained.identity().clone();
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut descendant_pid = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader.read_line(&mut descendant_pid),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let descendant_pid = descendant_pid.trim().parse::<i32>().unwrap();
+        let descendant =
+            crate::compatibility_process_group::capture_spawned_identity(descendant_pid).unwrap();
+
+        let mut runner_exited = false;
+        for _ in 0..200 {
+            if retained.exact_exited(&identity).unwrap() {
+                runner_exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(runner_exited, "the exact direct runner did not report exit");
+        let observed_descendant = process_identity(descendant_pid).unwrap().unwrap();
+        assert_eq!(observed_descendant.pid, descendant.pid);
+        assert_eq!(observed_descendant.start, descendant.start);
+        assert_ne!(observed_descendant.parent_pid, identity.pid);
     }
 
     #[test]

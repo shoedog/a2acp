@@ -122,6 +122,7 @@ pub(super) enum SupervisorPhaseV1 {
 #[serde(rename_all = "snake_case")]
 pub(super) enum SupervisorTerminalOutcomeV1 {
     Completed,
+    CancelledBeforeRunning,
     Cancelled,
     KilledAfterDeadline,
     KilledAfterCancellation,
@@ -454,6 +455,8 @@ pub(super) struct OneShotCharacterizationEntryV1 {
     pub(super) not_before_ms: i64,
     pub(super) expires_at_ms: i64,
     pub(super) revocation_generation: u64,
+    pub(super) prior_entry: OptionalRecordRefV1,
+    pub(super) reissue_reason: OptionalTextV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -570,6 +573,8 @@ pub(super) struct ManualAdmissionV1 {
     pub(super) environment_owner: String,
     pub(super) scheduler_binary_sha256: String,
     pub(super) input_source_sha256: String,
+    pub(super) case_id: String,
+    pub(super) provider_family: String,
     pub(super) characterization_profile: FingerprintV1,
     pub(super) case_execution: FingerprintV1,
     pub(super) evidence_purpose: EvidencePurposeV1,
@@ -807,6 +812,10 @@ pub(super) struct LedgerReservationV1 {
     pub(super) reservation_id: String,
     pub(super) attempt_idempotency_key: String,
     pub(super) accounting_class: AccountingClassV1,
+    pub(super) case_id: String,
+    pub(super) provider_family: String,
+    pub(super) trigger: TriggerKindV1,
+    pub(super) accounting_policy_sha256: String,
     pub(super) characterization_profile: FingerprintV1,
     pub(super) case_execution: FingerprintV1,
     pub(super) admission_attempt: FingerprintV1,
@@ -826,6 +835,7 @@ pub(super) struct LedgerReservationV1 {
 pub(super) struct LedgerReconciliationV1 {
     pub(super) schema_version: u16,
     pub(super) reservation_id: String,
+    pub(super) reservation_sha256: String,
     pub(super) characterization_profile: FingerprintV1,
     pub(super) case_execution: FingerprintV1,
     pub(super) admission_attempt: FingerprintV1,
@@ -833,6 +843,7 @@ pub(super) struct LedgerReconciliationV1 {
     pub(super) equivalent_work_key: String,
     pub(super) terminal_evidence_sha256: String,
     pub(super) disposition: LedgerDispositionV1,
+    pub(super) reason_code: String,
     pub(super) charged_usage: UsageChargeV1,
     pub(super) prompt_may_have_been_accepted: bool,
     pub(super) reconciled_at_ms: i64,
@@ -904,6 +915,7 @@ pub(super) struct ScheduledExecutionSourceV1 {
     pub(super) admission_attempt: AdmissionAttemptFingerprintRecordV1,
     pub(super) authority: AdmissionAuthorityV1,
     pub(super) trigger: TriggerKindV1,
+    pub(super) config_template_sha256: String,
     pub(super) requested_identity: EffectiveIdentityV1,
     pub(super) expected_effective_identity: EffectiveIdentityV1,
     pub(super) caps: EffectCapsV1,
@@ -925,6 +937,7 @@ pub(super) struct ClaimedSupportCharacterizationSourceV1 {
     pub(super) authority: AdmissionAuthorityV1,
     pub(super) trigger: TriggerKindV1,
     pub(super) pinned_config_sha256: String,
+    pub(super) config_template_sha256: String,
     pub(super) requested_identity: EffectiveIdentityV1,
     pub(super) expected_effective_identity: EffectiveIdentityV1,
     pub(super) caps: EffectCapsV1,
@@ -1425,6 +1438,38 @@ fn canonical_input_sha256<T: Serialize>(label: &str, value: &T) -> Result<String
     Ok(local_file::sha256_hex(&domain_separated))
 }
 
+pub(super) fn seal_case_execution_fingerprint(
+    input: CaseExecutionFingerprintInputV1,
+) -> Result<CaseExecutionFingerprintRecordV1, BoxError> {
+    let fingerprint = FingerprintV1 {
+        schema_version: 1,
+        sha256: canonical_input_sha256("case-execution input", &input)?,
+    };
+    let value = CaseExecutionFingerprintRecordV1 {
+        schema_version: 1,
+        input,
+        fingerprint,
+    };
+    value.validate()?;
+    Ok(value)
+}
+
+pub(super) fn seal_admission_attempt_fingerprint(
+    input: AdmissionAttemptFingerprintInputV1,
+) -> Result<AdmissionAttemptFingerprintRecordV1, BoxError> {
+    let fingerprint = FingerprintV1 {
+        schema_version: 1,
+        sha256: canonical_input_sha256("admission-attempt input", &input)?,
+    };
+    let value = AdmissionAttemptFingerprintRecordV1 {
+        schema_version: 1,
+        input,
+        fingerprint,
+    };
+    value.validate()?;
+    Ok(value)
+}
+
 pub(super) fn deadline_derivation_input_sha256(
     value: &DeadlineDerivationInputV1,
 ) -> Result<String, BoxError> {
@@ -1493,7 +1538,7 @@ struct SafetyHoldOpeningIdentityV1<'a> {
     created_at_ms: i64,
 }
 
-fn safety_hold_opening_sha256(value: &SafetyHoldV1) -> Result<String, BoxError> {
+pub(super) fn safety_hold_opening_sha256(value: &SafetyHoldV1) -> Result<String, BoxError> {
     canonical_input_sha256(
         "safety-hold opening",
         &SafetyHoldOpeningIdentityV1 {
@@ -1515,6 +1560,26 @@ struct SafetyHoldClearanceIdentityV1<'a> {
     cleared_at_ms: i64,
     operator: &'a str,
     reason: &'a str,
+}
+
+pub(super) fn safety_hold_clearance_action_sha256(
+    opening_sha256: &str,
+    clearance_action_id: &str,
+    cleared_at_ms: i64,
+    operator: &str,
+    reason: &str,
+) -> Result<String, BoxError> {
+    canonical_input_sha256(
+        "safety-hold clearance action",
+        &SafetyHoldClearanceIdentityV1 {
+            schema_version: 1,
+            opening_sha256,
+            clearance_action_id,
+            cleared_at_ms,
+            operator,
+            reason,
+        },
+    )
 }
 
 #[derive(Serialize)]
@@ -1846,7 +1911,7 @@ fn validate_authority(authority: &AdmissionAuthorityV1) -> Result<(), BoxError> 
     Ok(())
 }
 
-trait ValidateRecord {
+pub(super) trait ValidateRecord {
     fn validate(&self) -> Result<(), BoxError>;
 }
 
@@ -2179,7 +2244,12 @@ impl ValidateRecord for SupervisorRecordV1 {
                 }
             }
             SupervisorPhaseV1::Reaping => {
-                if runner.is_none()
+                let pre_running_cancellation = runner.is_none()
+                    && self.groups.iter().all(|group| group.workloads.is_empty())
+                    && term.is_none()
+                    && kill.is_none()
+                    && child.is_none();
+                if (!pre_running_cancellation && runner.is_none())
                     || self.groups.is_empty()
                     || outcome.is_some()
                     || hold.is_some()
@@ -2189,30 +2259,48 @@ impl ValidateRecord for SupervisorRecordV1 {
                 }
             }
             SupervisorPhaseV1::Complete => {
-                let signal_shape = match outcome {
+                let terminal_shape = match outcome {
+                    Some(SupervisorTerminalOutcomeV1::CancelledBeforeRunning) => {
+                        runner.is_none()
+                            && self.groups.iter().all(|group| group.workloads.is_empty())
+                            && term.is_none()
+                            && kill.is_none()
+                            && kill_cause.is_none()
+                            && child.is_none()
+                    }
                     Some(SupervisorTerminalOutcomeV1::Completed) => {
-                        term.is_none() && kill.is_none() && kill_cause.is_none()
+                        runner.is_some()
+                            && term.is_none()
+                            && kill.is_none()
+                            && kill_cause.is_none()
+                            && child.is_some()
                     }
                     Some(SupervisorTerminalOutcomeV1::Cancelled) => {
-                        term.is_some() && kill.is_none() && kill_cause.is_none()
+                        runner.is_some()
+                            && term.is_some()
+                            && kill.is_none()
+                            && kill_cause.is_none()
+                            && child.is_some()
                     }
                     Some(SupervisorTerminalOutcomeV1::KilledAfterDeadline) => {
-                        term.is_some()
+                        runner.is_some()
+                            && term.is_some()
                             && kill.is_some()
                             && kill_cause == Some(SupervisorKillCauseV1::Deadline)
+                            && child.is_some()
                     }
                     Some(SupervisorTerminalOutcomeV1::KilledAfterCancellation) => {
-                        term.is_some()
+                        runner.is_some()
+                            && term.is_some()
                             && kill.is_some()
                             && kill_cause == Some(SupervisorKillCauseV1::RepeatedCancellation)
+                            && child.is_some()
                     }
                     _ => false,
                 };
-                if runner.is_none()
-                    || self.groups.is_empty()
-                    || !signal_shape
+                if self.groups.is_empty()
+                    || !terminal_shape
                     || hold.is_some()
-                    || child.is_none()
                     || self.later_group_signal_permitted
                     || self
                         .groups
@@ -2426,6 +2514,21 @@ impl ValidateRecord for CharacterizationAuthorizationV1 {
                 entry.not_before_ms,
                 entry.expires_at_ms,
             )?;
+            optional_record_ref("one-shot prior entry", &entry.prior_entry)?;
+            optional_text("one-shot reissue reason", &entry.reissue_reason)?;
+            if !matches!(
+                (&entry.prior_entry, &entry.reissue_reason),
+                (OptionalRecordRefV1::Absent, OptionalTextV1::Absent)
+                    | (
+                        OptionalRecordRefV1::Record { .. },
+                        OptionalTextV1::Text { .. }
+                    )
+            ) {
+                return Err(
+                    "schedule schema: one-shot prior entry and reissue reason must be paired"
+                        .into(),
+                );
+            }
             if !profiles.insert(entry.characterization_profile.sha256.as_str()) {
                 return Err(
                     "schedule schema: one authorization cannot contain duplicate live profiles"
@@ -2591,6 +2694,8 @@ impl ValidateRecord for ManualAdmissionV1 {
         stable_id("manual environment owner", &self.environment_owner)?;
         sha256("scheduler binary", &self.scheduler_binary_sha256)?;
         sha256("manual input source", &self.input_source_sha256)?;
+        stable_id("manual case id", &self.case_id)?;
+        stable_id("manual provider family", &self.provider_family)?;
         fingerprint("manual profile", &self.characterization_profile)?;
         fingerprint("manual execution", &self.case_execution)?;
         stable_id("manual freshness bucket", &self.freshness_bucket)?;
@@ -2713,16 +2818,12 @@ impl ValidateRecord for SafetyHoldV1 {
                             .into(),
                     );
                 }
-                let expected_clearance = canonical_input_sha256(
-                    "safety-hold clearance action",
-                    &SafetyHoldClearanceIdentityV1 {
-                        schema_version: 1,
-                        opening_sha256,
-                        clearance_action_id,
-                        cleared_at_ms: *cleared_at_ms,
-                        operator,
-                        reason,
-                    },
+                let expected_clearance = safety_hold_clearance_action_sha256(
+                    opening_sha256,
+                    clearance_action_id,
+                    *cleared_at_ms,
+                    operator,
+                    reason,
                 )?;
                 if clearance_action_sha256 != &expected_clearance {
                     return Err(
@@ -2993,6 +3094,9 @@ impl ValidateRecord for LedgerRecordV1 {
                 }
                 stable_id("ledger reservation id", &value.reservation_id)?;
                 sha256("attempt idempotency key", &value.attempt_idempotency_key)?;
+                stable_id("ledger case id", &value.case_id)?;
+                stable_id("ledger provider family", &value.provider_family)?;
+                sha256("ledger accounting policy", &value.accounting_policy_sha256)?;
                 fingerprint("ledger profile", &value.characterization_profile)?;
                 fingerprint("ledger execution", &value.case_execution)?;
                 fingerprint("ledger admission attempt", &value.admission_attempt)?;
@@ -3014,12 +3118,14 @@ impl ValidateRecord for LedgerRecordV1 {
                     );
                 }
                 stable_id("ledger reservation id", &value.reservation_id)?;
+                sha256("ledger reservation", &value.reservation_sha256)?;
                 fingerprint("reconciled profile", &value.characterization_profile)?;
                 fingerprint("reconciled execution", &value.case_execution)?;
                 fingerprint("reconciled admission", &value.admission_attempt)?;
                 validate_authority(&value.authority)?;
                 sha256("reconciled equivalent-work key", &value.equivalent_work_key)?;
                 sha256("terminal evidence", &value.terminal_evidence_sha256)?;
+                stable_id("ledger reconciliation reason", &value.reason_code)?;
                 let usage = &value.charged_usage;
                 if usage.attempts > 1
                     || usage.tokens > 1_000_000
@@ -3127,7 +3233,12 @@ impl ValidateRecord for ConsumptionRecordV1 {
                     && self.satisfied_purpose == EvidencePurposeV1::Characterization
             }
         };
-        if !purpose_allowed || self.requested_purpose == EvidencePurposeV1::Characterization {
+        if !purpose_allowed
+            || matches!(
+                self.requested_purpose,
+                EvidencePurposeV1::Characterization | EvidencePurposeV1::ManualDiagnostic
+            )
+        {
             return Err("schedule schema: evidence-purpose reuse is not equal-or-stronger".into());
         }
         Ok(())
@@ -3143,6 +3254,7 @@ impl ValidateRecord for ScheduledExecutionSourceV1 {
         for (label, value) in [
             ("scheduled source", &self.source_sha256),
             ("profile policy bundle", &self.profile_policy_bundle_sha256),
+            ("scheduled config template", &self.config_template_sha256),
         ] {
             sha256(label, value)?;
         }
@@ -3212,6 +3324,10 @@ impl ValidateRecord for ClaimedSupportCharacterizationSourceV1 {
             ("production manifest", &self.production_manifest_sha256),
             ("profile policy bundle", &self.profile_policy_bundle_sha256),
             ("pinned config", &self.pinned_config_sha256),
+            (
+                "claimed-support config template",
+                &self.config_template_sha256,
+            ),
         ] {
             sha256(label, value)?;
         }
@@ -4444,6 +4560,38 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_before_running_is_terminal_without_runner_signals_or_child_artifact() {
+        let mut cancelled = completed_supervisor();
+        cancelled.runner = OptionalProcessIdentityV1::Absent;
+        cancelled.groups[0].workloads.clear();
+        cancelled.term_journal_elapsed_ms = OptionalElapsedMsV1::Absent;
+        cancelled.kill_journal_elapsed_ms = OptionalElapsedMsV1::Absent;
+        cancelled.kill_cause = OptionalSupervisorKillCauseV1::Absent;
+        cancelled.outcome = OptionalSupervisorOutcomeV1::Outcome {
+            value: SupervisorTerminalOutcomeV1::CancelledBeforeRunning,
+        };
+        cancelled.child_artifact = OptionalChildArtifactRefV1::Absent;
+        cancelled.validate().unwrap();
+
+        let mut retained = cancelled.clone();
+        retained.groups[0].anchor_lifecycle = AnchorLifecycleV1::RetainedLive;
+        assert!(retained.validate().is_err());
+
+        let mut with_runner = cancelled.clone();
+        with_runner.runner = OptionalProcessIdentityV1::Process {
+            value: process_identity_value(44, 43),
+        };
+        with_runner.groups[0]
+            .workloads
+            .push(process_identity_value(44, 43));
+        assert!(with_runner.validate().is_err());
+
+        let mut with_child = cancelled;
+        with_child.child_artifact = completed_supervisor().child_artifact;
+        assert!(with_child.validate().is_err());
+    }
+
+    #[test]
     fn supervisor_hold_requires_reason_and_forbids_numeric_group_retry() {
         let mut held = completed_supervisor();
         held.phase = SupervisorPhaseV1::SafetyHold;
@@ -4935,6 +5083,8 @@ mod tests {
             not_before_ms: 1,
             expires_at_ms: 3,
             revocation_generation: 1,
+            prior_entry: OptionalRecordRefV1::Absent,
+            reissue_reason: OptionalTextV1::Absent,
         };
         let mut authorization = CharacterizationAuthorizationV1 {
             schema_version: 1,
@@ -4951,6 +5101,18 @@ mod tests {
             entries: vec![entry],
         };
         authorization.validate().unwrap();
+
+        let mut prior_without_reason = authorization.clone();
+        prior_without_reason.entries[0].prior_entry = OptionalRecordRefV1::Record {
+            id: "prior-entry".into(),
+            sha256: digest('9'),
+        };
+        assert!(prior_without_reason.validate().is_err());
+
+        let mut reason_without_prior = authorization.clone();
+        reason_without_prior.entries[0].reissue_reason = text("reviewed reissue");
+        assert!(reason_without_prior.validate().is_err());
+
         authorization.entries[0].command = "compatibility run".into();
         assert!(authorization.validate().is_err());
 
@@ -5088,6 +5250,8 @@ mod tests {
             environment_owner: "wesley-macbook".into(),
             scheduler_binary_sha256: digest('a'),
             input_source_sha256: digest('b'),
+            case_id: "case-1".into(),
+            provider_family: "provider-1".into(),
             characterization_profile: fingerprint_value('c'),
             case_execution: fingerprint_value('d'),
             evidence_purpose: EvidencePurposeV1::ManualDiagnostic,
@@ -5103,6 +5267,9 @@ mod tests {
             expires_at_ms: 2,
         };
         manual.validate().unwrap();
+        let mut missing_dimension = manual.clone();
+        missing_dimension.case_id.clear();
+        assert!(missing_dimension.validate().is_err());
         let mut arbitrary = serde_json::to_value(&manual).unwrap();
         arbitrary["command"] = serde_json::json!("implement");
         assert!(serde_json::from_value::<ManualAdmissionV1>(arbitrary).is_err());
@@ -5145,6 +5312,7 @@ mod tests {
         let mut reconciliation = LedgerRecordV1::Reconciliation(LedgerReconciliationV1 {
             schema_version: 1,
             reservation_id: "reservation-1".into(),
+            reservation_sha256: digest('9'),
             characterization_profile: fingerprint_value('a'),
             case_execution: fingerprint_value('b'),
             admission_attempt: fingerprint_value('c'),
@@ -5152,6 +5320,7 @@ mod tests {
             equivalent_work_key: digest('d'),
             terminal_evidence_sha256: digest('e'),
             disposition: LedgerDispositionV1::ReleasedPreEffect,
+            reason_code: "proved-pre-effect".into(),
             charged_usage: UsageChargeV1 {
                 attempts: 0,
                 tokens: 0,
@@ -5223,6 +5392,10 @@ mod tests {
             reservation_id: "reservation-1".into(),
             attempt_idempotency_key: digest('a'),
             accounting_class: AccountingClassV1::Scheduled,
+            case_id: "case-1".into(),
+            provider_family: "provider-1".into(),
+            trigger: TriggerKindV1::Daily,
+            accounting_policy_sha256: digest('9'),
             characterization_profile: fingerprint_value('b'),
             case_execution: fingerprint_value('c'),
             admission_attempt: fingerprint_value('d'),
@@ -5298,6 +5471,7 @@ mod tests {
             authority,
             trigger: TriggerKindV1::ManualCharacterization,
             pinned_config_sha256: digest('f'),
+            config_template_sha256: digest('0'),
             requested_identity: identity.clone(),
             expected_effective_identity: identity,
             caps,
@@ -5452,6 +5626,7 @@ mod tests {
             admission_attempt,
             authority,
             trigger: TriggerKindV1::Daily,
+            config_template_sha256: digest('0'),
             requested_identity: identity.clone(),
             expected_effective_identity: identity,
             caps,

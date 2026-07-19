@@ -6,7 +6,7 @@
   at exact design head `b54840a017b87521677f1f95c3f7be69de55361d` by PR #37, merge
   `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is
   **MERGED** by PR #38 at merge commit `c2d147fb1f0df275f3c6452cdd212e185c002d08`. R3d1 is
-  **APPROVED FOR PR** on `agent/reliability-r3d1-supervisor`; initial exact candidate `01438c34` and first closure head
+  **MERGED** by PR #40 at `cbcfd1f06b914064456d1798be71bacdc294f3d5`; initial exact candidate `01438c34` and first closure head
   `e81ebbb` each received Sol/xhigh `REVISE`. Second closure head `8feda4d` marked all four requested topology/cursor
   residuals `FIXED`, found one new post-anchor-retention `WRONG / High`, no new `SMELL`, and returned `REVISE`.
   Third closure head `7fafe79` marked that item `FIXED`, confirmed prior residuals closed, found two new `WRONG`
@@ -18,6 +18,39 @@
   candidate release binary is 26,574,640 bytes at SHA-256
   `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. Its focused restart plan is
   [`2026-07-19-r3d1-supervisor-signal-parity.md`](2026-07-19-r3d1-supervisor-signal-parity.md).
+  R3d2a-e exact candidate `1373985cde2b7f0d8b7b97a39757dad42a254a22` then received a
+  bridge-mediated Sol/xhigh implementation `REVISE` with four `WRONG` and one `SMELL`. Mechanism remediations
+  `f481f39`, `cdf833a`, and `f700cde` bind terminal reconciliation to immutable child evidence, make completed-work
+  reuse reachable, and no-follow every fixed production-root suffix component. Remediation candidate `28e7d28`
+  passed **641/0/0** binary and **2,378/0/12 ignored** serial workspace, then closure review returned `REVISE` with
+  three new `WRONG` plus a stale-cursor residual. Commit `f18e74a` closes cross-admission preflight replay, joins the
+  executable authority-contained deadline to durable admission and handoff, and serializes same-process lock-state
+  publication. Focused preflight/state/supervisor/transaction gates are **11/0 + 15/0 + 41/0 + 20/0**. Exact
+  docs-fold candidate `840f486` passed binary **645/0/0**, full workspace **2,382/0/12 ignored** across **72**
+  result groups, and every deterministic release/validator gate. Third Sol review of exact `d082b49` resolved every
+  mechanism item, found no new `WRONG`, retained two cursor residuals, and reported one deadline-handoff `SMELL`;
+  `248e373` and the next docs fold closed those items. Fourth Sol review of exact `c418df4` marked all ten inherited
+  findings `RESOLVED` and returned `REVISE` with two new `WRONG` plus one `SMELL`: clock-rollback reuse, rejected
+  manual advisory reuse, and supervisor directory-capability downgrade. All three regressions failed on that reviewed
+  mechanism. Commit `5a01ce7` closes them; focused admission/supervisor/transaction gates are
+  **17/0 + 41/0 + 22/0**. Fifth Sol review of exact `3e4508a` marked nine of thirteen inherited items `RESOLVED`,
+  left four `UNRESOLVED`, found no fresh finding, and returned `REVISE`. Commit `1b07c80` plus the current cursor
+  fold close transaction-effect API visibility, independent-open lock exclusion, retained-generation rollback,
+  and stale status surfaces. Focused state/supervisor/transaction/preflight gates are
+  **19/0 + 42/0 + 23/0 + 11/0**. Exact candidate `68be708` passes binary **654/0/0**, canonical full workspace
+  **2,391/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic release/validator gate.
+  Exact docs-only `8d75069` reran the same full total. Sixth Sol review of that head explicitly adjudicated all four
+  fifth-review residuals, marked eleven inherited items `RESOLVED`, left the cursor and sibling-visible preflight-
+  pass API `UNRESOLVED`, found no fresh finding, and returned `REVISE`. The boundary regression failed **0/1** on
+  that reviewed head; `2d1640d` and the current cursor fold close both residuals. Focused preflight/transaction
+  gates pass **8/0 + 27/0**. Exact candidate `4133d0a` passes binary **655/0/0**, canonical full workspace
+  **2,392/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic release/validator gate;
+  exact docs-only `e74f93f` reran the same full totals. Seventh Sol/xhigh review of that exact head resolved both
+  sixth-review residuals, preserved the other eleven closures, found no fresh finding, and returned `APPROVE`. The
+  single Fable/xhigh release/compatibility lens found no `WRONG`, retained two Minor nonblocking R3d5 hardening
+  `SMELL`s, and returned `APPROVE`. Exact review-evidence head `9b63f42` passes every deterministic release gate at
+  binary **655/0/0** and canonical full workspace **2,392/0/12 ignored** across **72** groups (**55** nonempty).
+  Commit the final gate-recording docs fold, reproduce those full totals, then publish the non-draft PR.
   The merged R3d0 implementation was
   `agent/reliability-r3d0-foundation`: the fourth closure review approved exact cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test commit
@@ -605,6 +638,12 @@ A selector such as npm `latest` is a request, never resolved evidence. A success
 must remain separate commands: registry/image effects do not authorize a prompt, and a completed
 resolution does not authorize all resolved cases.
 
+That standalone, explicitly acknowledged R3c resolver remains available even when the private R3d scheduler root
+exists. It is provider-free and cannot issue or consume provider authority, construct an admitted capability,
+authorize a later run, or replace production pins/tags. By contrast, any scheduler-owned resolution/materialization
+in R3d5 must be covered by the shared R3d admission and effect envelope. The R3d takeover marker guards the legacy
+billable manual run path; it does not silently absorb this separately acknowledged R3c operator action.
+
 Initial scope is exactly the four R3b supported bridge-smoke shapes: Codex host, Codex reader, Claude host,
 and Claude reader. Historic direct CLI/ACP controls, Kiro, representative workflows, OpenRouter, and
 OpenCode remain outside R3c.
@@ -1138,11 +1177,43 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 
 ## R3d — owner-bound scheduling and evidence retention
 
-- **Branch:** `agent/reliability-r3d0-foundation`
-- **Base:** merged R3d design main `6eeea6ce553b792dc92cef95ee45f2234f7afe4e` (PR #37)
+- **Branch:** `agent/reliability-r3d2-authority-admission`
+- **Base:** merged R3d1 main `cbcfd1f06b914064456d1798be71bacdc294f3d5` (PR #40)
 - **Status:** design of record **APPROVED / MERGED** at exact design head
-  `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 default-off policy/schema implementation is
-  **RELEASE/COMPATIBILITY APPROVED / PR READY** at exact mechanism commit
+  `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 and R3d1 are merged, and R3d2 is
+  **ACTIVE / R3D2A-R3D2E IMPLEMENTED / SEVENTH SOL APPROVE / SINGLE FABLE LENS APPROVE / EXACT GATE GREEN /
+  FINAL DOCS-ONLY REPRODUCTION REQUIRED BEFORE PR**. Exact candidate `1373985` received four
+  `WRONG` and one `SMELL`; remediation candidate `28e7d28`
+  received three new `WRONG` plus a stale-cursor residual. Commit `f18e74a` closes preflight replay, executable
+  deadline proof/handoff, and same-process lock publication. Focused gates are green at preflight/state/supervisor/
+  transaction **11/0 + 15/0 + 41/0 + 20/0**; exact candidate `840f486` passed binary **645/0/0**, workspace
+  **2,382/0/12 ignored**, and all deterministic release/validator gates. Third review of `d082b49` resolved every
+  mechanism item, found no new `WRONG`, retained two cursor residuals, and raised one post-publication
+  deadline-handoff `SMELL`; `248e373` closes it and the transaction module is **21/0**. The next fold closed the cursor
+  residuals. Fourth review of `c418df4` resolved all ten inherited items, then found clock-rollback reuse and rejected
+  manual advisory reuse as `WRONG`, plus retained-supervisor-directory downgrade as a `SMELL`. `5a01ce7` closes all
+  three with pre-change-red regressions; admission/supervisor/transaction are **17/0 + 41/0 + 22/0**. Exact
+  post-remediation candidate `9fda91b` passes the complete binary **648/0/0**, full serial workspace
+  **2,385/0/12 ignored** across **72** result groups (**55** nonempty), and every deterministic release/validator
+  gate. Fifth review of exact `3e4508a` then left four inherited residuals and no fresh finding. `1b07c80` plus the
+  current docs fold close all four; four pre-change-red regressions cover the three mechanism residuals, and focused
+  state/supervisor/transaction/preflight gates are **19/0 + 42/0 + 23/0 + 11/0**. Exact `68be708` now passes binary
+  **654/0/0**, canonical full workspace
+  **2,391/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic release/validator gate, so
+  that fresh Sol rereview followed on docs-only `8d75069`. It resolved independent-open exclusion and retained-
+  generation rollback, left the cursor and preflight-pass API open, found no fresh finding, and returned `REVISE`.
+  The strengthened API-boundary control failed **0/1** on `8d75069`; `2d1640d` makes pass construction/validation
+  transaction-private while preserving serialized/hash compatibility, and the current fold closes the cursor.
+  Focused preflight/transaction gates are **8/0 + 27/0**. Exact `4133d0a` passes binary **655/0/0**, canonical full
+  workspace **2,392/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic release/validator
+  gate; exact docs-only `e74f93f` reran the same full totals. Seventh Sol/xhigh review of that exact head resolved
+  both residuals, confirmed the other eleven closures, found no fresh finding, and returned `APPROVE`. The single
+  Fable/xhigh release/compatibility lens found no `WRONG`, retained two Minor nonblocking R3d5 hardening `SMELL`s,
+  and returned `APPROVE`. Exact review-evidence head `9b63f42` passes every deterministic release gate at binary
+  **655/0/0** and canonical full workspace **2,392/0/12 ignored** across **72** groups (**55** nonempty). Commit the
+  final gate-recording docs fold, reproduce those full totals, then publish the non-draft PR.
+  The R3d0 default-off policy/schema mechanism was
+  approved at exact mechanism commit
   `5baeeb3f47183ea2a47d2cdc5ffce26f1df7dbfb`, approved cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test head
   `e771067f4a7e742ad813368f01018b011e86bbce`; exact proof-confirmation cursor
@@ -2704,9 +2775,39 @@ Rollback does not revert evidence, erase ledger charges, delete pins/tombstones,
 operator, or run missed windows on re-enable. The last reviewed immutable scheduler binary remains the code
 rollback target. Any code revert is a normal reviewed PR.
 
-**Restart point:** continue R3d1 from `/private/tmp/a2a-bridge-r3d1-supervisor` on branch
-`agent/reliability-r3d1-supervisor`, based on merged R3d0 main
-`c2d147fb1f0df275f3c6452cdd212e185c002d08`. The initial exact-base Fable review plus
+**Restart point:** continue R3d2 closure on branch `agent/reliability-r3d2-authority-admission` in a newly verified
+clean trusted worktree; do not depend on a prior `/private/tmp` worktree or review mirror. The branch is based on
+merged R3d1 main `cbcfd1f06b914064456d1798be71bacdc294f3d5`; use the focused
+[`2026-07-19-r3d2-authority-admission-accounting.md`](2026-07-19-r3d2-authority-admission-accounting.md)
+restart contract. R3d1 merged by PR #40 at that base. R3d2's first review froze `1373985`; its closure candidate
+`28e7d28` received three new `WRONG` and the stale-cursor residual, all mechanism findings are remediated by
+`f18e74a`; exact candidate `840f486` passed the complete deterministic gate. Third review of `d082b49` found no new
+`WRONG`, left two literal cursor residuals, and raised one post-publication deadline-handoff `SMELL`; `248e373`
+closed the smell with a deterministic pre-change-red regression and the next fold closed the cursors. Fourth review
+of exact `c418df4` resolved all ten inherited items and returned `REVISE` with two new `WRONG` plus one `SMELL`;
+`5a01ce7` closes the clock-rollback, manual-reuse, and retained-supervisor-directory findings with three
+pre-change-red regressions. Exact post-remediation candidate `9fda91b` passes the complete deterministic suite,
+including binary **648/0/0** and full serial workspace **2,385/0/12 ignored** across **72** result groups, **55**
+nonempty. Fifth Sol review of exact `3e4508a` marked nine of thirteen inherited items `RESOLVED`, left the cursor,
+effect-API, independent-open locking, and mid-publication rollback items `UNRESOLVED`, found no fresh finding, and
+returned `REVISE`. Commit `1b07c80` plus the current docs fold close all four; focused
+state/supervisor/transaction/preflight gates are **19/0 + 42/0 + 23/0 + 11/0**. Exact candidate `68be708` passes
+binary **654/0/0**, canonical full workspace **2,391/0/12 ignored** across **72** groups (**55** nonempty), and every
+deterministic release/validator gate; docs-only exact `8d75069` reran that full total. Sixth Sol review of `8d75069`
+explicitly adjudicated all four fifth-review residuals, marked eleven inherited items `RESOLVED`, left the cursor
+and preflight-pass API boundary `UNRESOLVED`, found no fresh finding, and returned `REVISE`. The strengthened
+boundary regression failed **0/1** on that head. Commit `2d1640d` makes the pass records, validation, hash, and
+producer transaction-private; this docs fold closes the cursor. Focused preflight/transaction tests pass
+**8/0 + 27/0**. Exact candidate `4133d0a` passes binary **655/0/0**, canonical full workspace **2,392/0/12
+ignored** across **72** groups (**55** nonempty), and every deterministic release/validator gate; exact docs-only
+`e74f93f` reran the same full totals. Seventh Sol closure review of that exact head resolved both sixth-review
+residuals, preserved the other eleven closures, found no fresh finding, and returned `APPROVE`. The single Fable
+release/compatibility lens found no `WRONG`, retained Minor nonblocking real-host legacy-inventory and staged
+`dead_code` hardening smells for R3d5, and returned `APPROVE`. Exact review-evidence head `9b63f42` passes every
+deterministic release gate at binary **655/0/0** and canonical full workspace **2,392/0/12 ignored** across **72**
+groups (**55** nonempty). Commit the final gate-recording three-doc fold, reproduce the same full totals, then
+publish the non-draft R3d2 PR; do not rerun Sol or Fable. The initial exact-base Fable design
+review plus
 exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
 exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, exact-`c50811f`, and
 exact-`fb8a2f4`, exact-`ae9db39`, exact-`2eb242a`, exact-`8dc6054`, exact-`cc01a52`, and exact-`b54840a`
@@ -2834,8 +2935,8 @@ implementation and release/compatibility lens then found no `WRONG`, three nonbl
 `/private/tmp/a2a-bridge-r3d1-fable-lens-review/review.md`, 7,837 bytes, SHA-256
 `088676af7e11beb4d33f1c4410dcf5bfc4a0e55dc1eaa689288934a04de01bed`. No post-approval mechanism change
 occurred; this fold only records review evidence and carries the three integration-hardening smells into R3d2.
-Run exact-final deterministic gates and publish a non-draft R3d1 PR. Preserve R3c/R4 inputs, keep R2f operator
-lifecycle work out of R3d, and never touch the long-lived operator lifecycle from this slice.
+Continue R3d2 through the focused authority/admission/accounting plan above. Preserve R3c/R4 inputs, keep R2f
+operator lifecycle work out of R3d, and never touch the long-lived operator lifecycle from this slice.
 
 ## R3e — OpenRouter provider expansion
 

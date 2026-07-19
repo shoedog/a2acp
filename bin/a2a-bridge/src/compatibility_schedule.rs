@@ -9,6 +9,10 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+use crate::compatibility_schedule_schema::{
+    EffectiveIdentityV1, FingerprintV1, OptionalTextV1,
+    ProfileSourceKindV1 as SchemaProfileSourceKindV1, ProfileSourceRefV1,
+};
 use crate::{compatibility, compatibility_resolution, local_file, BoxError};
 
 const MAX_FOUNDATION_FILE_BYTES: u64 = 1024 * 1024;
@@ -335,6 +339,8 @@ struct CanonicalProfileInputV1 {
     expected_effective_mode: Option<String>,
     config_template: String,
     config_template_sha256: String,
+    #[serde(skip_serializing)]
+    exact_config_sha256: String,
     resolution_constraint_sha256: Option<String>,
     allowed_effects: Vec<EffectClassV1>,
     fixed_prompt_contract: String,
@@ -408,6 +414,69 @@ pub(super) struct LoadedScheduleFoundation {
     pub(super) scheduled_profile_count: usize,
     pub(super) claimed_support_profile_count: usize,
     pub(super) profile_policy_bundle_sha256: String,
+    pub(super) scheduled_profiles: BTreeMap<String, FoundationProfileBindingV1>,
+    pub(super) claimed_support_profiles: BTreeMap<String, FoundationProfileBindingV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FoundationProfileBindingV1 {
+    pub(super) source: ProfileSourceRefV1,
+    pub(super) characterization_profile: FingerprintV1,
+    pub(super) provider_family: String,
+    pub(super) evidence_purpose: EvidencePurposeV1,
+    pub(super) requested_identity: EffectiveIdentityV1,
+    pub(super) expected_effective_identity: EffectiveIdentityV1,
+    pub(super) maximum_caps: EffectCapsV1,
+    pub(super) allowed_effects: Vec<EffectClassV1>,
+    pub(super) config_template_sha256: String,
+    pub(super) exact_config_sha256: String,
+}
+
+fn optional_identity_text(value: &Option<String>) -> OptionalTextV1 {
+    match value {
+        Some(value) => OptionalTextV1::Text {
+            value: value.clone(),
+        },
+        None => OptionalTextV1::Absent,
+    }
+}
+
+fn foundation_profile_binding(
+    profile: &CanonicalProfileInputV1,
+    source_kind: SchemaProfileSourceKindV1,
+    source_sha256: String,
+    row_sha256: String,
+    profile_sha256: String,
+) -> FoundationProfileBindingV1 {
+    FoundationProfileBindingV1 {
+        source: ProfileSourceRefV1 {
+            kind: source_kind,
+            schema_version: 1,
+            source_sha256,
+            row_id: profile.source_id.clone(),
+            row_sha256,
+        },
+        characterization_profile: FingerprintV1 {
+            schema_version: 1,
+            sha256: profile_sha256,
+        },
+        provider_family: profile.provider_family.clone(),
+        evidence_purpose: profile.evidence_purpose,
+        requested_identity: EffectiveIdentityV1 {
+            model: profile.requested_model.clone(),
+            effort: optional_identity_text(&profile.requested_effort),
+            mode: optional_identity_text(&profile.requested_mode),
+        },
+        expected_effective_identity: EffectiveIdentityV1 {
+            model: profile.expected_effective_model.clone(),
+            effort: optional_identity_text(&profile.expected_effective_effort),
+            mode: optional_identity_text(&profile.expected_effective_mode),
+        },
+        maximum_caps: profile.maximum_caps.clone(),
+        allowed_effects: profile.allowed_effects.clone(),
+        config_template_sha256: profile.config_template_sha256.clone(),
+        exact_config_sha256: profile.exact_config_sha256.clone(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1473,7 +1542,8 @@ fn validate_config(
 fn scheduled_profile(
     policy: &SchedulePolicyV1,
     case: &ScheduledCaseV1,
-    config_sha256: String,
+    config_template_sha256: String,
+    exact_config_sha256: String,
     resolution_constraint_sha256: Option<String>,
 ) -> Result<CanonicalProfileInputV1, BoxError> {
     let mut allowed_effects = case.allowed_effects.clone();
@@ -1527,7 +1597,8 @@ fn scheduled_profile(
         expected_effective_effort: case.expected_effective_effort.clone(),
         expected_effective_mode: case.expected_effective_mode.clone(),
         config_template: case.config_template.clone(),
-        config_template_sha256: config_sha256,
+        config_template_sha256,
+        exact_config_sha256,
         resolution_constraint_sha256,
         allowed_effects,
         fixed_prompt_contract: policy.fixed_prompt_contract.clone(),
@@ -1787,6 +1858,7 @@ fn support_profile(
         )
         .into());
     }
+    let exact_config_sha256 = config_snapshot.sha256.clone();
     captures.push(CapturedFoundationFile {
         canonical_path: config_snapshot.canonical_path.clone(),
         sha256: config_snapshot.sha256.clone(),
@@ -2017,6 +2089,7 @@ fn support_profile(
         expected_effective_mode: optional("mode"),
         config_template: config_template.into(),
         config_template_sha256,
+        exact_config_sha256,
         resolution_constraint_sha256: Some(resolution_constraint_sha256),
         allowed_effects,
         fixed_prompt_contract: policy.fixed_prompt_contract.clone(),
@@ -2346,6 +2419,7 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
         label: "production manifest".into(),
         max_bytes: MAX_FOUNDATION_FILE_BYTES,
     });
+    let production_manifest_sha256 = production_manifest_snapshot.sha256.clone();
     let production_manifest_bytes = production_manifest_snapshot.bytes;
     let floating =
         compatibility_resolution::load_recipes(&root.join(&policy.value.floating_recipes))?;
@@ -2370,9 +2444,11 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
 
     let mut expected = BTreeMap::new();
     let mut scheduled_hashes = BTreeMap::new();
+    let mut scheduled_profiles = BTreeMap::new();
     let mut config_hashes = BTreeMap::new();
     for case in &registry.value.cases {
         let (config_sha256, _, capture) = validate_config(&root, case)?;
+        let exact_config_sha256 = capture.sha256.clone();
         captures.push(capture);
         config_hashes.insert(
             case.config.to_string_lossy().into_owned(),
@@ -2383,14 +2459,24 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
             &policy.value,
             case,
             config_sha256,
+            exact_config_sha256,
             resolution_constraint_sha256,
         )?;
         let hash = canonical_hash("scheduled characterization profile", &profile)?;
+        let row_sha256 = canonical_hash("scheduled source row", case)?;
+        let binding = foundation_profile_binding(
+            &profile,
+            SchemaProfileSourceKindV1::ScheduledAdvisory,
+            registry.sha256.clone(),
+            row_sha256,
+            hash.clone(),
+        );
         expected.insert(
             (ProfileSourceKindV1::ScheduledAdvisory, case.id.clone()),
             hash.clone(),
         );
         scheduled_hashes.insert(case.id.clone(), hash);
+        scheduled_profiles.insert(case.id.clone(), binding);
     }
 
     let support = support_profiles(
@@ -2410,12 +2496,21 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
         .into());
     }
     let mut support_hashes = BTreeMap::new();
+    let mut claimed_support_profiles = BTreeMap::new();
     for profile in support {
         config_hashes.insert(
             profile.config_template.clone(),
             profile.config_template_sha256.clone(),
         );
         let hash = canonical_hash("claimed-support characterization profile", &profile)?;
+        let row_sha256 = canonical_hash("claimed-support source row", &profile)?;
+        let binding = foundation_profile_binding(
+            &profile,
+            SchemaProfileSourceKindV1::ClaimedSupportGate,
+            production_manifest_sha256.clone(),
+            row_sha256,
+            hash.clone(),
+        );
         expected.insert(
             (
                 ProfileSourceKindV1::ClaimedSupportGate,
@@ -2423,6 +2518,7 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
             ),
             hash.clone(),
         );
+        claimed_support_profiles.insert(profile.source_id.clone(), binding);
         support_hashes.insert(profile.source_id, hash);
     }
     validate_inventory(&inventory.value, &expected)?;
@@ -2464,6 +2560,8 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
         scheduled_profile_count: scheduled_hashes.len(),
         claimed_support_profile_count: support_hashes.len(),
         profile_policy_bundle_sha256: bundle_sha256,
+        scheduled_profiles,
+        claimed_support_profiles,
     })
 }
 
@@ -2545,6 +2643,223 @@ mod tests {
         let profile = canonical_hash("scheduled characterization profile", &value).unwrap();
         let bundle = canonical_hash("profile policy bundle", &value).unwrap();
         assert_ne!(profile, bundle);
+    }
+
+    #[test]
+    fn every_canonical_profile_field_changes_recharacterization_identity() {
+        let sha = |ch: char| ch.to_string().repeat(64);
+        let profile = CanonicalProfileInputV1 {
+            schema_version: 1,
+            source_kind: ProfileSourceKindV1::ScheduledAdvisory,
+            source_id: "case-1".into(),
+            repository: "shoedog/a2acp".into(),
+            source_schema_version: 1,
+            lane: "floating-current".into(),
+            classification: "canary".into(),
+            evidence_purpose: EvidencePurposeV1::ProviderPathAdvisory,
+            evidence_path: "host".into(),
+            probe: "health".into(),
+            expected_status: ExpectedStatusV1::Pass,
+            execution_mode: "host".into(),
+            provider_family: "openai-codex".into(),
+            agent: "codex-host".into(),
+            capability: "provider-path".into(),
+            adapter_family: "codex-acp".into(),
+            agent_cli_family: "codex".into(),
+            image_family: Some("node-acp-reader-v1".into()),
+            auth_path: "pre_authenticated".into(),
+            credential_env_name: Some("OPENAI_API_KEY".into()),
+            required_env: vec![RequiredEnvironmentV1 {
+                name: "PATH".into(),
+                one_of: vec!["/opt/homebrew/bin".into()],
+            }],
+            environment_owner: "wesleyjinks".into(),
+            os: "macos".into(),
+            architecture: "aarch64".into(),
+            session_cwd: "/Users/wesleyjinks/code/a2a-bridge".into(),
+            requested_model: "gpt-5.6-luna".into(),
+            requested_effort: Some("low".into()),
+            requested_mode: None,
+            expected_effective_model: "gpt-5.6-luna".into(),
+            expected_effective_effort: Some("low".into()),
+            expected_effective_mode: None,
+            config_template: "codex-host-read-only-v1".into(),
+            config_template_sha256: sha('1'),
+            exact_config_sha256: sha('2'),
+            resolution_constraint_sha256: Some(sha('3')),
+            allowed_effects: vec![EffectClassV1::ProviderPrompt],
+            fixed_prompt_contract: "compatibility-smoke-v1".into(),
+            artifact_template: "compatibility-evidence-v1".into(),
+            artifact_retention_days: 180,
+            artifact_redaction: "strict".into(),
+            maximum_caps: EffectCapsV1 {
+                timeout_secs: 60,
+                max_tokens: 1000,
+                max_cost_microusd: 1000,
+                attempts: 1,
+                retry_cap: 0,
+                fallback_cap: 0,
+            },
+        };
+        let base = canonical_hash("scheduled characterization profile", &profile).unwrap();
+        macro_rules! changes_profile {
+            ($name:literal, |$value:ident| $body:block) => {{
+                let mut $value = profile.clone();
+                $body
+                assert_ne!(
+                    canonical_hash("scheduled characterization profile", &$value).unwrap(),
+                    base,
+                    "{}",
+                    $name
+                );
+            }};
+        }
+        changes_profile!("schema_version", |value| {
+            value.schema_version = 2;
+        });
+        changes_profile!("source_kind", |value| {
+            value.source_kind = ProfileSourceKindV1::ClaimedSupportGate;
+        });
+        changes_profile!("source_id", |value| {
+            value.source_id = "case-2".into();
+        });
+        changes_profile!("repository", |value| {
+            value.repository = "shoedog/other".into();
+        });
+        changes_profile!("source_schema_version", |value| {
+            value.source_schema_version = 2;
+        });
+        changes_profile!("lane", |value| {
+            value.lane = "support".into();
+        });
+        changes_profile!("classification", |value| {
+            value.classification = "support".into();
+        });
+        changes_profile!("evidence_purpose", |value| {
+            value.evidence_purpose = EvidencePurposeV1::ClaimedSupportGate;
+        });
+        changes_profile!("evidence_path", |value| {
+            value.evidence_path = "reader".into();
+        });
+        changes_profile!("probe", |value| {
+            value.probe = "catalog".into();
+        });
+        changes_profile!("expected_status", |value| {
+            value.expected_status = ExpectedStatusV1::Fail;
+        });
+        changes_profile!("execution_mode", |value| {
+            value.execution_mode = "container_ro".into();
+        });
+        changes_profile!("provider_family", |value| {
+            value.provider_family = "anthropic-claude".into();
+        });
+        changes_profile!("agent", |value| {
+            value.agent = "codex-reader".into();
+        });
+        changes_profile!("capability", |value| {
+            value.capability = "claimed-support".into();
+        });
+        changes_profile!("adapter_family", |value| {
+            value.adapter_family = "claude-agent-acp".into();
+        });
+        changes_profile!("agent_cli_family", |value| {
+            value.agent_cli_family = "claude".into();
+        });
+        changes_profile!("image_family", |value| {
+            value.image_family = None;
+        });
+        changes_profile!("auth_path", |value| {
+            value.auth_path = "automatic".into();
+        });
+        changes_profile!("credential_env_name", |value| {
+            value.credential_env_name = None;
+        });
+        changes_profile!("required_env_name", |value| {
+            value.required_env[0].name = "HOME".into();
+        });
+        changes_profile!("required_env_constraint", |value| {
+            value.required_env[0].one_of[0] = "/usr/bin".into();
+        });
+        changes_profile!("environment_owner", |value| {
+            value.environment_owner = "other".into();
+        });
+        changes_profile!("os", |value| {
+            value.os = "linux".into();
+        });
+        changes_profile!("architecture", |value| {
+            value.architecture = "x86_64".into();
+        });
+        changes_profile!("session_cwd", |value| {
+            value.session_cwd = "/Users/wesleyjinks/code/stockTrading".into();
+        });
+        changes_profile!("requested_model", |value| {
+            value.requested_model = "gpt-5.6-sol".into();
+        });
+        changes_profile!("requested_effort", |value| {
+            value.requested_effort = Some("medium".into());
+        });
+        changes_profile!("requested_mode", |value| {
+            value.requested_mode = Some("plan".into());
+        });
+        changes_profile!("expected_effective_model", |value| {
+            value.expected_effective_model = "gpt-5.6-sol".into();
+        });
+        changes_profile!("expected_effective_effort", |value| {
+            value.expected_effective_effort = Some("medium".into());
+        });
+        changes_profile!("expected_effective_mode", |value| {
+            value.expected_effective_mode = Some("plan".into());
+        });
+        changes_profile!("config_template", |value| {
+            value.config_template = "codex-reader-read-only-v1".into();
+        });
+        changes_profile!("config_template_sha256", |value| {
+            value.config_template_sha256 = sha('4');
+        });
+        changes_profile!("resolution_constraint_sha256", |value| {
+            value.resolution_constraint_sha256 = Some(sha('5'));
+        });
+        changes_profile!("allowed_effects", |value| {
+            value.allowed_effects = vec![EffectClassV1::RegistryRead];
+        });
+        changes_profile!("fixed_prompt_contract", |value| {
+            value.fixed_prompt_contract = "compatibility-smoke-v2".into();
+        });
+        changes_profile!("artifact_template", |value| {
+            value.artifact_template = "compatibility-evidence-v2".into();
+        });
+        changes_profile!("artifact_retention_days", |value| {
+            value.artifact_retention_days += 1;
+        });
+        changes_profile!("artifact_redaction", |value| {
+            value.artifact_redaction = "strict-v2".into();
+        });
+        changes_profile!("maximum_timeout", |value| {
+            value.maximum_caps.timeout_secs += 1;
+        });
+        changes_profile!("maximum_tokens", |value| {
+            value.maximum_caps.max_tokens += 1;
+        });
+        changes_profile!("maximum_cost", |value| {
+            value.maximum_caps.max_cost_microusd += 1;
+        });
+        changes_profile!("maximum_attempts", |value| {
+            value.maximum_caps.attempts += 1;
+        });
+        changes_profile!("maximum_retry", |value| {
+            value.maximum_caps.retry_cap += 1;
+        });
+        changes_profile!("maximum_fallback", |value| {
+            value.maximum_caps.fallback_cap += 1;
+        });
+
+        let mut execution_only = profile;
+        execution_only.exact_config_sha256 = sha('6');
+        assert_eq!(
+            canonical_hash("scheduled characterization profile", &execution_only).unwrap(),
+            base,
+            "exact config bytes are deliberately case-execution identity, not profile identity"
+        );
     }
 
     #[test]

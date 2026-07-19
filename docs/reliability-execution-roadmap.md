@@ -1,12 +1,116 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main base:** `origin/main` at `c2d147fb1f0df275f3c6452cdd212e185c002d08` on 2026-07-18
-  (PR #38 merged R3d0)
-- **Completed through:** R3d0 **MERGED** at `c2d147fb`; R2e remains deferred and off the critical path
-- **Active slice:** R3d1 supervisor and signal parity on `agent/reliability-r3d1-supervisor`, based directly on
-  `c2d147fb`; it is non-billable and uses local fake child processes only
-- **Current R3d1 implementation gate:** **APPROVED FOR PR**. Initial exact candidate `01438c34` received a fresh
+- **Current main base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5` on 2026-07-19
+  (PR #40 merged R3d1)
+- **Completed through:** R3d1 **MERGED** at `cbcfd1f`; R2e remains deferred and off the critical path
+- **Active slice:** R3d2 authority, admission, preflights, and accounting on
+  `agent/reliability-r3d2-authority-admission`, based directly on `cbcfd1f`; it is non-billable and uses only
+  fake clocks/process inventories/effect controls and owner-private temporary state roots in tests
+- **Current R3d2 implementation gate:** **R3D2A-R3D2E IMPLEMENTED / SEVENTH SOL APPROVE / SINGLE FABLE LENS
+  APPROVE / EXACT GATE GREEN / FINAL DOCS-ONLY REPRODUCTION REQUIRED BEFORE PR**. The restart
+  contract is
+  [`2026-07-19-r3d2-authority-admission-accounting.md`](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md).
+  R3d2a closes the three inherited R3d1 integration smells, owns cancellation before `Running`, retains the
+  exact runner child for exit proof, and adds the private local state-root plus nonblocking lock primitives.
+  R3d2b adds sealed provider/storage authority, one-shot/manual lifecycle and append-only recovery, cross-process
+  issuance exclusion, exact standing/characterization selection, and independently rederived scheduled and
+  claimed-support sources. R3d2c adds exact final identities, equivalent-work/characterization reducers, and
+  disjoint hold/waste/quarantine controls. R3d2d adds crash-conservative append-only accounting, legacy-inventory
+  holds, action-directory pinning, and the same closed zero-effect preflight checklist at both fences. R3d2e adds
+  one canonical admission linearization point, same-capability authority/source/accounting revalidation, opaque
+  one-shot supervisor handoff, crash-idempotent terminal reconciliation, and a fixed-root fail-closed legacy
+  boundary. `schedule-tick` remains typed `r3d5_activation_not_enabled; no_effects`; no live route references the
+  admitted capability. Reviewed candidate `1373985` had transaction **16/0**, state/root/locks **13/0**, legacy
+  boundary **1/0**, complete compatibility CLI **22/0**, binary **639/0/0**, and full serial workspace
+  **2,376/0/12 ignored** across **72** targets. The first full binary gate
+  exposed and `2b333ba` fixed same-attempt ledger timestamp re-derivation; the isolated regression and all 12 ledger
+  tests are green. Its first bridge-mediated Sol/xhigh/read-only implementation review returned four `WRONG`, one
+  `SMELL`, and `R3D2 IMPLEMENTATION: REVISE`: caller-supplied completed-terminal identity/usage was not bound to the
+  joined child aggregate; proposal preparation made safe-session reuse unreachable; fixed-root canonicalization
+  followed intermediate suffix symlinks; the master cursor was stale; and standalone `compatibility resolve`
+  takeover scope was ambiguous. `f481f39` closes aggregate proof and reuse, `cdf833a` retains the aggregate terminal
+  time, and `f700cde` descriptor-walks every fixed
+  suffix component, and the current docs fold closes the cursor plus explicitly retains provider-free standalone
+  resolve under its R3c acknowledgement while scheduler-owned resolution remains admission-bound. Post-remediation
+  focused gates are transaction **17/0**, state/root/locks **14/0**, supervisor **41/0**, and local-file **11/0**.
+  The complete binary is **641/0/0** and the serial workspace is **2,378/0/12 ignored** across **72** targets;
+  format/diff, warnings-denied workspace check/Clippy, locked release, dependency policy, hygiene **37/7**, all
+  validators, compatibility CLI **22/0**, and legacy boundary **1/0** are green. The release binary is 26,604,912
+  bytes at SHA-256 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`. Closure review of exact
+  `28e7d28` marked four inherited items resolved, the cursor unresolved, and returned `REVISE` with three new
+  `WRONG`: cross-admission preflight replay, an unproved supervisor deadline digest, and a same-process lock
+  check/publication race. All three regressions failed on the reviewed mechanism. Commit `f18e74a` binds internally
+  generated passes to the full admission/authority/directory/deadline subject, carries a validated executable
+  authority-contained hard deadline through durable commit and opaque handoff, and makes process-local lock
+  transition publication atomic. Its focused gates are preflight **11/0**, state/root/locks **15/0**, supervisor
+  **41/0**, and transaction **20/0**. Exact docs-fold candidate `840f486` passed binary **645/0/0** and the full
+  serial workspace **2,382/0/12 ignored** across **72** result groups, **55** nonempty; format/diff, warnings-denied
+  workspace check/Clippy, locked release, dependency policy, hygiene **37/7**, and all validators are green. The
+  release binary remains byte-identical at 26,604,912 bytes and SHA-256 `5454b5eb...f584`. Sol then re-reviewed
+  exact `d082b49`: all seven inherited mechanism items were `RESOLVED`, the two literal cursor items remained
+  `UNRESOLVED`, no new `WRONG` was found, and one Medium `SMELL` identified expiry between durable publication and
+  runner invocation. The new regression failed on the reviewed mechanism by invoking the runner after forced
+  post-publication expiry. Commit `248e373` adds the final capability deadline check; the regression, positive
+  handoff, and complete transaction module are green at **1/0 + 1/0 + 21/0**. The docs fold closed the two cursor
+  residuals. Fourth Sol review of exact `c418df4` marked all ten inherited items `RESOLVED`, confirmed the docs/status
+  boundary was literally consistent, and returned `REVISE` with two new `WRONG / Medium` plus one `SMELL / Medium`:
+  reuse admitted a clock earlier than its selected evidence terminal, eligible manual advisory reuse was rejected
+  instead of consuming its one-run authority, and supervisor publication downgraded its retained directory
+  capability to a pathname. Its prompt is 11,027 bytes at SHA-256 `a5363563...f15`; its mode-`0644` report is 18,784
+  bytes at SHA-256 `70467885...e6a`. All three regressions failed **0/1** on the reviewed mechanism. Commit `5a01ce7`
+  adds the evidence-availability watermark, permits only exact manual advisory reuse while consuming its nonce once,
+  and keeps supervisor journal I/O descriptor-relative to the retained scheduler directory while refusing pathname
+  replacement. Focused admission/supervisor/transaction gates are **17/0 + 41/0 + 22/0**. Exact post-remediation
+  candidate `9fda91b` passed the complete binary **648/0/0** and full serial workspace **2,385/0/12 ignored** across
+  **72** result groups, **55** nonempty. Format/diff, warnings-denied workspace check/Clippy, locked release,
+  dependency policy, hygiene **37/7**, manifest **9**, recipes **4**, foundation **6 scheduled / 4 claimed-support**,
+  and compatibility CLI **22/0** are green. The release binary remains 26,604,912 bytes at SHA-256
+  `5454b5eb...f584`. Fifth Sol review of exact `3e4508a` marked nine of thirteen inherited items `RESOLVED`, left
+  four `UNRESOLVED`, found no fresh finding, and returned `REVISE`: active cursor surfaces were stale; proposal,
+  builder, and raw journal effects remained sibling-visible; independently opened scheduler roots could overlap
+  owner-wide and authority-only capabilities; and mid-publication supervisor replacement left a generation in the
+  retained directory. The three mechanism residuals had four focused regressions, each failing **0/1** on the
+  reviewed mechanism. Commit `1b07c80` makes the admission effect products transaction-private, reserves both
+  kernel locks in owner-then-authority order across
+  independent root handles, and rolls back plus directory-syncs the retained generation; this docs fold closes the
+  cursor. Focused state/supervisor/transaction/preflight gates are **19/0 + 42/0 + 23/0 + 11/0**. Exact candidate
+  `68be708` passed the complete binary **654/0/0** and canonical full serial workspace **2,391/0/12 ignored** across
+  **72** result groups, **55** nonempty. Format/diff, warnings-denied workspace check/Clippy, locked release,
+  dependency policy, hygiene **37/7**, manifest **9**, recipes **4**, foundation **6/4**, compatibility CLI **22/0**,
+  foundation CLI **31/0**, supervisor CLI **2/0**, legacy boundary **1/0**, and issue-intake live/local validators
+  are green. The release binary remains 26,604,912 bytes at SHA-256 `5454b5eb...f584`. Exact docs-only candidate
+  `8d75069` reran the same canonical full serial workspace at **2,391/0/12 ignored** across **72** groups (**55**
+  nonempty). Sixth Sol review of that exact head marked items 1, 2, 3, 5, 6, and 8 through 13 `RESOLVED`; left the
+  stale next-action cursor and sibling-visible preflight pass construction/validation `UNRESOLVED`; found no fresh
+  `WRONG` or `SMELL`; and returned `REVISE`. Its report is 14,359 bytes, mode `0644`, SHA-256
+  `8a487ffd...b3d8`. The strengthened API-boundary regression failed **0/1** on reviewed `8d75069` because
+  `PreflightBindingV1` remained sibling-visible. Commit `2d1640d` moves the fence, binding, pass, refusal, hash, and
+  producer into the transaction module with private visibility, preserves the canonical pass hash domain, and
+  leaves only the closed local-check/proof and directory primitives in preflight. The current docs fold closes the
+  cursor residual by recording all four fifth-review residuals and the sixth review's exact disposition. Focused
+  preflight/transaction gates are **8/0 + 27/0**. Exact candidate `4133d0a` passes complete binary **655/0/0** and
+  canonical full serial workspace **2,392/0/12 ignored** across **72** groups (**55** nonempty). Format/diff,
+  warnings-denied workspace check/Clippy, locked release build, dependency policy, hygiene **37/7**, manifest **9**,
+  recipes **4**, foundation **6/4**, compatibility CLI **22/0**, foundation CLI **31/0**, supervisor CLI **2/0**,
+  legacy boundary **1/0**, and issue-intake live/local validators are green. The 201,503-byte full-suite log has
+  SHA-256 `f2e32c46...b930`; the release binary remains 26,604,912 bytes at SHA-256 `5454b5eb...f584`. Exact
+  docs-only review head `e74f93f` independently reran the full workspace at **2,392/0/12 ignored**. Seventh Sol/
+  xhigh review of that exact head resolved both sixth-review residuals, preserved the other eleven closures, found
+  no fresh `WRONG` or `SMELL`, and returned `APPROVE`. The single Fable/xhigh release/compatibility lens then found
+  no `WRONG`, retained two Minor nonblocking R3d5 hardening `SMELL`s, and returned `APPROVE`. Exact review-evidence
+  head `9b63f42` passes every deterministic release gate at binary **655/0/0** and full workspace **2,392/0/12
+  ignored** across **72** groups (**55** nonempty); its canonical log SHA-256 is `a585434d...2080`. R3d2 still has one
+  merge boundary and
+  five internal subincrements: R3d1 integration hardening/local state; private
+  authority and source reducers; exact identities/equivalent work/control reducers; ledger/legacy/preflights; then
+  the shared transaction/default-off integration. No internal commit independently enables effects. The only
+  admission lock order is owner-wide then authority-state, and one durable commit binds authority consumption,
+  admission identity, equivalent-work disposition, and budget reservation before supervisor handoff. The fixed
+  production scheduler root remains absent and was not created. R3d2 does not
+  issue real authority or perform a provider, registry, image, runtime, GitHub, iCloud, timer, or production-operator
+  effect.
+- **R3d1 closure:** **MERGED** by PR #40 at `cbcfd1f`. Initial exact candidate `01438c34` received a fresh
   bridge-mediated Sol/xhigh/read-only review: eight `WRONG`, two `SMELL`, and
   `R3D1 IMPLEMENTATION: REVISE`. The remediation enforces deadline-first phase-local caps with complete later-phase
   reservation; keeps cleanup signal authority in the retained child handle; revalidates exact ancestry/topology;
@@ -414,14 +518,16 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** run the exact-final deterministic gates on the docs-only review fold, publish a non-draft R3d1 PR,
-  and wait for its required checks. Both exact-code review gates are approved; do not spend another Fable turn or
-  change the approved mechanism before publication. No live compatibility gate is authorized; R3d1 must not perform
-  any production-operator lifecycle action. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
+- **Next action:** exact `e74f93f` is approved by the seventh Sol/xhigh implementation review and the single
+  Fable/xhigh release/compatibility lens; exact review-evidence head `9b63f42` passes every deterministic release
+  gate. Commit this final gate-recording three-doc fold, rerun format/diff, hygiene, and the canonical full suite on
+  its exact head, and publish one non-draft R3d2 PR only if **2,392/0/12** across **72** groups reproduces. Do not
+  rerun Sol or Fable. No live compatibility/provider gate or production-operator lifecycle action is authorized.
+  OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**
-  [`superpowers/plans/2026-07-19-r3d1-supervisor-signal-parity.md`](superpowers/plans/2026-07-19-r3d1-supervisor-signal-parity.md)
+  [`superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md`](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md)
 - **Operating runbook:**
   [`../skills/a2a-bridge-operator/SKILL.md`](../skills/a2a-bridge-operator/SKILL.md)
 
@@ -443,7 +549,8 @@ R2a provenance (MERGED)
   -> R2c explicit one-turn billable smoke (MERGED)
        -> R2d local non-billable fallback plan (MERGED)
             -> R3 compatibility manifest + pinned/floating canaries + OpenRouter/OpenCode
-               (IN REVIEW: R3a/R3b/R3c/R3d0 MERGED; R3d DESIGN MERGED; R3d1 IMPLEMENTATION REVIEW)
+               (ACTIVE: R3a/R3b/R3c/R3d0/R3d1 MERGED; R3d DESIGN MERGED;
+                R3d2 IMPLEMENTED / SOL APPROVE / FABLE APPROVE / EXACT GATE GREEN / FINAL DOCS REPRODUCTION)
                  -> R4 reproducible dependency/image pins + release promotion gate
 
 R2e authenticated in-process fallback is DEFERRED and off the critical path.
@@ -470,7 +577,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (three incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`; R3d0 **MERGED** by PR #38 at `c2d147fb`. R3d1 is **APPROVED FOR PR** on `agent/reliability-r3d1-supervisor`: initial exact `01438c34` Sol/xhigh review returned eight `WRONG`, two `SMELL`, and `REVISE`; exact `e81ebbb`, `8feda4d`, `7fafe79`, and `b55c17d` closures drove four remediations; exact fifth-remediation head `b511d6c` received Sol/xhigh implementation `APPROVE` with no new finding, then the single Fable/xhigh release/compatibility lens returned `APPROVE` with no `WRONG` and three nonblocking Minor `SMELL`s. The approved mechanism requires retained anchors through every signal-capable phase and permits release or ambiguity only in the corresponding no-later-signal phase. Focused gates are **6/0**, **1/0**, **31/0**, **33/0**, **4/0**, **21/0**, and **2/0**; full serial workspace is **2,279/0/12 ignored** across **56** binaries, and all complete deterministic release/validator gates are green. Candidate release SHA-256 is `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. No live compatibility gate or production-operator lifecycle action occurred. | [R3d1 implementation plan](superpowers/plans/2026-07-19-r3d1-supervisor-signal-parity.md) | Rerun exact-final deterministic gates on the docs-only evidence fold and publish a non-draft PR. R3d never touches the long-lived operator lifecycle. |
+| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at `b54840a` by PR #37; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`. R3d2 is **ACTIVE / R3D2A-R3D2E IMPLEMENTED / SEVENTH SOL APPROVE / SINGLE FABLE LENS APPROVE / EXACT GATE GREEN / FINAL DOCS-ONLY REPRODUCTION REQUIRED BEFORE PR** on `agent/reliability-r3d2-authority-admission`, with one merge boundary. Exact `e74f93f` closed both sixth-review residuals under Sol/xhigh with no fresh finding; the single Fable/xhigh lens found no `WRONG`, retained two Minor R3d5 hardening `SMELL`s, and approved. Exact review-evidence `9b63f42` passes binary **655/0/0**, canonical full workspace **2,392/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic release/validator gate. No live compatibility gate, production state-root creation, or production-operator lifecycle action occurred. | [R3d2 implementation plan](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md) | Commit final three-doc gate fold, reproduce full totals, then publish one non-draft PR. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -525,6 +632,13 @@ the evidence has not yet separated a capacity ceiling from a poisoned long-lived
 model, auth, and cwd incompatibility predict failure in the isolated operator and are falsified by its green
 turn. A transport-specific fault predicts old-only failure without requiring a particular session count and
 remains viable. No operator process, warm session, or active turn was stopped or restarted.
+
+The same failure boundary recurred on 2026-07-19 while reviewing R3d2 exact `3e4508a`: the long-lived production
+operator returned generic `AgentCrashed` before creating a task/session/turn row or recording prompt/usage evidence,
+while its roughly two-day-old warm codex-acp/Codex process tree remained alive. One explicit fresh one-shot bridge
+using the same production release binary, adapter/CLI, raw model, effort, mode, and review input completed normally.
+This strengthens the old-generation-only asymmetry but still does not distinguish poisoned transport from session
+capacity. The production request was not retried, and no production process, session, config, or state was changed.
 
 Carry this into R2f as structured pre-turn ACP error retention, backend/session-capacity health,
 capability-gated close semantics, dead-backend detection, deterministic capacity-versus-transport
@@ -745,8 +859,47 @@ Next action:
   at `504c1e434fd5845bc6745e0b0a0aae95427afbdd`. R3c merged through PR #33 at
   `983398427c9f04861a2f1da501a7650c4a1cdd80`. R3d design merged through PR #37 at
   `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`; R3d0 merged through PR #38 at
-  `c2d147fb1f0df275f3c6452cdd212e185c002d08`. R3d1 is in review on
-  `agent/reliability-r3d1-supervisor`, based directly on that merge. The manifest still contains nine
+  `c2d147fb1f0df275f3c6452cdd212e185c002d08`; R3d1 merged through PR #40 at
+  `cbcfd1f06b914064456d1798be71bacdc294f3d5`. R3d2a-e are implemented on
+  `agent/reliability-r3d2-authority-admission`, based directly on that merge. First reviewed candidate `1373985`
+  received four `WRONG`, one `SMELL`, and `REVISE`; remediation head `28e7d28` then passed **641/0/0** binary and
+  **2,378/0/12 ignored** full workspace before Sol closure review returned three new `WRONG` and a stale-cursor
+  residual. Commit `f18e74a` binds both preflights to the exact admission and makes them internal to one `admit`
+  operation, joins and durably records the validated executable authority-contained deadline, transfers that same
+  deadline in the opaque handoff, and serializes same-process lock-state publication. Focused gates are preflight
+  **11/0**, state/root/locks **15/0**, supervisor **41/0**, and transaction **20/0**. Exact docs-fold candidate
+  `840f486` passed binary **645/0/0** and full workspace **2,382/0/12 ignored** across **72** groups; all deterministic
+  release/validator gates are green. Third Sol review of exact `d082b49` marked every inherited mechanism item
+  `RESOLVED`, left the two cursor items `UNRESOLVED`, found no new `WRONG`, and reported one Medium `SMELL`: the
+  committed capability could expire immediately before runner invocation. Its deterministic regression failed on
+  that reviewed mechanism; `248e373` adds the final refusal, keeps the conservative reservation, and passes the
+  regression, positive handoff, and full transaction module at **1/0 + 1/0 + 21/0**. The cursor fold completed;
+  fourth review of exact `c418df4` then resolved all ten inherited items and found two new `WRONG` plus one `SMELL`.
+  All three focused regressions failed on that reviewed mechanism; `5a01ce7` closes clock-rollback reuse, manual
+  advisory reuse/one-run consumption, and retained supervisor-directory publication. Focused admission/supervisor/
+  transaction gates are **17/0 + 41/0 + 22/0**. Exact candidate `3e4508a` then received a fifth Sol `REVISE`: nine
+  inherited items resolved, four residuals unresolved, and no fresh finding. `1b07c80` plus the current docs fold
+  close transaction-effect API visibility, independent-open lock exclusion, supervisor rollback after
+  mid-publication replacement, and the stale cursor. Four focused regressions covering the three mechanism
+  residuals failed **0/1** before remediation;
+  focused state/supervisor/transaction/preflight gates are **19/0 + 42/0 + 23/0 + 11/0**. Exact candidate
+  `68be708` passes binary **654/0/0**, canonical full workspace **2,391/0/12 ignored** across **72** groups (**55**
+  nonempty), and every deterministic release/validator gate; docs-only exact `8d75069` reran the same full total.
+  Sixth Sol review of `8d75069` resolved eleven inherited items, left the stale cursor and sibling-visible preflight
+  pass API unresolved, found no fresh finding, and returned `REVISE`. The strengthened boundary regression failed
+  **0/1** on that head. Commit `2d1640d` makes pass construction, validation, hashing, and records
+  transaction-private while preserving the canonical hash domain; this docs fold closes the cursor. Focused
+  preflight/transaction tests pass **8/0 + 27/0**. Exact candidate `4133d0a` passes binary **655/0/0**, canonical
+  full workspace **2,392/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic release/
+  validator gate; exact docs-only `e74f93f` reran the same full totals. Seventh Sol review of that exact head resolved
+  both residuals, preserved the other eleven closures, found no fresh finding, and returned `APPROVE`. The single
+  Fable release/compatibility lens found no `WRONG`, retained two Minor nonblocking R3d5 hardening `SMELL`s, and
+  returned `APPROVE`. Exact review-evidence head `9b63f42` passes every deterministic release gate at binary
+  **655/0/0** and canonical full workspace **2,392/0/12 ignored** across **72** groups (**55** nonempty). Commit the
+  final gate-recording docs fold, reproduce those full totals, then publish the non-draft PR.
+  No production state root,
+  authority, trigger, live effect, or operator lifecycle action was created. The
+  manifest still contains nine
   exact pinned rows: four release-blocking minimal bridge-smoke support cases and five explicit
   historical/non-goal controls. Every config is checked in and SHA-bound before provider spawn. The two
   supported reader cases and the stale Kiro reader control use the separately tagged immutable image
