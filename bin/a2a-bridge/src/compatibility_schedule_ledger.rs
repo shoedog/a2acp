@@ -1227,7 +1227,11 @@ impl<'lock> FileCompatibilityLedger<'lock> {
     ) -> Result<LedgerReservationV1, BoxError> {
         self.check_headroom(request, reserved_at_ms)
             .map_err(|error| -> BoxError { error.to_string().into() })?;
-        Self::request_record(request, reserved_at_ms)
+        let proposed = Self::request_record(request, reserved_at_ms)?;
+        if let Some(existing) = self.reservations.get(&proposed.reservation_id) {
+            return Ok(existing.record.clone());
+        }
+        Ok(proposed)
     }
 
     pub(super) fn commit_prepared_reservation(
@@ -1731,10 +1735,10 @@ mod tests {
         let owner = state.try_owner_admission("test:crash").unwrap();
         let ids = identities(standing_authority(), TriggerKindV1::Daily, 'c');
         let budget = standing_policy();
-        let request = request(&ids, AccountingClassV1::Scheduled, "case-1", &budget);
+        let original_request = request(&ids, AccountingClassV1::Scheduled, "case-1", &budget);
         let reservation = {
             let mut ledger = FileCompatibilityLedger::open(&owner).unwrap();
-            let (outcome, reservation) = ledger.reserve(&request, 1_000).unwrap();
+            let (outcome, reservation) = ledger.reserve(&original_request, 1_000).unwrap();
             assert_eq!(outcome, LedgerAppendOutcomeV1::Created);
             assert_eq!(
                 ledger.total_charge().unwrap(),
@@ -1748,9 +1752,11 @@ mod tests {
             AggregateUsageV1::from_caps(&caps())
         );
         assert_eq!(
-            recovered.reserve(&request, 2_000).unwrap().0,
+            recovered.reserve(&original_request, 2_000).unwrap().0,
             LedgerAppendOutcomeV1::ExistingIdentical
         );
+        let changed_request = request(&ids, AccountingClassV1::Scheduled, "case-2", &budget);
+        assert!(recovered.reserve(&changed_request, 2_000).is_err());
         let decision = ReconciliationDecisionV1::Conservative {
             evidence_sha256: digest('f'),
             reason: ConservativeChargeReasonV1::MissingUsage,
