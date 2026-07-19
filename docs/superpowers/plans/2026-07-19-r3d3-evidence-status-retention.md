@@ -1,8 +1,8 @@
 # R3d3 — evidence, status, and retention implementation plan
 
-**Status:** implementation started on `agent/reliability-r3d3-evidence-retention` from merged R3d2
-`origin/main` `06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41). This slice is local,
-non-billable, default-off, and has one merge boundary.
+**Status:** R3d3a is checkpointed at `21427e6` on `agent/reliability-r3d3-evidence-retention` from merged
+R3d2 `origin/main` `06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41); R3d3b is next. This slice
+is local, non-billable, default-off, and has one merge boundary.
 
 The approved design of record is
 [`2026-07-11-r3-compatibility-canaries.md`](2026-07-11-r3-compatibility-canaries.md), especially D4/D8,
@@ -119,6 +119,13 @@ obtain the matching exclusive lease without queueing.
 Pre-change-red/edge proof: absent R3d3 state types; shortened class/case clock; active pin; open reader; second
 process race; tombstone crash before/after unlink; corrupt chain; case-fold path collision; quota at/below limit;
 protected oldest object; and arithmetic overflow.
+
+Checkpoint `21427e6` implements this foundation. Its fail-first regressions demonstrated missing state APIs,
+hard-coded index generation, backdated/future pin and tombstone events, skipped durable-pending tombstones, a
+missing 180-day incident-unpin lifetime, cold-path retirement before the full clock, over-cap reservation, sealed
+byte overcounting, and incomplete tombstone recovery identity. The corrected focused gates are evidence **18/0**,
+retained state **19/0**, and strict schema **32/0**, with format and diff checks green. Full-workspace and release
+gates remain deliberately deferred until the complete R3d3 review candidate.
 
 ### R3d3b — deterministic sealing and schedule evidence publication
 
