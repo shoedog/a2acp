@@ -1138,11 +1138,12 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 
 ## R3d — owner-bound scheduling and evidence retention
 
-- **Branch:** `agent/reliability-r3d0-foundation`
-- **Base:** merged R3d design main `6eeea6ce553b792dc92cef95ee45f2234f7afe4e` (PR #37)
+- **Branch:** `agent/reliability-r3d2-authority-admission`
+- **Base:** merged R3d1 main `cbcfd1f06b914064456d1798be71bacdc294f3d5` (PR #40)
 - **Status:** design of record **APPROVED / MERGED** at exact design head
-  `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 default-off policy/schema implementation is
-  **RELEASE/COMPATIBILITY APPROVED / PR READY** at exact mechanism commit
+  `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 and R3d1 are merged, and R3d2 is
+  **ACTIVE / FOCUSED PLAN LOCKED** with no implementation yet. The R3d0 default-off policy/schema mechanism was
+  approved at exact mechanism commit
   `5baeeb3f47183ea2a47d2cdc5ffce26f1df7dbfb`, approved cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test head
   `e771067f4a7e742ad813368f01018b011e86bbce`; exact proof-confirmation cursor
@@ -2704,9 +2705,11 @@ Rollback does not revert evidence, erase ledger charges, delete pins/tombstones,
 operator, or run missed windows on re-enable. The last reviewed immutable scheduler binary remains the code
 rollback target. Any code revert is a normal reviewed PR.
 
-**Restart point:** continue R3d1 from `/private/tmp/a2a-bridge-r3d1-supervisor` on branch
-`agent/reliability-r3d1-supervisor`, based on merged R3d0 main
-`c2d147fb1f0df275f3c6452cdd212e185c002d08`. The initial exact-base Fable review plus
+**Restart point:** continue R3d2 from `/private/tmp/a2a-bridge-r3d2-authority-admission` on branch
+`agent/reliability-r3d2-authority-admission`, based on merged R3d1 main
+`cbcfd1f06b914064456d1798be71bacdc294f3d5`, using the focused
+[`2026-07-19-r3d2-authority-admission-accounting.md`](2026-07-19-r3d2-authority-admission-accounting.md)
+restart contract. R3d1 merged by PR #40 at that base. The initial exact-base Fable review plus
 exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
 exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, exact-`c50811f`, and
 exact-`fb8a2f4`, exact-`ae9db39`, exact-`2eb242a`, exact-`8dc6054`, exact-`cc01a52`, and exact-`b54840a`
@@ -2834,8 +2837,8 @@ implementation and release/compatibility lens then found no `WRONG`, three nonbl
 `/private/tmp/a2a-bridge-r3d1-fable-lens-review/review.md`, 7,837 bytes, SHA-256
 `088676af7e11beb4d33f1c4410dcf5bfc4a0e55dc1eaa689288934a04de01bed`. No post-approval mechanism change
 occurred; this fold only records review evidence and carries the three integration-hardening smells into R3d2.
-Run exact-final deterministic gates and publish a non-draft R3d1 PR. Preserve R3c/R4 inputs, keep R2f operator
-lifecycle work out of R3d, and never touch the long-lived operator lifecycle from this slice.
+Continue R3d2 through the focused authority/admission/accounting plan above. Preserve R3c/R4 inputs, keep R2f
+operator lifecycle work out of R3d, and never touch the long-lived operator lifecycle from this slice.
 
 ## R3e — OpenRouter provider expansion
 

@@ -1,7 +1,8 @@
 # R3d1 — supervisor and signal-parity implementation plan
 
-- **Status:** APPROVED FOR PR — exact fifth-remediation head `b511d6c` received Sol/xhigh implementation
-  `APPROVE` and the single Fable/xhigh release/compatibility `APPROVE`; this post-review fold changes docs only
+- **Status:** MERGED by PR #40 at `cbcfd1f06b914064456d1798be71bacdc294f3d5` — exact fifth-remediation head
+  `b511d6c` received Sol/xhigh implementation `APPROVE` and the single Fable/xhigh release/compatibility
+  `APPROVE`; the final approval fold changed docs only
 - **Branch:** `agent/reliability-r3d1-supervisor`
 - **Base:** `origin/main` at `c2d147fb1f0df275f3c6452cdd212e185c002d08`
   (PR #38 merged R3d0)

@@ -1,12 +1,22 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main base:** `origin/main` at `c2d147fb1f0df275f3c6452cdd212e185c002d08` on 2026-07-18
-  (PR #38 merged R3d0)
-- **Completed through:** R3d0 **MERGED** at `c2d147fb`; R2e remains deferred and off the critical path
-- **Active slice:** R3d1 supervisor and signal parity on `agent/reliability-r3d1-supervisor`, based directly on
-  `c2d147fb`; it is non-billable and uses local fake child processes only
-- **Current R3d1 implementation gate:** **APPROVED FOR PR**. Initial exact candidate `01438c34` received a fresh
+- **Current main base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5` on 2026-07-19
+  (PR #40 merged R3d1)
+- **Completed through:** R3d1 **MERGED** at `cbcfd1f`; R2e remains deferred and off the critical path
+- **Active slice:** R3d2 authority, admission, preflights, and accounting on
+  `agent/reliability-r3d2-authority-admission`, based directly on `cbcfd1f`; it is non-billable and uses only
+  fake clocks/process inventories/effect controls and owner-private temporary state roots in tests
+- **Current R3d2 implementation gate:** **FOCUSED PLAN LOCKED / IMPLEMENTATION NOT STARTED**. The restart contract is
+  [`2026-07-19-r3d2-authority-admission-accounting.md`](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md).
+  R3d2 has one merge boundary and five internal subincrements: R3d1 integration hardening/local state; private
+  authority and source reducers; exact identities/equivalent work/control reducers; ledger/legacy/preflights; then
+  the shared transaction/default-off integration. No internal commit independently enables effects. The only
+  admission lock order is owner-wide then authority-state, and one durable commit binds authority consumption,
+  admission identity, equivalent-work disposition, and budget reservation before supervisor handoff. R3d2 does not
+  issue real authority or perform a provider, registry, image, runtime, GitHub, iCloud, timer, or production-operator
+  effect.
+- **R3d1 closure:** **MERGED** by PR #40 at `cbcfd1f`. Initial exact candidate `01438c34` received a fresh
   bridge-mediated Sol/xhigh/read-only review: eight `WRONG`, two `SMELL`, and
   `R3D1 IMPLEMENTATION: REVISE`. The remediation enforces deadline-first phase-local caps with complete later-phase
   reservation; keeps cleanup signal authority in the retained child handle; revalidates exact ancestry/topology;
@@ -470,7 +480,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (three incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`; R3d0 **MERGED** by PR #38 at `c2d147fb`. R3d1 is **APPROVED FOR PR** on `agent/reliability-r3d1-supervisor`: initial exact `01438c34` Sol/xhigh review returned eight `WRONG`, two `SMELL`, and `REVISE`; exact `e81ebbb`, `8feda4d`, `7fafe79`, and `b55c17d` closures drove four remediations; exact fifth-remediation head `b511d6c` received Sol/xhigh implementation `APPROVE` with no new finding, then the single Fable/xhigh release/compatibility lens returned `APPROVE` with no `WRONG` and three nonblocking Minor `SMELL`s. The approved mechanism requires retained anchors through every signal-capable phase and permits release or ambiguity only in the corresponding no-later-signal phase. Focused gates are **6/0**, **1/0**, **31/0**, **33/0**, **4/0**, **21/0**, and **2/0**; full serial workspace is **2,279/0/12 ignored** across **56** binaries, and all complete deterministic release/validator gates are green. Candidate release SHA-256 is `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. No live compatibility gate or production-operator lifecycle action occurred. | [R3d1 implementation plan](superpowers/plans/2026-07-19-r3d1-supervisor-signal-parity.md) | Rerun exact-final deterministic gates on the docs-only evidence fold and publish a non-draft PR. R3d never touches the long-lived operator lifecycle. |
+| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`. R3d2 is **ACTIVE / FOCUSED PLAN LOCKED** on `agent/reliability-r3d2-authority-admission`, with one merge boundary and no implementation yet. R3d1 exact fifth-remediation head `b511d6c` received Sol/xhigh implementation `APPROVE` with no new finding, then the single Fable/xhigh release/compatibility lens returned `APPROVE` with no `WRONG` and three nonblocking Minor `SMELL`s carried into R3d2. Focused R3d1 gates were **6/0**, **1/0**, **31/0**, **33/0**, **4/0**, **21/0**, and **2/0**; full serial workspace was **2,279/0/12 ignored** across **56** binaries. Candidate release SHA-256 was `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. No live compatibility gate or production-operator lifecycle action occurred. | [R3d2 implementation plan](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md) | Complete all five internal R3d2 subincrements, exact-final deterministic gates, Sol/xhigh review, and the single post-Sol Fable/xhigh release lens before one non-draft PR. R3d never touches the long-lived operator lifecycle. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
