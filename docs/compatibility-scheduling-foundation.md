@@ -122,13 +122,18 @@ capability is still available. Once a runner exists, direct-runner exit is obser
 and not inferred from a mutable process-table snapshot; a surviving, reparented descendant therefore cannot make the
 direct runner look live. Before success, the supervisor descriptor-pins and hashes the actual child join and optional aggregate bytes,
 checks their run/window/hash bindings, parses and validates the unchanged aggregate, and releases anchors only after
-that private verified-artifact capability exists. These schemas and journal checks do not themselves authorize or
-execute work.
+that private verified-artifact capability exists. Completed admission reconciliation accepts only an opaque terminal
+proof created from that joined immutable one-case aggregate; requested/effective identity, candidate/manifest
+identity, prompt acceptance, terminal time, elapsed time, and usage come from those bytes. Missing token or cost observations charge
+the reservation cap, while inconsistent counters/totals, identity drift, or cap overflow refuse. These schemas and
+journal checks do not themselves authorize or execute work.
 
 R3d2 scheduler control state uses the fixed operator-local APFS root below
 `~/Library/Application Support/a2a-bridge/operator/compatibility-scheduler/`. The existing root and its `authority`,
 `admission`, `ledger`, `supervisor`, and `locks` children must be owner-owned mode-`0700` directories retained by
-descriptor; existing broadened entries, symlinks, and special files are rejected rather than repaired. Lock files are
+descriptor. Starting from the passwd-derived operator-home descriptor, every fixed suffix component is opened
+descriptor-relatively with no-follow; an intermediate or final symlink, existing broadened entry, or special file is
+rejected rather than repaired. Lock files are
 single-link owner-owned mode-`0600` regular files opened relative to the retained `locks` directory. The nonblocking
 owner-wide admission guard consumes itself into one combined capability when it takes the authority-state lock, so
 the nested authority lock always releases before the still-live owner lock. Operator-only issuance or revocation
@@ -195,7 +200,10 @@ required check.
   `r3d5_activation_not_enabled; no_effects`. The acknowledged legacy manual path remains available only while the
   fixed production scheduler root is absent. That root is resolved from the effective account's passwd home, not
   `$HOME`; once present it is the fail-closed private-control takeover marker and legacy manual execution cannot
-  bypass the shared transaction. R3d5 alone may create that production root and activate trusted triggers.
+  bypass the shared transaction. Standalone R3c `compatibility resolve` remains a separate provider-free
+  registry/image action under its own explicit acknowledgement; it cannot authorize a prompt or admitted capability.
+  Scheduler-owned resolution in R3d5 must use the shared admission/effect envelope. R3d5 alone may create that
+  production root and activate trusted triggers.
 - R3d3 implements evidence storage, retention, status, and crash-consistent publication state.
 - R3d4 implements disabled-by-default launchd and trusted test-merge/main triggers.
 - R3d5 separately characterizes every inventory row under single-use owner authority before any staged

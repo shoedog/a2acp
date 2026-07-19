@@ -6,7 +6,7 @@
   at exact design head `b54840a017b87521677f1f95c3f7be69de55361d` by PR #37, merge
   `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is
   **MERGED** by PR #38 at merge commit `c2d147fb1f0df275f3c6452cdd212e185c002d08`. R3d1 is
-  **APPROVED FOR PR** on `agent/reliability-r3d1-supervisor`; initial exact candidate `01438c34` and first closure head
+  **MERGED** by PR #40 at `cbcfd1f06b914064456d1798be71bacdc294f3d5`; initial exact candidate `01438c34` and first closure head
   `e81ebbb` each received Sol/xhigh `REVISE`. Second closure head `8feda4d` marked all four requested topology/cursor
   residuals `FIXED`, found one new post-anchor-retention `WRONG / High`, no new `SMELL`, and returned `REVISE`.
   Third closure head `7fafe79` marked that item `FIXED`, confirmed prior residuals closed, found two new `WRONG`
@@ -18,6 +18,11 @@
   candidate release binary is 26,574,640 bytes at SHA-256
   `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. Its focused restart plan is
   [`2026-07-19-r3d1-supervisor-signal-parity.md`](2026-07-19-r3d1-supervisor-signal-parity.md).
+  R3d2a-e exact candidate `1373985cde2b7f0d8b7b97a39757dad42a254a22` then received a
+  bridge-mediated Sol/xhigh implementation `REVISE` with four `WRONG` and one `SMELL`. Mechanism remediations
+  `f481f39`, `cdf833a`, and `f700cde` bind terminal reconciliation to immutable child evidence, make completed-work reuse
+  reachable, and no-follow every fixed production-root suffix component; this docs fold reconciles the stale cursor
+  and clarifies the standalone R3c resolver boundary. Exact-final reruns and Sol closure review remain pending.
   The merged R3d0 implementation was
   `agent/reliability-r3d0-foundation`: the fourth closure review approved exact cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test commit
@@ -605,6 +610,12 @@ A selector such as npm `latest` is a request, never resolved evidence. A success
 must remain separate commands: registry/image effects do not authorize a prompt, and a completed
 resolution does not authorize all resolved cases.
 
+That standalone, explicitly acknowledged R3c resolver remains available even when the private R3d scheduler root
+exists. It is provider-free and cannot issue or consume provider authority, construct an admitted capability,
+authorize a later run, or replace production pins/tags. By contrast, any scheduler-owned resolution/materialization
+in R3d5 must be covered by the shared R3d admission and effect envelope. The R3d takeover marker guards the legacy
+billable manual run path; it does not silently absorb this separately acknowledged R3c operator action.
+
 Initial scope is exactly the four R3b supported bridge-smoke shapes: Codex host, Codex reader, Claude host,
 and Claude reader. Historic direct CLI/ACP controls, Kiro, representative workflows, OpenRouter, and
 OpenCode remain outside R3c.
@@ -1142,7 +1153,9 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 - **Base:** merged R3d1 main `cbcfd1f06b914064456d1798be71bacdc294f3d5` (PR #40)
 - **Status:** design of record **APPROVED / MERGED** at exact design head
   `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 and R3d1 are merged, and R3d2 is
-  **ACTIVE / R3D2A IMPLEMENTED / DETERMINISTIC GATES GREEN / UNREVIEWED** before R3d2b. The R3d0 default-off policy/schema mechanism was
+  **ACTIVE / R3D2A-R3D2E IMPLEMENTED / FIRST SOL REVIEW REVISE / REMEDIATION FOLDED**. Exact candidate
+  `1373985` received four `WRONG` and one `SMELL`; mechanism commits `f481f39`, `cdf833a`, and `f700cde` plus this cursor fold
+  close the requested items, with exact-final reruns and Sol closure re-review pending. The R3d0 default-off policy/schema mechanism was
   approved at exact mechanism commit
   `5baeeb3f47183ea2a47d2cdc5ffce26f1df7dbfb`, approved cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test head
@@ -2705,11 +2718,14 @@ Rollback does not revert evidence, erase ledger charges, delete pins/tombstones,
 operator, or run missed windows on re-enable. The last reviewed immutable scheduler binary remains the code
 rollback target. Any code revert is a normal reviewed PR.
 
-**Restart point:** continue R3d2b from `/private/tmp/a2a-bridge-r3d2-authority-admission` on branch
+**Restart point:** continue R3d2 closure remediation from `/private/tmp/a2a-bridge-r3d2-authority-admission` on branch
 `agent/reliability-r3d2-authority-admission`, based on merged R3d1 main
 `cbcfd1f06b914064456d1798be71bacdc294f3d5`, using the focused
 [`2026-07-19-r3d2-authority-admission-accounting.md`](2026-07-19-r3d2-authority-admission-accounting.md)
-restart contract. R3d1 merged by PR #40 at that base. The initial exact-base Fable review plus
+restart contract. R3d1 merged by PR #40 at that base. R3d2's first implementation review froze exact `1373985`,
+returned four `WRONG` plus one `SMELL`, and is remediated by `f481f39`, `cdf833a`, `f700cde`, and the current docs fold.
+Rerun the complete exact-final gates, freeze the new head, and run Sol closure re-review before the single Fable
+release/compatibility lens. The initial exact-base Fable design review plus
 exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
 exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, exact-`c50811f`, and
 exact-`fb8a2f4`, exact-`ae9db39`, exact-`2eb242a`, exact-`8dc6054`, exact-`cc01a52`, and exact-`b54840a`

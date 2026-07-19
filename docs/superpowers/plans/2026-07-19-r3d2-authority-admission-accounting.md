@@ -1,7 +1,8 @@
 # R3d2 — authority, admission, preflights, and accounting implementation plan
 
-- **Status:** ACTIVE — R3d2a through R3d2e are implemented and exact-final deterministic gates are green; both
-  independent review lenses are pending
+- **Status:** ACTIVE — R3d2a through R3d2e are implemented; the first exact-head Sol/xhigh implementation review
+  returned `REVISE` at `1373985`, its four `WRONG` findings are remediated in `f481f39`, `f700cde`, and `cdf833a`, and Sol
+  closure re-review plus the post-Sol Fable lens remain pending
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -590,34 +591,52 @@ Implemented mechanism:
   path references it.
 - `8da4171` adds a same-generation canonical terminal journal. Exact `cancelled_before_running` proof releases the
   ledger and nonreusable equivalent-work reservation; a safety hold or possible acceptance keeps the full charge and
-  blocks a successor; exact completed evidence requires one attempt, usage within every cap, and expected/observed
-  effective-identity equality before it can reconcile downward. One-shot lifecycle reconciliation binds the
-  immutable terminal-file hash. Every recovery reopens the R3d1 journal and requires the terminal's complete
-  supervisor record and tail hash to equal its actual immutable tail before changing ledger or authority state.
+  blocks a successor. `f481f39` removes the caller-constructed completed-terminal arm: only an opaque proof loaded
+  from the supervisor-joined immutable one-case child aggregate may complete work. Reconciliation derives requested
+  and observed identity, prompt acceptance, candidate and manifest identity, terminal time, elapsed time, token/cost
+  usage, and missing-observation fallback from those bytes; it validates the aggregate totals/counters, charges a missing
+  observation at the reserved cap, and refuses identity drift or cap overflow. One-shot lifecycle reconciliation
+  binds the immutable terminal-file hash. Every recovery reopens the R3d1 journal and requires the terminal's
+  complete supervisor record and tail hash to equal its actual immutable tail before changing ledger or authority
+  state. The same commit previews equivalent-work disposition before allocating ledger/supervisor artifacts, making
+  completed standing-work reuse reachable without a second reservation or handoff.
 - `f3bbee0` closes the default-off boundary. `schedule-tick` accepts no source arguments and returns the typed
   `r3d5_activation_not_enabled; no_effects` refusal. The fixed production state root is derived from the effective
-  account's passwd home rather than `$HOME`; presence probing is read-only and rejects a broadened, symlinked,
-  nonlocal, or identity-swapped root. Absence preserves the explicitly acknowledged legacy manual command. Presence
-  marks private R3d takeover and refuses that legacy command before manifest/resolution/output or provider access;
-  ambiguous state also refuses. Only R3d5 may initialize production state or activate trusted triggers.
+  account's passwd home rather than `$HOME`. `f700cde` opens every fixed suffix component descriptor-relatively with
+  `O_NOFOLLOW`, so an intermediate or final symlink, broadened root, nonlocal root, or identity swap fails closed.
+  Presence probing remains read-only. Absence preserves the explicitly acknowledged legacy manual run command;
+  presence marks private R3d takeover and refuses that billable command before manifest/resolution/output or provider
+  access; ambiguous state also refuses. Only R3d5 may initialize production state or activate trusted triggers.
+
+The standalone R3c `compatibility resolve` command remains a separate provider-free but registry/image-effectful
+operator action under its own `--acknowledge-resolution-effects` boundary, even after private R3d state exists. It
+cannot issue or consume provider authority, construct an admitted capability, authorize a later run, or replace
+production pins/tags. Scheduler-owned resolution/materialization in R3d5 must instead be covered by the shared R3d
+admission and effect envelope. This separation adjudicates the first Sol review's takeover-scope `SMELL` without
+silently broadening R3d2's legacy billable-run guard.
 
 Pre-change and mutation red proof:
 
 - At R3d2d checkpoint `f832604`, the admission commit/terminal journals, safe transaction session, admitted
-  capability, shared source joins, and all 16 transaction tests were absent, so the focused e1-e3 suite is
+  capability, shared source joins, and the transaction test module were absent, so the focused e1-e3 suite is
   compile-red there. The stale/revoked/effect-mismatched source negatives, torn/skipped/noncanonical commit
-  negatives, duplicate-handoff refusal, cancellation/hold/completed terminal paths, zero-attempt/over-cap/effective-
-  identity negatives, pre-terminal successor refusal, reducer-state mutation, and supervisor-tail mutation each
-  target a distinct new branch.
+  negatives, duplicate-handoff refusal, cancellation/hold/completed terminal paths, pre-terminal successor refusal,
+  reducer-state mutation, and supervisor-tail mutation each target a distinct new branch.
+- The first review showed that the original completed-terminal API itself was the wrong trust boundary: a caller
+  could construct nominal identity/usage that was never joined to the immutable child aggregate. The new test is
+  API/compile-red before `f481f39`, loads a real aggregate through `VerifiedChildArtifact`, and proves observed-model
+  drift, over-cap tokens, zero accepted prompts, false telemetry-completeness counters, and divergent aggregate cost
+  totals all refuse without a terminal. Its missing-telemetry edge charges token/cost caps. The standing reuse test
+  is behavior-red before the preview fix because a preallocated ledger/supervisor reaches the reducer's reuse arm
+  and fails the disposition invariant; it now returns `Reused` with no new ledger or supervisor entry.
 - Without the actual supervisor-tail comparison, `terminal_supervisor_tail_mutation_holds_recovery` accepts the
-  canonical mutated terminal during recovery. Without exact expected/observed equality,
-  `completed_terminal_requires_exact_identity_and_valid_usage_before_it_commits` terminalizes
-  `unexpected-model`; permitting zero attempts or cap overflow likewise writes a terminal before ledger refusal.
+  canonical mutated terminal during recovery.
 - Before the fixed-root guard, an acknowledged legacy run could proceed regardless of private R3d state and the root
-  opener accepted a final-component symlink after canonicalization. The new presence/authority-boundary tests are
-  compile-red before `f3bbee0`; removing either root identity check or the boundary refusal makes its positive or
-  negative assertion fail. The argument-bearing `schedule-tick` test also fails against the prior R3d2-pending
-  status contract.
+  opener accepted a final-component symlink after canonicalization. The original `f3bbee0` fix still followed a
+  symlinked intermediate suffix component; the new `fixed_production_presence_rejects_a_symlink_ancestor` regression
+  is red there and green after descriptor-walking from the operator-home anchor in `f700cde`. Removing either root
+  identity check or the boundary refusal makes its positive or negative assertion fail. The argument-bearing
+  `schedule-tick` test also fails against the prior R3d2-pending status contract.
 - The first warnings-denied exact-final Clippy run found four `large_enum_variant` failures in the new transaction
   records. `f6a33af` boxes only the large payloads (and both published-result arms); Serde remains transparent, and
   all 16 canonical journal/recovery tests remained green. The first complete binary run then exposed a pre-existing
@@ -628,7 +647,7 @@ Pre-change and mutation red proof:
   a new same-attempt/different-case assertion still refuses. The exact regression is now **1/0**, full ledger is
   **12/0**, binary is **639/0/0**, and the full workspace is green.
 
-Exact-final deterministic evidence:
+Reviewed-candidate deterministic evidence at `1373985` before first Sol review:
 
 - Format and tracked whitespace checks, workspace all-target/all-feature compilation with `RUSTFLAGS=-D warnings`,
   warnings-denied all-target/all-feature Clippy, locked release build, and dependency policy are green. `cargo deny`
@@ -648,9 +667,35 @@ Exact-final deterministic evidence:
 
 Not verified or authorized at this checkpoint: any real authority issuance, production scheduler root creation,
 live admitted runner handoff, provider/model/credential/registry/image/runtime/GitHub/iCloud effect, timer/watcher/
-launchd installation, production-operator lifecycle action, evidence/status/retention publication, or independent
-implementation/release review. R3d2 is mechanically complete but deliberately non-activatable; R3d5 remains the
-sole activation owner.
+launchd installation, production-operator lifecycle action, evidence/status/retention publication, Sol closure
+approval, or the independent Fable release lens. R3d2 is mechanically complete but deliberately non-activatable;
+R3d5 remains the sole activation owner.
+
+#### First Sol implementation review and remediation — 2026-07-19
+
+The bridge-mediated `gpt-5.6-sol`/xhigh/read-only review froze exact candidate
+`1373985cde2b7f0d8b7b97a39757dad42a254a22` against merged R3d1 base
+`cbcfd1f06b914064456d1798be71bacdc294f3d5` and returned `R3D2 IMPLEMENTATION: REVISE` with four `WRONG` and
+one `SMELL`. Its complete SSE artifact is retained at
+`/private/tmp/a2a-bridge-r3d2-sol-review-02.sse`, 24,901 bytes, SHA-256
+`0f9bc9f8251f5fcf2a2bef166b6636fe8ffcd1e3a52cdba1597c17f1ec1f56c5`:
+
+1. completed reconciliation trusted caller-supplied nominal terminal identity/usage instead of the joined child
+   aggregate;
+2. safe-session reuse was unreachable because proposal preparation always allocated ledger/supervisor artifacts;
+3. fixed-root canonicalization could follow an intermediate suffix symlink;
+4. this master plan and its restart cursor still described R3d2a/b rather than the reviewed R3d2a-e boundary; and
+5. `SMELL`: the takeover contract did not explicitly say whether standalone effectful `compatibility resolve`
+   remained available.
+
+`f481f39` closes items 1-2 with the opaque aggregate proof, conservative missing-telemetry accounting, and full
+standing-reuse regression; `cdf833a` also retains the aggregate terminal time instead of substituting reconciliation
+time. `f700cde` closes item 3 with descriptor-relative optional child traversal and the
+intermediate-symlink regression. This docs fold closes item 4 and adjudicates item 5 as the intentionally separate
+R3c resolver boundary described above. Post-remediation focused gates are transaction **17/0**, state/root/locks
+**14/0**, supervisor **41/0**, and local-file **11/0**; warnings-denied package check and all-target/all-feature
+Clippy are green. The full exact-final binary/workspace/release/validator rerun and Sol closure re-review remain the
+next gates, so the earlier **639/0/0** and **2,376/0/12 ignored** totals are not claimed for the changed head.
 
 ## Verification and review gates
 
@@ -687,4 +732,6 @@ Resume from `/private/tmp/a2a-bridge-r3d2-authority-admission` on branch
 `cbcfd1f06b914064456d1798be71bacdc294f3d5`. Read this plan, the R3d design of record, the durable roadmap,
 `AGENTS.md`, and `skills/a2a-bridge-operator/SKILL.md` before editing. Preserve the single R3d2 merge boundary,
 the owner-wide-then-authority lock order, the single admission linearization point, the zero-effect default, and
-the separation between provider authority and storage consent.
+the separation between provider authority and storage consent. The next action is to rerun every exact-final gate,
+commit the resulting evidence/cursor, freeze the new exact head, and ask Sol/xhigh to adjudicate the four inherited
+`WRONG` findings and one `SMELL` before any Fable turn or PR.
