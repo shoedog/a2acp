@@ -1,8 +1,8 @@
 # R3d2 — authority, admission, preflights, and accounting implementation plan
 
 - **Status:** ACTIVE — R3d2a through R3d2e are implemented; the first exact-head Sol/xhigh implementation review
-  returned `REVISE` at `1373985`, its four `WRONG` findings are remediated in `f481f39`, `f700cde`, and `cdf833a`, and Sol
-  closure re-review plus the post-Sol Fable lens remain pending
+  returned `REVISE` at `1373985`, its four `WRONG` findings are remediated in `f481f39`, `f700cde`, and `cdf833a`,
+  exact-final deterministic gates are green, and Sol closure re-review plus the post-Sol Fable lens remain pending
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -693,9 +693,14 @@ standing-reuse regression; `cdf833a` also retains the aggregate terminal time in
 time. `f700cde` closes item 3 with descriptor-relative optional child traversal and the
 intermediate-symlink regression. This docs fold closes item 4 and adjudicates item 5 as the intentionally separate
 R3c resolver boundary described above. Post-remediation focused gates are transaction **17/0**, state/root/locks
-**14/0**, supervisor **41/0**, and local-file **11/0**; warnings-denied package check and all-target/all-feature
-Clippy are green. The full exact-final binary/workspace/release/validator rerun and Sol closure re-review remain the
-next gates, so the earlier **639/0/0** and **2,376/0/12 ignored** totals are not claimed for the changed head.
+**14/0**, supervisor **41/0**, and local-file **11/0**; warnings-denied workspace check and all-target/all-feature
+Clippy are green. The exact remediation binary is **641/0/0** and the serial workspace is
+**2,378/0/12 ignored** across **72** targets. Format/diff, locked release, dependency policy, hygiene **37/7**,
+manifest **9**, recipes **4**, foundation **6/4**, compatibility CLI **22/0**, and the pure legacy boundary **1/0**
+are green. The release binary is **26,604,912 bytes**, SHA-256
+`5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`. The earlier **639/0/0** and
+**2,376/0/12 ignored** totals remain labeled reviewed-candidate evidence rather than being conflated with this
+changed head. Sol closure re-review is the next gate.
 
 ## Verification and review gates
 
@@ -732,6 +737,6 @@ Resume from `/private/tmp/a2a-bridge-r3d2-authority-admission` on branch
 `cbcfd1f06b914064456d1798be71bacdc294f3d5`. Read this plan, the R3d design of record, the durable roadmap,
 `AGENTS.md`, and `skills/a2a-bridge-operator/SKILL.md` before editing. Preserve the single R3d2 merge boundary,
 the owner-wide-then-authority lock order, the single admission linearization point, the zero-effect default, and
-the separation between provider authority and storage consent. The next action is to rerun every exact-final gate,
-commit the resulting evidence/cursor, freeze the new exact head, and ask Sol/xhigh to adjudicate the four inherited
+the separation between provider authority and storage consent. The next action is to commit this evidence/cursor,
+rerun the full suite on that docs-only exact head, freeze it, and ask Sol/xhigh to adjudicate the four inherited
 `WRONG` findings and one `SMELL` before any Fable turn or PR.

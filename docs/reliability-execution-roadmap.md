@@ -8,7 +8,7 @@
   `agent/reliability-r3d2-authority-admission`, based directly on `cbcfd1f`; it is non-billable and uses only
   fake clocks/process inventories/effect controls and owner-private temporary state roots in tests
 - **Current R3d2 implementation gate:** **R3D2A-R3D2E IMPLEMENTED / FIRST SOL REVIEW REVISE /
-  REMEDIATION FOLDED / EXACT-FINAL RERUN PENDING**. The restart contract is
+  REMEDIATION FOLDED / EXACT-FINAL GREEN / SOL CLOSURE PENDING**. The restart contract is
   [`2026-07-19-r3d2-authority-admission-accounting.md`](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md).
   R3d2a closes the three inherited R3d1 integration smells, owns cancellation before `Running`, retains the
   exact runner child for exit proof, and adds the private local state-root plus nonblocking lock primitives.
@@ -32,9 +32,12 @@
   time, and `f700cde` descriptor-walks every fixed
   suffix component, and the current docs fold closes the cursor plus explicitly retains provider-free standalone
   resolve under its R3c acknowledgement while scheduler-owned resolution remains admission-bound. Post-remediation
-  focused gates are transaction **17/0**, state/root/locks **14/0**, supervisor **41/0**, and local-file **11/0**;
-  warnings-denied package check and all-target/all-feature Clippy are green. The complete exact-final rerun and Sol
-  closure re-review are pending. R3d2 still has one merge boundary and
+  focused gates are transaction **17/0**, state/root/locks **14/0**, supervisor **41/0**, and local-file **11/0**.
+  The complete binary is **641/0/0** and the serial workspace is **2,378/0/12 ignored** across **72** targets;
+  format/diff, warnings-denied workspace check/Clippy, locked release, dependency policy, hygiene **37/7**, all
+  validators, compatibility CLI **22/0**, and legacy boundary **1/0** are green. The release binary is 26,604,912
+  bytes at SHA-256 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`. Sol closure re-review is
+  pending. R3d2 still has one merge boundary and
   five internal subincrements: R3d1 integration hardening/local state; private
   authority and source reducers; exact identities/equivalent work/control reducers; ledger/legacy/preflights; then
   the shared transaction/default-off integration. No internal commit independently enables effects. The only
@@ -451,9 +454,8 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** run the complete exact-final binary/workspace/release/dependency/hygiene/validator gates on the
-  `f481f39`/`cdf833a`/`f700cde` remediation plus this docs fold, record their exact totals, then freeze head/base/merge-base and
-  changed paths for one bridge-mediated Sol/xhigh closure re-review. Require explicit adjudication of all four
+- **Next action:** commit this exact-final evidence fold, rerun the complete suite on that docs-only exact head, then
+  freeze head/base/merge-base and changed paths for one bridge-mediated Sol/xhigh closure re-review. Require explicit adjudication of all four
   inherited `WRONG` findings and the resolver-boundary `SMELL`. After Sol is green, spend the single design-approved
   Fable/xhigh adversarial implementation plus release/compatibility lens, with no Fable re-review loop, then publish
   one non-draft R3d2 PR. No live compatibility/provider gate or production-operator lifecycle action is authorized.
@@ -511,7 +513,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (three incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`. R3d2 is **ACTIVE / R3D2A-R3D2E IMPLEMENTED / FIRST SOL REVIEW REVISE / REMEDIATION FOLDED** on `agent/reliability-r3d2-authority-admission`, with one merge boundary. Exact reviewed candidate `1373985` passed binary **639/0/0** and workspace **2,376/0/12 ignored** before Sol returned four `WRONG` and one `SMELL`. `f481f39`, `cdf833a`, and `f700cde` close the three mechanism findings; the docs fold closes the cursor and resolver-scope item. Focused remediation gates are transaction/state/supervisor/local-file **17/0 + 14/0 + 41/0 + 11/0**, with warnings-denied check/Clippy green; complete exact-final reruns and Sol closure are pending. No live compatibility gate, production state-root creation, or production-operator lifecycle action occurred. | [R3d2 implementation plan](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md) | Rerun exact-final gates and obtain Sol closure approval, then the single Fable/xhigh release lens before one non-draft PR. R3d never touches the long-lived operator lifecycle. |
+| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`. R3d2 is **ACTIVE / R3D2A-R3D2E IMPLEMENTED / FIRST SOL REVIEW REVISE / REMEDIATION FOLDED / EXACT-FINAL GREEN** on `agent/reliability-r3d2-authority-admission`, with one merge boundary. Exact reviewed candidate `1373985` passed binary **639/0/0** and workspace **2,376/0/12 ignored** before Sol returned four `WRONG` and one `SMELL`. `f481f39`, `cdf833a`, and `f700cde` close the three mechanism findings; the docs fold closes the cursor and resolver-scope item. Remediation gates are transaction/state/supervisor/local-file **17/0 + 14/0 + 41/0 + 11/0**, binary **641/0/0**, and workspace **2,378/0/12 ignored**; all deterministic release/validator gates are green. Sol closure remains pending. No live compatibility gate, production state-root creation, or production-operator lifecycle action occurred. | [R3d2 implementation plan](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md) | Obtain Sol closure approval, then the single Fable/xhigh release lens before one non-draft PR. R3d never touches the long-lived operator lifecycle. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -797,7 +799,8 @@ Next action:
   reconciles the master cursor and clarifies that standalone provider-free R3c resolve remains separately
   acknowledged while scheduler-owned resolution is admission-bound. Focused remediation gates are transaction
   **17/0**, state/root/locks **14/0**, supervisor **41/0**, and local-file **11/0**; warnings-denied check and Clippy
-  are green. Complete exact-final reruns, Sol closure review, and the later Fable lens remain pending. No production
+  are green. The complete binary is **641/0/0** and serial workspace is **2,378/0/12 ignored** across **72** targets;
+  all release/policy/hygiene/validator gates are green. Sol closure review and the later Fable lens remain pending. No production
   state root, authority, trigger, live effect, or operator lifecycle action was created. The manifest still contains nine
   exact pinned rows: four release-blocking minimal bridge-smoke support cases and five explicit
   historical/non-goal controls. Every config is checked in and SHA-bound before provider spawn. The two

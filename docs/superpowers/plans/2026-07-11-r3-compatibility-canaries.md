@@ -22,7 +22,8 @@
   bridge-mediated Sol/xhigh implementation `REVISE` with four `WRONG` and one `SMELL`. Mechanism remediations
   `f481f39`, `cdf833a`, and `f700cde` bind terminal reconciliation to immutable child evidence, make completed-work reuse
   reachable, and no-follow every fixed production-root suffix component; this docs fold reconciles the stale cursor
-  and clarifies the standalone R3c resolver boundary. Exact-final reruns and Sol closure review remain pending.
+  and clarifies the standalone R3c resolver boundary. Exact-final gates are **641/0/0** binary and
+  **2,378/0/12 ignored** serial workspace; Sol closure review remains pending.
   The merged R3d0 implementation was
   `agent/reliability-r3d0-foundation`: the fourth closure review approved exact cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test commit
@@ -1155,7 +1156,8 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 and R3d1 are merged, and R3d2 is
   **ACTIVE / R3D2A-R3D2E IMPLEMENTED / FIRST SOL REVIEW REVISE / REMEDIATION FOLDED**. Exact candidate
   `1373985` received four `WRONG` and one `SMELL`; mechanism commits `f481f39`, `cdf833a`, and `f700cde` plus this cursor fold
-  close the requested items, with exact-final reruns and Sol closure re-review pending. The R3d0 default-off policy/schema mechanism was
+  close the requested items. Exact-final gates are green at binary **641/0/0** and workspace
+  **2,378/0/12 ignored**; Sol closure re-review is pending. The R3d0 default-off policy/schema mechanism was
   approved at exact mechanism commit
   `5baeeb3f47183ea2a47d2cdc5ffce26f1df7dbfb`, approved cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test head
@@ -2724,7 +2726,7 @@ rollback target. Any code revert is a normal reviewed PR.
 [`2026-07-19-r3d2-authority-admission-accounting.md`](2026-07-19-r3d2-authority-admission-accounting.md)
 restart contract. R3d1 merged by PR #40 at that base. R3d2's first implementation review froze exact `1373985`,
 returned four `WRONG` plus one `SMELL`, and is remediated by `f481f39`, `cdf833a`, `f700cde`, and the current docs fold.
-Rerun the complete exact-final gates, freeze the new head, and run Sol closure re-review before the single Fable
+Commit the exact-final evidence fold, rerun the complete suite on that docs-only head, freeze it, and run Sol closure re-review before the single Fable
 release/compatibility lens. The initial exact-base Fable design review plus
 exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
 exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, exact-`c50811f`, and
