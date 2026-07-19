@@ -2111,6 +2111,9 @@ pub(super) fn handoff_admitted<R: AdmittedRunnerHandoff>(
     capability: AdmittedRunCapabilityV1,
     runner: &mut R,
 ) -> Result<R::Output, BoxError> {
+    if capability.hard_deadline.remaining().is_zero() {
+        return Err("schedule transaction: hard deadline expired before runner handoff".into());
+    }
     runner.handoff(capability)
 }
 
@@ -4581,6 +4584,37 @@ mod tests {
             .unwrap();
         assert_eq!(recover_committed_state(&locks).unwrap(), 1);
         assert_eq!(runner.handoffs, 1);
+    }
+
+    #[test]
+    fn deadline_expired_after_durable_publication_never_calls_the_runner() {
+        let (_state_temp, state) = state_root();
+        let (_action_temp, trusted_root, requested_cwd) = action_bindings();
+        let locks = state
+            .try_owner_admission("test:expired-before-handoff")
+            .unwrap()
+            .try_authority_state("test:expired-before-handoff")
+            .unwrap();
+        FileAuthorityJournal::initialize(&locks, 1).unwrap();
+        let proposal = manual_proposal(&locks, trusted_root, requested_cwd);
+        let PublishedAdmissionV1::Admitted(mut capability) =
+            commit_prevalidated_proposal_for_capability(&locks, proposal).unwrap()
+        else {
+            panic!("manual fixture must create a new admission");
+        };
+        capability.hard_deadline.expire_for_test();
+
+        let mut runner = CountingRunner { handoffs: 0 };
+        assert!(
+            handoff_admitted(*capability, &mut runner).is_err(),
+            "an admitted deadline that expires after publication must refuse before runner handoff"
+        );
+        assert_eq!(runner.handoffs, 0);
+        assert!(FileAdmissionJournal::open(&locks)
+            .unwrap()
+            .journal
+            .pending_reserved
+            .is_some());
     }
 
     #[test]

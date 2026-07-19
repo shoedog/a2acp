@@ -290,6 +290,11 @@ impl HardDeadline {
         self.absolute.saturating_duration_since(Instant::now())
     }
 
+    #[cfg(test)]
+    pub(super) fn expire_for_test(&mut self) {
+        self.absolute = Instant::now();
+    }
+
     fn phase_budget_and_reserved_after(
         &self,
         phase: DeadlinePhase,
