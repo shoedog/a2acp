@@ -3654,6 +3654,28 @@ fn load_json<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Result<T
         .map_err(|error| format!("{label}: invalid schema: {error}").into())
 }
 
+pub(super) fn validate_child_aggregate_bytes(bytes: &[u8]) -> Result<(), BoxError> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("compatibility child aggregate: invalid JSON: {error}"))?;
+    if value_contains_secret(&value, &[]) {
+        return Err("compatibility child aggregate: secret-shaped material is not allowed".into());
+    }
+    let aggregate: AggregateArtifact = serde_json::from_value(value)
+        .map_err(|error| format!("compatibility child aggregate: invalid schema: {error}"))?;
+    if aggregate.schema_version != 1
+        || aggregate.ended_at_ms < aggregate.started_at_ms
+        || !local_file::valid_sha256(&aggregate.candidate.sha256)
+        || aggregate.candidate.sha256 != aggregate.candidate.sha256.to_ascii_lowercase()
+        || aggregate.candidate.byte_length == 0
+        || aggregate.manifest.schema_version != 1
+        || !local_file::valid_sha256(&aggregate.manifest.sha256)
+        || aggregate.manifest.sha256 != aggregate.manifest.sha256.to_ascii_lowercase()
+    {
+        return Err("compatibility child aggregate: invalid identity or time bounds".into());
+    }
+    Ok(())
+}
+
 fn compare_artifacts(
     current: &AggregateArtifact,
     baseline: &BaselineArtifact,

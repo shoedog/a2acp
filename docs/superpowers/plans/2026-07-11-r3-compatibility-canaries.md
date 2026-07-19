@@ -6,7 +6,8 @@
   at exact design head `b54840a017b87521677f1f95c3f7be69de55361d` by PR #37, merge
   `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is
   **MERGED** by PR #38 at merge commit `c2d147fb1f0df275f3c6452cdd212e185c002d08`. R3d1 is
-  **IN REVIEW** on `agent/reliability-r3d1-supervisor`; its focused restart plan is
+  **IN REVIEW** on `agent/reliability-r3d1-supervisor`; initial exact candidate `01438c34` received a
+  Sol/xhigh `REVISE` and its remediation is deterministic-green pending exact-head closure. Its focused restart plan is
   [`2026-07-19-r3d1-supervisor-signal-parity.md`](2026-07-19-r3d1-supervisor-signal-parity.md).
   The merged R3d0 implementation was
   `agent/reliability-r3d0-foundation`: the fourth closure review approved exact cursor
@@ -1935,7 +1936,10 @@ fetch, checkout/candidate build, preflight, resolution/materialization, every se
 publication, cold-archive handoff, cleanup grace, and a fixed margin. A phase absent from that trigger
 contributes zero, never an implicit unbounded allowance. Derivation time counts against the bound. It refuses
 before credential/registry/image/provider effects when the schedule window, grant expiry, or time budget
-cannot contain the complete bound. The deadline is not reset between phases.
+cannot contain the complete bound. Elapsed derivation is rounded conservatively so the serialized remainder never
+understates the executable remainder. The deadline is not reset between phases. Each phase is capped by the earlier
+of its own maximum or the hard deadline after reserving every later phase, cleanup grace, and fixed margin; an
+already-exhausted phase refuses before polling even an immediately-ready effect.
 
 The compatibility runner handles SIGTERM exactly like SIGINT: stop admitting later cases, let the current
 bounded child follow its cancel/release/retire path, publish its aggregate, and clean scratch. Before spawning
@@ -1943,11 +1947,14 @@ the runner or staged smoke, the parent creates a trusted inert bridge-owned grou
 workload in that process group. It records anchor/runner/child pids, process groups, start identities, container
 run labels, and phase before effects. The anchor remains live through TERM; the one terminal group-KILL step
 keeps its exited leader unreaped until the supervisor journals that no later group signal is permitted, then
-final wait/reap releases the identity. A crash that makes the signal/journal ordering ambiguous recovers to a
+final wait/reap releases the identity. The retained, unreaped child handle is itself the group-signal capability:
+PID/PGID reuse is impossible until reap, so a late process-observation error cannot suppress required cleanup.
+A crash that makes the signal/journal ordering ambiguous recovers to a
 hold and never retries a numeric-group signal. R3d1
 reuses or factors the already-proven R3c `CommandProcessGroupGuard` mechanism; it must not restore a numeric-
 PGID-only signal path. A
-descendant-created group in the same session may be group-signaled only after the supervisor successfully
+descendant-created group in the same session may be group-signaled only after the supervisor revalidates the exact
+runner, existing workload, incoming workload, and anchor identities and successfully
 adds and retains its own anchor member; a new-session escape, vanished leader, failed anchor acquisition, or
 ambiguous identity creates a safety hold and is never signaled through a stale numeric PGID. Escalation is:
 
@@ -1960,8 +1967,8 @@ ambiguous identity creates a safety hold and is never signaled through a stale n
    this mark performs no group signal;
 5. reap only containers with the exact run label;
 6. prove exit, or retain the owner-wide admission lock/hold state and refuse successors;
-7. publish a durable `killed_after_deadline` supervisor record joined to the runner artifact by run/window id
-   and retain the conservative budget charge.
+7. publish a durable `killed_after_deadline` or `killed_after_cancellation` supervisor record according to the
+   write-once KILL cause, joined to the runner artifact by run/window id, and retain the conservative budget charge.
 
 Startup reconciles any incomplete supervisor record before new admission. An unproved or uninterruptible
 survivor, missing/dead anchor before group absence is proved, or unreconciled anchor release creates a safety
@@ -1969,6 +1976,11 @@ hold rather than a duplicate attempt or stale signal. Recorded descendants that 
 process group remain in the enumeration and follow the anchor-or-hold rule; an unobserved host descendant that
 escapes all recorded ancestry is an explicit macOS containment limit, not grounds for a success claim.
 Deadline-kill tests use fake children only; a live provider turn is never killed merely to prove the mechanism.
+Prepared recovery is resumable only when its retained anchor remains exact and its group has no possible workload;
+the crash window after a workload spawn but before the Running journal therefore holds. Journal generations are
+read through the retained directory descriptor with no-follow and before/after identity checks. Before terminal
+success, the supervisor descriptor-pins and hashes the actual child join and optional aggregate bytes, validates
+their run/window/hash bindings, parses the unchanged aggregate, and only then releases anchors.
 
 ### Admission and concurrency
 
@@ -2748,9 +2760,17 @@ lens retained at `/private/tmp/a2a-bridge-r3d0-opus-lens/review.md`, SHA-256
 nonblocking `SMELL`, required no pre-PR remediation, and returned `R3D0 RELEASE/COMPATIBILITY: APPROVE`.
 The deterministic owner-host validator and release-artifact check reconciled S4's stale prompt hashes to the
 branch's documented values; S1-S3 remain accepted intentional constraints. R3d1 now implements only the
-default-off exact-identity supervisor/signal mechanism and typed no-effects parent boundary. Its focused and full
-deterministic gates are green; freeze the exact candidate, run the required Sol/xhigh implementation review, then
-the single design-approved Fable/xhigh implementation/release lens only after Sol approval. Preserve R3c/R4 inputs,
+default-off exact-identity supervisor/signal mechanism and typed no-effects parent boundary. Initial exact candidate
+`01438c34f2c17d3c4632583222b57748201e291b` received a bridge-mediated Sol/xhigh/read-only review with
+eight `WRONG`, two `SMELL`, and `R3D1 IMPLEMENTATION: REVISE`; its retained report is
+`/private/tmp/a2a-bridge-r3d1-sol-review-01438c3/review.md`, 6,290 bytes, SHA-256
+`5515c25a33170a9ffa176a116e88ced44dac7754ddbdc10017b6683b94d3334b`. The current remediation closes
+all eight demonstrated failures and the independently found Prepared spawn-before-Running crash window, while
+adjudicating the two proof-boundary `SMELL`s explicitly. Focused gates are **6/0**, **1/0**, **29/0**, **30/0**,
+**4/0**, **21/0**, and **2/0**; full serial workspace is **2,274/0/12 ignored** across **56** binaries. All
+deterministic release/validator gates are green. Freeze the remediation and run the required exact-head Sol/xhigh
+closure review; use the
+single design-approved Fable/xhigh implementation/release lens only after Sol approval. Preserve R3c/R4 inputs,
 keep R2f operator lifecycle work out of R3d, and never touch the long-lived operator lifecycle from this slice.
 
 ## R3e — OpenRouter provider expansion

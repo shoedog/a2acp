@@ -6,7 +6,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -15,12 +15,13 @@ use crate::compatibility_process_group::{
     AnchoredProcessGroup, ProcessIdentityV1,
 };
 use crate::compatibility_schedule_schema::{
-    deadline_derivation_input_sha256, validate_deadline_derivation, validate_supervisor_record,
-    AnchorLifecycleV1, AnchoredProcessGroupRecordV1, ChildArtifactRefV1, DeadlineContainmentV1,
-    DeadlineDerivationInputV1, DeadlineDerivationV1, DeadlinePhaseBudgetsV1, FingerprintV1,
-    OptionalChildArtifactRefV1, OptionalElapsedMsV1, OptionalProcessIdentityV1,
-    OptionalSafetyHoldReasonV1, OptionalSha256V1, OptionalSupervisorOutcomeV1, SafetyHoldReasonV1,
-    SupervisorPhaseV1, SupervisorRecordV1, SupervisorTerminalOutcomeV1,
+    deadline_derivation_input_sha256, validate_child_artifact_join, validate_deadline_derivation,
+    validate_supervisor_record, AnchorLifecycleV1, AnchoredProcessGroupRecordV1,
+    ChildArtifactJoinV1, ChildArtifactRefV1, DeadlineContainmentV1, DeadlineDerivationInputV1,
+    DeadlineDerivationV1, DeadlinePhaseBudgetsV1, FingerprintV1, OptionalChildArtifactRefV1,
+    OptionalElapsedMsV1, OptionalProcessIdentityV1, OptionalSafetyHoldReasonV1, OptionalSha256V1,
+    OptionalSupervisorKillCauseV1, OptionalSupervisorOutcomeV1, SafetyHoldReasonV1,
+    SupervisorKillCauseV1, SupervisorPhaseV1, SupervisorRecordV1, SupervisorTerminalOutcomeV1,
 };
 use crate::BoxError;
 
@@ -29,6 +30,79 @@ pub(super) struct HardDeadline {
     process_entry: Instant,
     absolute: Instant,
     record: DeadlineDerivationV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DeadlinePhase {
+    MetadataFetch,
+    CheckoutCandidateBuild,
+    Preflight,
+    ResolutionMaterialization,
+    SelectedCase(usize),
+    EvidencePublication,
+    ColdArchiveHandoff,
+    CleanupGrace,
+}
+
+#[derive(Debug)]
+pub(super) struct VerifiedChildArtifact {
+    reference: ChildArtifactRefV1,
+}
+
+impl VerifiedChildArtifact {
+    const MAX_JOIN_BYTES: u64 = 4 * 1024 * 1024;
+    const MAX_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
+
+    pub(super) fn load(join_path: &Path, aggregate_path: Option<&Path>) -> Result<Self, BoxError> {
+        let join_snapshot = crate::local_file::read_regular_file_bounded(
+            join_path,
+            "schedule supervisor child artifact join",
+            Self::MAX_JOIN_BYTES,
+        )?;
+        let join: ChildArtifactJoinV1 =
+            serde_json::from_slice(&join_snapshot.bytes).map_err(|error| {
+                format!("schedule supervisor: invalid child artifact join: {error}")
+            })?;
+        validate_child_artifact_join(&join)?;
+        match (&join.aggregate_sha256, aggregate_path) {
+            (OptionalSha256V1::Absent, None) => {}
+            (OptionalSha256V1::Sha256 { value }, Some(path)) => {
+                let aggregate = crate::local_file::read_regular_file_bounded(
+                    path,
+                    "schedule supervisor child aggregate",
+                    Self::MAX_AGGREGATE_BYTES,
+                )?;
+                if &aggregate.sha256 != value {
+                    return Err(
+                        "schedule supervisor: child aggregate byte hash does not match the join"
+                            .into(),
+                    );
+                }
+                crate::compatibility::validate_child_aggregate_bytes(&aggregate.bytes)?;
+            }
+            (OptionalSha256V1::Absent, Some(_)) => {
+                return Err(
+                    "schedule supervisor: unexpected child aggregate without a joined hash".into(),
+                )
+            }
+            (OptionalSha256V1::Sha256 { .. }, None) => {
+                return Err("schedule supervisor: joined child aggregate is missing".into())
+            }
+        }
+        Ok(Self {
+            reference: ChildArtifactRefV1 {
+                record_id: join.record_id,
+                run_id: join.run_id,
+                window_id: join.window_id,
+                artifact_sha256: join_snapshot.sha256,
+                aggregate_sha256: join.aggregate_sha256,
+            },
+        })
+    }
+
+    fn into_reference(self) -> ChildArtifactRefV1 {
+        self.reference
+    }
 }
 
 fn duration_ms_ceil(duration: Duration) -> Result<u64, BoxError> {
@@ -88,7 +162,11 @@ impl HardDeadline {
         containment: DeadlineContainmentV1,
     ) -> Result<Self, BoxError> {
         let total_bound_ms = sum_deadline_budgets(&budgets)?;
-        let process_entry_elapsed_ms = duration_ms_ceil(process_entry.elapsed())?;
+        let derivation_now = Instant::now();
+        let exact_elapsed = derivation_now
+            .checked_duration_since(process_entry)
+            .ok_or("schedule supervisor: process-entry origin is in the future")?;
+        let process_entry_elapsed_ms = duration_ms_ceil(exact_elapsed)?;
         let remaining_at_derivation_ms = total_bound_ms
             .checked_sub(process_entry_elapsed_ms)
             .ok_or("schedule supervisor: deadline was consumed during derivation")?;
@@ -111,8 +189,11 @@ impl HardDeadline {
             input,
         };
         validate_deadline_derivation(&record)?;
-        let absolute = process_entry
-            .checked_add(Duration::from_millis(total_bound_ms))
+        // Bind the executable deadline to the same conservatively rounded remaining duration that
+        // the containment record validated. Using process_entry + total here would leave up to one
+        // unrepresented millisecond outside the admitted schedule/grant/accounting windows.
+        let absolute = derivation_now
+            .checked_add(Duration::from_millis(remaining_at_derivation_ms))
             .ok_or("schedule supervisor: absolute monotonic deadline overflows")?;
         Ok(Self {
             process_entry,
@@ -137,19 +218,102 @@ impl HardDeadline {
         self.absolute.saturating_duration_since(Instant::now())
     }
 
-    pub(super) async fn run_until_absolute<T, F>(
+    fn phase_budget_and_reserved_after(
         &self,
-        phase: &'static str,
+        phase: DeadlinePhase,
+    ) -> Result<(String, u64, u64), BoxError> {
+        let budgets = &self.record.input.budgets;
+        let mut ordered = vec![
+            ("metadata_fetch".to_owned(), budgets.metadata_fetch_ms),
+            (
+                "checkout_candidate_build".to_owned(),
+                budgets.checkout_candidate_build_ms,
+            ),
+            ("preflight".to_owned(), budgets.preflight_ms),
+            (
+                "resolution_materialization".to_owned(),
+                budgets.resolution_materialization_ms,
+            ),
+        ];
+        ordered.extend(
+            budgets
+                .selected_cases
+                .iter()
+                .map(|case| (format!("selected_case:{}", case.case_id), case.timeout_ms)),
+        );
+        let selected_offset = 4;
+        let evidence_index = ordered.len();
+        ordered.push((
+            "evidence_publication".to_owned(),
+            budgets.evidence_publication_ms,
+        ));
+        let cold_index = ordered.len();
+        ordered.push((
+            "cold_archive_handoff".to_owned(),
+            budgets.cold_archive_handoff_ms,
+        ));
+        let cleanup_index = ordered.len();
+        ordered.push(("cleanup_grace".to_owned(), budgets.cleanup_grace_ms));
+        let index = match phase {
+            DeadlinePhase::MetadataFetch => 0,
+            DeadlinePhase::CheckoutCandidateBuild => 1,
+            DeadlinePhase::Preflight => 2,
+            DeadlinePhase::ResolutionMaterialization => 3,
+            DeadlinePhase::SelectedCase(index) => {
+                if index >= budgets.selected_cases.len() {
+                    return Err(
+                        "schedule supervisor: selected-case deadline index is invalid".into(),
+                    );
+                }
+                selected_offset + index
+            }
+            DeadlinePhase::EvidencePublication => evidence_index,
+            DeadlinePhase::ColdArchiveHandoff => cold_index,
+            DeadlinePhase::CleanupGrace => cleanup_index,
+        };
+        let (label, budget_ms) = ordered[index].clone();
+        let reserved_after_ms = ordered[index + 1..].iter().try_fold(
+            budgets.fixed_margin_ms,
+            |reserved, (_, value)| {
+                reserved
+                    .checked_add(*value)
+                    .ok_or("schedule supervisor: phase reservation sum overflows")
+            },
+        )?;
+        Ok((label, budget_ms, reserved_after_ms))
+    }
+
+    pub(super) async fn run_phase<T, F>(
+        &self,
+        phase: DeadlinePhase,
         future: F,
     ) -> Result<T, BoxError>
     where
         F: std::future::Future<Output = Result<T, BoxError>>,
     {
-        match tokio::time::timeout_at(tokio::time::Instant::from_std(self.absolute), future).await {
-            Ok(result) => result,
-            Err(_) => {
-                Err(format!("schedule supervisor: absolute_deadline_exceeded:{phase}").into())
+        let (label, budget_ms, reserved_after_ms) = self.phase_budget_and_reserved_after(phase)?;
+        let now = Instant::now();
+        let local_deadline = now
+            .checked_add(Duration::from_millis(budget_ms))
+            .ok_or("schedule supervisor: local phase deadline overflows")?;
+        let reserve_deadline = self
+            .absolute
+            .checked_sub(Duration::from_millis(reserved_after_ms))
+            .ok_or("schedule supervisor: phase reservations exceed the absolute deadline")?;
+        let phase_deadline = local_deadline.min(reserve_deadline);
+        if budget_ms == 0 || now >= phase_deadline {
+            return Err(format!("schedule supervisor: phase_deadline_exceeded:{label}").into());
+        }
+
+        let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(phase_deadline));
+        tokio::pin!(timer);
+        tokio::pin!(future);
+        tokio::select! {
+            biased;
+            _ = &mut timer => {
+                Err(format!("schedule supervisor: phase_deadline_exceeded:{label}").into())
             }
+            result = &mut future => result,
         }
     }
 }
@@ -297,6 +461,8 @@ pub(super) enum SupervisorSignal {
 }
 
 pub(super) trait SupervisorControl {
+    fn exact_process_live(&mut self, process: &ProcessIdentityV1) -> Result<bool, BoxError>;
+
     fn exact_runner_live(&mut self, runner: &ProcessIdentityV1) -> Result<bool, BoxError>;
 
     fn exact_anchor_live(&mut self, group: &AnchoredProcessGroupRecordV1)
@@ -374,6 +540,10 @@ fn validate_supervisor_transition(
         &next.kill_journal_elapsed_ms,
         &OptionalElapsedMsV1::Absent,
     ) || !field_is_write_once(
+        &previous.kill_cause,
+        &next.kill_cause,
+        &OptionalSupervisorKillCauseV1::Absent,
+    ) || !field_is_write_once(
         &previous.outcome,
         &next.outcome,
         &OptionalSupervisorOutcomeV1::Absent,
@@ -430,9 +600,20 @@ fn validate_supervisor_transition(
         else {
             return Err("schedule supervisor: anchored group disappeared from journal".into());
         };
+        let workloads_are_safe = if matches!(
+            (previous.phase, next.phase),
+            (SupervisorPhaseV1::Prepared, SupervisorPhaseV1::Running)
+        ) {
+            previous_group
+                .workloads
+                .iter()
+                .all(|workload| next_group.workloads.contains(workload))
+        } else {
+            previous_group.workloads == next_group.workloads
+        };
         if previous_group.session_id != next_group.session_id
             || previous_group.anchor != next_group.anchor
-            || previous_group.workloads != next_group.workloads
+            || !workloads_are_safe
             || !matches!(
                 (previous_group.anchor_lifecycle, next_group.anchor_lifecycle),
                 (
@@ -546,13 +727,13 @@ impl FileSupervisorJournal {
             next_generation: 1,
             previous_sha256: None,
         };
-        if !journal.generation_paths()?.is_empty() {
+        if !journal.generation_entries()?.is_empty() {
             return Err("schedule supervisor: journal already contains this record id".into());
         }
         Ok(journal)
     }
 
-    fn generation_paths(&mut self) -> Result<Vec<(u64, PathBuf)>, BoxError> {
+    fn generation_entries(&mut self) -> Result<Vec<(u64, String)>, BoxError> {
         use std::os::unix::fs::MetadataExt as _;
 
         let expected = self.directory_handle.metadata()?;
@@ -580,7 +761,7 @@ impl FileSupervisorJournal {
             let generation = raw_generation
                 .parse::<u64>()
                 .map_err(|_| "schedule supervisor: journal generation does not fit u64")?;
-            paths.push((generation, entry.path()));
+            paths.push((generation, name.to_owned()));
         }
         if paths.len() > Self::MAX_JOURNAL_GENERATIONS {
             return Err("schedule supervisor: journal generation count exceeds the bound".into());
@@ -593,6 +774,66 @@ impl FileSupervisorJournal {
         }
         paths.sort_by_key(|(generation, _)| *generation);
         Ok(paths)
+    }
+
+    fn read_generation(&self, name: &str) -> Result<(Vec<u8>, String), BoxError> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::fs::MetadataExt as _;
+
+        let c_name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| "schedule supervisor: journal generation name contains NUL")?;
+        // SAFETY: the retained directory descriptor and single-component name are live. O_NOFOLLOW
+        // rejects a retargeted final component and O_NONBLOCK prevents a special file from parking
+        // the recovery scan before the regular-file check.
+        let fd = unsafe {
+            libc::openat(
+                self.directory_handle.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if fd == -1 {
+            return Err(format!(
+                "schedule supervisor: cannot open journal generation {name}: {}",
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+        // SAFETY: openat returned this descriptor uniquely.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let before = file.metadata()?;
+        if !before.is_file()
+            || before.nlink() != 1
+            || before.uid() != unsafe { libc::geteuid() }
+            || before.mode() & 0o177 != 0
+            || before.len() > Self::MAX_JOURNAL_RECORD_BYTES
+        {
+            return Err(
+                "schedule supervisor: journal generation is not a bounded owner-private regular file"
+                    .into(),
+            );
+        }
+        let mut bytes = Vec::with_capacity(before.len() as usize);
+        (&mut file)
+            .take(Self::MAX_JOURNAL_RECORD_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > Self::MAX_JOURNAL_RECORD_BYTES {
+            return Err("schedule supervisor: journal generation exceeds the byte bound".into());
+        }
+        let after = file.metadata()?;
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.len() != after.len()
+            || before.mtime() != after.mtime()
+            || before.mtime_nsec() != after.mtime_nsec()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+            || bytes.len() as u64 != after.len()
+        {
+            return Err("schedule supervisor: journal generation changed during read".into());
+        }
+        let sha256 = crate::local_file::sha256_hex(&bytes);
+        Ok((bytes, sha256))
     }
 
     pub(super) fn open_existing(
@@ -608,27 +849,22 @@ impl FileSupervisorJournal {
             next_generation: 1,
             previous_sha256: None,
         };
-        let paths = journal.generation_paths()?;
-        if paths.is_empty() {
+        let entries = journal.generation_entries()?;
+        if entries.is_empty() {
             return Err("schedule supervisor: journal has no generations".into());
         }
         let mut previous_sha256 = None;
         let mut latest = None;
-        for (index, (generation, path)) in paths.into_iter().enumerate() {
+        for (index, (generation, name)) in entries.into_iter().enumerate() {
             let expected_generation = u64::try_from(index + 1)
                 .map_err(|_| "schedule supervisor: journal generation index overflows")?;
             if generation != expected_generation {
                 return Err("schedule supervisor: journal generations are not contiguous".into());
             }
-            let snapshot = crate::local_file::read_regular_file_bounded(
-                &path,
-                "schedule supervisor journal generation",
-                Self::MAX_JOURNAL_RECORD_BYTES,
-            )?;
-            let record: SupervisorRecordV1 =
-                serde_json::from_slice(&snapshot.bytes).map_err(|error| {
-                    format!("schedule supervisor: invalid journal generation: {error}")
-                })?;
+            let (bytes, sha256) = journal.read_generation(&name)?;
+            let record: SupervisorRecordV1 = serde_json::from_slice(&bytes).map_err(|error| {
+                format!("schedule supervisor: invalid journal generation: {error}")
+            })?;
             validate_supervisor_record(&record)?;
             if record.supervisor_record_id != record_id || record.generation != generation {
                 return Err("schedule supervisor: journal generation identity mismatch".into());
@@ -643,7 +879,7 @@ impl FileSupervisorJournal {
             } else if record.phase != SupervisorPhaseV1::Prepared {
                 return Err("schedule supervisor: initial journal phase is not prepared".into());
             }
-            previous_sha256 = Some(snapshot.sha256.clone());
+            previous_sha256 = Some(sha256);
             latest = Some(record);
         }
         let latest = latest.expect("non-empty journal has a latest record");
@@ -832,8 +1068,9 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
         self.transition(candidate)
     }
 
-    pub(super) fn register_descendant_group(
+    pub(super) fn register_descendant_group<C: SupervisorControl>(
         &mut self,
+        control: &mut C,
         group: AnchoredProcessGroupRecordV1,
     ) -> Result<(), BoxError> {
         if self.record.phase != SupervisorPhaseV1::Running
@@ -856,13 +1093,29 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
         {
             return self.enter_hold(SafetyHoldReasonV1::NewSessionEscape);
         }
-        let mut known = self
+        let mut known_identities = self
             .record
             .groups
             .iter()
-            .flat_map(|group| group.workloads.iter().map(|workload| workload.pid))
+            .flat_map(|group| group.workloads.iter().cloned())
+            .collect::<Vec<_>>();
+        known_identities.push(runner.clone());
+        known_identities.sort_by_key(|identity| identity.pid);
+        known_identities.dedup();
+        for identity in known_identities.iter().chain(group.workloads.iter()) {
+            let exact_live = control.exact_process_live(identity);
+            if !self.control_or_hold(exact_live, SafetyHoldReasonV1::ProcessIdentityUnavailable)? {
+                return self.enter_hold(SafetyHoldReasonV1::ProcessIdentityUnavailable);
+            }
+        }
+        let anchor_live = control.exact_anchor_live(&group);
+        if !self.control_or_hold(anchor_live, SafetyHoldReasonV1::ProcessIdentityUnavailable)? {
+            return self.enter_hold(SafetyHoldReasonV1::AnchorNotLive);
+        }
+        let mut known = known_identities
+            .iter()
+            .map(|identity| identity.pid)
             .collect::<BTreeSet<_>>();
-        known.insert(runner.pid);
         let mut pending = group.workloads.iter().collect::<Vec<_>>();
         while !pending.is_empty() {
             let before = pending.len();
@@ -899,13 +1152,40 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
     }
 
     fn enter_hold(&mut self, reason: SafetyHoldReasonV1) -> Result<(), BoxError> {
+        self.enter_hold_with_group_lifecycle(reason, None)
+    }
+
+    fn enter_hold_with_group_lifecycle(
+        &mut self,
+        reason: SafetyHoldReasonV1,
+        group_lifecycle: Option<(i32, AnchorLifecycleV1)>,
+    ) -> Result<(), BoxError> {
         let mut candidate = self.record.clone();
+        if let Some((process_group, lifecycle)) = group_lifecycle {
+            let group = candidate
+                .groups
+                .iter_mut()
+                .find(|group| group.process_group == process_group)
+                .ok_or("schedule supervisor: hold group is not in the journal inventory")?;
+            group.anchor_lifecycle = lifecycle;
+        }
         candidate.phase = SupervisorPhaseV1::SafetyHold;
         candidate.later_group_signal_permitted = false;
         candidate.outcome = OptionalSupervisorOutcomeV1::Outcome {
             value: SupervisorTerminalOutcomeV1::SafetyHold,
         };
         candidate.safety_hold = OptionalSafetyHoldReasonV1::Reason { value: reason };
+        self.transition(candidate)
+    }
+
+    fn mark_group_released(&mut self, process_group: i32) -> Result<(), BoxError> {
+        let mut candidate = self.record.clone();
+        let group = candidate
+            .groups
+            .iter_mut()
+            .find(|group| group.process_group == process_group)
+            .ok_or("schedule supervisor: released group is not in the journal inventory")?;
+        group.anchor_lifecycle = AnchorLifecycleV1::ReleasedReaped;
         self.transition(candidate)
     }
 
@@ -957,6 +1237,7 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
         &mut self,
         control: &mut C,
         elapsed_ms: u64,
+        cause: SupervisorKillCauseV1,
     ) -> Result<(), BoxError> {
         let anchor_observation = self.all_anchors_live(control);
         if !self.control_or_hold(
@@ -968,6 +1249,7 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
         let mut candidate = self.record.clone();
         candidate.phase = SupervisorPhaseV1::KillJournaled;
         candidate.kill_journal_elapsed_ms = OptionalElapsedMsV1::ElapsedMs { value: elapsed_ms };
+        candidate.kill_cause = OptionalSupervisorKillCauseV1::Cause { value: cause };
         self.transition(candidate)?;
         for group in &self.record.groups {
             if let Err(error) = control.signal_group(group, SupervisorSignal::Kill) {
@@ -988,7 +1270,11 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
     ) -> Result<(), BoxError> {
         match self.record.phase {
             SupervisorPhaseV1::Running => self.begin_term(control, elapsed_ms),
-            SupervisorPhaseV1::TermGrace => self.begin_kill(control, elapsed_ms),
+            SupervisorPhaseV1::TermGrace => self.begin_kill(
+                control,
+                elapsed_ms,
+                SupervisorKillCauseV1::RepeatedCancellation,
+            ),
             SupervisorPhaseV1::Prepared
             | SupervisorPhaseV1::KillJournaled
             | SupervisorPhaseV1::Reaping
@@ -1003,7 +1289,7 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
         elapsed_ms: u64,
     ) -> Result<(), BoxError> {
         if self.record.phase == SupervisorPhaseV1::TermGrace {
-            self.begin_kill(control, elapsed_ms)
+            self.begin_kill(control, elapsed_ms, SupervisorKillCauseV1::Deadline)
         } else {
             Ok(())
         }
@@ -1012,18 +1298,53 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
     pub(super) fn finish_after_exit<C: SupervisorControl>(
         &mut self,
         control: &mut C,
-        child: ChildArtifactRefV1,
-        outcome: SupervisorTerminalOutcomeV1,
+        child: VerifiedChildArtifact,
     ) -> Result<(), BoxError> {
         if !matches!(
             self.record.phase,
             SupervisorPhaseV1::Running | SupervisorPhaseV1::TermGrace | SupervisorPhaseV1::Reaping
-        ) || outcome == SupervisorTerminalOutcomeV1::SafetyHold
-        {
+        ) {
             return Err(
                 "schedule supervisor: terminal completion is not allowed in this phase".into(),
             );
         }
+        let outcome = match (
+            &self.record.term_journal_elapsed_ms,
+            &self.record.kill_journal_elapsed_ms,
+            &self.record.kill_cause,
+        ) {
+            (
+                OptionalElapsedMsV1::Absent,
+                OptionalElapsedMsV1::Absent,
+                OptionalSupervisorKillCauseV1::Absent,
+            ) => SupervisorTerminalOutcomeV1::Completed,
+            (
+                OptionalElapsedMsV1::ElapsedMs { .. },
+                OptionalElapsedMsV1::Absent,
+                OptionalSupervisorKillCauseV1::Absent,
+            ) => SupervisorTerminalOutcomeV1::Cancelled,
+            (
+                OptionalElapsedMsV1::ElapsedMs { .. },
+                OptionalElapsedMsV1::ElapsedMs { .. },
+                OptionalSupervisorKillCauseV1::Cause {
+                    value: SupervisorKillCauseV1::Deadline,
+                },
+            ) => SupervisorTerminalOutcomeV1::KilledAfterDeadline,
+            (
+                OptionalElapsedMsV1::ElapsedMs { .. },
+                OptionalElapsedMsV1::ElapsedMs { .. },
+                OptionalSupervisorKillCauseV1::Cause {
+                    value: SupervisorKillCauseV1::RepeatedCancellation,
+                },
+            ) => SupervisorTerminalOutcomeV1::KilledAfterCancellation,
+            _ => {
+                return Err(
+                    "schedule supervisor: terminal outcome cannot be derived from signal state"
+                        .into(),
+                )
+            }
+        };
+        let child = child.into_reference();
         let runner = match &self.record.runner {
             OptionalProcessIdentityV1::Process { value } => value.clone(),
             OptionalProcessIdentityV1::Absent => {
@@ -1058,14 +1379,22 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
             let anchor_live = control.exact_anchor_live(group);
             if self.control_or_hold(anchor_live, SafetyHoldReasonV1::ProcessIdentityUnavailable)? {
                 if let Err(error) = control.release_and_reap_anchor(group) {
-                    self.enter_hold(SafetyHoldReasonV1::AnchorNotLive)?;
+                    self.enter_hold_with_group_lifecycle(
+                        SafetyHoldReasonV1::AnchorNotLive,
+                        Some((group.process_group, AnchorLifecycleV1::Ambiguous)),
+                    )?;
                     return Err(error);
                 }
+                self.mark_group_released(group.process_group)?;
             } else {
                 let absent = control.group_absent(group.process_group);
                 if !self.control_or_hold(absent, SafetyHoldReasonV1::ProcessIdentityUnavailable)? {
-                    return self.enter_hold(SafetyHoldReasonV1::AnchorNotLive);
+                    return self.enter_hold_with_group_lifecycle(
+                        SafetyHoldReasonV1::AnchorNotLive,
+                        Some((group.process_group, AnchorLifecycleV1::Ambiguous)),
+                    );
                 }
+                self.mark_group_released(group.process_group)?;
             }
             let absent = control.group_absent(group.process_group);
             if !self.control_or_hold(absent, SafetyHoldReasonV1::ProcessIdentityUnavailable)? {
@@ -1107,7 +1436,31 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
     ) -> Result<RecoveryDisposition, BoxError> {
         validate_supervisor_record(&self.record)?;
         match self.record.phase {
-            SupervisorPhaseV1::Prepared => Ok(RecoveryDisposition::ResumePreSignal),
+            SupervisorPhaseV1::Prepared => {
+                let groups = self.record.groups.clone();
+                for group in &groups {
+                    let anchor_live = control.exact_anchor_live(group);
+                    if !self.control_or_hold(
+                        anchor_live,
+                        SafetyHoldReasonV1::StartupReconciliationIncomplete,
+                    )? {
+                        self.enter_hold(SafetyHoldReasonV1::AnchorNotLive)?;
+                        return Ok(RecoveryDisposition::SafetyHold);
+                    }
+                    let members = control.non_anchor_members(group);
+                    if !self
+                        .control_or_hold(
+                            members,
+                            SafetyHoldReasonV1::StartupReconciliationIncomplete,
+                        )?
+                        .is_empty()
+                    {
+                        self.enter_hold(SafetyHoldReasonV1::StartupReconciliationIncomplete)?;
+                        return Ok(RecoveryDisposition::SafetyHold);
+                    }
+                }
+                Ok(RecoveryDisposition::ResumePreSignal)
+            }
             SupervisorPhaseV1::Running => {
                 let runner = match &self.record.runner {
                     OptionalProcessIdentityV1::Process { value } => value.clone(),
@@ -1183,6 +1536,11 @@ mod tests {
         runner_live: bool,
         fail_anchor_observation: bool,
         fail_runner_observation: bool,
+        stale_process_pids: BTreeSet<i32>,
+        fail_signal: bool,
+        fail_anchor_release: bool,
+        fail_container_reap: bool,
+        fail_container_absence: bool,
         recycled: bool,
         signals: Vec<FakeSignal>,
         unrelated_alive: bool,
@@ -1204,6 +1562,10 @@ mod tests {
     }
 
     impl SupervisorControl for FakeControl {
+        fn exact_process_live(&mut self, process: &ProcessIdentityV1) -> Result<bool, BoxError> {
+            Ok(!self.stale_process_pids.contains(&process.pid))
+        }
+
         fn exact_runner_live(&mut self, _runner: &ProcessIdentityV1) -> Result<bool, BoxError> {
             if self.fail_runner_observation {
                 return Err("fake runner identity observation failed".into());
@@ -1226,6 +1588,9 @@ mod tests {
             _group: &AnchoredProcessGroupRecordV1,
             signal: SupervisorSignal,
         ) -> Result<(), BoxError> {
+            if self.fail_signal {
+                return Err("fake group signal failed".into());
+            }
             if self.recycled {
                 self.unrelated_alive = false;
             }
@@ -1265,6 +1630,9 @@ mod tests {
             &mut self,
             group: &AnchoredProcessGroupRecordV1,
         ) -> Result<(), BoxError> {
+            if self.fail_anchor_release {
+                return Err("fake anchor release failed".into());
+            }
             if !self.anchor_live || self.recycled {
                 return Err("fake exact anchor is unavailable".into());
             }
@@ -1281,6 +1649,9 @@ mod tests {
         }
 
         fn reap_exact_containers(&mut self, labels: &[String]) -> Result<(), BoxError> {
+            if self.fail_container_reap {
+                return Err("fake container reap failed".into());
+            }
             for label in labels {
                 self.containers.remove(label);
             }
@@ -1288,6 +1659,9 @@ mod tests {
         }
 
         fn exact_containers_absent(&mut self, labels: &[String]) -> Result<bool, BoxError> {
+            if self.fail_container_absence {
+                return Err("fake container absence observation failed".into());
+            }
             Ok(labels.iter().all(|label| !self.containers.contains(label)))
         }
     }
@@ -1342,11 +1716,18 @@ mod tests {
             deadline_derivation_sha256: digest('a'),
             scheduler: identity(42, 42),
             runner: OptionalProcessIdentityV1::Absent,
-            groups: Vec::new(),
+            groups: vec![AnchoredProcessGroupRecordV1 {
+                process_group: 43,
+                session_id: 41,
+                anchor: identity(43, 43),
+                workloads: Vec::new(),
+                anchor_lifecycle: AnchorLifecycleV1::RetainedLive,
+            }],
             container_run_labels: vec!["a2a-compat-run-1".into()],
             phase: SupervisorPhaseV1::Prepared,
             term_journal_elapsed_ms: OptionalElapsedMsV1::Absent,
             kill_journal_elapsed_ms: OptionalElapsedMsV1::Absent,
+            kill_cause: OptionalSupervisorKillCauseV1::Absent,
             later_group_signal_permitted: true,
             outcome: OptionalSupervisorOutcomeV1::Absent,
             safety_hold: OptionalSafetyHoldReasonV1::Absent,
@@ -1387,6 +1768,11 @@ mod tests {
             runner_live: true,
             fail_anchor_observation: false,
             fail_runner_observation: false,
+            stale_process_pids: BTreeSet::new(),
+            fail_signal: false,
+            fail_anchor_release: false,
+            fail_container_reap: false,
+            fail_container_absence: false,
             recycled: false,
             signals: Vec::new(),
             unrelated_alive: true,
@@ -1400,14 +1786,22 @@ mod tests {
         }
     }
 
-    fn child_artifact() -> ChildArtifactRefV1 {
-        ChildArtifactRefV1 {
+    fn child_artifact() -> VerifiedChildArtifact {
+        child_artifact_for_window("window-1")
+    }
+
+    fn child_artifact_for_window(window_id: &str) -> VerifiedChildArtifact {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("child-join.json");
+        let join = ChildArtifactJoinV1 {
+            schema_version: 1,
             record_id: "aggregate-1".into(),
             run_id: "run-1".into(),
-            window_id: "window-1".into(),
-            artifact_sha256: digest('b'),
-            aggregate_sha256: OptionalSha256V1::Sha256 { value: digest('c') },
-        }
+            window_id: window_id.into(),
+            aggregate_sha256: OptionalSha256V1::Absent,
+        };
+        std::fs::write(&path, serde_json::to_vec(&join).unwrap()).unwrap();
+        VerifiedChildArtifact::load(&path, None).unwrap()
     }
 
     fn record_sha256(record: &SupervisorRecordV1) -> String {
@@ -1447,10 +1841,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(deadline.record().input.total_bound_ms, 360);
-        assert_eq!(
-            deadline.absolute(),
-            process_entry + Duration::from_millis(360)
-        );
+        assert!(deadline.absolute() <= process_entry + Duration::from_millis(360));
         assert!(deadline.remaining() <= Duration::from_millis(360));
         assert!(deadline.elapsed_ms().unwrap() <= 360);
 
@@ -1483,7 +1874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publication_wedge_expires_at_the_original_process_deadline() {
+    async fn publication_wedge_reserves_cleanup_and_margin_under_the_absolute_deadline() {
         let process_entry = Instant::now();
         let deadline = HardDeadline::derive(
             process_entry,
@@ -1508,20 +1899,158 @@ mod tests {
         )
         .unwrap();
         let original_absolute = deadline.absolute();
+        let started = Instant::now();
 
         let error = deadline
-            .run_until_absolute(
-                "evidence_publication",
+            .run_phase(
+                DeadlinePhase::EvidencePublication,
                 std::future::pending::<Result<(), BoxError>>(),
             )
             .await
             .unwrap_err();
 
         assert_eq!(deadline.absolute(), original_absolute);
-        assert_eq!(deadline.remaining(), Duration::ZERO);
+        assert!(started.elapsed() < Duration::from_millis(70));
+        assert!(deadline.remaining() > Duration::ZERO);
         assert_eq!(
             error.to_string(),
-            "schedule supervisor: absolute_deadline_exceeded:evidence_publication"
+            "schedule supervisor: phase_deadline_exceeded:evidence_publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_or_zero_budget_phase_never_polls_an_immediately_ready_effect() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let deadline = HardDeadline::derive(
+            Instant::now(),
+            "run-expired".into(),
+            "window-expired".into(),
+            DeadlinePhaseBudgetsV1 {
+                metadata_fetch_ms: 10,
+                checkout_candidate_build_ms: 0,
+                preflight_ms: 0,
+                resolution_materialization_ms: 0,
+                selected_cases: Vec::new(),
+                evidence_publication_ms: 0,
+                cold_archive_handoff_ms: 0,
+                cleanup_grace_ms: 1,
+                fixed_margin_ms: 1,
+            },
+            DeadlineContainmentV1 {
+                schedule_window_remaining_ms: 12,
+                grant_remaining_ms: 12,
+                time_budget_remaining_ms: 12,
+            },
+        )
+        .unwrap();
+        tokio::time::sleep_until(
+            tokio::time::Instant::from_std(deadline.absolute()) + Duration::from_millis(1),
+        )
+        .await;
+        let polled = Arc::new(AtomicBool::new(false));
+        let polled_by_effect = Arc::clone(&polled);
+        assert!(deadline
+            .run_phase(DeadlinePhase::MetadataFetch, async move {
+                polled_by_effect.store(true, Ordering::SeqCst);
+                Ok::<_, BoxError>(())
+            })
+            .await
+            .is_err());
+        assert!(!polled.load(Ordering::SeqCst));
+
+        let zero_deadline = HardDeadline::derive(
+            Instant::now(),
+            "run-zero".into(),
+            "window-zero".into(),
+            DeadlinePhaseBudgetsV1 {
+                metadata_fetch_ms: 100,
+                checkout_candidate_build_ms: 0,
+                preflight_ms: 0,
+                resolution_materialization_ms: 0,
+                selected_cases: Vec::new(),
+                evidence_publication_ms: 0,
+                cold_archive_handoff_ms: 0,
+                cleanup_grace_ms: 10,
+                fixed_margin_ms: 10,
+            },
+            DeadlineContainmentV1 {
+                schedule_window_remaining_ms: 120,
+                grant_remaining_ms: 120,
+                time_budget_remaining_ms: 120,
+            },
+        )
+        .unwrap();
+        let zero_budget = Arc::new(AtomicBool::new(false));
+        let zero_budget_effect = Arc::clone(&zero_budget);
+        assert!(zero_deadline
+            .run_phase(DeadlinePhase::ColdArchiveHandoff, async move {
+                zero_budget_effect.store(true, Ordering::SeqCst);
+                Ok::<_, BoxError>(())
+            })
+            .await
+            .is_err());
+        assert!(!zero_budget.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn every_phase_uses_its_local_budget_and_reserves_the_complete_tail() {
+        let deadline = HardDeadline::derive(
+            Instant::now(),
+            "run-phase-map".into(),
+            "window-phase-map".into(),
+            deadline_budgets(),
+            DeadlineContainmentV1 {
+                schedule_window_remaining_ms: 360,
+                grant_remaining_ms: 360,
+                time_budget_remaining_ms: 360,
+            },
+        )
+        .unwrap();
+        let expected = [
+            (DeadlinePhase::MetadataFetch, 10, 350),
+            (DeadlinePhase::CheckoutCandidateBuild, 20, 330),
+            (DeadlinePhase::Preflight, 30, 300),
+            (DeadlinePhase::ResolutionMaterialization, 40, 260),
+            (DeadlinePhase::SelectedCase(0), 50, 210),
+            (DeadlinePhase::EvidencePublication, 60, 150),
+            (DeadlinePhase::ColdArchiveHandoff, 0, 150),
+            (DeadlinePhase::CleanupGrace, 70, 80),
+        ];
+        for (phase, budget, reserved) in expected {
+            let (_, actual_budget, actual_reserved) =
+                deadline.phase_budget_and_reserved_after(phase).unwrap();
+            assert_eq!((actual_budget, actual_reserved), (budget, reserved));
+        }
+        assert!(deadline
+            .phase_budget_and_reserved_after(DeadlinePhase::SelectedCase(1))
+            .is_err());
+    }
+
+    #[test]
+    fn serialized_remaining_time_never_understates_the_executable_deadline() {
+        let process_entry = Instant::now()
+            .checked_sub(Duration::from_micros(5_100))
+            .unwrap();
+        let deadline = HardDeadline::derive(
+            process_entry,
+            "run-rounded".into(),
+            "window-rounded".into(),
+            deadline_budgets(),
+            DeadlineContainmentV1 {
+                schedule_window_remaining_ms: 354,
+                grant_remaining_ms: 354,
+                time_budget_remaining_ms: 354,
+            },
+        )
+        .unwrap();
+        let represented = deadline.record().input.remaining_at_derivation_ms;
+        assert!(represented <= 354);
+        assert!(deadline.remaining() <= Duration::from_millis(represented));
+        assert!(
+            deadline.absolute()
+                < process_entry + Duration::from_millis(deadline.record().input.total_bound_ms)
         );
     }
 
@@ -1687,7 +2216,7 @@ mod tests {
             .unwrap();
         drop(supervisor);
 
-        let (_journal, latest, latest_sha256) =
+        let (journal, latest, latest_sha256) =
             FileSupervisorJournal::open_existing(directory.path(), "supervisor-1").unwrap();
         assert_eq!(latest.generation, 2);
         assert_eq!(latest.phase, SupervisorPhaseV1::Running);
@@ -1696,17 +2225,23 @@ mod tests {
         members.insert(43, vec![identity(44, 43)]);
         let mut control = fake_control(false, members);
         let mut recovered =
-            ScheduleSupervisor::resume_existing(latest, latest_sha256, MemoryJournal::default())
-                .unwrap();
+            ScheduleSupervisor::resume_existing(latest, latest_sha256, journal).unwrap();
         assert_eq!(
             recovered.recover(&mut control).unwrap(),
             RecoveryDisposition::ResumeRunning
         );
+        recovered.request_cancel(&mut control, 10).unwrap();
+        drop(recovered);
+
+        let (_journal, latest, _latest_sha256) =
+            FileSupervisorJournal::open_existing(directory.path(), "supervisor-1").unwrap();
+        assert_eq!(latest.generation, 3);
+        assert_eq!(latest.phase, SupervisorPhaseV1::TermGrace);
 
         std::fs::write(
             directory
                 .path()
-                .join("supervisor-1.00000000000000000003.json"),
+                .join("supervisor-1.00000000000000000004.json"),
             b"truncated",
         )
         .unwrap();
@@ -1795,6 +2330,23 @@ mod tests {
     }
 
     #[test]
+    fn signal_effect_failure_is_followed_by_a_durable_ambiguous_hold() {
+        let (mut supervisor, mut control) = running_fake_supervisor(false);
+        control.fail_signal = true;
+
+        assert!(supervisor.request_cancel(&mut control, 10).is_err());
+
+        assert_eq!(supervisor.record().phase, SupervisorPhaseV1::SafetyHold);
+        assert_eq!(
+            supervisor.record().safety_hold,
+            OptionalSafetyHoldReasonV1::Reason {
+                value: SafetyHoldReasonV1::SignalJournalAmbiguous
+            }
+        );
+        assert!(control.signals.is_empty());
+    }
+
+    #[test]
     fn ignored_term_escalates_once_after_a_durable_kill_journal() {
         let (mut supervisor, mut control) = running_fake_supervisor(false);
         supervisor.request_cancel(&mut control, 10).unwrap();
@@ -1808,15 +2360,41 @@ mod tests {
             .iter()
             .any(|record| record.phase == SupervisorPhaseV1::KillJournaled));
         supervisor
-            .finish_after_exit(
-                &mut control,
-                child_artifact(),
-                SupervisorTerminalOutcomeV1::KilledAfterDeadline,
-            )
+            .finish_after_exit(&mut control, child_artifact())
             .unwrap();
         assert_eq!(supervisor.record().phase, SupervisorPhaseV1::Complete);
         assert!(control.unrelated_alive);
         assert!(control.unrelated_container_alive);
+        assert_eq!(
+            supervisor.record().outcome,
+            OptionalSupervisorOutcomeV1::Outcome {
+                value: SupervisorTerminalOutcomeV1::KilledAfterDeadline
+            }
+        );
+    }
+
+    #[test]
+    fn repeated_cancellation_derives_a_killed_after_cancellation_outcome() {
+        let (mut supervisor, mut control) = running_fake_supervisor(false);
+        supervisor.request_cancel(&mut control, 10).unwrap();
+        supervisor.request_cancel(&mut control, 11).unwrap();
+        supervisor
+            .finish_after_exit(&mut control, child_artifact())
+            .unwrap();
+
+        assert_eq!(control.signals, vec![FakeSignal::Term, FakeSignal::Kill]);
+        assert_eq!(
+            supervisor.record().kill_cause,
+            OptionalSupervisorKillCauseV1::Cause {
+                value: SupervisorKillCauseV1::RepeatedCancellation
+            }
+        );
+        assert_eq!(
+            supervisor.record().outcome,
+            OptionalSupervisorOutcomeV1::Outcome {
+                value: SupervisorTerminalOutcomeV1::KilledAfterCancellation
+            }
+        );
     }
 
     #[test]
@@ -1824,11 +2402,7 @@ mod tests {
         let (mut supervisor, mut control) = running_fake_supervisor(true);
         supervisor.request_cancel(&mut control, 10).unwrap();
         supervisor
-            .finish_after_exit(
-                &mut control,
-                child_artifact(),
-                SupervisorTerminalOutcomeV1::Cancelled,
-            )
+            .finish_after_exit(&mut control, child_artifact())
             .unwrap();
 
         assert_eq!(control.signals, vec![FakeSignal::Term]);
@@ -1840,6 +2414,85 @@ mod tests {
     }
 
     #[test]
+    fn child_join_is_byte_verified_before_anchor_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let aggregate_path = directory.path().join("aggregate.json");
+        std::fs::write(&aggregate_path, b"{}").unwrap();
+        let join_path = directory.path().join("join.json");
+        let join = ChildArtifactJoinV1 {
+            schema_version: 1,
+            record_id: "aggregate-1".into(),
+            run_id: "run-1".into(),
+            window_id: "window-1".into(),
+            aggregate_sha256: OptionalSha256V1::Sha256 { value: digest('c') },
+        };
+        std::fs::write(&join_path, serde_json::to_vec(&join).unwrap()).unwrap();
+        assert_eq!(
+            VerifiedChildArtifact::load(&join_path, Some(&aggregate_path))
+                .unwrap_err()
+                .to_string(),
+            "schedule supervisor: child aggregate byte hash does not match the join"
+        );
+
+        let (mut supervisor, mut control) = running_fake_supervisor(true);
+        supervisor.request_cancel(&mut control, 10).unwrap();
+        assert!(supervisor
+            .finish_after_exit(&mut control, child_artifact_for_window("other-window"))
+            .is_err());
+        assert_eq!(supervisor.record().phase, SupervisorPhaseV1::TermGrace);
+        assert!(control.released_groups.is_empty());
+    }
+
+    #[test]
+    fn release_and_container_failures_preserve_exact_terminal_hold_state() {
+        let (mut release_failure, mut release_control) = running_fake_supervisor(true);
+        release_failure
+            .request_cancel(&mut release_control, 10)
+            .unwrap();
+        release_control.fail_anchor_release = true;
+        assert!(release_failure
+            .finish_after_exit(&mut release_control, child_artifact())
+            .is_err());
+        assert_eq!(
+            release_failure.record().groups[0].anchor_lifecycle,
+            AnchorLifecycleV1::Ambiguous
+        );
+        assert_eq!(
+            release_failure.record().phase,
+            SupervisorPhaseV1::SafetyHold
+        );
+
+        let (mut reap_failure, mut reap_control) = running_fake_supervisor(true);
+        reap_failure.request_cancel(&mut reap_control, 10).unwrap();
+        reap_control.fail_container_reap = true;
+        assert!(reap_failure
+            .finish_after_exit(&mut reap_control, child_artifact())
+            .is_err());
+        assert_eq!(
+            reap_failure.record().groups[0].anchor_lifecycle,
+            AnchorLifecycleV1::ReleasedReaped
+        );
+        assert_eq!(reap_failure.record().phase, SupervisorPhaseV1::SafetyHold);
+
+        let (mut absence_failure, mut absence_control) = running_fake_supervisor(true);
+        absence_failure
+            .request_cancel(&mut absence_control, 10)
+            .unwrap();
+        absence_control.fail_container_absence = true;
+        assert!(absence_failure
+            .finish_after_exit(&mut absence_control, child_artifact())
+            .is_err());
+        assert_eq!(
+            absence_failure.record().groups[0].anchor_lifecycle,
+            AnchorLifecycleV1::ReleasedReaped
+        );
+        assert_eq!(
+            absence_failure.record().phase,
+            SupervisorPhaseV1::SafetyHold
+        );
+    }
+
+    #[test]
     fn unproved_exit_after_kill_remains_a_safety_hold() {
         let (mut supervisor, mut control) = running_fake_supervisor(false);
         control.kill_exits = false;
@@ -1847,11 +2500,7 @@ mod tests {
         supervisor.grace_expired(&mut control, 20).unwrap();
 
         supervisor
-            .finish_after_exit(
-                &mut control,
-                child_artifact(),
-                SupervisorTerminalOutcomeV1::KilledAfterDeadline,
-            )
+            .finish_after_exit(&mut control, child_artifact())
             .unwrap();
 
         assert_eq!(supervisor.record().phase, SupervisorPhaseV1::SafetyHold);
@@ -1863,13 +2512,16 @@ mod tests {
         let (mut supervisor, mut control) = running_fake_supervisor(false);
         let descendant = identity_with_parent(55, 44, 53);
         supervisor
-            .register_descendant_group(AnchoredProcessGroupRecordV1 {
-                process_group: 53,
-                session_id: 41,
-                anchor: identity(54, 53),
-                workloads: vec![descendant.clone()],
-                anchor_lifecycle: AnchorLifecycleV1::RetainedLive,
-            })
+            .register_descendant_group(
+                &mut control,
+                AnchoredProcessGroupRecordV1 {
+                    process_group: 53,
+                    session_id: 41,
+                    anchor: identity(54, 53),
+                    workloads: vec![descendant.clone()],
+                    anchor_lifecycle: AnchorLifecycleV1::RetainedLive,
+                },
+            )
             .unwrap();
         control.non_anchor_members.insert(53, vec![descendant]);
         supervisor.request_cancel(&mut control, 10).unwrap();
@@ -1885,30 +2537,54 @@ mod tests {
         );
         assert!(control.unrelated_alive);
         supervisor
-            .finish_after_exit(
-                &mut control,
-                child_artifact(),
-                SupervisorTerminalOutcomeV1::KilledAfterDeadline,
-            )
+            .finish_after_exit(&mut control, child_artifact())
             .unwrap();
         assert_eq!(supervisor.record().phase, SupervisorPhaseV1::Complete);
         assert!(control.non_anchor_members.values().all(Vec::is_empty));
 
-        let (mut escaped, _control) = running_fake_supervisor(false);
+        let (mut escaped, mut escaped_control) = running_fake_supervisor(false);
         let mut workload = identity_with_parent(65, 44, 63);
         workload.session_id = 99;
         let mut anchor = identity(64, 63);
         anchor.session_id = 99;
         escaped
-            .register_descendant_group(AnchoredProcessGroupRecordV1 {
-                process_group: 63,
-                session_id: 99,
-                anchor,
-                workloads: vec![workload],
-                anchor_lifecycle: AnchorLifecycleV1::RetainedLive,
-            })
+            .register_descendant_group(
+                &mut escaped_control,
+                AnchoredProcessGroupRecordV1 {
+                    process_group: 63,
+                    session_id: 99,
+                    anchor,
+                    workloads: vec![workload],
+                    anchor_lifecycle: AnchorLifecycleV1::RetainedLive,
+                },
+            )
             .unwrap();
         assert_eq!(escaped.record().phase, SupervisorPhaseV1::SafetyHold);
+    }
+
+    #[test]
+    fn recycled_numeric_parent_cannot_authorize_a_descendant_group() {
+        let (mut supervisor, mut control) = running_fake_supervisor(false);
+        control.stale_process_pids.insert(44);
+        let descendant = identity_with_parent(55, 44, 53);
+
+        supervisor
+            .register_descendant_group(
+                &mut control,
+                AnchoredProcessGroupRecordV1 {
+                    process_group: 53,
+                    session_id: 41,
+                    anchor: identity(54, 53),
+                    workloads: vec![descendant],
+                    anchor_lifecycle: AnchorLifecycleV1::RetainedLive,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(supervisor.record().phase, SupervisorPhaseV1::SafetyHold);
+        assert_eq!(supervisor.record().groups.len(), 1);
+        assert!(control.signals.is_empty());
+        assert!(control.unrelated_alive);
     }
 
     #[test]
@@ -1963,6 +2639,41 @@ mod tests {
         assert_eq!(recovered.record().phase, SupervisorPhaseV1::SafetyHold);
         assert_eq!(recovered.record().generation, generation + 1);
         assert_eq!(recovered.journal().records.len(), 1);
+    }
+
+    #[test]
+    fn prepared_recovery_resumes_only_when_the_anchored_group_has_no_workload() {
+        let prepared = prepared_record();
+        let hash = record_sha256(&prepared);
+        let mut empty_control = fake_control(false, BTreeMap::from([(43, Vec::new())]));
+        let mut empty = ScheduleSupervisor::resume_existing(
+            prepared.clone(),
+            hash.clone(),
+            MemoryJournal::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            empty.recover(&mut empty_control).unwrap(),
+            RecoveryDisposition::ResumePreSignal
+        );
+
+        let mut members = BTreeMap::new();
+        members.insert(43, vec![identity(44, 43)]);
+        let mut ambiguous_control = fake_control(false, members);
+        let mut ambiguous =
+            ScheduleSupervisor::resume_existing(prepared, hash, MemoryJournal::default()).unwrap();
+        assert_eq!(
+            ambiguous.recover(&mut ambiguous_control).unwrap(),
+            RecoveryDisposition::SafetyHold
+        );
+        assert_eq!(ambiguous.record().phase, SupervisorPhaseV1::SafetyHold);
+        assert_eq!(
+            ambiguous.record().safety_hold,
+            OptionalSafetyHoldReasonV1::Reason {
+                value: SafetyHoldReasonV1::StartupReconciliationIncomplete
+            }
+        );
+        assert!(ambiguous_control.signals.is_empty());
     }
 
     #[test]
@@ -2024,11 +2735,7 @@ mod tests {
             RecoveryDisposition::ReconcileWithoutSignal
         );
         recovered
-            .finish_after_exit(
-                &mut control,
-                child_artifact(),
-                SupervisorTerminalOutcomeV1::KilledAfterDeadline,
-            )
+            .finish_after_exit(&mut control, child_artifact())
             .unwrap();
 
         assert!(control.signals.is_empty());
@@ -2056,11 +2763,7 @@ mod tests {
         );
 
         recovered
-            .finish_after_exit(
-                &mut control,
-                child_artifact(),
-                SupervisorTerminalOutcomeV1::KilledAfterDeadline,
-            )
+            .finish_after_exit(&mut control, child_artifact())
             .unwrap();
 
         assert!(control.signals.is_empty());

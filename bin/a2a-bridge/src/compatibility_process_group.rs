@@ -365,6 +365,7 @@ pub(super) struct AnchoredProcessGroup {
     anchor_stdin: Option<tokio::process::ChildStdin>,
     drop_policy: AnchorDropPolicy,
     signal_attempts: u32,
+    identity_observer: fn(libc::pid_t) -> std::io::Result<Option<ProcessIdentityV1>>,
 }
 
 #[cfg(unix)]
@@ -463,6 +464,7 @@ impl AnchoredProcessGroup {
             anchor_stdin: Some(anchor_stdin),
             drop_policy,
             signal_attempts: 0,
+            identity_observer: process_identity,
         })
     }
 
@@ -484,7 +486,7 @@ impl AnchoredProcessGroup {
         let Some(expected) = &self.anchor_identity else {
             return Ok(false);
         };
-        Ok(process_identity(expected.pid)?.as_ref() == Some(expected))
+        Ok((self.identity_observer)(expected.pid)?.as_ref() == Some(expected))
     }
 
     pub(super) fn signal(&mut self, signal: AnchoredGroupSignal) -> std::io::Result<()> {
@@ -494,15 +496,20 @@ impl AnchoredProcessGroup {
                 "process-group anchor has already been released",
             ));
         };
-        if process_identity(expected.pid)?.as_ref() != Some(expected) {
+        if self.anchor.is_none()
+            || expected.process_group != self.process_group
+            || expected.pid <= 0
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "exact process-group anchor is no longer live",
+                "exact process-group anchor capability is no longer retained",
             ));
         }
         self.signal_attempts = self.signal_attempts.saturating_add(1);
-        // SAFETY: the positive PGID is retained by the exact bridge-owned anchor revalidated above;
-        // negation therefore cannot target a later recycled group identity.
+        // SAFETY: the exact bridge-owned Child handle has not been waited/reaped, so its captured PID
+        // and PGID cannot be recycled even if the anchor has exited into an unreaped state. This
+        // retained capability is intentionally stronger than a late /proc/proc_pidinfo observation:
+        // resolver cleanup must not lose descendant containment merely because that observation fails.
         if unsafe { libc::kill(-self.process_group, signal.raw()) } == -1 {
             return Err(std::io::Error::last_os_error());
         }
@@ -527,6 +534,14 @@ impl AnchoredProcessGroup {
     fn signal_attempts(&self) -> u32 {
         self.signal_attempts
     }
+
+    #[cfg(test)]
+    fn set_identity_observer(
+        &mut self,
+        observer: fn(libc::pid_t) -> std::io::Result<Option<ProcessIdentityV1>>,
+    ) {
+        self.identity_observer = observer;
+    }
 }
 
 #[cfg(unix)]
@@ -536,12 +551,14 @@ impl Drop for AnchoredProcessGroup {
             return;
         }
         if self.drop_policy == AnchorDropPolicy::KillGroup
+            && self.anchor.is_some()
             && self.anchor_identity.as_ref().is_some_and(|expected| {
-                process_identity(expected.pid).ok().flatten().as_ref() == Some(expected)
+                expected.pid > 0 && expected.process_group == self.process_group
             })
         {
-            // SAFETY: the still-live exact anchor retains this group identity. This is the resolver's
-            // synchronous cancellation fail-safe; the scheduler uses ReleaseOnly and recovery holds.
+            // SAFETY: the exact anchor Child has not been waited/reaped, so the PGID cannot have been
+            // recycled. This is the resolver's synchronous cancellation fail-safe; the scheduler uses
+            // ReleaseOnly and recovery holds.
             unsafe {
                 libc::kill(-self.process_group, libc::SIGKILL);
             }
@@ -590,6 +607,33 @@ mod tests {
         group.release_and_reap().await.unwrap();
         assert!(group.signal(AnchoredGroupSignal::Kill).is_err());
         assert_eq!(group.signal_attempts(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_child_capability_survives_late_identity_observation_failure() {
+        fn failed_observer(_pid: libc::pid_t) -> std::io::Result<Option<ProcessIdentityV1>> {
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+        }
+
+        let mut group = AnchoredProcessGroup::start_leader(AnchorDropPolicy::KillGroup).unwrap();
+        let mut workload = tokio::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .process_group(group.process_group())
+            .spawn()
+            .unwrap();
+        group.set_identity_observer(failed_observer);
+        assert_eq!(
+            group.anchor_is_exactly_live().unwrap_err().raw_os_error(),
+            Some(libc::EMFILE)
+        );
+
+        group.signal(AnchoredGroupSignal::Kill).unwrap();
+        workload.wait().await.unwrap();
+        group.release_and_reap().await.unwrap();
     }
 
     #[cfg(unix)]

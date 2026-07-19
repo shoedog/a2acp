@@ -1,6 +1,7 @@
 # R3d1 — supervisor and signal-parity implementation plan
 
-- **Status:** IN REVIEW
+- **Status:** IN REVIEW — initial Sol/xhigh review `REVISE`; remediation implemented and deterministic-green;
+  exact-head closure review pending
 - **Branch:** `agent/reliability-r3d1-supervisor`
 - **Base:** `origin/main` at `c2d147fb1f0df275f3c6452cdd212e185c002d08`
   (PR #38 merged R3d0)
@@ -19,9 +20,11 @@ or accounting, and it does not implement R3d3 evidence retention/publication. In
 - `compatibility schedule-tick` becomes a recognized parent entrypoint, captures its monotonic process-entry
   origin before dispatch, and refuses with a typed R3d2-not-implemented result before credentials or any
   provider-capable spawn. It is not advertised as an executable scheduler until the R3d2 path exists.
-- Deadline derivation is a checked, versioned, hashable contract. One in-memory absolute monotonic deadline is
-  computed from process entry; phase derivation time consumes the same bound; absent phases contribute zero;
-  overflow or an insufficient schedule/grant/accounting window refuses.
+- Deadline derivation is a checked, versioned, hashable contract. One conservatively rounded in-memory absolute
+  monotonic deadline is computed from process entry; phase derivation time consumes the same bound; absent phases
+  contribute zero; overflow or an insufficient schedule/grant/accounting window refuses. Each phase is capped by
+  both its own maximum and the hard deadline minus every later phase, cleanup grace, and fixed margin. An exhausted
+  phase refuses before polling even an immediately-ready effect.
 - The R3c retained group-leader anchor is factored into one reusable primitive. The resolver keeps its existing
   behavior through that primitive. R3d1 adds TERM, exact anchor identity checks, an anchor for an existing
   same-session descendant group, journal-before-terminal-signal ordering, and final release/reap only after no
@@ -29,8 +32,10 @@ or accounting, and it does not implement R3d3 evidence retention/publication. In
 - The supervisor is a deterministic state machine over exact process identities. Production Unix process
   inspection supplies PID, parent PID, process group, session, and a platform start marker; fake backends drive
   all cancellation, wedge, recycled-PGID, recovery, and unrelated-process regressions.
-- The parent supervisor record and child aggregate reference join on exact run/window identifiers and hashes.
-  A missing or mismatched child artifact cannot become a successful parent record.
+- The parent supervisor record and child aggregate reference join on exact run/window identifiers and hashes. The
+  supervisor descriptor-pins and hashes the actual join and optional aggregate bytes, parses and validates the
+  aggregate, and accepts only the resulting private verified-artifact capability. A missing, replaced, malformed,
+  or mismatched child artifact cannot become a successful parent record.
 - An anchor-acquisition/liveness ambiguity, new-session escape, unproved survivor, or crash ambiguity becomes a
   durable safety hold. Recovery never retries a numeric process-group signal when the prior terminal-signal
   ordering is uncertain.
@@ -165,42 +170,66 @@ Required tests:
 
 ## Implementation evidence
 
-- The R3c resolver now uses the shared retained-anchor primitive without weakening its exact-identity cleanup.
-  R3d1 adds exact TERM/KILL containment, same-session descendant anchoring, retained-anchor finalization, and
-  Linux/macOS process-identity inspection.
-- The versioned deadline and supervisor schemas validate checked phase sums, elapsed derivation, exact process and
-  group identities, signal/outcome/hold shape, parent/child joins, and hash domains. The runtime journal additionally
-  enforces a prepared first generation, monotonic phases, immutable identity/deadline fields, append-only groups,
-  write-once effects/outcomes, and a one-way anchor lifecycle across generations.
-- The default-off supervisor journals before effects, uses one absolute monotonic deadline, escalates first
-  cancellation/deadline through TERM then bounded grace and one KILL, proves exact exit/group absence before anchor
-  release, and turns effect or observation ambiguity into a durable safety hold. Startup recovery never retries an
-  ambiguously journaled numeric process-group signal.
+- The R3c resolver now uses the shared retained-anchor primitive without weakening cleanup when later identity
+  observation fails. The retained, unreaped child handle is the group-signal capability: the PID/PGID cannot be
+  recycled until reap, so a fallible late `/proc` or `proc_pidinfo` read cannot strand descendants. R3d1 adds exact
+  TERM/KILL containment, same-session descendant anchoring, retained-anchor finalization, and Linux/macOS
+  process-identity inspection.
+- The versioned deadline and supervisor schemas validate checked phase sums, conservative elapsed derivation,
+  exact process and group identities, unique live PID topology, signal/cause/outcome/hold shape, parent/child joins,
+  and hash domains. The runtime journal additionally enforces a prepared first generation with a retained empty
+  anchor, monotonic phases, immutable identity/deadline fields, append-only groups, write-once effects/outcomes, and
+  a one-way anchor lifecycle across generations. Reopen reads each generation through the retained journal-directory
+  descriptor and verifies file identity before and after its bounded read.
+- The default-off supervisor journals before effects, enforces local phase caps while reserving every later phase,
+  cleanup grace, and fixed margin under one absolute monotonic deadline, escalates first cancellation/deadline
+  through TERM then bounded grace and one KILL, records whether KILL followed deadline or repeated cancellation,
+  proves exact exit/group absence before anchor release, and turns effect or observation ambiguity into a durable
+  safety hold. Startup resumes Prepared only when the retained group is still exact and empty; any possible spawned
+  member or ambiguous terminal-signal ordering holds and never retries a numeric process-group signal.
 - SIGINT and SIGTERM now share the aggregate runner's one-shot cancellation path. `compatibility schedule-tick` is
   recognized but returns the typed `r3d2_authority_admission_not_implemented; no_effects` refusal before credential
   access or a provider-capable spawn.
-- Pre-change-red or isolated mutation proofs cover missing shared anchor/schema/supervisor APIs, TERM delivery,
-  stale exact workload identity, deadline publication wedge, cross-generation phase rollback, terminal-first
-  initialization, already-absent recovery, observation-error holds, SIGINT/SIGTERM parity, and the fail-closed
+- Pre-change-red, observed-red, or isolated mutation proofs cover missing shared anchor/schema/supervisor APIs, TERM
+  delivery, stale and recycled workload identities, deadline-first polling and later-phase reservation, conservative
+  deadline rounding, cross-generation phase rollback, terminal-first initialization, Prepared crash ambiguity,
+  already-absent recovery, cleanup despite identity-observation failure, KILL-cause/outcome separation, actual child
+  byte/hash validation, effect and cleanup failure holds, SIGINT/SIGTERM selector parity, and the fail-closed
   `schedule-tick` boundary. Each new effect path has a negative or edge fixture, including ignored TERM, SIGSTOP,
-  repeated cancellation, recycled PGID, unrelated-process survival, journal wedge, crash ambiguity, and mismatched
-  child joins.
-- Focused gates: process-group **5/0**, resolver compatibility **1/0**, schedule-schema **27/0**, supervisor
-  **21/0**, cancellation **3/0**, compatibility CLI **21/0**, and R3d1 CLI **2/0**.
-- Full serial workspace: **2,262 passed / 0 failed / 12 ignored** across **56** test binaries. Format/diff,
-  workspace all-target check, warnings-denied all-feature Clippy, locked release build, dependency policy,
-  repository hygiene (**37** tracked artifacts / **7** example configs), pinned manifest (**9**), floating recipes
-  (**4**), and schedule foundation (**6** advisory / **4** claimed-support) are green.
+  repeated cancellation, recycled PGID, unrelated-process survival, journal wedge/reopen, crash ambiguity, signal/
+  release/container failures, and mismatched child joins.
+- Initial bridge-mediated Sol/xhigh/read-only review of exact
+  `01438c34f2c17d3c4632583222b57748201e291b` returned eight `WRONG`, two `SMELL`, and
+  `R3D1 IMPLEMENTATION: REVISE`. The retained report is
+  `/private/tmp/a2a-bridge-r3d1-sol-review-01438c3/review.md`, mode `0644`, 6,290 bytes, SHA-256
+  `5515c25a33170a9ffa176a116e88ced44dac7754ddbdc10017b6683b94d3334b`. The current remediation closes
+  the eight demonstrated failures and the independently found Prepared spawn-before-Running crash window. The
+  journal-dirfd and real process-signal integration `SMELL`s are explicitly adjudicated below rather than hidden.
+- Focused gates on the remediated tree: process-group **6/0**, resolver compatibility **1/0**, schedule-schema
+  **29/0**, supervisor **30/0**, cancellation **4/0**, compatibility CLI **21/0**, and R3d1 CLI **2/0**. The complete
+  binary suite is **538/0/0**.
+- Full serial workspace on the remediated tree: **2,274 passed / 0 failed / 12 ignored** across **56** test binaries.
+  Format/diff, workspace all-target check, warnings-denied all-target/all-feature Clippy, locked release build,
+  dependency policy, repository hygiene (**37** tracked artifacts / **7** example configs), pinned manifest (**9**),
+  floating recipes (**4**), and schedule foundation (**6** advisory / **4** claimed-support) are green. The
+  provider-unexercised release binary is 26,575,056 bytes at SHA-256
+  `b4dc8349fdc5faed8255b2a2399350964f9a5334c2a99877c70fa573d39790cc`.
 - No timer, private authority issuance, live characterization, model discovery, credential access, container/runtime
   access, registry/image effect, compatibility provider turn, GitHub check mutation, or production-operator
   lifecycle action occurred. The authenticated live-agent/two-bridge/Kiro and local-Ollama tests remain the same
   **12 ignored** cases; no live compatibility gate was run or authorized.
+- R3d1 does not claim a real process-directed SIGINT/SIGTERM integration gate: deterministic tests inject both
+  selector outcomes through the shared cancellation path, while process-global OS signal delivery remains
+  unexercised to avoid perturbing the test runner. The retained-child cleanup and group-signal path itself is
+  exercised with real local child processes on the owner host.
 
 ## Restart point
 
 Continue in `/private/tmp/a2a-bridge-r3d1-supervisor` on branch
 `agent/reliability-r3d1-supervisor`. Re-read this plan, the active R3d design supervision section, and the
 central reliability roadmap. Freeze `HEAD`, `origin/main`, merge base, cleanliness, and changed paths before
-review or publication. The next action is to commit the exact candidate, run one fresh bridge-mediated Sol/xhigh
-review, fold every `WRONG` and adjudicate every `SMELL`, then run the single design-approved Fable/xhigh
-implementation/release lens only after Sol approval. Never touch the long-lived operator lifecycle during R3d1.
+review or publication. The initial candidate at exact `01438c34` has already received the Sol/xhigh `REVISE`
+recorded above. The next action is to commit and freeze the deterministic-green remediation, then run an exact-head
+Sol/xhigh closure review that adjudicates all inherited findings plus the Prepared crash window. Run
+the single design-approved Fable/xhigh implementation/release lens only after Sol approval. Never touch the
+long-lived operator lifecycle during R3d1.

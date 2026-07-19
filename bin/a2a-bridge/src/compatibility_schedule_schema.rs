@@ -124,6 +124,7 @@ pub(super) enum SupervisorTerminalOutcomeV1 {
     Completed,
     Cancelled,
     KilledAfterDeadline,
+    KilledAfterCancellation,
     SafetyHold,
 }
 
@@ -139,6 +140,20 @@ pub(super) enum OptionalSupervisorOutcomeV1 {
 pub(super) enum OptionalElapsedMsV1 {
     Absent,
     ElapsedMs { value: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum SupervisorKillCauseV1 {
+    Deadline,
+    RepeatedCancellation,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum OptionalSupervisorKillCauseV1 {
+    Absent,
+    Cause { value: SupervisorKillCauseV1 },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -171,6 +186,16 @@ pub(super) struct ChildArtifactRefV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ChildArtifactJoinV1 {
+    pub(super) schema_version: u16,
+    pub(super) record_id: String,
+    pub(super) run_id: String,
+    pub(super) window_id: String,
+    pub(super) aggregate_sha256: OptionalSha256V1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum OptionalChildArtifactRefV1 {
     Absent,
@@ -195,6 +220,7 @@ pub(super) struct SupervisorRecordV1 {
     pub(super) phase: SupervisorPhaseV1,
     pub(super) term_journal_elapsed_ms: OptionalElapsedMsV1,
     pub(super) kill_journal_elapsed_ms: OptionalElapsedMsV1,
+    pub(super) kill_cause: OptionalSupervisorKillCauseV1,
     pub(super) later_group_signal_permitted: bool,
     pub(super) outcome: OptionalSupervisorOutcomeV1,
     pub(super) safety_hold: OptionalSafetyHoldReasonV1,
@@ -1916,6 +1942,19 @@ impl ValidateRecord for DeadlineDerivationV1 {
     }
 }
 
+impl ValidateRecord for ChildArtifactJoinV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        if self.schema_version != 1 {
+            return Err("schedule schema: child artifact join must be version 1".into());
+        }
+        stable_id("child artifact record id", &self.record_id)?;
+        stable_id("child artifact run id", &self.run_id)?;
+        stable_id("child artifact window id", &self.window_id)?;
+        optional_sha256("child artifact aggregate", &self.aggregate_sha256)?;
+        Ok(())
+    }
+}
+
 impl ValidateRecord for SupervisorRecordV1 {
     fn validate(&self) -> Result<(), BoxError> {
         if self.schema_version != 1 || self.generation == 0 || self.recorded_at_ms <= 0 {
@@ -1956,10 +1995,7 @@ impl ValidateRecord for SupervisorRecordV1 {
             );
         }
         let mut groups = BTreeSet::new();
-        let mut identities = BTreeSet::from([(
-            self.scheduler.pid,
-            serde_json::to_string(&self.scheduler.start)?,
-        )]);
+        let mut process_pids = BTreeSet::from([self.scheduler.pid]);
         let mut runner_bound = runner.is_none();
         for (index, group) in self.groups.iter().enumerate() {
             if group.process_group <= 0
@@ -1980,12 +2016,8 @@ impl ValidateRecord for SupervisorRecordV1 {
                         .into(),
                 );
             }
-            let anchor_key = (
-                group.anchor.pid,
-                serde_json::to_string(&group.anchor.start)?,
-            );
-            if !identities.insert(anchor_key) {
-                return Err("schedule schema: supervisor process identities must be unique".into());
+            if !process_pids.insert(group.anchor.pid) {
+                return Err("schedule schema: supervisor process PIDs must be unique".into());
             }
             if group.workloads.len() > MAX_ITEMS {
                 return Err("schedule schema: supervisor group has too many workloads".into());
@@ -2003,11 +2035,8 @@ impl ValidateRecord for SupervisorRecordV1 {
                             .into(),
                     );
                 }
-                let workload_key = (workload.pid, serde_json::to_string(&workload.start)?);
-                if !identities.insert(workload_key) {
-                    return Err(
-                        "schedule schema: supervisor process identities must be unique".into(),
-                    );
+                if !process_pids.insert(workload.pid) {
+                    return Err("schedule schema: supervisor process PIDs must be unique".into());
                 }
                 runner_bound |= runner == Some(workload);
             }
@@ -2023,9 +2052,14 @@ impl ValidateRecord for SupervisorRecordV1 {
         )?;
         let term = optional_elapsed(&self.term_journal_elapsed_ms);
         let kill = optional_elapsed(&self.kill_journal_elapsed_ms);
+        let kill_cause = match self.kill_cause {
+            OptionalSupervisorKillCauseV1::Absent => None,
+            OptionalSupervisorKillCauseV1::Cause { value } => Some(value),
+        };
         if kill.is_some_and(|kill| term.is_none_or(|term| kill < term))
             || term.is_some_and(|elapsed| elapsed > MAX_SUPERVISOR_DEADLINE_MS)
             || kill.is_some_and(|elapsed| elapsed > MAX_SUPERVISOR_DEADLINE_MS)
+            || kill.is_some() != kill_cause.is_some()
         {
             return Err("schedule schema: supervisor signal journal ordering is invalid".into());
         }
@@ -2057,6 +2091,11 @@ impl ValidateRecord for SupervisorRecordV1 {
         match self.phase {
             SupervisorPhaseV1::Prepared => {
                 if runner.is_some()
+                    || self.groups.is_empty()
+                    || self.groups.iter().any(|group| {
+                        group.anchor_lifecycle != AnchorLifecycleV1::RetainedLive
+                            || !group.workloads.is_empty()
+                    })
                     || term.is_some()
                     || kill.is_some()
                     || outcome.is_some()
@@ -2082,6 +2121,7 @@ impl ValidateRecord for SupervisorRecordV1 {
             }
             SupervisorPhaseV1::TermGrace => {
                 if runner.is_none()
+                    || self.groups.is_empty()
                     || term.is_none()
                     || kill.is_some()
                     || outcome.is_some()
@@ -2095,6 +2135,7 @@ impl ValidateRecord for SupervisorRecordV1 {
             }
             SupervisorPhaseV1::KillJournaled => {
                 if runner.is_none()
+                    || self.groups.is_empty()
                     || term.is_none()
                     || kill.is_none()
                     || outcome.is_some()
@@ -2108,6 +2149,7 @@ impl ValidateRecord for SupervisorRecordV1 {
             }
             SupervisorPhaseV1::Reaping => {
                 if runner.is_none()
+                    || self.groups.is_empty()
                     || outcome.is_some()
                     || hold.is_some()
                     || self.later_group_signal_permitted
@@ -2118,15 +2160,26 @@ impl ValidateRecord for SupervisorRecordV1 {
             SupervisorPhaseV1::Complete => {
                 let signal_shape = match outcome {
                     Some(SupervisorTerminalOutcomeV1::Completed) => {
-                        term.is_none() && kill.is_none()
+                        term.is_none() && kill.is_none() && kill_cause.is_none()
                     }
-                    Some(SupervisorTerminalOutcomeV1::Cancelled) => term.is_some(),
+                    Some(SupervisorTerminalOutcomeV1::Cancelled) => {
+                        term.is_some() && kill.is_none() && kill_cause.is_none()
+                    }
                     Some(SupervisorTerminalOutcomeV1::KilledAfterDeadline) => {
-                        term.is_some() && kill.is_some()
+                        term.is_some()
+                            && kill.is_some()
+                            && kill_cause == Some(SupervisorKillCauseV1::Deadline)
+                    }
+                    Some(SupervisorTerminalOutcomeV1::KilledAfterCancellation) => {
+                        term.is_some()
+                            && kill.is_some()
+                            && kill_cause == Some(SupervisorKillCauseV1::RepeatedCancellation)
                     }
                     _ => false,
                 };
-                if !signal_shape
+                if runner.is_none()
+                    || self.groups.is_empty()
+                    || !signal_shape
                     || hold.is_some()
                     || child.is_none()
                     || self.later_group_signal_permitted
@@ -2154,6 +2207,10 @@ impl ValidateRecord for SupervisorRecordV1 {
 }
 
 pub(super) fn validate_deadline_derivation(value: &DeadlineDerivationV1) -> Result<(), BoxError> {
+    value.validate()
+}
+
+pub(super) fn validate_child_artifact_join(value: &ChildArtifactJoinV1) -> Result<(), BoxError> {
     value.validate()
 }
 
@@ -4151,6 +4208,7 @@ mod tests {
             phase: SupervisorPhaseV1::Complete,
             term_journal_elapsed_ms: OptionalElapsedMsV1::Absent,
             kill_journal_elapsed_ms: OptionalElapsedMsV1::Absent,
+            kill_cause: OptionalSupervisorKillCauseV1::Absent,
             later_group_signal_permitted: false,
             outcome: OptionalSupervisorOutcomeV1::Outcome {
                 value: SupervisorTerminalOutcomeV1::Completed,
@@ -4239,6 +4297,64 @@ mod tests {
         let mut later_signal = valid;
         later_signal.later_group_signal_permitted = true;
         assert!(later_signal.validate().is_err());
+
+        let mut no_topology = completed_supervisor();
+        no_topology.runner = OptionalProcessIdentityV1::Absent;
+        no_topology.groups.clear();
+        assert!(no_topology.validate().is_err());
+
+        let mut recycled_pid = completed_supervisor();
+        recycled_pid.groups[0].anchor.pid = 44;
+        recycled_pid.groups[0].anchor.start = ProcessStartMarkerV1::LinuxBootTicks {
+            boot_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+            start_ticks: 999,
+        };
+        assert!(recycled_pid.validate().is_err());
+    }
+
+    #[test]
+    fn supervisor_kill_outcome_is_derived_from_the_recorded_cause() {
+        let mut killed = completed_supervisor();
+        killed.term_journal_elapsed_ms = OptionalElapsedMsV1::ElapsedMs { value: 10 };
+        killed.kill_journal_elapsed_ms = OptionalElapsedMsV1::ElapsedMs { value: 20 };
+        killed.kill_cause = OptionalSupervisorKillCauseV1::Cause {
+            value: SupervisorKillCauseV1::Deadline,
+        };
+        killed.outcome = OptionalSupervisorOutcomeV1::Outcome {
+            value: SupervisorTerminalOutcomeV1::Cancelled,
+        };
+        assert!(killed.validate().is_err());
+
+        killed.outcome = OptionalSupervisorOutcomeV1::Outcome {
+            value: SupervisorTerminalOutcomeV1::KilledAfterDeadline,
+        };
+        killed.validate().unwrap();
+
+        killed.kill_cause = OptionalSupervisorKillCauseV1::Cause {
+            value: SupervisorKillCauseV1::RepeatedCancellation,
+        };
+        killed.outcome = OptionalSupervisorOutcomeV1::Outcome {
+            value: SupervisorTerminalOutcomeV1::KilledAfterCancellation,
+        };
+        killed.validate().unwrap();
+    }
+
+    #[test]
+    fn prepared_state_requires_a_retained_empty_anchor_group() {
+        let mut prepared = completed_supervisor();
+        prepared.generation = 1;
+        prepared.previous_record = OptionalSha256V1::Absent;
+        prepared.runner = OptionalProcessIdentityV1::Absent;
+        prepared.groups[0].workloads.clear();
+        prepared.groups[0].anchor_lifecycle = AnchorLifecycleV1::RetainedLive;
+        prepared.phase = SupervisorPhaseV1::Prepared;
+        prepared.later_group_signal_permitted = true;
+        prepared.outcome = OptionalSupervisorOutcomeV1::Absent;
+        prepared.child_artifact = OptionalChildArtifactRefV1::Absent;
+        prepared.validate().unwrap();
+
+        prepared.groups.clear();
+        assert!(prepared.validate().is_err());
     }
 
     #[test]

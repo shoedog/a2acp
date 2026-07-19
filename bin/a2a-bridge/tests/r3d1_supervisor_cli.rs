@@ -141,6 +141,7 @@ fn supervisor_record(deadline_sha256: &str) -> serde_json::Value {
         "phase": "complete",
         "term_journal_elapsed_ms": {"kind": "absent"},
         "kill_journal_elapsed_ms": {"kind": "absent"},
+        "kill_cause": {"kind": "absent"},
         "later_group_signal_permitted": false,
         "outcome": {"kind": "outcome", "value": "completed"},
         "safety_hold": {"kind": "absent"},
