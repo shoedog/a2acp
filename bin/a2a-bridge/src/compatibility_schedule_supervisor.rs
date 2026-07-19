@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::compatibility_process_group::{
-    process_group_members, process_identity, AnchorDropPolicy, AnchoredGroupSignal,
-    AnchoredProcessGroup, ProcessIdentityV1,
+    process_group_members, AnchorDropPolicy, AnchoredGroupSignal, AnchoredProcessGroup,
+    ProcessIdentityV1,
 };
 use crate::compatibility_schedule_schema::{
     deadline_derivation_input_sha256, validate_child_artifact_join, validate_deadline_derivation,
@@ -368,17 +368,10 @@ impl SupervisorAnchorSet {
             expected_session,
             AnchorDropPolicy::ReleaseOnly,
         )?;
-        // The new exact anchor now prevents PGID recycling. Revalidate every supplied workload only
-        // after that capability exists so a vanished old group cannot be replaced between observation
-        // and anchoring by an unrelated same-session group with the same numeric identity.
-        for workload in &workloads {
-            if process_identity(workload.pid)?.as_ref() != Some(workload) {
-                return Err(
-                    "schedule supervisor: descendant workload identity changed before anchoring"
-                        .into(),
-                );
-            }
-        }
+        // The new exact anchor now prevents PGID recycling. Do not perform another fallible
+        // observation before retaining it: registration revalidates every supplied workload through
+        // `SupervisorControl`, where any vanished/recycled identity can be journaled with this exact
+        // acquired group in a non-signaling safety hold.
         let record = AnchoredProcessGroupRecordV1 {
             process_group,
             session_id: expected_session,
@@ -386,9 +379,8 @@ impl SupervisorAnchorSet {
             workloads,
             anchor_lifecycle: AnchorLifecycleV1::RetainedLive,
         };
-        if self.groups.insert(process_group, anchor).is_some() {
-            return Err("schedule supervisor: descendant anchor insertion raced".into());
-        }
+        let previous = self.groups.insert(process_group, anchor);
+        debug_assert!(previous.is_none(), "exclusive anchor insertion cannot race");
         Ok(record)
     }
 
@@ -2175,7 +2167,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn descendant_anchor_rejects_a_stale_exact_workload_identity() {
+    async fn descendant_anchor_retains_a_stale_workload_for_a_durable_hold() {
+        let mut anchors = SupervisorAnchorSet::new();
         let mut leader = tokio::process::Command::new("/bin/cat")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
@@ -2184,9 +2177,21 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        let mut stale = process_identity(leader.id().unwrap() as i32)
+        let leader_identity = process_identity(leader.id().unwrap() as i32)
             .unwrap()
             .unwrap();
+        let mut survivor = tokio::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .process_group(leader_identity.process_group)
+            .spawn()
+            .unwrap();
+        let survivor_identity = process_identity(survivor.id().unwrap() as i32)
+            .unwrap()
+            .unwrap();
+        let mut stale = leader_identity.clone();
         match &mut stale.start {
             ProcessStartMarkerV1::LinuxBootTicks { start_ticks, .. } => {
                 *start_ticks = start_ticks.saturating_add(1);
@@ -2195,14 +2200,59 @@ mod tests {
                 *microseconds = (*microseconds + 1) % 1_000_000;
             }
         }
-        let mut anchors = SupervisorAnchorSet::new();
 
-        assert!(anchors
-            .anchor_descendant_group(stale.process_group, stale.session_id, vec![stale])
-            .is_err());
+        let mut initial = prepared_record();
+        initial.scheduler.session_id = stale.session_id;
+        initial.groups[0].session_id = stale.session_id;
+        initial.groups[0].anchor.session_id = stale.session_id;
+        let mut running_group = initial.groups[0].clone();
+        let mut runner_identity = identity(44, running_group.process_group);
+        runner_identity.session_id = stale.session_id;
+        running_group.workloads = vec![runner_identity.clone()];
+        let mut supervisor =
+            ScheduleSupervisor::initialize(initial, MemoryJournal::default()).unwrap();
+        supervisor
+            .start_running(runner_identity.clone(), vec![running_group])
+            .unwrap();
+        let mut control = fake_control(
+            false,
+            BTreeMap::from([(runner_identity.process_group, vec![runner_identity])]),
+        );
+        control.stale_process_pids.insert(stale.pid);
+
+        let descendant = anchors
+            .anchor_descendant_group(
+                stale.process_group,
+                stale.session_id,
+                vec![stale, survivor_identity.clone()],
+            )
+            .expect("an acquired anchor must remain available for durable supervisor validation");
+        assert!(anchors.exact_anchor_live(&descendant).unwrap());
+        supervisor
+            .register_descendant_group(&mut control, descendant.clone())
+            .unwrap();
+
+        assert_eq!(supervisor.record().phase, SupervisorPhaseV1::SafetyHold);
+        assert!(!supervisor.record().later_group_signal_permitted);
+        assert_eq!(supervisor.record().groups.len(), 2);
+        assert_eq!(
+            supervisor.record().groups[1],
+            AnchoredProcessGroupRecordV1 {
+                anchor_lifecycle: AnchorLifecycleV1::RetainedLive,
+                ..descendant.clone()
+            }
+        );
+        assert_eq!(
+            process_identity(survivor_identity.pid).unwrap().as_ref(),
+            Some(&survivor_identity),
+            "the surviving workload remains live but durably inventoried in the hold"
+        );
 
         let _ = leader.start_kill();
+        let _ = survivor.start_kill();
         let _ = leader.wait().await;
+        let _ = survivor.wait().await;
+        anchors.release_and_reap(&descendant).await.unwrap();
     }
 
     #[cfg(unix)]

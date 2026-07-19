@@ -91,9 +91,11 @@ journaled TERM/KILL ordering and cause, the no-later-group-signal mark, safety h
 and the child artifact's run/window/hash join. Numeric PIDs are unique across scheduler, anchors, and workloads;
 the runner must be one exact workload. `Prepared` owns at least one retained empty anchor, operational and terminal
 states require coherent runner/group topology, every non-hold group stays in the exact scheduler/runner session,
-and every hold retains at least one group. A session, ancestry, liveness, or identity-observation failure after descendant-anchor
-acquisition appends that exact group to the durable hold before disabling later signals; an escaped or
-observation-ambiguous group may therefore be recorded only in `SafetyHold`, never in an operational phase. KILL
+and every hold retains at least one group. No fallible workload observation occurs between exact descendant-anchor
+acquisition and retained capability/record insertion; runtime registration owns revalidation. A session, ancestry,
+liveness, or identity-observation failure then appends that exact acquired group to the durable hold before disabling
+later signals; an escaped or observation-ambiguous group may therefore be recorded only in `SafetyHold`, never in an
+operational phase. KILL
 terminates as exactly `killed_after_deadline` or
 `killed_after_cancellation` according to its write-once cause. The standalone `supervisor` validator checks one
 snapshot. The runtime journal additionally requires a prepared generation 1, a contiguous hash chain, strictly

@@ -215,6 +215,17 @@ Required tests:
   topology-free holds, rejects cross-session non-hold snapshots, and durably inventories an already-acquired group
   before a session/ancestry/liveness/identity-observation hold. All three failures were observed red on the prior
   mechanism.
+- Second closure review of exact `8feda4d93c22ebe2c5e8867d46e006af50b8899f` marked all four requested
+  topology/cursor residuals `FIXED`, found one new `WRONG / High`, no new `SMELL`, and returned
+  `R3D1 IMPLEMENTATION: REVISE`. Its retained report is
+  `/private/tmp/a2a-bridge-r3d1-sol-closure-8feda4d/review.md`, mode `0644`, 5,777 bytes, SHA-256
+  `d9042da3d20c30955c52ffb86e78df06cd055acfdc9f873bac888cc7f1a67799`. After successfully acquiring a
+  descendant anchor, that reviewed code could still fail workload revalidation before retaining either the live
+  capability or serializable record, leaving another live workload group outside the journal. The third remediation
+  performs no fallible observation between exact anchor acquisition and retained-record insertion; registration then
+  revalidates every workload and journals the exact acquired group into `SafetyHold` on failure. The real two-workload
+  regression failed on `8feda4d` at the pre-retention error and now proves the stale workload holds while the second
+  workload remains live and durably inventoried.
 - Current focused gates: process-group **6/0**, resolver compatibility **1/0**, schedule-schema **30/0**,
   supervisor **31/0**, cancellation **4/0**, compatibility CLI **21/0**, and R3d1 CLI **2/0**. The complete binary
   suite is **540/0/0**; the full serial workspace is **2,276 passed / 0 failed / 12 ignored** across **56** test
@@ -237,7 +248,7 @@ Continue in `/private/tmp/a2a-bridge-r3d1-supervisor` on branch
 `agent/reliability-r3d1-supervisor`. Re-read this plan, the active R3d design supervision section, and the
 central reliability roadmap. Freeze `HEAD`, `origin/main`, merge base, cleanliness, and changed paths before
 review or publication. The initial candidate at exact `01438c34` has already received the Sol/xhigh `REVISE`
-recorded above, and first closure head `e81ebbb` received the second `REVISE`. The second remediation is committed
-in the frozen review head. The next action is an exact-head Sol/xhigh closure
-review of the three topology/ownership fixes and the stale-cursor fold. Run the single design-approved Fable/xhigh
+recorded above; first closure head `e81ebbb` and second closure head `8feda4d` each received `REVISE`. The third
+remediation is committed in the frozen review head. The next action is an exact-head Sol/xhigh closure of the
+post-anchor retention fix and its red-before-green two-workload regression. Run the single design-approved Fable/xhigh
 implementation/release lens only after Sol approval. Never touch the long-lived operator lifecycle during R3d1.

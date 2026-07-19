@@ -6,9 +6,10 @@
   at exact design head `b54840a017b87521677f1f95c3f7be69de55361d` by PR #37, merge
   `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is
   **MERGED** by PR #38 at merge commit `c2d147fb1f0df275f3c6452cdd212e185c002d08`. R3d1 is
-  **IN REVIEW** on `agent/reliability-r3d1-supervisor`; initial exact candidate `01438c34` received a
-  Sol/xhigh `REVISE`, and first closure head `e81ebbb` received a second `REVISE` with only topology and
-  stale-cursor items still partial. The second remediation is deterministic-green pending exact-head closure; its
+  **IN REVIEW** on `agent/reliability-r3d1-supervisor`; initial exact candidate `01438c34` and first closure head
+  `e81ebbb` each received Sol/xhigh `REVISE`. Second closure head `8feda4d` marked all four requested topology/cursor
+  residuals `FIXED`, found one new post-anchor-retention `WRONG / High`, no new `SMELL`, and returned `REVISE`.
+  The third remediation is deterministic-green pending exact-head closure; its
   candidate release binary is 26,574,128 bytes at SHA-256
   `5be952d4f6491aea3c1b193d1571c671191547763090b57190e57a22be8133af`. Its focused restart plan is
   [`2026-07-19-r3d1-supervisor-signal-parity.md`](2026-07-19-r3d1-supervisor-signal-parity.md).
@@ -1954,9 +1955,10 @@ final wait/reap releases the identity. The retained, unreaped child handle is it
 PID/PGID reuse is impossible until reap, so a late process-observation error cannot suppress required cleanup.
 A non-hold supervisor record binds the scheduler, runner, and every anchored group to one exact session. A safety
 hold retains at least one anchored-group record even when its runner identity is unavailable. Once the supervisor
-has acquired a descendant-group anchor, any session, ancestry, liveness, or identity-observation failure appends
-that exact group to the durable hold before disabling later group signals; a dead or unobservable anchor is retained
-as ambiguous rather than silently dropped.
+has acquired a descendant-group anchor, it retains the exact live capability and serializable record before any
+fallible workload observation. Registration then revalidates the runner and every workload; any session, ancestry,
+liveness, or identity-observation failure appends that exact acquired group to the durable hold before disabling
+later group signals. A dead or unobservable anchor is retained as ambiguous rather than silently dropped.
 A crash that makes the signal/journal ordering ambiguous recovers to a
 hold and never retries a numeric-group signal. R3d1
 reuses or factors the already-proven R3c `CommandProcessGroupGuard` mechanism; it must not restore a numeric-
@@ -2784,7 +2786,15 @@ binary suite is **540/0/0**, and full serial workspace is **2,276/0/12 ignored**
 diff checks, workspace check, warnings-denied Clippy, locked release, dependency policy, hygiene **37/7**, manifest **9**,
 recipes **4**, and foundation **6/4** are green. The candidate release binary is **26,574,128 bytes**, SHA-256
 `5be952d4f6491aea3c1b193d1571c671191547763090b57190e57a22be8133af`.
-Run the required exact-head Sol/xhigh closure review; use the
+Second closure review of exact `8feda4d93c22ebe2c5e8867d46e006af50b8899f` marked all four requested
+topology/cursor residuals `FIXED`, found one new `WRONG / High`, no new `SMELL`, and returned
+`R3D1 IMPLEMENTATION: REVISE`; its retained report is
+`/private/tmp/a2a-bridge-r3d1-sol-closure-8feda4d/review.md`, 5,777 bytes, SHA-256
+`d9042da3d20c30955c52ffb86e78df06cd055acfdc9f873bac888cc7f1a67799`. The third remediation performs no
+fallible observation after exact descendant-anchor acquisition and before retaining the capability and record.
+Registration owns workload revalidation and can journal that exact group into `SafetyHold`. Its real two-workload
+regression failed at the pre-retention error on `8feda4d` and now proves the stale workload holds while the other
+workload remains live and durably inventoried. Run the required exact-head Sol/xhigh closure review; use the
 single design-approved Fable/xhigh implementation/release lens only after Sol approval. Preserve R3c/R4 inputs,
 keep R2f operator lifecycle work out of R3d, and never touch the long-lived operator lifecycle from this slice.
 
