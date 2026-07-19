@@ -3437,8 +3437,10 @@ impl ValidateRecord for ScheduleEvidenceRecordV1 {
             "affected case id",
             self.affected_case_ids.iter().map(String::as_str),
         )?;
-        if self.affected_case_ids.is_empty() {
-            return Err("schedule schema: sidecar must bind at least one affected case".into());
+        if self.affected_case_ids.is_empty() || self.affected_case_ids.len() > MAX_ITEMS {
+            return Err(
+                "schedule schema: sidecar must bind a bounded non-empty affected-case set".into(),
+            );
         }
         match (&self.check, self.trigger) {
             (
@@ -4024,10 +4026,10 @@ impl ValidateRecord for DogfoodRoutingPolicyV1 {
     }
 }
 
-fn parse_and_validate<T: DeserializeOwned + ValidateRecord>(
+fn parse_and_validate_value<T: DeserializeOwned + ValidateRecord>(
     bytes: &[u8],
     label: &str,
-) -> Result<(), BoxError> {
+) -> Result<T, BoxError> {
     let raw = std::str::from_utf8(bytes)
         .map_err(|_| format!("schedule schema: invalid {label}: JSON must be UTF-8"))?;
     if compatibility::looks_like_secret(raw) {
@@ -4066,7 +4068,21 @@ fn parse_and_validate<T: DeserializeOwned + ValidateRecord>(
     scan(&untyped, label)?;
     let value: T = serde_json::from_slice(bytes)
         .map_err(|error| format!("schedule schema: invalid {label}: {error}"))?;
-    value.validate()
+    value.validate()?;
+    Ok(value)
+}
+
+fn parse_and_validate<T: DeserializeOwned + ValidateRecord>(
+    bytes: &[u8],
+    label: &str,
+) -> Result<(), BoxError> {
+    parse_and_validate_value::<T>(bytes, label).map(|_| ())
+}
+
+pub(super) fn parse_schedule_evidence_record(
+    bytes: &[u8],
+) -> Result<ScheduleEvidenceRecordV1, BoxError> {
+    parse_and_validate_value(bytes, "schedule-sidecar")
 }
 
 pub(super) fn validate_schedule_record(kind: &str, path: &Path) -> Result<(), BoxError> {

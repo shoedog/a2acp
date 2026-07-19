@@ -543,6 +543,10 @@ impl PinnedDirectory {
         PathBuf::from(self.canonical_cwd.as_str())
     }
 
+    pub(crate) fn object_sha256(&self) -> &str {
+        &self.identity.object_sha256
+    }
+
     pub(crate) fn sync(&self) -> Result<(), BoxError> {
         self.file
             .sync_all()
