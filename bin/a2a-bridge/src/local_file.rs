@@ -740,6 +740,17 @@ impl PinnedDirectory {
     /// Reopen one existing child directory relative to the retained parent object. Each path
     /// component is therefore traversed without following a replacement symlink.
     pub(crate) fn open_child_directory(&self, name: &OsStr, label: &str) -> Result<Self, BoxError> {
+        self.open_child_directory_optional(name, label)?
+            .ok_or_else(|| format!("{label}: descriptor-relative directory is absent").into())
+    }
+
+    /// As [`Self::open_child_directory`], but preserve a genuinely absent child as `None` so a
+    /// read-only presence probe can distinguish absence from a symlink or other unsafe object.
+    pub(crate) fn open_child_directory_optional(
+        &self,
+        name: &OsStr,
+        label: &str,
+    ) -> Result<Option<Self>, BoxError> {
         #[cfg(unix)]
         {
             use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -755,9 +766,13 @@ impl PinnedDirectory {
                 )
             };
             if fd == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(None);
+                }
                 return Err(format!(
                     "{label}: cannot open descriptor-relative directory: {}",
-                    std::io::Error::last_os_error()
+                    error
                 )
                 .into());
             }
@@ -775,13 +790,13 @@ impl PinnedDirectory {
             let canonical_child = Path::new(self.canonical_cwd.as_str()).join(name);
             let canonical_cwd = SessionCwd::parse(&canonical_child.to_string_lossy())
                 .map_err(|_| format!("{label}: child directory is not a valid session cwd"))?;
-            Ok(Self {
+            Ok(Some(Self {
                 file: Arc::new(file),
                 canonical_cwd,
                 identity,
                 acp_session_cwd,
                 retain_descriptor_after_exec,
-            })
+            }))
         }
         #[cfg(not(unix))]
         {

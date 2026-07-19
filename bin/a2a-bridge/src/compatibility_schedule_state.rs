@@ -21,6 +21,13 @@ const STATE_FILE_MODE: u32 = 0o600;
 const MAX_LOCK_HOLDER_BYTES: usize = 512;
 const MAX_PASSWD_BUFFER_BYTES: usize = 1024 * 1024;
 const STATE_SUBDIRECTORIES: [&str; 5] = ["authority", "admission", "ledger", "supervisor", "locks"];
+const PRODUCTION_STATE_COMPONENTS: [&str; 5] = [
+    "Library",
+    "Application Support",
+    "a2a-bridge",
+    "operator",
+    "compatibility-scheduler",
+];
 
 #[derive(Debug)]
 pub(super) enum SchedulerStateError {
@@ -174,41 +181,50 @@ fn verify_local_apfs(_directory: &PinnedDirectory) -> Result<(), SchedulerStateE
     ))
 }
 
-fn open_existing_root(path: &Path) -> Result<PinnedDirectory, SchedulerStateError> {
+fn open_existing_nonsymlink_directory(
+    path: &Path,
+    label: &str,
+    inspect_context: &'static str,
+) -> Result<PinnedDirectory, SchedulerStateError> {
     use std::os::unix::fs::MetadataExt as _;
 
     let lexical_metadata =
         std::fs::symlink_metadata(path).map_err(|source| SchedulerStateError::Io {
-            context: "cannot inspect scheduler state root",
+            context: inspect_context,
             source,
         })?;
     if !lexical_metadata.is_dir() || lexical_metadata.file_type().is_symlink() {
-        return Err(SchedulerStateError::Invalid(
-            "scheduler state root must be a non-symlink directory".into(),
-        ));
+        return Err(SchedulerStateError::Invalid(format!(
+            "{label} must be a non-symlink directory"
+        )));
     }
-    let snapshot = local_file::snapshot_directory(path, "scheduler state root").map_err(invalid)?;
-    let root = PinnedDirectory::open(
-        path,
-        &snapshot.canonical_cwd,
-        &snapshot.identity,
-        "scheduler state root",
-    )
-    .map_err(invalid)?;
+    let snapshot = local_file::snapshot_directory(path, label).map_err(invalid)?;
+    let directory = PinnedDirectory::open(path, &snapshot.canonical_cwd, &snapshot.identity, label)
+        .map_err(invalid)?;
     let opened_metadata =
-        root.file_handle()
+        directory
+            .file_handle()
             .metadata()
             .map_err(|source| SchedulerStateError::Io {
-                context: "cannot inspect opened scheduler state root",
+                context: inspect_context,
                 source,
             })?;
     if lexical_metadata.dev() != opened_metadata.dev()
         || lexical_metadata.ino() != opened_metadata.ino()
     {
-        return Err(SchedulerStateError::Invalid(
-            "scheduler state root changed while it was being opened".into(),
-        ));
+        return Err(SchedulerStateError::Invalid(format!(
+            "{label} changed while it was being opened"
+        )));
     }
+    Ok(directory)
+}
+
+fn open_existing_root(path: &Path) -> Result<PinnedDirectory, SchedulerStateError> {
+    let root = open_existing_nonsymlink_directory(
+        path,
+        "scheduler state root",
+        "cannot inspect scheduler state root",
+    )?;
     verify_private_directory(&root, "scheduler state root")?;
     Ok(root)
 }
@@ -280,30 +296,45 @@ fn current_operator_home() -> Result<PathBuf, SchedulerStateError> {
 }
 
 fn production_state_path(operator_home: &Path) -> PathBuf {
-    operator_home
-        .join("Library")
-        .join("Application Support")
-        .join("a2a-bridge")
-        .join("operator")
-        .join("compatibility-scheduler")
+    PRODUCTION_STATE_COMPONENTS
+        .iter()
+        .fold(operator_home.to_path_buf(), |path, name| path.join(name))
+}
+
+fn open_production_root(
+    operator_home: &Path,
+) -> Result<Option<PinnedDirectory>, SchedulerStateError> {
+    // The passwd-derived home is the trusted anchor. Every fixed suffix component is then opened
+    // relative to a retained descriptor with O_NOFOLLOW, so canonicalization cannot redirect an
+    // intermediate component and a concurrent replacement cannot change the returned root.
+    let mut directory = open_existing_nonsymlink_directory(
+        operator_home,
+        "effective operator home",
+        "cannot inspect effective operator home",
+    )?;
+    for name in PRODUCTION_STATE_COMPONENTS {
+        directory = match directory
+            .open_child_directory_optional(
+                OsStr::new(name),
+                "fixed production scheduler state component",
+            )
+            .map_err(invalid)?
+        {
+            Some(directory) => directory,
+            None => return Ok(None),
+        };
+    }
+    verify_private_directory(&directory, "scheduler state root")?;
+    Ok(Some(directory))
 }
 
 fn production_scheduler_state_present_at(
     operator_home: &Path,
     require_local_apfs: bool,
 ) -> Result<bool, SchedulerStateError> {
-    let path = production_state_path(operator_home);
-    match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(source) => {
-            return Err(SchedulerStateError::Io {
-                context: "cannot inspect fixed production scheduler state",
-                source,
-            })
-        }
-        Ok(_) => {}
-    }
-    let root = open_existing_root(&path)?;
+    let Some(root) = open_production_root(operator_home)? else {
+        return Ok(false);
+    };
     if require_local_apfs {
         verify_local_apfs(&root)?;
     }
@@ -445,8 +476,10 @@ fn try_lock(
 }
 
 impl SchedulerStateRoot {
-    fn initialize(path: &Path, require_local_apfs: bool) -> Result<Self, SchedulerStateError> {
-        let root = open_existing_root(path)?;
+    fn initialize_opened(
+        root: PinnedDirectory,
+        require_local_apfs: bool,
+    ) -> Result<Self, SchedulerStateError> {
         if require_local_apfs {
             verify_local_apfs(&root)?;
         }
@@ -472,10 +505,18 @@ impl SchedulerStateRoot {
         })
     }
 
+    fn initialize(path: &Path, require_local_apfs: bool) -> Result<Self, SchedulerStateError> {
+        Self::initialize_opened(open_existing_root(path)?, require_local_apfs)
+    }
+
     #[allow(dead_code)] // R3d5 is the sole production initialization/activation owner.
     pub(super) fn initialize_production() -> Result<Self, SchedulerStateError> {
-        let path = production_state_path(&current_operator_home()?);
-        Self::initialize(&path, true)
+        let root = open_production_root(&current_operator_home()?)?.ok_or_else(|| {
+            SchedulerStateError::Invalid(
+                "fixed production scheduler state root has not been initialized".into(),
+            )
+        })?;
+        Self::initialize_opened(root, true)
     }
 
     #[cfg(test)]
@@ -679,6 +720,27 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let target = root();
         std::os::unix::fs::symlink(target.path(), &path).unwrap();
+
+        assert!(production_scheduler_state_present_at(operator_home.path(), false).is_err());
+    }
+
+    #[test]
+    fn fixed_production_presence_rejects_a_symlink_ancestor() {
+        let operator_home = tempfile::tempdir().unwrap();
+        let bridge_parent = operator_home
+            .path()
+            .join("Library/Application Support/a2a-bridge");
+        std::fs::create_dir_all(&bridge_parent).unwrap();
+        let redirected_operator = tempfile::tempdir().unwrap();
+        let redirected_root = redirected_operator.path().join("compatibility-scheduler");
+        std::fs::create_dir(&redirected_root).unwrap();
+        std::fs::set_permissions(
+            &redirected_root,
+            std::fs::Permissions::from_mode(STATE_DIRECTORY_MODE),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(redirected_operator.path(), bridge_parent.join("operator"))
+            .unwrap();
 
         assert!(production_scheduler_state_present_at(operator_home.path(), false).is_err());
     }
