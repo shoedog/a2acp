@@ -1,12 +1,13 @@
 # R3d2 — authority, admission, preflights, and accounting implementation plan
 
-- **Status:** ACTIVE — R3d2a through R3d2e are implemented. Sol/xhigh reviews one through five returned `REVISE`
-  at `1373985`, `28e7d28`, `d082b49`, `c418df4`, and `3e4508a`. Sixth review of exact `8d75069` marked eleven of
-  thirteen inherited items `RESOLVED`, left the literal next-action cursor and sibling-visible preflight-pass API
-  `UNRESOLVED`, found no fresh finding, and returned `REVISE`. Mechanism commit `2d1640d` closes the pass API with
-  a pre-change-red boundary regression; the current fold closes the cursor. Exact candidate `4133d0a` passes the
-  complete deterministic gate at binary **655/0/0** and canonical full workspace **2,392/0/12 ignored**. A fresh
-  Sol closure rereview remains pending. The single Fable lens stays gated on Sol approval
+- **Status:** ACTIVE — R3d2a through R3d2e are implemented. Sol/xhigh reviews one through six returned `REVISE`
+  through exact `8d75069`; mechanism commit `2d1640d` plus the cursor fold closed the last two residuals. Seventh
+  Sol/xhigh review of exact `e74f93f` marked both residuals `RESOLVED`, preserved the other eleven closures, found no
+  fresh `WRONG` or `SMELL`, and returned `APPROVE`. The single Fable/xhigh release/compatibility lens of that same
+  exact head found no `WRONG`, retained two Minor nonblocking `SMELL`s for R3d5, and returned `APPROVE`. Exact
+  candidate `4133d0a` passes the complete deterministic gate at binary **655/0/0** and canonical full workspace
+  **2,392/0/12 ignored**; exact docs-only review head `e74f93f` independently reran the same full totals. Review
+  evidence is folded; exact-final deterministic gates are next
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -900,8 +901,9 @@ workspace **2,391 passed / 0 failed / 12 ignored** across **72** result groups, 
 validation passed against live repository labels, and its local suite passed **6 runs / 19 assertions**. The
 201,273-byte full-suite log is retained at `/private/tmp/a2a-bridge-r3d2-full-68be708.log`, SHA-256
 `896eeac2ab41f81727c56a080e0c78b4f9815a1693d1867f9ebd0f9471f6d317`. The release binary remains 26,604,912
-bytes at SHA-256 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`. A fresh Sol/xhigh closure re-review
-explicitly adjudicating the four fifth-review residuals is next. Fable remains blocked until Sol approves.
+bytes at SHA-256 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`. That made a fresh Sol/xhigh closure
+re-review of the four fifth-review residuals next; the sixth review below performed it. Fable remained blocked at
+that checkpoint.
 
 #### Sixth Sol closure review and remediation — 2026-07-19
 
@@ -947,9 +949,49 @@ workspace **2,392 passed / 0 failed / 12 ignored** across **72** result groups, 
 remains the existing explicitly live/authenticated provider integrations; none ran. The mode-`0644`, 201,503-byte
 full-suite log is retained at `/private/tmp/a2a-bridge-r3d2-full-4133d0a.log`, SHA-256
 `f2e32c46169d77e2a758e90f881cd16030eb41596868811e50b895968c6db930`. The release binary remains 26,604,912
-bytes at SHA-256 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`. Run one fresh
-Sol/xhigh closure rereview explicitly adjudicating the two sixth-review residuals. Fable remains blocked until Sol
-approves.
+bytes at SHA-256 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`. That made one fresh
+Sol/xhigh closure rereview of the two sixth-review residuals next; the seventh review below performed it. Fable
+remained blocked at that checkpoint.
+
+#### Seventh Sol closure review and single Fable release lens — 2026-07-19
+
+The controller froze exact docs-only candidate `e74f93fa494e287296a7cfb8404ff78b94a35385` against merged R3d1 base
+`cbcfd1f06b914064456d1798be71bacdc294f3d5`. The detached trusted review mirror was clean, ancestry-valid, 30
+commits and 20 changed paths ahead of base, with 19,614 additions and 245 deletions. Its only delta from exact
+deterministic-gate head `4133d0a` was this roadmap, the master R3 plan, and this focused plan. That docs-only head
+independently passed format/diff, hygiene **37/7**, and the canonical full serial workspace at **2,392/0/12
+ignored** across **72** result groups (**55** nonempty). Its mode-`0644`, 201,405-byte log is
+`/private/tmp/a2a-bridge-r3d2-full-e74f93f.log`, SHA-256
+`af9104b2d3bfbb1d9df76926071aa21750e56f4ef76545f8c89686315b52992f`.
+
+Fresh bridge-mediated Sol/xhigh/read-only review used a separate one-shot host bridge and the raw advertised
+`gpt-5.6-sol` model. Its 12,229-byte prompt is
+`/private/tmp/a2a-bridge-r3d2-sol-closure-e74f93f/review-task.md`, SHA-256
+`a9cc8b9ca8bdde274098e9ad777061eec3ea40ce439f783626a8b601c03cf5ed`. The review marked both inherited
+sixth-review residuals `RESOLVED`, confirmed the other eleven inherited closures remain intact, found no fresh
+`WRONG` or `SMELL`, and returned `R3D2 IMPLEMENTATION: APPROVE`. Its mode-`0644`, 10,830-byte report is
+`/private/tmp/a2a-bridge-r3d2-sol-closure-e74f93f/review.md`, SHA-256
+`df0c0e2955dcc0c8451bc0b23cd325648f689c66b55d84f0ef20c8a2e307e082`.
+
+Only after Sol approved, the design-approved single Fable/xhigh adversarial implementation plus release/
+compatibility lens ran through another isolated one-shot host bridge. Capability discovery selected raw
+`claude-fable-5[1m]` with `xhigh` and the Claude default mode through `claude-agent-acp` **0.59.0**, Claude Agent SDK
+**0.3.207**, and bundled CLI **2.1.207**. Its 8,130-byte prompt is
+`/private/tmp/a2a-bridge-r3d2-fable-lens-e74f93f/review-task.md`, SHA-256
+`baca5b0705c27d69ce55d2d9deea38d0a7101be062a716d95ebbf7ca1108caba`. Fable found no `WRONG`, returned
+`R3D2 RELEASE/COMPATIBILITY: APPROVE`, and retained two Minor nonblocking `SMELL`s: real-host legacy inventory may
+fail closed on unreadable/SIP-protected process identity, and module-wide `dead_code` allowances should narrow when
+R3d5 makes the staged mechanism live. Both are R3d5 pre-activation hardening inputs; neither demonstrates incorrect
+R3d2 behavior or warrants a Fable rereview. The mode-`0644`, 10,929-byte report is
+`/private/tmp/a2a-bridge-r3d2-fable-lens-e74f93f/review.md`, SHA-256
+`a6e269f4f0e63d565abd496bc9d40d94675b17984a1b082c9c3beab4db0b4cfc`.
+
+Both reviewers independently froze the complete branch and verified the final full-suite log identity/totals; both
+accepted compilation, focused suites, release build, dependency policy, and validator executions as supplied rather
+than rerunning them. Neither review is live compatibility, characterization, promotion, or distributable-artifact
+evidence. The long-lived production operator, production scheduler root, registries, images, containers, and live
+compatibility paths were not used, stopped, rebuilt, or changed. This review-evidence docs fold is the only change
+after reviewed `e74f93f`; exact-final deterministic gates and then the one non-draft R3d2 PR are next.
 
 ## Verification and review gates
 
@@ -977,22 +1019,24 @@ approves.
 - No launchd job, GitHub watcher/check publisher, timer tick, or required context exists.
 - No iCloud byte, hot/cold evidence object, retention/GC action, or notification is written.
 - No production operator process is stopped, restarted, drained, rotated, or used as a scheduling endpoint.
+- Full real-host process inventory against a sealed legacy plan remains unexercised; R3d5 must characterize
+  unreadable/SIP-protected process identities before activation and keep refusal fail-closed.
 - R3d3 owns evidence/status/retention; R3d4 owns trusted triggers; R3d5 owns characterization and staged activation.
 
 ## Restart contract
 
 Resume branch `agent/reliability-r3d2-authority-admission` in a newly verified clean trusted worktree; do not depend
 on a prior `/private/tmp` worktree or review mirror. The branch is based on merged R3d1 main
-`cbcfd1f06b914064456d1798be71bacdc294f3d5`. Sixth review of exact `8d75069` explicitly adjudicated the four
-fifth-review residuals, marked eleven of thirteen inherited items `RESOLVED`, left the cursor and preflight-pass API
-boundary `UNRESOLVED`, found no fresh finding, and returned `REVISE`. The boundary regression failed **0/1** on
-that reviewed head. Mechanism commit `2d1640d` closes the API boundary; this fold closes the cursor. Focused
-preflight/transaction gates are **8/0 + 27/0**. Exact candidate `4133d0a` passes complete binary **655/0/0**,
-canonical full workspace **2,392/0/12 ignored** across **72** result groups, **55** nonempty, and every deterministic
-release/validator gate. Read this plan, the R3d design of record, the durable roadmap, `AGENTS.md`, and
+`cbcfd1f06b914064456d1798be71bacdc294f3d5`. Sixth review of exact `8d75069` left the cursor and preflight-pass API
+boundary open; `2d1640d` plus the cursor fold closed both. Seventh Sol review of exact `e74f93f` resolved both,
+confirmed the other eleven closures, found no fresh finding, and returned `APPROVE`. The single Fable lens of that
+same exact head found no `WRONG`, retained the two Minor R3d5 hardening smells above, and returned `APPROVE`. Focused
+preflight/transaction gates are **8/0 + 27/0**. Exact candidate `4133d0a` passes complete binary **655/0/0** and
+every deterministic release/validator gate; exact docs-only `e74f93f` reran canonical full workspace
+**2,392/0/12 ignored** across **72** result groups, **55** nonempty. Read this plan, the R3d design of record, the
+durable roadmap, `AGENTS.md`, and
 `skills/a2a-bridge-operator/SKILL.md` before editing. Preserve the single R3d2 merge boundary, the
 owner-wide-then-authority lock order, the single admission linearization point, the zero-effect default, and the
-separation between provider authority and storage consent. The next action is a fresh Sol/xhigh closure rereview
-explicitly adjudicating the cursor and transaction-private preflight-pass residuals. Its prompt must carry the
-frozen exact boundary and gate evidence. Run the single Fable lens only after
-Sol approves; then fold final evidence, rerun exact-final gates, and publish the non-draft PR.
+separation between provider authority and storage consent. The next action is to commit this review-evidence fold,
+run every exact-final deterministic gate, record that evidence without changing the mechanism, rerun the full suite
+on the final docs-only head, and publish the one non-draft R3d2 PR. Do not rerun Fable.
