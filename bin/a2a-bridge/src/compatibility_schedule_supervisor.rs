@@ -10,6 +10,10 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::compatibility::{
+    validate_child_aggregate_bytes, validate_child_aggregate_terminal_bytes,
+    ValidatedChildAggregateTerminalV1,
+};
 use crate::compatibility_process_group::{
     process_group_members, AnchorDropPolicy, AnchoredGroupSignal, AnchoredProcessGroup,
     ProcessIdentityV1,
@@ -47,6 +51,23 @@ pub(super) enum DeadlinePhase {
 #[derive(Debug)]
 pub(super) struct VerifiedChildArtifact {
     reference: ChildArtifactRefV1,
+    terminal: Option<ValidatedChildAggregateTerminalV1>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct VerifiedChildTerminalProofV1 {
+    reference: ChildArtifactRefV1,
+    terminal: ValidatedChildAggregateTerminalV1,
+}
+
+impl VerifiedChildTerminalProofV1 {
+    pub(super) fn child_reference(&self) -> &ChildArtifactRefV1 {
+        &self.reference
+    }
+
+    pub(super) fn aggregate(&self) -> &ValidatedChildAggregateTerminalV1 {
+        &self.terminal
+    }
 }
 
 impl VerifiedChildArtifact {
@@ -64,8 +85,8 @@ impl VerifiedChildArtifact {
                 format!("schedule supervisor: invalid child artifact join: {error}")
             })?;
         validate_child_artifact_join(&join)?;
-        match (&join.aggregate_sha256, aggregate_path) {
-            (OptionalSha256V1::Absent, None) => {}
+        let terminal = match (&join.aggregate_sha256, aggregate_path) {
+            (OptionalSha256V1::Absent, None) => None,
             (OptionalSha256V1::Sha256 { value }, Some(path)) => {
                 let aggregate = crate::local_file::read_regular_file_bounded(
                     path,
@@ -78,7 +99,8 @@ impl VerifiedChildArtifact {
                             .into(),
                     );
                 }
-                crate::compatibility::validate_child_aggregate_bytes(&aggregate.bytes)?;
+                validate_child_aggregate_bytes(&aggregate.bytes)?;
+                validate_child_aggregate_terminal_bytes(&aggregate.bytes)?
             }
             (OptionalSha256V1::Absent, Some(_)) => {
                 return Err(
@@ -88,7 +110,7 @@ impl VerifiedChildArtifact {
             (OptionalSha256V1::Sha256 { .. }, None) => {
                 return Err("schedule supervisor: joined child aggregate is missing".into())
             }
-        }
+        };
         Ok(Self {
             reference: ChildArtifactRefV1 {
                 record_id: join.record_id,
@@ -97,6 +119,18 @@ impl VerifiedChildArtifact {
                 artifact_sha256: join_snapshot.sha256,
                 aggregate_sha256: join.aggregate_sha256,
             },
+            terminal,
+        })
+    }
+
+    pub(super) fn terminal_proof(&self) -> Result<VerifiedChildTerminalProofV1, BoxError> {
+        let terminal = self
+            .terminal
+            .clone()
+            .ok_or("schedule supervisor: child artifact has no exact successful terminal proof")?;
+        Ok(VerifiedChildTerminalProofV1 {
+            reference: self.reference.clone(),
+            terminal,
         })
     }
 

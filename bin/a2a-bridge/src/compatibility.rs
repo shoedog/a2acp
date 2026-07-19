@@ -1764,6 +1764,82 @@ struct AggregateArtifact {
     floating_summary: Option<FloatingSummary>,
 }
 
+/// Terminal facts derived from one successful, exact-case compatibility aggregate. The fields are
+/// intentionally private: callers may consume only values parsed from the immutable aggregate bytes
+/// retained by the supervisor, never reconstruct a nominal identity or usage claim themselves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ValidatedChildAggregateTerminalV1 {
+    case_id: String,
+    candidate_sha256: String,
+    candidate_length_bytes: u64,
+    manifest_sha256: String,
+    requested_model: String,
+    requested_effort: Option<String>,
+    requested_mode: Option<String>,
+    observed_model: String,
+    observed_effort: Option<String>,
+    observed_mode: Option<String>,
+    observed_tokens: Option<u64>,
+    observed_cost_microusd: Option<u64>,
+    elapsed_millis: u64,
+    prompt_was_accepted: bool,
+    terminal_at_ms: i64,
+}
+
+impl ValidatedChildAggregateTerminalV1 {
+    pub(super) fn case_id(&self) -> &str {
+        &self.case_id
+    }
+
+    pub(super) fn candidate_sha256(&self) -> &str {
+        &self.candidate_sha256
+    }
+
+    pub(super) fn candidate_length_bytes(&self) -> u64 {
+        self.candidate_length_bytes
+    }
+
+    pub(super) fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
+
+    pub(super) fn requested_identity(&self) -> (&str, Option<&str>, Option<&str>) {
+        (
+            &self.requested_model,
+            self.requested_effort.as_deref(),
+            self.requested_mode.as_deref(),
+        )
+    }
+
+    pub(super) fn observed_identity(&self) -> (&str, Option<&str>, Option<&str>) {
+        (
+            &self.observed_model,
+            self.observed_effort.as_deref(),
+            self.observed_mode.as_deref(),
+        )
+    }
+
+    pub(super) fn observed_tokens(&self) -> Option<u64> {
+        self.observed_tokens
+    }
+
+    pub(super) fn observed_cost_microusd(&self) -> Option<u64> {
+        self.observed_cost_microusd
+    }
+
+    pub(super) fn elapsed_millis(&self) -> u64 {
+        self.elapsed_millis
+    }
+
+    pub(super) fn prompt_was_accepted(&self) -> bool {
+        self.prompt_was_accepted
+    }
+
+    pub(super) fn terminal_at_ms(&self) -> i64 {
+        self.terminal_at_ms
+    }
+}
+
 fn floating_summary(results: &[CaseResult]) -> Option<FloatingSummary> {
     let mut summary = FloatingSummary {
         candidate_pass: 0,
@@ -3654,7 +3730,7 @@ fn load_json<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Result<T
         .map_err(|error| format!("{label}: invalid schema: {error}").into())
 }
 
-pub(super) fn validate_child_aggregate_bytes(bytes: &[u8]) -> Result<(), BoxError> {
+fn parse_validated_child_aggregate(bytes: &[u8]) -> Result<AggregateArtifact, BoxError> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("compatibility child aggregate: invalid JSON: {error}"))?;
     if value_contains_secret(&value, &[]) {
@@ -3673,7 +3749,278 @@ pub(super) fn validate_child_aggregate_bytes(bytes: &[u8]) -> Result<(), BoxErro
     {
         return Err("compatibility child aggregate: invalid identity or time bounds".into());
     }
-    Ok(())
+    Ok(aggregate)
+}
+
+pub(super) fn validate_child_aggregate_bytes(bytes: &[u8]) -> Result<(), BoxError> {
+    parse_validated_child_aggregate(bytes).map(|_| ())
+}
+
+fn optional_terminal_text(value: Option<&Value>, label: &str) -> Result<Option<String>, BoxError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() && value.trim() == value => {
+            Ok(Some(value.clone()))
+        }
+        _ => Err(format!("compatibility child aggregate: invalid {label}").into()),
+    }
+}
+
+fn terminal_cost_microusd(amount: f64) -> Result<u64, BoxError> {
+    let microusd = (amount * 1_000_000.0).ceil();
+    if !microusd.is_finite() || microusd < 0.0 || microusd > u64::MAX as f64 {
+        return Err("compatibility child aggregate: cost cannot be represented in microusd".into());
+    }
+    Ok(microusd as u64)
+}
+
+/// Extract a terminal proof only from a successful one-case aggregate. Other valid aggregate
+/// shapes remain valid child artifacts but cannot reconcile a per-case admission downward.
+pub(super) fn validate_child_aggregate_terminal_bytes(
+    bytes: &[u8],
+) -> Result<Option<ValidatedChildAggregateTerminalV1>, BoxError> {
+    let aggregate = parse_validated_child_aggregate(bytes)?;
+    if !aggregate.success
+        || aggregate.cancelled
+        || aggregate.budget.exhausted
+        || aggregate.selection.all
+        || aggregate.selection.cases.len() != 1
+        || aggregate.results.len() != 1
+        || aggregate.selection.cases[0] != aggregate.results[0].case_id
+    {
+        return Ok(None);
+    }
+    let result = &aggregate.results[0];
+    if result.execution != ExecutionState::Completed
+        || result.actual_status != EvidenceStatus::Pass
+        || !result.expectation_met
+        || !result.drift.is_empty()
+        || !result.budget_violations.is_empty()
+        || result.not_run_reason.is_some()
+        || result.runner_error_code.is_some()
+    {
+        return Err(
+            "compatibility child aggregate: successful terminal row is internally inconsistent"
+                .into(),
+        );
+    }
+    let smoke = result
+        .smoke
+        .as_ref()
+        .ok_or("compatibility child aggregate: successful terminal row has no smoke evidence")?;
+    if smoke.get("success").and_then(Value::as_bool) != Some(true)
+        || smoke.pointer("/turn/prompt_calls").and_then(Value::as_u64) != Some(1)
+        || smoke
+            .pointer("/turn/terminal_state")
+            .and_then(Value::as_str)
+            != Some("completed")
+        || smoke.pointer("/turn/exact_pong").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(
+            "compatibility child aggregate: successful terminal smoke contract diverged".into(),
+        );
+    }
+    let prompt_was_accepted = smoke
+        .pointer("/attempt/prompt_may_have_been_accepted")
+        .and_then(Value::as_bool)
+        .ok_or("compatibility child aggregate: prompt-acceptance evidence is missing")?;
+    if !prompt_was_accepted {
+        return Err(
+            "compatibility child aggregate: successful terminal denies prompt acceptance".into(),
+        );
+    }
+    let requested_model = smoke
+        .pointer("/request/model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.trim() == *value)
+        .ok_or("compatibility child aggregate: requested model is missing")?
+        .to_owned();
+    let observed_model = smoke
+        .pointer("/session/effective_request/model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.trim() == *value)
+        .ok_or("compatibility child aggregate: observed effective model is missing")?
+        .to_owned();
+    let requested_effort =
+        optional_terminal_text(smoke.pointer("/request/effort"), "requested effort")?;
+    let requested_mode = optional_terminal_text(smoke.pointer("/request/mode"), "requested mode")?;
+    let observed_effort = optional_terminal_text(
+        smoke.pointer("/session/effective_request/effort"),
+        "observed effort",
+    )?;
+    let observed_mode = optional_terminal_text(
+        smoke.pointer("/session/effective_request/mode"),
+        "observed mode",
+    )?;
+    let observed_tokens = observed_tokens(smoke);
+    match observed_tokens {
+        Some(tokens)
+            if tokens == aggregate.budget.observed_tokens
+                && aggregate.budget.token_observation_missing_cases == 0 => {}
+        None if aggregate.budget.observed_tokens == 0
+            && aggregate.budget.token_observation_missing_cases == 1 => {}
+        _ => {
+            return Err("compatibility child aggregate: aggregate token accounting diverged".into())
+        }
+    }
+    let observed_cost_microusd = match observed_cost_usd(smoke) {
+        CostObservation::Usd(amount)
+            if aggregate.budget.observed_cost_usd == amount
+                && aggregate.budget.cost_observation_missing_cases == 0 =>
+        {
+            Some(terminal_cost_microusd(amount)?)
+        }
+        CostObservation::Missing
+            if aggregate.budget.observed_cost_usd == 0.0
+                && aggregate.budget.cost_observation_missing_cases == 1 =>
+        {
+            None
+        }
+        _ => {
+            return Err("compatibility child aggregate: aggregate cost accounting diverged".into())
+        }
+    };
+
+    Ok(Some(ValidatedChildAggregateTerminalV1 {
+        case_id: result.case_id.clone(),
+        candidate_sha256: aggregate.candidate.sha256,
+        candidate_length_bytes: aggregate.candidate.byte_length,
+        manifest_sha256: aggregate.manifest.sha256,
+        requested_model,
+        requested_effort,
+        requested_mode,
+        observed_model,
+        observed_effort,
+        observed_mode,
+        observed_tokens,
+        observed_cost_microusd,
+        elapsed_millis: result.duration_ms,
+        prompt_was_accepted,
+        terminal_at_ms: aggregate.ended_at_ms,
+    }))
+}
+
+#[cfg(test)]
+pub(super) struct ChildTerminalAggregateFixtureV1 {
+    pub(super) case_id: String,
+    pub(super) candidate_sha256: String,
+    pub(super) candidate_length_bytes: u64,
+    pub(super) manifest_sha256: String,
+    pub(super) requested_model: String,
+    pub(super) requested_effort: Option<String>,
+    pub(super) requested_mode: Option<String>,
+    pub(super) observed_model: String,
+    pub(super) observed_effort: Option<String>,
+    pub(super) observed_mode: Option<String>,
+    pub(super) tokens: Option<u64>,
+    pub(super) cost_usd: Option<f64>,
+    pub(super) duration_ms: u64,
+}
+
+#[cfg(test)]
+pub(super) fn child_terminal_aggregate_fixture(
+    fixture: &ChildTerminalAggregateFixtureV1,
+) -> Vec<u8> {
+    let mut request = json!({"model": fixture.requested_model});
+    let mut effective = json!({"model": fixture.observed_model});
+    if let Some(effort) = &fixture.requested_effort {
+        request["effort"] = Value::String(effort.clone());
+    }
+    if let Some(effort) = &fixture.observed_effort {
+        effective["effort"] = Value::String(effort.clone());
+    }
+    if let Some(mode) = &fixture.requested_mode {
+        request["mode"] = Value::String(mode.clone());
+    }
+    if let Some(mode) = &fixture.observed_mode {
+        effective["mode"] = Value::String(mode.clone());
+    }
+    let mut usage = json!({});
+    if let Some(tokens) = fixture.tokens {
+        usage["used"] = Value::from(tokens);
+    }
+    if let Some(cost) = fixture.cost_usd {
+        usage["cost"] = json!({"amount": cost, "currency": "USD"});
+    }
+    let smoke = json!({
+        "schema_version": 2,
+        "success": true,
+        "attempt": {
+            "prompt_may_have_been_accepted": true
+        },
+        "request": request,
+        "session": {"effective_request": effective},
+        "turn": {
+            "prompt_calls": 1,
+            "terminal_state": "completed",
+            "exact_pong": true,
+            "usage": usage
+        }
+    });
+    let result = CaseResult {
+        case_id: fixture.case_id.clone(),
+        baseline_case_id: None,
+        lane: Lane::Pinned,
+        evidence_path: EvidencePath::BridgeSmoke,
+        probe: ProbeType::Minimal,
+        billable: true,
+        execution: ExecutionState::Completed,
+        expected_status: EvidenceStatus::Pass,
+        actual_status: EvidenceStatus::Pass,
+        expectation_met: true,
+        classification: Classification::Canary,
+        candidate_outcome: None,
+        resolved: None,
+        artifact_policy: ArtifactPolicy {
+            retention_days: 14,
+            redaction: RedactionPolicy::Strict,
+        },
+        duration_ms: fixture.duration_ms,
+        not_run_reason: None,
+        runner_error_code: None,
+        drift: Vec::new(),
+        budget_violations: Vec::new(),
+        smoke: Some(smoke),
+    };
+    let aggregate = AggregateArtifact {
+        schema_version: 1,
+        candidate: CandidateIdentity {
+            canonical_path: "/test/a2a-bridge".into(),
+            sha256: fixture.candidate_sha256.clone(),
+            byte_length: fixture.candidate_length_bytes,
+        },
+        manifest: ManifestIdentity {
+            schema_version: 1,
+            canonical_path: "/test/manifest.toml".into(),
+            sha256: fixture.manifest_sha256.clone(),
+        },
+        selection: SelectionRecord {
+            lane: Some(Lane::Pinned),
+            cases: vec![fixture.case_id.clone()],
+            all: false,
+        },
+        environment_owner: "test-operator".into(),
+        started_at_ms: 1,
+        ended_at_ms: 1_i64.saturating_add(fixture.duration_ms.try_into().unwrap_or(i64::MAX - 1)),
+        cancelled: false,
+        success: true,
+        budget: BudgetOutcome {
+            timeout_secs: 30,
+            max_tokens: 1_000_000,
+            max_cost_usd: Some(100.0),
+            observed_tokens: fixture.tokens.unwrap_or(0),
+            observed_cost_usd: fixture.cost_usd.unwrap_or(0.0),
+            token_observation_missing_cases: u32::from(fixture.tokens.is_none()),
+            cost_observation_missing_cases: u32::from(fixture.cost_usd.is_none()),
+            exhausted: false,
+        },
+        results: vec![result],
+        resolution: None,
+        floating_summary: None,
+    };
+    let mut bytes = serde_json::to_vec(&aggregate).unwrap();
+    bytes.push(b'\n');
+    bytes
 }
 
 fn compare_artifacts(
