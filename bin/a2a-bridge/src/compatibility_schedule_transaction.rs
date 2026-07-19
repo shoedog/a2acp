@@ -5,7 +5,7 @@
 //! in this module can call a provider; only the opaque capability created after publication may be
 //! transferred to an injected runner handoff.
 
-#![allow(dead_code)] // The default-off CLI wiring lands at the end of R3d2e.
+#![allow(dead_code)] // R3d5 activation will make the internal admitted-capability path live.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;

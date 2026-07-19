@@ -24,8 +24,37 @@ fn schedule_tick_is_recognized_but_refuses_before_provider_capable_spawn() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("r3d2_authority_admission_not_implemented"));
+    assert!(stderr.contains("r3d5_activation_not_enabled"));
     assert!(stderr.contains("no_effects"));
+    assert!(!stderr.contains("must-not-be-read"));
+    assert!(!marker.exists(), "schedule-tick spawned the provider trap");
+}
+
+#[test]
+fn schedule_tick_rejects_all_source_arguments_without_inspecting_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("provider-spawned");
+    let trap = directory.path().join("codex");
+    fs::write(&trap, format!("#!/bin/sh\n: > {:?}\nexit 99\n", marker)).unwrap();
+    fs::set_permissions(&trap, fs::Permissions::from_mode(0o700)).unwrap();
+    let untrusted_source = directory.path().join("must-not-be-read-or-reported");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+        .arg("compatibility")
+        .arg("schedule-tick")
+        .arg("--source")
+        .arg(&untrusted_source)
+        .env("PATH", directory.path())
+        .env("OPENAI_API_KEY", "must-not-be-read")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("r3d5_activation_not_enabled"));
+    assert!(stderr.contains("arguments are disabled"));
+    assert!(stderr.contains("no_effects"));
+    assert!(!stderr.contains("must-not-be-read-or-reported"));
     assert!(!stderr.contains("must-not-be-read"));
     assert!(!marker.exists(), "schedule-tick spawned the provider trap");
 }

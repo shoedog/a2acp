@@ -1,7 +1,7 @@
 //! R3d1 deadline and supervision state machine.
 //!
-//! The mechanism is deliberately default-off until R3d2 supplies authority, admission, and accounting.
-//! R3d1 tests it only with local fake controls; every signal-producing transition is journaled first.
+//! The mechanism is deliberately default-off until R3d5 issues authority and activates trusted triggers.
+//! R3d1/R3d2 test it only with local fake controls; every signal-producing transition is journaled first.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -124,11 +124,11 @@ pub(super) fn schedule_tick_parent(
     let _entry_elapsed_ms = duration_ms_ceil(process_entry.elapsed())?;
     if !args.is_empty() {
         return Err(
-            "compatibility schedule-tick: r3d2_authority_admission_not_implemented; no_effects; arguments are disabled"
+            "compatibility schedule-tick: r3d5_activation_not_enabled; no_effects; arguments are disabled"
                 .into(),
         );
     }
-    Err("compatibility schedule-tick: r3d2_authority_admission_not_implemented; no_effects".into())
+    Err("compatibility schedule-tick: r3d5_activation_not_enabled; no_effects".into())
 }
 
 fn sum_deadline_budgets(budgets: &DeadlinePhaseBudgetsV1) -> Result<u64, BoxError> {

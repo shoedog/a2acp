@@ -1,8 +1,8 @@
 //! Owner-private local state and lock capabilities for R3d2 admission.
 //!
-//! This module is intentionally unreachable from the R3d1 schedule-tick entrypoint until the
-//! authority/admission transaction is complete. Tests inject an existing temporary root; production
-//! callers must bind the fixed operator-home path on local APFS.
+//! The default-off boundary may only probe the fixed production root read-only. Tests inject an
+//! existing temporary root; R3d5 is the sole owner of production initialization and activation on
+//! the operator account's local APFS volume.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -10,7 +10,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Seek as _, Write as _};
 use std::os::fd::AsRawFd as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -19,6 +19,7 @@ use crate::local_file::{self, PinnedDirectory};
 const STATE_DIRECTORY_MODE: u32 = 0o700;
 const STATE_FILE_MODE: u32 = 0o600;
 const MAX_LOCK_HOLDER_BYTES: usize = 512;
+const MAX_PASSWD_BUFFER_BYTES: usize = 1024 * 1024;
 const STATE_SUBDIRECTORIES: [&str; 5] = ["authority", "admission", "ledger", "supervisor", "locks"];
 
 #[derive(Debug)]
@@ -174,6 +175,18 @@ fn verify_local_apfs(_directory: &PinnedDirectory) -> Result<(), SchedulerStateE
 }
 
 fn open_existing_root(path: &Path) -> Result<PinnedDirectory, SchedulerStateError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let lexical_metadata =
+        std::fs::symlink_metadata(path).map_err(|source| SchedulerStateError::Io {
+            context: "cannot inspect scheduler state root",
+            source,
+        })?;
+    if !lexical_metadata.is_dir() || lexical_metadata.file_type().is_symlink() {
+        return Err(SchedulerStateError::Invalid(
+            "scheduler state root must be a non-symlink directory".into(),
+        ));
+    }
     let snapshot = local_file::snapshot_directory(path, "scheduler state root").map_err(invalid)?;
     let root = PinnedDirectory::open(
         path,
@@ -182,8 +195,125 @@ fn open_existing_root(path: &Path) -> Result<PinnedDirectory, SchedulerStateErro
         "scheduler state root",
     )
     .map_err(invalid)?;
+    let opened_metadata =
+        root.file_handle()
+            .metadata()
+            .map_err(|source| SchedulerStateError::Io {
+                context: "cannot inspect opened scheduler state root",
+                source,
+            })?;
+    if lexical_metadata.dev() != opened_metadata.dev()
+        || lexical_metadata.ino() != opened_metadata.ino()
+    {
+        return Err(SchedulerStateError::Invalid(
+            "scheduler state root changed while it was being opened".into(),
+        ));
+    }
     verify_private_directory(&root, "scheduler state root")?;
     Ok(root)
+}
+
+fn current_operator_home() -> Result<PathBuf, SchedulerStateError> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    // SAFETY: sysconf reads one process-wide configuration value and has no pointer preconditions.
+    let configured = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut capacity = if configured > 0 {
+        usize::try_from(configured).unwrap_or(16 * 1024)
+    } else {
+        16 * 1024
+    }
+    .min(MAX_PASSWD_BUFFER_BYTES);
+    loop {
+        let mut passwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; capacity];
+        // SAFETY: passwd and result are writable outputs, buffer is live for the call, and geteuid
+        // has no preconditions. getpwuid_r returns only pointers into passwd/buffer before either
+        // allocation is dropped.
+        let status = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                passwd.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE && capacity < MAX_PASSWD_BUFFER_BYTES {
+            capacity = capacity.saturating_mul(2).min(MAX_PASSWD_BUFFER_BYTES);
+            continue;
+        }
+        if status != 0 {
+            return Err(SchedulerStateError::Io {
+                context: "cannot resolve effective operator account",
+                source: std::io::Error::from_raw_os_error(status),
+            });
+        }
+        if result.is_null() {
+            return Err(SchedulerStateError::Invalid(
+                "effective operator account has no passwd entry".into(),
+            ));
+        }
+        // SAFETY: a non-null getpwuid_r result initialized passwd and pw_dir points into the still-
+        // live buffer for this iteration.
+        let passwd = unsafe { passwd.assume_init() };
+        if passwd.pw_dir.is_null() {
+            return Err(SchedulerStateError::Invalid(
+                "effective operator account has no home directory".into(),
+            ));
+        }
+        let bytes = unsafe { std::ffi::CStr::from_ptr(passwd.pw_dir) }.to_bytes();
+        if bytes.is_empty() {
+            return Err(SchedulerStateError::Invalid(
+                "effective operator account has an empty home directory".into(),
+            ));
+        }
+        let home = PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()));
+        if !home.is_absolute() {
+            return Err(SchedulerStateError::Invalid(
+                "effective operator home directory is not absolute".into(),
+            ));
+        }
+        return Ok(home);
+    }
+}
+
+fn production_state_path(operator_home: &Path) -> PathBuf {
+    operator_home
+        .join("Library")
+        .join("Application Support")
+        .join("a2a-bridge")
+        .join("operator")
+        .join("compatibility-scheduler")
+}
+
+fn production_scheduler_state_present_at(
+    operator_home: &Path,
+    require_local_apfs: bool,
+) -> Result<bool, SchedulerStateError> {
+    let path = production_state_path(operator_home);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(SchedulerStateError::Io {
+                context: "cannot inspect fixed production scheduler state",
+                source,
+            })
+        }
+        Ok(_) => {}
+    }
+    let root = open_existing_root(&path)?;
+    if require_local_apfs {
+        verify_local_apfs(&root)?;
+    }
+    Ok(true)
+}
+
+/// Read-only default-off guard for the legacy manual compatibility path. The effective account's
+/// passwd home is authoritative; caller-controlled environment and CLI paths cannot redirect it.
+pub(super) fn production_scheduler_state_present() -> Result<bool, SchedulerStateError> {
+    production_scheduler_state_present_at(&current_operator_home()?, true)
 }
 
 fn open_or_create_private_child(
@@ -342,14 +472,9 @@ impl SchedulerStateRoot {
         })
     }
 
-    #[allow(dead_code)] // Wired only after the R3d2 transaction is complete.
-    pub(super) fn initialize_production(operator_home: &Path) -> Result<Self, SchedulerStateError> {
-        let path = operator_home
-            .join("Library")
-            .join("Application Support")
-            .join("a2a-bridge")
-            .join("operator")
-            .join("compatibility-scheduler");
+    #[allow(dead_code)] // R3d5 is the sole production initialization/activation owner.
+    pub(super) fn initialize_production() -> Result<Self, SchedulerStateError> {
+        let path = production_state_path(&current_operator_home()?);
         Self::initialize(&path, true)
     }
 
@@ -520,6 +645,48 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         root
+    }
+
+    fn create_production_root(operator_home: &Path) -> PathBuf {
+        let path = production_state_path(operator_home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[test]
+    fn fixed_production_presence_is_read_only_and_fail_closed() {
+        let operator_home = tempfile::tempdir().unwrap();
+        assert!(!production_scheduler_state_present_at(operator_home.path(), false).unwrap());
+
+        let root = create_production_root(operator_home.path());
+        assert!(production_scheduler_state_present_at(operator_home.path(), false).unwrap());
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(production_scheduler_state_present_at(operator_home.path(), false).is_err());
+        assert_eq!(
+            std::fs::metadata(root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn fixed_production_presence_rejects_a_symlink_root() {
+        let operator_home = tempfile::tempdir().unwrap();
+        let path = production_state_path(operator_home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let target = root();
+        std::os::unix::fs::symlink(target.path(), &path).unwrap();
+
+        assert!(production_scheduler_state_present_at(operator_home.path(), false).is_err());
+    }
+
+    #[test]
+    fn effective_operator_home_is_absolute() {
+        let passwd_home = current_operator_home().unwrap();
+        assert!(passwd_home.is_absolute());
     }
 
     #[test]

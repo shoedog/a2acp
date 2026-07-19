@@ -63,7 +63,7 @@ usage: a2a-bridge compatibility validate
        a2a-bridge compatibility compare --current <aggregate.json>
               [--baseline <pinned.json>] [--mode pinned|floating-to-pinned]
        a2a-bridge compatibility schedule-tick
-              (recognized but effect-disabled until R3d2 authority/admission)
+              (recognized but effect-disabled until R3d5 activation)
 
 `validate` is local and non-billable. `resolve` is non-billable but requires explicit acknowledgement
 before registry/image effects. It retains its private bundle and uniquely tagged image; it never starts an
@@ -4475,7 +4475,25 @@ fn request_compatibility_cancellation(cancellation: &std::sync::atomic::AtomicBo
         .is_ok()
 }
 
+fn enforce_legacy_manual_authority_boundary(
+    presence: Result<bool, crate::compatibility_schedule_state::SchedulerStateError>,
+) -> Result<(), BoxError> {
+    match presence {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(
+            "compatibility run: r3d_private_authority_requires_shared_admission; no_effects".into(),
+        ),
+        Err(error) => Err(format!(
+            "compatibility run: r3d_private_authority_state_ambiguous; no_effects; {error}"
+        )
+        .into()),
+    }
+}
+
 async fn run_command(args: RunArgs) -> Result<(), BoxError> {
+    enforce_legacy_manual_authority_boundary(
+        crate::compatibility_schedule_state::production_scheduler_state_present(),
+    )?;
     let (loaded, resolution) = match &args.source {
         RunSource::Manifest(path) => (load_manifest(path)?, None),
         RunSource::Resolution(path) => {
@@ -7066,6 +7084,27 @@ agent_cli = "@openai/codex=0.144.1"
         assert!(request_compatibility_cancellation(&cancellation));
         assert!(!request_compatibility_cancellation(&cancellation));
         assert!(cancellation.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn legacy_manual_run_is_allowed_only_when_private_authority_state_is_absent() {
+        enforce_legacy_manual_authority_boundary(Ok(false)).unwrap();
+
+        let present = enforce_legacy_manual_authority_boundary(Ok(true))
+            .unwrap_err()
+            .to_string();
+        assert!(present.contains("r3d_private_authority_requires_shared_admission"));
+        assert!(present.contains("no_effects"));
+
+        let ambiguous = enforce_legacy_manual_authority_boundary(Err(
+            crate::compatibility_schedule_state::SchedulerStateError::Invalid(
+                "injected malformed private state".into(),
+            ),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(ambiguous.contains("r3d_private_authority_state_ambiguous"));
+        assert!(ambiguous.contains("no_effects"));
     }
 
     #[tokio::test]
