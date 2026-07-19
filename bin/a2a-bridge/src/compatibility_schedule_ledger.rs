@@ -681,6 +681,38 @@ fn validate_reservation(value: &LedgerReservationV1) -> Result<(), BoxError> {
     Ok(())
 }
 
+pub(super) fn prepared_reservation_sha256(value: &LedgerReservationV1) -> Result<String, BoxError> {
+    validate_reservation(value)?;
+    Ok(local_file::sha256_hex(&canonical_bytes(
+        &LedgerRecordV1::Reservation(value.clone()),
+    )?))
+}
+
+pub(super) fn validate_prepared_reservation_context(
+    value: &LedgerReservationV1,
+    context: &DerivedLedgerAdmissionContextV1,
+) -> Result<(), BoxError> {
+    validate_reservation(value)?;
+    context.identities.validate()?;
+    if value.attempt_idempotency_key != context.identities.attempt_idempotency_key
+        || value.accounting_class != context.accounting_class
+        || value.case_id != context.case_id
+        || value.provider_family != context.provider_family
+        || value.characterization_profile != context.identities.characterization_profile
+        || value.case_execution != context.identities.case_execution.fingerprint
+        || value.admission_attempt != context.identities.admission_attempt.fingerprint
+        || value.authority != context.identities.admission_attempt.input.authority
+        || value.equivalent_work_key != context.identities.equivalent_work_key
+        || value.evidence_purpose != context.identities.evidence_purpose
+        || value.freshness_bucket != context.identities.freshness_bucket
+    {
+        return Err(
+            "schedule ledger: prepared reservation diverges from its derived context".into(),
+        );
+    }
+    Ok(())
+}
+
 fn full_conservative_charge(caps: &EffectCapsV1) -> UsageChargeV1 {
     UsageChargeV1 {
         attempts: caps.attempts,
@@ -1184,17 +1216,38 @@ impl<'lock> FileCompatibilityLedger<'lock> {
         request: &LedgerReservationRequestV1<'_>,
         reserved_at_ms: i64,
     ) -> Result<(LedgerAppendOutcomeV1, LedgerReservationV1), BoxError> {
+        let record = self.prepare_reservation(request, reserved_at_ms)?;
+        self.commit_prepared_reservation(record)
+    }
+
+    pub(super) fn prepare_reservation(
+        &self,
+        request: &LedgerReservationRequestV1<'_>,
+        reserved_at_ms: i64,
+    ) -> Result<LedgerReservationV1, BoxError> {
         self.check_headroom(request, reserved_at_ms)
             .map_err(|error| -> BoxError { error.to_string().into() })?;
-        let record = Self::request_record(request, reserved_at_ms)?;
+        Self::request_record(request, reserved_at_ms)
+    }
+
+    pub(super) fn commit_prepared_reservation(
+        &mut self,
+        record: LedgerReservationV1,
+    ) -> Result<(LedgerAppendOutcomeV1, LedgerReservationV1), BoxError> {
+        validate_reservation(&record)?;
         if let Some(existing) = self.reservations.get(&record.reservation_id) {
-            if Self::existing_matches_request(&existing.record, request)? {
+            if existing.record == record {
                 return Ok((
                     LedgerAppendOutcomeV1::ExistingIdentical,
                     existing.record.clone(),
                 ));
             }
             return Err("schedule ledger: attempt id was rebound".into());
+        }
+        if self.reservations.values().any(|existing| {
+            existing.record.attempt_idempotency_key == record.attempt_idempotency_key
+        }) {
+            return Err("schedule ledger: prepared attempt-idempotency key was rebound".into());
         }
         let wrapped = LedgerRecordV1::Reservation(record.clone());
         let bytes = canonical_bytes(&wrapped)?;

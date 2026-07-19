@@ -112,6 +112,31 @@ pub(super) struct PreflightRefusalV1 {
     pub(super) runtime_effect_calls: u64,
 }
 
+pub(super) fn preflight_pass_sha256(value: &PreflightPassV1) -> Result<String, BoxError> {
+    if value.schema_version != 1
+        || value.proofs.len() != ORDERED_CHECKS.len()
+        || value
+            .proofs
+            .iter()
+            .zip(ORDERED_CHECKS)
+            .any(|(proof, expected)| {
+                proof.check != expected
+                    || !local_file::valid_sha256(&proof.evidence_sha256)
+                    || proof.observed_at_ms <= 0
+            })
+        || value.completed_at_ms
+            != value
+                .proofs
+                .iter()
+                .map(|proof| proof.observed_at_ms)
+                .max()
+                .unwrap_or(1)
+    {
+        return Err("schedule preflight: pass record is malformed or incomplete".into());
+    }
+    preflight_hash("preflight-pass", value)
+}
+
 fn valid_code(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -208,6 +233,22 @@ pub(super) struct PinnedActionDirectoriesV1 {
     pub(super) requested_cwd: local_file::PinnedDirectory,
 }
 
+pub(super) fn validate_planned_directory_binding(
+    value: &PlannedDirectoryBindingV1,
+) -> Result<(), BoxError> {
+    let requested = Path::new(&value.requested_path);
+    let canonical = Path::new(&value.canonical_path);
+    if !requested.is_absolute()
+        || requested != canonical
+        || value.device == 0
+        || value.inode == 0
+        || !local_file::valid_sha256(&value.object_sha256)
+    {
+        return Err("schedule preflight: planned directory binding is malformed".into());
+    }
+    Ok(())
+}
+
 fn binding_from_snapshot(
     requested_path: &Path,
     snapshot: &local_file::DirectorySnapshot,
@@ -235,7 +276,9 @@ pub(super) fn plan_directory_binding(path: &Path) -> Result<PlannedDirectoryBind
         return Err("schedule preflight: planned directory must be absolute".into());
     }
     let snapshot = local_file::snapshot_directory(path, "schedule planned directory")?;
-    binding_from_snapshot(path, &snapshot)
+    let binding = binding_from_snapshot(path, &snapshot)?;
+    validate_planned_directory_binding(&binding)?;
+    Ok(binding)
 }
 
 fn binding_matches(

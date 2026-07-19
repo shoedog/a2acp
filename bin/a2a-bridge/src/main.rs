@@ -46,6 +46,7 @@ mod compatibility_schedule_preflight;
 mod compatibility_schedule_schema;
 mod compatibility_schedule_state;
 mod compatibility_schedule_supervisor;
+mod compatibility_schedule_transaction;
 mod config;
 mod containers;
 mod doctor;

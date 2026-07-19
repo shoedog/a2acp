@@ -419,7 +419,8 @@ pub(super) struct ManualAdmissionBindingsV1 {
     pub(super) expires_at_ms: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(super) struct SealedManualAdmissionV1 {
     pub(super) record: ManualAdmissionV1,
     pub(super) authority: AdmissionAuthorityV1,
@@ -1413,6 +1414,36 @@ pub(super) fn select_standing_grant(
     ))
 }
 
+/// Selects only the budget pool used by a generic manual admission. This does not return or imply
+/// standing provider-effect authority; the sealed one-run manual record remains the sole effect arm.
+pub(super) fn select_manual_accounting_grant<'a>(
+    state: &'a AuthorityStateModelV1,
+    grant_id: &str,
+    environment: &AuthorityEnvironmentV1,
+) -> Result<&'a ProviderEffectGrantV1, BoxError> {
+    state.validate()?;
+    let grant = state
+        .grants
+        .get(grant_id)
+        .ok_or("schedule authority: manual accounting grant does not exist")?;
+    validate_sealed_provider_effect_grant(grant)?;
+    validate_window(environment, grant.not_before_ms, grant.expires_at_ms)?;
+    if grant.operator != environment.operator
+        || grant.environment_owner != environment.environment_owner
+        || grant.host_identity_sha256 != environment.host_identity_sha256
+        || grant.profile_policy_bundle_sha256 != environment.profile_policy_bundle_sha256
+        || grant.scheduler_binary_sha256 != environment.scheduler_binary_sha256
+        || grant.price_snapshot_sha256 != environment.price_snapshot_sha256
+        || grant.legacy_inventory_sha256 != environment.legacy_inventory_sha256
+        || environment.now_ms < grant.price_snapshot_observed_at_ms
+        || environment.now_ms > grant.price_snapshot_valid_until_ms
+        || state.grant_revocations.get(grant_id).copied() != Some(grant.revocation_generation)
+    {
+        return Err("schedule authority: manual accounting grant is stale or revoked".into());
+    }
+    Ok(grant)
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct StorageConsentRequestV1 {
     pub(super) operator: String,
@@ -1461,7 +1492,7 @@ pub(super) struct AuthorityStateSnapshotV1 {
 }
 
 impl AuthorityStateSnapshotV1 {
-    fn validate(&self) -> Result<(), BoxError> {
+    pub(super) fn validate(&self) -> Result<(), BoxError> {
         if self.schema_version != 1 || self.generation == 0 || self.recorded_at_ms <= 0 {
             return Err(
                 "schedule authority: state snapshot must be version 1 with positive generation/time"
@@ -1529,6 +1560,15 @@ impl AuthorityStateSnapshotV1 {
     }
 }
 
+pub(super) fn authority_state_snapshot_sha256(
+    value: &AuthorityStateSnapshotV1,
+) -> Result<String, BoxError> {
+    value.validate()?;
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    Ok(local_file::sha256_hex(&bytes))
+}
+
 fn phase_transition_allowed(
     previous: &OneShotLifecyclePhaseV1,
     next: &OneShotLifecyclePhaseV1,
@@ -1568,7 +1608,7 @@ fn phase_transition_allowed(
     }
 }
 
-fn validate_authority_state_transition(
+pub(super) fn validate_authority_state_transition(
     previous: &AuthorityStateSnapshotV1,
     next: &AuthorityStateSnapshotV1,
 ) -> Result<(), BoxError> {
@@ -1864,8 +1904,8 @@ impl<'lock> FileAuthorityJournal<'lock> {
         })
     }
 
-    pub(super) fn append(
-        &mut self,
+    pub(super) fn preview_append(
+        &self,
         state: &AuthorityStateModelV1,
         recorded_at_ms: i64,
     ) -> Result<(AuthorityStateSnapshotV1, String), BoxError> {
@@ -1891,6 +1931,38 @@ impl<'lock> FileAuthorityJournal<'lock> {
         if bytes.len() as u64 > Self::MAX_RECORD_BYTES {
             return Err("schedule authority: state generation exceeds the byte bound".into());
         }
+        Ok((
+            snapshot.clone(),
+            authority_state_snapshot_sha256(&snapshot)?,
+        ))
+    }
+
+    pub(super) fn contains_exact_snapshot(
+        &self,
+        expected: &AuthorityStateSnapshotV1,
+        expected_sha256: &str,
+    ) -> Result<bool, BoxError> {
+        if !local_file::valid_sha256(expected_sha256) {
+            return Err("schedule authority: expected snapshot hash is malformed".into());
+        }
+        let Some((_, name)) = Self::generation_entries(self.directory)?
+            .into_iter()
+            .find(|(generation, _)| *generation == expected.generation)
+        else {
+            return Ok(false);
+        };
+        let (observed, _bytes, observed_sha256) = Self::read_generation(self.directory, &name)?;
+        Ok(&observed == expected && observed_sha256 == expected_sha256)
+    }
+
+    pub(super) fn append(
+        &mut self,
+        state: &AuthorityStateModelV1,
+        recorded_at_ms: i64,
+    ) -> Result<(AuthorityStateSnapshotV1, String), BoxError> {
+        let (snapshot, expected_sha256) = self.preview_append(state, recorded_at_ms)?;
+        let mut bytes = serde_json::to_vec(&snapshot)?;
+        bytes.push(b'\n');
         let name = Self::generation_name(self.next_generation);
         let mut file = self.directory.create_new_file(
             OsStr::new(&name),
@@ -1911,6 +1983,9 @@ impl<'lock> FileAuthorityJournal<'lock> {
         }
         self.directory.sync()?;
         let sha256 = local_file::sha256_hex(&bytes);
+        if sha256 != expected_sha256 {
+            return Err("schedule authority: previewed state generation hash diverged".into());
+        }
         self.next_generation = self
             .next_generation
             .checked_add(1)

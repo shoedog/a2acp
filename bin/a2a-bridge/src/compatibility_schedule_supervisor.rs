@@ -929,6 +929,44 @@ impl FileSupervisorJournal {
         journal.previous_sha256 = Some(latest_sha256.clone());
         Ok((journal, latest, latest_sha256))
     }
+
+    fn read_initial_record(&self) -> Result<SupervisorRecordV1, BoxError> {
+        let name = Self::generation_name(&self.record_id, 1);
+        let (bytes, _sha256) = self.read_generation(&name)?;
+        let record: SupervisorRecordV1 = serde_json::from_slice(&bytes).map_err(|error| {
+            format!("schedule supervisor: invalid initial journal generation: {error}")
+        })?;
+        validate_supervisor_record(&record)?;
+        Ok(record)
+    }
+}
+
+/// Makes the commit-bound Prepared generation durable exactly once. Existing later generations are
+/// accepted only when their immutable generation one is byte-equivalent to the supplied record.
+/// This recovery primitive cannot start a runner or signal a process group.
+#[cfg(unix)]
+pub(super) fn ensure_prepared_supervisor(
+    directory: &Path,
+    prepared: &SupervisorRecordV1,
+) -> Result<(SupervisorRecordV1, String), BoxError> {
+    if prepared.generation != 1 || prepared.phase != SupervisorPhaseV1::Prepared {
+        return Err("schedule supervisor: prepared publication requires generation one".into());
+    }
+    match FileSupervisorJournal::create(directory, &prepared.supervisor_record_id) {
+        Ok(journal) => {
+            ScheduleSupervisor::initialize(prepared.clone(), journal)?;
+        }
+        Err(_create_error) => {
+            // An existing generation is the normal crash-recovery path. Reopen validates the
+            // complete chain; a malformed object or unrelated create failure remains an error.
+        }
+    }
+    let (journal, latest, latest_sha256) =
+        FileSupervisorJournal::open_existing(directory, &prepared.supervisor_record_id)?;
+    if journal.read_initial_record()? != *prepared {
+        return Err("schedule supervisor: existing journal is rebound to another admission".into());
+    }
+    Ok((latest, latest_sha256))
 }
 
 #[cfg(unix)]

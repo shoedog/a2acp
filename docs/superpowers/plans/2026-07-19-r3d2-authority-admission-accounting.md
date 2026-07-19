@@ -504,6 +504,29 @@ compatibility review, or independent implementation review. R3d2d is not indepen
 
 ### R3d2e — shared transaction and default-off entrypoint integration
 
+Implementation breakdown and crash order:
+
+- **R3d2e1 — commit journal.** Add an owner-lock-scoped admission journal whose create-new commit is the sole
+  linearization point. A commit binds the exact source-derived identities, authority action and previewed authority
+  generation, equivalent-work disposition, prepared ledger reservation, both preflight results, action-directory
+  bindings, and prepared supervisor record. Recovery replays only a complete canonical hash-chained commit; a torn,
+  rebound, skipped, or divergent generation holds.
+- **R3d2e2 — authority/source/accounting join.** Under owner-wide then authority-state locks, reopen the authority
+  journal and checked-in foundation, reselect exactly one one-shot/standing/manual authority path, derive the ledger
+  policy only from that selected record, run the final zero-effect fence, and prepare all reducer outputs without
+  publishing them. The durable commit precedes authority-journal and ledger publication; recovery completes those
+  idempotently before any handoff.
+- **R3d2e3 — supervisor handoff and reconciliation.** Materialize the commit-bound R3d1 `Prepared` generation before
+  transferring an opaque admitted capability to an injected runner. Recovery may recreate or resume `Prepared` but
+  never repeats provider handoff. Typed pre-effect cancellation releases the ledger/equivalent-work reservation;
+  possible acceptance or a supervisor hold remains conservatively charged and non-replayable; exact terminal evidence
+  reconciles once.
+- **R3d2e4 — default-off boundary.** No command-line source path, serve/A2A route, timer, watcher, or production
+  operator action can construct an internal runner source or admitted capability. With no private R3d authority, the
+  existing explicitly acknowledged manual compatibility command remains the legacy-compatible path. If private R3d
+  authority exists, legacy manual execution must not bypass the shared transaction. `schedule-tick` remains a typed
+  zero-effect refusal until R3d5 issues authority and activates trusted triggers.
+
 Files expected:
 
 - edit `bin/a2a-bridge/src/compatibility.rs`

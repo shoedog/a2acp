@@ -105,7 +105,8 @@ pub(super) fn attempt_idempotency_key(
     )
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(super) struct DerivedAdmissionIdentitiesV1 {
     pub(super) characterization_profile: FingerprintV1,
     pub(super) case_execution: CaseExecutionFingerprintRecordV1,
@@ -116,7 +117,36 @@ pub(super) struct DerivedAdmissionIdentitiesV1 {
     pub(super) freshness_bucket: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl DerivedAdmissionIdentitiesV1 {
+    pub(super) fn validate(&self) -> Result<(), BoxError> {
+        self.case_execution.validate()?;
+        self.admission_attempt.validate()?;
+        if self.characterization_profile != self.case_execution.input.characterization_profile
+            || self.characterization_profile
+                != self.admission_attempt.input.characterization_profile
+            || self.case_execution.fingerprint != self.admission_attempt.input.case_execution
+            || self.equivalent_work_key
+                != equivalent_work_key(
+                    &self.case_execution.fingerprint,
+                    self.evidence_purpose,
+                    &self.freshness_bucket,
+                )?
+            || self.attempt_idempotency_key
+                != attempt_idempotency_key(
+                    &self.admission_attempt.fingerprint,
+                    &self.admission_attempt.input.trigger.repeat_nonce,
+                )?
+        {
+            return Err(
+                "schedule admission: derived identity set is internally inconsistent".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(super) struct DerivedLedgerAdmissionContextV1 {
     pub(super) identities: DerivedAdmissionIdentitiesV1,
     pub(super) accounting_class: AccountingClassV1,
@@ -176,7 +206,7 @@ pub(super) fn rederive_scheduled_identities(
     )
 }
 
-fn rederive_scheduled_ledger_context_from_foundation(
+pub(super) fn rederive_scheduled_ledger_context_from_foundation(
     foundation: &LoadedScheduleFoundation,
     source: &ScheduledExecutionSourceV1,
     freshness_bucket: String,
@@ -243,7 +273,7 @@ pub(super) fn rederive_claimed_support_identities(
     .identities)
 }
 
-fn rederive_claimed_support_ledger_context_from_foundation(
+pub(super) fn rederive_claimed_support_ledger_context_from_foundation(
     foundation: &LoadedScheduleFoundation,
     source: &ClaimedSupportCharacterizationSourceV1,
     freshness_bucket: String,
