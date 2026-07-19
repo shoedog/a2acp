@@ -455,6 +455,8 @@ pub(super) struct OneShotCharacterizationEntryV1 {
     pub(super) not_before_ms: i64,
     pub(super) expires_at_ms: i64,
     pub(super) revocation_generation: u64,
+    pub(super) prior_entry: OptionalRecordRefV1,
+    pub(super) reissue_reason: OptionalTextV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -905,6 +907,7 @@ pub(super) struct ScheduledExecutionSourceV1 {
     pub(super) admission_attempt: AdmissionAttemptFingerprintRecordV1,
     pub(super) authority: AdmissionAuthorityV1,
     pub(super) trigger: TriggerKindV1,
+    pub(super) config_template_sha256: String,
     pub(super) requested_identity: EffectiveIdentityV1,
     pub(super) expected_effective_identity: EffectiveIdentityV1,
     pub(super) caps: EffectCapsV1,
@@ -926,6 +929,7 @@ pub(super) struct ClaimedSupportCharacterizationSourceV1 {
     pub(super) authority: AdmissionAuthorityV1,
     pub(super) trigger: TriggerKindV1,
     pub(super) pinned_config_sha256: String,
+    pub(super) config_template_sha256: String,
     pub(super) requested_identity: EffectiveIdentityV1,
     pub(super) expected_effective_identity: EffectiveIdentityV1,
     pub(super) caps: EffectCapsV1,
@@ -1426,6 +1430,40 @@ fn canonical_input_sha256<T: Serialize>(label: &str, value: &T) -> Result<String
     Ok(local_file::sha256_hex(&domain_separated))
 }
 
+#[cfg(test)]
+pub(super) fn seal_case_execution_fingerprint(
+    input: CaseExecutionFingerprintInputV1,
+) -> Result<CaseExecutionFingerprintRecordV1, BoxError> {
+    let fingerprint = FingerprintV1 {
+        schema_version: 1,
+        sha256: canonical_input_sha256("case-execution input", &input)?,
+    };
+    let value = CaseExecutionFingerprintRecordV1 {
+        schema_version: 1,
+        input,
+        fingerprint,
+    };
+    value.validate()?;
+    Ok(value)
+}
+
+#[cfg(test)]
+pub(super) fn seal_admission_attempt_fingerprint(
+    input: AdmissionAttemptFingerprintInputV1,
+) -> Result<AdmissionAttemptFingerprintRecordV1, BoxError> {
+    let fingerprint = FingerprintV1 {
+        schema_version: 1,
+        sha256: canonical_input_sha256("admission-attempt input", &input)?,
+    };
+    let value = AdmissionAttemptFingerprintRecordV1 {
+        schema_version: 1,
+        input,
+        fingerprint,
+    };
+    value.validate()?;
+    Ok(value)
+}
+
 pub(super) fn deadline_derivation_input_sha256(
     value: &DeadlineDerivationInputV1,
 ) -> Result<String, BoxError> {
@@ -1847,7 +1885,7 @@ fn validate_authority(authority: &AdmissionAuthorityV1) -> Result<(), BoxError> 
     Ok(())
 }
 
-trait ValidateRecord {
+pub(super) trait ValidateRecord {
     fn validate(&self) -> Result<(), BoxError>;
 }
 
@@ -2450,6 +2488,21 @@ impl ValidateRecord for CharacterizationAuthorizationV1 {
                 entry.not_before_ms,
                 entry.expires_at_ms,
             )?;
+            optional_record_ref("one-shot prior entry", &entry.prior_entry)?;
+            optional_text("one-shot reissue reason", &entry.reissue_reason)?;
+            if !matches!(
+                (&entry.prior_entry, &entry.reissue_reason),
+                (OptionalRecordRefV1::Absent, OptionalTextV1::Absent)
+                    | (
+                        OptionalRecordRefV1::Record { .. },
+                        OptionalTextV1::Text { .. }
+                    )
+            ) {
+                return Err(
+                    "schedule schema: one-shot prior entry and reissue reason must be paired"
+                        .into(),
+                );
+            }
             if !profiles.insert(entry.characterization_profile.sha256.as_str()) {
                 return Err(
                     "schedule schema: one authorization cannot contain duplicate live profiles"
@@ -3167,6 +3220,7 @@ impl ValidateRecord for ScheduledExecutionSourceV1 {
         for (label, value) in [
             ("scheduled source", &self.source_sha256),
             ("profile policy bundle", &self.profile_policy_bundle_sha256),
+            ("scheduled config template", &self.config_template_sha256),
         ] {
             sha256(label, value)?;
         }
@@ -3236,6 +3290,10 @@ impl ValidateRecord for ClaimedSupportCharacterizationSourceV1 {
             ("production manifest", &self.production_manifest_sha256),
             ("profile policy bundle", &self.profile_policy_bundle_sha256),
             ("pinned config", &self.pinned_config_sha256),
+            (
+                "claimed-support config template",
+                &self.config_template_sha256,
+            ),
         ] {
             sha256(label, value)?;
         }
@@ -4991,6 +5049,8 @@ mod tests {
             not_before_ms: 1,
             expires_at_ms: 3,
             revocation_generation: 1,
+            prior_entry: OptionalRecordRefV1::Absent,
+            reissue_reason: OptionalTextV1::Absent,
         };
         let mut authorization = CharacterizationAuthorizationV1 {
             schema_version: 1,
@@ -5007,6 +5067,18 @@ mod tests {
             entries: vec![entry],
         };
         authorization.validate().unwrap();
+
+        let mut prior_without_reason = authorization.clone();
+        prior_without_reason.entries[0].prior_entry = OptionalRecordRefV1::Record {
+            id: "prior-entry".into(),
+            sha256: digest('9'),
+        };
+        assert!(prior_without_reason.validate().is_err());
+
+        let mut reason_without_prior = authorization.clone();
+        reason_without_prior.entries[0].reissue_reason = text("reviewed reissue");
+        assert!(reason_without_prior.validate().is_err());
+
         authorization.entries[0].command = "compatibility run".into();
         assert!(authorization.validate().is_err());
 
@@ -5354,6 +5426,7 @@ mod tests {
             authority,
             trigger: TriggerKindV1::ManualCharacterization,
             pinned_config_sha256: digest('f'),
+            config_template_sha256: digest('0'),
             requested_identity: identity.clone(),
             expected_effective_identity: identity,
             caps,
@@ -5508,6 +5581,7 @@ mod tests {
             admission_attempt,
             authority,
             trigger: TriggerKindV1::Daily,
+            config_template_sha256: digest('0'),
             requested_identity: identity.clone(),
             expected_effective_identity: identity,
             caps,

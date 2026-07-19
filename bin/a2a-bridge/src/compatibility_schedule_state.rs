@@ -85,6 +85,10 @@ pub(super) struct AuthorityMutationLock {
     file: File,
 }
 
+pub(super) trait AuthorityStateCapability {
+    fn authority_directory(&self) -> &PinnedDirectory;
+}
+
 fn invalid(error: impl std::fmt::Display) -> SchedulerStateError {
     SchedulerStateError::Invalid(error.to_string())
 }
@@ -341,7 +345,7 @@ impl SchedulerStateRoot {
     }
 
     #[cfg(test)]
-    fn initialize_for_test(path: &Path) -> Result<Self, SchedulerStateError> {
+    pub(super) fn initialize_for_test(path: &Path) -> Result<Self, SchedulerStateError> {
         Self::initialize(path, false)
     }
 
@@ -446,6 +450,12 @@ impl Drop for AdmissionAuthorityLocks {
     }
 }
 
+impl AuthorityStateCapability for AdmissionAuthorityLocks {
+    fn authority_directory(&self) -> &PinnedDirectory {
+        &self._owner.inner.authority
+    }
+}
+
 impl Drop for AuthorityMutationLock {
     fn drop(&mut self) {
         // SAFETY: this guard uniquely owns the locked descriptor.
@@ -455,6 +465,12 @@ impl Drop for AuthorityMutationLock {
         self.inner
             .authority_only_holders
             .fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl AuthorityStateCapability for AuthorityMutationLock {
+    fn authority_directory(&self) -> &PinnedDirectory {
+        &self.inner.authority
     }
 }
 
@@ -562,6 +578,49 @@ mod tests {
         let abrupt = helper("exit_while_held");
         assert!(abrupt.status.success());
         state.try_owner_admission("parent:after-crash").unwrap();
+    }
+
+    #[test]
+    fn authority_lock_contender_process_helper() {
+        let Some(root) = std::env::var_os("A2A_R3D2_AUTHORITY_HELPER_ROOT") else {
+            return;
+        };
+        let state = SchedulerStateRoot::initialize_for_test(Path::new(&root)).unwrap();
+        let result = state.try_authority_mutation("child:issue");
+        match std::env::var("A2A_R3D2_AUTHORITY_HELPER_EXPECT").as_deref() {
+            Ok("busy") => assert!(matches!(result, Err(SchedulerStateError::LockBusy(_)))),
+            Ok("acquired") => assert!(result.is_ok()),
+            other => panic!("unexpected authority helper expectation {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authority_issuance_is_exclusive_across_processes_without_queueing() {
+        let root = root();
+        let state = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let authority = state.try_authority_mutation("parent:issue").unwrap();
+        let helper = |expect: &str| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("compatibility_schedule_state::tests::authority_lock_contender_process_helper")
+                .env("A2A_R3D2_AUTHORITY_HELPER_ROOT", root.path())
+                .env("A2A_R3D2_AUTHORITY_HELPER_EXPECT", expect)
+                .output()
+                .unwrap()
+        };
+        let busy = helper("busy");
+        assert!(
+            busy.status.success(),
+            "child authority busy probe failed: {}",
+            String::from_utf8_lossy(&busy.stderr)
+        );
+        drop(authority);
+        let acquired = helper("acquired");
+        assert!(
+            acquired.status.success(),
+            "child authority acquisition probe failed: {}",
+            String::from_utf8_lossy(&acquired.stderr)
+        );
     }
 
     #[cfg(target_os = "macos")]

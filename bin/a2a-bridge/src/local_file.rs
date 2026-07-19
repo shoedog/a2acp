@@ -923,9 +923,7 @@ impl PinnedDirectory {
             };
             if created {
                 let handle = child.file_handle();
-                if let Err(error) = set_effective_owner(&handle, label) {
-                    return Err(error);
-                }
+                set_effective_owner(&handle, label)?;
                 // SAFETY: the retained child descriptor is live and `mode` is a permission mask.
                 if unsafe { libc::fchmod(handle.as_raw_fd(), mode as libc::mode_t) } == -1 {
                     return Err(format!(

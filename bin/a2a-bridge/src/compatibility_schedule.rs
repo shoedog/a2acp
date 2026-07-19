@@ -9,6 +9,10 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+use crate::compatibility_schedule_schema::{
+    EffectiveIdentityV1, FingerprintV1, OptionalTextV1,
+    ProfileSourceKindV1 as SchemaProfileSourceKindV1, ProfileSourceRefV1,
+};
 use crate::{compatibility, compatibility_resolution, local_file, BoxError};
 
 const MAX_FOUNDATION_FILE_BYTES: u64 = 1024 * 1024;
@@ -335,6 +339,8 @@ struct CanonicalProfileInputV1 {
     expected_effective_mode: Option<String>,
     config_template: String,
     config_template_sha256: String,
+    #[serde(skip_serializing)]
+    exact_config_sha256: String,
     resolution_constraint_sha256: Option<String>,
     allowed_effects: Vec<EffectClassV1>,
     fixed_prompt_contract: String,
@@ -408,6 +414,67 @@ pub(super) struct LoadedScheduleFoundation {
     pub(super) scheduled_profile_count: usize,
     pub(super) claimed_support_profile_count: usize,
     pub(super) profile_policy_bundle_sha256: String,
+    pub(super) scheduled_profiles: BTreeMap<String, FoundationProfileBindingV1>,
+    pub(super) claimed_support_profiles: BTreeMap<String, FoundationProfileBindingV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FoundationProfileBindingV1 {
+    pub(super) source: ProfileSourceRefV1,
+    pub(super) characterization_profile: FingerprintV1,
+    pub(super) provider_family: String,
+    pub(super) requested_identity: EffectiveIdentityV1,
+    pub(super) expected_effective_identity: EffectiveIdentityV1,
+    pub(super) maximum_caps: EffectCapsV1,
+    pub(super) allowed_effects: Vec<EffectClassV1>,
+    pub(super) config_template_sha256: String,
+    pub(super) exact_config_sha256: String,
+}
+
+fn optional_identity_text(value: &Option<String>) -> OptionalTextV1 {
+    match value {
+        Some(value) => OptionalTextV1::Text {
+            value: value.clone(),
+        },
+        None => OptionalTextV1::Absent,
+    }
+}
+
+fn foundation_profile_binding(
+    profile: &CanonicalProfileInputV1,
+    source_kind: SchemaProfileSourceKindV1,
+    source_sha256: String,
+    row_sha256: String,
+    profile_sha256: String,
+) -> FoundationProfileBindingV1 {
+    FoundationProfileBindingV1 {
+        source: ProfileSourceRefV1 {
+            kind: source_kind,
+            schema_version: 1,
+            source_sha256,
+            row_id: profile.source_id.clone(),
+            row_sha256,
+        },
+        characterization_profile: FingerprintV1 {
+            schema_version: 1,
+            sha256: profile_sha256,
+        },
+        provider_family: profile.provider_family.clone(),
+        requested_identity: EffectiveIdentityV1 {
+            model: profile.requested_model.clone(),
+            effort: optional_identity_text(&profile.requested_effort),
+            mode: optional_identity_text(&profile.requested_mode),
+        },
+        expected_effective_identity: EffectiveIdentityV1 {
+            model: profile.expected_effective_model.clone(),
+            effort: optional_identity_text(&profile.expected_effective_effort),
+            mode: optional_identity_text(&profile.expected_effective_mode),
+        },
+        maximum_caps: profile.maximum_caps.clone(),
+        allowed_effects: profile.allowed_effects.clone(),
+        config_template_sha256: profile.config_template_sha256.clone(),
+        exact_config_sha256: profile.exact_config_sha256.clone(),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1473,7 +1540,8 @@ fn validate_config(
 fn scheduled_profile(
     policy: &SchedulePolicyV1,
     case: &ScheduledCaseV1,
-    config_sha256: String,
+    config_template_sha256: String,
+    exact_config_sha256: String,
     resolution_constraint_sha256: Option<String>,
 ) -> Result<CanonicalProfileInputV1, BoxError> {
     let mut allowed_effects = case.allowed_effects.clone();
@@ -1527,7 +1595,8 @@ fn scheduled_profile(
         expected_effective_effort: case.expected_effective_effort.clone(),
         expected_effective_mode: case.expected_effective_mode.clone(),
         config_template: case.config_template.clone(),
-        config_template_sha256: config_sha256,
+        config_template_sha256,
+        exact_config_sha256,
         resolution_constraint_sha256,
         allowed_effects,
         fixed_prompt_contract: policy.fixed_prompt_contract.clone(),
@@ -1787,6 +1856,7 @@ fn support_profile(
         )
         .into());
     }
+    let exact_config_sha256 = config_snapshot.sha256.clone();
     captures.push(CapturedFoundationFile {
         canonical_path: config_snapshot.canonical_path.clone(),
         sha256: config_snapshot.sha256.clone(),
@@ -2017,6 +2087,7 @@ fn support_profile(
         expected_effective_mode: optional("mode"),
         config_template: config_template.into(),
         config_template_sha256,
+        exact_config_sha256,
         resolution_constraint_sha256: Some(resolution_constraint_sha256),
         allowed_effects,
         fixed_prompt_contract: policy.fixed_prompt_contract.clone(),
@@ -2346,6 +2417,7 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
         label: "production manifest".into(),
         max_bytes: MAX_FOUNDATION_FILE_BYTES,
     });
+    let production_manifest_sha256 = production_manifest_snapshot.sha256.clone();
     let production_manifest_bytes = production_manifest_snapshot.bytes;
     let floating =
         compatibility_resolution::load_recipes(&root.join(&policy.value.floating_recipes))?;
@@ -2370,9 +2442,11 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
 
     let mut expected = BTreeMap::new();
     let mut scheduled_hashes = BTreeMap::new();
+    let mut scheduled_profiles = BTreeMap::new();
     let mut config_hashes = BTreeMap::new();
     for case in &registry.value.cases {
         let (config_sha256, _, capture) = validate_config(&root, case)?;
+        let exact_config_sha256 = capture.sha256.clone();
         captures.push(capture);
         config_hashes.insert(
             case.config.to_string_lossy().into_owned(),
@@ -2383,14 +2457,24 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
             &policy.value,
             case,
             config_sha256,
+            exact_config_sha256,
             resolution_constraint_sha256,
         )?;
         let hash = canonical_hash("scheduled characterization profile", &profile)?;
+        let row_sha256 = canonical_hash("scheduled source row", case)?;
+        let binding = foundation_profile_binding(
+            &profile,
+            SchemaProfileSourceKindV1::ScheduledAdvisory,
+            registry.sha256.clone(),
+            row_sha256,
+            hash.clone(),
+        );
         expected.insert(
             (ProfileSourceKindV1::ScheduledAdvisory, case.id.clone()),
             hash.clone(),
         );
         scheduled_hashes.insert(case.id.clone(), hash);
+        scheduled_profiles.insert(case.id.clone(), binding);
     }
 
     let support = support_profiles(
@@ -2410,12 +2494,21 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
         .into());
     }
     let mut support_hashes = BTreeMap::new();
+    let mut claimed_support_profiles = BTreeMap::new();
     for profile in support {
         config_hashes.insert(
             profile.config_template.clone(),
             profile.config_template_sha256.clone(),
         );
         let hash = canonical_hash("claimed-support characterization profile", &profile)?;
+        let row_sha256 = canonical_hash("claimed-support source row", &profile)?;
+        let binding = foundation_profile_binding(
+            &profile,
+            SchemaProfileSourceKindV1::ClaimedSupportGate,
+            production_manifest_sha256.clone(),
+            row_sha256,
+            hash.clone(),
+        );
         expected.insert(
             (
                 ProfileSourceKindV1::ClaimedSupportGate,
@@ -2423,6 +2516,7 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
             ),
             hash.clone(),
         );
+        claimed_support_profiles.insert(profile.source_id.clone(), binding);
         support_hashes.insert(profile.source_id, hash);
     }
     validate_inventory(&inventory.value, &expected)?;
@@ -2464,6 +2558,8 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
         scheduled_profile_count: scheduled_hashes.len(),
         claimed_support_profile_count: support_hashes.len(),
         profile_policy_bundle_sha256: bundle_sha256,
+        scheduled_profiles,
+        claimed_support_profiles,
     })
 }
 

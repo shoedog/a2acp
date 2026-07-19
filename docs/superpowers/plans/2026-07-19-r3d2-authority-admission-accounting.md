@@ -1,7 +1,7 @@
 # R3d2 — authority, admission, preflights, and accounting implementation plan
 
-- **Status:** ACTIVE — R3d2a implemented with focused/full deterministic gates green but not independently
-  reviewed; R3d2b is next
+- **Status:** ACTIVE — R3d2a and R3d2b are implemented with focused/full deterministic gates green but not
+  independently reviewed; R3d2c is next
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -212,6 +212,68 @@ Required tests and red proof:
   refuses;
 - valid/invalid provider authority crossed with valid/invalid storage consent proves the two capabilities are
   independent. R3d2 validates the consent fence only; it performs no cold write.
+
+#### R3d2b checkpoint evidence — 2026-07-19
+
+Implemented mechanism:
+
+- Owner-issued characterization batches, standing provider-effect grants, and storage consents are canonical,
+  domain-separated, self-hashed records reduced through copy-validate-commit state changes. Provider rollback
+  increments the standing-grant and every nonterminal one-shot revocation generation; storage revocation remains
+  independent.
+- One-shot state is append-only `available -> consumed_unreconciled -> reconciled`. Entry ids and authority-wide
+  nonces are unique, a materialized profile index is rebuilt only from authoritative records, and a same-profile
+  reissue must name the sole terminal predecessor, next generation, and reviewed reason. Concurrent operator
+  issuance takes the nonblocking authority-state lock; a second process refuses rather than queues.
+- Mode-`0600` canonical JSON authority generations form one contiguous hash chain under a retained mode-`0700`
+  directory capability. Immutable envelopes/manual consumptions cannot disappear or change, lifecycle and
+  revocation transitions are monotonic, partial/corrupt authoritative generations hold, and only a divergent
+  rebuildable profile projection may be repaired and durably superseded.
+- Explicit characterization selects only one exact available `characterization_once` entry and now binds its
+  reviewed command in addition to source/profile/execution/effective identity/provider/effects/caps and the full
+  owner/host/binary/bundle/price/legacy/deadline environment. Unattended daily/main/test-merge selection accepts
+  only a standing grant with its exact completed non-inconclusive characterization and, where applicable, exact
+  launchd label/plist binding.
+- Direct generic manual derivation accepts only the internal direct-local-CLI origin plus explicit billable
+  acknowledgement, rejects caller nonce input, uses 256 bits from `SystemRandom`, seals a maximum-15-minute
+  `ManualAdmissionV1`, and exposes an exactly-once durable nonce-consumption reducer. Serve, A2A, timer, watcher,
+  characterization-purpose, replay, expiry, mutation, and persistent/manual-arm mixtures refuse. R3d2e still owns
+  joining this reducer to the shared admission commit and CLI route.
+- The foundation loader now exposes immutable scheduled and claimed-support bindings containing raw source/row,
+  stable profile/bundle, requested/effective identity, effect/cap maximum, semantic config-template, and exact raw
+  config hashes. Scheduled and claimed-support source generators load this state, seal a strict source, then reopen
+  and independently rederive every foundation-bound field. The source DTOs now explicitly carry the config-template
+  digest that the design required but R3d0 omitted.
+
+Pre-change and mutation red proof:
+
+- At checkpoint `5104332`, the authority module, journal, source reducers, manual reducer, and authority-only
+  cross-process contention tests did not exist; their modules/tests are compile-red against that tree.
+- The first duplicate-nonce issuance regression returned `Err` but left the candidate model mutated and invalid.
+  Copy-validate-commit leaves the prior model byte-equivalent and the regression is green.
+- Removing only the one-shot `entry.command == request.command` comparison made
+  `one_shot_selection_fences_all_bound_identity_and_revocation_state` fail **0/1** at its wrong-command assertion;
+  restoring the comparison passes the exact test **1/0**.
+- A stale source mutation fails its self-hash. Rebuilding every dependent execution/admission/source hash after an
+  exact-config or template mutation still refuses only when the validator independently reopens the checked-in
+  foundation, proving the source's own internally consistent bytes are not authority.
+- Manual replay leaves the prior state unchanged; deleting a consumed manual record from a later journal generation,
+  rewriting immutable authority history, corrupting authoritative bytes, or publishing a partial generation refuses.
+
+Deterministic gates:
+
+- `cargo fmt --all -- --check`, tracked and untracked whitespace checks,
+  `RUSTFLAGS='-D warnings' cargo check -p a2a-bridge --all-targets`, and warnings-denied all-target Clippy are green.
+- Focused tests are authority/source/manual/journal **15/0**, scheduler state/locks **10/0**, strict schedule schema
+  **32/0**, and foundation **9/0**.
+- The complete `a2a-bridge` binary is **579/0/0**. The full serial workspace is
+  **2,315/0/12 ignored**; ignored cases are the existing explicitly authenticated/live Kiro and local-Ollama tests.
+
+Not verified or authorized at this checkpoint: a real authority envelope, real manual CLI route or shared admission
+commit, provider/model/credential/registry/image/runtime/GitHub/iCloud effect, timer/watcher installation, real
+production state root, production-operator lifecycle action, source-schema compatibility review, or independent
+implementation review. R3d2b is not independently activatable, and `schedule-tick` retains its typed no-effects
+refusal.
 
 ### R3d2c — exact identities, equivalent work, and control reducers
 

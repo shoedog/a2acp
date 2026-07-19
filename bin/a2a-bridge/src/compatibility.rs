@@ -4425,8 +4425,7 @@ where
             terminate.await?;
             Ok(CompatibilityShutdownSignal::Terminate)
         }
-        (Err(interrupt), Err(terminate)) => Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        (Err(interrupt), Err(terminate)) => Err(std::io::Error::other(
             format!(
                 "cannot register either compatibility shutdown signal: SIGINT: {interrupt}; SIGTERM: {terminate}"
             ),
@@ -7071,12 +7070,7 @@ agent_cli = "@openai/codex=0.144.1"
 
     #[tokio::test]
     async fn one_viable_shutdown_signal_registration_survives_the_other_failure() {
-        let registration_error = || {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "injected signal registration failure",
-            )
-        };
+        let registration_error = || std::io::Error::other("injected signal registration failure");
 
         let interrupt = select_registered_compatibility_shutdown_signal(
             Ok(std::future::ready(Ok(()))),
