@@ -85,6 +85,7 @@ pub(super) struct SchedulerStateRoot {
 pub(super) struct OwnerAdmissionLock {
     inner: Arc<StateRootInner>,
     file: File,
+    authority_file: Option<File>,
 }
 
 pub(super) struct AdmissionAuthorityLocks {
@@ -460,6 +461,12 @@ fn try_lock(
             source: error,
         });
     }
+    persist_lock_holder(&mut file, holder)?;
+    Ok(file)
+}
+
+fn persist_lock_holder(file: &mut File, holder: &str) -> Result<(), SchedulerStateError> {
+    validate_holder(holder)?;
     file.set_len(0).map_err(|source| SchedulerStateError::Io {
         context: "cannot clear scheduler lock holder",
         source,
@@ -476,7 +483,7 @@ fn try_lock(
             context: "cannot persist scheduler lock holder",
             source,
         })?;
-    Ok(file)
+    Ok(())
 }
 
 impl SchedulerStateRoot {
@@ -552,6 +559,12 @@ impl SchedulerStateRoot {
             "owner-wide compatibility admission lock",
             holder,
         )?;
+        let authority_file = try_lock(
+            &self.inner.locks,
+            "authority-state.lock",
+            "authority-state lock",
+            holder,
+        )?;
         before_counter_publication();
         process_state.admission_holders = process_state
             .admission_holders
@@ -564,6 +577,7 @@ impl SchedulerStateRoot {
         Ok(OwnerAdmissionLock {
             inner: Arc::clone(&self.inner),
             file,
+            authority_file: Some(authority_file),
         })
     }
 
@@ -643,15 +657,19 @@ fn process_lock_state_after_drop(inner: &StateRootInner) -> MutexGuard<'_, Proce
 
 impl OwnerAdmissionLock {
     pub(super) fn try_authority_state(
-        self,
+        mut self,
         holder: &str,
     ) -> Result<AdmissionAuthorityLocks, SchedulerStateError> {
-        let authority_file = try_lock(
-            &self.inner.locks,
-            "authority-state.lock",
-            "authority-state lock",
-            holder,
-        )?;
+        let authority_file = self.authority_file.as_mut().ok_or_else(|| {
+            SchedulerStateError::Invalid(
+                "owner admission lost its reserved authority-state lock".into(),
+            )
+        })?;
+        persist_lock_holder(authority_file, holder)?;
+        let authority_file = self
+            .authority_file
+            .take()
+            .expect("validated owner admission authority file is present");
         Ok(AdmissionAuthorityLocks {
             authority_file,
             _owner: self,
@@ -675,8 +693,12 @@ impl AdmissionStateCapability for OwnerAdmissionLock {
 
 impl Drop for OwnerAdmissionLock {
     fn drop(&mut self) {
-        // SAFETY: this guard uniquely owns the locked descriptor.
+        // SAFETY: this guard uniquely owns both locked descriptors. Release the nested authority
+        // lock before the owner-wide lock to preserve the sole owner-then-authority order.
         unsafe {
+            if let Some(authority_file) = self.authority_file.as_ref() {
+                libc::flock(authority_file.as_raw_fd(), libc::LOCK_UN);
+            }
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
         let mut state = process_lock_state_after_drop(&self.inner);
@@ -998,6 +1020,118 @@ mod tests {
             !both_acquired,
             "owner-wide and authority-only capabilities must never be returned concurrently"
         );
+    }
+
+    #[test]
+    fn independently_opened_roots_exclude_owner_and_authority_in_both_orders() {
+        let root = root();
+        let owner_root = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let authority_root = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+
+        let owner = owner_root
+            .try_owner_admission("independent:owner:first")
+            .unwrap();
+        assert!(
+            authority_root
+                .try_authority_mutation("independent:authority:blocked")
+                .is_err(),
+            "an independently opened authority capability must not overlap owner-wide admission"
+        );
+        drop(owner);
+
+        let authority = authority_root
+            .try_authority_mutation("independent:authority:first")
+            .unwrap();
+        assert!(
+            owner_root
+                .try_owner_admission("independent:owner:blocked")
+                .is_err(),
+            "an independently opened owner capability must not overlap authority-only mutation"
+        );
+        drop(authority);
+
+        owner_root
+            .try_owner_admission("independent:owner:after-drop")
+            .unwrap();
+        authority_root
+            .try_authority_mutation("independent:authority:after-drop")
+            .unwrap();
+    }
+
+    #[test]
+    fn independent_open_interleaving_cannot_publish_both_capabilities() {
+        let root = root();
+        let owner_root = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let authority_root = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let (hook_ready_tx, hook_ready_rx) = std::sync::mpsc::channel();
+        let (release_hook_tx, release_hook_rx) = std::sync::mpsc::channel();
+        let (owner_result_tx, owner_result_rx) = std::sync::mpsc::channel();
+        let (release_owner_tx, release_owner_rx) = std::sync::mpsc::channel();
+
+        let owner_thread = std::thread::spawn(move || {
+            let owner = owner_root.try_owner_admission_with_hook("independent-race:owner", || {
+                hook_ready_tx.send(()).unwrap();
+                release_hook_rx.recv().unwrap();
+            });
+            owner_result_tx.send(owner.is_ok()).unwrap();
+            if let Ok(_owner) = owner {
+                release_owner_rx.recv().unwrap();
+            }
+        });
+
+        hook_ready_rx.recv().unwrap();
+        let authority = authority_root.try_authority_mutation("independent-race:authority");
+        release_hook_tx.send(()).unwrap();
+        let owner_acquired = owner_result_rx.recv().unwrap();
+        let both_acquired = owner_acquired && authority.is_ok();
+        release_owner_tx.send(()).unwrap();
+        drop(authority);
+        owner_thread.join().unwrap();
+
+        assert!(
+            !both_acquired,
+            "independent root opens must share one owner-versus-authority exclusion domain"
+        );
+    }
+
+    #[test]
+    fn invalid_nested_holder_releases_both_preacquired_locks() {
+        let root = root();
+        let state = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let independently_opened = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+
+        let owner = state.try_owner_admission("nested-holder:owner").unwrap();
+        assert!(owner.try_authority_state("INVALID HOLDER").is_err());
+
+        let authority = independently_opened
+            .try_authority_mutation("nested-holder:authority:after-error")
+            .unwrap();
+        drop(authority);
+        independently_opened
+            .try_owner_admission("nested-holder:owner:after-error")
+            .unwrap();
+    }
+
+    #[test]
+    fn poisoned_process_transition_remains_fail_closed() {
+        let root = root();
+        let state = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let poisoner = state.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoner.inner.process_lock_state.lock().unwrap();
+            panic!("poison the scheduler transition mutex");
+        })
+        .join()
+        .is_err());
+
+        assert!(matches!(
+            state.try_owner_admission("poisoned:owner"),
+            Err(SchedulerStateError::Invalid(_))
+        ));
+        assert!(matches!(
+            state.try_authority_mutation("poisoned:authority"),
+            Err(SchedulerStateError::Invalid(_))
+        ));
     }
 
     #[test]

@@ -783,21 +783,21 @@ fn validate_commit_against_state(
     Ok(())
 }
 
-pub(super) struct AdmissionCommitProposalV1 {
-    pub(super) source_kind: InternalAdmissionSourceKindV1,
-    pub(super) source_sha256: String,
-    pub(super) authority_snapshot_sha256: String,
-    pub(super) context: DerivedLedgerAdmissionContextV1,
-    pub(super) authority_action: AuthorityCommitActionV1,
-    pub(super) effect_envelope: AuthorizedEffectEnvelopeV1,
-    pub(super) ledger: Option<LedgerReservationV1>,
-    pub(super) supervisor: Option<PreparedSupervisorV1>,
-    pub(super) initial_preflight: PreflightPassV1,
-    pub(super) final_preflight: PreflightPassV1,
-    pub(super) trusted_root: PlannedDirectoryBindingV1,
-    pub(super) requested_cwd: PlannedDirectoryBindingV1,
-    pub(super) terminal_deadline_ms: i64,
-    pub(super) recorded_at_ms: i64,
+struct AdmissionCommitProposalV1 {
+    source_kind: InternalAdmissionSourceKindV1,
+    source_sha256: String,
+    authority_snapshot_sha256: String,
+    context: DerivedLedgerAdmissionContextV1,
+    authority_action: AuthorityCommitActionV1,
+    effect_envelope: AuthorizedEffectEnvelopeV1,
+    ledger: Option<LedgerReservationV1>,
+    supervisor: Option<PreparedSupervisorV1>,
+    initial_preflight: PreflightPassV1,
+    final_preflight: PreflightPassV1,
+    trusted_root: PlannedDirectoryBindingV1,
+    requested_cwd: PlannedDirectoryBindingV1,
+    terminal_deadline_ms: i64,
+    recorded_at_ms: i64,
 }
 
 #[derive(Serialize)]
@@ -1461,7 +1461,7 @@ where
     }
 }
 
-pub(super) fn build_admission_commit(
+fn build_admission_commit(
     admission: &FileAdmissionJournal<'_>,
     authority: &AuthorityJournalOpen<'_>,
     proposal: AdmissionCommitProposalV1,
@@ -2127,15 +2127,15 @@ pub(super) fn handoff_admitted<R: AdmittedRunnerHandoff>(
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct AdmissionJournalOpen<'lock> {
-    pub(super) journal: FileAdmissionJournal<'lock>,
-    pub(super) state: AdmissionStateV1,
-    pub(super) commits: Vec<(AdmissionCommitV1, String)>,
-    pub(super) terminals: Vec<(AdmissionTerminalV1, String)>,
+struct AdmissionJournalOpen<'lock> {
+    journal: FileAdmissionJournal<'lock>,
+    state: AdmissionStateV1,
+    commits: Vec<(AdmissionCommitV1, String)>,
+    terminals: Vec<(AdmissionTerminalV1, String)>,
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct FileAdmissionJournal<'lock> {
+struct FileAdmissionJournal<'lock> {
     directory: &'lock local_file::PinnedDirectory,
     next_generation: u64,
     previous_sha256: Option<String>,
@@ -2279,7 +2279,7 @@ impl<'lock> FileAdmissionJournal<'lock> {
         Ok((value, read.sha256))
     }
 
-    pub(super) fn open<C: AdmissionStateCapability + ?Sized>(
+    fn open<C: AdmissionStateCapability + ?Sized>(
         capability: &'lock C,
     ) -> Result<AdmissionJournalOpen<'lock>, BoxError> {
         let directory = capability.admission_directory();
@@ -2357,11 +2357,11 @@ impl<'lock> FileAdmissionJournal<'lock> {
         })
     }
 
-    pub(super) fn next_generation(&self) -> u64 {
+    fn next_generation(&self) -> u64 {
         self.next_generation
     }
 
-    pub(super) fn previous_record(&self) -> OptionalSha256V1 {
+    fn previous_record(&self) -> OptionalSha256V1 {
         match &self.previous_sha256 {
             Some(value) => OptionalSha256V1::Sha256 {
                 value: value.clone(),
@@ -2370,11 +2370,11 @@ impl<'lock> FileAdmissionJournal<'lock> {
         }
     }
 
-    pub(super) fn state(&self) -> &AdmissionStateV1 {
+    fn state(&self) -> &AdmissionStateV1 {
         &self.state
     }
 
-    pub(super) fn append(&mut self, value: AdmissionCommitV1) -> Result<String, BoxError> {
+    fn append(&mut self, value: AdmissionCommitV1) -> Result<String, BoxError> {
         if self.pending_reserved.is_some()
             || value.generation != self.next_generation
             || value.previous_commit != self.previous_record()
@@ -2406,10 +2406,7 @@ impl<'lock> FileAdmissionJournal<'lock> {
         Ok(sha256)
     }
 
-    pub(super) fn append_terminal(
-        &mut self,
-        value: AdmissionTerminalV1,
-    ) -> Result<String, BoxError> {
+    fn append_terminal(&mut self, value: AdmissionTerminalV1) -> Result<String, BoxError> {
         let pending = self
             .pending_reserved
             .as_ref()
@@ -2437,6 +2434,28 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     use std::time::Instant;
+
+    #[test]
+    fn admission_effect_products_are_transaction_private() {
+        const TRANSACTION: &str = include_str!("compatibility_schedule_transaction.rs");
+
+        for forbidden in [
+            concat!("pub(super) struct AdmissionCommit", "ProposalV1"),
+            concat!("pub(super) fn build_admission_", "commit"),
+            concat!("pub(super) struct FileAdmission", "Journal"),
+            concat!("pub(super) fn open<C: AdmissionState", "Capability"),
+            concat!(
+                "pub(super) fn append(&mut self, value: Admission",
+                "CommitV1"
+            ),
+            concat!("pub(super) fn append_", "terminal"),
+        ] {
+            assert!(
+                !TRANSACTION.contains(forbidden),
+                "admission effect product remains sibling-visible: {forbidden}"
+            );
+        }
+    }
 
     use crate::compatibility::{child_terminal_aggregate_fixture, ChildTerminalAggregateFixtureV1};
     use crate::compatibility_process_group::{ProcessIdentityV1, ProcessStartMarkerV1};

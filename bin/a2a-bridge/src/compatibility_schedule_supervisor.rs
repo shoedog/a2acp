@@ -773,6 +773,8 @@ pub(super) struct FileSupervisorJournal {
     record_id: String,
     next_generation: u64,
     previous_sha256: Option<String>,
+    #[cfg(test)]
+    before_create_hook: Option<Box<dyn FnOnce()>>,
 }
 
 #[cfg(unix)]
@@ -815,6 +817,34 @@ impl FileSupervisorJournal {
         Ok(())
     }
 
+    fn rollback_generation_after_directory_change(
+        &self,
+        name: &std::ffi::OsStr,
+        identity_error: BoxError,
+    ) -> BoxError {
+        let remove = self.directory.remove_child(
+            name,
+            false,
+            "schedule supervisor journal identity-change rollback",
+        );
+        let sync = self.directory.sync();
+        match (remove, sync) {
+            (Ok(()), Ok(())) => identity_error,
+            (Err(remove_error), Ok(())) => format!(
+                "{identity_error}; schedule supervisor rollback removal failed: {remove_error}"
+            )
+            .into(),
+            (Ok(()), Err(sync_error)) => format!(
+                "{identity_error}; schedule supervisor rollback directory sync failed: {sync_error}"
+            )
+            .into(),
+            (Err(remove_error), Err(sync_error)) => format!(
+                "{identity_error}; schedule supervisor rollback removal failed: {remove_error}; directory sync failed: {sync_error}"
+            )
+            .into(),
+        }
+    }
+
     fn generation_name(record_id: &str, generation: u64) -> String {
         format!("{record_id}.{generation:020}.json")
     }
@@ -827,6 +857,8 @@ impl FileSupervisorJournal {
             record_id: record_id.to_owned(),
             next_generation: 1,
             previous_sha256: None,
+            #[cfg(test)]
+            before_create_hook: None,
         };
         if !journal.generation_entries()?.is_empty() {
             return Err("schedule supervisor: journal already contains this record id".into());
@@ -921,6 +953,8 @@ impl FileSupervisorJournal {
             record_id: record_id.to_owned(),
             next_generation: 1,
             previous_sha256: None,
+            #[cfg(test)]
+            before_create_hook: None,
         };
         let entries = journal.generation_entries()?;
         if entries.is_empty() {
@@ -1027,6 +1061,10 @@ impl SupervisorJournal for FileSupervisorJournal {
             return Err("schedule supervisor: journal generation exceeds the byte bound".into());
         }
         let name = Self::generation_name(&self.record_id, record.generation);
+        #[cfg(test)]
+        if let Some(hook) = self.before_create_hook.take() {
+            hook();
+        }
         let mut file = self.directory.create_new_file(
             std::ffi::OsStr::new(&name),
             0o600,
@@ -1046,7 +1084,13 @@ impl SupervisorJournal for FileSupervisorJournal {
             );
         }
         self.directory.sync()?;
-        Self::validate_directory(&self.directory)?;
+        if let Err(identity_error) = Self::validate_directory(&self.directory) {
+            drop(file);
+            return Err(self.rollback_generation_after_directory_change(
+                std::ffi::OsStr::new(&name),
+                identity_error,
+            ));
+        }
         let sha256 = crate::local_file::sha256_hex(&bytes);
         self.next_generation = self
             .next_generation
@@ -2574,6 +2618,33 @@ mod tests {
         )
         .unwrap();
         assert!(FileSupervisorJournal::open_existing(&pinned, "supervisor-1").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_journal_mid_publication_replacement_rolls_back_retained_generation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pinned = pinned_temp_directory(&directory);
+        let mut journal = FileSupervisorJournal::create(&pinned, "supervisor-1").unwrap();
+        let canonical = directory.path().to_path_buf();
+        let retained = canonical.with_file_name(format!(
+            "{}-retained-mid-publication",
+            canonical.file_name().unwrap().to_string_lossy()
+        ));
+        let retained_for_hook = retained.clone();
+        journal.before_create_hook = Some(Box::new(move || {
+            std::fs::rename(&canonical, &retained_for_hook).unwrap();
+            std::fs::create_dir(&canonical).unwrap();
+            std::fs::set_permissions(&canonical, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }));
+
+        assert!(journal.persist(&prepared_record()).is_err());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&retained).unwrap().count(), 0);
+        std::fs::remove_dir(&retained).unwrap();
     }
 
     #[cfg(unix)]
