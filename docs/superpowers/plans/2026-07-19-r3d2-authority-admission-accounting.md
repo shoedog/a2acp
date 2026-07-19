@@ -1,11 +1,12 @@
 # R3d2 — authority, admission, preflights, and accounting implementation plan
 
-- **Status:** ACTIVE — R3d2a through R3d2e are implemented. Sol/xhigh reviews one through four returned `REVISE`
-  at `1373985`, `28e7d28`, `d082b49`, and `c418df4`. Fifth review of exact `3e4508a` marked nine of thirteen
-  inherited items `RESOLVED`, left four `UNRESOLVED`, found no fresh finding, and returned `REVISE`. Mechanism
-  commit `1b07c80` closes the three code residuals with four pre-change-red regressions; the current fold closes the
-  literal cursor residual. Exact post-remediation candidate `68be708` passes the complete deterministic gate. A
-  fresh Sol closure re-review remains pending; the single Fable lens stays gated on Sol approval
+- **Status:** ACTIVE — R3d2a through R3d2e are implemented. Sol/xhigh reviews one through five returned `REVISE`
+  at `1373985`, `28e7d28`, `d082b49`, `c418df4`, and `3e4508a`. Sixth review of exact `8d75069` marked eleven of
+  thirteen inherited items `RESOLVED`, left the literal next-action cursor and sibling-visible preflight-pass API
+  `UNRESOLVED`, found no fresh finding, and returned `REVISE`. Mechanism commit `2d1640d` closes the pass API with
+  a pre-change-red boundary regression; the current fold closes the cursor. Focused gates are green; exact
+  post-remediation deterministic gates and a fresh Sol closure rereview remain pending. The single Fable lens stays
+  gated on Sol approval
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -902,6 +903,45 @@ validation passed against live repository labels, and its local suite passed **6
 bytes at SHA-256 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`. A fresh Sol/xhigh closure re-review
 explicitly adjudicating the four fifth-review residuals is next. Fable remains blocked until Sol approves.
 
+#### Sixth Sol closure review and remediation — 2026-07-19
+
+The controller froze exact candidate `8d75069abf9720d21455f49c869b4478b05cc6c9` against merged R3d1 base
+`cbcfd1f06b914064456d1798be71bacdc294f3d5`. The boundary was clean, ancestry-valid, 27 commits and 20 changed
+paths ahead of base, with 19,465 additions and 245 deletions. Its 13,924-byte prompt is retained at
+`/private/tmp/a2a-bridge-r3d2-sol-closure-8d75069/review-task.md`, SHA-256
+`3d69a884c7da1ec272cdc1beda1f457eaf7e409a74676e27d482078f685cad3e`. A fresh one-shot host bridge using the
+installed R3c production release binary selected raw `gpt-5.6-sol`, `xhigh`, and `read-only`; the long-lived
+production operator was not used, stopped, rebuilt, or changed. The mode-`0644`, 14,359-byte report is retained at
+`/private/tmp/a2a-bridge-r3d2-sol-closure-8d75069/review.md`, SHA-256
+`8a487ffd403f1ebfb1379c11cc3f2ab321f820ab60df0f6fa7840958cc35b3d8`.
+
+The sixth review marked inherited items 1, 2, 3, 5, 6, and 8 through 13 `RESOLVED`; marked items 4 and 7
+`UNRESOLVED`; found no additional `WRONG` or `SMELL`; and returned `R3D2 IMPLEMENTATION: REVISE`. It explicitly
+adjudicated all four fifth-review residuals. Independent-open owner/authority exclusion and mid-publication retained-
+generation rollback were closed. Two residuals remained:
+
+1. the roadmap's authoritative “Next action” still named the prior clock-rollback, manual-reuse, and retained-
+   supervisor-directory trio instead of the four fifth-review residuals; and
+2. proposal/builder/raw-journal effects were private, but `PreflightBindingV1`, `PreflightPassV1`, their fields,
+   pass hashing, and the pass-producing function remained `pub(super)`, while the visibility regression inspected
+   only the transaction module.
+
+The strengthened `admission_effect_products_are_transaction_private` regression was added alone to reviewed
+`8d75069` in a disposable detached worktree. It compiled and failed **0/1** at the exact API boundary because
+`PreflightBindingV1` remained sibling-visible. Mechanism commit
+`2d1640deb371f5da6ba6b80084708518c219fc68` moves the fence, binding, pass, refusal, pass validation/hash, and
+producer into transaction-private scope; makes the two pass fields in the otherwise sibling-visible commit record
+private; retains only the closed local-check/proof interface, ordered checklist, and directory primitives in the
+preflight module; and preserves the canonical serialized pass shape and
+`a2a-bridge:r3d2:preflight:preflight-pass:v1` hash domain. The existing both-fence success/failure and malformed-
+proof controls moved with the mechanism, and a direct canonical-hash control was added. The current docs fold
+closes the cursor residual by naming all four fifth-review residuals and recording the sixth review's disposition.
+
+Post-remediation format and diff checks, warnings-denied workspace all-target/all-feature check, preflight **8/0**,
+and transaction **27/0** are green. The exact-final deterministic gate remains pending on the post-remediation docs
+head. After that gate, run one fresh Sol/xhigh closure rereview explicitly adjudicating the two sixth-review
+residuals. Fable remains blocked until Sol approves.
+
 ## Verification and review gates
 
 1. Before each mechanism is accepted, demonstrate its focused regression against the pre-change implementation or
@@ -934,17 +974,16 @@ explicitly adjudicating the four fifth-review residuals is next. Fable remains b
 
 Resume branch `agent/reliability-r3d2-authority-admission` in a newly verified clean trusted worktree; do not depend
 on a prior `/private/tmp` worktree or review mirror. The branch is based on merged R3d1 main
-`cbcfd1f06b914064456d1798be71bacdc294f3d5`. Fifth review of exact `3e4508a` marked nine of thirteen inherited
-items `RESOLVED`, left the cursor, effect-API, independent-open locking, and mid-publication rollback items
-`UNRESOLVED`, found no fresh finding, and returned `REVISE`. Mechanism commit `1b07c80` closes the three code
-residuals with demonstrated pre-change-red regressions; this fold closes the literal cursor. Focused
-state/supervisor/transaction/preflight gates are **19/0 + 42/0 + 23/0 + 11/0**, with warnings-denied check, format,
-and diff green. Exact candidate `68be708` passes the complete binary **654/0/0** and canonical full serial workspace
-**2,391/0/12 ignored** across **72** result groups, **55** nonempty, with every deterministic release/validator gate
-green. Read this plan, the R3d design of record, the durable roadmap, `AGENTS.md`, and
+`cbcfd1f06b914064456d1798be71bacdc294f3d5`. Sixth review of exact `8d75069` explicitly adjudicated the four
+fifth-review residuals, marked eleven of thirteen inherited items `RESOLVED`, left the cursor and preflight-pass API
+boundary `UNRESOLVED`, found no fresh finding, and returned `REVISE`. The boundary regression failed **0/1** on
+that reviewed head. Mechanism commit `2d1640d` closes the API boundary; this fold closes the cursor. Focused
+preflight/transaction gates are **8/0 + 27/0**, with warnings-denied check, format, and diff green. Exact
+post-remediation deterministic gates are pending. Read this plan, the R3d design of record, the durable roadmap,
+`AGENTS.md`, and
 `skills/a2a-bridge-operator/SKILL.md` before editing. Preserve the single R3d2 merge boundary, the
 owner-wide-then-authority lock order, the single admission linearization point, the zero-effect default, and the
-separation between provider authority and storage consent. The next action is a fresh Sol/xhigh closure re-review
-explicitly adjudicating all four fifth-review residuals. Its prompt must carry the frozen exact boundary and gate
-evidence. Run the single Fable lens only after Sol approves; then fold final evidence, rerun exact-final gates, and
-publish the non-draft PR.
+separation between provider authority and storage consent. The next action is the exact-final deterministic gate,
+then a fresh Sol/xhigh closure rereview explicitly adjudicating the cursor and transaction-private preflight-pass
+residuals. Its prompt must carry the frozen exact boundary and gate evidence. Run the single Fable lens only after
+Sol approves; then fold final evidence, rerun exact-final gates, and publish the non-draft PR.
