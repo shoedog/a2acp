@@ -33,7 +33,11 @@
   findings `RESOLVED` and returned `REVISE` with two new `WRONG` plus one `SMELL`: clock-rollback reuse, rejected
   manual advisory reuse, and supervisor directory-capability downgrade. All three regressions failed on that reviewed
   mechanism. Commit `5a01ce7` closes them; focused admission/supervisor/transaction gates are
-  **17/0 + 41/0 + 22/0**. Full exact-head gates and a fresh Sol closure rereview remain pending.
+  **17/0 + 41/0 + 22/0**. Fifth Sol review of exact `3e4508a` marked nine of thirteen inherited items `RESOLVED`,
+  left four `UNRESOLVED`, found no fresh finding, and returned `REVISE`. Commit `1b07c80` plus the current cursor
+  fold close transaction-effect API visibility, independent-open lock exclusion, retained-generation rollback,
+  and stale status surfaces. Focused state/supervisor/transaction/preflight gates are
+  **19/0 + 42/0 + 23/0 + 11/0**. Full exact-head gates and a fresh Sol closure rereview remain pending.
   The merged R3d0 implementation was
   `agent/reliability-r3d0-foundation`: the fourth closure review approved exact cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test commit
@@ -1164,8 +1168,8 @@ turn, or production-operator lifecycle action; each live gate below retains its 
 - **Base:** merged R3d1 main `cbcfd1f06b914064456d1798be71bacdc294f3d5` (PR #40)
 - **Status:** design of record **APPROVED / MERGED** at exact design head
   `b54840a017b87521677f1f95c3f7be69de55361d`; R3d0 and R3d1 are merged, and R3d2 is
-  **ACTIVE / R3D2A-R3D2E IMPLEMENTED / FOURTH SOL REVIEW REVISE / ALL TEN INHERITED RESOLVED / TWO NEW WRONG +
-  ONE SMELL REMEDIATED / FULL GATE THEN SOL CLOSURE REREVIEW NEXT**. Exact candidate `1373985` received four `WRONG` and one `SMELL`; remediation candidate `28e7d28`
+  **ACTIVE / R3D2A-R3D2E IMPLEMENTED / FIFTH SOL REVIEW REVISE / NINE OF THIRTEEN INHERITED RESOLVED / FOUR
+  RESIDUALS REMEDIATED / FULL GATE THEN SOL CLOSURE REREVIEW NEXT**. Exact candidate `1373985` received four `WRONG` and one `SMELL`; remediation candidate `28e7d28`
   received three new `WRONG` plus a stale-cursor residual. Commit `f18e74a` closes preflight replay, executable
   deadline proof/handoff, and same-process lock publication. Focused gates are green at preflight/state/supervisor/
   transaction **11/0 + 15/0 + 41/0 + 20/0**; exact candidate `840f486` passed binary **645/0/0**, workspace
@@ -1177,7 +1181,10 @@ turn, or production-operator lifecycle action; each live gate below retains its 
   three with pre-change-red regressions; admission/supervisor/transaction are **17/0 + 41/0 + 22/0**. Exact
   post-remediation candidate `9fda91b` passes the complete binary **648/0/0**, full serial workspace
   **2,385/0/12 ignored** across **72** result groups (**55** nonempty), and every deterministic release/validator
-  gate. Fresh Sol closure rereview remains next.
+  gate. Fifth review of exact `3e4508a` then left four inherited residuals and no fresh finding. `1b07c80` plus the
+  current docs fold close all four; four pre-change-red regressions cover the three mechanism residuals, and focused
+  state/supervisor/transaction/preflight gates are **19/0 + 42/0 + 23/0 + 11/0**. Exact-head full gates precede the
+  fresh Sol closure rereview.
   The R3d0 default-off policy/schema mechanism was
   approved at exact mechanism commit
   `5baeeb3f47183ea2a47d2cdc5ffce26f1df7dbfb`, approved cursor
@@ -2754,9 +2761,12 @@ of exact `c418df4` resolved all ten inherited items and returned `REVISE` with t
 `5a01ce7` closes the clock-rollback, manual-reuse, and retained-supervisor-directory findings with three
 pre-change-red regressions. Exact post-remediation candidate `9fda91b` passes the complete deterministic suite,
 including binary **648/0/0** and full serial workspace **2,385/0/12 ignored** across **72** result groups, **55**
-nonempty. The next semantic gate is a fresh Sol closure rereview supplied with the frozen exact boundary and gate
-evidence, before the single Fable
-release/compatibility lens. The initial exact-base Fable design review plus
+nonempty. Fifth Sol review of exact `3e4508a` marked nine of thirteen inherited items `RESOLVED`, left the cursor,
+effect-API, independent-open locking, and mid-publication rollback items `UNRESOLVED`, found no fresh finding, and
+returned `REVISE`. Commit `1b07c80` plus the current docs fold close all four; focused
+state/supervisor/transaction/preflight gates are **19/0 + 42/0 + 23/0 + 11/0**. The next gate is exact-head full
+deterministic verification, then a fresh Sol closure rereview supplied with the frozen exact boundary and evidence,
+before the single Fable release/compatibility lens. The initial exact-base Fable design review plus
 exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
 exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, exact-`c50811f`, and
 exact-`fb8a2f4`, exact-`ae9db39`, exact-`2eb242a`, exact-`8dc6054`, exact-`cc01a52`, and exact-`b54840a`

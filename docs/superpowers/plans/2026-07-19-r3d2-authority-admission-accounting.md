@@ -1,10 +1,12 @@
 # R3d2 — authority, admission, preflights, and accounting implementation plan
 
-- **Status:** ACTIVE — R3d2a through R3d2e are implemented. Sol/xhigh reviews one through three returned `REVISE`
-  at `1373985`, `28e7d28`, and `d082b49`; exact-head review four returned `REVISE` at `c418df4` after resolving all
-  ten inherited items, with two new `WRONG` and one new `SMELL`. Mechanism commit `5a01ce7` closes the three fresh
-  findings with pre-change-red regressions. Exact post-remediation candidate `9fda91b` passes the complete
-  deterministic gate. A fresh Sol closure re-review and the post-Sol Fable lens remain pending
+- **Status:** ACTIVE — R3d2a through R3d2e are implemented. Sol/xhigh reviews one through four returned `REVISE`
+  at `1373985`, `28e7d28`, `d082b49`, and `c418df4`. Fifth review of exact `3e4508a` marked nine of thirteen
+  inherited items `RESOLVED`, left four `UNRESOLVED`, found no fresh finding, and returned `REVISE`. Mechanism
+  commit `1b07c80` closes the three code residuals with four pre-change-red regressions; the current fold closes the
+  literal cursor residual.
+  Exact-head full deterministic gates and a fresh Sol closure re-review remain pending; the single Fable lens stays
+  gated on Sol approval
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -15,7 +17,7 @@
 - **Effects:** non-billable. Tests use fake clocks, process inventories, effect controls, and owner-state roots.
   This slice does not issue real authority, characterize a profile, discover models, read a provider credential,
   start a registry/image/provider operation, publish to GitHub/iCloud, install or load a timer, or touch the
-  long-lived production operator.
+  long-lived production operator's lifecycle, configuration, or state.
 
 ## Delivery boundary
 
@@ -835,8 +837,60 @@ complete binary **648/0/0**; and full serial workspace **2,385 passed / 0 failed
 groups, **55** nonempty. The 200,708-byte full-suite log is retained at
 `/private/tmp/a2a-bridge-r3d2-full-9fda91b.log`, SHA-256
 `9157138c5459260aa92d78c2fc7b97c281e1eb1d4b9af603ce858e0ece023fbd`. The release binary is 26,604,912 bytes,
-SHA-256 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`. The next semantic action is a fresh
-Sol/xhigh closure re-review explicitly adjudicating these three findings. Fable remains blocked until Sol approves.
+SHA-256 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`. That gate made a fresh Sol/xhigh closure
+re-review explicitly adjudicating these three findings the next action; the fifth review below performed it. Fable
+remained blocked because that review did not approve.
+
+#### Fifth Sol closure review and remediation — 2026-07-19
+
+The controller froze exact candidate `3e4508ab4c091c9adb4353ec823550fbbbfdeb22` against merged R3d1 base
+`cbcfd1f06b914064456d1798be71bacdc294f3d5`. Its 13,241-byte prompt is retained at
+`/private/tmp/a2a-bridge-r3d2-sol-closure-3e4508a/review-task.md`, SHA-256
+`ccfc5db60bcdcf248eced288f8a3733beea42d711ea12c31aebbe7e0b54b4595`. Submission through the long-lived
+production operator returned generic `AgentCrashed` before observable prompt start: no new task, session, or
+`turn_log` row was persisted, no prompt/usage evidence appeared, and the roughly two-day-old warm codex-acp/Codex
+process tree remained alive. No request was replayed through that server and no production process, session,
+configuration, or state was stopped, cleared, or changed.
+
+One explicit fresh one-shot host bridge using the same production release binary, adapter 1.1.2, Codex CLI 0.144.1,
+raw `gpt-5.6-sol`, `xhigh`, and `read-only` passed validate/doctor/model preflight and completed the review in
+1,302,585 ms. This falsifies a general prompt/model/package/auth/cwd incompatibility for this attempt, but does not
+separate stale shared transport from accumulated session-capacity debt; it is review evidence, not compatibility
+evidence. The mode-`0644` report is retained at
+`/private/tmp/a2a-bridge-r3d2-sol-closure-3e4508a/review.md`, 15,124 bytes, SHA-256
+`ba743813460132f1a5810b4d34dcbde80070415e1d34ec05ec24fd0e2ec29936`.
+
+The fifth review marked inherited items 1, 2, 3, 5, 6, 8, 10, 11, and 12 `RESOLVED`; marked items 4, 7, 9, and 13
+`UNRESOLVED`; found no additional finding; and returned `R3D2 IMPLEMENTATION: REVISE`. The four residuals were:
+
+1. the master canary cursor and roadmap dependency/status surfaces still described full gates and Sol review as
+   pending even though exact `3e4508a` gate evidence and the review outcome existed;
+2. proposal construction, commit building, and raw admission-journal effects remained sibling-visible instead of
+   leaving the transaction session's `admit` method as the sole effect seam;
+3. independently initialized handles to the same scheduler root owned different process mutexes, so owner-wide and
+   authority-only capabilities could overlap across handles; and
+4. a supervisor-directory replacement between publication precheck and postcheck returned no capability but left
+   the newly written generation in the retained original directory.
+
+The three mechanism residuals were covered by four focused regressions, each of which failed **0/1** on the reviewed
+mechanism before remediation:
+
+- `admission_effect_products_are_transaction_private` found the sibling-visible effect API;
+- `independently_opened_roots_exclude_owner_and_authority_in_both_orders` acquired authority while an independently
+  opened owner capability was live;
+- `independent_open_interleaving_cannot_publish_both_capabilities` published both capabilities at the forced
+  pre-counter interleaving; and
+- `file_journal_mid_publication_replacement_rolls_back_retained_generation` found one retained generation after the
+  forced directory replacement.
+
+Mechanism commit `1b07c8057bce76f75a276b115b7cb8bae9d4db1a` makes the proposal/builder/raw journal private to the
+transaction module; owner admission reserves both kernel locks in the sole owner-then-authority order so independent
+root handles share one exclusion domain; and supervisor postcheck failure removes and directory-syncs the just-written
+generation through the retained descriptor. Invalid nested-holder and poisoned-transition edges fail closed and
+release the relevant locks. The current docs fold closes the literal cursor residual. Focused gates are state/locks
+**19/0**, supervisor **42/0**, transaction **23/0**, and preflight **11/0**; warnings-denied all-target/all-feature
+check, format, and diff checks are green. Exact-head full deterministic gates must now run before the fresh Sol
+closure re-review. Fable remains blocked until Sol approves.
 
 ## Verification and review gates
 
@@ -870,16 +924,15 @@ Sol/xhigh closure re-review explicitly adjudicating these three findings. Fable 
 
 Resume branch `agent/reliability-r3d2-authority-admission` in a newly verified clean trusted worktree; do not depend
 on a prior `/private/tmp` worktree or review mirror. The branch is based on merged R3d1 main
-`cbcfd1f06b914064456d1798be71bacdc294f3d5`. Fourth review of exact `c418df4` resolved all ten inherited items and
-returned `REVISE` with two new `WRONG` plus one retained-directory `SMELL`; mechanism commit `5a01ce7` closes all
-three with demonstrated pre-change-red regressions and focused admission/supervisor/transaction gates
-**17/0 + 41/0 + 22/0**. Exact post-remediation candidate `9fda91b` passes the complete deterministic gate, including
-binary **648/0/0** and full serial workspace **2,385/0/12 ignored** across **72** result groups, **55** nonempty. Read
-this plan, the R3d design of record, the durable roadmap, `AGENTS.md`, and
+`cbcfd1f06b914064456d1798be71bacdc294f3d5`. Fifth review of exact `3e4508a` marked nine of thirteen inherited
+items `RESOLVED`, left the cursor, effect-API, independent-open locking, and mid-publication rollback items
+`UNRESOLVED`, found no fresh finding, and returned `REVISE`. Mechanism commit `1b07c80` closes the three code
+residuals with demonstrated pre-change-red regressions; this fold closes the literal cursor. Focused
+state/supervisor/transaction/preflight gates are **19/0 + 42/0 + 23/0 + 11/0**, with warnings-denied check, format,
+and diff green. Read this plan, the R3d design of record, the durable roadmap, `AGENTS.md`, and
 `skills/a2a-bridge-operator/SKILL.md` before editing. Preserve the single R3d2 merge boundary, the
 owner-wide-then-authority lock order, the single admission linearization point, the zero-effect default, and the
-separation between provider authority and storage consent. The next semantic action is a fresh Sol/xhigh closure
-re-review explicitly adjudicating the clock-rollback, manual-reuse, and retained-supervisor-directory findings. Its
-prompt must carry the frozen exact boundary and gate evidence. Run
-the single Fable lens only after Sol approves; then fold final evidence, rerun exact-final gates, and publish the
-non-draft PR.
+separation between provider authority and storage consent. The next action is exact-head full deterministic gates;
+then run a fresh Sol/xhigh closure re-review explicitly adjudicating all four fifth-review residuals. Its prompt must
+carry the frozen exact boundary and gate evidence. Run the single Fable lens only after Sol approves; then fold final
+evidence, rerun exact-final gates, and publish the non-draft PR.
