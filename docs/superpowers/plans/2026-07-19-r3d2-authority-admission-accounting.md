@@ -1,10 +1,10 @@
 # R3d2 — authority, admission, preflights, and accounting implementation plan
 
-- **Status:** ACTIVE — R3d2a through R3d2e are implemented; the first exact-head Sol/xhigh implementation review
-  returned `REVISE` at `1373985`, and closure review of exact `28e7d28` returned `REVISE` with three new `WRONG`
-  findings plus a stale-cursor residual. Mechanism commit `f18e74a` closes the three new findings; focused gates are
-  green, exact docs-fold candidate `840f486` passed the complete deterministic gate, and Sol closure re-review plus
-  the post-Sol Fable lens remain pending
+- **Status:** ACTIVE — R3d2a through R3d2e are implemented. The first Sol/xhigh review returned `REVISE` at
+  `1373985`; the second returned `REVISE` at `28e7d28` with three new `WRONG` plus a stale cursor; and the third
+  returned `REVISE` at `d082b49` with no new `WRONG`, two cursor residuals, and one deadline-handoff `SMELL`.
+  Mechanism commits `f18e74a` and `248e373` close every mechanism finding, this fold closes the cursor residuals,
+  and a fresh Sol closure re-review plus the post-Sol Fable lens remain pending
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -756,8 +756,38 @@ at **26,604,912 bytes**, SHA-256
 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`, consistent with the internal mechanism
 remaining unreachable from production routes. The previously reported unrelated
 `warm_streaming_records_usage_without_emitting_usage_frame` raw-substring/UUID flake did not recur; no unrelated
-test was rebaselined or changed. After this evidence-only fold, rerun the full suite on the resulting exact head,
-freeze its boundary, and request a fresh Sol/xhigh closure rereview. Fable remains blocked until Sol approves.
+test was rebaselined or changed.
+
+#### Third Sol closure review and remediation — 2026-07-19
+
+The bridge-mediated `gpt-5.6-sol`/xhigh/read-only closure re-review froze exact candidate
+`d082b499d26d2c8d52fbab69e484dc6c000a7196` against merged R3d1 base
+`cbcfd1f06b914064456d1798be71bacdc294f3d5` and returned `R3D2 IMPLEMENTATION: REVISE`. Its prompt is retained
+at `/private/tmp/a2a-bridge-r3d2-sol-closure-d082b49/review-task.md`, 9,627 bytes, SHA-256
+`ae3863fb1519b7196f52ccf9d3a75d482a41d9109632d5e10d01321bb3b3f2be`; its report is retained at
+`/private/tmp/a2a-bridge-r3d2-sol-closure-d082b49/review.md`, 15,737 bytes, SHA-256
+`5f90a07d795e73c619f860a4dfe68cf10c545a992e7d776ce6ee8a5a048f79da`. It independently reran transaction
+**20/0**, state/root/locks **15/0**, preflight **11/0**, supervisor **41/0**, compatibility CLI **22/0**, the exact
+diff, and a same-process separate-open `flock` probe.
+
+The review marked the terminal proof, safe reuse, fixed-root traversal, standalone resolver scope,
+admission-bound preflights, executable hard-deadline join, and lock-publication race `RESOLVED`. The release cursor
+and restart cursor remained `UNRESOLVED`. It found no new `WRONG` and one new `SMELL / Medium`: after durable
+publication, the capability deadline could expire before runner invocation because `handoff_admitted` did not make
+a final local deadline check.
+
+The deterministic regression `deadline_expired_after_durable_publication_never_calls_the_runner` failed **0/1**
+on the reviewed mechanism: forced post-publication expiry still invoked the runner, ruling out implicit runner or
+capability enforcement as the alternative explanation. Commit
+`248e3733662ebb59eaf9f2c5d80de790fe1f9c50` adds a final `remaining() > 0` fence immediately before invocation.
+Expiry now refuses without invoking the runner, consumes the one-shot capability, and preserves the conservative
+pending reservation for later reconciliation. The regression, existing positive handoff, and complete transaction
+module are green at **1/0 + 1/0 + 21/0**; format and diff checks are green. This docs fold closes both literal cursor
+residuals without changing the mechanism.
+
+The next semantic gate is a fresh Sol/xhigh closure re-review of the exact cursor-remediation head. Immediately
+before launch, the controller must freeze head/base/merge-base/changed paths and supply exact-head full deterministic
+gate evidence in the review request. Fable remains blocked until Sol approves.
 
 ## Verification and review gates
 
@@ -791,12 +821,14 @@ freeze its boundary, and request a fresh Sol/xhigh closure rereview. Fable remai
 
 Resume branch `agent/reliability-r3d2-authority-admission` in a newly verified clean trusted worktree; do not depend
 on a prior `/private/tmp` worktree or review mirror. The branch is based on merged R3d1 main
-`cbcfd1f06b914064456d1798be71bacdc294f3d5`, and mechanism commit `f18e74a` closes the three findings from the
-second Sol review. Exact candidate `840f486` passed the complete gate before the current evidence-only fold. Read
+`cbcfd1f06b914064456d1798be71bacdc294f3d5`. Mechanism commit `f18e74a` closes the three findings from the second
+Sol review; exact candidate `840f486` passed the complete deterministic gate; third review of `d082b49` found no
+new `WRONG`, retained two cursor residuals, and raised one deadline-handoff `SMELL`; and `248e373` closes that smell
+with a deterministic pre-change-red regression. Read
 this plan, the R3d design of record, the durable roadmap, `AGENTS.md`, and
 `skills/a2a-bridge-operator/SKILL.md` before editing. Preserve the single R3d2 merge boundary, the
 owner-wide-then-authority lock order, the single admission linearization point, the zero-effect default, and the
-separation between provider authority and storage consent. The next action is to commit this evidence/cursor, rerun
-the full suite on that exact docs-only head, freeze head/base/merge-base/changed paths, and ask Sol/xhigh to
-adjudicate the stale-cursor residual plus all three second-review `WRONG` findings. Run the single Fable lens only
-after Sol approves; then fold final evidence, rerun exact-final gates, and publish the non-draft PR.
+separation between provider authority and storage consent. The next semantic action is a fresh Sol/xhigh closure
+re-review that explicitly adjudicates both cursor residuals and the deadline-handoff `SMELL`; its prompt must carry
+the frozen exact boundary and exact-head full deterministic gate evidence. Run the single Fable lens only after Sol
+approves; then fold final evidence, rerun exact-final gates, and publish the non-draft PR.

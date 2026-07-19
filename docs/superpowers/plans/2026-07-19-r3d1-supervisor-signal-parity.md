@@ -286,13 +286,11 @@ Required tests:
 
 ## Restart point
 
-Continue in `/private/tmp/a2a-bridge-r3d1-supervisor` on branch
-`agent/reliability-r3d1-supervisor`. Re-read this plan, the active R3d design supervision section, and the
-central reliability roadmap. Freeze `HEAD`, `origin/main`, merge base, cleanliness, and changed paths before
-review or publication. The initial candidate at exact `01438c34` has already received the Sol/xhigh `REVISE`
-recorded above; first closure head `e81ebbb`, second closure head `8feda4d`, third closure head `7fafe79`, and fourth
-closure head `b55c17d` each received `REVISE`. Exact fifth-remediation head `b511d6c` received Sol/xhigh
-implementation `APPROVE`, then the single Fable/xhigh release/compatibility lens returned `APPROVE`; no later
-mechanism change occurred. This commit folds only those review records, verdicts, and deferred-integration notes.
-Run the exact-final deterministic gates, publish a non-draft R3d1 PR, and never touch the long-lived operator
-lifecycle during R3d1.
+R3d1 is complete and merged by PR #40 at `cbcfd1f06b914064456d1798be71bacdc294f3d5`; it has no active restart
+worktree or publication step. The former `/private/tmp/a2a-bridge-r3d1-supervisor` path and branch
+`agent/reliability-r3d1-supervisor` are historical evidence only and must not be treated as durable state. Exact
+fifth-remediation head `b511d6c` received Sol/xhigh implementation `APPROVE`, then the single Fable/xhigh release/
+compatibility lens returned `APPROVE`; PR #40 merged the reviewed result. Continue R3 only from the central
+reliability roadmap and the currently active slice's focused plan, using a newly verified clean trusted worktree.
+Freeze `HEAD`, `origin/main`, merge base, cleanliness, and changed paths before any review or publication, and
+never touch the long-lived operator lifecycle as part of R3d reliability work.
