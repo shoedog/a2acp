@@ -70,12 +70,54 @@ a2a-bridge compatibility validate --schedule-record <kind> /absolute/path/to/rec
 
 Supported kinds are:
 
+- supervision: `deadline-derivation`, `supervisor`;
 - canonical identities: `case-execution-fingerprint`, `admission-attempt-fingerprint`;
 - authority and controls: `characterization-authorization`, `provider-effect-grant`, `manual-admission`,
   `storage-consent`, `characterization`, `safety-hold`, `quarantine`, `failure-disposition`;
 - classification and accounting: `impact`, `ledger`, `equivalent-work`, `consumption`;
 - sealed sources and evidence: `scheduled-source`, `claimed-support-characterization-source`,
   `schedule-sidecar`, `publication-outbox`, `evidence-index`, `status`, `routing`.
+
+The R3d1 deadline record binds one checked sum of metadata, build, preflight, resolution/materialization,
+per-selected-case, publication, cold-handoff, cleanup-grace, and fixed-margin maxima to the elapsed time since
+the process-entry monotonic origin. Runtime derivation rounds elapsed time up and never gives the executable
+deadline more time than the serialized record. Each phase runs under the earlier of its local maximum or the hard
+deadline after reserving every later phase, cleanup grace, and fixed margin; an exhausted phase refuses before
+polling even an immediately-ready effect. The record refuses overflow, a consumed deadline, duplicate/zero case
+timeouts, or a schedule/grant/accounting window shorter than the remaining hard bound.
+
+The R3d1 supervisor record binds exact PID/start/parent/group/session identities, retained-anchor lifecycle,
+journaled TERM/KILL ordering and cause, the no-later-group-signal mark, safety holds, exact container run labels,
+and the child artifact's run/window/hash join. Numeric PIDs are unique across scheduler, anchors, and workloads;
+the runner must be one exact workload. `Prepared` owns at least one retained empty anchor; `Prepared`, `Running`,
+`TermGrace`, and `KillJournaled` require every anchor to remain `RetainedLive`; operational and terminal states
+require coherent runner/group topology; every non-hold group stays in the exact scheduler/runner session; and every
+hold retains at least one group. An anchor may become `ReleasedReaped` only on entry to `Reaping` after later group
+signals are forbidden, or `Ambiguous` only on entry to `SafetyHold` after later group signals are forbidden. No
+fallible workload observation occurs between exact descendant-anchor
+acquisition and retained capability/record insertion; runtime registration owns revalidation. A session, ancestry,
+liveness, or identity-observation failure then appends that exact acquired group to the durable hold before disabling
+later signals; an escaped or observation-ambiguous group may therefore be recorded only in `SafetyHold`, never in an
+operational phase. KILL
+terminates as exactly `killed_after_deadline` or
+`killed_after_cancellation` according to its write-once cause. The standalone `supervisor` validator checks one
+snapshot. The runtime journal additionally requires a prepared generation 1, a contiguous hash chain, strictly
+advancing record time, an explicit monotonic phase graph, immutable run/deadline/scheduler/container identity,
+append-only exact groups, one-way anchor lifecycle, and write-once signal/artifact/outcome fields both on append and
+startup reopen. Reopen reads each named generation through the retained directory descriptor with no-follow and
+verifies descriptor identity before and after its bounded read.
+
+The retained, unreaped anchor child is the process-group capability: its PID/PGID cannot recycle before reap, so a
+late liveness-observation error cannot suppress necessary cleanup. TERM/KILL journals first and then signals through
+that retained capability without another fallible liveness preflight. A missing or mismatched capability refuses
+without a numeric-group signal and makes the already-journaled attempt an ambiguous safety hold. Descendant
+registration revalidates every exact runner, workload, and anchor identity before trusting numeric parent links.
+Prepared recovery resumes only when its
+retained group is still exact and contains no possible workload; any observed member or ambiguity becomes a durable
+hold. Before success, the supervisor descriptor-pins and hashes the actual child join and optional aggregate bytes,
+checks their run/window/hash bindings, parses and validates the unchanged aggregate, and releases anchors only after
+that private verified-artifact capability exists. These schemas and journal checks do not themselves authorize or
+execute work.
 
 All records are versioned, deny unknown fields, raw-scan every decoded object key and string for secret-shaped
 material, and use bounded local file reads. Git object identities are non-null tagged SHA-1/SHA-256 object IDs rather than
@@ -126,7 +168,11 @@ required check.
 ## Later slices
 
 - R3d1 implements provider-free one-shot supervision and signal parity with fake-process proof.
-- R3d2 implements private authority, admission, preflights, equivalent-work, and durable accounting.
+- R3d2 implements private authority, admission, preflights, equivalent-work, and durable accounting. Before it wires
+  the R3d1 mechanism to a production control implementation, it also makes Darwin zero/error group enumeration
+  errno-aware for absence proof, owns cancellation before `Running`, supplies an exact-runner-exit primitive,
+  preserves whichever SIGINT/SIGTERM registration succeeds if the other fails, and either excludes `.` from
+  externally derived supervisor record ids or gives every record a private journal directory.
 - R3d3 implements evidence storage, retention, status, and crash-consistent publication state.
 - R3d4 implements disabled-by-default launchd and trusted test-merge/main triggers.
 - R3d5 separately characterizes every inventory row under single-use owner authority before any staged

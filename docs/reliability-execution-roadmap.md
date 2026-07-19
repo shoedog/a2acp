@@ -1,11 +1,47 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main base:** `origin/main` at `6eeea6ce553b792dc92cef95ee45f2234f7afe4e` on 2026-07-18
-  (PR #37 merged the approved R3d design)
-- **Completed through:** R3d design **MERGED** at `6eeea6ce`; R2e remains deferred and off the critical path
-- **Active slice:** R3d0 default-off scheduling policy/schema foundation on
-  `agent/reliability-r3d0-foundation`; no live compatibility or operator lifecycle work is in scope
+- **Current main base:** `origin/main` at `c2d147fb1f0df275f3c6452cdd212e185c002d08` on 2026-07-18
+  (PR #38 merged R3d0)
+- **Completed through:** R3d0 **MERGED** at `c2d147fb`; R2e remains deferred and off the critical path
+- **Active slice:** R3d1 supervisor and signal parity on `agent/reliability-r3d1-supervisor`, based directly on
+  `c2d147fb`; it is non-billable and uses local fake child processes only
+- **Current R3d1 implementation gate:** **APPROVED FOR PR**. Initial exact candidate `01438c34` received a fresh
+  bridge-mediated Sol/xhigh/read-only review: eight `WRONG`, two `SMELL`, and
+  `R3D1 IMPLEMENTATION: REVISE`. The remediation enforces deadline-first phase-local caps with complete later-phase
+  reservation; keeps cleanup signal authority in the retained child handle; revalidates exact ancestry/topology;
+  byte-verifies child artifacts; distinguishes deadline KILL from repeated-cancellation KILL; makes Prepared crash
+  ambiguity hold; descriptor-pins journal generations; and tests signal/release/container effect failures. First
+  closure review of exact `e81ebbb` marked nine inherited items `FIXED`, topology and stale-cursor items
+  `PARTIAL`, found no new finding, and returned `R3D1 IMPLEMENTATION: REVISE`. The second remediation rejects
+  topology-free holds and cross-session operational snapshots, and it durably inventories every already-acquired
+  descendant group before a session/ancestry/liveness/identity-observation hold. Second closure review of exact
+  `8feda4d` marked all four requested residuals `FIXED`, found one new `WRONG / High`, no new `SMELL`, and returned
+  `R3D1 IMPLEMENTATION: REVISE`: successful descendant-anchor acquisition was followed by fallible workload
+  observation before the capability or record was retained. The third remediation retains both first, then lets
+  registration revalidate and journal the exact acquired group into `SafetyHold` on failure. Its real two-workload
+  regression failed at the pre-retention error on `8feda4d` and now keeps the surviving workload live but durably
+  inventoried. Third closure review of exact `7fafe79` marked that inherited item `FIXED`, confirmed the four prior
+  topology/cursor residuals remain closed, found two new `WRONG` (`High` and `Minor`), no new `SMELL`, and returned
+  `R3D1 IMPLEMENTATION: REVISE`. The fourth remediation removes fallible TERM/KILL liveness preflight from the
+  retained signal capability, keeps journal-before-effect ordering, and makes capability loss fail closed without a
+  numeric signal; it also corrects the focused status generation. Its observation-error and recycled-capability tests
+  both failed on `7fafe79` before the fix. Fourth closure review of exact `b55c17d` marked both inherited findings
+  `FIXED`, confirmed the earlier mechanisms remain closed, found one new `WRONG / High`, no new `SMELL`, and
+  returned `R3D1 IMPLEMENTATION: REVISE`: signal-capable phases could accept an already released or ambiguous
+  anchor lifecycle. The fifth remediation requires retained anchors in `Prepared`, `Running`, `TermGrace`, and
+  `KillJournaled`; permits release only on entry to `Reaping`, or ambiguity only on entry to `SafetyHold`, after later
+  signals are forbidden; and rejects a non-retained `start_running`. Its schema, start, and transition tests all
+  failed on `b55c17d` before the fix. Current focused gates are process group **6/0**,
+  resolver **1/0**, schema **31/0**, supervisor **33/0**, cancellation **4/0**, compatibility CLI **21/0**, and
+  R3d1 CLI **2/0**; the complete binary suite is **543/0/0** and full serial workspace is
+  **2,279/0/12 ignored** across **56** test binaries. Format/diff, workspace check, warnings-denied Clippy, locked
+  release, dependency policy, hygiene **37/7**, manifest **9**, recipes **4**, and foundation **6/4** are green. The
+  candidate release binary is **26,574,640 bytes**, SHA-256
+  `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. Exact fifth-remediation head `b511d6c`
+  then received Sol/xhigh `R3D1 IMPLEMENTATION: APPROVE` with no new finding and the single Fable/xhigh lens returned
+  `R3D1 RELEASE/COMPATIBILITY: APPROVE` with no `WRONG` and three nonblocking Minor `SMELL`s. The post-review fold is
+  docs-only; no mechanism changed. No live compatibility gate or production-operator lifecycle action occurred.
 - **Current R3d design gate:** **APPROVED / MERGED** by PR #37. The initial Fable/xhigh clean-room review
   of exact merged base `98339842`
   returned six `WRONG`, thirteen `SMELL`, and `R3D DESIGN: REVISE`. After D1-D10 owner approval, a
@@ -145,10 +181,8 @@
   `f2869caa4ccdc5b8fc055a803e462a05a2354cd53f4fa5b5aeaed71ea64efd28`. Fresh post-proof gates
   retain the same totals and byte identities above. No timer, private authority issuance, live characterization,
   model discovery, credential access, container/runtime access, registry/image effect, compatibility execution
-  turn, GitHub check mutation, or production-operator lifecycle action has occurred. Status is
-  **RELEASE/COMPATIBILITY APPROVED / PR READY**. Publish the non-draft R3d0 PR; let GitHub gates run; do
-  not merge until those gates are green and the owner directs the merge. No Fable review is planned because
-  no hard or complex unresolved problem remains.
+  turn, GitHub check mutation, or production-operator lifecycle action occurred before publication. R3d0 is
+  **MERGED** by PR #38 at `c2d147fb1f0df275f3c6452cdd212e185c002d08`; no further R3d0 review is planned.
 - **Last merged R3c deterministic gate:** code head
   `4bd63f3f129a08586742c3c3e946fecfa02839ba` completes all four implementation slices and seven
   adversarial-review rounds. The initial Sol/xhigh review of exact `a5dfef8` returned nine `WRONG`, no
@@ -380,17 +414,14 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** freeze the Opus-approved successor to exact reviewed cursor `d61176c`. Publish the
-  non-draft R3d0 PR; let GitHub gates run; do not merge until those gates are green and the owner directs the
-  merge. No timer,
-  private authority issuance, live characterization, model discovery, credential
-  access, container/runtime access, registry/image effect, compatibility execution turn, GitHub check mutation,
-  or production-operator lifecycle action has occurred. OpenRouter/OpenCode remain R3e/R3f after the R3 core
-  and before R4.
+- **Next action:** run the exact-final deterministic gates on the docs-only review fold, publish a non-draft R3d1 PR,
+  and wait for its required checks. Both exact-code review gates are approved; do not spend another Fable turn or
+  change the approved mechanism before publication. No live compatibility gate is authorized; R3d1 must not perform
+  any production-operator lifecycle action. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**
-  [`superpowers/plans/2026-07-11-r3-compatibility-canaries.md`](superpowers/plans/2026-07-11-r3-compatibility-canaries.md)
+  [`superpowers/plans/2026-07-19-r3d1-supervisor-signal-parity.md`](superpowers/plans/2026-07-19-r3d1-supervisor-signal-parity.md)
 - **Operating runbook:**
   [`../skills/a2a-bridge-operator/SKILL.md`](../skills/a2a-bridge-operator/SKILL.md)
 
@@ -412,7 +443,7 @@ R2a provenance (MERGED)
   -> R2c explicit one-turn billable smoke (MERGED)
        -> R2d local non-billable fallback plan (MERGED)
             -> R3 compatibility manifest + pinned/floating canaries + OpenRouter/OpenCode
-               (IN REVIEW: R3a/R3b/R3c MERGED; R3d DESIGN MERGED; R3d0 CLOSURE REVIEW)
+               (IN REVIEW: R3a/R3b/R3c/R3d0 MERGED; R3d DESIGN MERGED; R3d1 IMPLEMENTATION REVIEW)
                  -> R4 reproducible dependency/image pins + release promotion gate
 
 R2e authenticated in-process fallback is DEFERRED and off the critical path.
@@ -439,7 +470,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (three incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`. D1-D10 and all sixteen design-review sets are folded. R3d0 is **RELEASE/COMPATIBILITY APPROVED / PR READY** on `agent/reliability-r3d0-foundation`: exact cursor `b6f5c9e` received a fourth fresh Sol/xhigh closure review that marked both inherited families `FIXED`, found no new `WRONG`, found one nonblocking proof-isolation `SMELL`, and returned `APPROVE`; proof-only `e771067` makes the equality branch mutation-isolated. Exact cursor `c548dc0` confirmed that proof `FIXED` and mechanism unchanged but returned `REVISE` on one stale-handoff `WRONG` and one no-effect-wording `SMELL`; exact cursor `e9d030f` marked the wording `FIXED`, the handoff `PARTIAL` on conditional publication wording only, found no new item, and returned `REVISE`; exact cursor `1d2fb80` marked the publication-tail item `FIXED`, found no new `WRONG` or `SMELL`, and returned `APPROVE`; exact cursor `d61176c` received the Opus/xhigh release/compatibility lens, found no `WRONG`, four nonblocking `SMELL`, required no pre-PR remediation, and returned `APPROVE`. S4's stale prompt hashes were reconciled by the deterministic owner-host foundation and binary checks; S1-S3 are accepted intentional constraints. Focused gates are **9/0**, **23/0**, and **31/0**; full serial workspace is **2,228/0/12 ignored** across **55** binaries; all deterministic release/validator gates are green. No timer, private authority issuance, live characterization, model discovery, credential access, container/runtime access, registry/image effect, compatibility execution turn, GitHub check mutation, or production-operator lifecycle action has occurred. | [R3 implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md) | Publish the non-draft R3d0 PR; let GitHub gates run; do not merge until those gates are green and the owner directs the merge. R3d never touches the long-lived operator. |
+| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at design head `b54840a` by PR #37, merge `6eeea6ce`; R3d0 **MERGED** by PR #38 at `c2d147fb`. R3d1 is **APPROVED FOR PR** on `agent/reliability-r3d1-supervisor`: initial exact `01438c34` Sol/xhigh review returned eight `WRONG`, two `SMELL`, and `REVISE`; exact `e81ebbb`, `8feda4d`, `7fafe79`, and `b55c17d` closures drove four remediations; exact fifth-remediation head `b511d6c` received Sol/xhigh implementation `APPROVE` with no new finding, then the single Fable/xhigh release/compatibility lens returned `APPROVE` with no `WRONG` and three nonblocking Minor `SMELL`s. The approved mechanism requires retained anchors through every signal-capable phase and permits release or ambiguity only in the corresponding no-later-signal phase. Focused gates are **6/0**, **1/0**, **31/0**, **33/0**, **4/0**, **21/0**, and **2/0**; full serial workspace is **2,279/0/12 ignored** across **56** binaries, and all complete deterministic release/validator gates are green. Candidate release SHA-256 is `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. No live compatibility gate or production-operator lifecycle action occurred. | [R3d1 implementation plan](superpowers/plans/2026-07-19-r3d1-supervisor-signal-parity.md) | Rerun exact-final deterministic gates on the docs-only evidence fold and publish a non-draft PR. R3d never touches the long-lived operator lifecycle. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -713,8 +744,9 @@ Next action:
 - R3a merged through PR #31 at `3927df3f1dce03fde50b7754151a718017f45815`. R3b merged through PR #32
   at `504c1e434fd5845bc6745e0b0a0aae95427afbdd`. R3c merged through PR #33 at
   `983398427c9f04861a2f1da501a7650c4a1cdd80`. R3d design merged through PR #37 at
-  `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`; R3d0 is active on
-  `agent/reliability-r3d0-foundation`, based directly on that merge. The manifest still contains nine
+  `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`; R3d0 merged through PR #38 at
+  `c2d147fb1f0df275f3c6452cdd212e185c002d08`. R3d1 is in review on
+  `agent/reliability-r3d1-supervisor`, based directly on that merge. The manifest still contains nine
   exact pinned rows: four release-blocking minimal bridge-smoke support cases and five explicit
   historical/non-goal controls. Every config is checked in and SHA-bound before provider spawn. The two
   supported reader cases and the stale Kiro reader control use the separately tagged immutable image
@@ -797,11 +829,73 @@ Next action:
   `/private/tmp/a2a-bridge-r3d0-opus-lens/review.md`, mode `0644`, 9,836 bytes, SHA-256
   `f7a8e55f540ec9dd318b2f788c6d05f61f1641cff6b8f5851b271b64dafe0a64`; the post-review owner-host
   validator and local release-artifact check reconciled S4 to the branch's documented hashes, while S1-S3
-  remain accepted intentional constraints. Publish the non-draft R3d0 PR; let GitHub gates run; do not merge
-  until those gates are green and the owner directs the merge. No timer,
-  private authority issuance, live characterization, model
-  discovery, credential access, container/runtime access, registry/image effect, compatibility execution turn,
-  GitHub check mutation, or production-operator lifecycle action has occurred.
+  remain accepted intentional constraints. PR #38 merged R3d0 at `c2d147fb`. R3d1 now owns only the
+  default-off supervision/signal mechanism and typed no-effects parent boundary. Initial exact candidate
+  `01438c34f2c17d3c4632583222b57748201e291b` received a fresh bridge-mediated Sol/xhigh/read-only review:
+  eight `WRONG`, two `SMELL`, and `R3D1 IMPLEMENTATION: REVISE`. Its retained report is
+  `/private/tmp/a2a-bridge-r3d1-sol-review-01438c3/review.md`, mode `0644`, 6,290 bytes, SHA-256
+  `5515c25a33170a9ffa176a116e88ced44dac7754ddbdc10017b6683b94d3334b`. The current remediation closes
+  the demonstrated deadline ordering/reservation, resolver cleanup, exact ancestry/topology, child-byte/hash,
+  kill-outcome, deadline-rounding, and stale-doc failures plus the independently found Prepared
+  spawn-before-Running crash window. It also descriptor-pins generation reads and adds the missing signal,
+  anchor-release, container-cleanup, and retained-capability fault tests. First closure review of exact
+  `e81ebbb388ab6ca38b6a0f4c20c4dd54f1690df3` marked nine items `FIXED`, inherited topology/cursor items
+  `PARTIAL`, found no new `WRONG` or `SMELL`, and returned `R3D1 IMPLEMENTATION: REVISE`. Its retained report is
+  `/private/tmp/a2a-bridge-r3d1-sol-closure-e81ebbb/review.md`, mode `0644`, 10,258 bytes, SHA-256
+  `fa6b12a67e65df7438cb00ab953792e307b0e0b3748a5c9c37e170d96c088a24`. The second remediation rejects
+  a topology-free hold, independently observed cross-session operational snapshots, and loss of newly acquired
+  descendant-group inventory on session/ancestry/liveness/identity-observation holds. Those three cases were red on
+  `e81ebbb` before the fixes. Second closure review of exact
+  `8feda4d93c22ebe2c5e8867d46e006af50b8899f` marked all four requested topology/cursor residuals `FIXED`, found
+  one new `WRONG / High`, no new `SMELL`, and returned `R3D1 IMPLEMENTATION: REVISE`. Its retained report is
+  `/private/tmp/a2a-bridge-r3d1-sol-closure-8feda4d/review.md`, mode `0644`, 5,777 bytes, SHA-256
+  `d9042da3d20c30955c52ffb86e78df06cd055acfdc9f873bac888cc7f1a67799`. That reviewed code could acquire the
+  exact descendant anchor, then fail workload observation before retaining either the live capability or its
+  serializable record, leaving another live workload outside the journal. The third remediation performs no
+  fallible observation between exact anchor acquisition and retained-record insertion. Registration then revalidates
+  every workload and journals the exact acquired group into `SafetyHold` on failure. The real two-workload regression
+  failed at that pre-retention error on `8feda4d` and now proves the stale workload holds while the other workload
+  remains live and durably inventoried. Third closure review of exact
+  `7fafe7933faca56842c64773011040be670cb2dc` marked that inherited item `FIXED`, confirmed the four prior residuals
+  remain closed, found two new `WRONG` (`High` and `Minor`), no new `SMELL`, and returned
+  `R3D1 IMPLEMENTATION: REVISE`. Its retained report is
+  `/private/tmp/a2a-bridge-r3d1-sol-closure-7fafe79/review.md`, mode `0644`, 6,176 bytes, SHA-256
+  `aabaae00bb2a4eca44db018a7a434b71f56ff6fed63cb90de94b2bd76bfa14b6`. The reviewed supervisor still allowed
+  fallible liveness observation to suppress TERM/KILL despite retaining the stronger exact signal capability, and
+  the focused header named the second rather than third remediation. The fourth remediation removes only that
+  TERM/KILL preflight, preserves conservative recovery/release observation holds and journal-before-effect ordering,
+  and makes actual capability loss fail closed into `SignalJournalAmbiguous` without signaling a recycled group. Its
+  observation-error TERM/KILL and recycled-capability negative tests both failed on `7fafe79` before the fix. Fourth
+  closure review of exact `b55c17d390861b5afa86a5f812b7727f38f630a0` marked both inherited findings `FIXED`,
+  confirmed the earlier mechanisms remain closed, found one new `WRONG / High`, no new `SMELL`, and returned
+  `R3D1 IMPLEMENTATION: REVISE`. Its retained report is
+  `/private/tmp/a2a-bridge-r3d1-sol-closure-b55c17d/review.md`, mode `0644`, 5,866 bytes, SHA-256
+  `3472273ff438cb58b1ceb8eeba69bc3ed6ee0dbd2fb5faaddaf471292489c634`. The reviewed schema and transition layer
+  allowed a released or ambiguous anchor in a signal-capable phase. The fifth remediation requires `RetainedLive`
+  anchors in `Prepared`, `Running`, `TermGrace`, and `KillJournaled`; release only on entry to `Reaping`, or ambiguity
+  only on entry to `SafetyHold`, after later signals are forbidden; and a retained capability at `start_running`.
+  Its schema, start, and transition tests all failed on `b55c17d` before the fix. Exact fifth-remediation head
+  `b511d6ce490590e54aae87dccad57e99fbe59a5a` then received Sol/xhigh implementation `APPROVE`: the inherited
+  finding was `FIXED`, all earlier mechanisms remained closed, and there was no new `WRONG` or `SMELL`. The retained
+  report is `/private/tmp/a2a-bridge-r3d1-sol-closure-b511d6c/review.md`, mode `0644`, 5,023 bytes, SHA-256
+  `1bf7bf1873c224b0da0067e53a440295c02be7ec677f82553525e5d808840b6d`. The single design-approved Fable/xhigh
+  adversarial implementation and release/compatibility lens on the same head found no `WRONG`, three nonblocking
+  Minor `SMELL`s, and returned `APPROVE`. Its retained report is
+  `/private/tmp/a2a-bridge-r3d1-fable-lens-review/review.md`, mode `0644`, 7,837 bytes, SHA-256
+  `088676af7e11beb4d33f1c4410dcf5bfc4a0e55dc1eaa689288934a04de01bed`. The smells are carried to R3d2 before
+  production integration: errno-aware Darwin zero/error enumeration, independent viable shutdown-signal
+  registration, and collision-free externally derived record-id storage; R3d2 also owns pre-`Running` cancellation
+  and exact-runner-exit control. No post-approval mechanism change occurred. Current
+  focused gates are **6/0**, **1/0**, **31/0**, **33/0**, **4/0**,
+  **21/0**, and **2/0**;
+  full serial workspace is **2,279/0/12 ignored** across **56** binaries. Real OS-delivered SIGINT/SIGTERM
+  integration remains explicitly unexercised; injected selector parity and real local group containment are
+  covered separately. All complete deterministic release/validator gates are green; the candidate release binary
+  is **26,574,640 bytes**, SHA-256
+  `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. No timer, private authority issuance,
+  live characterization, model discovery, credential access, container/runtime access, registry/image effect,
+  compatibility execution turn, GitHub check mutation,
+  or production-operator lifecycle action has occurred in R3d1.
 - The merged-R3c production operator binary is installed at
   `/Users/wesleyjinks/Library/Application Support/a2a-bridge/operator/releases/983398427c9f0486/a2a-bridge`,
   24,673,456 bytes, SHA-256

@@ -62,6 +62,8 @@ usage: a2a-bridge compatibility validate
               --environment-owner <id> --acknowledge-billable --out <path>
        a2a-bridge compatibility compare --current <aggregate.json>
               [--baseline <pinned.json>] [--mode pinned|floating-to-pinned]
+       a2a-bridge compatibility schedule-tick
+              (recognized but effect-disabled until R3d2 authority/admission)
 
 `validate` is local and non-billable. `resolve` is non-billable but requires explicit acknowledgement
 before registry/image effects. It retains its private bundle and uniquely tagged image; it never starts an
@@ -3652,6 +3654,28 @@ fn load_json<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Result<T
         .map_err(|error| format!("{label}: invalid schema: {error}").into())
 }
 
+pub(super) fn validate_child_aggregate_bytes(bytes: &[u8]) -> Result<(), BoxError> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("compatibility child aggregate: invalid JSON: {error}"))?;
+    if value_contains_secret(&value, &[]) {
+        return Err("compatibility child aggregate: secret-shaped material is not allowed".into());
+    }
+    let aggregate: AggregateArtifact = serde_json::from_value(value)
+        .map_err(|error| format!("compatibility child aggregate: invalid schema: {error}"))?;
+    if aggregate.schema_version != 1
+        || aggregate.ended_at_ms < aggregate.started_at_ms
+        || !local_file::valid_sha256(&aggregate.candidate.sha256)
+        || aggregate.candidate.sha256 != aggregate.candidate.sha256.to_ascii_lowercase()
+        || aggregate.candidate.byte_length == 0
+        || aggregate.manifest.schema_version != 1
+        || !local_file::valid_sha256(&aggregate.manifest.sha256)
+        || aggregate.manifest.sha256 != aggregate.manifest.sha256.to_ascii_lowercase()
+    {
+        return Err("compatibility child aggregate: invalid identity or time bounds".into());
+    }
+    Ok(())
+}
+
 fn compare_artifacts(
     current: &AggregateArtifact,
     baseline: &BaselineArtifact,
@@ -4353,6 +4377,65 @@ fn load_bound_execution(
     Ok((resolution, execution))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompatibilityShutdownSignal {
+    Interrupt,
+    Terminate,
+}
+
+async fn select_compatibility_shutdown_signal<I, T>(
+    interrupt: I,
+    terminate: T,
+) -> std::io::Result<CompatibilityShutdownSignal>
+where
+    I: std::future::Future<Output = std::io::Result<()>>,
+    T: std::future::Future<Output = std::io::Result<()>>,
+{
+    tokio::pin!(interrupt);
+    tokio::pin!(terminate);
+    tokio::select! {
+        result = &mut interrupt => {
+            result?;
+            Ok(CompatibilityShutdownSignal::Interrupt)
+        }
+        result = &mut terminate => {
+            result?;
+            Ok(CompatibilityShutdownSignal::Terminate)
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_compatibility_shutdown_signal() -> std::io::Result<CompatibilityShutdownSignal> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    select_compatibility_shutdown_signal(tokio::signal::ctrl_c(), async move {
+        terminate.recv().await.map(|_| ()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "SIGTERM stream closed before a signal",
+            )
+        })
+    })
+    .await
+}
+
+#[cfg(not(unix))]
+async fn wait_for_compatibility_shutdown_signal() -> std::io::Result<CompatibilityShutdownSignal> {
+    tokio::signal::ctrl_c().await?;
+    Ok(CompatibilityShutdownSignal::Interrupt)
+}
+
+fn request_compatibility_cancellation(cancellation: &std::sync::atomic::AtomicBool) -> bool {
+    cancellation
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
 async fn run_command(args: RunArgs) -> Result<(), BoxError> {
     let (loaded, resolution) = match &args.source {
         RunSource::Manifest(path) => (load_manifest(path)?, None),
@@ -4418,10 +4501,10 @@ async fn run_command(args: RunArgs) -> Result<(), BoxError> {
     let cancellation_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancellation_for_signal = std::sync::Arc::clone(&cancellation_requested);
     let signal_task = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
+        if wait_for_compatibility_shutdown_signal().await.is_ok() {
             // Finish the already-started one-attempt smoke so its R2c cleanup and artifact contract
             // remain intact, then refuse every subsequent case.
-            cancellation_for_signal.store(true, std::sync::atomic::Ordering::Release);
+            request_compatibility_cancellation(&cancellation_for_signal);
         }
     });
     let aggregate_inputs = || AggregateInputs {
@@ -4781,7 +4864,10 @@ fn compare_command(args: CompareArgs) -> Result<(), BoxError> {
     }
 }
 
-pub(crate) async fn compatibility_cmd(args: &[String]) -> Result<(), BoxError> {
+pub(crate) async fn compatibility_cmd(
+    args: &[String],
+    process_entry: std::time::Instant,
+) -> Result<(), BoxError> {
     if args
         .iter()
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
@@ -4841,8 +4927,12 @@ pub(crate) async fn compatibility_cmd(args: &[String]) -> Result<(), BoxError> {
         "resolve" => resolve_command(parse_resolve_args(&args[1..])?).await,
         "run" => run_command(parse_run_args(&args[1..])?).await,
         "compare" => compare_command(parse_compare_args(&args[1..])?),
+        "schedule-tick" => crate::compatibility_schedule_supervisor::schedule_tick_parent(
+            process_entry,
+            &args[1..],
+        ),
         other => Err(format!(
-            "compatibility: unknown subcommand {other:?} (expected validate | resolve | run | compare)\n{USAGE}"
+            "compatibility: unknown subcommand {other:?} (expected validate | resolve | run | compare | schedule-tick)\n{USAGE}"
         )
         .into()),
     }
@@ -6914,6 +7004,29 @@ agent_cli = "@openai/codex=0.144.1"
         );
         assert!(aggregate.cancelled);
         assert!(!aggregate.success);
+    }
+
+    #[tokio::test]
+    async fn sigint_and_sigterm_select_the_same_runner_cancellation_path() {
+        let interrupt = select_compatibility_shutdown_signal(
+            std::future::ready(Ok(())),
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        let terminate = select_compatibility_shutdown_signal(
+            std::future::pending(),
+            std::future::ready(Ok(())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(interrupt, CompatibilityShutdownSignal::Interrupt);
+        assert_eq!(terminate, CompatibilityShutdownSignal::Terminate);
+
+        let cancellation = AtomicBool::new(false);
+        assert!(request_compatibility_cancellation(&cancellation));
+        assert!(!request_compatibility_cancellation(&cancellation));
+        assert!(cancellation.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[tokio::test]

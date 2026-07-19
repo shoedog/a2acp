@@ -36,9 +36,11 @@
 
 mod catalog_probe;
 mod compatibility;
+mod compatibility_process_group;
 mod compatibility_resolution;
 mod compatibility_schedule;
 mod compatibility_schedule_schema;
+mod compatibility_schedule_supervisor;
 mod config;
 mod containers;
 mod doctor;
@@ -6178,6 +6180,9 @@ fn task_spec_cmd(args: &[String]) -> Result<(), BoxError> {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
+    // R3d1 schedule-tick owns this monotonic process-entry origin. Capture it before argument/help
+    // dispatch so later metadata and policy derivation can never reset the hard deadline.
+    let process_entry = std::time::Instant::now();
     // Dispatch subcommands BEFORE the server path touches the filesystem.
     let raw_args: Vec<String> = std::env::args().collect();
     let sub = parse_top_subcommand(&raw_args);
@@ -6194,7 +6199,7 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::Batch => return batch_cmd(&raw_args[2..]).await,
         TopSubcommand::Models => return models_cmd(&raw_args[2..]).await,
         TopSubcommand::Compatibility => {
-            return compatibility::compatibility_cmd(&raw_args[2..]).await
+            return compatibility::compatibility_cmd(&raw_args[2..], process_entry).await
         }
         TopSubcommand::Implement => return implement_cmd(&raw_args[2..]).await,
         TopSubcommand::Merge => return merge_cmd(&raw_args[2..]).await,

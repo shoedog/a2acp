@@ -5,7 +5,20 @@
   `983398427c9f04861a2f1da501a7650c4a1cdd80` by PR #33; R3d design is **APPROVED / MERGED**
   at exact design head `b54840a017b87521677f1f95c3f7be69de55361d` by PR #37, merge
   `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is
-  **RELEASE/COMPATIBILITY APPROVED / PR READY** on
+  **MERGED** by PR #38 at merge commit `c2d147fb1f0df275f3c6452cdd212e185c002d08`. R3d1 is
+  **APPROVED FOR PR** on `agent/reliability-r3d1-supervisor`; initial exact candidate `01438c34` and first closure head
+  `e81ebbb` each received Sol/xhigh `REVISE`. Second closure head `8feda4d` marked all four requested topology/cursor
+  residuals `FIXED`, found one new post-anchor-retention `WRONG / High`, no new `SMELL`, and returned `REVISE`.
+  Third closure head `7fafe79` marked that item `FIXED`, confirmed prior residuals closed, found two new `WRONG`
+  (`High` and `Minor`), no new `SMELL`, and returned `REVISE`. Fourth closure head `b55c17d` marked both inherited
+  retained-capability findings `FIXED`, found one new signal-capable anchor-lifecycle `WRONG / High`, no new
+  `SMELL`, and returned `REVISE`. Exact fifth-remediation head `b511d6c` received Sol/xhigh implementation
+  `APPROVE` with no new finding, then the single Fable/xhigh release/compatibility lens returned `APPROVE` with no
+  `WRONG` and three nonblocking Minor `SMELL`s. Its
+  candidate release binary is 26,574,640 bytes at SHA-256
+  `7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`. Its focused restart plan is
+  [`2026-07-19-r3d1-supervisor-signal-parity.md`](2026-07-19-r3d1-supervisor-signal-parity.md).
+  The merged R3d0 implementation was
   `agent/reliability-r3d0-foundation`: the fourth closure review approved exact cursor
   `b6f5c9e7af2ffd0a1b022e3f07c2898a3d2c65c4`, and proof-only test commit
   `e771067f4a7e742ad813368f01018b011e86bbce` isolates its sole nonblocking `SMELL`; exact
@@ -1932,7 +1945,10 @@ fetch, checkout/candidate build, preflight, resolution/materialization, every se
 publication, cold-archive handoff, cleanup grace, and a fixed margin. A phase absent from that trigger
 contributes zero, never an implicit unbounded allowance. Derivation time counts against the bound. It refuses
 before credential/registry/image/provider effects when the schedule window, grant expiry, or time budget
-cannot contain the complete bound. The deadline is not reset between phases.
+cannot contain the complete bound. Elapsed derivation is rounded conservatively so the serialized remainder never
+understates the executable remainder. The deadline is not reset between phases. Each phase is capped by the earlier
+of its own maximum or the hard deadline after reserving every later phase, cleanup grace, and fixed margin; an
+already-exhausted phase refuses before polling even an immediately-ready effect.
 
 The compatibility runner handles SIGTERM exactly like SIGINT: stop admitting later cases, let the current
 bounded child follow its cancel/release/retire path, publish its aggregate, and clean scratch. Before spawning
@@ -1940,11 +1956,26 @@ the runner or staged smoke, the parent creates a trusted inert bridge-owned grou
 workload in that process group. It records anchor/runner/child pids, process groups, start identities, container
 run labels, and phase before effects. The anchor remains live through TERM; the one terminal group-KILL step
 keeps its exited leader unreaped until the supervisor journals that no later group signal is permitted, then
-final wait/reap releases the identity. A crash that makes the signal/journal ordering ambiguous recovers to a
+final wait/reap releases the identity. The retained, unreaped child handle is itself the group-signal capability:
+PID/PGID reuse is impossible until reap, so a late process-observation error cannot suppress required cleanup.
+TERM/KILL journals before the effect and then uses that retained capability directly; it does not gate the capability
+on another fallible liveness observation. An absent or mismatched capability refuses without a numeric-group signal
+and moves the already-journaled attempt to an ambiguous safety hold.
+A non-hold supervisor record binds the scheduler, runner, and every anchored group to one exact session. A safety
+hold retains at least one anchored-group record even when its runner identity is unavailable. `Prepared`, `Running`,
+`TermGrace`, and `KillJournaled` require every anchor to remain `RetainedLive`. An anchor may become
+`ReleasedReaped` only on entry to `Reaping` after later group signals are forbidden, or `Ambiguous` only on entry
+to `SafetyHold` after later group signals are forbidden. Once the supervisor
+has acquired a descendant-group anchor, it retains the exact live capability and serializable record before any
+fallible workload observation. Registration then revalidates the runner and every workload; any session, ancestry,
+liveness, or identity-observation failure appends that exact acquired group to the durable hold before disabling
+later group signals. A dead or unobservable anchor is retained as ambiguous rather than silently dropped.
+A crash that makes the signal/journal ordering ambiguous recovers to a
 hold and never retries a numeric-group signal. R3d1
 reuses or factors the already-proven R3c `CommandProcessGroupGuard` mechanism; it must not restore a numeric-
 PGID-only signal path. A
-descendant-created group in the same session may be group-signaled only after the supervisor successfully
+descendant-created group in the same session may be group-signaled only after the supervisor revalidates the exact
+runner, existing workload, incoming workload, and anchor identities and successfully
 adds and retains its own anchor member; a new-session escape, vanished leader, failed anchor acquisition, or
 ambiguous identity creates a safety hold and is never signaled through a stale numeric PGID. Escalation is:
 
@@ -1957,8 +1988,8 @@ ambiguous identity creates a safety hold and is never signaled through a stale n
    this mark performs no group signal;
 5. reap only containers with the exact run label;
 6. prove exit, or retain the owner-wide admission lock/hold state and refuse successors;
-7. publish a durable `killed_after_deadline` supervisor record joined to the runner artifact by run/window id
-   and retain the conservative budget charge.
+7. publish a durable `killed_after_deadline` or `killed_after_cancellation` supervisor record according to the
+   write-once KILL cause, joined to the runner artifact by run/window id, and retain the conservative budget charge.
 
 Startup reconciles any incomplete supervisor record before new admission. An unproved or uninterruptible
 survivor, missing/dead anchor before group absence is proved, or unreconciled anchor release creates a safety
@@ -1966,6 +1997,11 @@ hold rather than a duplicate attempt or stale signal. Recorded descendants that 
 process group remain in the enumeration and follow the anchor-or-hold rule; an unobserved host descendant that
 escapes all recorded ancestry is an explicit macOS containment limit, not grounds for a success claim.
 Deadline-kill tests use fake children only; a live provider turn is never killed merely to prove the mechanism.
+Prepared recovery is resumable only when its retained anchor remains exact and its group has no possible workload;
+the crash window after a workload spawn but before the Running journal therefore holds. Journal generations are
+read through the retained directory descriptor with no-follow and before/after identity checks. Before terminal
+success, the supervisor descriptor-pins and hashes the actual child join and optional aggregate bytes, validates
+their run/window/hash bindings, parses the unchanged aggregate, and only then releases anchors.
 
 ### Admission and concurrency
 
@@ -2400,7 +2436,10 @@ unknown sidecar version fails schedule-specific consumption without making the u
    accounting classes, legacy executable/process detection and conservative import, and automated zero-effect
    preflights. Immediately before admission, re-resolve the trusted owner root and requested cwd as real
    filesystem objects and fail closed unless the cwd remains contained; an R3d0 offline/static validation is
-   never sufficient for that action-time check.
+   never sufficient for that action-time check. Before wiring R3d1 to a production control implementation, make
+   Darwin zero/error group enumeration errno-aware for absence proof, own cancellation before `Running`, supply an
+   exact-runner-exit primitive, preserve whichever SIGINT/SIGTERM registration succeeds if the other fails, and
+   either exclude `.` from externally derived supervisor record ids or give each record a private journal directory.
 4. **R3d3 — evidence, status, and retention.** Add hot/cold stores, index, sealing, pins, tombstones, quotas,
    leases, bundle/image GC, local CLI/status/notifications, strict schedule-sidecar plus unchanged-aggregate
    compatibility, crash-consistent publication-outbox journal storage, explicit owner-iCloud upload/offload
@@ -2665,8 +2704,10 @@ Rollback does not revert evidence, erase ledger charges, delete pins/tombstones,
 operator, or run missed windows on re-enable. The last reviewed immutable scheduler binary remains the code
 rollback target. Any code revert is a normal reviewed PR.
 
-**Restart point:** continue R3d0 from branch `agent/reliability-r3d0-foundation` based on merged main
-`6eeea6ce`. The initial exact-base Fable review plus exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
+**Restart point:** continue R3d1 from `/private/tmp/a2a-bridge-r3d1-supervisor` on branch
+`agent/reliability-r3d1-supervisor`, based on merged R3d0 main
+`c2d147fb1f0df275f3c6452cdd212e185c002d08`. The initial exact-base Fable review plus
+exact-`a20db199`, exact-`d5041ee`, exact-`1c3a7ce`,
 exact-`9414aa8`, exact-`6bc06fe`, exact-`a7db6e7`, exact-`c241087`, exact-`e0cc7dc`, exact-`c50811f`, and
 exact-`fb8a2f4`, exact-`ae9db39`, exact-`2eb242a`, exact-`8dc6054`, exact-`cc01a52`, and exact-`b54840a`
 Sol reviews are retained at the paths/hashes above.
@@ -2679,9 +2720,10 @@ one `WRONG`/zero new `SMELL`; seventh-closure zero new `WRONG`/one `SMELL`; and 
 `SMELL`; thirteenth-closure one inherited `PARTIAL`/zero new findings; and fourteenth-closure one inherited
 `FIXED`/zero new findings are folded into D1-D10 and the slices/gates above. The fourteenth closure found no
 regression, required no amendment, and returned `R3D DESIGN: APPROVE` at exact `b54840a`. All D1-D10 owner
-decisions were approved on 2026-07-17. PR #37 merged the approved design at `6eeea6ce`. R3d0 now owns only
-the checked-in non-authoritative policy, complete profile inventory, proposed advisory configs, canonical
-identity and inert record schemas/validators, plus routing/foundation docs. Exact implementation commit
+decisions were approved on 2026-07-17. PR #37 merged the approved design at `6eeea6ce`. R3d0 delivered the
+checked-in non-authoritative policy, complete profile inventory, proposed advisory configs, canonical identity,
+inert record schemas/validators, and routing/foundation docs; PR #38 merged it at `c2d147fb`. Exact implementation
+commit
 `e7e5fa1` received a bridge-mediated Sol/xhigh/read-only review with eleven `WRONG`, two `SMELL`, and
 `R3D0 IMPLEMENTATION: REVISE`; its retained report is
 `/private/tmp/a2a-bridge-r3d0-sol-review-e7e5fa1/review.md`, SHA-256
@@ -2741,9 +2783,59 @@ lens retained at `/private/tmp/a2a-bridge-r3d0-opus-lens/review.md`, SHA-256
 `f7a8e55f540ec9dd318b2f788c6d05f61f1641cff6b8f5851b271b64dafe0a64`; it found no `WRONG`, four
 nonblocking `SMELL`, required no pre-PR remediation, and returned `R3D0 RELEASE/COMPATIBILITY: APPROVE`.
 The deterministic owner-host validator and release-artifact check reconciled S4's stale prompt hashes to the
-branch's documented values; S1-S3 remain accepted intentional constraints. Publish the non-draft R3d0 PR; let
-GitHub gates run; do not merge until those gates are green and the owner directs the merge. Preserve R3c/R4
-inputs and keep R2f operator lifecycle work out of R3d.
+branch's documented values; S1-S3 remain accepted intentional constraints. R3d1 now implements only the
+default-off exact-identity supervisor/signal mechanism and typed no-effects parent boundary. Initial exact candidate
+`01438c34f2c17d3c4632583222b57748201e291b` received a bridge-mediated Sol/xhigh/read-only review with
+eight `WRONG`, two `SMELL`, and `R3D1 IMPLEMENTATION: REVISE`; its retained report is
+`/private/tmp/a2a-bridge-r3d1-sol-review-01438c3/review.md`, 6,290 bytes, SHA-256
+`5515c25a33170a9ffa176a116e88ced44dac7754ddbdc10017b6683b94d3334b`. First closure review of exact
+`e81ebbb388ab6ca38b6a0f4c20c4dd54f1690df3` marked nine inherited items `FIXED`, topology and stale-cursor
+items `PARTIAL`, found no new `WRONG` or `SMELL`, and returned `R3D1 IMPLEMENTATION: REVISE`; its retained
+report is `/private/tmp/a2a-bridge-r3d1-sol-closure-e81ebbb/review.md`, 10,258 bytes, SHA-256
+`fa6b12a67e65df7438cb00ab953792e307b0e0b3748a5c9c37e170d96c088a24`. The second remediation rejects
+topology-free holds and cross-session operational snapshots and durably inventories an already-acquired group
+before a session, ancestry, liveness, or identity-observation hold. All three failures were observed red on
+`e81ebbb`. Focused gates are **6/0**, **1/0**, **31/0**, **33/0**, **4/0**, **21/0**, and **2/0**; the complete
+binary suite is **543/0/0**, and full serial workspace is **2,279/0/12 ignored** across **56** binaries. Format and
+diff checks, workspace check, warnings-denied Clippy, locked release, dependency policy, hygiene **37/7**, manifest **9**,
+recipes **4**, and foundation **6/4** are green. The candidate release binary is **26,574,640 bytes**, SHA-256
+`7d74f85aeeb22d25e226e45457fccc4038b5e1de81a8c084c3d226ca0b9bd154`.
+Second closure review of exact `8feda4d93c22ebe2c5e8867d46e006af50b8899f` marked all four requested
+topology/cursor residuals `FIXED`, found one new `WRONG / High`, no new `SMELL`, and returned
+`R3D1 IMPLEMENTATION: REVISE`; its retained report is
+`/private/tmp/a2a-bridge-r3d1-sol-closure-8feda4d/review.md`, 5,777 bytes, SHA-256
+`d9042da3d20c30955c52ffb86e78df06cd055acfdc9f873bac888cc7f1a67799`. The third remediation performs no
+fallible observation after exact descendant-anchor acquisition and before retaining the capability and record.
+Registration owns workload revalidation and can journal that exact group into `SafetyHold`. Its real two-workload
+regression failed at the pre-retention error on `8feda4d` and now proves the stale workload holds while the other
+workload remains live and durably inventoried. Third closure review of exact
+`7fafe7933faca56842c64773011040be670cb2dc` marked that inherited item `FIXED`, confirmed the prior four residuals
+remain closed, found two new `WRONG` (`High` and `Minor`), no new `SMELL`, and returned
+`R3D1 IMPLEMENTATION: REVISE`; its retained report is
+`/private/tmp/a2a-bridge-r3d1-sol-closure-7fafe79/review.md`, 6,176 bytes, SHA-256
+`aabaae00bb2a4eca44db018a7a434b71f56ff6fed63cb90de94b2bd76bfa14b6`. The fourth remediation removes the
+fallible liveness preflight only from TERM/KILL, uses the retained capability after durable journal publication, and
+makes an actually missing/recycled capability fail closed into `SignalJournalAmbiguous` without a numeric signal.
+It also corrects the focused status generation. The observation-error TERM/KILL and recycled-capability negative
+tests both failed on `7fafe79` before the fix. Fourth closure review of exact
+`b55c17d390861b5afa86a5f812b7727f38f630a0` marked both inherited findings `FIXED`, confirmed the earlier
+mechanisms remain closed, found one new `WRONG / High`, no new `SMELL`, and returned
+`R3D1 IMPLEMENTATION: REVISE`; its retained report is
+`/private/tmp/a2a-bridge-r3d1-sol-closure-b55c17d/review.md`, 5,866 bytes, SHA-256
+`3472273ff438cb58b1ceb8eeba69bc3ed6ee0dbd2fb5faaddaf471292489c634`. The fifth remediation requires retained
+anchors through every signal-capable phase, permits release or ambiguity only in the corresponding no-later-signal
+phase, and rejects a non-retained `start_running`. The schema, start, and transition tests all failed on `b55c17d`
+before the fix. Exact fifth-remediation head `b511d6ce490590e54aae87dccad57e99fbe59a5a` received Sol/xhigh
+`R3D1 IMPLEMENTATION: APPROVE` with no new finding; its retained report is
+`/private/tmp/a2a-bridge-r3d1-sol-closure-b511d6c/review.md`, 5,023 bytes, SHA-256
+`1bf7bf1873c224b0da0067e53a440295c02be7ec677f82553525e5d808840b6d`. The single Fable/xhigh adversarial
+implementation and release/compatibility lens then found no `WRONG`, three nonblocking Minor `SMELL`s, and returned
+`R3D1 RELEASE/COMPATIBILITY: APPROVE`; its retained report is
+`/private/tmp/a2a-bridge-r3d1-fable-lens-review/review.md`, 7,837 bytes, SHA-256
+`088676af7e11beb4d33f1c4410dcf5bfc4a0e55dc1eaa689288934a04de01bed`. No post-approval mechanism change
+occurred; this fold only records review evidence and carries the three integration-hardening smells into R3d2.
+Run exact-final deterministic gates and publish a non-draft R3d1 PR. Preserve R3c/R4 inputs, keep R2f operator
+lifecycle work out of R3d, and never touch the long-lived operator lifecycle from this slice.
 
 ## R3e — OpenRouter provider expansion
 
