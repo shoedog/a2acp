@@ -6,8 +6,9 @@
   fresh `WRONG` or `SMELL`, and returned `APPROVE`. The single Fable/xhigh release/compatibility lens of that same
   exact head found no `WRONG`, retained two Minor nonblocking `SMELL`s for R3d5, and returned `APPROVE`. Exact
   candidate `4133d0a` passes the complete deterministic gate at binary **655/0/0** and canonical full workspace
-  **2,392/0/12 ignored**; exact docs-only review head `e74f93f` independently reran the same full totals. Review
-  evidence is folded; exact-final deterministic gates are next
+  **2,392/0/12 ignored**; exact docs-only review head `e74f93f` independently reran the same full totals. Exact
+  review-evidence head `9b63f42` passes every deterministic release gate with the same binary/full totals. The
+  final docs-only head must reproduce the full suite before the non-draft PR
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)
@@ -990,8 +991,27 @@ Both reviewers independently froze the complete branch and verified the final fu
 accepted compilation, focused suites, release build, dependency policy, and validator executions as supplied rather
 than rerunning them. Neither review is live compatibility, characterization, promotion, or distributable-artifact
 evidence. The long-lived production operator, production scheduler root, registries, images, containers, and live
-compatibility paths were not used, stopped, rebuilt, or changed. This review-evidence docs fold is the only change
-after reviewed `e74f93f`; exact-final deterministic gates and then the one non-draft R3d2 PR are next.
+compatibility paths were not used, stopped, rebuilt, or changed. That review-evidence docs fold was the only change
+after reviewed `e74f93f` and made the exact-final deterministic gate next; exact `9b63f42` below performed it.
+
+Exact review-evidence head `9b63f426b01a8edda818829fd6f7895751b9455c` passes format/diff; warnings-denied
+workspace all-target/all-feature check and Clippy; locked release build; dependency policy; repository hygiene
+**37 tracked artifacts / 7 configs**; manifest **9 cases** at SHA-256
+`5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828`; recipes **4 cases** at SHA-256
+`11d8f50de5515b2f6703741c9a00980e1dc96f766e6370677fd654a0968f0160`; foundation **6 scheduled / 4
+claimed-support** at SHA-256 `aed0e9b224d84624220a6091e51601a677b13d254091a12bc3b1879e36bf5e81`; issue-intake
+live labels plus local **6 runs / 19 assertions**; compatibility CLI **22/0**; foundation CLI **31/0**; supervisor
+CLI **2/0**; complete binary **655/0/0**; and canonical full serial workspace **2,392 passed / 0 failed / 12
+ignored** across **72** result groups, **55** nonempty. The mode-`0600`, 201,405-byte canonical log is
+`/private/tmp/a2a-bridge-r3d2-final-9b63f42/full-workspace-canonical.log`, SHA-256
+`a585434d33ab3209519439ea20911b896e07a5e6b99d14de2c6c33275a282080`. The ignored set remains the twelve
+explicitly authenticated/live provider integration tests; none ran. The release binary remains byte-identical at
+26,604,912 bytes, SHA-256 `5454b5eb38ca7454bd1e3c9feae7d1c97e6565602d704ff5f434bc7e7479f584`.
+
+This gate-recording edit changes only the same three authoritative documents and does not change the reviewed
+mechanism. Commit it as the final docs-only fold, rerun format/diff, hygiene, and the canonical full workspace suite
+on that exact head, and publish the non-draft PR only if the same **2,392/0/12** totals reproduce. Do not rerun Sol
+or Fable.
 
 ## Verification and review gates
 
@@ -1031,12 +1051,12 @@ on a prior `/private/tmp` worktree or review mirror. The branch is based on merg
 boundary open; `2d1640d` plus the cursor fold closed both. Seventh Sol review of exact `e74f93f` resolved both,
 confirmed the other eleven closures, found no fresh finding, and returned `APPROVE`. The single Fable lens of that
 same exact head found no `WRONG`, retained the two Minor R3d5 hardening smells above, and returned `APPROVE`. Focused
-preflight/transaction gates are **8/0 + 27/0**. Exact candidate `4133d0a` passes complete binary **655/0/0** and
-every deterministic release/validator gate; exact docs-only `e74f93f` reran canonical full workspace
-**2,392/0/12 ignored** across **72** result groups, **55** nonempty. Read this plan, the R3d design of record, the
+preflight/transaction gates are **8/0 + 27/0**. Exact review-evidence head `9b63f42` passes complete binary
+**655/0/0**, canonical full workspace **2,392/0/12 ignored** across **72** result groups (**55** nonempty), and every
+deterministic release/validator gate. Read this plan, the R3d design of record, the
 durable roadmap, `AGENTS.md`, and
 `skills/a2a-bridge-operator/SKILL.md` before editing. Preserve the single R3d2 merge boundary, the
 owner-wide-then-authority lock order, the single admission linearization point, the zero-effect default, and the
-separation between provider authority and storage consent. The next action is to commit this review-evidence fold,
-run every exact-final deterministic gate, record that evidence without changing the mechanism, rerun the full suite
-on the final docs-only head, and publish the one non-draft R3d2 PR. Do not rerun Fable.
+separation between provider authority and storage consent. This is the final gate-recording docs-only fold. Rerun
+format/diff, hygiene, and the canonical full suite on its exact committed head; publish the one non-draft R3d2 PR
+only if **2,392/0/12** across **72** groups reproduces. Do not rerun Sol or Fable.
