@@ -3,6 +3,10 @@
 This is an operational evidence matrix, not a support promise. Versions are the installed or pinned
 versions observed on the stated date; they are not claims about the newest upstream release.
 
+For provider/model selection and review-lens policy, read
+[Compatibility and dogfooding routing](compatibility-routing.md). The default-off R3d0 schemas and local
+validators are documented in [Compatibility scheduling foundation](compatibility-scheduling-foundation.md).
+
 Status meanings:
 
 - **PASS** — the exact stated path or control completed its real minimal probe.

@@ -1,0 +1,15 @@
+# R3d0 characterization-required local Ollama profile. The API key variable name is non-secret metadata.
+default = "ollama-local"
+
+[[agents]]
+id = "ollama-local"
+kind = "api"
+base_url = "http://127.0.0.1:11434/v1"
+api_key_env = "OLLAMA_API_KEY"
+model = "qwen3.5:9b"
+
+[registry]
+allowed_cmds = []
+
+[server]
+addr = "127.0.0.1:8080"
