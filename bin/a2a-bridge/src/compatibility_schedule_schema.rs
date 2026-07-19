@@ -2046,6 +2046,18 @@ impl ValidateRecord for SupervisorRecordV1 {
                 "schedule schema: runner is not bound to an anchored workload group".into(),
             );
         }
+        if self.phase != SupervisorPhaseV1::SafetyHold
+            && (runner.is_some_and(|runner| runner.session_id != self.scheduler.session_id)
+                || self
+                    .groups
+                    .iter()
+                    .any(|group| group.session_id != self.scheduler.session_id))
+        {
+            return Err(
+                "schedule schema: operational supervisor topology crossed a session boundary"
+                    .into(),
+            );
+        }
         unique_ids(
             "container run label",
             self.container_run_labels.iter().map(String::as_str),
@@ -2194,6 +2206,7 @@ impl ValidateRecord for SupervisorRecordV1 {
             SupervisorPhaseV1::SafetyHold => {
                 if outcome != Some(SupervisorTerminalOutcomeV1::SafetyHold)
                     || hold.is_none()
+                    || self.groups.is_empty()
                     || self.later_group_signal_permitted
                 {
                     return Err(
@@ -4313,6 +4326,24 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_operational_topology_rejects_cross_session_groups() {
+        let mut cross_session = completed_supervisor();
+        let mut anchor = process_identity_value(53, 53);
+        anchor.session_id = 99;
+        let mut workload = process_identity_value(54, 53);
+        workload.session_id = 99;
+        cross_session.groups.push(AnchoredProcessGroupRecordV1 {
+            process_group: 53,
+            session_id: 99,
+            anchor,
+            workloads: vec![workload],
+            anchor_lifecycle: AnchorLifecycleV1::ReleasedReaped,
+        });
+
+        assert!(cross_session.validate().is_err());
+    }
+
+    #[test]
     fn supervisor_kill_outcome_is_derived_from_the_recorded_cause() {
         let mut killed = completed_supervisor();
         killed.term_journal_elapsed_ms = OptionalElapsedMsV1::ElapsedMs { value: 10 };
@@ -4370,6 +4401,11 @@ mod tests {
         held.child_artifact = OptionalChildArtifactRefV1::Absent;
         held.groups[0].anchor_lifecycle = AnchorLifecycleV1::Ambiguous;
         held.validate().unwrap();
+
+        let mut no_topology = held.clone();
+        no_topology.runner = OptionalProcessIdentityV1::Absent;
+        no_topology.groups.clear();
+        assert!(no_topology.validate().is_err());
 
         held.later_group_signal_permitted = true;
         assert!(held.validate().is_err());

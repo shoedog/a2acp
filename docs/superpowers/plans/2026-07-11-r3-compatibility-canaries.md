@@ -7,7 +7,10 @@
   `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`. R3d0 is
   **MERGED** by PR #38 at merge commit `c2d147fb1f0df275f3c6452cdd212e185c002d08`. R3d1 is
   **IN REVIEW** on `agent/reliability-r3d1-supervisor`; initial exact candidate `01438c34` received a
-  Sol/xhigh `REVISE` and its remediation is deterministic-green pending exact-head closure. Its focused restart plan is
+  Sol/xhigh `REVISE`, and first closure head `e81ebbb` received a second `REVISE` with only topology and
+  stale-cursor items still partial. The second remediation is deterministic-green pending exact-head closure; its
+  candidate release binary is 26,574,128 bytes at SHA-256
+  `5be952d4f6491aea3c1b193d1571c671191547763090b57190e57a22be8133af`. Its focused restart plan is
   [`2026-07-19-r3d1-supervisor-signal-parity.md`](2026-07-19-r3d1-supervisor-signal-parity.md).
   The merged R3d0 implementation was
   `agent/reliability-r3d0-foundation`: the fourth closure review approved exact cursor
@@ -1949,6 +1952,11 @@ run labels, and phase before effects. The anchor remains live through TERM; the 
 keeps its exited leader unreaped until the supervisor journals that no later group signal is permitted, then
 final wait/reap releases the identity. The retained, unreaped child handle is itself the group-signal capability:
 PID/PGID reuse is impossible until reap, so a late process-observation error cannot suppress required cleanup.
+A non-hold supervisor record binds the scheduler, runner, and every anchored group to one exact session. A safety
+hold retains at least one anchored-group record even when its runner identity is unavailable. Once the supervisor
+has acquired a descendant-group anchor, any session, ancestry, liveness, or identity-observation failure appends
+that exact group to the durable hold before disabling later group signals; a dead or unobservable anchor is retained
+as ambiguous rather than silently dropped.
 A crash that makes the signal/journal ordering ambiguous recovers to a
 hold and never retries a numeric-group signal. R3d1
 reuses or factors the already-proven R3c `CommandProcessGroupGuard` mechanism; it must not restore a numeric-
@@ -2764,12 +2772,19 @@ default-off exact-identity supervisor/signal mechanism and typed no-effects pare
 `01438c34f2c17d3c4632583222b57748201e291b` received a bridge-mediated Sol/xhigh/read-only review with
 eight `WRONG`, two `SMELL`, and `R3D1 IMPLEMENTATION: REVISE`; its retained report is
 `/private/tmp/a2a-bridge-r3d1-sol-review-01438c3/review.md`, 6,290 bytes, SHA-256
-`5515c25a33170a9ffa176a116e88ced44dac7754ddbdc10017b6683b94d3334b`. The current remediation closes
-all eight demonstrated failures and the independently found Prepared spawn-before-Running crash window, while
-adjudicating the two proof-boundary `SMELL`s explicitly. Focused gates are **6/0**, **1/0**, **29/0**, **30/0**,
-**4/0**, **21/0**, and **2/0**; full serial workspace is **2,274/0/12 ignored** across **56** binaries. All
-deterministic release/validator gates are green. Freeze the remediation and run the required exact-head Sol/xhigh
-closure review; use the
+`5515c25a33170a9ffa176a116e88ced44dac7754ddbdc10017b6683b94d3334b`. First closure review of exact
+`e81ebbb388ab6ca38b6a0f4c20c4dd54f1690df3` marked nine inherited items `FIXED`, topology and stale-cursor
+items `PARTIAL`, found no new `WRONG` or `SMELL`, and returned `R3D1 IMPLEMENTATION: REVISE`; its retained
+report is `/private/tmp/a2a-bridge-r3d1-sol-closure-e81ebbb/review.md`, 10,258 bytes, SHA-256
+`fa6b12a67e65df7438cb00ab953792e307b0e0b3748a5c9c37e170d96c088a24`. The second remediation rejects
+topology-free holds and cross-session operational snapshots and durably inventories an already-acquired group
+before a session, ancestry, liveness, or identity-observation hold. All three failures were observed red on
+`e81ebbb`. Focused gates are **6/0**, **1/0**, **30/0**, **31/0**, **4/0**, **21/0**, and **2/0**; the complete
+binary suite is **540/0/0**, and full serial workspace is **2,276/0/12 ignored** across **56** binaries. Format and
+diff checks, workspace check, warnings-denied Clippy, locked release, dependency policy, hygiene **37/7**, manifest **9**,
+recipes **4**, and foundation **6/4** are green. The candidate release binary is **26,574,128 bytes**, SHA-256
+`5be952d4f6491aea3c1b193d1571c671191547763090b57190e57a22be8133af`.
+Run the required exact-head Sol/xhigh closure review; use the
 single design-approved Fable/xhigh implementation/release lens only after Sol approval. Preserve R3c/R4 inputs,
 keep R2f operator lifecycle work out of R3d, and never touch the long-lived operator lifecycle from this slice.
 

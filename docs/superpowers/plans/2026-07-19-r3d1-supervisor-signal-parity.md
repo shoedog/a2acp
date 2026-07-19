@@ -1,6 +1,6 @@
 # R3d1 — supervisor and signal-parity implementation plan
 
-- **Status:** IN REVIEW — initial Sol/xhigh review `REVISE`; remediation implemented and deterministic-green;
+- **Status:** IN REVIEW — initial and first closure Sol/xhigh reviews `REVISE`; second remediation implemented;
   exact-head closure review pending
 - **Branch:** `agent/reliability-r3d1-supervisor`
 - **Base:** `origin/main` at `c2d147fb1f0df275f3c6452cdd212e185c002d08`
@@ -178,9 +178,11 @@ Required tests:
 - The versioned deadline and supervisor schemas validate checked phase sums, conservative elapsed derivation,
   exact process and group identities, unique live PID topology, signal/cause/outcome/hold shape, parent/child joins,
   and hash domains. The runtime journal additionally enforces a prepared first generation with a retained empty
-  anchor, monotonic phases, immutable identity/deadline fields, append-only groups, write-once effects/outcomes, and
-  a one-way anchor lifecycle across generations. Reopen reads each generation through the retained journal-directory
-  descriptor and verifies file identity before and after its bounded read.
+  anchor, one scheduler/runner session for every non-hold phase, a nonempty group inventory for every hold,
+  monotonic phases, immutable identity/deadline fields, append-only groups, write-once effects/outcomes, and a
+  one-way anchor lifecycle across generations. A registration failure after descendant-anchor acquisition appends
+  that group to the durable hold before forbidding later signals. Reopen reads each generation through the retained
+  journal-directory descriptor and verifies file identity before and after its bounded read.
 - The default-off supervisor journals before effects, enforces local phase caps while reserving every later phase,
   cleanup grace, and fixed margin under one absolute monotonic deadline, escalates first cancellation/deadline
   through TERM then bounded grace and one KILL, records whether KILL followed deadline or repeated cancellation,
@@ -205,15 +207,21 @@ Required tests:
   `5515c25a33170a9ffa176a116e88ced44dac7754ddbdc10017b6683b94d3334b`. The current remediation closes
   the eight demonstrated failures and the independently found Prepared spawn-before-Running crash window. The
   journal-dirfd and real process-signal integration `SMELL`s are explicitly adjudicated below rather than hidden.
-- Focused gates on the remediated tree: process-group **6/0**, resolver compatibility **1/0**, schedule-schema
-  **29/0**, supervisor **30/0**, cancellation **4/0**, compatibility CLI **21/0**, and R3d1 CLI **2/0**. The complete
-  binary suite is **538/0/0**.
-- Full serial workspace on the remediated tree: **2,274 passed / 0 failed / 12 ignored** across **56** test binaries.
-  Format/diff, workspace all-target check, warnings-denied all-target/all-feature Clippy, locked release build,
-  dependency policy, repository hygiene (**37** tracked artifacts / **7** example configs), pinned manifest (**9**),
-  floating recipes (**4**), and schedule foundation (**6** advisory / **4** claimed-support) are green. The
-  provider-unexercised release binary is 26,575,056 bytes at SHA-256
-  `b4dc8349fdc5faed8255b2a2399350964f9a5334c2a99877c70fa573d39790cc`.
+- First closure review of exact `e81ebbb388ab6ca38b6a0f4c20c4dd54f1690df3` marked nine inherited items
+  `FIXED`, topology and stale-cursor items `PARTIAL`, found no new `WRONG` or `SMELL`, and returned
+  `R3D1 IMPLEMENTATION: REVISE`. Its retained report is
+  `/private/tmp/a2a-bridge-r3d1-sol-closure-e81ebbb/review.md`, mode `0644`, 10,258 bytes, SHA-256
+  `fa6b12a67e65df7438cb00ab953792e307b0e0b3748a5c9c37e170d96c088a24`. The second remediation rejects
+  topology-free holds, rejects cross-session non-hold snapshots, and durably inventories an already-acquired group
+  before a session/ancestry/liveness/identity-observation hold. All three failures were observed red on the prior
+  mechanism.
+- Current focused gates: process-group **6/0**, resolver compatibility **1/0**, schedule-schema **30/0**,
+  supervisor **31/0**, cancellation **4/0**, compatibility CLI **21/0**, and R3d1 CLI **2/0**. The complete binary
+  suite is **540/0/0**; the full serial workspace is **2,276 passed / 0 failed / 12 ignored** across **56** test
+  binaries. Format/diff, workspace all-target check, warnings-denied all-target/all-feature Clippy, locked release,
+  dependency policy, repository hygiene **37/7**, manifest **9**, floating recipes **4**, and schedule foundation
+  **6/4** are green. The exact candidate release binary is **26,574,128 bytes**, SHA-256
+  `5be952d4f6491aea3c1b193d1571c671191547763090b57190e57a22be8133af`.
 - No timer, private authority issuance, live characterization, model discovery, credential access, container/runtime
   access, registry/image effect, compatibility provider turn, GitHub check mutation, or production-operator
   lifecycle action occurred. The authenticated live-agent/two-bridge/Kiro and local-Ollama tests remain the same
@@ -229,7 +237,7 @@ Continue in `/private/tmp/a2a-bridge-r3d1-supervisor` on branch
 `agent/reliability-r3d1-supervisor`. Re-read this plan, the active R3d design supervision section, and the
 central reliability roadmap. Freeze `HEAD`, `origin/main`, merge base, cleanliness, and changed paths before
 review or publication. The initial candidate at exact `01438c34` has already received the Sol/xhigh `REVISE`
-recorded above. The next action is to commit and freeze the deterministic-green remediation, then run an exact-head
-Sol/xhigh closure review that adjudicates all inherited findings plus the Prepared crash window. Run
-the single design-approved Fable/xhigh implementation/release lens only after Sol approval. Never touch the
-long-lived operator lifecycle during R3d1.
+recorded above, and first closure head `e81ebbb` received the second `REVISE`. The second remediation is committed
+in the frozen review head. The next action is an exact-head Sol/xhigh closure
+review of the three topology/ownership fixes and the stale-cursor fold. Run the single design-approved Fable/xhigh
+implementation/release lens only after Sol approval. Never touch the long-lived operator lifecycle during R3d1.

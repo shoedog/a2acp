@@ -591,6 +591,7 @@ fn validate_supervisor_transition(
         (previous.phase, next.phase),
         (SupervisorPhaseV1::Prepared, SupervisorPhaseV1::Running)
             | (SupervisorPhaseV1::Running, SupervisorPhaseV1::Running)
+            | (SupervisorPhaseV1::Running, SupervisorPhaseV1::SafetyHold)
     );
     for previous_group in &previous.groups {
         let Some(next_group) = next
@@ -644,6 +645,8 @@ fn validate_supervisor_transition(
                 .iter()
                 .all(|prior| prior.process_group != group.process_group)
                 && group.anchor_lifecycle != AnchorLifecycleV1::RetainedLive
+                && !(next.phase == SupervisorPhaseV1::SafetyHold
+                    && group.anchor_lifecycle == AnchorLifecycleV1::Ambiguous)
         })
     {
         return Err("schedule supervisor: anchored group inventory changed unsafely".into());
@@ -1080,18 +1083,45 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
             return self.enter_hold(SafetyHoldReasonV1::AnchorAcquisitionFailed);
         }
         let runner = match &self.record.runner {
-            OptionalProcessIdentityV1::Process { value } => value,
+            OptionalProcessIdentityV1::Process { value } => value.clone(),
             OptionalProcessIdentityV1::Absent => {
                 return self.enter_hold(SafetyHoldReasonV1::ProcessIdentityUnavailable)
             }
         };
+        match control.exact_anchor_live(&group) {
+            Ok(true) => {}
+            Ok(false) => {
+                return self.enter_hold_with_added_group(
+                    SafetyHoldReasonV1::AnchorNotLive,
+                    group,
+                    AnchorLifecycleV1::Ambiguous,
+                )
+            }
+            Err(error) => {
+                if let Err(hold_error) = self.enter_hold_with_added_group(
+                    SafetyHoldReasonV1::ProcessIdentityUnavailable,
+                    group,
+                    AnchorLifecycleV1::Ambiguous,
+                ) {
+                    return Err(format!(
+                        "schedule supervisor: anchor observation failed ({error}); durable group hold publication also failed ({hold_error})"
+                    )
+                    .into());
+                }
+                return Err(error);
+            }
+        }
         if group.session_id != runner.session_id
             || group
                 .workloads
                 .iter()
                 .any(|workload| workload.session_id != runner.session_id)
         {
-            return self.enter_hold(SafetyHoldReasonV1::NewSessionEscape);
+            return self.enter_hold_with_added_group(
+                SafetyHoldReasonV1::NewSessionEscape,
+                group,
+                AnchorLifecycleV1::RetainedLive,
+            );
         }
         let mut known_identities = self
             .record
@@ -1103,14 +1133,29 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
         known_identities.sort_by_key(|identity| identity.pid);
         known_identities.dedup();
         for identity in known_identities.iter().chain(group.workloads.iter()) {
-            let exact_live = control.exact_process_live(identity);
-            if !self.control_or_hold(exact_live, SafetyHoldReasonV1::ProcessIdentityUnavailable)? {
-                return self.enter_hold(SafetyHoldReasonV1::ProcessIdentityUnavailable);
+            match control.exact_process_live(identity) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return self.enter_hold_with_added_group(
+                        SafetyHoldReasonV1::ProcessIdentityUnavailable,
+                        group,
+                        AnchorLifecycleV1::RetainedLive,
+                    )
+                }
+                Err(error) => {
+                    if let Err(hold_error) = self.enter_hold_with_added_group(
+                        SafetyHoldReasonV1::ProcessIdentityUnavailable,
+                        group,
+                        AnchorLifecycleV1::RetainedLive,
+                    ) {
+                        return Err(format!(
+                            "schedule supervisor: process observation failed ({error}); durable group hold publication also failed ({hold_error})"
+                        )
+                        .into());
+                    }
+                    return Err(error);
+                }
             }
-        }
-        let anchor_live = control.exact_anchor_live(&group);
-        if !self.control_or_hold(anchor_live, SafetyHoldReasonV1::ProcessIdentityUnavailable)? {
-            return self.enter_hold(SafetyHoldReasonV1::AnchorNotLive);
         }
         let mut known = known_identities
             .iter()
@@ -1128,7 +1173,11 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
                 }
             });
             if pending.len() == before {
-                return self.enter_hold(SafetyHoldReasonV1::ProcessIdentityUnavailable);
+                return self.enter_hold_with_added_group(
+                    SafetyHoldReasonV1::ProcessIdentityUnavailable,
+                    group,
+                    AnchorLifecycleV1::RetainedLive,
+                );
             }
         }
         let mut candidate = self.record.clone();
@@ -1153,6 +1202,32 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
 
     fn enter_hold(&mut self, reason: SafetyHoldReasonV1) -> Result<(), BoxError> {
         self.enter_hold_with_group_lifecycle(reason, None)
+    }
+
+    fn enter_hold_with_added_group(
+        &mut self,
+        reason: SafetyHoldReasonV1,
+        mut group: AnchoredProcessGroupRecordV1,
+        lifecycle: AnchorLifecycleV1,
+    ) -> Result<(), BoxError> {
+        if self
+            .record
+            .groups
+            .iter()
+            .any(|existing| existing.process_group == group.process_group)
+        {
+            return self.enter_hold(reason);
+        }
+        group.anchor_lifecycle = lifecycle;
+        let mut candidate = self.record.clone();
+        candidate.groups.push(group);
+        candidate.phase = SupervisorPhaseV1::SafetyHold;
+        candidate.later_group_signal_permitted = false;
+        candidate.outcome = OptionalSupervisorOutcomeV1::Outcome {
+            value: SupervisorTerminalOutcomeV1::SafetyHold,
+        };
+        candidate.safety_hold = OptionalSafetyHoldReasonV1::Reason { value: reason };
+        self.transition(candidate)
     }
 
     fn enter_hold_with_group_lifecycle(
@@ -1534,6 +1609,7 @@ mod tests {
     struct FakeControl {
         anchor_live: bool,
         runner_live: bool,
+        fail_process_observation: bool,
         fail_anchor_observation: bool,
         fail_runner_observation: bool,
         stale_process_pids: BTreeSet<i32>,
@@ -1563,6 +1639,9 @@ mod tests {
 
     impl SupervisorControl for FakeControl {
         fn exact_process_live(&mut self, process: &ProcessIdentityV1) -> Result<bool, BoxError> {
+            if self.fail_process_observation {
+                return Err("fake process identity observation failed".into());
+            }
             Ok(!self.stale_process_pids.contains(&process.pid))
         }
 
@@ -1766,6 +1845,7 @@ mod tests {
         FakeControl {
             anchor_live: true,
             runner_live: true,
+            fail_process_observation: false,
             fail_anchor_observation: false,
             fail_runner_observation: false,
             stale_process_pids: BTreeSet::new(),
@@ -2560,6 +2640,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(escaped.record().phase, SupervisorPhaseV1::SafetyHold);
+        assert_eq!(escaped.record().groups.len(), 2);
+        assert_eq!(escaped.record().groups[1].process_group, 63);
     }
 
     #[test]
@@ -2582,9 +2664,60 @@ mod tests {
             .unwrap();
 
         assert_eq!(supervisor.record().phase, SupervisorPhaseV1::SafetyHold);
-        assert_eq!(supervisor.record().groups.len(), 1);
+        assert_eq!(supervisor.record().groups.len(), 2);
+        assert_eq!(supervisor.record().groups[1].process_group, 53);
         assert!(control.signals.is_empty());
         assert!(control.unrelated_alive);
+    }
+
+    #[test]
+    fn registration_observation_failures_keep_the_acquired_group_in_the_hold() {
+        let group = || AnchoredProcessGroupRecordV1 {
+            process_group: 53,
+            session_id: 41,
+            anchor: identity(54, 53),
+            workloads: vec![identity_with_parent(55, 44, 53)],
+            anchor_lifecycle: AnchorLifecycleV1::RetainedLive,
+        };
+
+        let (mut dead_anchor, mut dead_anchor_control) = running_fake_supervisor(false);
+        dead_anchor_control.anchor_live = false;
+        dead_anchor
+            .register_descendant_group(&mut dead_anchor_control, group())
+            .unwrap();
+        assert_eq!(dead_anchor.record().phase, SupervisorPhaseV1::SafetyHold);
+        assert_eq!(dead_anchor.record().groups.len(), 2);
+        assert_eq!(
+            dead_anchor.record().groups[1].anchor_lifecycle,
+            AnchorLifecycleV1::Ambiguous
+        );
+        assert!(dead_anchor_control.signals.is_empty());
+
+        let (mut anchor_error, mut anchor_error_control) = running_fake_supervisor(false);
+        anchor_error_control.fail_anchor_observation = true;
+        assert!(anchor_error
+            .register_descendant_group(&mut anchor_error_control, group())
+            .is_err());
+        assert_eq!(anchor_error.record().phase, SupervisorPhaseV1::SafetyHold);
+        assert_eq!(anchor_error.record().groups.len(), 2);
+        assert_eq!(
+            anchor_error.record().groups[1].anchor_lifecycle,
+            AnchorLifecycleV1::Ambiguous
+        );
+        assert!(anchor_error_control.signals.is_empty());
+
+        let (mut process_error, mut process_error_control) = running_fake_supervisor(false);
+        process_error_control.fail_process_observation = true;
+        assert!(process_error
+            .register_descendant_group(&mut process_error_control, group())
+            .is_err());
+        assert_eq!(process_error.record().phase, SupervisorPhaseV1::SafetyHold);
+        assert_eq!(process_error.record().groups.len(), 2);
+        assert_eq!(
+            process_error.record().groups[1].anchor_lifecycle,
+            AnchorLifecycleV1::RetainedLive
+        );
+        assert!(process_error_control.signals.is_empty());
     }
 
     #[test]
