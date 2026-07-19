@@ -105,8 +105,11 @@ startup reopen. Reopen reads each named generation through the retained director
 verifies descriptor identity before and after its bounded read.
 
 The retained, unreaped anchor child is the process-group capability: its PID/PGID cannot recycle before reap, so a
-late liveness-observation error cannot suppress necessary cleanup. Descendant registration revalidates every exact
-runner, workload, and anchor identity before trusting numeric parent links. Prepared recovery resumes only when its
+late liveness-observation error cannot suppress necessary cleanup. TERM/KILL journals first and then signals through
+that retained capability without another fallible liveness preflight. A missing or mismatched capability refuses
+without a numeric-group signal and makes the already-journaled attempt an ambiguous safety hold. Descendant
+registration revalidates every exact runner, workload, and anchor identity before trusting numeric parent links.
+Prepared recovery resumes only when its
 retained group is still exact and contains no possible workload; any observed member or ambiguity becomes a durable
 hold. Before success, the supervisor descriptor-pins and hashes the actual child join and optional aggregate bytes,
 checks their run/window/hash bindings, parses and validates the unchanged aggregate, and releases anchors only after

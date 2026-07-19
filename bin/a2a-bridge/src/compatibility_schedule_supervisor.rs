@@ -460,6 +460,9 @@ pub(super) trait SupervisorControl {
     fn exact_anchor_live(&mut self, group: &AnchoredProcessGroupRecordV1)
         -> Result<bool, BoxError>;
 
+    /// Signal only through the exact retained anchor capability represented by `group`. Implementations
+    /// must refuse without issuing a numeric-group signal when that capability is absent or mismatched;
+    /// a fallible liveness observation is not a substitute for the retained capability.
     fn signal_group(
         &mut self,
         group: &AnchoredProcessGroupRecordV1,
@@ -1181,17 +1184,6 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
         self.enter_hold(SafetyHoldReasonV1::AnchorAcquisitionFailed)
     }
 
-    fn all_anchors_live<C: SupervisorControl>(&self, control: &mut C) -> Result<bool, BoxError> {
-        for group in &self.record.groups {
-            if group.anchor_lifecycle != AnchorLifecycleV1::RetainedLive
-                || !control.exact_anchor_live(group)?
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
     fn enter_hold(&mut self, reason: SafetyHoldReasonV1) -> Result<(), BoxError> {
         self.enter_hold_with_group_lifecycle(reason, None)
     }
@@ -1280,13 +1272,10 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
         control: &mut C,
         elapsed_ms: u64,
     ) -> Result<(), BoxError> {
-        let anchor_observation = self.all_anchors_live(control);
-        if !self.control_or_hold(
-            anchor_observation,
-            SafetyHoldReasonV1::ProcessIdentityUnavailable,
-        )? {
-            return self.enter_hold(SafetyHoldReasonV1::AnchorNotLive);
-        }
+        // The retained, unreaped child handle is the exact group capability. A late fallible
+        // process observation cannot revoke it or permit PID/PGID reuse. Journal first, then let
+        // `signal_group` use that capability and fail closed without a numeric signal if it is
+        // actually absent or mismatched.
         let mut candidate = self.record.clone();
         candidate.phase = SupervisorPhaseV1::TermGrace;
         candidate.term_journal_elapsed_ms = OptionalElapsedMsV1::ElapsedMs { value: elapsed_ms };
@@ -1306,13 +1295,6 @@ impl<J: SupervisorJournal> ScheduleSupervisor<J> {
         elapsed_ms: u64,
         cause: SupervisorKillCauseV1,
     ) -> Result<(), BoxError> {
-        let anchor_observation = self.all_anchors_live(control);
-        if !self.control_or_hold(
-            anchor_observation,
-            SafetyHoldReasonV1::ProcessIdentityUnavailable,
-        )? {
-            return self.enter_hold(SafetyHoldReasonV1::AnchorNotLive);
-        }
         let mut candidate = self.record.clone();
         candidate.phase = SupervisorPhaseV1::KillJournaled;
         candidate.kill_journal_elapsed_ms = OptionalElapsedMsV1::ElapsedMs { value: elapsed_ms };
@@ -1662,8 +1644,8 @@ mod tests {
             if self.fail_signal {
                 return Err("fake group signal failed".into());
             }
-            if self.recycled {
-                self.unrelated_alive = false;
+            if !self.anchor_live || self.recycled {
+                return Err("fake exact retained anchor capability is unavailable".into());
             }
             self.signals.push(match signal {
                 SupervisorSignal::Term => FakeSignal::Term,
@@ -2449,14 +2431,17 @@ mod tests {
     }
 
     #[test]
-    fn anchor_observation_error_enters_hold_before_any_signal() {
+    fn anchor_observation_error_does_not_suppress_retained_capability_signals() {
         let (mut supervisor, mut control) = running_fake_supervisor(false);
         control.fail_anchor_observation = true;
 
-        assert!(supervisor.request_cancel(&mut control, 10).is_err());
+        supervisor.request_cancel(&mut control, 10).unwrap();
+        assert_eq!(supervisor.record().phase, SupervisorPhaseV1::TermGrace);
+        assert_eq!(control.signals, vec![FakeSignal::Term]);
 
-        assert_eq!(supervisor.record().phase, SupervisorPhaseV1::SafetyHold);
-        assert!(control.signals.is_empty());
+        supervisor.request_cancel(&mut control, 20).unwrap();
+        assert_eq!(supervisor.record().phase, SupervisorPhaseV1::Reaping);
+        assert_eq!(control.signals, vec![FakeSignal::Term, FakeSignal::Kill]);
     }
 
     #[test]
@@ -2958,10 +2943,16 @@ mod tests {
         let (mut supervisor, mut control) = running_fake_supervisor(false);
         control.recycle_supervised_group_to_unrelated();
 
-        supervisor.request_cancel(&mut control, 10).unwrap();
+        assert!(supervisor.request_cancel(&mut control, 10).is_err());
 
         assert!(control.signals.is_empty());
         assert!(control.unrelated_alive);
         assert_eq!(supervisor.record().phase, SupervisorPhaseV1::SafetyHold);
+        assert_eq!(
+            supervisor.record().safety_hold,
+            OptionalSafetyHoldReasonV1::Reason {
+                value: SafetyHoldReasonV1::SignalJournalAmbiguous
+            }
+        );
     }
 }

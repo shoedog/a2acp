@@ -9,7 +9,9 @@
   **IN REVIEW** on `agent/reliability-r3d1-supervisor`; initial exact candidate `01438c34` and first closure head
   `e81ebbb` each received Sol/xhigh `REVISE`. Second closure head `8feda4d` marked all four requested topology/cursor
   residuals `FIXED`, found one new post-anchor-retention `WRONG / High`, no new `SMELL`, and returned `REVISE`.
-  The third remediation is deterministic-green pending exact-head closure; its
+  Third closure head `7fafe79` marked that item `FIXED`, confirmed prior residuals closed, found two new `WRONG`
+  (`High` and `Minor`), no new `SMELL`, and returned `REVISE`. The fourth remediation is deterministic-green pending
+  exact-head closure; its
   candidate release binary is 26,574,128 bytes at SHA-256
   `5be952d4f6491aea3c1b193d1571c671191547763090b57190e57a22be8133af`. Its focused restart plan is
   [`2026-07-19-r3d1-supervisor-signal-parity.md`](2026-07-19-r3d1-supervisor-signal-parity.md).
@@ -1953,6 +1955,9 @@ run labels, and phase before effects. The anchor remains live through TERM; the 
 keeps its exited leader unreaped until the supervisor journals that no later group signal is permitted, then
 final wait/reap releases the identity. The retained, unreaped child handle is itself the group-signal capability:
 PID/PGID reuse is impossible until reap, so a late process-observation error cannot suppress required cleanup.
+TERM/KILL journals before the effect and then uses that retained capability directly; it does not gate the capability
+on another fallible liveness observation. An absent or mismatched capability refuses without a numeric-group signal
+and moves the already-journaled attempt to an ambiguous safety hold.
 A non-hold supervisor record binds the scheduler, runner, and every anchored group to one exact session. A safety
 hold retains at least one anchored-group record even when its runner identity is unavailable. Once the supervisor
 has acquired a descendant-group anchor, it retains the exact live capability and serializable record before any
@@ -2794,7 +2799,16 @@ topology/cursor residuals `FIXED`, found one new `WRONG / High`, no new `SMELL`,
 fallible observation after exact descendant-anchor acquisition and before retaining the capability and record.
 Registration owns workload revalidation and can journal that exact group into `SafetyHold`. Its real two-workload
 regression failed at the pre-retention error on `8feda4d` and now proves the stale workload holds while the other
-workload remains live and durably inventoried. Run the required exact-head Sol/xhigh closure review; use the
+workload remains live and durably inventoried. Third closure review of exact
+`7fafe7933faca56842c64773011040be670cb2dc` marked that inherited item `FIXED`, confirmed the prior four residuals
+remain closed, found two new `WRONG` (`High` and `Minor`), no new `SMELL`, and returned
+`R3D1 IMPLEMENTATION: REVISE`; its retained report is
+`/private/tmp/a2a-bridge-r3d1-sol-closure-7fafe79/review.md`, 6,176 bytes, SHA-256
+`aabaae00bb2a4eca44db018a7a434b71f56ff6fed63cb90de94b2bd76bfa14b6`. The fourth remediation removes the
+fallible liveness preflight only from TERM/KILL, uses the retained capability after durable journal publication, and
+makes an actually missing/recycled capability fail closed into `SignalJournalAmbiguous` without a numeric signal.
+It also corrects the focused status generation. The observation-error TERM/KILL and recycled-capability negative
+tests both failed on `7fafe79` before the fix. Run the required exact-head Sol/xhigh closure review; use the
 single design-approved Fable/xhigh implementation/release lens only after Sol approval. Preserve R3c/R4 inputs,
 keep R2f operator lifecycle work out of R3d, and never touch the long-lived operator lifecycle from this slice.
 

@@ -1,7 +1,7 @@
 # R3d1 — supervisor and signal-parity implementation plan
 
-- **Status:** IN REVIEW — initial and first closure Sol/xhigh reviews `REVISE`; second remediation implemented;
-  exact-head closure review pending
+- **Status:** IN REVIEW — initial plus first, second, and third closure Sol/xhigh reviews `REVISE`; fourth
+  remediation implemented; exact-head closure review pending
 - **Branch:** `agent/reliability-r3d1-supervisor`
 - **Base:** `origin/main` at `c2d147fb1f0df275f3c6452cdd212e185c002d08`
   (PR #38 merged R3d0)
@@ -226,6 +226,16 @@ Required tests:
   revalidates every workload and journals the exact acquired group into `SafetyHold` on failure. The real two-workload
   regression failed on `8feda4d` at the pre-retention error and now proves the stale workload holds while the second
   workload remains live and durably inventoried.
+- Third closure review of exact `7fafe7933faca56842c64773011040be670cb2dc` marked the inherited
+  post-anchor-retention finding `FIXED`, confirmed the four prior topology/cursor residuals remain closed, found two
+  new `WRONG` (`High` and `Minor`), no new `SMELL`, and returned `R3D1 IMPLEMENTATION: REVISE`. Its retained report
+  is `/private/tmp/a2a-bridge-r3d1-sol-closure-7fafe79/review.md`, mode `0644`, 6,176 bytes, SHA-256
+  `aabaae00bb2a4eca44db018a7a434b71f56ff6fed63cb90de94b2bd76bfa14b6`. TERM/KILL still preflighted the exact
+  retained signal capability through a fallible liveness observation, so an `EMFILE`-like error suppressed required
+  cleanup; the status header also named the wrong remediation generation. The fourth remediation makes
+  journal-before-effect `signal_group` capability-authoritative, preserves conservative recovery/release observation
+  holds, makes missing/recycled capabilities fail closed into `SignalJournalAmbiguous`, and corrects this header. The
+  observation-error TERM/KILL and recycled-capability negative tests both failed on `7fafe79` before the fix.
 - Current focused gates: process-group **6/0**, resolver compatibility **1/0**, schedule-schema **30/0**,
   supervisor **31/0**, cancellation **4/0**, compatibility CLI **21/0**, and R3d1 CLI **2/0**. The complete binary
   suite is **540/0/0**; the full serial workspace is **2,276 passed / 0 failed / 12 ignored** across **56** test
@@ -248,7 +258,8 @@ Continue in `/private/tmp/a2a-bridge-r3d1-supervisor` on branch
 `agent/reliability-r3d1-supervisor`. Re-read this plan, the active R3d design supervision section, and the
 central reliability roadmap. Freeze `HEAD`, `origin/main`, merge base, cleanliness, and changed paths before
 review or publication. The initial candidate at exact `01438c34` has already received the Sol/xhigh `REVISE`
-recorded above; first closure head `e81ebbb` and second closure head `8feda4d` each received `REVISE`. The third
-remediation is committed in the frozen review head. The next action is an exact-head Sol/xhigh closure of the
-post-anchor retention fix and its red-before-green two-workload regression. Run the single design-approved Fable/xhigh
+recorded above; first closure head `e81ebbb`, second closure head `8feda4d`, and third closure head `7fafe79` each
+received `REVISE`. The fourth remediation is committed in the frozen review head. The next action is an exact-head
+Sol/xhigh closure of the retained-capability TERM/KILL fix, its two red-before-green regressions, and the status-header
+correction. Run the single design-approved Fable/xhigh
 implementation/release lens only after Sol approval. Never touch the long-lived operator lifecycle during R3d1.
