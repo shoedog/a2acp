@@ -7,6 +7,7 @@
 
 #![allow(dead_code)] // The default-off CLI wiring lands at the end of R3d2e.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::Path;
@@ -18,8 +19,9 @@ use crate::compatibility_schedule::{
 };
 use crate::compatibility_schedule_admission::{
     rederive_claimed_support_ledger_context_from_foundation, rederive_manual_ledger_context,
-    rederive_scheduled_ledger_context_from_foundation, CharacterizationStateV1, ControlStateV1,
-    DerivedLedgerAdmissionContextV1, EquivalentWorkDecisionV1, EquivalentWorkStateV1,
+    rederive_scheduled_ledger_context_from_foundation, CharacterizationStateV1,
+    CompletedEquivalentEvidenceV1, ControlStateV1, DerivedLedgerAdmissionContextV1,
+    EquivalentWorkDecisionV1, EquivalentWorkStateV1,
 };
 use crate::compatibility_schedule_authority::{
     authority_state_snapshot_sha256, manual_admission_sha256, select_characterization_authority,
@@ -29,8 +31,9 @@ use crate::compatibility_schedule_authority::{
     SealedManualAdmissionV1, StandingAdmissionRequestV1,
 };
 use crate::compatibility_schedule_ledger::{
-    prepared_reservation_sha256, validate_prepared_reservation_context, FileCompatibilityLedger,
-    LedgerBudgetAuthorityV1, LedgerReservationRequestV1,
+    prepared_reservation_sha256, validate_prepared_reservation_context, ConservativeChargeReasonV1,
+    FileCompatibilityLedger, LedgerBudgetAuthorityV1, LedgerReservationRequestV1,
+    ReconciliationDecisionV1,
 };
 use crate::compatibility_schedule_preflight::{
     pin_action_directories, preflight_pass_sha256, validate_planned_directory_binding,
@@ -38,9 +41,10 @@ use crate::compatibility_schedule_preflight::{
 };
 use crate::compatibility_schedule_schema::{
     validate_supervisor_record, AdmissionAuthorityV1, AdmissionTriggerIdentityV1,
-    CaseExecutionFingerprintInputV1, ClaimedSupportCharacterizationSourceV1, ConsumptionRecordV1,
-    EquivalentWorkReservationV1, LedgerReservationV1, OptionalSha256V1, ScheduledExecutionSourceV1,
-    SupervisorRecordV1,
+    CaseExecutionFingerprintInputV1, ClaimedSupportCharacterizationSourceV1,
+    ConsumptionEvidenceProvenanceV1, ConsumptionRecordV1, EquivalentWorkReservationV1,
+    LedgerReservationV1, OptionalSha256V1, OptionalSupervisorOutcomeV1, ScheduledExecutionSourceV1,
+    SupervisorPhaseV1, SupervisorRecordV1, SupervisorTerminalOutcomeV1, UsageChargeV1,
 };
 use crate::compatibility_schedule_state::{AdmissionStateCapability, AuthorityStateCapability};
 use crate::compatibility_schedule_supervisor::ensure_prepared_supervisor;
@@ -49,6 +53,7 @@ use crate::{local_file, BoxError};
 const MAX_COMMIT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_COMMIT_GENERATIONS: usize = 100_000;
 const COMMIT_PREFIX: &str = "admission-commit.";
+const TERMINAL_PREFIX: &str = "admission-terminal.";
 
 fn transaction_hash<T: Serialize>(label: &str, value: &T) -> Result<String, BoxError> {
     let canonical = serde_json::to_vec(value)
@@ -341,6 +346,187 @@ pub(super) struct AdmissionCommitV1 {
     pub(super) trusted_root: PlannedDirectoryBindingV1,
     pub(super) requested_cwd: PlannedDirectoryBindingV1,
     pub(super) recorded_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum AdmissionTerminalDispositionV1 {
+    ProvedPreEffect {
+        evidence_sha256: String,
+    },
+    ValidTerminal {
+        evidence: CompletedEquivalentEvidenceV1,
+        usage: UsageChargeV1,
+        prompt_was_accepted: bool,
+    },
+    Conservative {
+        evidence_sha256: String,
+        reason: ConservativeChargeReasonV1,
+        prompt_may_have_been_accepted: bool,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdmissionTerminalV1 {
+    pub(super) schema_version: u16,
+    pub(super) generation: u64,
+    pub(super) terminal_id: String,
+    pub(super) admission_commit_identity_sha256: String,
+    pub(super) supervisor: SupervisorRecordV1,
+    pub(super) supervisor_journal_sha256: String,
+    pub(super) disposition: AdmissionTerminalDispositionV1,
+    pub(super) admission_state_before_sha256: String,
+    pub(super) admission_state_after: AdmissionStateV1,
+    pub(super) recorded_at_ms: i64,
+}
+
+fn supervisor_outcome(value: &SupervisorRecordV1) -> Option<SupervisorTerminalOutcomeV1> {
+    match value.outcome {
+        OptionalSupervisorOutcomeV1::Absent => None,
+        OptionalSupervisorOutcomeV1::Outcome { value } => Some(value),
+    }
+}
+
+fn usage_within_caps(usage: &UsageChargeV1, caps: &EffectCapsV1) -> bool {
+    usage.attempts == 1
+        && usage.attempts <= caps.attempts
+        && usage.tokens <= caps.max_tokens
+        && usage.cost_microusd <= caps.max_cost_microusd
+        && usage.elapsed_millis <= caps.timeout_secs.saturating_mul(1_000)
+}
+
+fn pre_effect_evidence(
+    commit: &AdmissionCommitV1,
+    reservation: &EquivalentWorkReservationV1,
+    evidence_sha256: String,
+    terminal_at_ms: i64,
+) -> CompletedEquivalentEvidenceV1 {
+    let expected = commit
+        .context
+        .identities
+        .case_execution
+        .input
+        .expected_effective_identity
+        .clone();
+    CompletedEquivalentEvidenceV1 {
+        reservation_id: reservation.reservation_id.clone(),
+        evidence_sha256,
+        satisfied_purpose: reservation.evidence_purpose,
+        freshness_bucket: reservation.freshness_bucket.clone(),
+        characterization_profile: reservation.characterization_profile.clone(),
+        case_execution: reservation.case_execution.clone(),
+        expected_effective_identity: expected.clone(),
+        observed_effective_identity: expected,
+        provenance: ConsumptionEvidenceProvenanceV1::Ordinary,
+        reusable: false,
+        terminal_at_ms,
+    }
+}
+
+fn validate_terminal_against_state(
+    value: &AdmissionTerminalV1,
+    commit: &AdmissionCommitV1,
+    before: &AdmissionStateV1,
+) -> Result<(), BoxError> {
+    if value.schema_version != 1
+        || value.generation != commit.generation
+        || value.recorded_at_ms < commit.recorded_at_ms
+        || value.terminal_id != format!("terminal-{}", commit.commit_identity_sha256)
+        || value.admission_commit_identity_sha256 != commit.commit_identity_sha256
+        || !local_file::valid_sha256(&value.supervisor_journal_sha256)
+        || value.admission_state_before_sha256 != admission_state_sha256(before)?
+    {
+        return Err("schedule transaction: terminal identity or state binding diverged".into());
+    }
+    let AdmissionDispositionV1::Reserved {
+        equivalent_work,
+        ledger,
+        supervisor: prepared,
+        ..
+    } = &commit.disposition
+    else {
+        return Err("schedule transaction: reused admission cannot have a terminal record".into());
+    };
+    validate_supervisor_record(&value.supervisor)?;
+    if value.supervisor.supervisor_record_id != prepared.supervisor_record_id
+        || value.supervisor.run_id != prepared.run_id
+        || value.supervisor.window_id != prepared.window_id
+        || value.supervisor.trigger != prepared.trigger
+        || value.supervisor.recorded_at_ms > value.recorded_at_ms
+        || !matches!(
+            value.supervisor.phase,
+            SupervisorPhaseV1::Complete | SupervisorPhaseV1::SafetyHold
+        )
+    {
+        return Err("schedule transaction: terminal supervisor/reservation join diverged".into());
+    }
+
+    let mut expected = before.clone();
+    match &value.disposition {
+        AdmissionTerminalDispositionV1::ProvedPreEffect { evidence_sha256 } => {
+            if !local_file::valid_sha256(evidence_sha256)
+                || supervisor_outcome(&value.supervisor)
+                    != Some(SupervisorTerminalOutcomeV1::CancelledBeforeRunning)
+            {
+                return Err("schedule transaction: pre-effect terminal is not proved".into());
+            }
+            expected
+                .equivalent_work
+                .record_completed(pre_effect_evidence(
+                    commit,
+                    equivalent_work,
+                    evidence_sha256.clone(),
+                    value.recorded_at_ms,
+                ))?;
+        }
+        AdmissionTerminalDispositionV1::ValidTerminal {
+            evidence,
+            usage,
+            prompt_was_accepted: _,
+        } => {
+            if value.supervisor.phase != SupervisorPhaseV1::Complete
+                || supervisor_outcome(&value.supervisor)
+                    == Some(SupervisorTerminalOutcomeV1::CancelledBeforeRunning)
+                || !usage_within_caps(usage, &ledger.caps)
+                || evidence.reservation_id != equivalent_work.reservation_id
+                || evidence.characterization_profile != equivalent_work.characterization_profile
+                || evidence.case_execution != equivalent_work.case_execution
+                || evidence.satisfied_purpose != equivalent_work.evidence_purpose
+                || evidence.freshness_bucket != equivalent_work.freshness_bucket
+                || evidence.expected_effective_identity
+                    != commit
+                        .context
+                        .identities
+                        .case_execution
+                        .input
+                        .expected_effective_identity
+                || evidence.expected_effective_identity != evidence.observed_effective_identity
+                || evidence.terminal_at_ms != value.recorded_at_ms
+            {
+                return Err("schedule transaction: valid terminal evidence diverged".into());
+            }
+            expected
+                .equivalent_work
+                .record_completed(evidence.clone())?;
+        }
+        AdmissionTerminalDispositionV1::Conservative {
+            evidence_sha256, ..
+        } => {
+            if !local_file::valid_sha256(evidence_sha256)
+                || supervisor_outcome(&value.supervisor)
+                    == Some(SupervisorTerminalOutcomeV1::CancelledBeforeRunning)
+            {
+                return Err("schedule transaction: conservative terminal shape diverged".into());
+            }
+            // Ambiguous/possibly accepted work intentionally remains live and blocks a successor.
+        }
+    }
+    expected.validate()?;
+    if value.admission_state_after != expected {
+        return Err("schedule transaction: terminal state was not reducer-derived".into());
+    }
+    Ok(())
 }
 
 fn commit_identity_sha256(
@@ -1163,6 +1349,182 @@ where
     }
 }
 
+fn ledger_reconciliation(terminal: &AdmissionTerminalV1) -> ReconciliationDecisionV1 {
+    match &terminal.disposition {
+        AdmissionTerminalDispositionV1::ProvedPreEffect { evidence_sha256 } => {
+            ReconciliationDecisionV1::ProvedPreEffect {
+                evidence_sha256: evidence_sha256.clone(),
+                reconciled_at_ms: terminal.recorded_at_ms,
+            }
+        }
+        AdmissionTerminalDispositionV1::ValidTerminal {
+            evidence,
+            usage,
+            prompt_was_accepted,
+        } => ReconciliationDecisionV1::ValidTerminal {
+            evidence_sha256: evidence.evidence_sha256.clone(),
+            usage: usage.clone(),
+            prompt_was_accepted: *prompt_was_accepted,
+            reconciled_at_ms: terminal.recorded_at_ms,
+        },
+        AdmissionTerminalDispositionV1::Conservative {
+            evidence_sha256,
+            reason,
+            prompt_may_have_been_accepted,
+        } => ReconciliationDecisionV1::Conservative {
+            evidence_sha256: evidence_sha256.clone(),
+            reason: *reason,
+            prompt_may_have_been_accepted: *prompt_may_have_been_accepted,
+            reconciled_at_ms: terminal.recorded_at_ms,
+        },
+    }
+}
+
+fn publish_terminal_state<C>(
+    capability: &C,
+    commit: &AdmissionCommitV1,
+    terminal: &AdmissionTerminalV1,
+    terminal_sha256: &str,
+) -> Result<(), BoxError>
+where
+    C: AdmissionStateCapability + AuthorityStateCapability + ?Sized,
+{
+    let AdmissionDispositionV1::Reserved {
+        ledger,
+        supervisor: prepared,
+        ..
+    } = &commit.disposition
+    else {
+        return Err("schedule transaction: reused commit cannot publish a terminal".into());
+    };
+    let supervisor_directory = capability.supervisor_directory().canonical_path();
+    let (latest, latest_sha256) = ensure_prepared_supervisor(&supervisor_directory, prepared)?;
+    if latest != terminal.supervisor || latest_sha256 != terminal.supervisor_journal_sha256 {
+        return Err("schedule transaction: terminal supervisor tail diverged".into());
+    }
+    let mut opened_ledger = FileCompatibilityLedger::open(capability)?;
+    opened_ledger.reconcile(&ledger.reservation_id, ledger_reconciliation(terminal))?;
+
+    let AuthorityCommitActionV1::OneShot { entry_id } = &commit.authority_action else {
+        return Ok(());
+    };
+    let mut authority = FileAuthorityJournal::open_existing(capability)?;
+    let phase = &authority
+        .snapshot
+        .state
+        .one_shots
+        .get(entry_id)
+        .ok_or("schedule transaction: terminal one-shot lifecycle is absent")?
+        .phase;
+    match phase {
+        OneShotLifecyclePhaseV1::ConsumedUnreconciled {
+            admission_commit_sha256,
+            ..
+        } if admission_commit_sha256 == &commit.commit_identity_sha256 => {
+            let mut next = authority.snapshot.state.clone();
+            next.reconcile_one_shot(
+                entry_id,
+                &commit.commit_identity_sha256,
+                terminal_sha256,
+                terminal.recorded_at_ms,
+            )?;
+            authority.journal.append(&next, terminal.recorded_at_ms)?;
+            Ok(())
+        }
+        OneShotLifecyclePhaseV1::Reconciled {
+            admission_commit_sha256,
+            terminal_record_sha256,
+            ..
+        } if admission_commit_sha256 == &commit.commit_identity_sha256
+            && terminal_record_sha256 == terminal_sha256 =>
+        {
+            Ok(())
+        }
+        _ => Err("schedule transaction: one-shot terminal reconciliation diverged".into()),
+    }
+}
+
+fn build_admission_terminal(
+    commit: &AdmissionCommitV1,
+    before: &AdmissionStateV1,
+    supervisor: SupervisorRecordV1,
+    supervisor_journal_sha256: String,
+    disposition: AdmissionTerminalDispositionV1,
+    recorded_at_ms: i64,
+) -> Result<AdmissionTerminalV1, BoxError> {
+    let AdmissionDispositionV1::Reserved {
+        equivalent_work, ..
+    } = &commit.disposition
+    else {
+        return Err("schedule transaction: reused commit cannot be terminalized".into());
+    };
+    let mut after = before.clone();
+    match &disposition {
+        AdmissionTerminalDispositionV1::ProvedPreEffect { evidence_sha256 } => {
+            after.equivalent_work.record_completed(pre_effect_evidence(
+                commit,
+                equivalent_work,
+                evidence_sha256.clone(),
+                recorded_at_ms,
+            ))?;
+        }
+        AdmissionTerminalDispositionV1::ValidTerminal { evidence, .. } => {
+            after.equivalent_work.record_completed(evidence.clone())?;
+        }
+        AdmissionTerminalDispositionV1::Conservative { .. } => {}
+    }
+    let value = AdmissionTerminalV1 {
+        schema_version: 1,
+        generation: commit.generation,
+        terminal_id: format!("terminal-{}", commit.commit_identity_sha256),
+        admission_commit_identity_sha256: commit.commit_identity_sha256.clone(),
+        supervisor,
+        supervisor_journal_sha256,
+        disposition,
+        admission_state_before_sha256: admission_state_sha256(before)?,
+        admission_state_after: after,
+        recorded_at_ms,
+    };
+    validate_terminal_against_state(&value, commit, before)?;
+    Ok(value)
+}
+
+pub(super) fn reconcile_pending_admission<C>(
+    capability: &C,
+    disposition: AdmissionTerminalDispositionV1,
+    recorded_at_ms: i64,
+) -> Result<AdmissionTerminalV1, BoxError>
+where
+    C: AdmissionStateCapability + AuthorityStateCapability + ?Sized,
+{
+    recover_committed_state(capability)?;
+    let mut admission = FileAdmissionJournal::open(capability)?;
+    let Some(commit) = admission.journal.pending_reserved.clone() else {
+        if let Some((existing, _sha256)) = admission.terminals.last() {
+            if existing.disposition == disposition && existing.recorded_at_ms == recorded_at_ms {
+                return Ok(existing.clone());
+            }
+        }
+        return Err("schedule transaction: no pending admission matches reconciliation".into());
+    };
+    let AdmissionDispositionV1::Reserved { supervisor, .. } = &commit.disposition else {
+        unreachable!("pending admission is always reserved")
+    };
+    let supervisor_directory = capability.supervisor_directory().canonical_path();
+    let (latest, latest_sha256) = ensure_prepared_supervisor(&supervisor_directory, supervisor)?;
+    let terminal = build_admission_terminal(
+        &commit,
+        admission.journal.state(),
+        latest,
+        latest_sha256,
+        disposition,
+        recorded_at_ms,
+    )?;
+    let terminal_sha256 = admission.journal.append_terminal(terminal.clone())?;
+    publish_terminal_state(capability, &commit, &terminal, &terminal_sha256)?;
+    Ok(terminal)
+}
+
 /// Completes every durable projection implied by a valid admission commit. It deliberately has no
 /// runner handoff argument: recovery may make authority, ledger, and Prepared supervisor state
 /// visible, but it can never repeat a possibly accepted provider effect.
@@ -1173,6 +1535,17 @@ where
     let admission = FileAdmissionJournal::open(capability)?;
     for (commit, _sha256) in &admission.commits {
         publish_committed_state(capability, commit)?;
+    }
+    let commits = admission
+        .commits
+        .iter()
+        .map(|(commit, _)| (commit.generation, commit))
+        .collect::<BTreeMap<_, _>>();
+    for (terminal, terminal_sha256) in &admission.terminals {
+        let commit = commits
+            .get(&terminal.generation)
+            .ok_or("schedule transaction: terminal recovery lost its commit")?;
+        publish_terminal_state(capability, commit, terminal, terminal_sha256)?;
     }
     Ok(admission.commits.len())
 }
@@ -1272,6 +1645,7 @@ pub(super) struct AdmissionJournalOpen<'lock> {
     pub(super) journal: FileAdmissionJournal<'lock>,
     pub(super) state: AdmissionStateV1,
     pub(super) commits: Vec<(AdmissionCommitV1, String)>,
+    pub(super) terminals: Vec<(AdmissionTerminalV1, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1280,11 +1654,16 @@ pub(super) struct FileAdmissionJournal<'lock> {
     next_generation: u64,
     previous_sha256: Option<String>,
     state: AdmissionStateV1,
+    pending_reserved: Option<AdmissionCommitV1>,
 }
 
 impl<'lock> FileAdmissionJournal<'lock> {
     fn generation_name(generation: u64) -> String {
         format!("{COMMIT_PREFIX}{generation:020}.json")
+    }
+
+    fn terminal_name(generation: u64) -> String {
+        format!("{TERMINAL_PREFIX}{generation:020}.json")
     }
 
     fn entries(directory: &local_file::PinnedDirectory) -> Result<Vec<(u64, String)>, BoxError> {
@@ -1319,6 +1698,41 @@ impl<'lock> FileAdmissionJournal<'lock> {
         Ok(entries)
     }
 
+    fn terminal_entries(
+        directory: &local_file::PinnedDirectory,
+    ) -> Result<Vec<(u64, String)>, BoxError> {
+        if !directory.current_path_matches() {
+            return Err("schedule transaction: retained admission directory changed".into());
+        }
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(directory.canonical_path())? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "schedule transaction: non-UTF8 terminal entry")?;
+            if !name.starts_with(TERMINAL_PREFIX) {
+                continue;
+            }
+            let raw = name
+                .strip_prefix(TERMINAL_PREFIX)
+                .and_then(|value| value.strip_suffix(".json"))
+                .ok_or("schedule transaction: malformed terminal generation name")?;
+            if raw.len() != 20 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("schedule transaction: malformed terminal generation number".into());
+            }
+            entries.push((raw.parse::<u64>()?, name));
+        }
+        if entries.len() > MAX_COMMIT_GENERATIONS || !directory.current_path_matches() {
+            return Err("schedule transaction: terminal scan is unbounded or unstable".into());
+        }
+        entries.sort_by_key(|(generation, _)| *generation);
+        if entries.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err("schedule transaction: duplicate terminal generation".into());
+        }
+        Ok(entries)
+    }
+
     fn read_commit(
         directory: &local_file::PinnedDirectory,
         name: &str,
@@ -1350,6 +1764,35 @@ impl<'lock> FileAdmissionJournal<'lock> {
         Ok((value, read.sha256))
     }
 
+    fn read_terminal(
+        directory: &local_file::PinnedDirectory,
+        name: &str,
+    ) -> Result<(AdmissionTerminalV1, String), BoxError> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let file = directory.open_regular_file(OsStr::new(name), "admission terminal")?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.len() > MAX_COMMIT_BYTES
+        {
+            return Err("schedule transaction: terminal is not owner-only mode-0600".into());
+        }
+        let read = local_file::read_open_regular_file_bounded(
+            &file,
+            "admission terminal",
+            MAX_COMMIT_BYTES,
+        )?;
+        let value: AdmissionTerminalV1 = serde_json::from_slice(&read.bytes)
+            .map_err(|error| format!("schedule transaction: invalid terminal: {error}"))?;
+        if canonical_bytes(&value)? != read.bytes {
+            return Err("schedule transaction: terminal is not canonical JSON".into());
+        }
+        Ok((value, read.sha256))
+    }
+
     pub(super) fn open<C: AdmissionStateCapability + ?Sized>(
         capability: &'lock C,
     ) -> Result<AdmissionJournalOpen<'lock>, BoxError> {
@@ -1357,7 +1800,17 @@ impl<'lock> FileAdmissionJournal<'lock> {
         let mut state = AdmissionStateV1::new();
         let mut previous_sha256: Option<String> = None;
         let mut commits = Vec::new();
+        let mut terminals = Vec::new();
+        let mut terminal_entries = Self::terminal_entries(directory)?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let mut pending_reserved: Option<AdmissionCommitV1> = None;
         for (index, (generation, name)) in Self::entries(directory)?.into_iter().enumerate() {
+            if pending_reserved.is_some() {
+                return Err(
+                    "schedule transaction: a later commit bypassed terminal reconciliation".into(),
+                );
+            }
             let expected = u64::try_from(index + 1)?;
             if generation != expected {
                 return Err(
@@ -1382,7 +1835,26 @@ impl<'lock> FileAdmissionJournal<'lock> {
             validate_commit_against_state(&commit, &state)?;
             state = commit.admission_state_after.clone();
             previous_sha256 = Some(sha256.clone());
+            let terminal_name = terminal_entries.remove(&generation);
+            match (&commit.disposition, terminal_name) {
+                (AdmissionDispositionV1::Reserved { .. }, Some(name)) => {
+                    let (terminal, terminal_sha256) = Self::read_terminal(directory, &name)?;
+                    validate_terminal_against_state(&terminal, &commit, &state)?;
+                    state = terminal.admission_state_after.clone();
+                    terminals.push((terminal, terminal_sha256));
+                }
+                (AdmissionDispositionV1::Reserved { .. }, None) => {
+                    pending_reserved = Some(commit.clone());
+                }
+                (AdmissionDispositionV1::Reused { .. }, Some(_)) => {
+                    return Err("schedule transaction: reused commit has a terminal record".into())
+                }
+                (AdmissionDispositionV1::Reused { .. }, None) => {}
+            }
             commits.push((commit, sha256));
+        }
+        if !terminal_entries.is_empty() {
+            return Err("schedule transaction: terminal has no matching admission commit".into());
         }
         state.validate()?;
         Ok(AdmissionJournalOpen {
@@ -1391,9 +1863,11 @@ impl<'lock> FileAdmissionJournal<'lock> {
                 next_generation: u64::try_from(commits.len())?.saturating_add(1),
                 previous_sha256,
                 state: state.clone(),
+                pending_reserved,
             },
             state,
             commits,
+            terminals,
         })
     }
 
@@ -1415,7 +1889,8 @@ impl<'lock> FileAdmissionJournal<'lock> {
     }
 
     pub(super) fn append(&mut self, value: AdmissionCommitV1) -> Result<String, BoxError> {
-        if value.generation != self.next_generation
+        if self.pending_reserved.is_some()
+            || value.generation != self.next_generation
             || value.previous_commit != self.previous_record()
         {
             return Err("schedule transaction: admission append generation diverged".into());
@@ -1433,12 +1908,40 @@ impl<'lock> FileAdmissionJournal<'lock> {
             .map_err(|error| format!("schedule transaction: cannot persist commit: {error}"))?;
         self.directory.sync()?;
         let sha256 = local_file::sha256_hex(&bytes);
-        self.state = value.admission_state_after;
+        self.state = value.admission_state_after.clone();
+        if matches!(value.disposition, AdmissionDispositionV1::Reserved { .. }) {
+            self.pending_reserved = Some(value);
+        }
         self.next_generation = self
             .next_generation
             .checked_add(1)
             .ok_or("schedule transaction: admission generation overflow")?;
         self.previous_sha256 = Some(sha256.clone());
+        Ok(sha256)
+    }
+
+    pub(super) fn append_terminal(
+        &mut self,
+        value: AdmissionTerminalV1,
+    ) -> Result<String, BoxError> {
+        let pending = self
+            .pending_reserved
+            .as_ref()
+            .ok_or("schedule transaction: no reserved admission awaits reconciliation")?;
+        validate_terminal_against_state(&value, pending, &self.state)?;
+        let bytes = canonical_bytes(&value)?;
+        let name = Self::terminal_name(value.generation);
+        let mut file =
+            self.directory
+                .create_new_file(OsStr::new(&name), 0o600, "admission terminal")?;
+        // A partial terminal is retained so recovery holds instead of reopening the predecessor.
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("schedule transaction: cannot persist terminal: {error}"))?;
+        self.directory.sync()?;
+        let sha256 = local_file::sha256_hex(&bytes);
+        self.state = value.admission_state_after;
+        self.pending_reserved = None;
         Ok(sha256)
     }
 }
@@ -1477,8 +1980,8 @@ mod tests {
         CandidateBinaryIdentityV1, CaseExecutionFingerprintInputV1,
         CharacterizationAuthorizationV1, CharacterizationOnceAuthorityV1,
         CharacterizationOutcomeV1, CharacterizationRecordV1, CharacterizedGrantProfileV1,
-        EffectiveIdentityV1, ExactExecutionBindingsV1, ExactExecutionTargetV1, FingerprintV1,
-        GitObjectAlgorithmV1, GitObjectIdV1, GrantBudgetPolicyV1, LaunchdBindingV1,
+        ChildArtifactRefV1, EffectiveIdentityV1, ExactExecutionBindingsV1, ExactExecutionTargetV1,
+        FingerprintV1, GitObjectAlgorithmV1, GitObjectIdV1, GrantBudgetPolicyV1, LaunchdBindingV1,
         NamedBudgetCapsV1, OneShotCharacterizationEntryV1, OptionalChildArtifactRefV1,
         OptionalElapsedMsV1, OptionalGitObjectIdV1, OptionalProcessIdentityV1, OptionalRecordRefV1,
         OptionalSafetyHoldReasonV1, OptionalSha256V1, OptionalStableIdV1,
@@ -1486,6 +1989,7 @@ mod tests {
         ProviderEffectGrantV1, SupervisorPhaseV1, TriggerBudgetCapsV1, TriggerSourceV1,
     };
     use crate::compatibility_schedule_state::{AdmissionStateCapability, SchedulerStateRoot};
+    use crate::compatibility_schedule_supervisor::{FileSupervisorJournal, SupervisorJournal};
 
     const COMMIT_AT_MS: i64 = 10;
 
@@ -2180,6 +2684,155 @@ mod tests {
         (state_temp, action_temp, state, published)
     }
 
+    fn publish_fixture_commit(state: &SchedulerStateRoot, commit: &AdmissionCommitV1) {
+        let locks = state
+            .try_owner_admission("test:publish-fixture")
+            .unwrap()
+            .try_authority_state("test:publish-fixture")
+            .unwrap();
+        FileAdmissionJournal::open(&locks)
+            .unwrap()
+            .journal
+            .append(commit.clone())
+            .unwrap();
+        recover_committed_state(&locks).unwrap();
+    }
+
+    fn persist_cancelled_before_running(
+        capability: &impl AdmissionStateCapability,
+        supervisor_record_id: &str,
+    ) {
+        let directory = capability.supervisor_directory().canonical_path();
+        let (mut journal, prepared, prepared_sha256) =
+            FileSupervisorJournal::open_existing(&directory, supervisor_record_id).unwrap();
+        let mut reaping = prepared;
+        reaping.generation = 2;
+        reaping.previous_record = OptionalSha256V1::Sha256 {
+            value: prepared_sha256,
+        };
+        reaping.phase = SupervisorPhaseV1::Reaping;
+        reaping.later_group_signal_permitted = false;
+        reaping.recorded_at_ms = 11;
+        let reaping_sha256 = journal.persist(&reaping).unwrap();
+
+        let mut released = reaping;
+        released.generation = 3;
+        released.previous_record = OptionalSha256V1::Sha256 {
+            value: reaping_sha256,
+        };
+        for group in &mut released.groups {
+            group.anchor_lifecycle = AnchorLifecycleV1::ReleasedReaped;
+        }
+        released.recorded_at_ms = 12;
+        let released_sha256 = journal.persist(&released).unwrap();
+
+        let mut complete = released;
+        complete.generation = 4;
+        complete.previous_record = OptionalSha256V1::Sha256 {
+            value: released_sha256,
+        };
+        complete.phase = SupervisorPhaseV1::Complete;
+        complete.outcome = OptionalSupervisorOutcomeV1::Outcome {
+            value: SupervisorTerminalOutcomeV1::CancelledBeforeRunning,
+        };
+        complete.recorded_at_ms = 13;
+        journal.persist(&complete).unwrap();
+        FileSupervisorJournal::open_existing(&directory, supervisor_record_id).unwrap();
+    }
+
+    fn persist_safety_hold(capability: &impl AdmissionStateCapability, supervisor_record_id: &str) {
+        let directory = capability.supervisor_directory().canonical_path();
+        let (mut journal, prepared, prepared_sha256) =
+            FileSupervisorJournal::open_existing(&directory, supervisor_record_id).unwrap();
+        let mut held = prepared;
+        held.generation = 2;
+        held.previous_record = OptionalSha256V1::Sha256 {
+            value: prepared_sha256,
+        };
+        held.phase = SupervisorPhaseV1::SafetyHold;
+        held.later_group_signal_permitted = false;
+        held.outcome = OptionalSupervisorOutcomeV1::Outcome {
+            value: SupervisorTerminalOutcomeV1::SafetyHold,
+        };
+        held.safety_hold = OptionalSafetyHoldReasonV1::Reason {
+            value: crate::compatibility_schedule_schema::SafetyHoldReasonV1::StartupReconciliationIncomplete,
+        };
+        held.recorded_at_ms = 11;
+        journal.persist(&held).unwrap();
+        FileSupervisorJournal::open_existing(&directory, supervisor_record_id).unwrap();
+    }
+
+    fn persist_completed(capability: &impl AdmissionStateCapability, supervisor_record_id: &str) {
+        let directory = capability.supervisor_directory().canonical_path();
+        let (mut journal, prepared, prepared_sha256) =
+            FileSupervisorJournal::open_existing(&directory, supervisor_record_id).unwrap();
+        let runner = ProcessIdentityV1 {
+            pid: 44,
+            parent_pid: 42,
+            process_group: 43,
+            session_id: 41,
+            start: ProcessStartMarkerV1::MacosEpochMicros {
+                seconds: 44,
+                microseconds: 0,
+            },
+        };
+        let mut running = prepared;
+        running.generation = 2;
+        running.previous_record = OptionalSha256V1::Sha256 {
+            value: prepared_sha256,
+        };
+        running.runner = OptionalProcessIdentityV1::Process {
+            value: runner.clone(),
+        };
+        running.groups[0].workloads.push(runner);
+        running.phase = SupervisorPhaseV1::Running;
+        running.recorded_at_ms = 11;
+        let running_sha256 = journal.persist(&running).unwrap();
+
+        let mut reaping = running;
+        reaping.generation = 3;
+        reaping.previous_record = OptionalSha256V1::Sha256 {
+            value: running_sha256,
+        };
+        reaping.phase = SupervisorPhaseV1::Reaping;
+        reaping.later_group_signal_permitted = false;
+        reaping.child_artifact = OptionalChildArtifactRefV1::Artifact {
+            value: ChildArtifactRefV1 {
+                record_id: "artifact-1".into(),
+                run_id: reaping.run_id.clone(),
+                window_id: reaping.window_id.clone(),
+                artifact_sha256: digest('a'),
+                aggregate_sha256: OptionalSha256V1::Absent,
+            },
+        };
+        reaping.recorded_at_ms = 12;
+        let reaping_sha256 = journal.persist(&reaping).unwrap();
+
+        let mut released = reaping;
+        released.generation = 4;
+        released.previous_record = OptionalSha256V1::Sha256 {
+            value: reaping_sha256,
+        };
+        for group in &mut released.groups {
+            group.anchor_lifecycle = AnchorLifecycleV1::ReleasedReaped;
+        }
+        released.recorded_at_ms = 13;
+        let released_sha256 = journal.persist(&released).unwrap();
+
+        let mut complete = released;
+        complete.generation = 5;
+        complete.previous_record = OptionalSha256V1::Sha256 {
+            value: released_sha256,
+        };
+        complete.phase = SupervisorPhaseV1::Complete;
+        complete.outcome = OptionalSupervisorOutcomeV1::Outcome {
+            value: SupervisorTerminalOutcomeV1::Completed,
+        };
+        complete.recorded_at_ms = 14;
+        journal.persist(&complete).unwrap();
+        FileSupervisorJournal::open_existing(&directory, supervisor_record_id).unwrap();
+    }
+
     #[test]
     fn claimed_support_one_shot_reselects_foundation_effects_and_revocation() {
         let (state, source, environment, request) = claimed_source_fixture();
@@ -2223,7 +2876,7 @@ mod tests {
         )
         .unwrap();
         let expected_effects = selected.effect_envelope.allowed_effects.clone();
-        let (_state_temp, _action_temp, _scheduler, published) = publish_selected(state, selected);
+        let (_state_temp, _action_temp, scheduler, published) = publish_selected(state, selected);
         let PublishedAdmissionV1::Admitted(capability) = published else {
             panic!("one-shot source must reserve");
         };
@@ -2231,6 +2884,33 @@ mod tests {
             capability.effect_envelope().allowed_effects,
             expected_effects
         );
+        let supervisor_record_id = capability.supervisor_record_id().to_owned();
+        drop(capability);
+        let locks = scheduler
+            .try_owner_admission("test:one-shot-terminal")
+            .unwrap()
+            .try_authority_state("test:one-shot-terminal")
+            .unwrap();
+        persist_cancelled_before_running(&locks, &supervisor_record_id);
+        reconcile_pending_admission(
+            &locks,
+            AdmissionTerminalDispositionV1::ProvedPreEffect {
+                evidence_sha256: digest('6'),
+            },
+            14,
+        )
+        .unwrap();
+        let authority = FileAuthorityJournal::open_existing(&locks).unwrap();
+        assert!(matches!(
+            authority
+                .snapshot
+                .state
+                .one_shots
+                .get("entry-1")
+                .unwrap()
+                .phase,
+            OneShotLifecyclePhaseV1::Reconciled { .. }
+        ));
     }
 
     #[test]
@@ -2506,6 +3186,297 @@ mod tests {
             assert_eq!(latest.phase, SupervisorPhaseV1::Prepared);
             assert_eq!(latest.generation, 1);
         }
+    }
+
+    #[test]
+    fn proved_pre_effect_terminal_releases_once_and_allows_a_regenerated_successor() {
+        let (_state_temp, _action_temp, state, commit) = fixture_commit();
+        let (ledger_reservation_id, supervisor_record_id, execution_sha256) =
+            match &commit.disposition {
+                AdmissionDispositionV1::Reserved {
+                    ledger, supervisor, ..
+                } => (
+                    ledger.reservation_id.clone(),
+                    supervisor.supervisor_record_id.clone(),
+                    ledger.case_execution.sha256.clone(),
+                ),
+                AdmissionDispositionV1::Reused { .. } => panic!("fixture must reserve"),
+            };
+        publish_fixture_commit(&state, &commit);
+        let locks = state
+            .try_owner_admission("test:pre-effect-terminal")
+            .unwrap()
+            .try_authority_state("test:pre-effect-terminal")
+            .unwrap();
+        persist_cancelled_before_running(&locks, &supervisor_record_id);
+        let disposition = AdmissionTerminalDispositionV1::ProvedPreEffect {
+            evidence_sha256: digest('6'),
+        };
+        let first = reconcile_pending_admission(&locks, disposition.clone(), 14).unwrap();
+        let repeated = reconcile_pending_admission(&locks, disposition, 14).unwrap();
+        assert_eq!(first, repeated);
+
+        let admission = FileAdmissionJournal::open(&locks).unwrap();
+        assert_eq!(admission.terminals.len(), 1);
+        assert!(!admission
+            .state
+            .equivalent_work
+            .live_by_execution
+            .contains_key(&execution_sha256));
+        assert_eq!(admission.state.equivalent_work.completed.len(), 1);
+        let ledger = FileCompatibilityLedger::open(&locks).unwrap();
+        assert!(ledger.may_admit_regenerated_successor(&ledger_reservation_id));
+    }
+
+    #[test]
+    fn safety_hold_is_conservatively_charged_and_keeps_equivalent_work_blocked() {
+        let (_state_temp, _action_temp, state, commit) = fixture_commit();
+        let (ledger_reservation_id, supervisor_record_id, execution_sha256) =
+            match &commit.disposition {
+                AdmissionDispositionV1::Reserved {
+                    ledger, supervisor, ..
+                } => (
+                    ledger.reservation_id.clone(),
+                    supervisor.supervisor_record_id.clone(),
+                    ledger.case_execution.sha256.clone(),
+                ),
+                AdmissionDispositionV1::Reused { .. } => panic!("fixture must reserve"),
+            };
+        publish_fixture_commit(&state, &commit);
+        let locks = state
+            .try_owner_admission("test:conservative-terminal")
+            .unwrap()
+            .try_authority_state("test:conservative-terminal")
+            .unwrap();
+        persist_safety_hold(&locks, &supervisor_record_id);
+        reconcile_pending_admission(
+            &locks,
+            AdmissionTerminalDispositionV1::Conservative {
+                evidence_sha256: digest('7'),
+                reason: ConservativeChargeReasonV1::SpawnStateAmbiguous,
+                prompt_may_have_been_accepted: true,
+            },
+            12,
+        )
+        .unwrap();
+
+        let admission = FileAdmissionJournal::open(&locks).unwrap();
+        assert_eq!(admission.terminals.len(), 1);
+        assert_eq!(
+            admission
+                .state
+                .equivalent_work
+                .live_by_execution
+                .get(&execution_sha256),
+            Some(&match &commit.disposition {
+                AdmissionDispositionV1::Reserved {
+                    equivalent_work, ..
+                } => equivalent_work.reservation_id.clone(),
+                AdmissionDispositionV1::Reused { .. } => unreachable!(),
+            })
+        );
+        let ledger = FileCompatibilityLedger::open(&locks).unwrap();
+        assert!(!ledger.may_admit_regenerated_successor(&ledger_reservation_id));
+    }
+
+    #[test]
+    fn completed_terminal_requires_exact_identity_and_valid_usage_before_it_commits() {
+        let (_state_temp, _action_temp, state, commit) = fixture_commit();
+        let (equivalent_work, ledger_reservation, supervisor_record_id, execution_sha256) =
+            match &commit.disposition {
+                AdmissionDispositionV1::Reserved {
+                    equivalent_work,
+                    ledger,
+                    supervisor,
+                    ..
+                } => (
+                    equivalent_work.clone(),
+                    ledger.clone(),
+                    supervisor.supervisor_record_id.clone(),
+                    ledger.case_execution.sha256.clone(),
+                ),
+                AdmissionDispositionV1::Reused { .. } => panic!("fixture must reserve"),
+            };
+        publish_fixture_commit(&state, &commit);
+        let locks = state
+            .try_owner_admission("test:valid-terminal")
+            .unwrap()
+            .try_authority_state("test:valid-terminal")
+            .unwrap();
+        persist_completed(&locks, &supervisor_record_id);
+        let expected_identity = commit
+            .context
+            .identities
+            .case_execution
+            .input
+            .expected_effective_identity
+            .clone();
+        let evidence = CompletedEquivalentEvidenceV1 {
+            reservation_id: equivalent_work.reservation_id,
+            evidence_sha256: digest('b'),
+            satisfied_purpose: equivalent_work.evidence_purpose,
+            freshness_bucket: equivalent_work.freshness_bucket,
+            characterization_profile: equivalent_work.characterization_profile,
+            case_execution: equivalent_work.case_execution,
+            expected_effective_identity: expected_identity.clone(),
+            observed_effective_identity: expected_identity,
+            provenance: ConsumptionEvidenceProvenanceV1::Ordinary,
+            reusable: false,
+            terminal_at_ms: 15,
+        };
+        let valid_usage = UsageChargeV1 {
+            attempts: 1,
+            tokens: 10,
+            cost_microusd: 10,
+            elapsed_millis: 10,
+        };
+
+        let mut mismatched = evidence.clone();
+        mismatched.observed_effective_identity.model = "unexpected-model".into();
+        assert!(reconcile_pending_admission(
+            &locks,
+            AdmissionTerminalDispositionV1::ValidTerminal {
+                evidence: mismatched,
+                usage: valid_usage.clone(),
+                prompt_was_accepted: true,
+            },
+            15,
+        )
+        .is_err());
+        assert!(FileAdmissionJournal::open(&locks)
+            .unwrap()
+            .terminals
+            .is_empty());
+
+        let mut zero_attempts = valid_usage.clone();
+        zero_attempts.attempts = 0;
+        assert!(reconcile_pending_admission(
+            &locks,
+            AdmissionTerminalDispositionV1::ValidTerminal {
+                evidence: evidence.clone(),
+                usage: zero_attempts,
+                prompt_was_accepted: true,
+            },
+            15,
+        )
+        .is_err());
+        assert!(FileAdmissionJournal::open(&locks)
+            .unwrap()
+            .terminals
+            .is_empty());
+
+        let mut over_cap = valid_usage.clone();
+        over_cap.tokens = ledger_reservation.caps.max_tokens + 1;
+        assert!(reconcile_pending_admission(
+            &locks,
+            AdmissionTerminalDispositionV1::ValidTerminal {
+                evidence: evidence.clone(),
+                usage: over_cap,
+                prompt_was_accepted: true,
+            },
+            15,
+        )
+        .is_err());
+        assert!(FileAdmissionJournal::open(&locks)
+            .unwrap()
+            .terminals
+            .is_empty());
+
+        reconcile_pending_admission(
+            &locks,
+            AdmissionTerminalDispositionV1::ValidTerminal {
+                evidence,
+                usage: valid_usage,
+                prompt_was_accepted: true,
+            },
+            15,
+        )
+        .unwrap();
+        let admission = FileAdmissionJournal::open(&locks).unwrap();
+        assert_eq!(admission.terminals.len(), 1);
+        assert!(!admission
+            .state
+            .equivalent_work
+            .live_by_execution
+            .contains_key(&execution_sha256));
+        assert_eq!(admission.state.equivalent_work.completed.len(), 1);
+        let ledger = FileCompatibilityLedger::open(&locks).unwrap();
+        assert!(!ledger.may_admit_regenerated_successor(&ledger_reservation.reservation_id));
+    }
+
+    #[test]
+    fn terminal_state_mutation_and_successor_before_terminal_fail_closed() {
+        let (_state_temp, _action_temp, state, commit) = fixture_commit();
+        publish_fixture_commit(&state, &commit);
+        let locks = state
+            .try_owner_admission("test:terminal-mutation")
+            .unwrap()
+            .try_authority_state("test:terminal-mutation")
+            .unwrap();
+        let supervisor_record_id = match &commit.disposition {
+            AdmissionDispositionV1::Reserved { supervisor, .. } => {
+                supervisor.supervisor_record_id.clone()
+            }
+            AdmissionDispositionV1::Reused { .. } => unreachable!(),
+        };
+        let mut journal = FileAdmissionJournal::open(&locks).unwrap();
+        assert!(journal.journal.append(commit.clone()).is_err());
+        drop(journal);
+
+        persist_cancelled_before_running(&locks, &supervisor_record_id);
+        reconcile_pending_admission(
+            &locks,
+            AdmissionTerminalDispositionV1::ProvedPreEffect {
+                evidence_sha256: digest('8'),
+            },
+            14,
+        )
+        .unwrap();
+        let path = locks
+            .admission_directory()
+            .canonical_path()
+            .join("admission-terminal.00000000000000000001.json");
+        let mut value: AdmissionTerminalV1 =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value.admission_state_after = AdmissionStateV1::new();
+        std::fs::write(&path, canonical_bytes(&value).unwrap()).unwrap();
+        assert!(FileAdmissionJournal::open(&locks).is_err());
+    }
+
+    #[test]
+    fn terminal_supervisor_tail_mutation_holds_recovery() {
+        let (_state_temp, _action_temp, state, commit) = fixture_commit();
+        publish_fixture_commit(&state, &commit);
+        let locks = state
+            .try_owner_admission("test:terminal-tail-mutation")
+            .unwrap()
+            .try_authority_state("test:terminal-tail-mutation")
+            .unwrap();
+        let supervisor_record_id = match &commit.disposition {
+            AdmissionDispositionV1::Reserved { supervisor, .. } => {
+                supervisor.supervisor_record_id.clone()
+            }
+            AdmissionDispositionV1::Reused { .. } => unreachable!(),
+        };
+        persist_cancelled_before_running(&locks, &supervisor_record_id);
+        reconcile_pending_admission(
+            &locks,
+            AdmissionTerminalDispositionV1::ProvedPreEffect {
+                evidence_sha256: digest('8'),
+            },
+            14,
+        )
+        .unwrap();
+        let path = locks
+            .admission_directory()
+            .canonical_path()
+            .join("admission-terminal.00000000000000000001.json");
+        let mut value: AdmissionTerminalV1 =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value.supervisor_journal_sha256 = digest('9');
+        std::fs::write(&path, canonical_bytes(&value).unwrap()).unwrap();
+        assert!(FileAdmissionJournal::open(&locks).is_ok());
+        assert!(recover_committed_state(&locks).is_err());
     }
 
     #[test]
