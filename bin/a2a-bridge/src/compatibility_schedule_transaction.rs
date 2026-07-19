@@ -524,7 +524,7 @@ fn validate_terminal_against_state(
                         .input
                         .expected_effective_identity
                 || evidence.expected_effective_identity != evidence.observed_effective_identity
-                || evidence.terminal_at_ms != value.recorded_at_ms
+                || evidence.terminal_at_ms > value.recorded_at_ms
             {
                 return Err("schedule transaction: valid terminal evidence diverged".into());
             }
@@ -1603,7 +1603,7 @@ fn durable_terminal_disposition(
                 observed_effective_identity: observed_identity,
                 provenance: ConsumptionEvidenceProvenanceV1::Ordinary,
                 reusable,
-                terminal_at_ms: recorded_at_ms,
+                terminal_at_ms: aggregate.terminal_at_ms(),
             };
             Ok(AdmissionTerminalDispositionV1::ValidTerminal {
                 evidence: Box::new(evidence),
@@ -3835,6 +3835,10 @@ mod tests {
         assert_eq!(usage.cost_microusd, ledger.caps.max_cost_microusd);
         assert_eq!(usage.elapsed_millis, fixture.duration_ms);
         assert_eq!(evidence.evidence_sha256, local_file::sha256_hex(&aggregate));
+        assert_eq!(
+            evidence.terminal_at_ms,
+            1 + i64::try_from(fixture.duration_ms).unwrap()
+        );
         assert!(!evidence.reusable);
 
         let admission = FileAdmissionJournal::open(&locks).unwrap();
