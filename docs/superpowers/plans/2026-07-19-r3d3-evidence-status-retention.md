@@ -1,8 +1,9 @@
 # R3d3 — evidence, status, and retention implementation plan
 
-**Status:** R3d3a is checkpointed at `21427e6` on `agent/reliability-r3d3-evidence-retention` from merged
-R3d2 `origin/main` `06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41); R3d3b is next. This slice
-is local, non-billable, default-off, and has one merge boundary.
+**Status:** R3d3a and R3d3b are checkpointed at `21427e6` and `739495a` on
+`agent/reliability-r3d3-evidence-retention` from merged R3d2 `origin/main`
+`06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41); R3d3c is next. This slice is local,
+non-billable, default-off, and has one merge boundary.
 
 The approved design of record is
 [`2026-07-11-r3-compatibility-canaries.md`](2026-07-11-r3-compatibility-canaries.md), especially D4/D8,
@@ -143,6 +144,15 @@ gates remain deliberately deferred until the complete R3d3 review candidate.
 Pre-change-red/edge proof: aggregate byte identity, absent/mismatched aggregate, unknown sidecar version, secret in
 decoded key/value and raw text, symlink/hard-link/special file, replacement between enumeration/read, case-fold
 collision, deterministic repeat, partial archive/manifest, crash before/after index publication, and size/count cap.
+
+Checkpoint `739495a` implements deterministic sealing and index-last local publication. Its fail-first regressions
+demonstrated absent sealing/publication APIs, unbound compact-record identity, undercounted appended state bytes,
+missing crash boundaries, an off-by-one entry limit, unbounded compact case metadata, and incident publication
+without its mandatory active pin. Source-path secret-shaped material was already rejected by the shared portable
+path validator, so that probe was retained as a regression without a redundant mechanism change. Corrected focused
+gates are evidence **30/0**, strict schema **32/0**, retained state **19/0**, and descriptor-local file **11/0**;
+format and diff checks are green. Full-workspace and release gates remain deferred until the complete R3d3 review
+candidate.
 
 ### R3d3c — independent cold consent, publication, verification, and hot eviction
 
