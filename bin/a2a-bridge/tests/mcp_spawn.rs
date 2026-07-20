@@ -73,3 +73,131 @@ async fn mcp_subcommand_handshake_and_tool_call_over_real_pipes() {
         .unwrap();
     assert!(status.success(), "mcp child exited nonzero on EOF");
 }
+
+#[tokio::test]
+async fn managed_agent_depth_refuses_before_config_or_store_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+        .arg("mcp")
+        .arg("--config")
+        .arg(&missing)
+        .env("A2A_BRIDGE_MCP_CALL_DEPTH", "1")
+        .output()
+        .await
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("managed-agent MCP loopback is unsupported"),
+        "guard must own the failure before config resolution: {stderr}"
+    );
+    assert!(
+        !missing.exists(),
+        "guard must not create the missing config"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "guard must create no config, store, lease, or other artifact"
+    );
+}
+
+#[tokio::test]
+async fn external_depth_zero_keeps_existing_mcp_startup_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+        .arg("mcp")
+        .arg("--config")
+        .arg(&missing)
+        .env("A2A_BRIDGE_MCP_CALL_DEPTH", "0")
+        .output()
+        .await
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("run `a2a-bridge init`"), "got: {stderr}");
+    assert!(
+        !stderr.contains("managed-agent MCP loopback is unsupported"),
+        "depth zero is the supported external-controller path: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn malformed_managed_depth_fails_closed_before_config_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+        .arg("mcp")
+        .arg("--config")
+        .arg(&missing)
+        .env("A2A_BRIDGE_MCP_CALL_DEPTH", "not-a-depth")
+        .output()
+        .await
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid A2A_BRIDGE_MCP_CALL_DEPTH"),
+        "malformed lineage must fail closed: {stderr}"
+    );
+    assert!(!missing.exists());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn non_unicode_managed_depth_fails_closed_before_config_work() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+        .arg("mcp")
+        .arg("--config")
+        .arg(&missing)
+        .env(
+            "A2A_BRIDGE_MCP_CALL_DEPTH",
+            std::ffi::OsString::from_vec(vec![0xff]),
+        )
+        .output()
+        .await
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid non-Unicode A2A_BRIDGE_MCP_CALL_DEPTH"),
+        "non-Unicode lineage must fail closed: {stderr}"
+    );
+    assert!(!missing.exists());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn managed_depth_does_not_hide_side_effect_free_mcp_help() {
+    let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+        .arg("mcp")
+        .arg("--help")
+        .env("A2A_BRIDGE_MCP_CALL_DEPTH", "1")
+        .output()
+        .await
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("usage: a2a-bridge mcp"), "got: {stdout}");
+    assert!(stdout.contains("external-controller MCP"), "got: {stdout}");
+    assert!(
+        stdout.contains("Managed-agent loopback is refused"),
+        "got: {stdout}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("managed-agent MCP loopback"),
+        "help returns before the runtime loopback guard"
+    );
+}

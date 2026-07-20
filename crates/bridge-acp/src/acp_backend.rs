@@ -1568,7 +1568,7 @@ impl AcpBackend {
         let servers: Vec<McpServer> = mcp
             .iter()
             .map(|spec| {
-                let s = spec.substituted(&cwd_str);
+                let s = spec.substituted_for_managed_agent(&cwd_str);
                 McpServer::Stdio(
                     McpServerStdio::new(s.name, s.command).args(s.args).env(
                         s.env

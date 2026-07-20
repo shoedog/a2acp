@@ -1,14 +1,21 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main base:** `origin/main` at `0d628271a910168230491e8610a31f92f7063cbc` on 2026-07-20
-  (PR #44 merged the classified model-probe fix with CI and CLA green, after PR #43 merged the registry/metrics
-  fixes and PR #42 merged R3d3)
+- **Current main base:** `origin/main` at `db0eb28f48ad5f15e6848d1975d6de6776e13692` on 2026-07-20
+  (PR #45 merged the provider-free #22/#24 R2f incident intake with CI and CLA green, after PR #44 merged the
+  classified model-probe fix, PR #43 merged the registry/metrics fixes, and PR #42 merged R3d3)
 - **Completed through:** R3d3 **MERGED** at `3c02bf3f`; standalone issues #35/#39 **MERGED** at `0f84a5ca`
-  and issue #30 **MERGED** at `0d628271`; R2e remains deferred and off the critical path
-- **Active slice:** R2f incident intake on `agent/r2f-incident-intake`, based directly on `0d628271`; no provider
-  turn is authorized or required for this intake
-- **Current R2f intake gate:** **#22 CONFIRMED / #24 PARTIALLY CONFIRMED / DETERMINISTIC CURRENT-MAIN PROBES GREEN /
+  and issue #30 **MERGED** at `0d628271`; R2f incident intake **MERGED** by PR #45 at `db0eb28f`; R2e remains
+  deferred and off the critical path
+- **Active slice:** standalone issue #36 managed-agent MCP loopback guard on
+  `agent/fix-mcp-loopback-guard`, based directly on `db0eb28f`; no provider turn is required
+- **Current #36 gate:** **FAIL-FIRST REGRESSIONS PROVED / TWO-LAYER GUARD IMPLEMENTED / FOCUSED GATES GREEN /
+  FULL WORKSPACE GATE GREEN**. Config admission is **1/0**, core Codex/Kiro delivery is **14/0**, ACP framing is
+  **1/0**, and the real-process MCP boundary is **6/0**. The canonical full serial workspace is
+  **2,538/0/12 ignored** across **72** groups (**55** nonempty). Format/diff, workspace check, warnings-denied
+  all-target Clippy, locked release workspace build, repository hygiene **37/7**, and dependency policy are
+  green. No provider, compatibility, production-server, or live controller turn was exercised.
+- **R2f intake closure:** **#22 CONFIRMED / #24 PARTIALLY CONFIRMED / DETERMINISTIC CURRENT-MAIN PROBES GREEN /
   FOCUSED OWNER DESIGN NOT STARTED**. The exact scheduler characterization reproduced the failed-root/silent-sibling
   wedge at **1/0**, and the ACP delivered-error, disabled-watchdog, and configured-watchdog controls each passed
   **1/0**. The durable disposition and closure contract live in the
@@ -707,10 +714,10 @@
   `SMELL`s, returned `READY`, and ended `GATE: APPROVE`. Its non-USD cost wording gap is fixed in this docs
   fold; its other verification/fault-boundary items remain accepted/nonblocking. R3b is
   **MERGED** at `504c1e43` by PR #32. Reviews are not compatibility evidence.
-- **Last merged full workspace gate:** R3b host serial **2,085 / 0 / 12 ignored** across **70**
-  test/doc-test executables; affected bridge-core/ACP **514 / 0** and binary **395 / 0 / 0**.
-  Format/diff, all-target check, warnings-denied Clippy, locked release build, repository hygiene
-  **37/7**, and PR #32 Build/Lint/Coverage plus CLA were green.
+- **Last merged full workspace gate:** PR #45 R2f incident intake host serial **2,531/0/12 ignored** across
+  **72** result groups (**55** nonempty). Format/diff, workspace all-target check, warnings-denied Clippy,
+  locked release build, repository hygiene **37/7**, dependency policy, PR Build/Lint/Coverage, and CLA were
+  green. Its four deterministic incident controls each passed **1/0** without a provider turn.
 - **Current execution boundary:** R3b has four minimal bridge-smoke support cases (Codex host,
   Codex reader, Claude 0.44 host, Claude 0.55 Fable reader) and five explicit non-goal/unrun historical
   rows (Claude direct CLI, Claude 0.55 host ACP, managed-no-egress negative, Kiro host, Kiro reader).
@@ -723,11 +730,11 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** merge the docs-only #22/#24 R2f intake after its deterministic gates, then resolve open issue #36
-  as a separate policy/design-and-guard increment before beginning R2f source implementation. R2f implementation
-  requires the focused owner design decisions named in its plan. Do not launch a provider turn or intentionally
-  exhaust Kiro quota for intake; a provider-specific reproduction requires separate authorization. OpenRouter/
-  OpenCode remain R3e/R3f after the reliability/open-issue work and before R4.
+- **Next action:** finish the full deterministic gate and merge issue #36 as a separate policy-and-guard
+  increment, then conduct the focused owner R2f design decisions named in its plan before source implementation.
+  Do not launch a provider turn or intentionally exhaust Kiro quota for R2f; a provider-specific reproduction
+  requires separate authorization. OpenRouter/OpenCode remain R3e/R3f after the reliability/open-issue work and
+  before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**

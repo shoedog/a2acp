@@ -21,6 +21,10 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ### Fixed
 
+- Bridge-managed agents can no longer accidentally recurse into the bridge's external-controller MCP
+  surface. Direct `[[agents.mcp]]` loopback configurations are rejected, every managed MCP delivery carries
+  a reserved depth marker, and marked `a2a-bridge mcp` invocations refuse before config, store, or coordinator
+  work while ordinary external MCP clients remain supported.
 - Production container-backed ACP starts now distinguish a runtime object that never left its pre-start
   state from an ACP initialization failure. The bridge reports that condition as a typed container-runtime
   fallback candidate, terminates the exact supervised runtime client before one named-container reap, and

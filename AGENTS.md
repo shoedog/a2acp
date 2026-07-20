@@ -38,6 +38,13 @@ Use `--examples-policy deny` in cleanup/CI gates when you want to reject project
 under an `examples/` directory; pass the strings that identify that project with repeated
 `--project-marker` flags, for example `--project-marker code/slicing --project-marker prism-mcp`.
 
+`a2a-bridge mcp` is an **external-controller** surface. Never point a bridge-managed agent's
+`[[agents.mcp]]` entry back at `a2a-bridge mcp`. Direct loopback configurations fail validation, every MCP
+spec delivered to a managed agent receives the reserved `A2A_BRIDGE_MCP_CALL_DEPTH=1` marker, and a marked
+bridge MCP invocation refuses before config, store, or coordinator work. Do not set that reserved variable
+in agent MCP configuration. This is a safety guard against accidental recursion, not a security boundary
+against a deliberately hostile wrapper that removes inherited environment variables.
+
 ## 1. Build / install
 
 ```bash
