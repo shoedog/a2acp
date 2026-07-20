@@ -6,7 +6,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::io::Write as _;
 
 use serde::{Deserialize, Serialize};
 
@@ -675,20 +674,20 @@ impl<'lock> ScheduleStatusJournal<'lock> {
         };
         validate_status_record(&record, generation, previous_sha256, previous_time)?;
         let bytes = canonical_bytes(&record)?;
-        self.state_quota
+        let state_quota = self
+            .state_quota
             .as_ref()
-            .ok_or("schedule status: append requires the owner state quota capability")?
-            .reserve(bytes.len() as u64)?;
+            .ok_or("schedule status: append requires the owner state quota capability")?;
+        self.directory
+            .recover_journal_append_residue(STATUS_FILE_MODE, "schedule status record")?;
+        state_quota.reserve(bytes.len() as u64)?;
         let name = Self::generation_name(generation);
-        let mut file = self.directory.create_new_file(
+        self.directory.write_new_journal_record(
             OsStr::new(&name),
+            &bytes,
             STATUS_FILE_MODE,
             "schedule status record",
         )?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|error| format!("schedule status: cannot persist record: {error}"))?;
-        self.directory.sync()?;
         let sha256 = local_file::sha256_hex(&bytes);
         self.records.push((record, sha256.clone()));
         Ok(sha256)
@@ -1129,17 +1128,16 @@ impl<'lock> NotificationJournal<'lock> {
             self.latest.get(&record.notification.fingerprint_sha256),
         )?;
         let bytes = canonical_bytes(&record)?;
+        self.directory
+            .recover_journal_append_residue(STATUS_FILE_MODE, "notification record")?;
         self.state_quota.reserve(bytes.len() as u64)?;
         let name = Self::generation_name(generation);
-        let mut file = self.directory.create_new_file(
+        self.directory.write_new_journal_record(
             OsStr::new(&name),
+            &bytes,
             STATUS_FILE_MODE,
             "notification record",
         )?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|error| format!("schedule status: cannot persist notification: {error}"))?;
-        self.directory.sync()?;
         let sha256 = local_file::sha256_hex(&bytes);
         self.latest.insert(
             record.notification.fingerprint_sha256.clone(),
@@ -1521,6 +1519,7 @@ mod tests {
     };
     use crate::compatibility_schedule_state::SchedulerStateRoot;
     use std::cell::Cell;
+    use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
 
@@ -1804,10 +1803,100 @@ mod tests {
     }
 
     #[test]
+    fn status_interruption_before_atomic_publish_reopens_and_retries_same_generation() {
+        let directory = root();
+        let root = SchedulerStateRoot::initialize_for_test(directory.path()).unwrap();
+        let lock = root
+            .try_owner_admission("status-interrupted-publication")
+            .unwrap();
+        let status_directory = lock.status_directory();
+        let temporary = status_directory
+            .canonical_path()
+            .join(".a2a-journal-append-v1.tmp");
+        let final_record = status_directory
+            .canonical_path()
+            .join(ScheduleStatusJournal::generation_name(1));
+        let projection = project_status(status(350), healthy_sources()).unwrap();
+        let mut journal = ScheduleStatusJournal::open(&lock).unwrap();
+
+        status_directory.fail_journal_publish_on_nth_call_for_test(1);
+        let error = journal
+            .append_projected_for_test(projection.clone())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected failure before journal publication"));
+        assert!(temporary.is_file());
+        assert!(!final_record.exists());
+        drop(journal);
+
+        let mut reopened = ScheduleStatusJournal::open(&lock).unwrap();
+        assert!(reopened.latest().is_none());
+        assert!(NotificationJournal::open(&lock).is_ok());
+        reopened.append_projected_for_test(projection).unwrap();
+        assert!(!temporary.exists());
+        assert!(final_record.is_file());
+        assert!(ScheduleStatusJournal::open(&lock)
+            .unwrap()
+            .latest()
+            .is_some());
+    }
+
+    #[test]
     fn notification_generation_bound_rejects_the_first_unreopenable_generation() {
         let first_unreopenable = u64::try_from(MAX_STATUS_GENERATIONS).unwrap() + 1;
         assert!(validate_notification_generation(first_unreopenable).is_err());
         assert!(validate_notification_generation(first_unreopenable - 1).is_ok());
+    }
+
+    #[test]
+    fn notification_interruption_before_atomic_publish_reopens_and_retries_same_generation() {
+        let directory = root();
+        let root = SchedulerStateRoot::initialize_for_test(directory.path()).unwrap();
+        let lock = root
+            .try_owner_admission("notification-interrupted-publication")
+            .unwrap();
+        let status_directory = lock.status_directory();
+        let temporary = status_directory
+            .canonical_path()
+            .join(".a2a-journal-append-v1.tmp");
+        let final_record = status_directory
+            .canonical_path()
+            .join(NotificationJournal::generation_name(1));
+        let green = project_status(status(360), healthy_sources()).unwrap();
+        let mut unknown_status = status(361);
+        unknown_status.fresh_one_shot_compatibility = OneShotCompatibilityStateV1::Unknown;
+        unknown_status.cases[0].last_outcome = OptionalTextV1::Text {
+            value: "candidate_unknown:catalog_unavailable".into(),
+        };
+        let unknown = project_status(unknown_status, healthy_sources()).unwrap();
+        let notification = status_notifications(Some(&green), &unknown)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("green-to-unknown transition must notify");
+        let mut journal = NotificationJournal::open(&lock).unwrap();
+
+        status_directory.fail_journal_publish_on_nth_call_for_test(1);
+        let error = journal
+            .append(notification.clone(), 500, NotificationLifecycleV1::Pending)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected failure before journal publication"));
+        assert!(temporary.is_file());
+        assert!(!final_record.exists());
+        drop(journal);
+
+        let mut reopened = NotificationJournal::open(&lock).unwrap();
+        assert!(reopened.records.is_empty());
+        assert!(ScheduleStatusJournal::open(&lock).is_ok());
+        reopened
+            .append(notification, 500, NotificationLifecycleV1::Pending)
+            .unwrap();
+        assert!(!temporary.exists());
+        assert!(final_record.is_file());
+        assert_eq!(NotificationJournal::open(&lock).unwrap().records.len(), 1);
     }
 
     #[derive(Default)]

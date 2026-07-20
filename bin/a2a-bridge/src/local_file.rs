@@ -16,6 +16,13 @@ use bridge_core::session_cwd::SessionCwd;
 
 use crate::BoxError;
 
+const JOURNAL_APPEND_TEMP_NAME: &str = ".a2a-journal-append-v1.tmp";
+
+pub(crate) fn is_journal_append_residue_name(name: &OsStr) -> Result<bool, BoxError> {
+    let temporary = OsStr::new(JOURNAL_APPEND_TEMP_NAME);
+    Ok(name == temporary || name == removal_quarantine_name(temporary, "journal append residue")?)
+}
+
 #[cfg(unix)]
 pub(crate) fn removal_quarantine_name(name: &OsStr, label: &str) -> Result<OsString, BoxError> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -433,6 +440,8 @@ pub(crate) struct PinnedDirectory {
     retain_descriptor_after_exec: bool,
     #[cfg(test)]
     sync_failure_countdown: Arc<AtomicUsize>,
+    #[cfg(test)]
+    journal_publish_failure_countdown: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Copy)]
@@ -589,6 +598,8 @@ impl PinnedDirectory {
             retain_descriptor_after_exec,
             #[cfg(test)]
             sync_failure_countdown: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            journal_publish_failure_countdown: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -637,6 +648,35 @@ impl PinnedDirectory {
     pub(crate) fn fail_sync_on_nth_call_for_test(&self, call: usize) {
         assert!(call > 0, "sync failure injection call must be positive");
         self.sync_failure_countdown.store(call, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_journal_publish_on_nth_call_for_test(&self, call: usize) {
+        assert!(
+            call > 0,
+            "journal publication failure injection call must be positive"
+        );
+        self.journal_publish_failure_countdown
+            .store(call, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn journal_publish_failure_is_due(&self) -> bool {
+        let mut remaining = self
+            .journal_publish_failure_countdown
+            .load(Ordering::SeqCst);
+        while remaining != 0 {
+            match self.journal_publish_failure_countdown.compare_exchange(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return remaining == 1,
+                Err(observed) => remaining = observed,
+            }
+        }
+        false
     }
 
     pub(crate) fn retain_descriptor_after_exec(&self) -> bool {
@@ -777,6 +817,72 @@ impl PinnedDirectory {
             let _ = (name, mode);
             Err(format!("{label}: descriptor-relative file creation is unsupported").into())
         }
+    }
+
+    /// Remove only the fixed, uncommitted journal-append residue beneath this retained directory.
+    /// Callers hold the owner-wide capability, so every journal in a shared directory uses one
+    /// serialized temporary namespace. Wrong-type, wrong-owner, linked, or broadened residue fails
+    /// closed instead of being unlinked.
+    pub(crate) fn recover_journal_append_residue(
+        &self,
+        mode: u32,
+        label: &str,
+    ) -> Result<(), BoxError> {
+        let temporary = OsStr::new(JOURNAL_APPEND_TEMP_NAME);
+        let Some(candidate_name) = self.regular_child_removal_candidate(temporary, label)? else {
+            return Ok(());
+        };
+        let file = self.open_regular_file(&candidate_name, label)?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("{label}: cannot inspect append residue: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != mode {
+                return Err(format!(
+                    "{label}: journal append residue is not owner-only mode-{mode:04o}"
+                )
+                .into());
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (metadata, mode);
+            return Err(format!("{label}: journal residue recovery is unsupported").into());
+        }
+        self.remove_regular_child_candidate(
+            temporary,
+            RegularChildRef::new(&candidate_name, &file),
+            label,
+        )
+    }
+
+    /// Persist one new journal generation without exposing its final name until all bytes and the
+    /// file itself are durable. A crash before the no-replace rename leaves only the fixed temporary
+    /// residue; a surviving final name therefore always identifies a complete, synced record.
+    pub(crate) fn write_new_journal_record(
+        &self,
+        target_name: &OsStr,
+        bytes: &[u8],
+        mode: u32,
+        label: &str,
+    ) -> Result<(), BoxError> {
+        use std::io::Write as _;
+
+        self.recover_journal_append_residue(mode, label)?;
+        let temporary = OsStr::new(JOURNAL_APPEND_TEMP_NAME);
+        let mut file = self.create_new_file(temporary, mode, label)?;
+        // Intentionally retain a partial temporary entry on error. Recovery verifies and removes
+        // that exact owner-private regular file before quota accounting and the next append.
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("{label}: cannot sync journal append temporary: {error}"))?;
+        #[cfg(test)]
+        if self.journal_publish_failure_is_due() {
+            return Err(format!("{label}: injected failure before journal publication").into());
+        }
+        self.publish_new_regular_child(RegularChildRef::new(temporary, &file), target_name, label)
     }
 
     /// Create one symbolic link relative to the retained directory object. Callers remain
@@ -939,6 +1045,8 @@ impl PinnedDirectory {
                 retain_descriptor_after_exec,
                 #[cfg(test)]
                 sync_failure_countdown: Arc::new(AtomicUsize::new(0)),
+                #[cfg(test)]
+                journal_publish_failure_countdown: Arc::new(AtomicUsize::new(0)),
             }))
         }
         #[cfg(not(unix))]
@@ -1026,6 +1134,8 @@ impl PinnedDirectory {
                 retain_descriptor_after_exec,
                 #[cfg(test)]
                 sync_failure_countdown: Arc::new(AtomicUsize::new(0)),
+                #[cfg(test)]
+                journal_publish_failure_countdown: Arc::new(AtomicUsize::new(0)),
             })
         }
         #[cfg(not(unix))]
@@ -1970,6 +2080,81 @@ mod tests {
             fs::metadata(dir.path().join(final_name)).unwrap().nlink(),
             1
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn journal_append_publishes_only_a_complete_synced_record_and_recovers_its_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_directory(dir.path(), "test journal root").unwrap();
+        let pin = PinnedDirectory::open(
+            dir.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test journal root",
+        )
+        .unwrap();
+        let final_name = OsStr::new("journal.00000000000000000001.json");
+        let final_bytes = b"{\"complete\":true}\n";
+
+        pin.fail_journal_publish_on_nth_call_for_test(1);
+        let error = pin
+            .write_new_journal_record(final_name, final_bytes, 0o600, "test journal append")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected failure before journal publication"));
+        assert!(!dir.path().join(final_name).exists());
+        assert_eq!(
+            fs::read(dir.path().join(JOURNAL_APPEND_TEMP_NAME)).unwrap(),
+            final_bytes
+        );
+
+        let quarantine_name =
+            removal_quarantine_name(OsStr::new(JOURNAL_APPEND_TEMP_NAME), "test journal append")
+                .unwrap();
+        fs::rename(
+            dir.path().join(JOURNAL_APPEND_TEMP_NAME),
+            dir.path().join(&quarantine_name),
+        )
+        .unwrap();
+        pin.sync().unwrap();
+        assert!(is_journal_append_residue_name(&quarantine_name).unwrap());
+
+        pin.write_new_journal_record(final_name, final_bytes, 0o600, "test journal append")
+            .unwrap();
+        assert!(!dir.path().join(JOURNAL_APPEND_TEMP_NAME).exists());
+        assert!(!dir.path().join(quarantine_name).exists());
+        assert_eq!(fs::read(dir.path().join(final_name)).unwrap(), final_bytes);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn journal_append_refuses_to_remove_untrusted_residue() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_directory(dir.path(), "test journal root").unwrap();
+        let pin = PinnedDirectory::open(
+            dir.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test journal root",
+        )
+        .unwrap();
+        let temporary = dir.path().join(JOURNAL_APPEND_TEMP_NAME);
+        fs::write(&temporary, b"untrusted").unwrap();
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644)).unwrap();
+        let final_name = OsStr::new("journal.00000000000000000001.json");
+
+        let error = pin
+            .write_new_journal_record(final_name, b"trusted\n", 0o600, "test journal append")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("journal append residue is not owner-only mode-0600"));
+        assert_eq!(fs::read(&temporary).unwrap(), b"untrusted");
+        assert!(!dir.path().join(final_name).exists());
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

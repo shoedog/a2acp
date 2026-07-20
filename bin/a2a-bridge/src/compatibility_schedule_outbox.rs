@@ -5,7 +5,6 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::io::Write as _;
 
 use serde::{Deserialize, Serialize};
 
@@ -418,6 +417,9 @@ impl<'lock> PublicationOutboxJournal<'lock> {
                 .file_name()
                 .into_string()
                 .map_err(|_| "schedule outbox: non-UTF8 journal entry")?;
+            if local_file::is_journal_append_residue_name(OsStr::new(&name))? {
+                continue;
+            }
             let raw = name
                 .strip_prefix(OUTBOX_PREFIX)
                 .and_then(|value| value.strip_suffix(".json"))
@@ -546,17 +548,16 @@ impl<'lock> PublicationOutboxJournal<'lock> {
             &self.latest,
         )?;
         let bytes = canonical_bytes(&record)?;
+        self.directory
+            .recover_journal_append_residue(OUTBOX_FILE_MODE, "publication outbox record")?;
         self.state_quota.reserve(bytes.len() as u64)?;
         let name = Self::generation_name(generation);
-        let mut file = self.directory.create_new_file(
+        self.directory.write_new_journal_record(
             OsStr::new(&name),
+            &bytes,
             OUTBOX_FILE_MODE,
             "publication outbox record",
         )?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|error| format!("schedule outbox: cannot persist record: {error}"))?;
-        self.directory.sync()?;
         let journal_sha256 = local_file::sha256_hex(&bytes);
         let payload_sha256 = outbox_payload_sha256(&record.outbox)?;
         self.latest.insert(
@@ -803,6 +804,7 @@ mod tests {
     use super::*;
     use crate::compatibility_schedule_schema::GitObjectAlgorithmV1;
     use crate::compatibility_schedule_state::SchedulerStateRoot;
+    use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     fn root() -> tempfile::TempDir {
@@ -919,6 +921,69 @@ mod tests {
         let reopened = PublicationOutboxJournal::open(&lock).unwrap();
         assert_eq!(reopened.latest(&create.outbox_id), Some(&confirmed));
         assert!(reopened.pending_recovery_actions().is_empty());
+    }
+
+    #[test]
+    fn interrupted_outbox_tail_does_not_poison_reopen_or_next_append() {
+        let directory = root();
+        let root = SchedulerStateRoot::initialize_for_test(directory.path()).unwrap();
+        let outbox_directory = directory.path().join("publication-outbox");
+        let temporary = outbox_directory.join(".a2a-journal-append-v1.tmp");
+        std::fs::write(&temporary, b"truncated-uncommitted-record").unwrap();
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let lock = root.try_owner_admission("outbox-interrupted-tail").unwrap();
+        let mut journal = PublicationOutboxJournal::open(&lock).unwrap();
+        journal.start(identity("external-after-crash"), 10).unwrap();
+
+        assert!(!temporary.exists());
+        assert!(outbox_directory
+            .join(PublicationOutboxJournal::generation_name(1))
+            .is_file());
+        assert_eq!(
+            PublicationOutboxJournal::open(&lock).unwrap().records.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn outbox_interruption_before_atomic_publish_reopens_and_retries_same_generation() {
+        let directory = root();
+        let root = SchedulerStateRoot::initialize_for_test(directory.path()).unwrap();
+        let lock = root
+            .try_owner_admission("outbox-interrupted-publication")
+            .unwrap();
+        let outbox_directory = lock.publication_outbox_directory();
+        let temporary = outbox_directory
+            .canonical_path()
+            .join(".a2a-journal-append-v1.tmp");
+        let final_record = outbox_directory
+            .canonical_path()
+            .join(PublicationOutboxJournal::generation_name(1));
+        let mut journal = PublicationOutboxJournal::open(&lock).unwrap();
+
+        outbox_directory.fail_journal_publish_on_nth_call_for_test(1);
+        let error = journal
+            .start(identity("external-interrupted-publication"), 10)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected failure before journal publication"));
+        assert!(temporary.is_file());
+        assert!(!final_record.exists());
+        drop(journal);
+
+        let mut reopened = PublicationOutboxJournal::open(&lock).unwrap();
+        assert!(reopened.records.is_empty());
+        reopened
+            .start(identity("external-interrupted-publication"), 10)
+            .unwrap();
+        assert!(!temporary.exists());
+        assert!(final_record.is_file());
+        assert_eq!(
+            PublicationOutboxJournal::open(&lock).unwrap().records.len(),
+            1
+        );
     }
 
     #[test]

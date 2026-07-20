@@ -943,8 +943,15 @@ impl EvidenceStateModelV1 {
                 ColdCopyLifecycleV1::Admitted => {
                     if !self.entries.contains_key(&copy.evidence_id)
                         || !matches!(cold_path, OptionalRelativeEvidencePathV1::Absent)
+                        || self.tombstones.values().any(|value| {
+                            value.evidence_id == copy.evidence_id
+                                && value.lifecycle == TombstoneLifecycleV1::Pending
+                        })
                     {
-                        return Err("schedule evidence: admitted cold copy is not pending".into());
+                        return Err(
+                            "schedule evidence: admitted cold copy is not exclusively pending"
+                                .into(),
+                        );
                     }
                 }
                 ColdCopyLifecycleV1::Abandoned { .. } => {}
@@ -1130,6 +1137,10 @@ impl EvidenceStateModelV1 {
             || candidate.cold_copies.values().any(|value| {
                 value.evidence_id == copy.evidence_id
                     && !matches!(value.lifecycle, ColdCopyLifecycleV1::Abandoned { .. })
+            })
+            || candidate.tombstones.values().any(|value| {
+                value.evidence_id == copy.evidence_id
+                    && value.lifecycle == TombstoneLifecycleV1::Pending
             })
         {
             return Err(
@@ -1383,6 +1394,13 @@ impl EvidenceStateModelV1 {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn has_admitted_cold_copy(&self, evidence_id: &str) -> bool {
+        self.cold_copies.values().any(|copy| {
+            copy.evidence_id == evidence_id && copy.lifecycle == ColdCopyLifecycleV1::Admitted
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn begin_tombstone(
         &mut self,
         tombstone_id: &str,
@@ -1391,9 +1409,14 @@ impl EvidenceStateModelV1 {
         created_at_ms: i64,
     ) -> Result<(), BoxError> {
         let mut candidate = self.clone();
-        if candidate.tombstones.contains_key(tombstone_id) || candidate.has_active_pin(evidence_id)
+        if candidate.tombstones.contains_key(tombstone_id)
+            || candidate.has_active_pin(evidence_id)
+            || candidate.has_admitted_cold_copy(evidence_id)
         {
-            return Err("schedule evidence: tombstone id exists or evidence is pinned".into());
+            return Err(
+                "schedule evidence: tombstone id exists, evidence is pinned, or an admitted cold copy is unresolved"
+                    .into(),
+            );
         }
         let entry = candidate
             .entries
@@ -2411,25 +2434,16 @@ impl<'lock> FileEvidenceJournal<'lock> {
         if bytes.len() as u64 > MAX_STATE_RECORD_BYTES {
             return Err("schedule evidence: state generation exceeds the byte bound".into());
         }
+        self.directory
+            .recover_journal_append_residue(STATE_FILE_MODE, "evidence state generation")?;
         self.state_quota.reserve(bytes.len() as u64)?;
         let name = Self::generation_name(snapshot.generation);
-        let mut file = self.directory.create_new_file(
+        self.directory.write_new_journal_record(
             OsStr::new(&name),
+            &bytes,
             STATE_FILE_MODE,
             "evidence state generation",
         )?;
-        if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
-            drop(file);
-            let _ = self.directory.remove_child(
-                OsStr::new(&name),
-                false,
-                "failed evidence state generation",
-            );
-            return Err(
-                format!("schedule evidence: cannot persist state generation: {error}").into(),
-            );
-        }
-        self.directory.sync()?;
         Ok(())
     }
 
@@ -4603,25 +4617,16 @@ impl<'lock> FileIncidentMigrationJournal<'lock> {
         if bytes.len() as u64 > MAX_INCIDENT_MIGRATION_RECORD_BYTES {
             return Err("schedule evidence: incident migration record exceeds its bound".into());
         }
+        self.directory
+            .recover_journal_append_residue(STATE_FILE_MODE, "incident migration record")?;
         self.state_quota.reserve(bytes.len() as u64)?;
         let name = Self::generation_name(generation);
-        let mut file = self.directory.create_new_file(
+        self.directory.write_new_journal_record(
             OsStr::new(&name),
+            &bytes,
             STATE_FILE_MODE,
             "incident migration record",
         )?;
-        if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
-            drop(file);
-            let _ = self.directory.remove_child(
-                OsStr::new(&name),
-                false,
-                "failed incident migration record",
-            );
-            return Err(
-                format!("schedule evidence: cannot persist incident migration: {error}").into(),
-            );
-        }
-        self.directory.sync()?;
         self.records = candidate;
         Ok(())
     }
@@ -6130,6 +6135,49 @@ mod tests {
     }
 
     #[test]
+    fn evidence_interruption_before_atomic_publish_reopens_and_retries_same_generation() {
+        let root = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let lock = scheduler
+            .try_owner_admission("test/evidence-interrupted-publication")
+            .unwrap();
+        let evidence_directory = lock.evidence_index_directory();
+        let temporary = evidence_directory
+            .canonical_path()
+            .join(".a2a-journal-append-v1.tmp");
+        let final_record = evidence_directory
+            .canonical_path()
+            .join(FileEvidenceJournal::generation_name(2));
+        let mut state = model();
+        let mut opened = FileEvidenceJournal::initialize(&lock, &state, 1).unwrap();
+        state
+            .insert_entry(entry("evidence-interrupted", 1_000_000, 512))
+            .unwrap();
+
+        evidence_directory.fail_journal_publish_on_nth_call_for_test(1);
+        let error = opened.journal.append(&state, 2_000_000).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected failure before journal publication"));
+        assert!(temporary.is_file());
+        assert!(!final_record.exists());
+        drop(opened);
+
+        let mut reopened = FileEvidenceJournal::open_existing(&lock).unwrap();
+        assert_eq!(reopened.snapshot.generation, 1);
+        reopened.journal.append(&state, 2_000_000).unwrap();
+        assert!(!temporary.exists());
+        assert!(final_record.is_file());
+        assert_eq!(
+            FileEvidenceJournal::open_existing(&lock)
+                .unwrap()
+                .snapshot
+                .generation,
+            2
+        );
+    }
+
+    #[test]
     fn evidence_journal_rejects_gap_corruption_and_same_path_replacement() {
         let root = root();
         let scheduler = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
@@ -7181,29 +7229,37 @@ mod tests {
             root_sha256: digest('e'),
             file_provider_domain_id: "icloud-domain-1".into(),
         };
-        state
-            .admit_cold_copy(
-                binding,
-                ColdCopyRecordV1 {
-                    copy_id: "cold-copy-1".into(),
-                    evidence_id: "evidence-1".into(),
-                    archive_sha256: digest('a'),
-                    archive_bytes: 512,
-                    manifest_sha256: digest('b'),
-                    manifest_bytes: 128,
-                    consent_id: "consent-1".into(),
-                    consent_sha256: digest('d'),
-                    consent_revocation_generation: 1,
-                    cold_root_sha256: digest('e'),
-                    file_provider_domain_id: "icloud-domain-1".into(),
-                    archive_path: archive_path.clone(),
-                    manifest_path: manifest_path.clone(),
-                    deadline_ms: 20_000_000_100,
-                    admitted_at_ms: 20_000_000_001,
-                    lifecycle: ColdCopyLifecycleV1::Admitted,
-                },
+        let copy = ColdCopyRecordV1 {
+            copy_id: "cold-copy-1".into(),
+            evidence_id: "evidence-1".into(),
+            archive_sha256: digest('a'),
+            archive_bytes: 512,
+            manifest_sha256: digest('b'),
+            manifest_bytes: 128,
+            consent_id: "consent-1".into(),
+            consent_sha256: digest('d'),
+            consent_revocation_generation: 1,
+            cold_root_sha256: digest('e'),
+            file_provider_domain_id: "icloud-domain-1".into(),
+            archive_path: archive_path.clone(),
+            manifest_path: manifest_path.clone(),
+            deadline_ms: 20_000_000_100,
+            admitted_at_ms: 20_000_000_001,
+            lifecycle: ColdCopyLifecycleV1::Admitted,
+        };
+        let mut deleting = state.clone();
+        deleting
+            .begin_tombstone(
+                "tombstone-before-admission",
+                "evidence-1",
+                "retention_expired",
+                i64::MAX,
             )
             .unwrap();
+        assert!(deleting
+            .admit_cold_copy(binding.clone(), copy.clone())
+            .is_err());
+        state.admit_cold_copy(binding, copy).unwrap();
         let admitted = first.successor(state.clone(), 20_000_000_002).unwrap();
         validate_evidence_state_transition(&first, &admitted).unwrap();
 
@@ -7429,6 +7485,56 @@ mod tests {
         assert!(chain_error
             .to_string()
             .contains("incident migration chain is not monotonic"));
+    }
+
+    #[test]
+    fn migration_interruption_before_atomic_publish_reopens_and_retries_same_generation() {
+        let source = root();
+        let aggregate = aggregate_bytes();
+        let item = migration_item(
+            "incident-interrupted-publication",
+            &source.path().join("missing-interrupted.json"),
+            &aggregate,
+        );
+        let state_root = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(state_root.path()).unwrap();
+        let lock = scheduler
+            .try_owner_admission("test/migration-interrupted-publication")
+            .unwrap();
+        let migration_directory = lock.migration_directory();
+        let temporary = migration_directory
+            .canonical_path()
+            .join(".a2a-journal-append-v1.tmp");
+        let final_record = migration_directory
+            .canonical_path()
+            .join(FileIncidentMigrationJournal::generation_name(1));
+        let mut journal = FileIncidentMigrationJournal::open_existing_or_empty(&lock).unwrap();
+
+        migration_directory.fail_journal_publish_on_nth_call_for_test(1);
+        let error = journal
+            .append(&item, IncidentMigrationDispositionV1::Missing, 1_000_001)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected failure before journal publication"));
+        assert!(temporary.is_file());
+        assert!(!final_record.exists());
+        drop(journal);
+
+        let mut reopened = FileIncidentMigrationJournal::open_existing_or_empty(&lock).unwrap();
+        assert!(reopened.records().is_empty());
+        reopened
+            .append(&item, IncidentMigrationDispositionV1::Missing, 1_000_001)
+            .unwrap();
+        assert!(!temporary.exists());
+        assert!(final_record.is_file());
+        assert_eq!(
+            FileIncidentMigrationJournal::open_existing_or_empty(&lock)
+                .unwrap()
+                .records()
+                .len(),
+            1
+        );
     }
 
     #[test]

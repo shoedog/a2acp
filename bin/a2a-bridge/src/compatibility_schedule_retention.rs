@@ -1864,6 +1864,11 @@ pub(super) fn execute_evidence_tombstone<C: EvidenceStateCapability + ?Sized>(
     if tombstone.lifecycle == TombstoneLifecycleV1::Pending && state.has_active_pin(evidence_id) {
         return Err("schedule retention: active pin blocks evidence deletion".into());
     }
+    if tombstone.lifecycle == TombstoneLifecycleV1::Pending
+        && state.has_admitted_cold_copy(evidence_id)
+    {
+        return Err("schedule retention: admitted cold copy blocks evidence deletion".into());
+    }
 
     cleanup_exact_hot_payload(
         hot,
@@ -4144,6 +4149,36 @@ mod tests {
             state.entries["evidence-1"].cold_path,
             OptionalRelativeEvidencePathV1::Absent
         ));
+        let tombstone_error = execute_evidence_tombstone(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &recovery_fixture.hot,
+            Some(&recovery_fixture.cold),
+            Some(&mut recovery_provider),
+            "tombstone-before-cold-recovery",
+            "evidence-1",
+            "retention_elapsed",
+            i64::MAX - 1,
+            i64::MAX,
+            EvidenceTombstoneFailpointV1::None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            tombstone_error.contains("admitted cold copy"),
+            "unexpected tombstone refusal: {tombstone_error}"
+        );
+        assert!(!state
+            .tombstones
+            .contains_key("tombstone-before-cold-recovery"));
+        let hot_directory = recovery_fixture
+            .hot_root
+            .path()
+            .join("sealed")
+            .join(local_file::sha256_hex(b"evidence-1"));
+        assert!(hot_directory.join("evidence.tar.gz").is_file());
+        assert!(hot_directory.join("manifest.json").is_file());
         publish_admitted_cold_copy(
             &owner,
             &mut opened.journal,
