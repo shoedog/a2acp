@@ -402,6 +402,8 @@ pub(crate) struct ChildMetadataSnapshot {
 
 impl ChildMetadataSnapshot {
     #[cfg_attr(not(test), allow(dead_code))]
+    // The libc mode constants already are u32 on Linux but require widening on macOS.
+    #[allow(clippy::unnecessary_cast)]
     pub(crate) fn is_regular(self) -> bool {
         self.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
     }
@@ -706,6 +708,8 @@ impl PinnedDirectory {
     /// Inspect one direct child without following a final symlink and without re-resolving the
     /// retained parent directory pathname.
     #[cfg_attr(not(test), allow(dead_code))]
+    // These libc stat fields match the stored widths on Linux but require widening on macOS.
+    #[allow(clippy::unnecessary_cast)]
     pub(crate) fn child_metadata_no_follow(
         &self,
         name: &OsStr,
