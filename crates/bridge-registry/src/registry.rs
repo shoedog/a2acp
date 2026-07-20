@@ -481,9 +481,9 @@ impl AgentRegistry for Registry {
         let _g = self.write_lock.lock().await;
         // Atomic reconcile [spec §7]:
         //  - validate first → malformed config is rejected before any state change.
-        //  - reuse the live slot for a config-only edit (same cmd/args/cwd/auth_method)
+        //  - reuse the live slot for a config-only edit (same spawn-frozen identity)
         //    so its warm OnceCell backend + active leases survive [req #1].
-        //  - a new slot for an add OR a cmd/args/cwd/auth change.
+        //  - a new slot for an add OR any spawn-frozen identity change.
         //  - swap the (slots, default) pair in ONE store → no partial-snapshot window.
         //  - retire by slot-INSTANCE identity (Arc ptr) = removed ∪ replaced [req #2];
         //    retired slots are simply absent from `next` so resolve can't livelock [req #3].
@@ -508,6 +508,9 @@ impl AgentRegistry for Registry {
                     && c.sandbox == e.sandbox
                     && c.session_cwd == e.session_cwd
                     && c.api_key_env == e.api_key_env
+                    && c.watchdog == e.watchdog
+                    && c.mcp == e.mcp
+                    && c.mcp_delivery == e.mcp_delivery
             });
             match reuse {
                 // Config-only edit: keep the warm slot, swap only its entry config.
@@ -591,8 +594,9 @@ impl Registry {
 mod tests {
     use super::*;
     use bridge_core::diagnostics::{DiagnosticPhase, InMemoryDiagnosticObserver, PhaseStatus};
-    use bridge_core::domain::{AgentKind, Effort, RegistrySnapshot};
+    use bridge_core::domain::{AgentKind, Effort, RegistrySnapshot, WatchdogConfig};
     use bridge_core::ids::SessionId;
+    use bridge_core::mcp::{McpDelivery, McpServerSpec};
     use bridge_core::ports::{BackendStream, DiagnosticObserver, Update};
     use std::collections::BTreeMap;
 
@@ -1148,6 +1152,76 @@ mod tests {
             Some("opus"),
             "the new model is live on the reused slot"
         );
+    }
+
+    fn single_entry_snapshot(entry: AgentEntry) -> RegistrySnapshot {
+        RegistrySnapshot {
+            default: entry.id.clone(),
+            entries: vec![entry],
+            allowed_cmds: vec!["fake-cmd".into()],
+        }
+    }
+
+    async fn assert_spawn_frozen_edit_replaces_slot(
+        label: &str,
+        before: AgentEntry,
+        after: AgentEntry,
+    ) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = Registry::new(
+            single_entry_snapshot(before),
+            counting_spawn_recording(count.clone(), 0, retired.clone()),
+        )
+        .unwrap();
+        let agent = AgentId::parse("a").unwrap();
+
+        let old = reg.resolve(&agent).await.unwrap();
+        let slot_before = reg.slot_arc(&agent).unwrap();
+        reg.apply(single_entry_snapshot(after)).await.unwrap();
+        let slot_after = reg.slot_arc(&agent).unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&slot_before, &slot_after),
+            "{label} change must replace the spawn-frozen slot"
+        );
+        let new = reg.resolve(&agent).await.unwrap();
+        assert_eq!(
+            count.load(SeqCst),
+            2,
+            "{label} change must spawn a backend with the new configuration"
+        );
+        drop(new);
+        drop(old);
+        await_retired(&retired, 1).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_frozen_watchdog_mcp_and_delivery_edits_replace_backend() {
+        let base = entry("a");
+
+        let mut with_watchdog = base.clone();
+        with_watchdog.watchdog = Some(WatchdogConfig {
+            idle_timeout: Duration::from_secs(30),
+            hard_wall_clock: Duration::from_secs(300),
+        });
+        assert_spawn_frozen_edit_replaces_slot("watchdog", base.clone(), with_watchdog).await;
+
+        let mcp = McpServerSpec {
+            name: "repo-nav".into(),
+            command: "repo-nav-mcp".into(),
+            args: vec!["--cwd".into(), "{cwd}".into()],
+            env: vec![],
+        };
+        let mut with_mcp = base.clone();
+        with_mcp.mcp = vec![mcp.clone()];
+        assert_spawn_frozen_edit_replaces_slot("mcp", base.clone(), with_mcp).await;
+
+        let mut acp_delivery = base.clone();
+        acp_delivery.mcp = vec![mcp.clone()];
+        let mut native_delivery = acp_delivery.clone();
+        native_delivery.mcp_delivery = McpDelivery::CodexNative;
+        assert_spawn_frozen_edit_replaces_slot("mcp_delivery", acp_delivery, native_delivery).await;
     }
 
     #[tokio::test]

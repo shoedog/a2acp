@@ -331,6 +331,8 @@ pub struct PrometheusObserver {
     turn_duration: HistogramVec,
     turn_ttft: HistogramVec,
     turns_in_flight: IntGauge,
+    /// Active lifecycle identities keep duplicate/missing events from skewing the gauge.
+    active_turns: Mutex<HashSet<String>>,
     queue_depth: IntGauge,
     queue_wait: HistogramVec,
     cost_total: CounterVec,
@@ -361,7 +363,10 @@ impl PrometheusObserver {
             HistogramOpts::new("bridge_turn_ttft_seconds", "Turn time to first token"),
             &["agent"],
         )?;
-        let turns_in_flight = IntGauge::new("bridge_turns_in_flight", "Currently running turns")?;
+        let turns_in_flight = IntGauge::new(
+            "bridge_turns_in_flight",
+            "Currently running agent turns across all execution surfaces",
+        )?;
         let queue_depth = IntGauge::new("bridge_queue_depth", "Queued batch admissions")?;
         let queue_wait = HistogramVec::new(
             HistogramOpts::new("bridge_queue_wait_seconds", "Queue wait duration"),
@@ -410,6 +415,7 @@ impl PrometheusObserver {
             turn_duration,
             turn_ttft,
             turns_in_flight,
+            active_turns: Mutex::new(HashSet::new()),
             queue_depth,
             queue_wait,
             cost_total,
@@ -545,17 +551,34 @@ impl PrometheusObserver {
             }
         }
     }
+
+    fn set_turn_active(&self, ctx: &TurnContext, active: bool) {
+        let mut turns = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = if active {
+            turns.insert(ctx.turn_id.as_str().to_string())
+        } else {
+            turns.remove(ctx.turn_id.as_str())
+        };
+        if changed {
+            self.turns_in_flight
+                .set(i64::try_from(turns.len()).unwrap_or(i64::MAX));
+        }
+    }
 }
 
 impl Observer for PrometheusObserver {
     fn record(&self, e: &ObsEvent<'_>) {
         match e {
+            ObsEvent::TurnStarted { ctx } => self.set_turn_active(ctx, true),
             ObsEvent::TurnFinished {
                 ctx,
                 latency,
                 ttft,
                 outcome,
             } => {
+                // Clear liveness before recording secondary completion metrics, so a sink failure cannot
+                // strand the drain signal after the execution owner has emitted its terminal event.
+                self.set_turn_active(ctx, false);
                 let (agent, model, effort) = self.labels(ctx);
                 self.turns_total
                     .with_label_values(&[&agent, &model, &effort, outcome_label(outcome)])
@@ -569,12 +592,7 @@ impl Observer for PrometheusObserver {
                         .observe(ttft.as_secs_f64());
                 }
             }
-            ObsEvent::QueueChanged {
-                in_flight,
-                queued,
-                wait,
-            } => {
-                self.turns_in_flight.set(*in_flight as i64);
+            ObsEvent::QueueChanged { queued, wait, .. } => {
                 self.queue_depth.set(*queued as i64);
                 if let Some(wait) = wait {
                     self.queue_wait
@@ -602,7 +620,6 @@ impl Observer for PrometheusObserver {
                 }
             }
             ObsEvent::TaskStarted { .. }
-            | ObsEvent::TurnStarted { .. }
             | ObsEvent::TaskFinished { .. }
             | ObsEvent::NodeStarted { .. }
             | ObsEvent::NodeFinished { .. } => {}
@@ -1208,6 +1225,119 @@ mod prometheus_tests {
         }
     }
 
+    fn in_flight(observer: &PrometheusObserver) -> i64 {
+        observer
+            .endpoint()
+            .render()
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("bridge_turns_in_flight "))
+            .expect("in-flight gauge is registered")
+            .parse()
+            .expect("in-flight gauge is an integer")
+    }
+
+    #[test]
+    fn prometheus_tracks_all_turn_lifecycles_idempotently() {
+        let observer = PrometheusObserver::new(LabelVocabulary::default()).unwrap();
+        let first = ctx("turn-active-1", "codex", None, None);
+        let second = ctx("turn-active-2", "claude", None, None);
+        let unknown = ctx("turn-never-started", "kiro", None, None);
+        let ok = TurnOutcome::Success;
+
+        observer.record(&ObsEvent::TurnStarted { ctx: &first });
+        observer.record(&ObsEvent::TurnStarted { ctx: &first });
+        assert_eq!(in_flight(&observer), 1, "duplicate start counts once");
+
+        observer.record(&ObsEvent::TurnStarted { ctx: &second });
+        assert_eq!(in_flight(&observer), 2, "distinct direct turns both count");
+
+        observer.record(&ObsEvent::QueueChanged {
+            in_flight: 99,
+            queued: 3,
+            wait: None,
+        });
+        assert_eq!(
+            in_flight(&observer),
+            2,
+            "batch admission state must not overwrite active-turn truth"
+        );
+
+        observer.record(&ObsEvent::TurnFinished {
+            ctx: &unknown,
+            latency: Duration::ZERO,
+            ttft: None,
+            outcome: &ok,
+        });
+        assert_eq!(in_flight(&observer), 2, "finish without start is a no-op");
+
+        for _ in 0..2 {
+            observer.record(&ObsEvent::TurnFinished {
+                ctx: &first,
+                latency: Duration::ZERO,
+                ttft: None,
+                outcome: &ok,
+            });
+        }
+        assert_eq!(in_flight(&observer), 1, "duplicate finish decrements once");
+
+        observer.record(&ObsEvent::TurnFinished {
+            ctx: &second,
+            latency: Duration::ZERO,
+            ttft: None,
+            outcome: &ok,
+        });
+        assert_eq!(in_flight(&observer), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prometheus_active_turn_accounting_is_concurrency_safe() {
+        const WORKERS: usize = 32;
+        let observer = Arc::new(PrometheusObserver::new(LabelVocabulary::default()).unwrap());
+        let started_count = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Barrier::new(WORKERS + 1));
+        let release = Arc::new(tokio::sync::Barrier::new(WORKERS + 1));
+        let mut handles = Vec::new();
+
+        for index in 0..WORKERS {
+            let observer = observer.clone();
+            let started_count = started_count.clone();
+            let started = started.clone();
+            let release = release.clone();
+            handles.push(tokio::spawn(async move {
+                let turn = ctx(&format!("turn-concurrent-{index}"), "codex", None, None);
+                let ok = TurnOutcome::Success;
+                observer.record(&ObsEvent::TurnStarted { ctx: &turn });
+                started_count.fetch_add(1, Ordering::SeqCst);
+                started.wait().await;
+                release.wait().await;
+                observer.record(&ObsEvent::TurnFinished {
+                    ctx: &turn,
+                    latency: Duration::ZERO,
+                    ttft: None,
+                    outcome: &ok,
+                });
+            }));
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), started.wait())
+            .await
+            .expect("every concurrent start must reach the accounting barrier");
+        assert_eq!(started_count.load(Ordering::SeqCst), WORKERS);
+        assert_eq!(in_flight(&observer), WORKERS as i64);
+        tokio::time::timeout(Duration::from_secs(1), release.wait())
+            .await
+            .expect("every concurrent turn must reach release");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for handle in handles {
+                handle.await.unwrap();
+            }
+        })
+        .await
+        .expect("every concurrent finish must complete");
+        assert_eq!(in_flight(&observer), 0);
+    }
+
     #[test]
     fn prometheus_records_turn_latency_usage_queue_and_currency_rules() {
         let observer = PrometheusObserver::new(LabelVocabulary {
@@ -1349,7 +1479,7 @@ mod prometheus_tests {
             out.contains("bridge_turn_duration_seconds_sum{agent=\"codex\",model=\"gpt-5.5\"} 1.5")
         );
         assert!(out.contains("bridge_turn_ttft_seconds_sum{agent=\"codex\"} 0.1"));
-        assert!(out.contains("bridge_turns_in_flight 4"));
+        assert!(out.contains("bridge_turns_in_flight 0"));
         assert!(out.contains("bridge_queue_depth 9"));
         assert!(out.contains("bridge_queue_wait_seconds_sum 0.25"));
         assert!(out.contains(
