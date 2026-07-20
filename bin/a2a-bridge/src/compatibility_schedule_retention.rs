@@ -508,13 +508,17 @@ pub(super) enum ColdResidueDispositionV1 {
     Ambiguous,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(super) struct ColdPublicationResultV1 {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) snapshot_sha256: String,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) archive_path: RelativeEvidencePathV1,
+pub(super) enum ColdPublicationOutcomeV1 {
+    Published {
+        snapshot_sha256: String,
+        archive_path: RelativeEvidencePathV1,
+    },
+    IntegrityBlocked {
+        hold_id: String,
+        snapshot_sha256: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -837,7 +841,7 @@ pub(super) fn publish_admitted_cold_copy<
     copy_id: &str,
     recorded_at_ms: i64,
     failpoint: ColdPublicationFailpointV1,
-) -> Result<ColdPublicationResultV1, BoxError> {
+) -> Result<ColdPublicationOutcomeV1, BoxError> {
     state.validate()?;
     if state.hot_root_sha256 != hot.root_sha256() {
         return Err("schedule retention: evidence state/hot-root binding mismatch".into());
@@ -991,6 +995,21 @@ pub(super) fn publish_admitted_cold_copy<
     let archive_observation = probe_object(cold, probe, &copy, &copy.archive_path, recorded_at_ms)?;
     let manifest_observation =
         probe_object(cold, probe, &copy, &copy.manifest_path, recorded_at_ms)?;
+    if observation_is_integrity_blocking(&archive_observation)
+        || observation_is_integrity_blocking(&manifest_observation)
+    {
+        let (hold_id, snapshot_sha256) = persist_integrity_hold(
+            journal,
+            state,
+            &copy.evidence_id,
+            "cold_publication_state_uncertain",
+            recorded_at_ms,
+        )?;
+        return Ok(ColdPublicationOutcomeV1::IntegrityBlocked {
+            hold_id,
+            snapshot_sha256,
+        });
+    }
     let mut candidate = state.clone();
     candidate.publish_cold_copy(
         copy_id,
@@ -1000,7 +1019,7 @@ pub(super) fn publish_admitted_cold_copy<
     )?;
     let (_snapshot, snapshot_sha256) = journal.append(&candidate, recorded_at_ms)?;
     *state = candidate;
-    Ok(ColdPublicationResultV1 {
+    Ok(ColdPublicationOutcomeV1::Published {
         snapshot_sha256,
         archive_path: copy.archive_path,
     })
@@ -3112,6 +3131,7 @@ pub(super) fn plan_image_gc(
 pub(super) enum RuntimeImageRemovalV1 {
     Removed,
     Absent,
+    Referenced { state: ContainerLifecycleV1 },
     Refused { reason_code: String },
 }
 
@@ -3119,7 +3139,14 @@ pub(super) enum RuntimeImageRemovalV1 {
 pub(super) trait RuntimeImageEffectsV1 {
     fn inventory_all(&mut self) -> Result<RuntimeImageInventoryV1, BoxError>;
 
-    fn remove_exact_digest(&mut self, digest: &str) -> Result<RuntimeImageRemovalV1, BoxError>;
+    /// Hold the runtime's image-GC exclusion across a final query of every running and stopped
+    /// container reference and the exact-digest removal. A reference observed inside that critical
+    /// section must leave the image unchanged and return `Referenced`; the preceding
+    /// `inventory_all` call is only a preflight and does not discharge this action-time fence.
+    fn remove_exact_digest_if_unreferenced(
+        &mut self,
+        digest: &str,
+    ) -> Result<RuntimeImageRemovalV1, BoxError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3306,7 +3333,7 @@ pub(super) fn execute_image_gc_item<
         );
     }
 
-    let removal = match runtime.remove_exact_digest(&item.digest) {
+    let removal = match runtime.remove_exact_digest_if_unreferenced(&item.digest) {
         Ok(removal) => removal,
         Err(_) => {
             return finish_image_safe_skip(
@@ -3319,6 +3346,13 @@ pub(super) fn execute_image_gc_item<
         }
     };
     match removal {
+        RuntimeImageRemovalV1::Referenced { .. } => finish_image_safe_skip(
+            journal,
+            state,
+            &item.action_id,
+            "runtime_reference_race",
+            completed_at_ms,
+        ),
         RuntimeImageRemovalV1::Refused { .. } => finish_image_safe_skip(
             journal,
             state,
@@ -3898,9 +3932,16 @@ mod tests {
             ColdPublicationFailpointV1::None,
         )
         .unwrap();
-        assert_eq!(publication.archive_path, admission.archive_path);
+        let ColdPublicationOutcomeV1::Published {
+            snapshot_sha256,
+            archive_path,
+        } = publication
+        else {
+            panic!("known publication must complete")
+        };
+        assert_eq!(archive_path, admission.archive_path);
         let reopened = FileEvidenceJournal::open_existing(&owner).unwrap();
-        assert_eq!(publication.snapshot_sha256, reopened.snapshot_sha256);
+        assert_eq!(snapshot_sha256, reopened.snapshot_sha256);
         assert_eq!(
             inspect_cold_copy_residue(&fixture.cold, &admission).unwrap(),
             ColdResidueDispositionV1::Published
@@ -3914,6 +3955,88 @@ mod tests {
             state.entries["evidence-1"].cold_path,
             OptionalRelativeEvidencePathV1::RelativePath { .. }
         ));
+    }
+
+    #[test]
+    fn cold_publication_uncertain_observation_blocks_before_indexing() {
+        for uncertain_state in [
+            FileProviderObjectStateV1::Unknown {
+                reason_code: "metadata_unavailable".into(),
+            },
+            FileProviderObjectStateV1::Unavailable {
+                reason_code: "provider_unavailable".into(),
+            },
+        ] {
+            let fixture = Fixture::new();
+            let mut provider = FakeProvider::new(&fixture.cold);
+            let admission = admit(&fixture, &mut provider, "evidence-1", BASE + 1);
+            provider
+                .overrides
+                .insert(admission.archive_path.components.join("/"), uncertain_state);
+            let owner = fixture
+                .scheduler
+                .try_owner_admission("test/r3d3c-uncertain-publication")
+                .unwrap();
+            let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+            let mut state = opened.snapshot.state.clone();
+
+            let outcome = publish_admitted_cold_copy(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &fixture.hot,
+                &fixture.cold,
+                &mut provider,
+                &fixture.consent,
+                &admission.copy_id,
+                BASE + 2,
+                ColdPublicationFailpointV1::None,
+            )
+            .unwrap();
+
+            assert!(matches!(
+                outcome,
+                ColdPublicationOutcomeV1::IntegrityBlocked {
+                    snapshot_sha256: Some(_),
+                    ..
+                }
+            ));
+            assert!(matches!(
+                state.cold_copies[&admission.copy_id].lifecycle,
+                ColdCopyLifecycleV1::Admitted
+            ));
+            assert!(state.entries["evidence-1"].hot_present);
+            assert!(matches!(
+                state.entries["evidence-1"].cold_path,
+                OptionalRelativeEvidencePathV1::Absent
+            ));
+            assert_eq!(state.storage_integrity_holds.len(), 1);
+            let reopened = FileEvidenceJournal::open_existing(&owner).unwrap();
+            assert_eq!(reopened.snapshot.state, state);
+            drop(reopened);
+
+            provider
+                .overrides
+                .remove(&admission.archive_path.components.join("/"));
+            assert!(matches!(
+                publish_admitted_cold_copy(
+                    &owner,
+                    &mut opened.journal,
+                    &mut state,
+                    &fixture.hot,
+                    &fixture.cold,
+                    &mut provider,
+                    &fixture.consent,
+                    &admission.copy_id,
+                    BASE + 3,
+                    ColdPublicationFailpointV1::None,
+                )
+                .unwrap(),
+                ColdPublicationOutcomeV1::Published { .. }
+            ));
+            assert_eq!(state.storage_integrity_holds.len(), 1);
+            assert!(state.entries["evidence-1"].hot_present);
+        }
     }
 
     #[test]
@@ -6556,6 +6679,7 @@ mod tests {
         inventory_error: bool,
         remove_error: bool,
         refuse_removal: bool,
+        reference_on_next_remove: Option<ContainerLifecycleV1>,
         remove_calls: Vec<String>,
     }
 
@@ -6568,13 +6692,23 @@ mod tests {
             }
         }
 
-        fn remove_exact_digest(
+        fn remove_exact_digest_if_unreferenced(
             &mut self,
             digest: &str,
         ) -> Result<RuntimeImageRemovalV1, crate::BoxError> {
             self.remove_calls.push(digest.into());
             if self.remove_error {
                 return Err("injected runtime removal failure".into());
+            }
+            if let Some(state) = self.reference_on_next_remove.take() {
+                self.inventory
+                    .container_references
+                    .push(ContainerImageReferenceV1 {
+                        container_id: "between-inventory-and-remove".into(),
+                        digest: digest.into(),
+                        state,
+                    });
+                return Ok(RuntimeImageRemovalV1::Referenced { state });
             }
             if self.refuse_removal {
                 return Ok(RuntimeImageRemovalV1::Refused {
@@ -6620,6 +6754,7 @@ mod tests {
             inventory_error: false,
             remove_error: false,
             refuse_removal: false,
+            reference_on_next_remove: None,
             remove_calls: Vec::new(),
         };
         assert_eq!(
@@ -6713,6 +6848,56 @@ mod tests {
     }
 
     #[test]
+    fn image_gc_safely_skips_reference_created_between_inventory_and_remove() {
+        let _gc_test_guard = gc_test_guard();
+        for lifecycle in [ContainerLifecycleV1::Running, ContainerLifecycleV1::Stopped] {
+            let fixture = Fixture::new();
+            let initial = image_inventory();
+            let plan = plan_image_gc(&initial, BASE + 2).unwrap();
+            let item = &plan.removals[0];
+            let owner = fixture
+                .scheduler
+                .try_owner_admission("test/r3d3d-image-effect-race")
+                .unwrap();
+            let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+            let mut state = opened.snapshot.state.clone();
+            let mut fresh = initial.clone();
+            fresh.observed_at_ms = BASE + 3;
+            let mut runtime = FakeImageRuntime {
+                inventory: fresh,
+                inventory_error: false,
+                remove_error: false,
+                refuse_removal: false,
+                reference_on_next_remove: Some(lifecycle),
+                remove_calls: Vec::new(),
+            };
+
+            assert_eq!(
+                execute_image_gc_item(
+                    &owner,
+                    &mut opened.journal,
+                    &mut state,
+                    &mut runtime,
+                    Some(&initial),
+                    item,
+                    BASE + 3,
+                    BASE + 4,
+                    ImageGcFailpointV1::None,
+                )
+                .unwrap(),
+                ImageGcOutcomeV1::SafeSkipped {
+                    reason_code: "runtime_reference_race".into()
+                }
+            );
+            assert!(runtime
+                .inventory
+                .images
+                .iter()
+                .any(|image| image.digest == item.digest));
+        }
+    }
+
+    #[test]
     fn image_gc_recovers_a_crash_after_exact_digest_removal_without_touching_other_images() {
         let _gc_test_guard = gc_test_guard();
         let fixture = Fixture::new();
@@ -6732,6 +6917,7 @@ mod tests {
             inventory_error: false,
             remove_error: false,
             refuse_removal: false,
+            reference_on_next_remove: None,
             remove_calls: Vec::new(),
         };
         assert!(execute_image_gc_item(
@@ -6787,6 +6973,7 @@ mod tests {
             inventory_error: false,
             remove_error: false,
             refuse_removal: true,
+            reference_on_next_remove: None,
             remove_calls: Vec::new(),
         };
 
@@ -6832,6 +7019,7 @@ mod tests {
             inventory_error: false,
             remove_error: false,
             refuse_removal: false,
+            reference_on_next_remove: None,
             remove_calls: Vec::new(),
         };
         let action_count = state.image_gc_actions.len();
