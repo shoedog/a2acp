@@ -90,7 +90,29 @@ warnings-denied check and Clippy, dependency policy, locked release workspace bu
 canonical full serial workspace **2,512/0/12 ignored** across **72** groups (**55** nonempty). Its 215,487-byte log
 has SHA-256 `eb3cd35270d6e08be92f45c7ed4d5a09e559b4fb75dfcae482357bf5b8883151`; the provider-unexercised
 26,793,312-byte release binary remains SHA-256
-`a5f08c29a161cee2e5da6742e980c00018f597a9814f93dd8f4b9c30728f4aa4`. The docs-only commit containing this
+`a5f08c29a161cee2e5da6742e980c00018f597a9814f93dd8f4b9c30728f4aa4`. Exact docs head
+`50b3e84c70cdce2b564848a50df9dc5d0571c45e` reproduced those gates and received an eighth Sol/xhigh
+**REVISE**. Items 2-16 were resolved; items 1, 17, and 18 remained High `WRONG` through one shared mechanism:
+rename-success plus parent-sync failure exposed a complete final journal name, and evidence, migration, outbox,
+status, notification, and admission reopen accepted it without first making the surviving directory entry durable.
+No additional fresh finding was reported. The 10,572-byte artifact has SHA-256
+`49227af3d09924c979326e6c4f6c830bd99baf7070a263ee3059f1c9fda2f2b7`.
+
+Eighth remediation is checkpointed at `4f3ccfc`. One descriptor-relative journal recovery barrier now syncs the
+retained parent before any affected reopen scans final generation names; a failed barrier returns an error without
+consuming state, while a later successful barrier makes every surviving complete final durable before parsing.
+Evidence initialization uses the same barrier, and the production status read remains namespace/content-write-free.
+Six post-rename sync-failure regressions each failed at the required fail-closed reopen assertion on the reviewed
+mechanism and now pass through successful retry. Affected suites are evidence **51/0**, outbox **9/0**, status
+**14/0**, and transaction/control **33/0**. Exact source commit `4f3ccfc4f87c3eef4b2b4081e4f3642ac9c13ba7`
+passes format/diff, workspace all-target/all-feature warnings-denied check and Clippy, dependency policy, locked
+release workspace build, hygiene **37/7**, manifest **9**, recipes **4**, foundation **6/4**, scheduler CLI
+**25/0 + 31/0 + 2/0**, complete binary **778/0/0**, and canonical full serial workspace **2,518/0/12 ignored**
+across **72** groups (**55** nonempty). The binary log is 74,611 bytes at SHA-256
+`71402ea9af088fdc009a36833880501998d2b764940b2d6b82aaf15527a82b99`; the workspace log is 216,241 bytes at
+SHA-256 `261b215b22198a11192dfca0c5d237eb6c5357cc8433e7f37de05810dad24660`; and the provider-unexercised
+26,795,184-byte release binary has SHA-256
+`9ec0a066a5c90a0019f686229434fc012a492239f2756090fd42ca58211619c7`. The docs-only commit containing this
 evidence is the intended next review head. No approval is claimed. This slice remains local, non-billable,
 default-off, and has one merge boundary.
 
@@ -515,9 +537,31 @@ binary **772/0/0**, and canonical full serial workspace **2,512/0/12 ignored** a
 nonempty). The complete log is 215,487 bytes at SHA-256
 `eb3cd35270d6e08be92f45c7ed4d5a09e559b4fb75dfcae482357bf5b8883151`; the provider-unexercised release binary
 remains 26,793,312 bytes at SHA-256
-`a5f08c29a161cee2e5da6742e980c00018f597a9814f93dd8f4b9c30728f4aa4`. The docs-only commit containing this
-paragraph is the intended next review head. Reproduce deterministic gates on that exact unchanged head as supplied
-review evidence, then run fresh Sol closure rereview without another docs fold. No approval is claimed yet.
+`a5f08c29a161cee2e5da6742e980c00018f597a9814f93dd8f4b9c30728f4aa4`. Exact docs head
+`50b3e84c70cdce2b564848a50df9dc5d0571c45e` reproduced those gates. Fresh Sol/xhigh/read-only closure rereview
+returned an eighth **REVISE**. Items 2-16 were resolved, while items 1, 17, and 18 remained High `WRONG` through
+one common durability gap: all six complete-temp/no-replace journal writers report an error if parent sync fails
+after rename, but every reopen consumed the visible final before first re-syncing the retained directory. A later
+crash could therefore lose state already used for evidence deletion or quarantine opening/closure. There was no
+additional fresh finding. The 10,572-byte artifact has SHA-256
+`49227af3d09924c979326e6c4f6c830bd99baf7070a263ee3059f1c9fda2f2b7`.
+
+Eighth remediation commit `4f3ccfc` adds one descriptor-relative recovery barrier before evidence initialization
+or reopen and before migration, outbox, status, notification, or admission scanning. Barrier failure is returned
+before any visible final is interpreted; a later successful barrier durably establishes every surviving complete
+name before parse. The status path still changes no namespace or file content, as its existing before/after tree
+snapshot proves. Six injected post-rename parent-sync regressions each failed at the fail-closed reopen assertion on
+the reviewed mechanism and now pass through the subsequent successful reopen. Affected suites pass evidence
+**51/0**, outbox **9/0**, status **14/0**, and transaction/control **33/0**. Exact source head
+`4f3ccfc4f87c3eef4b2b4081e4f3642ac9c13ba7` passes every deterministic gate, complete binary **778/0/0**, and
+canonical full serial workspace **2,518/0/12 ignored** across **72** result groups (**55** nonempty). The binary
+log is 74,611 bytes at SHA-256 `71402ea9af088fdc009a36833880501998d2b764940b2d6b82aaf15527a82b99`; the
+workspace log is 216,241 bytes at SHA-256
+`261b215b22198a11192dfca0c5d237eb6c5357cc8433e7f37de05810dad24660`; the provider-unexercised release binary
+is 26,795,184 bytes at SHA-256 `9ec0a066a5c90a0019f686229434fc012a492239f2756090fd42ca58211619c7`.
+The docs-only commit containing this paragraph is the intended next review head. Reproduce deterministic gates on
+that exact unchanged head as supplied review evidence, then run fresh Sol closure rereview without another docs
+fold. No approval is claimed yet.
 
 One dogfood incident is deliberately deferred outside R3d3 correctness. Operator release `983398427c9f0486`
 served a healthy agent card/model catalog and green Codex doctor/provenance checks with zero unfinished tasks and
@@ -593,9 +637,20 @@ status **10/0**, complete binary **760/0/0**, canonical workspace **2,500/0/12 i
 publication and one runtime-image atomic-reference `SMELL`. Fifth remediation `28682c1` closes both through a
 typed durable publication hold and a runtime-GC-excluded reference-and-remove effect. Its exact regressions failed
 **0/1 + 0/1** before the fix; retention/GC **35/0**, binary **762/0/0**, canonical workspace
-**2,502/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic gate are green. The
-docs-only commit containing this evidence is the intended review head; supply its exact-head deterministic
-reproduction directly to fresh Sol/xhigh closure rereview without another cursor mutation. Run the single
-Fable/xhigh release/compatibility lens only after Sol approval. No production operator rebuild or swap is part of
-this slice; preserve the deferred lifecycle-sensitive unary-submit incident above for later reliability
-investigation.
+**2,502/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic gate are green. Exact docs
+head `58144d3` received the sixth Sol **REVISE** with the uncertain-publication/tombstone interaction still wrong
+and five direct-final journal writers newly wrong. Sixth remediation `43b429a` closes both with mutually exclusive
+Admitted/Pending state and complete-temp/no-replace journal publication; binary **770/0/0** and workspace
+**2,510/0/12 ignored** are green. Exact docs head `5c1e03e` received the seventh Sol **REVISE** after resolving all
+seventeen inherited items; its sole new High `WRONG` was the admission-control chain's sixth direct-final writer.
+Seventh remediation `34bcfcd` moves it to the same atomic append primitive; binary **772/0/0** and workspace
+**2,512/0/12 ignored** are green. Exact docs head `50b3e84` received the eighth Sol **REVISE**: items 2-16 were
+resolved, but items 1, 17, and 18 shared a post-rename parent-sync ambiguity because reopen did not establish a
+durability barrier. Eighth remediation `4f3ccfc` adds that barrier at all six affected reopen surfaces. Its six
+fail-first regressions and focused suites are green; complete binary is **778/0/0**, canonical workspace is
+**2,518/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic release/validator gate is
+green. The docs-only commit containing this evidence is the intended review head; supply its exact-head
+deterministic reproduction directly to fresh Sol/xhigh closure rereview without another cursor mutation. Run the
+single Fable/xhigh release/compatibility lens only after Sol approval. No production operator rebuild or swap is
+part of this slice; preserve `INC-SHARED-RESTART-RECOVERY-2026-07-19` for later R2f investigation rather than
+treating restart as a fix.

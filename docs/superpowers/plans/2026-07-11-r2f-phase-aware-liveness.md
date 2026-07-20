@@ -1,11 +1,11 @@
 # R2f — Phase-aware liveness and safe takeover plan
 
-- **Status:** DEFERRED; three incidents recorded, investigation not started
+- **Status:** DEFERRED; four incidents recorded, investigation not started
 - **Prerequisite:** R2b structured diagnostics merged; may proceed independently of R2c–R2e afterward
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Incident ids:** `INC-VERIFY-STALL-2026-07-11`, `INC-SHARED-WARM-CRASH-2026-07-16`,
-  `INC-SHARED-SESSION-CAPACITY-2026-07-17`
+  `INC-SHARED-SESSION-CAPACITY-2026-07-17`, `INC-SHARED-RESTART-RECOVERY-2026-07-19`
 
 ## Incident evidence and limits
 
