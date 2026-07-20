@@ -10,14 +10,21 @@ use std::io::Write as _;
 
 use serde::{Deserialize, Serialize};
 
+use crate::compatibility_schedule_authority::authority_status_source_sha256;
+use crate::compatibility_schedule_evidence::evidence_status_source_sha256;
+use crate::compatibility_schedule_ledger::ledger_status_source_sha256;
+use crate::compatibility_schedule_outbox::outbox_status_source_sha256;
 use crate::compatibility_schedule_schema::{
     AuthorityStateV1, OneShotCompatibilityStateV1, OptionalAuthorityStatusV1, OptionalRecordRefV1,
     OptionalSha256V1, OptionalTextV1, QuarantineV1, ScheduleCaseLifecycleV1, ScheduleStatusV1,
     StorageStateV1, ValidateRecord,
 };
 use crate::compatibility_schedule_state::{
-    open_production_status_directory_read_only, EvidenceStateCapability,
+    open_production_status_directory_read_only, AdmissionStateCapability, AuthorityStateCapability,
+    EvidenceStateCapability, StateQuota,
 };
+use crate::compatibility_schedule_supervisor::ownership_status_source_sha256;
+use crate::compatibility_schedule_transaction::admission_status_source_sha256;
 use crate::{local_file, BoxError};
 
 const STATUS_PREFIX: &str = "status-snapshot.";
@@ -316,8 +323,7 @@ impl ProjectedScheduleStatusV1 {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn project_status(
+fn project_status_from_verified_sources(
     status: ScheduleStatusV1,
     mut sources: Vec<StatusSourceObservationV1>,
 ) -> Result<ProjectedScheduleStatusV1, BoxError> {
@@ -340,6 +346,146 @@ pub(super) fn project_status(
     Ok(projected)
 }
 
+fn healthy_source(source: StatusSourceKindV1, sha256: String) -> StatusSourceObservationV1 {
+    StatusSourceObservationV1 {
+        source,
+        state: StatusSourceStateV1::Healthy { sha256 },
+    }
+}
+
+fn missing_source(source: StatusSourceKindV1, code: &str) -> StatusSourceObservationV1 {
+    StatusSourceObservationV1 {
+        source,
+        state: StatusSourceStateV1::Missing { code: code.into() },
+    }
+}
+
+fn corrupt_source(source: StatusSourceKindV1, code: &str) -> StatusSourceObservationV1 {
+    StatusSourceObservationV1 {
+        source,
+        state: StatusSourceStateV1::Corrupt { code: code.into() },
+    }
+}
+
+fn domain_source_sha256(domain: &[u8], source_sha256: &str) -> String {
+    let mut material = domain.to_vec();
+    material.extend_from_slice(source_sha256.as_bytes());
+    local_file::sha256_hex(&material)
+}
+
+fn optional_source(
+    source: StatusSourceKindV1,
+    acquired: Result<Option<String>, BoxError>,
+    missing_code: &str,
+    corrupt_code: &str,
+) -> StatusSourceObservationV1 {
+    match acquired {
+        Ok(Some(sha256)) => healthy_source(source, sha256),
+        Ok(None) => missing_source(source, missing_code),
+        Err(_) => corrupt_source(source, corrupt_code),
+    }
+}
+
+fn required_source(
+    source: StatusSourceKindV1,
+    acquired: Result<String, BoxError>,
+    corrupt_code: &str,
+) -> StatusSourceObservationV1 {
+    match acquired {
+        Ok(sha256) => healthy_source(source, sha256),
+        Err(_) => corrupt_source(source, corrupt_code),
+    }
+}
+
+fn project_status_from_journals<C>(
+    capability: &C,
+    status: ScheduleStatusV1,
+) -> Result<ProjectedScheduleStatusV1, BoxError>
+where
+    C: AuthorityStateCapability + AdmissionStateCapability + EvidenceStateCapability + ?Sized,
+{
+    let authority = optional_source(
+        StatusSourceKindV1::Authority,
+        authority_status_source_sha256(capability),
+        "authority_state_missing",
+        "authority_state_corrupt",
+    );
+    let ledger = required_source(
+        StatusSourceKindV1::Ledger,
+        ledger_status_source_sha256(capability),
+        "ledger_state_corrupt",
+    );
+    let evidence_result = capability
+        .state_quota()
+        .reserve(0)
+        .map_err(|error| -> BoxError { error })
+        .and_then(|_| evidence_status_source_sha256(capability));
+    let (evidence, retention) = match evidence_result {
+        Ok(Some(sha256)) => (
+            healthy_source(StatusSourceKindV1::Evidence, sha256.clone()),
+            healthy_source(
+                StatusSourceKindV1::Retention,
+                domain_source_sha256(b"a2a-bridge:r3d3:status-source:retention:v1\0", &sha256),
+            ),
+        ),
+        Ok(None) => (
+            missing_source(StatusSourceKindV1::Evidence, "evidence_state_missing"),
+            missing_source(StatusSourceKindV1::Retention, "retention_state_missing"),
+        ),
+        Err(_) => (
+            corrupt_source(StatusSourceKindV1::Evidence, "evidence_state_corrupt"),
+            corrupt_source(StatusSourceKindV1::Retention, "retention_state_corrupt"),
+        ),
+    };
+    let (controls, windows) = match admission_status_source_sha256(capability) {
+        Ok((controls, windows)) => (
+            healthy_source(StatusSourceKindV1::Controls, controls),
+            healthy_source(StatusSourceKindV1::Windows, windows),
+        ),
+        Err(_) => (
+            corrupt_source(StatusSourceKindV1::Controls, "controls_state_corrupt"),
+            corrupt_source(StatusSourceKindV1::Windows, "windows_state_corrupt"),
+        ),
+    };
+    let outbox = required_source(
+        StatusSourceKindV1::Outbox,
+        outbox_status_source_sha256(capability),
+        "outbox_state_corrupt",
+    );
+    let notifications = required_source(
+        StatusSourceKindV1::Notifications,
+        notification_status_source_sha256(capability),
+        "notification_state_corrupt",
+    );
+    let ownership = required_source(
+        StatusSourceKindV1::Ownership,
+        ownership_status_source_sha256(capability.supervisor_directory()),
+        "ownership_state_corrupt",
+    );
+    project_status_from_verified_sources(
+        status,
+        vec![
+            authority,
+            ledger,
+            evidence,
+            retention,
+            controls,
+            windows,
+            outbox,
+            notifications,
+            ownership,
+        ],
+    )
+}
+
+#[cfg(test)]
+fn project_status(
+    status: ScheduleStatusV1,
+    sources: Vec<StatusSourceObservationV1>,
+) -> Result<ProjectedScheduleStatusV1, BoxError> {
+    project_status_from_verified_sources(status, sources)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct StatusJournalRecordV1 {
@@ -353,6 +499,7 @@ struct StatusJournalRecordV1 {
 #[allow(dead_code)] // The R3d5 scheduler will append projections; the R3d3 CLI is read-only.
 pub(super) struct ScheduleStatusJournal<'lock> {
     directory: &'lock local_file::PinnedDirectory,
+    state_quota: Option<StateQuota>,
     records: Vec<(StatusJournalRecordV1, String)>,
 }
 
@@ -436,16 +583,22 @@ impl<'lock> ScheduleStatusJournal<'lock> {
             previous_time = Some(record.recorded_at_ms);
             records.push((record, sha256));
         }
-        Ok(Self { directory, records })
+        Ok(Self {
+            directory,
+            state_quota: None,
+            records,
+        })
     }
 
     pub(super) fn open<C: EvidenceStateCapability + ?Sized>(
         capability: &'lock C,
     ) -> Result<Self, BoxError> {
-        Self::open_directory(capability.status_directory())
+        let mut journal = Self::open_directory(capability.status_directory())?;
+        journal.state_quota = Some(capability.state_quota());
+        Ok(journal)
     }
 
-    pub(super) fn append(
+    fn append_projected(
         &mut self,
         projection: ProjectedScheduleStatusV1,
     ) -> Result<String, BoxError> {
@@ -467,6 +620,10 @@ impl<'lock> ScheduleStatusJournal<'lock> {
         };
         validate_status_record(&record, generation, previous_sha256, previous_time)?;
         let bytes = canonical_bytes(&record)?;
+        self.state_quota
+            .as_ref()
+            .ok_or("schedule status: append requires the owner state quota capability")?
+            .reserve(bytes.len() as u64)?;
         let name = Self::generation_name(generation);
         let mut file = self.directory.create_new_file(
             OsStr::new(&name),
@@ -480,6 +637,25 @@ impl<'lock> ScheduleStatusJournal<'lock> {
         let sha256 = local_file::sha256_hex(&bytes);
         self.records.push((record, sha256.clone()));
         Ok(sha256)
+    }
+
+    pub(super) fn append<C>(
+        &mut self,
+        capability: &C,
+        status: ScheduleStatusV1,
+    ) -> Result<String, BoxError>
+    where
+        C: AuthorityStateCapability + AdmissionStateCapability + EvidenceStateCapability + ?Sized,
+    {
+        self.append_projected(project_status_from_journals(capability, status)?)
+    }
+
+    #[cfg(test)]
+    fn append_projected_for_test(
+        &mut self,
+        projection: ProjectedScheduleStatusV1,
+    ) -> Result<String, BoxError> {
+        self.append_projected(projection)
     }
 
     pub(super) fn latest(&self) -> Option<&ProjectedScheduleStatusV1> {
@@ -761,6 +937,7 @@ pub(super) struct NotificationDeliverySummaryV1 {
 #[allow(dead_code)] // The R3d5 scheduler supplies a macOS sink; R3d3 tests inject only fake sinks.
 pub(super) struct NotificationJournal<'lock> {
     directory: &'lock local_file::PinnedDirectory,
+    state_quota: StateQuota,
     records: Vec<(NotificationJournalRecordV1, String)>,
     latest: BTreeMap<String, NotificationJournalRecordV1>,
 }
@@ -864,6 +1041,7 @@ impl<'lock> NotificationJournal<'lock> {
         }
         Ok(Self {
             directory,
+            state_quota: capability.state_quota(),
             records,
             latest,
         })
@@ -900,6 +1078,7 @@ impl<'lock> NotificationJournal<'lock> {
             self.latest.get(&record.notification.fingerprint_sha256),
         )?;
         let bytes = canonical_bytes(&record)?;
+        self.state_quota.reserve(bytes.len() as u64)?;
         let name = Self::generation_name(generation);
         let mut file = self.directory.create_new_file(
             OsStr::new(&name),
@@ -945,6 +1124,21 @@ impl<'lock> NotificationJournal<'lock> {
         }
         Ok(pending.len())
     }
+}
+
+fn notification_status_source_sha256<C: EvidenceStateCapability + ?Sized>(
+    capability: &C,
+) -> Result<String, BoxError> {
+    let journal = NotificationJournal::open(capability)?;
+    let mut material = b"a2a-bridge:r3d3:status-source:notifications:v1\0".to_vec();
+    material.extend_from_slice(
+        journal
+            .records
+            .last()
+            .map_or("empty", |(_, sha256)| sha256.as_str())
+            .as_bytes(),
+    );
+    Ok(local_file::sha256_hex(&material))
 }
 
 fn notification_event_time(lifecycle: &NotificationLifecycleV1, created_at_ms: i64) -> i64 {
@@ -1267,8 +1461,11 @@ pub(super) fn render_production_status(json: bool) -> Result<String, BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compatibility_schedule_authority::FileAuthorityJournal;
+    use crate::compatibility_schedule_evidence::{EvidenceStateModelV1, FileEvidenceJournal};
     use crate::compatibility_schedule_schema::{
-        FingerprintV1, OptionalWindowV1, ScheduleCaseStatusV1, SharedOperatorHealthV1,
+        ColdStorageBindingV1, FingerprintV1, OptionalWindowV1, ScheduleCaseStatusV1,
+        SharedOperatorHealthV1,
     };
     use crate::compatibility_schedule_state::SchedulerStateRoot;
     use std::cell::Cell;
@@ -1370,7 +1567,7 @@ mod tests {
             .unwrap();
         let mut journal = ScheduleStatusJournal::open(&owner).unwrap();
         journal
-            .append(project_status(status(900), healthy_sources()).unwrap())
+            .append_projected_for_test(project_status(status(900), healthy_sources()).unwrap())
             .unwrap();
         drop(journal);
         drop(owner);
@@ -1463,20 +1660,71 @@ mod tests {
     }
 
     #[test]
+    fn journal_acquisition_cannot_project_missing_or_corrupt_required_state_green() {
+        let directory = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(directory.path()).unwrap();
+        let combined = scheduler
+            .try_owner_admission("status-source-acquisition")
+            .unwrap()
+            .try_authority_state("status-source-authority")
+            .unwrap();
+
+        let missing = project_status_from_journals(&combined, status(210)).unwrap();
+        assert_eq!(missing.overall, ScheduleOverallStateV1::Degraded);
+        assert!(matches!(
+            missing.sources[0].state,
+            StatusSourceStateV1::Missing { ref code } if code == "authority_state_missing"
+        ));
+        assert!(matches!(
+            missing.sources[2].state,
+            StatusSourceStateV1::Missing { ref code } if code == "evidence_state_missing"
+        ));
+
+        FileAuthorityJournal::initialize(&combined, 1).unwrap();
+        let evidence =
+            EvidenceStateModelV1::new("d".repeat(64), ColdStorageBindingV1::Absent).unwrap();
+        FileEvidenceJournal::initialize(&combined, &evidence, 2).unwrap();
+        let mut journal = ScheduleStatusJournal::open(&combined).unwrap();
+        journal.append(&combined, status(211)).unwrap();
+        let healthy = journal.latest().unwrap().clone();
+        assert_eq!(healthy.overall, ScheduleOverallStateV1::Green);
+        assert!(healthy
+            .sources
+            .iter()
+            .all(|source| matches!(source.state, StatusSourceStateV1::Healthy { .. })));
+
+        let evidence_path = combined
+            .evidence_index_directory()
+            .canonical_path()
+            .join("evidence-state.00000000000000000001.json");
+        std::fs::write(&evidence_path, b"{}\n").unwrap();
+        let corrupt = project_status_from_journals(&combined, status(212)).unwrap();
+        assert_eq!(corrupt.overall, ScheduleOverallStateV1::Degraded);
+        assert!(matches!(
+            corrupt.sources[2].state,
+            StatusSourceStateV1::Corrupt { ref code } if code == "evidence_state_corrupt"
+        ));
+        assert!(matches!(
+            corrupt.sources[3].state,
+            StatusSourceStateV1::Corrupt { ref code } if code == "retention_state_corrupt"
+        ));
+    }
+
+    #[test]
     fn status_journal_reopens_contiguous_chain_and_rejects_gap_or_backdating() {
         let directory = root();
         let root = SchedulerStateRoot::initialize_for_test(directory.path()).unwrap();
         let lock = root.try_owner_admission("status-journal").unwrap();
         let mut journal = ScheduleStatusJournal::open(&lock).unwrap();
         let first = project_status(status(300), healthy_sources()).unwrap();
-        journal.append(first.clone()).unwrap();
+        journal.append_projected_for_test(first.clone()).unwrap();
         let second = project_status(status(301), healthy_sources()).unwrap();
-        journal.append(second.clone()).unwrap();
+        journal.append_projected_for_test(second.clone()).unwrap();
         assert!(journal
-            .append(project_status(status(301), healthy_sources()).unwrap())
+            .append_projected_for_test(project_status(status(301), healthy_sources()).unwrap())
             .is_err());
         let third = project_status(status(302), healthy_sources()).unwrap();
-        journal.append(third.clone()).unwrap();
+        journal.append_projected_for_test(third.clone()).unwrap();
         drop(journal);
         assert_eq!(
             ScheduleStatusJournal::open(&lock).unwrap().latest(),

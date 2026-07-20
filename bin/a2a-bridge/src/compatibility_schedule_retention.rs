@@ -226,6 +226,76 @@ pub(super) trait FileProviderStateProbeV1 {
     ) -> Result<FileProviderObservationV1, BoxError>;
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct FileProviderRemovalRequestV1 {
+    pub(super) cold_root_sha256: String,
+    pub(super) file_provider_domain_id: String,
+    pub(super) object_path: RelativeEvidencePathV1,
+    pub(super) expected_length_bytes: u64,
+    pub(super) expected_sha256: String,
+    pub(super) requested_at_ms: i64,
+}
+
+impl FileProviderRemovalRequestV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        if !local_file::valid_sha256(&self.cold_root_sha256)
+            || !local_file::valid_sha256(&self.expected_sha256)
+            || self.expected_length_bytes == 0
+            || self.requested_at_ms <= 0
+        {
+            return Err("schedule retention: FileProvider removal request is invalid".into());
+        }
+        cache_stable_id("FileProvider removal domain", &self.file_provider_domain_id)?;
+        if self.object_path.components.len() != 1 {
+            return Err(
+                "schedule retention: FileProvider removal path is not a cold-root child".into(),
+            );
+        }
+        crate::compatibility_schedule_schema::relative_evidence_path(
+            "FileProvider removal path",
+            &self.object_path,
+        )?;
+        Ok(())
+    }
+
+    fn sha256(&self) -> Result<String, BoxError> {
+        self.validate()?;
+        let mut material = b"a2a-bridge:r3d3:file-provider-removal:v1\0".to_vec();
+        material.extend_from_slice(&serde_json::to_vec(self)?);
+        Ok(local_file::sha256_hex(&material))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) enum FileProviderRemovalDispositionV1 {
+    RemovedExact,
+    AlreadyAbsent,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct FileProviderRemovalResultV1 {
+    pub(super) request_sha256: String,
+    pub(super) disposition: FileProviderRemovalDispositionV1,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) trait FileProviderMutationV1: FileProviderStateProbeV1 {
+    /// Revalidate and remove the exact requested object while holding FileProvider namespace
+    /// coordination. Implementations must sync the parent namespace before returning either
+    /// terminal disposition. A changed object is an error, never `AlreadyAbsent`.
+    fn remove_exact(
+        &mut self,
+        cold: &ColdEvidenceStoreV1,
+        request: &FileProviderRemovalRequestV1,
+    ) -> Result<FileProviderRemovalResultV1, BoxError>;
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn probe_request(
     copy: Option<&ColdCopyRecordV1>,
@@ -911,6 +981,10 @@ pub(super) fn publish_admitted_cold_copy<
     if cold_bytes != hot_bytes {
         return Err("schedule retention: published cold payload bytes diverged".into());
     }
+    // A prior rename may have succeeded while its directory sync failed. Re-sync even when both
+    // finals were already present at recovery entry; only then may the state journal claim the
+    // publication as durable.
+    cold.root.sync()?;
     if failpoint == ColdPublicationFailpointV1::AfterFinalPublication {
         return Err("schedule retention: injected crash after cold final publication".into());
     }
@@ -935,35 +1009,32 @@ pub(super) fn publish_admitted_cold_copy<
 #[cfg_attr(not(test), allow(dead_code))]
 fn cleanup_exact_partial(
     cold: &ColdEvidenceStoreV1,
-    name: &str,
+    provider_mutation: &mut Option<&mut dyn FileProviderMutationV1>,
+    copy: &ColdCopyRecordV1,
+    path: RelativeEvidencePathV1,
     expected_bytes: u64,
     expected_sha256: &str,
+    observed_at_ms: i64,
 ) -> Result<(), BoxError> {
-    let Some(candidate_name) = cold
-        .root
-        .regular_child_removal_candidate(OsStr::new(name), "abandoned cold partial")?
-    else {
-        return Ok(());
-    };
-    let file = cold
-        .root
-        .open_regular_file(&candidate_name, "abandoned cold partial")?;
-    validate_private_file(&file.metadata()?, "abandoned cold partial")?;
-    let snapshot = local_file::read_open_regular_file_bounded(
-        &file,
-        "abandoned cold partial",
+    coordinated_remove_cold_file(
+        cold,
+        provider_mutation,
+        copy,
+        &path,
         expected_bytes,
-    )?;
-    if snapshot.bytes.len() as u64 != expected_bytes || snapshot.sha256 != expected_sha256 {
-        return Err("schedule retention: abandoned cold partial length or hash mismatch".into());
-    }
-    cold.root.remove_regular_child_candidate(
-        OsStr::new(name),
-        local_file::RegularChildRef::new(&candidate_name, &file),
+        expected_sha256,
+        observed_at_ms,
         "abandoned cold partial cleanup",
     )?;
-    cold.root.sync()?;
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct ColdAbandonmentRequestV1 {
+    pub(super) copy_id: String,
+    pub(super) reason_code: String,
+    pub(super) recorded_at_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -980,28 +1051,39 @@ pub(super) fn abandon_cold_copy<C: EvidenceStateCapability + ?Sized>(
     journal: &mut FileEvidenceJournal<'_>,
     state: &mut EvidenceStateModelV1,
     cold: &ColdEvidenceStoreV1,
-    copy_id: &str,
-    reason_code: &str,
-    recorded_at_ms: i64,
+    provider_mutation: Option<&mut dyn FileProviderMutationV1>,
+    request: &ColdAbandonmentRequestV1,
 ) -> Result<ColdAbandonmentResultV1, BoxError> {
     state.validate()?;
     let copy = state
         .cold_copies
-        .get(copy_id)
+        .get(&request.copy_id)
         .ok_or("schedule retention: cold-copy abandonment target does not exist")?
         .clone();
-    if copy.lifecycle != ColdCopyLifecycleV1::Admitted || recorded_at_ms <= copy.deadline_ms {
+    if copy.lifecycle != ColdCopyLifecycleV1::Admitted || request.recorded_at_ms <= copy.deadline_ms
+    {
         return Err(
             "schedule retention: only an expired admitted cold copy can be abandoned".into(),
         );
     }
     let residue = inspect_cold_copy_residue(cold, &copy)?;
     let mut candidate = state.clone();
-    candidate.abandon_cold_copy(copy_id, reason_code, recorded_at_ms)?;
-    let (_snapshot, snapshot_sha256) = journal.append(&candidate, recorded_at_ms)?;
+    candidate.abandon_cold_copy(
+        &request.copy_id,
+        &request.reason_code,
+        request.recorded_at_ms,
+    )?;
+    let (_snapshot, snapshot_sha256) = journal.append(&candidate, request.recorded_at_ms)?;
     *state = candidate;
 
-    let cleanup = cleanup_abandoned_cold_copy(capability, state, cold, copy_id);
+    let cleanup = cleanup_abandoned_cold_copy(
+        capability,
+        state,
+        cold,
+        provider_mutation,
+        &request.copy_id,
+        request.recorded_at_ms,
+    );
     Ok(ColdAbandonmentResultV1 {
         snapshot_sha256,
         residue,
@@ -1014,7 +1096,9 @@ pub(super) fn cleanup_abandoned_cold_copy<C: EvidenceStateCapability + ?Sized>(
     _capability: &C,
     state: &EvidenceStateModelV1,
     cold: &ColdEvidenceStoreV1,
+    mut provider_mutation: Option<&mut dyn FileProviderMutationV1>,
     copy_id: &str,
+    observed_at_ms: i64,
 ) -> Result<ColdResidueDispositionV1, BoxError> {
     state.validate()?;
     let copy = state
@@ -1033,36 +1117,61 @@ pub(super) fn cleanup_abandoned_cold_copy<C: EvidenceStateCapability + ?Sized>(
         ColdResidueDispositionV1::None => {}
         ColdResidueDispositionV1::ArchivePartialOnly => cleanup_exact_partial(
             cold,
-            &archive_partial,
+            &mut provider_mutation,
+            copy,
+            RelativeEvidencePathV1 {
+                components: vec![archive_partial],
+            },
             copy.archive_bytes,
             &copy.archive_sha256,
+            observed_at_ms,
         )?,
         ColdResidueDispositionV1::ManifestPartialOnly => cleanup_exact_partial(
             cold,
-            &manifest_partial,
+            &mut provider_mutation,
+            copy,
+            RelativeEvidencePathV1 {
+                components: vec![manifest_partial],
+            },
             copy.manifest_bytes,
             &copy.manifest_sha256,
+            observed_at_ms,
         )?,
         ColdResidueDispositionV1::BothPartials => {
             cleanup_exact_partial(
                 cold,
-                &archive_partial,
+                &mut provider_mutation,
+                copy,
+                RelativeEvidencePathV1 {
+                    components: vec![archive_partial],
+                },
                 copy.archive_bytes,
                 &copy.archive_sha256,
+                observed_at_ms,
             )?;
             cleanup_exact_partial(
                 cold,
-                &manifest_partial,
+                &mut provider_mutation,
+                copy,
+                RelativeEvidencePathV1 {
+                    components: vec![manifest_partial],
+                },
                 copy.manifest_bytes,
                 &copy.manifest_sha256,
+                observed_at_ms,
             )?;
         }
         ColdResidueDispositionV1::ArchivePublishedManifestPartial => {
             cleanup_exact_partial(
                 cold,
-                &manifest_partial,
+                &mut provider_mutation,
+                copy,
+                RelativeEvidencePathV1 {
+                    components: vec![manifest_partial],
+                },
                 copy.manifest_bytes,
                 &copy.manifest_sha256,
+                observed_at_ms,
             )?;
             return Err("schedule retention: abandoned cold final requires owner cleanup".into());
         }
@@ -1210,6 +1319,9 @@ fn cleanup_exact_hot_payload(
         .sealed_directory()
         .open_child_directory_optional(OsStr::new(object_name), "hot evidence eviction payload")?
     else {
+        // Directory removal may have completed before a failed parent sync. Recovery must make
+        // that namespace effect durable before it permits terminal state.
+        hot.sealed_directory().sync()?;
         return Ok(());
     };
     validate_private_directory(&payload, "hot evidence eviction payload")?;
@@ -1486,7 +1598,7 @@ fn materialize_for_deletion(
 #[cfg_attr(not(test), allow(dead_code))]
 fn open_optional_cold_deletion_file(
     cold: &ColdEvidenceStoreV1,
-    provider_probe: &mut Option<&mut dyn FileProviderStateProbeV1>,
+    provider_mutation: &mut Option<&mut dyn FileProviderMutationV1>,
     copy: &ColdCopyRecordV1,
     path: &RelativeEvidencePathV1,
     expected_bytes: u64,
@@ -1511,9 +1623,9 @@ fn open_optional_cold_deletion_file(
         }
         ChildDispositionV1::PrivateRegular => {}
     }
-    let probe = provider_probe
+    let probe = provider_mutation
         .as_deref_mut()
-        .ok_or("schedule retention: cold deletion probe is unavailable")?;
+        .ok_or("schedule retention: coordinated cold deletion is unavailable")?;
     let candidate_path = RelativeEvidencePathV1 {
         components: vec![candidate_component.into()],
     };
@@ -1527,10 +1639,60 @@ fn open_optional_cold_deletion_file(
     Ok(Some((candidate_name, file)))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn coordinated_remove_cold_file(
+    cold: &ColdEvidenceStoreV1,
+    provider_mutation: &mut Option<&mut dyn FileProviderMutationV1>,
+    copy: &ColdCopyRecordV1,
+    path: &RelativeEvidencePathV1,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    observed_at_ms: i64,
+    label: &str,
+) -> Result<FileProviderRemovalDispositionV1, BoxError> {
+    let prevalidated = open_optional_cold_deletion_file(
+        cold,
+        provider_mutation,
+        copy,
+        path,
+        expected_bytes,
+        expected_sha256,
+        observed_at_ms,
+        label,
+    )?;
+    drop(prevalidated);
+    let request = FileProviderRemovalRequestV1 {
+        cold_root_sha256: copy.cold_root_sha256.clone(),
+        file_provider_domain_id: copy.file_provider_domain_id.clone(),
+        object_path: path.clone(),
+        expected_length_bytes: expected_bytes,
+        expected_sha256: expected_sha256.into(),
+        requested_at_ms: observed_at_ms,
+    };
+    request.validate()?;
+    let mutation = provider_mutation
+        .as_deref_mut()
+        .ok_or("schedule retention: coordinated cold deletion is unavailable")?;
+    let result = mutation.remove_exact(cold, &request)?;
+    if result.request_sha256 != request.sha256()? {
+        return Err("schedule retention: FileProvider removal result binding changed".into());
+    }
+    let name = single_component(path, label)?;
+    if cold
+        .root
+        .regular_child_removal_candidate(OsStr::new(name), label)?
+        .is_some()
+    {
+        return Err("schedule retention: coordinated cold removal left a namespace entry".into());
+    }
+    cold.root.sync()?;
+    Ok(result.disposition)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn cleanup_exact_cold_payload(
     cold: &ColdEvidenceStoreV1,
-    mut provider_probe: Option<&mut dyn FileProviderStateProbeV1>,
+    mut provider_mutation: Option<&mut dyn FileProviderMutationV1>,
     copy: &ColdCopyRecordV1,
     observed_at_ms: i64,
     fail_after_first_unlink: bool,
@@ -1573,11 +1735,11 @@ fn cleanup_exact_cold_payload(
             "cold evidence manifest partial deletion",
         ),
     ];
-    let mut opened = Vec::with_capacity(files.len());
+    let mut removed_any = false;
     for (path, expected_bytes, expected_sha256, label) in &files {
-        let file = open_optional_cold_deletion_file(
+        let disposition = coordinated_remove_cold_file(
             cold,
-            &mut provider_probe,
+            &mut provider_mutation,
             copy,
             path,
             *expected_bytes,
@@ -1585,24 +1747,13 @@ fn cleanup_exact_cold_payload(
             observed_at_ms,
             label,
         )?;
-        opened.push((path.clone(), file, *label));
-    }
-    let mut unlinked_any = false;
-    for (path, candidate, label) in opened {
-        let Some((candidate_name, file)) = candidate else {
-            continue;
-        };
-        let name = single_component(&path, label)?;
-        cold.root.remove_regular_child_candidate(
-            OsStr::new(name),
-            local_file::RegularChildRef::new(&candidate_name, &file),
-            label,
-        )?;
-        cold.root.sync()?;
-        if !unlinked_any && fail_after_first_unlink {
+        if disposition == FileProviderRemovalDispositionV1::RemovedExact
+            && !removed_any
+            && fail_after_first_unlink
+        {
             return Err("schedule retention: injected crash after first cold unlink".into());
         }
-        unlinked_any = true;
+        removed_any |= disposition == FileProviderRemovalDispositionV1::RemovedExact;
     }
     for (path, _, _, label) in &files {
         let name = single_component(path, label)?;
@@ -1626,7 +1777,7 @@ pub(super) fn execute_evidence_tombstone<C: EvidenceStateCapability + ?Sized>(
     state: &mut EvidenceStateModelV1,
     hot: &EvidenceHotStoreV1,
     cold: Option<&ColdEvidenceStoreV1>,
-    mut provider_probe: Option<&mut dyn FileProviderStateProbeV1>,
+    mut provider_mutation: Option<&mut dyn FileProviderMutationV1>,
     tombstone_id: &str,
     evidence_id: &str,
     reason_code: &str,
@@ -1646,6 +1797,12 @@ pub(super) fn execute_evidence_tombstone<C: EvidenceStateCapability + ?Sized>(
             || started_at_ms < existing.created_at_ms
         {
             return Err("schedule retention: tombstone recovery identity changed".into());
+        }
+        if matches!(
+            existing.lifecycle,
+            TombstoneLifecycleV1::FullEvidenceUnlinked { .. }
+        ) {
+            return Ok(EvidenceTombstoneOutcomeV1::AlreadyComplete);
         }
     } else {
         if state
@@ -1721,7 +1878,7 @@ pub(super) fn execute_evidence_tombstone<C: EvidenceStateCapability + ?Sized>(
         let cold = cold.ok_or("schedule retention: cold deletion root is unavailable")?;
         cleanup_exact_cold_payload(
             cold,
-            provider_probe.take(),
+            provider_mutation.take(),
             &copy,
             completed_at_ms,
             failpoint == EvidenceTombstoneFailpointV1::AfterFirstUnlink
@@ -1732,12 +1889,6 @@ pub(super) fn execute_evidence_tombstone<C: EvidenceStateCapability + ?Sized>(
         return Err("schedule retention: injected crash after all evidence unlinks".into());
     }
 
-    if matches!(
-        tombstone.lifecycle,
-        TombstoneLifecycleV1::FullEvidenceUnlinked { .. }
-    ) {
-        return Ok(EvidenceTombstoneOutcomeV1::AlreadyComplete);
-    }
     let proof = FullEvidenceUnlinkProofV1 {
         tombstone_id: tombstone_id.into(),
         evidence_id: evidence_id.into(),
@@ -2681,11 +2832,13 @@ pub(super) fn execute_bundle_gc_item<
             local_file::RegularChildRef::new(&candidate_name, &file),
             "bundle GC target",
         )?;
-        store.root.sync()?;
         true
     } else {
         false
     };
+    // An earlier unlink may have succeeded while its directory sync failed. The absent recovery
+    // path therefore carries the same durability fence as a first-attempt removal.
+    store.root.sync()?;
     if failpoint == BundleGcFailpointV1::AfterUnlink {
         return Err("schedule retention: injected crash after bundle unlink".into());
     }
@@ -3425,6 +3578,7 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeProvider {
+        cold_root: local_file::PinnedDirectory,
         cold_root_sha256: String,
         domain_id: String,
         materialization: FileProviderMaterializationV1,
@@ -3432,11 +3586,13 @@ mod tests {
         overrides: BTreeMap<String, FileProviderObjectStateV1>,
         materialized_paths: BTreeSet<String>,
         materialize_calls: usize,
+        replacement_on_next_remove: Option<Vec<u8>>,
     }
 
     impl FakeProvider {
         fn new(cold: &ColdEvidenceStoreV1) -> Self {
             Self {
+                cold_root: cold.root.clone(),
                 cold_root_sha256: cold.root_sha256().into(),
                 domain_id: "icloud-domain-1".into(),
                 materialization: FileProviderMaterializationV1::Materialized,
@@ -3444,6 +3600,7 @@ mod tests {
                 overrides: BTreeMap::new(),
                 materialized_paths: BTreeSet::new(),
                 materialize_calls: 0,
+                replacement_on_next_remove: None,
             }
         }
 
@@ -3499,6 +3656,79 @@ mod tests {
             };
             self.materialized_paths.insert(key);
             Ok(self.observation(request))
+        }
+    }
+
+    impl FileProviderMutationV1 for FakeProvider {
+        fn remove_exact(
+            &mut self,
+            cold: &ColdEvidenceStoreV1,
+            request: &FileProviderRemovalRequestV1,
+        ) -> Result<FileProviderRemovalResultV1, crate::BoxError> {
+            request.validate()?;
+            if request.cold_root_sha256 != self.cold_root_sha256
+                || request.cold_root_sha256 != cold.root_sha256()
+                || request.file_provider_domain_id != self.domain_id
+                || self.cold_root.object_sha256() != cold.root.object_sha256()
+            {
+                return Err("fake FileProvider removal binding changed".into());
+            }
+            let original_name = OsStr::new(&request.object_path.components[0]);
+            let mut candidate_name = cold
+                .root
+                .regular_child_removal_candidate(original_name, "fake coordinated removal")?;
+            if let (Some(replacement), Some(candidate)) = (
+                self.replacement_on_next_remove.take(),
+                candidate_name.as_ref(),
+            ) {
+                let temporary_name = OsStr::new("fake-provider-replacement.tmp");
+                let mut temporary = cold.root.create_new_file(
+                    temporary_name,
+                    PRIVATE_FILE_MODE,
+                    "fake FileProvider replacement",
+                )?;
+                temporary.write_all(&replacement)?;
+                temporary.sync_all()?;
+                std::fs::rename(
+                    cold.root.canonical_path().join(temporary_name),
+                    cold.root.canonical_path().join(candidate),
+                )?;
+                cold.root.sync()?;
+                candidate_name = cold
+                    .root
+                    .regular_child_removal_candidate(original_name, "fake coordinated removal")?;
+            }
+            let Some(candidate_name) = candidate_name else {
+                cold.root.sync()?;
+                return Ok(FileProviderRemovalResultV1 {
+                    request_sha256: request.sha256()?,
+                    disposition: FileProviderRemovalDispositionV1::AlreadyAbsent,
+                });
+            };
+            let file = cold
+                .root
+                .open_regular_file(&candidate_name, "fake coordinated removal")?;
+            validate_private_file(&file.metadata()?, "fake coordinated removal")?;
+            let snapshot = local_file::read_open_regular_file_bounded(
+                &file,
+                "fake coordinated removal",
+                request.expected_length_bytes,
+            )?;
+            if snapshot.bytes.len() as u64 != request.expected_length_bytes
+                || snapshot.sha256 != request.expected_sha256
+            {
+                return Err("fake FileProvider coordinated object changed".into());
+            }
+            cold.root.remove_regular_child_candidate(
+                original_name,
+                local_file::RegularChildRef::new(&candidate_name, &file),
+                "fake coordinated removal",
+            )?;
+            cold.root.sync()?;
+            Ok(FileProviderRemovalResultV1 {
+                request_sha256: request.sha256()?,
+                disposition: FileProviderRemovalDispositionV1::RemovedExact,
+            })
         }
     }
 
@@ -4061,6 +4291,97 @@ mod tests {
     }
 
     #[test]
+    fn cold_publication_retries_directory_sync_before_journaling_published_residue() {
+        let fixture = Fixture::new();
+        let mut provider = FakeProvider::new(&fixture.cold);
+        let admission = admit(&fixture, &mut provider, "evidence-1", BASE + 1);
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3c-publication-sync-recovery")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+
+        assert!(publish_admitted_cold_copy(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            &fixture.cold,
+            &mut provider,
+            &fixture.consent,
+            &admission.copy_id,
+            BASE + 2,
+            ColdPublicationFailpointV1::AfterArchivePublication,
+        )
+        .is_err());
+        assert_eq!(
+            inspect_cold_copy_residue(&fixture.cold, &admission).unwrap(),
+            ColdResidueDispositionV1::ArchivePublishedManifestPartial
+        );
+
+        fixture.cold.root.fail_sync_on_nth_call_for_test(1);
+        assert!(publish_admitted_cold_copy(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            &fixture.cold,
+            &mut provider,
+            &fixture.consent,
+            &admission.copy_id,
+            BASE + 3,
+            ColdPublicationFailpointV1::None,
+        )
+        .is_err());
+        assert_eq!(
+            inspect_cold_copy_residue(&fixture.cold, &admission).unwrap(),
+            ColdResidueDispositionV1::Published
+        );
+        assert_eq!(
+            state.cold_copies[&admission.copy_id].lifecycle,
+            ColdCopyLifecycleV1::Admitted
+        );
+
+        fixture.cold.root.fail_sync_on_nth_call_for_test(1);
+        assert!(publish_admitted_cold_copy(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            &fixture.cold,
+            &mut provider,
+            &fixture.consent,
+            &admission.copy_id,
+            BASE + 4,
+            ColdPublicationFailpointV1::None,
+        )
+        .is_err());
+        assert_eq!(
+            state.cold_copies[&admission.copy_id].lifecycle,
+            ColdCopyLifecycleV1::Admitted
+        );
+
+        publish_admitted_cold_copy(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            &fixture.cold,
+            &mut provider,
+            &fixture.consent,
+            &admission.copy_id,
+            BASE + 5,
+            ColdPublicationFailpointV1::None,
+        )
+        .unwrap();
+        assert!(matches!(
+            state.cold_copies[&admission.copy_id].lifecycle,
+            ColdCopyLifecycleV1::Published { .. }
+        ));
+    }
+
+    #[test]
     fn cold_entries_reject_offloaded_root_symlink_and_hard_link() {
         let fixture = Fixture::new();
         let mut provider = FakeProvider::new(&fixture.cold);
@@ -4378,9 +4699,12 @@ mod tests {
             &mut opened.journal,
             &mut state,
             &fixture.cold,
-            &admission.copy_id,
-            "deadline_expired",
-            BASE + 101,
+            Some(&mut provider),
+            &ColdAbandonmentRequestV1 {
+                copy_id: admission.copy_id.clone(),
+                reason_code: "deadline_expired".into(),
+                recorded_at_ms: BASE + 101,
+            },
         )
         .unwrap();
         assert!(abandoned.cleanup_required);
@@ -4390,11 +4714,27 @@ mod tests {
         ));
         write_private(&archive_partial, &exact_archive);
         assert_eq!(
-            cleanup_abandoned_cold_copy(&owner, &state, &fixture.cold, &admission.copy_id).unwrap(),
+            cleanup_abandoned_cold_copy(
+                &owner,
+                &state,
+                &fixture.cold,
+                Some(&mut provider),
+                &admission.copy_id,
+                BASE + 102,
+            )
+            .unwrap(),
             ColdResidueDispositionV1::ArchivePartialOnly
         );
         assert_eq!(
-            cleanup_abandoned_cold_copy(&owner, &state, &fixture.cold, &admission.copy_id).unwrap(),
+            cleanup_abandoned_cold_copy(
+                &owner,
+                &state,
+                &fixture.cold,
+                Some(&mut provider),
+                &admission.copy_id,
+                BASE + 103,
+            )
+            .unwrap(),
             ColdResidueDispositionV1::None
         );
         assert_eq!(
@@ -4752,6 +5092,108 @@ mod tests {
     }
 
     #[test]
+    fn tombstone_retries_parent_sync_after_ambiguous_payload_directory_removal() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3a-tombstone-parent-sync")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let evidence_id = "evidence-1";
+        let payload = fixture
+            .hot_root
+            .path()
+            .join("sealed")
+            .join(local_file::sha256_hex(evidence_id.as_bytes()));
+
+        assert!(execute_evidence_tombstone(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            None,
+            None,
+            "tombstone-parent-sync",
+            evidence_id,
+            "retention_expired",
+            BASE + 1,
+            BASE + 2,
+            EvidenceTombstoneFailpointV1::AfterPendingIntent,
+        )
+        .is_err());
+
+        fixture
+            .hot
+            .sealed_directory()
+            .fail_sync_on_nth_call_for_test(1);
+        assert!(execute_evidence_tombstone(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            None,
+            None,
+            "tombstone-parent-sync",
+            evidence_id,
+            "retention_expired",
+            BASE + 3,
+            BASE + 4,
+            EvidenceTombstoneFailpointV1::None,
+        )
+        .is_err());
+        assert!(!payload.exists());
+        assert_eq!(
+            state.tombstones["tombstone-parent-sync"].lifecycle,
+            TombstoneLifecycleV1::Pending
+        );
+
+        fixture
+            .hot
+            .sealed_directory()
+            .fail_sync_on_nth_call_for_test(1);
+        assert!(execute_evidence_tombstone(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            None,
+            None,
+            "tombstone-parent-sync",
+            evidence_id,
+            "retention_expired",
+            BASE + 5,
+            BASE + 6,
+            EvidenceTombstoneFailpointV1::None,
+        )
+        .is_err());
+        assert_eq!(
+            state.tombstones["tombstone-parent-sync"].lifecycle,
+            TombstoneLifecycleV1::Pending
+        );
+
+        assert!(matches!(
+            execute_evidence_tombstone(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &fixture.hot,
+                None,
+                None,
+                "tombstone-parent-sync",
+                evidence_id,
+                "retention_expired",
+                BASE + 7,
+                BASE + 8,
+                EvidenceTombstoneFailpointV1::None,
+            )
+            .unwrap(),
+            EvidenceTombstoneOutcomeV1::Completed { .. }
+        ));
+    }
+
+    #[test]
     fn pending_tombstone_rejects_a_later_pin_without_deleting_evidence() {
         let _gc_test_guard = gc_test_guard();
         let fixture = Fixture::new();
@@ -5009,6 +5451,107 @@ mod tests {
             .join(&admission.manifest_path.components[0])
             .exists());
         assert!(!state.entries.contains_key("evidence-1"));
+    }
+
+    #[test]
+    fn coordinated_cold_removal_refuses_a_replacement_after_caller_validation() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let mut provider = FakeProvider::new(&fixture.cold);
+        provider.synchronization = FileProviderSynchronizationV1::Synchronized;
+        let admission = admit(&fixture, &mut provider, "evidence-1", BASE + 1);
+        let combined = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3a-cold-replacement-owner")
+            .unwrap()
+            .try_authority_state("test/r3d3a-cold-replacement-authority")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&combined).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        publish_admitted_cold_copy(
+            &combined,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            &fixture.cold,
+            &mut provider,
+            &fixture.consent,
+            &admission.copy_id,
+            BASE + 2,
+            ColdPublicationFailpointV1::None,
+        )
+        .unwrap();
+        evict_hot_evidence(
+            &combined,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            &fixture.cold,
+            &mut provider,
+            "evidence-1",
+            BASE + 3,
+            HotEvictionFailpointV1::None,
+        )
+        .unwrap();
+        assert!(execute_evidence_tombstone(
+            &combined,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            Some(&fixture.cold),
+            Some(&mut provider),
+            "tombstone-cold-replacement",
+            "evidence-1",
+            "retention_expired",
+            BASE + 4,
+            BASE + 5,
+            EvidenceTombstoneFailpointV1::AfterPendingIntent,
+        )
+        .is_err());
+
+        let archive_name = OsStr::new(&admission.archive_path.components[0]);
+        let quarantine_name =
+            local_file::removal_quarantine_name(archive_name, "cold evidence archive deletion")
+                .unwrap();
+        let archive_path = fixture.cold_root.path().join(archive_name);
+        let quarantine_path = fixture.cold_root.path().join(&quarantine_name);
+        std::fs::rename(&archive_path, &quarantine_path).unwrap();
+        fixture.cold.root.sync().unwrap();
+        let replacement = vec![b'x'; usize::try_from(admission.archive_bytes).unwrap()];
+        assert_ne!(
+            local_file::sha256_hex(&replacement),
+            admission.archive_sha256
+        );
+        provider.replacement_on_next_remove = Some(replacement.clone());
+
+        let error = execute_evidence_tombstone(
+            &combined,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            Some(&fixture.cold),
+            Some(&mut provider),
+            "tombstone-cold-replacement",
+            "evidence-1",
+            "retention_expired",
+            BASE + 6,
+            BASE + 7,
+            EvidenceTombstoneFailpointV1::None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("coordinated object changed"));
+        assert_eq!(std::fs::read(&quarantine_path).unwrap(), replacement);
+        assert!(!archive_path.exists());
+        assert!(fixture
+            .cold_root
+            .path()
+            .join(&admission.manifest_path.components[0])
+            .exists());
+        assert!(state.entries.contains_key("evidence-1"));
+        assert_eq!(
+            state.tombstones["tombstone-cold-replacement"].lifecycle,
+            TombstoneLifecycleV1::Pending
+        );
     }
 
     #[test]
@@ -5349,6 +5892,133 @@ mod tests {
             state.bundle_gc_actions[&item.action_id].lifecycle,
             crate::compatibility_schedule_evidence::BundleGcLifecycleV1::Unlinked { .. }
         ));
+    }
+
+    #[test]
+    fn bundle_gc_retries_directory_sync_before_terminalizing_an_absent_target() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let bundle_root = private_root();
+        write_private(&bundle_root.path().join("old.bundle"), b"old bundle\n");
+        let store =
+            BundleCacheStoreV1::open_existing(&pin(bundle_root.path(), "bundle cache")).unwrap();
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3d-bundle-sync-recovery")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let now = BASE + 200 * DAY_MS;
+        let entry = bundle_entry(
+            &state,
+            "old",
+            "evidence-1",
+            "codex",
+            "case-a",
+            now - 40 * DAY_MS,
+            BundleCacheKindV1::ReconstructiblePayload,
+            b"old bundle\n",
+        );
+        let inventory = BundleCacheInventoryV1 {
+            cache_root_sha256: store.root_sha256().into(),
+            observed_at_ms: now,
+            entries: vec![entry],
+            referenced_bundle_ids: BTreeSet::new(),
+        };
+        let plan = plan_bundle_gc(&state, &inventory, now).unwrap();
+        let item = &plan.removals[0];
+
+        let reader = acquire_bundle_read_lease(&owner, "old").unwrap();
+        let mut busy_inventory = inventory.clone();
+        busy_inventory.observed_at_ms = now + 1;
+        let mut busy_probe = fixed_bundle_inventory_probe(busy_inventory);
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &inventory,
+                &mut busy_probe,
+                item,
+                now + 1,
+                now + 2,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::DeferredLeaseBusy
+        );
+        drop(reader);
+
+        store.root.fail_sync_on_nth_call_for_test(2);
+        let mut removal_inventory = inventory.clone();
+        removal_inventory.observed_at_ms = now + 3;
+        let mut removal_probe = fixed_bundle_inventory_probe(removal_inventory);
+        assert!(execute_bundle_gc_item(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &store,
+            &inventory,
+            &mut removal_probe,
+            item,
+            now + 3,
+            now + 4,
+            BundleGcFailpointV1::None,
+        )
+        .is_err());
+        assert!(!bundle_root.path().join("old.bundle").exists());
+        assert!(matches!(
+            state.bundle_gc_actions[&item.action_id].lifecycle,
+            crate::compatibility_schedule_evidence::BundleGcLifecycleV1::Pending
+        ));
+
+        store.root.fail_sync_on_nth_call_for_test(1);
+        let absent_inventory = BundleCacheInventoryV1 {
+            cache_root_sha256: store.root_sha256().into(),
+            observed_at_ms: now + 5,
+            entries: Vec::new(),
+            referenced_bundle_ids: BTreeSet::new(),
+        };
+        let mut absent_probe = fixed_bundle_inventory_probe(absent_inventory.clone());
+        assert!(execute_bundle_gc_item(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &store,
+            &inventory,
+            &mut absent_probe,
+            item,
+            now + 5,
+            now + 6,
+            BundleGcFailpointV1::None,
+        )
+        .is_err());
+        assert!(matches!(
+            state.bundle_gc_actions[&item.action_id].lifecycle,
+            crate::compatibility_schedule_evidence::BundleGcLifecycleV1::Pending
+        ));
+
+        let mut final_probe = fixed_bundle_inventory_probe(BundleCacheInventoryV1 {
+            observed_at_ms: now + 7,
+            ..absent_inventory
+        });
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &inventory,
+                &mut final_probe,
+                item,
+                now + 7,
+                now + 8,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::RecoveredAlreadyAbsent
+        );
     }
 
     #[test]

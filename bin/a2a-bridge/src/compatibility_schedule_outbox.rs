@@ -15,7 +15,7 @@ use crate::compatibility_schedule_schema::{
     OptionalSha256V1, OptionalStableIdV1, PublicationOutboxStateV1, PublicationOutboxV1,
     ValidateRecord,
 };
-use crate::compatibility_schedule_state::EvidenceStateCapability;
+use crate::compatibility_schedule_state::{EvidenceStateCapability, StateQuota};
 use crate::{local_file, BoxError};
 
 const OUTBOX_PREFIX: &str = "publication-outbox.";
@@ -396,6 +396,7 @@ fn validate_transition(
 #[allow(dead_code)] // R3d4 will drive the persisted outbox; R3d3 only proves the local mechanism.
 pub(super) struct PublicationOutboxJournal<'lock> {
     directory: &'lock local_file::PinnedDirectory,
+    state_quota: StateQuota,
     records: Vec<(OutboxJournalRecordV1, String)>,
     latest: BTreeMap<String, (PublicationOutboxV1, String)>,
 }
@@ -509,6 +510,7 @@ impl<'lock> PublicationOutboxJournal<'lock> {
         }
         Ok(Self {
             directory,
+            state_quota: capability.state_quota(),
             records,
             latest,
         })
@@ -544,6 +546,7 @@ impl<'lock> PublicationOutboxJournal<'lock> {
             &self.latest,
         )?;
         let bytes = canonical_bytes(&record)?;
+        self.state_quota.reserve(bytes.len() as u64)?;
         let name = Self::generation_name(generation);
         let mut file = self.directory.create_new_file(
             OsStr::new(&name),
@@ -751,6 +754,21 @@ impl<'lock> PublicationOutboxJournal<'lock> {
     }
 }
 
+pub(super) fn outbox_status_source_sha256<C: EvidenceStateCapability + ?Sized>(
+    capability: &C,
+) -> Result<String, BoxError> {
+    let journal = PublicationOutboxJournal::open(capability)?;
+    let mut material = b"a2a-bridge:r3d3:status-source:outbox:v1\0".to_vec();
+    material.extend_from_slice(
+        journal
+            .records
+            .last()
+            .map_or("empty", |(_, sha256)| sha256.as_str())
+            .as_bytes(),
+    );
+    Ok(local_file::sha256_hex(&material))
+}
+
 fn validate_record_shape(
     record: &OutboxJournalRecordV1,
     expected_generation: u64,
@@ -900,6 +918,32 @@ mod tests {
         let reopened = PublicationOutboxJournal::open(&lock).unwrap();
         assert_eq!(reopened.latest(&create.outbox_id), Some(&confirmed));
         assert!(reopened.pending_recovery_actions().is_empty());
+    }
+
+    #[test]
+    fn outbox_append_counts_status_bytes_against_the_aggregate_state_cap() {
+        let directory = root();
+        let root =
+            SchedulerStateRoot::initialize_for_test_with_state_cap(directory.path(), 64).unwrap();
+        let lock = root.try_owner_admission("outbox-aggregate-quota").unwrap();
+        let status_bytes = lock
+            .status_directory()
+            .create_new_file(
+                OsStr::new("existing-status-bytes"),
+                OUTBOX_FILE_MODE,
+                "test status quota bytes",
+            )
+            .unwrap();
+        status_bytes.set_len(64).unwrap();
+
+        let mut journal = PublicationOutboxJournal::open(&lock).unwrap();
+        assert!(journal.start(identity("external-over-quota"), 10).is_err());
+        assert!(
+            std::fs::read_dir(lock.publication_outbox_directory().canonical_path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::compatibility_schedule_schema::{
     LedgerDispositionV1, LedgerReconciliationV1, LedgerRecordV1, LedgerReservationV1,
     TriggerBudgetCapsV1, UsageChargeV1, ValidateRecord,
 };
-use crate::compatibility_schedule_state::AdmissionStateCapability;
+use crate::compatibility_schedule_state::{AdmissionStateCapability, StateQuota};
 use crate::{local_file, BoxError};
 
 const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
@@ -564,6 +564,7 @@ struct StoredReservationV1 {
 
 pub(super) struct FileCompatibilityLedger<'lock> {
     directory: &'lock local_file::PinnedDirectory,
+    state_quota: StateQuota,
     reservations: BTreeMap<String, StoredReservationV1>,
     imports: BTreeMap<String, LegacyLedgerImportV1>,
 }
@@ -603,6 +604,7 @@ fn read_owner_record(
 
 fn append_record(
     directory: &local_file::PinnedDirectory,
+    state_quota: &StateQuota,
     name: &str,
     bytes: &[u8],
 ) -> Result<LedgerAppendOutcomeV1, BoxError> {
@@ -615,6 +617,7 @@ fn append_record(
         }
         return Err("schedule ledger: create-new record name already has different bytes".into());
     }
+    state_quota.reserve(bytes.len() as u64)?;
     let mut file = directory.create_new_file(OsStr::new(name), 0o600, "schedule ledger record")?;
     // A failed write/sync is intentionally not unlinked. Recovery must see the partial record and
     // hold rather than accidentally manufacture headroom after an ambiguous durable effect.
@@ -989,6 +992,7 @@ impl<'lock> FileCompatibilityLedger<'lock> {
         }
         Ok(Self {
             directory,
+            state_quota: capability.state_quota(),
             reservations,
             imports,
         })
@@ -1256,7 +1260,7 @@ impl<'lock> FileCompatibilityLedger<'lock> {
         let wrapped = LedgerRecordV1::Reservation(record.clone());
         let bytes = canonical_bytes(&wrapped)?;
         let name = format!("{}.reservation.json", record.reservation_id);
-        let outcome = append_record(self.directory, &name, &bytes)?;
+        let outcome = append_record(self.directory, &self.state_quota, &name, &bytes)?;
         let stored = StoredReservationV1 {
             record: record.clone(),
             record_sha256: local_file::sha256_hex(&bytes),
@@ -1360,7 +1364,7 @@ impl<'lock> FileCompatibilityLedger<'lock> {
         let wrapped = LedgerRecordV1::Reconciliation(value.clone());
         let bytes = canonical_bytes(&wrapped)?;
         let name = format!("{}.reconciliation.json", value.reservation_id);
-        let outcome = append_record(self.directory, &name, &bytes)?;
+        let outcome = append_record(self.directory, &self.state_quota, &name, &bytes)?;
         self.reservations
             .get_mut(reservation_id)
             .expect("reservation was checked above")
@@ -1382,7 +1386,7 @@ impl<'lock> FileCompatibilityLedger<'lock> {
         }
         let bytes = canonical_bytes(&value)?;
         let name = format!("{}.legacy.json", value.import_id);
-        let outcome = append_record(self.directory, &name, &bytes)?;
+        let outcome = append_record(self.directory, &self.state_quota, &name, &bytes)?;
         self.imports.insert(value.import_id.clone(), value);
         Ok(outcome)
     }
@@ -1409,6 +1413,33 @@ impl<'lock> FileCompatibilityLedger<'lock> {
             .get(id)
             .and_then(|value| value.reconciliation.as_ref())
     }
+}
+
+pub(super) fn ledger_status_source_sha256<C: AdmissionStateCapability + ?Sized>(
+    capability: &C,
+) -> Result<String, BoxError> {
+    let _validated = FileCompatibilityLedger::open(capability)?;
+    let directory = capability.ledger_directory();
+    let mut names = std::fs::read_dir(directory.canonical_path())?
+        .map(|entry| {
+            entry?
+                .file_name()
+                .into_string()
+                .map_err(|_| std::io::Error::other("non-UTF8 ledger status source"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    let mut material = b"a2a-bridge:r3d3:status-source:ledger:v1\0".to_vec();
+    for name in names {
+        let bytes = read_owner_record(directory, &name)?;
+        material.extend_from_slice(&(name.len() as u64).to_be_bytes());
+        material.extend_from_slice(name.as_bytes());
+        material.extend_from_slice(local_file::sha256_hex(&bytes).as_bytes());
+    }
+    if !directory.current_path_matches() {
+        return Err("schedule ledger: status source changed during acquisition".into());
+    }
+    Ok(local_file::sha256_hex(&material))
 }
 
 #[cfg(test)]

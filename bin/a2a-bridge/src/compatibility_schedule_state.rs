@@ -14,11 +14,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::local_file::{self, PinnedDirectory};
+use crate::BoxError;
 
 const STATE_DIRECTORY_MODE: u32 = 0o700;
 const STATE_FILE_MODE: u32 = 0o600;
 const MAX_LOCK_HOLDER_BYTES: usize = 512;
 const MAX_PASSWD_BUFFER_BYTES: usize = 1024 * 1024;
+pub(super) const SCHEDULER_STATE_CAP_BYTES: u64 = 1024 * 1024 * 1024;
 const STATE_SUBDIRECTORIES: [&str; 9] = [
     "authority",
     "admission",
@@ -82,6 +84,7 @@ struct StateRootInner {
     status: PinnedDirectory,
     migration: PinnedDirectory,
     locks: PinnedDirectory,
+    state_cap_bytes: u64,
     process_lock_state: Mutex<ProcessLockState>,
 }
 
@@ -112,14 +115,74 @@ pub(super) struct AuthorityMutationLock {
     file: File,
 }
 
-pub(super) trait AuthorityStateCapability {
+pub(super) trait StateQuotaCapability {
+    fn state_quota(&self) -> StateQuota;
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct StateQuota {
+    directories: [PinnedDirectory; 8],
+    cap_bytes: u64,
+}
+
+impl StateQuota {
+    pub(super) fn usage_bytes(&self) -> Result<u64, BoxError> {
+        let mut total = 0_u64;
+        for directory in &self.directories {
+            if !directory.current_path_matches() {
+                return Err("scheduler state quota: retained directory changed".into());
+            }
+            for entry in std::fs::read_dir(directory.canonical_path())? {
+                let name = entry?.file_name();
+                let metadata = directory
+                    .child_metadata_no_follow(&name, "scheduler state quota entry")?
+                    .ok_or("scheduler state quota: scanned entry disappeared")?;
+                if !metadata.is_regular()
+                    || metadata.link_count() != 1
+                    || metadata.owner_uid() != unsafe { libc::geteuid() }
+                    || metadata.permission_mode() != STATE_FILE_MODE
+                {
+                    return Err(
+                        "scheduler state quota: entry is not an owner-only single-link regular file"
+                            .into(),
+                    );
+                }
+                total = total
+                    .checked_add(metadata.length())
+                    .ok_or("scheduler state quota: byte accounting overflow")?;
+            }
+            if !directory.current_path_matches() {
+                return Err("scheduler state quota: retained directory changed".into());
+            }
+        }
+        Ok(total)
+    }
+
+    pub(super) fn reserve(&self, new_bytes: u64) -> Result<u64, BoxError> {
+        let next = self
+            .usage_bytes()?
+            .checked_add(new_bytes)
+            .ok_or("scheduler state quota: byte accounting overflow")?;
+        if next > self.cap_bytes {
+            return Err("scheduler state quota: aggregate state cap exceeded".into());
+        }
+        Ok(next)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cap_bytes(&self) -> u64 {
+        self.cap_bytes
+    }
+}
+
+pub(super) trait AuthorityStateCapability: StateQuotaCapability {
     fn authority_directory(&self) -> &PinnedDirectory;
 }
 
 /// Capability for state that participates in the single owner-wide admission transaction.
 /// It is deliberately implemented only by guards that retain the owner admission lock.
 #[allow(dead_code)] // Admission/supervisor journals are wired together in R3d2e.
-pub(super) trait AdmissionStateCapability {
+pub(super) trait AdmissionStateCapability: StateQuotaCapability {
     fn admission_directory(&self) -> &PinnedDirectory;
     fn ledger_directory(&self) -> &PinnedDirectory;
     fn supervisor_directory(&self) -> &PinnedDirectory;
@@ -128,7 +191,7 @@ pub(super) trait AdmissionStateCapability {
 /// Capability for R3d3 evidence/index/status state. Only the owner-wide admission guards implement
 /// it, so retention, deletion, migration, and local publication cannot run outside the same
 /// cross-process owner lock used by admission.
-pub(super) trait EvidenceStateCapability {
+pub(super) trait EvidenceStateCapability: StateQuotaCapability {
     fn evidence_index_directory(&self) -> &PinnedDirectory;
     fn publication_outbox_directory(&self) -> &PinnedDirectory;
     fn status_directory(&self) -> &PinnedDirectory;
@@ -540,7 +603,13 @@ impl SchedulerStateRoot {
     fn initialize_opened(
         root: PinnedDirectory,
         require_local_apfs: bool,
+        state_cap_bytes: u64,
     ) -> Result<Self, SchedulerStateError> {
+        if state_cap_bytes == 0 || state_cap_bytes > SCHEDULER_STATE_CAP_BYTES {
+            return Err(SchedulerStateError::Invalid(
+                "scheduler state cap is outside the approved bound".into(),
+            ));
+        }
         if require_local_apfs {
             verify_local_apfs(&root)?;
         }
@@ -574,13 +643,18 @@ impl SchedulerStateRoot {
                 status,
                 migration,
                 locks,
+                state_cap_bytes,
                 process_lock_state: Mutex::new(ProcessLockState::default()),
             }),
         })
     }
 
     fn initialize(path: &Path, require_local_apfs: bool) -> Result<Self, SchedulerStateError> {
-        Self::initialize_opened(open_existing_root(path)?, require_local_apfs)
+        Self::initialize_opened(
+            open_existing_root(path)?,
+            require_local_apfs,
+            SCHEDULER_STATE_CAP_BYTES,
+        )
     }
 
     #[allow(dead_code)] // R3d5 is the sole production initialization/activation owner.
@@ -590,12 +664,20 @@ impl SchedulerStateRoot {
                 "fixed production scheduler state root has not been initialized".into(),
             )
         })?;
-        Self::initialize_opened(root, true)
+        Self::initialize_opened(root, true, SCHEDULER_STATE_CAP_BYTES)
     }
 
     #[cfg(test)]
     pub(super) fn initialize_for_test(path: &Path) -> Result<Self, SchedulerStateError> {
         Self::initialize(path, false)
+    }
+
+    #[cfg(test)]
+    pub(super) fn initialize_for_test_with_state_cap(
+        path: &Path,
+        state_cap_bytes: u64,
+    ) -> Result<Self, SchedulerStateError> {
+        Self::initialize_opened(open_existing_root(path)?, false, state_cap_bytes)
     }
 
     pub(super) fn try_owner_admission(
@@ -723,6 +805,22 @@ fn process_lock_state_after_drop(inner: &StateRootInner) -> MutexGuard<'_, Proce
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn state_quota(inner: &StateRootInner) -> StateQuota {
+    StateQuota {
+        directories: [
+            inner.authority.clone(),
+            inner.admission.clone(),
+            inner.ledger.clone(),
+            inner.supervisor.clone(),
+            inner.evidence_index.clone(),
+            inner.publication_outbox.clone(),
+            inner.status.clone(),
+            inner.migration.clone(),
+        ],
+        cap_bytes: inner.state_cap_bytes,
+    }
+}
+
 impl OwnerAdmissionLock {
     pub(super) fn try_authority_state(
         mut self,
@@ -742,6 +840,12 @@ impl OwnerAdmissionLock {
             authority_file,
             _owner: self,
         })
+    }
+}
+
+impl StateQuotaCapability for OwnerAdmissionLock {
+    fn state_quota(&self) -> StateQuota {
+        state_quota(&self.inner)
     }
 }
 
@@ -803,6 +907,12 @@ impl Drop for AdmissionAuthorityLocks {
     }
 }
 
+impl StateQuotaCapability for AdmissionAuthorityLocks {
+    fn state_quota(&self) -> StateQuota {
+        state_quota(&self._owner.inner)
+    }
+}
+
 impl AuthorityStateCapability for AdmissionAuthorityLocks {
     fn authority_directory(&self) -> &PinnedDirectory {
         &self._owner.inner.authority
@@ -850,6 +960,12 @@ impl Drop for AuthorityMutationLock {
         let mut state = process_lock_state_after_drop(&self.inner);
         debug_assert!(state.authority_only_holders > 0);
         state.authority_only_holders = state.authority_only_holders.saturating_sub(1);
+    }
+}
+
+impl StateQuotaCapability for AuthorityMutationLock {
+    fn state_quota(&self) -> StateQuota {
+        state_quota(&self.inner)
     }
 }
 
@@ -973,6 +1089,50 @@ mod tests {
             assert!(metadata.is_file());
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn aggregate_state_quota_counts_every_state_journal_and_rejects_unsafe_entries() {
+        let root = root();
+        let state =
+            SchedulerStateRoot::initialize_for_test_with_state_cap(root.path(), 16).unwrap();
+        let owner = state
+            .try_owner_admission("test:aggregate-state-quota")
+            .unwrap();
+        let status = owner
+            .status_directory()
+            .create_new_file(
+                OsStr::new("status-bytes"),
+                STATE_FILE_MODE,
+                "test status bytes",
+            )
+            .unwrap();
+        status.set_len(6).unwrap();
+        let outbox = owner
+            .publication_outbox_directory()
+            .create_new_file(
+                OsStr::new("outbox-bytes"),
+                STATE_FILE_MODE,
+                "test outbox bytes",
+            )
+            .unwrap();
+        outbox.set_len(4).unwrap();
+
+        let quota = owner.state_quota();
+        assert_eq!(quota.cap_bytes(), 16);
+        assert_eq!(quota.usage_bytes().unwrap(), 10);
+        assert_eq!(quota.reserve(6).unwrap(), 16);
+        assert!(quota.reserve(7).is_err());
+
+        std::os::unix::fs::symlink(
+            "outside",
+            owner
+                .migration_directory()
+                .canonical_path()
+                .join("unsafe-link"),
+        )
+        .unwrap();
+        assert!(quota.usage_bytes().is_err());
     }
 
     #[test]

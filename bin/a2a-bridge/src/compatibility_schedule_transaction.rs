@@ -49,7 +49,9 @@ use crate::compatibility_schedule_schema::{
     QuarantineV1, ScheduledExecutionSourceV1, SupervisorPhaseV1, SupervisorRecordV1,
     SupervisorTerminalOutcomeV1, UsageChargeV1, ValidateRecord,
 };
-use crate::compatibility_schedule_state::{AdmissionStateCapability, AuthorityStateCapability};
+use crate::compatibility_schedule_state::{
+    AdmissionStateCapability, AuthorityStateCapability, StateQuota,
+};
 use crate::compatibility_schedule_status::{
     PersistedQuarantineOpeningV1, QuarantineClosureStoreV1,
 };
@@ -1864,8 +1866,11 @@ where
             if &published != ledger.as_ref() {
                 return Err("schedule transaction: published ledger reservation diverged".into());
             }
-            let (latest, _latest_sha256) =
-                ensure_prepared_supervisor(capability.supervisor_directory(), supervisor)?;
+            let (latest, _latest_sha256) = ensure_prepared_supervisor(
+                capability.supervisor_directory(),
+                capability.state_quota(),
+                supervisor,
+            )?;
             Ok(Some(latest))
         }
         AdmissionDispositionV1::Reused { .. } => Ok(None),
@@ -1920,8 +1925,11 @@ where
     else {
         return Err("schedule transaction: reused commit cannot publish a terminal".into());
     };
-    let (latest, latest_sha256) =
-        ensure_prepared_supervisor(capability.supervisor_directory(), prepared)?;
+    let (latest, latest_sha256) = ensure_prepared_supervisor(
+        capability.supervisor_directory(),
+        capability.state_quota(),
+        prepared,
+    )?;
     if latest != terminal.supervisor || latest_sha256 != terminal.supervisor_journal_sha256 {
         return Err("schedule transaction: terminal supervisor tail diverged".into());
     }
@@ -2169,8 +2177,11 @@ where
     let AdmissionDispositionV1::Reserved { supervisor, .. } = &commit.disposition else {
         return Err("schedule transaction: reused admission cannot be reconciled".into());
     };
-    let (latest, latest_sha256) =
-        ensure_prepared_supervisor(capability.supervisor_directory(), supervisor)?;
+    let (latest, latest_sha256) = ensure_prepared_supervisor(
+        capability.supervisor_directory(),
+        capability.state_quota(),
+        supervisor,
+    )?;
     let disposition = durable_terminal_disposition(&commit, &latest, proof, recorded_at_ms)?;
     if pending.is_none() {
         let existing = existing.expect("the no-pending branch selected an existing terminal");
@@ -2377,6 +2388,7 @@ struct AdmissionJournalOpen<'lock> {
 #[derive(Clone, Debug)]
 struct FileAdmissionJournal<'lock> {
     directory: &'lock local_file::PinnedDirectory,
+    state_quota: StateQuota,
     next_generation: u64,
     previous_sha256: Option<String>,
     state: AdmissionStateV1,
@@ -2926,6 +2938,7 @@ impl<'lock> FileAdmissionJournal<'lock> {
         Ok(AdmissionJournalOpen {
             journal: Self {
                 directory,
+                state_quota: capability.state_quota(),
                 next_generation: u64::try_from(commits.len())?.saturating_add(1),
                 previous_sha256,
                 state: state.clone(),
@@ -2969,6 +2982,7 @@ impl<'lock> FileAdmissionJournal<'lock> {
         }
         validate_commit_against_state(&value, &self.state)?;
         let bytes = canonical_bytes(&value)?;
+        self.state_quota.reserve(bytes.len() as u64)?;
         let name = Self::generation_name(self.next_generation);
         let mut file =
             self.directory
@@ -3008,6 +3022,7 @@ impl<'lock> FileAdmissionJournal<'lock> {
             .ok_or("schedule transaction: no reserved admission awaits reconciliation")?;
         validate_terminal_against_state(&value, pending, &self.state)?;
         let bytes = canonical_bytes(&value)?;
+        self.state_quota.reserve(bytes.len() as u64)?;
         let name = Self::terminal_name(value.generation);
         let mut file =
             self.directory
@@ -3110,6 +3125,7 @@ impl<'lock> FileAdmissionJournal<'lock> {
             previous_control_time,
         )?;
         let bytes = canonical_bytes(&record)?;
+        self.state_quota.reserve(bytes.len() as u64)?;
         let name = Self::control_name(sequence);
         let mut file =
             self.directory
@@ -3296,6 +3312,28 @@ impl<'lock> FileAdmissionJournal<'lock> {
         self.append_control(record)?;
         Ok(())
     }
+}
+
+pub(super) fn admission_status_source_sha256<C: AdmissionStateCapability + ?Sized>(
+    capability: &C,
+) -> Result<(String, String), BoxError> {
+    let opened = FileAdmissionJournal::open(capability)?;
+    let state_bytes = serde_json::to_vec(&opened.state)?;
+    let tail = opened
+        .journal
+        .state_sources
+        .last()
+        .map_or("empty", |source| source.sha256.as_str());
+    let source_hash = |domain: &[u8]| {
+        let mut material = domain.to_vec();
+        material.extend_from_slice(tail.as_bytes());
+        material.extend_from_slice(&state_bytes);
+        local_file::sha256_hex(&material)
+    };
+    Ok((
+        source_hash(b"a2a-bridge:r3d3:status-source:controls:v1\0"),
+        source_hash(b"a2a-bridge:r3d3:status-source:windows:v1\0"),
+    ))
 }
 
 /// Concrete owner-lock-bound adapter for the status module's quarantine-close policy. It exposes

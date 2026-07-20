@@ -19,7 +19,7 @@ use crate::compatibility_schedule_schema::{
     OptionalRelativeEvidencePathV1, OptionalSha256V1, RelativeEvidencePathV1,
     ScheduleEvidenceRecordV1, ValidateRecord,
 };
-use crate::compatibility_schedule_state::EvidenceStateCapability;
+use crate::compatibility_schedule_state::{EvidenceStateCapability, StateQuota};
 use crate::{local_file, BoxError};
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2233,6 +2233,7 @@ pub(super) fn validate_evidence_state_transition(
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct FileEvidenceJournal<'lock> {
     directory: &'lock local_file::PinnedDirectory,
+    state_quota: StateQuota,
     next_generation: u64,
     previous_snapshot: EvidenceStateSnapshotV1,
 }
@@ -2321,30 +2322,6 @@ impl<'lock> FileEvidenceJournal<'lock> {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    fn persisted_bytes(directory: &local_file::PinnedDirectory) -> Result<u64, BoxError> {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let mut bytes = 0_u64;
-        for (_, name) in Self::generation_entries(directory)? {
-            let file =
-                directory.open_regular_file(OsStr::new(&name), "evidence state generation")?;
-            let metadata = file.metadata()?;
-            if metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.mode() & 0o777 != STATE_FILE_MODE
-                || metadata.len() > MAX_STATE_RECORD_BYTES
-            {
-                return Err(
-                    "schedule evidence: state generation is not a bounded owner-only mode-0600 file"
-                        .into(),
-                );
-            }
-            bytes = bytes
-                .checked_add(metadata.len())
-                .ok_or("schedule evidence: state journal byte accounting overflow")?;
-        }
-        Ok(bytes)
-    }
-
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn initialize<C: EvidenceStateCapability + ?Sized>(
         capability: &'lock C,
@@ -2358,6 +2335,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
         let first = EvidenceStateSnapshotV1::first(state.clone(), recorded_at_ms)?;
         let mut journal = Self {
             directory,
+            state_quota: capability.state_quota(),
             next_generation: 1,
             previous_snapshot: first.clone(),
         };
@@ -2412,6 +2390,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
         Ok(EvidenceJournalOpen {
             journal: Self {
                 directory,
+                state_quota: capability.state_quota(),
                 next_generation: snapshot
                     .generation
                     .checked_add(1)
@@ -2432,7 +2411,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
         if bytes.len() as u64 > MAX_STATE_RECORD_BYTES {
             return Err("schedule evidence: state generation exceeds the byte bound".into());
         }
-        reserve_state_journal_bytes(Self::persisted_bytes(self.directory)?, bytes.len() as u64)?;
+        self.state_quota.reserve(bytes.len() as u64)?;
         let name = Self::generation_name(snapshot.generation);
         let mut file = self.directory.create_new_file(
             OsStr::new(&name),
@@ -2495,6 +2474,17 @@ impl<'lock> FileEvidenceJournal<'lock> {
         self.previous_snapshot = snapshot.clone();
         Ok((snapshot, sha256))
     }
+}
+
+pub(super) fn evidence_status_source_sha256<C: EvidenceStateCapability + ?Sized>(
+    capability: &C,
+) -> Result<Option<String>, BoxError> {
+    if FileEvidenceJournal::generation_entries(capability.evidence_index_directory())?.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        FileEvidenceJournal::open_existing(capability)?.snapshot_sha256,
+    ))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3797,7 +3787,9 @@ fn measure_hot_storage_usage(
     store: &EvidenceHotStoreV1,
     journal: &FileEvidenceJournal<'_>,
 ) -> Result<HotStorageUsageV1, BoxError> {
-    let state_bytes = FileEvidenceJournal::persisted_bytes(journal.directory)?
+    let state_bytes = journal
+        .state_quota
+        .usage_bytes()?
         .checked_add(measure_flat_private_file_bytes(
             &store.state,
             "hot evidence state",
@@ -4355,6 +4347,7 @@ fn incident_migration_record_sha256(
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct FileIncidentMigrationJournal<'lock> {
     directory: &'lock local_file::PinnedDirectory,
+    state_quota: StateQuota,
     records: Vec<IncidentMigrationRecordV1>,
 }
 
@@ -4496,7 +4489,11 @@ impl<'lock> FileIncidentMigrationJournal<'lock> {
             records.push(record);
         }
         Self::validate_records(&records)?;
-        Ok(Self { directory, records })
+        Ok(Self {
+            directory,
+            state_quota: capability.state_quota(),
+            records,
+        })
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -4560,6 +4557,7 @@ impl<'lock> FileIncidentMigrationJournal<'lock> {
         if bytes.len() as u64 > MAX_INCIDENT_MIGRATION_RECORD_BYTES {
             return Err("schedule evidence: incident migration record exceeds its bound".into());
         }
+        self.state_quota.reserve(bytes.len() as u64)?;
         let name = Self::generation_name(generation);
         let mut file = self.directory.create_new_file(
             OsStr::new(&name),

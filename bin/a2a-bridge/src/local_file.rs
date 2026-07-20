@@ -8,6 +8,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek as _};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bridge_core::session_cwd::SessionCwd;
@@ -429,6 +431,8 @@ pub(crate) struct PinnedDirectory {
     identity: DirectoryIdentity,
     acp_session_cwd: PathBuf,
     retain_descriptor_after_exec: bool,
+    #[cfg(test)]
+    sync_failure_countdown: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Copy)]
@@ -583,6 +587,8 @@ impl PinnedDirectory {
             identity: snapshot.identity,
             acp_session_cwd,
             retain_descriptor_after_exec,
+            #[cfg(test)]
+            sync_failure_countdown: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -604,9 +610,33 @@ impl PinnedDirectory {
     }
 
     pub(crate) fn sync(&self) -> Result<(), BoxError> {
+        #[cfg(test)]
+        {
+            let mut remaining = self.sync_failure_countdown.load(Ordering::SeqCst);
+            while remaining != 0 {
+                match self.sync_failure_countdown.compare_exchange(
+                    remaining,
+                    remaining - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) if remaining == 1 => {
+                        return Err("pinned directory: injected sync failure".into());
+                    }
+                    Ok(_) => break,
+                    Err(observed) => remaining = observed,
+                }
+            }
+        }
         self.file
             .sync_all()
             .map_err(|error| format!("pinned directory: cannot sync: {error}").into())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_sync_on_nth_call_for_test(&self, call: usize) {
+        assert!(call > 0, "sync failure injection call must be positive");
+        self.sync_failure_countdown.store(call, Ordering::SeqCst);
     }
 
     pub(crate) fn retain_descriptor_after_exec(&self) -> bool {
@@ -907,6 +937,8 @@ impl PinnedDirectory {
                 identity,
                 acp_session_cwd,
                 retain_descriptor_after_exec,
+                #[cfg(test)]
+                sync_failure_countdown: Arc::new(AtomicUsize::new(0)),
             }))
         }
         #[cfg(not(unix))]
@@ -992,6 +1024,8 @@ impl PinnedDirectory {
                 identity,
                 acp_session_cwd,
                 retain_descriptor_after_exec,
+                #[cfg(test)]
+                sync_failure_countdown: Arc::new(AtomicUsize::new(0)),
             })
         }
         #[cfg(not(unix))]

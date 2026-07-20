@@ -27,7 +27,7 @@ use crate::compatibility_schedule_schema::{
     OptionalTextV1, ProfileSourceRefV1, ProviderEffectGrantV1, ScheduledExecutionSourceV1,
     StandingGrantAuthorityV1, StorageConsentV1, ValidateRecord,
 };
-use crate::compatibility_schedule_state::AuthorityStateCapability;
+use crate::compatibility_schedule_state::{AuthorityStateCapability, StateQuota};
 use crate::{local_file, BoxError};
 
 const ZERO_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -1713,6 +1713,7 @@ pub(super) fn validate_authority_state_transition(
 
 pub(super) struct FileAuthorityJournal<'lock> {
     directory: &'lock local_file::PinnedDirectory,
+    state_quota: StateQuota,
     next_generation: u64,
     previous_sha256: Option<String>,
     previous_snapshot: Option<AuthorityStateSnapshotV1>,
@@ -1814,6 +1815,7 @@ impl<'lock> FileAuthorityJournal<'lock> {
         }
         let mut journal = Self {
             directory,
+            state_quota: capability.state_quota(),
             next_generation: 1,
             previous_sha256: None,
             previous_snapshot: None,
@@ -1894,6 +1896,7 @@ impl<'lock> FileAuthorityJournal<'lock> {
         Ok(AuthorityJournalOpen {
             journal: Self {
                 directory,
+                state_quota: capability.state_quota(),
                 next_generation: snapshot.generation + 1,
                 previous_sha256: Some(snapshot_sha256.clone()),
                 previous_snapshot: Some(snapshot.clone()),
@@ -1963,6 +1966,7 @@ impl<'lock> FileAuthorityJournal<'lock> {
         let (snapshot, expected_sha256) = self.preview_append(state, recorded_at_ms)?;
         let mut bytes = serde_json::to_vec(&snapshot)?;
         bytes.push(b'\n');
+        self.state_quota.reserve(bytes.len() as u64)?;
         let name = Self::generation_name(self.next_generation);
         let mut file = self.directory.create_new_file(
             OsStr::new(&name),
@@ -1994,6 +1998,17 @@ impl<'lock> FileAuthorityJournal<'lock> {
         self.previous_snapshot = Some(snapshot.clone());
         Ok((snapshot, sha256))
     }
+}
+
+pub(super) fn authority_status_source_sha256<C: AuthorityStateCapability + ?Sized>(
+    capability: &C,
+) -> Result<Option<String>, BoxError> {
+    if FileAuthorityJournal::generation_entries(capability.authority_directory())?.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        FileAuthorityJournal::open_existing(capability)?.snapshot_sha256,
+    ))
 }
 
 #[cfg(test)]
