@@ -8,8 +8,8 @@
   `agent/reliability-r3d3-evidence-retention`, based directly on `06e22faf`; it is non-billable, default-off,
   and uses only injected owner-private roots, fake storage/runtime/notification adapters, and deterministic files
   in tests
-- **Current R3d3 implementation gate:** **THIRD SOL REVISE / THIRD REMEDIATION FULL-GATE GREEN / SOL CLOSURE REREVIEW NEXT**
-  at code commit `2d90e759d8f0ef1e099ee670779077e00c6984f3`, after the original R3d3a-e checkpoints
+- **Current R3d3 implementation gate:** **FOURTH SOL REVISE / FOURTH REMEDIATION FULL-GATE GREEN / SOL CLOSURE REREVIEW NEXT**
+  at code commit `55ef98b`, after the original R3d3a-e checkpoints
   `21427e6`, `739495a`, `7ed0446`, `84fbbf3`, and `33ec5c3`.
   Evidence state, generation-aware projection, retention/pin clocks, durable tombstone ordering and recovery
   identity, cross-process leases, and 1/4/5 GiB quota primitives now feed descriptor-safe deterministic sealing,
@@ -20,10 +20,10 @@
   incident migration through the normal seal/publication/pin path, a local-only crash-recoverable publication
   outbox, degraded status and transition-deduplicated fake-sink notifications, immutable quarantine-opening
   dereference, and a read-only status CLI. Latest affected focused gates pass retention/GC **33/0**, retained state
-  **20/0**, status **10/0**, and outbox **6/0**; compatibility CLI **25/0**, evidence **46/0**, transaction/control
+  **20/0**, status **10/0**, and outbox **6/0**; compatibility CLI **25/0**, evidence **47/0**, transaction/control
   **30/0**, descriptor-local file **15/0**, and strict schema **32/0** are unchanged. Package all-target
-  warnings-denied check and Clippy, format/diff, complete serial binary **759/0/0**, and canonical full serial
-  workspace **2,499/0/12 ignored** across **72** groups (**55** nonempty) are green,
+  warnings-denied check and Clippy, format/diff, complete serial binary **760/0/0**, and canonical full serial
+  workspace **2,500/0/12 ignored** across **72** groups (**55** nonempty) are green,
   and the unchanged authority seam was last verified at **15/0** in R3d3c. The restart contract is
   [`2026-07-19-r3d3-evidence-status-retention.md`](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md).
   Prior code-and-doc candidate `c75b082` passed workspace check/Clippy, dependency policy, locked release build,
@@ -72,8 +72,22 @@
   `166c337a5af678fa2190c24d0961a4a12a116a4f1b885fcd0c154ef05b61f3a4`; the provider-unexercised
   26,793,248-byte release binary has SHA-256
   `57676b30fa8565ad6f0cd209c07103858f997fd14f5875499cc080a766a55179`. The docs-only commit containing this
-  evidence is the intended review boundary: reproduce the deterministic gates on that unchanged exact head and
-  supply them to fresh Sol/xhigh closure rereview without another cursor mutation. No review approval is claimed.
+  evidence became exact review head `527231e`; fresh Sol/xhigh closure rereview returned a fourth **REVISE**.
+  Inherited findings 1, 3-12, and 14 were resolved; policy-growable hot caps and caller-fabricable semantic status
+  remained High `WRONG`; no fresh finding was reported. Its 10,412-byte artifact has SHA-256
+  `73df466196237e74836224f968a52a06c7cd8d89f2f0d701d5c085cc41d9bb00`. Fourth remediation `55ef98b` makes the
+  exact approved 1/4/5/10-GiB caps the only production-constructible values and refuses test overrides above policy.
+  Raw journal status acquisition is typed degraded as `status_semantics_unverified`; durable append consumes a
+  non-clone verified-projection token tied to the owner-capability lifetime, with no production constructor until
+  R3d5 owns every semantic source. Both focused assertions failed **0/1** on the reviewed mechanism and now pass;
+  evidence is **47/0**, status is **10/0**, and complete binary is **760/0/0**. Exact source commit `55ef98b` passes
+  every deterministic release/validator gate and canonical full serial workspace **2,500/0/12 ignored** across
+  **72** groups (**55** nonempty). Its 214,028-byte canonical log has SHA-256
+  `25c13f5fc9aa8dedffda511d59c29ecabe96851f7e083e273b6428597557bb47`; the provider-unexercised
+  26,793,312-byte release binary has SHA-256
+  `57b47f37725e64a92fc28641121395c0915aac95edb60dae8c4974dbb919ba1e`. The docs-only commit containing this
+  evidence is the intended review boundary: reproduce deterministic gates on that unchanged exact head and supply
+  them to fresh Sol/xhigh closure rereview without another cursor mutation. No review approval is claimed.
   The twelve ignored tests remain authenticated/live-provider integration coverage.
   A separate operator-server reliability incident is deferred without being treated as R3d3 review evidence:
   release `983398427c9f0486` served a healthy card/catalog and all Codex doctor/provenance checks were green, with
@@ -624,7 +638,7 @@ R2a provenance (MERGED)
        -> R2d local non-billable fallback plan (MERGED)
             -> R3 compatibility manifest + pinned/floating canaries + OpenRouter/OpenCode
                (ACTIVE: R3a/R3b/R3c/R3d0/R3d1/R3d2 MERGED; R3d DESIGN MERGED;
-                R3d3 THIRD SOL REVISE / THIRD REMEDIATION FULL-GATE GREEN / SOL CLOSURE REREVIEW NEXT)
+                R3d3 FOURTH SOL REVISE / FOURTH REMEDIATION FULL-GATE GREEN / SOL CLOSURE REREVIEW NEXT)
                  -> R4 reproducible dependency/image pins + release promotion gate
 
 R2e authenticated in-process fallback is DEFERRED and off the critical path.
@@ -651,7 +665,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (three incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at `b54840a` by PR #37; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`; R3d2 **MERGED** by PR #41 at `06e22faf` after seventh Sol approval, the single Fable approval lens, exact deterministic gates, and green CI/CLA. R3d3 is **ACTIVE / THIRD SOL REVISE / THIRD REMEDIATION FULL-GATE GREEN / SOL CLOSURE REREVIEW NEXT** at code checkpoint `2d90e759` on `agent/reliability-r3d3-evidence-retention`, based directly on merged R3d2. Exact `db109b7` and `f485092` received the first two `REVISE` verdicts. Exact `a3cd854` passed binary **752/0/0**, full workspace **2,492/0/12 ignored**, and every deterministic release/validator gate before the third Sol review returned two new High `WRONG` findings for caller-fabricable status and the incomplete state cap. `2d90e759` closes those plus the FileProvider mutation boundary and three retry-sync gaps; exact gate candidate `511ebf0` passes binary **759/0/0**, full workspace **2,499/0/12 ignored**, and every deterministic release/validator gate. The docs-only review head carries an exact-head reproduction into fresh Sol closure rereview without another cursor mutation. No live compatibility gate or production state/iCloud/runtime/GitHub/notification effect occurred. The operator reports that a stop/start recovered a deferred pre-prompt unary-submit incident; that lifecycle observation is neither R3d3 verification nor root-cause proof. | [R3d3 implementation plan](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md) | Evidence/index/retention foundation, sealing, cold storage, GC/migration, then status/outbox/notifications; one default-off merge boundary. |
+| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at `b54840a` by PR #37; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`; R3d2 **MERGED** by PR #41 at `06e22faf` after seventh Sol approval, the single Fable approval lens, exact deterministic gates, and green CI/CLA. R3d3 is **ACTIVE / FOURTH SOL REVISE / FOURTH REMEDIATION FULL-GATE GREEN / SOL CLOSURE REREVIEW NEXT** at code checkpoint `55ef98b` on `agent/reliability-r3d3-evidence-retention`, based directly on merged R3d2. Exact `db109b7` and `f485092` received the first two `REVISE` verdicts. Exact `a3cd854` passed binary **752/0/0**, full workspace **2,492/0/12 ignored**, and every deterministic release/validator gate before the third Sol review returned two new High `WRONG` findings for caller-fabricable status and the incomplete state cap. Third remediation `2d90e759` closed those plus the FileProvider mutation boundary and three retry-sync gaps; exact docs head `527231e` passed binary **759/0/0**, full workspace **2,499/0/12 ignored**, and every deterministic gate before the fourth Sol review retained two High `WRONG` items for policy-growable hot caps and caller-fabricable semantic status. Fourth remediation `55ef98b` makes caps canonical and status append consume a closed owner-lifetime token with production derivation deferred to R3d5; it passes binary **760/0/0**, full workspace **2,500/0/12 ignored**, and every deterministic release/validator gate. The docs-only review head carries an exact-head reproduction into fresh Sol closure rereview without another cursor mutation. No live compatibility gate or production state/iCloud/runtime/GitHub/notification effect occurred. The operator reports that a stop/start recovered a deferred pre-prompt unary-submit incident; that lifecycle observation is neither R3d3 verification nor root-cause proof. | [R3d3 implementation plan](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md) | Evidence/index/retention foundation, sealing, cold storage, GC/migration, then status/outbox/notifications; one default-off merge boundary. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -952,10 +966,16 @@ Next action:
   **20/0**, status **10/0**, outbox **6/0**, and complete binary **759/0/0**; format/diff and package all-target
   warnings-denied check/Clippy are green. Exact gate candidate `511ebf0` passes full workspace **2,499/0/12
   ignored** across **72** groups (**55** nonempty) and every deterministic release/validator gate; its log and
-  release-binary SHA-256 are `166c337a...f3a4` and `57676b30...5179`. The docs-only commit containing this evidence
-  is the intended review head; supply its exact-head reproduction to fresh Sol/xhigh closure rereview without
-  another cursor mutation. Prior full-gate candidates `c75b082`, `990cf99`, and `317cfbf` remain historical
-  evidence only. R3d2's
+  release-binary SHA-256 are `166c337a...f3a4` and `57676b30...5179`. Exact docs head `527231e` received the fourth
+  Sol **REVISE**, with no fresh findings and two unresolved inherited High `WRONG` items: policy-growable hot caps
+  and caller-fabricable semantic status. Artifact SHA-256 is `73df4661...bb00`. Fourth remediation `55ef98b`
+  closes both through canonical production caps and a closed owner-lifetime status token whose production
+  derivation remains R3d5-owned. Evidence **47/0**, status **10/0**, binary **760/0/0**, full workspace
+  **2,500/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic release/validator gate are
+  green; log and release-binary SHA-256 are `25c13f5f...bb47` and `57b47f37...ba1e`. The docs-only commit containing
+  this evidence is the intended review head; supply its exact-head reproduction to fresh Sol/xhigh closure
+  rereview without another cursor mutation. Prior full-gate candidates `c75b082`, `990cf99`, and `317cfbf` remain
+  historical evidence only. R3d2's
   closure history remains below. First reviewed candidate `1373985`
   received four `WRONG`, one `SMELL`, and `REVISE`; remediation head `28e7d28` then passed **641/0/0** binary and
   **2,378/0/12 ignored** full workspace before Sol closure review returned three new `WRONG` and a stale-cursor

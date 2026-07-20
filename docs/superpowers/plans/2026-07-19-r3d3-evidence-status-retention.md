@@ -4,31 +4,35 @@
 `agent/reliability-r3d3-evidence-retention` from merged R3d2 `origin/main`
 `06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41). The first two bridge-mediated Sol/xhigh adversarial
 implementation reviews returned **REVISE** on exact `db109b7` and `f485092`; their remediations are checkpointed at
-`49dd5b381547c8d9f73516946d4e0f66430830bb` and `bfa1d35868cca4a2aa562ed9f74a9da3ed0021f2`. Exact candidate
-`a3cd85431c679736ee13c05bec2abed4954df6ac` then passed the full deterministic gate set: complete binary
-**752/0/0** and canonical full serial workspace **2,492/0/12 ignored** across **72** groups (**55** nonempty), plus
-every release/validator gate. Fresh Sol closure review of that exact head returned **REVISE**: inherited findings
-1-6, 8, and 10-12 were resolved; the stale docs cursor and FileProvider-coordination deletion boundary remained;
-and two new High `WRONG` findings showed that callers could fabricate green source observations and that the 1 GiB
-state cap omitted status, notification, and outbox journals. Its 9,270-byte artifact has SHA-256
-`edb1029795aee38486c1f6640cc1b00ef4ce41c75c2ff3e17313fe7898dc7241`.
+`49dd5b381547c8d9f73516946d4e0f66430830bb` and `bfa1d35868cca4a2aa562ed9f74a9da3ed0021f2`. A third Sol review of
+exact `a3cd85431c679736ee13c05bec2abed4954df6ac` returned **REVISE** with the stale cursor and FileProvider deletion
+boundary unresolved plus two new High `WRONG` findings for caller-fabricable source health and an incomplete 1 GiB
+state cap. Third remediation is checkpointed at `2d90e759d8f0ef1e099ee670779077e00c6984f3`.
 
-Third remediation is checkpointed at `2d90e759d8f0ef1e099ee670779077e00c6984f3`. Production status append now
-acquires and validates every real journal source under the owner capability; aggregate quota scans and reserves
-all eight state-journal directories; cold deletion requires an exact request/result-bound FileProvider mutation
-capability that revalidates under namespace coordination; and cold publication, hot tombstone recovery, and bundle
-GC retry the parent-directory sync before terminal state after an ambiguous prior sync. The seven new regressions
-have explicit fail-first or one-mechanism mutation evidence. Current affected gates are retention **33/0**, state
-**20/0**, status **10/0**, and outbox **6/0**; package all-target warnings-denied check and Clippy, format/diff, and
-the complete binary **759/0/0** are green. Exact gate candidate
-`511ebf0d724c0cacb3d2f0e3ce97aa0146932da7` passes canonical full serial workspace **2,499/0/12 ignored** across
-**72** groups (**55** nonempty), every release/validator gate, and the same complete binary total. Its 213,919-byte
-canonical log has SHA-256 `166c337a5af678fa2190c24d0961a4a12a116a4f1b885fcd0c154ef05b61f3a4`; the
-provider-unexercised 26,793,248-byte release binary has SHA-256
-`57676b30fa8565ad6f0cd209c07103858f997fd14f5875499cc080a766a55179`. The docs-only commit containing this
-evidence is the intended review boundary: reproduce the deterministic gates on that unchanged exact head and
-supply them to fresh Sol/xhigh closure rereview without another cursor mutation. This slice is local,
-non-billable, default-off, and has one merge boundary.
+Exact docs head `527231ed9ee3c76e04f1791715cfc73dcf5b18a0` then reproduced every deterministic gate, complete binary
+**759/0/0**, and canonical full serial workspace **2,499/0/12 ignored** across **72** groups (**55** nonempty).
+Fresh Sol/xhigh closure rereview returned a fourth **REVISE**: inherited findings 1, 3-12, and 14 were resolved;
+items 2 and 13 remained High `WRONG`; and there were no fresh findings. The approved 1/4/5/10-GiB evidence caps
+were still caller-overridable, and real journal hashes still authenticated a caller-built semantic status payload.
+Its 10,412-byte artifact has SHA-256
+`73df466196237e74836224f968a52a06c7cd8d89f2f0d701d5c085cc41d9bb00`.
+
+Fourth remediation is checkpointed at `55ef98b`. Hot-cap fields are private, the sole production constructor emits
+the exact approved constants, validation rejects policy growth, and the test-only reduced-cap constructor cannot
+exceed any approved partition. Raw journal acquisition now carries a typed `status_semantics_unverified`
+degradation. Durable append consumes a non-clone verified-projection token tied to the owner-capability lifetime;
+R3d3 intentionally exposes no production constructor because R3d5 owns the authoritative policy/window lifecycle
+needed to derive every semantic field. The exact cap-growth and fabricated-green assertions each failed **0/1** on
+the reviewed mechanism and now pass; affected suites are evidence **47/0** and status **10/0**. Exact source commit
+`55ef98b` passes format/diff, workspace all-target warnings-denied check and Clippy, dependency policy, locked
+release workspace build, hygiene **37/7**, manifest **9**, recipes **4**, foundation **6/4**, scheduler CLI
+**25/0 + 31/0 + 2/0**, complete binary **760/0/0**, and canonical full serial workspace **2,500/0/12 ignored**
+across **72** groups (**55** nonempty). Its 214,028-byte canonical log has SHA-256
+`25c13f5fc9aa8dedffda511d59c29ecabe96851f7e083e273b6428597557bb47`; the provider-unexercised 26,793,312-byte
+release binary has SHA-256 `57b47f37725e64a92fc28641121395c0915aac95edb60dae8c4974dbb919ba1e`.
+The docs-only commit containing this evidence is the intended review boundary: reproduce deterministic gates on
+that unchanged exact head and supply them to fresh Sol/xhigh closure rereview without another cursor mutation.
+This slice is local, non-billable, default-off, and has one merge boundary.
 
 The approved design of record is
 [`2026-07-11-r3-compatibility-canaries.md`](2026-07-11-r3-compatibility-canaries.md), especially D4/D8,
@@ -380,9 +384,26 @@ schedule foundation **6/4**, compatibility/foundation/supervisor CLI **25/0 + 31
 serial workspace **2,499/0/12 ignored** across **72** result groups (**55** nonempty). The complete log is 213,919
 bytes at SHA-256 `166c337a5af678fa2190c24d0961a4a12a116a4f1b885fcd0c154ef05b61f3a4`; the provider-unexercised release
 binary is 26,793,248 bytes at SHA-256 `57676b30fa8565ad6f0cd209c07103858f997fd14f5875499cc080a766a55179`.
-The docs-only commit containing this paragraph is the intended review head. Reproduce the same deterministic gates
-on that exact unchanged head as supplied review evidence; then run fresh Sol closure rereview without another docs
-fold. No approval is claimed yet.
+The resulting docs-only head `527231ed9ee3c76e04f1791715cfc73dcf5b18a0` reproduced those gates unchanged.
+Fresh Sol/xhigh/read-only closure rereview returned a fourth **REVISE**. It resolved inherited items 1, 3-12, and
+14, found no fresh issue, and retained two High `WRONG` items: `HotStorageCapsV1` still accepted caller-grown
+1/4/5/10-GiB policy, while authenticated journal hashes still certified caller-built semantic status fields.
+The 10,412-byte review artifact has SHA-256
+`73df466196237e74836224f968a52a06c7cd8d89f2f0d701d5c085cc41d9bb00`.
+
+Fourth remediation commit `55ef98b` makes hot-cap fields private, exposes only exact approved production caps,
+rejects enlarged validation, and limits the test-only constructor to reductions. Raw journal status acquisition
+adds `status_semantics_unverified`, so real hashes alone cannot green a raw summary. Durable append instead consumes
+a non-clone verified-projection token whose lifetime is bound to the owner capability; R3d3 exposes no production
+constructor because R3d5 owns authoritative policy/window derivation. The cap-growth and fabricated-green
+assertions each failed **0/1** before the fix and now pass. Evidence is **47/0**, status is **10/0**, and complete
+binary is **760/0/0**. Exact source head `55ef98b` passes every deterministic gate and canonical full serial
+workspace **2,500/0/12 ignored** across **72** result groups (**55** nonempty). The complete log is 214,028 bytes at
+SHA-256 `25c13f5fc9aa8dedffda511d59c29ecabe96851f7e083e273b6428597557bb47`; the provider-unexercised release binary is
+26,793,312 bytes at SHA-256 `57b47f37725e64a92fc28641121395c0915aac95edb60dae8c4974dbb919ba1e`.
+The docs-only commit containing this paragraph is the intended review head. Reproduce deterministic gates on that
+exact unchanged head as supplied review evidence, then run fresh Sol closure rereview without another docs fold.
+No approval is claimed yet.
 
 One dogfood incident is deliberately deferred outside R3d3 correctness. Operator release `983398427c9f0486`
 served a healthy agent card/model catalog and green Codex doctor/provenance checks with zero unfinished tasks and
@@ -448,8 +469,13 @@ full serial workspace **2,492/0/12 ignored** across **72** groups (**55** nonemp
 release/validator gate, but its third Sol review returned two new High `WRONG` findings. Third remediation is
 checkpointed at `2d90e759`; exact gate candidate `511ebf0` passes every deterministic gate, complete binary
 **759/0/0**, and canonical full serial workspace **2,499/0/12 ignored** across **72** groups (**55** nonempty).
-The docs-only commit containing this gate evidence is the intended review head; supply its exact-head deterministic
-reproduction directly to fresh Sol/xhigh closure rereview without another cursor mutation. Run the single
-Fable/xhigh release/compatibility lens only after Sol approval. No production operator rebuild or swap is part of
-this slice; preserve the deferred lifecycle-sensitive unary-submit incident above for later reliability
-investigation.
+Exact docs head `527231e` received the fourth Sol **REVISE** with no fresh findings and two unresolved inherited
+High `WRONG` items: policy-growable hot caps and caller-fabricable semantic status. Fourth remediation `55ef98b`
+closes both with canonical production-only caps and a closed owner-lifetime verified status token whose production
+derivation remains R3d5-owned. Its cap and status regressions failed **0/1 + 0/1** before the fix; evidence **47/0**,
+status **10/0**, complete binary **760/0/0**, canonical workspace **2,500/0/12 ignored** across **72** groups
+(**55** nonempty), and every deterministic gate are green. The docs-only commit containing this evidence is the
+intended review head; supply its exact-head deterministic reproduction directly to fresh Sol/xhigh closure
+rereview without another cursor mutation. Run the single Fable/xhigh release/compatibility lens only after Sol
+approval. No production operator rebuild or swap is part of this slice; preserve the deferred lifecycle-sensitive
+unary-submit incident above for later reliability investigation.
