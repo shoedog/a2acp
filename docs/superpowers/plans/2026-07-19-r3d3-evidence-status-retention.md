@@ -2,9 +2,11 @@
 
 **Status:** R3d3a through R3d3e are checkpointed at `21427e6`, `739495a`, `7ed0446`, `84fbbf3`, and `33ec5c3` on
 `agent/reliability-r3d3-evidence-retention` from merged R3d2 `origin/main`
-`06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41). Exact code-and-doc candidate `c75b082` passed the
-complete deterministic release gates; the bridge-mediated Sol/xhigh adversarial implementation review is next.
-This slice is local, non-billable, default-off, and has one merge boundary.
+`06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41). Exact candidate `db109b7` received a bridge-mediated
+Sol/xhigh adversarial implementation verdict of **REVISE** with eight `WRONG` findings and one `SMELL`; review
+evidence SHA-256 is `82375d418777611eafc6a02f92ef3f8ba478782242bcabf47f321306797a37fd`. Code remediation is checkpointed at
+`49dd5b381547c8d9f73516946d4e0f66430830bb`; focused gates are green, while exact full deterministic gates and a
+fresh Sol rereview remain next. This slice is local, non-billable, default-off, and has one merge boundary.
 
 The approved design of record is
 [`2026-07-11-r3-compatibility-canaries.md`](2026-07-11-r3-compatibility-canaries.md), especially D4/D8,
@@ -249,6 +251,17 @@ floating recipes **4**, schedule foundation **6/4**, compatibility/foundation/su
 2/0**, complete binary **734/0/0**, and canonical full serial workspace **2,473/0/12 ignored** across **72**
 result groups (**55** nonempty). The ignored set remains authenticated/live-provider integration coverage.
 
+The initial Sol review then froze exact `db109b7` and returned **REVISE**. Remediation commit `49dd5b3` closes the
+locally reproduced mechanisms without claiming reviewer closure: tombstone completion now requires persisted
+pending intent, an exclusive lease, journal reopen, exact hot/cold verification and unlink, and a non-constructible
+effect proof; publication self-measures live state/scratch/sealed bytes and idempotently recovers pre-index and
+post-index residue; bundle GC obtains a fresh timestamped inventory only after its exclusive lease; evidence and
+notification journals refuse the first unreopenable generation; top-level help discovers schedule status; and an
+injected operator-home test fingerprints missing, valid, and corrupt status trees before and after read-only access.
+Fail-first regressions were red on the reviewed mechanism. Current focused gates pass evidence **45/0**, retention/
+GC **25/0**, status **9/0**, retained state **19/0**, and compatibility CLI **25/0**; format, diff, and package
+all-target warnings-denied Clippy are green. These are checkpoint gates, not a replacement for the exact full suite.
+
 ## Verification and review gates
 
 1. Add each focused test before its mechanism, run it against the pre-change state or a one-mechanism mutation, and
@@ -287,10 +300,12 @@ admitted handoff, independent storage consent, unchanged aggregate v1, and typed
 R3d2 merged by PR #41 with CI/CLA green. Its final local gate was complete binary **655/0/0** and canonical full
 workspace **2,392/0/12 ignored** across **72** result groups (**55** nonempty); the twelve ignored tests remain
 authenticated/live-provider integration tests. R3d3a through R3d3e are checkpointed at `21427e6`, `739495a`,
-`7ed0446`, `84fbbf3`, and `33ec5c3`; the latest focused gates are outbox **5/0**, status **7/0**, transaction/
-control **30/0**, compatibility CLI **24/0**, evidence **43/0**, retention/GC **19/0**, retained state **19/0**,
-strict schema **32/0**, and descriptor-local file **12/0**. Exact candidate `c75b082` passes complete binary
-**734/0/0** and canonical full serial workspace **2,473/0/12 ignored** across **72** groups (**55** nonempty),
-plus every deterministic release/validator gate. Rerun those gates after this docs fold, freeze the exact review
-boundary, then run the Sol/xhigh adversarial implementation review. No production operator rebuild or swap is
-part of this slice.
+`7ed0446`, `84fbbf3`, and `33ec5c3`. Exact reviewed candidate `db109b7` received Sol/xhigh **REVISE** with eight
+`WRONG` findings and one `SMELL`; `49dd5b3` is the remediation checkpoint. Latest focused gates are outbox **5/0**,
+status **9/0**, transaction/control **30/0**, compatibility CLI **25/0**, evidence **45/0**, retention/GC **25/0**,
+retained state **19/0**, strict schema **32/0**, and descriptor-local file **12/0**. The prior candidate `c75b082`
+passed complete binary **734/0/0** and canonical full serial workspace **2,473/0/12 ignored** across **72** groups
+(**55** nonempty), plus every deterministic release/validator gate; those historical totals are not attributed to
+`49dd5b3`. Rerun every deterministic gate on the exact docs-fold head, freeze it, then run a fresh Sol/xhigh
+rereview. Run the single Fable/xhigh release/compatibility lens only after Sol approval. No production operator
+rebuild or swap is part of this slice.
