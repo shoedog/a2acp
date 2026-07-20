@@ -20,9 +20,15 @@ capability that revalidates under namespace coordination; and cold publication, 
 GC retry the parent-directory sync before terminal state after an ambiguous prior sync. The seven new regressions
 have explicit fail-first or one-mechanism mutation evidence. Current affected gates are retention **33/0**, state
 **20/0**, status **10/0**, and outbox **6/0**; package all-target warnings-denied check and Clippy, format/diff, and
-the complete binary **759/0/0** are green. Exact full deterministic gates on the docs-fold head and a fresh
-Sol/xhigh closure rereview remain required. This slice is local, non-billable, default-off, and has one merge
-boundary.
+the complete binary **759/0/0** are green. Exact gate candidate
+`511ebf0d724c0cacb3d2f0e3ce97aa0146932da7` passes canonical full serial workspace **2,499/0/12 ignored** across
+**72** groups (**55** nonempty), every release/validator gate, and the same complete binary total. Its 213,919-byte
+canonical log has SHA-256 `166c337a5af678fa2190c24d0961a4a12a116a4f1b885fcd0c154ef05b61f3a4`; the
+provider-unexercised 26,793,248-byte release binary has SHA-256
+`57676b30fa8565ad6f0cd209c07103858f997fd14f5875499cc080a766a55179`. The docs-only commit containing this
+evidence is the intended review boundary: reproduce the deterministic gates on that unchanged exact head and
+supply them to fresh Sol/xhigh closure rereview without another cursor mutation. This slice is local,
+non-billable, default-off, and has one merge boundary.
 
 The approved design of record is
 [`2026-07-11-r3-compatibility-canaries.md`](2026-07-11-r3-compatibility-canaries.md), especially D4/D8,
@@ -367,8 +373,16 @@ Pre-change-red/mutation evidence is literal:
 
 Post-remediation affected gates are retention **33/0**, state **20/0**, status **10/0**, and outbox **6/0**.
 Format, diff, package all-target warnings-denied check and Clippy, the exact abandonment edge **1/0**, and the
-complete serial binary **759/0/0** are green. Full serial workspace, locked release, dependency/validator gates,
-and exact-head Sol closure rereview still must run after this docs fold; none is claimed yet.
+complete serial binary **759/0/0** are green. Exact gate candidate `511ebf0d724c0cacb3d2f0e3ce97aa0146932da7`
+also passes committed/worktree diff and format, workspace all-target warnings-denied check and Clippy, dependency
+policy, locked release workspace build, repository hygiene **37/7**, pinned manifest **9**, floating recipes **4**,
+schedule foundation **6/4**, compatibility/foundation/supervisor CLI **25/0 + 31/0 + 2/0**, and canonical full
+serial workspace **2,499/0/12 ignored** across **72** result groups (**55** nonempty). The complete log is 213,919
+bytes at SHA-256 `166c337a5af678fa2190c24d0961a4a12a116a4f1b885fcd0c154ef05b61f3a4`; the provider-unexercised release
+binary is 26,793,248 bytes at SHA-256 `57676b30fa8565ad6f0cd209c07103858f997fd14f5875499cc080a766a55179`.
+The docs-only commit containing this paragraph is the intended review head. Reproduce the same deterministic gates
+on that exact unchanged head as supplied review evidence; then run fresh Sol closure rereview without another docs
+fold. No approval is claimed yet.
 
 One dogfood incident is deliberately deferred outside R3d3 correctness. Operator release `983398427c9f0486`
 served a healthy agent card/model catalog and green Codex doctor/provenance checks with zero unfinished tasks and
@@ -432,9 +446,10 @@ serial workspace **2,484/0/12 ignored** across **72** groups (**55** nonempty), 
 validator gate. Exact second-remediation review head `a3cd854` passes complete binary **752/0/0** and canonical
 full serial workspace **2,492/0/12 ignored** across **72** groups (**55** nonempty), plus every deterministic
 release/validator gate, but its third Sol review returned two new High `WRONG` findings. Third remediation is
-checkpointed at `2d90e759`; affected gates are retention **33/0**, state **20/0**, status **10/0**, outbox **6/0**,
-and complete binary **759/0/0**, with format/diff and package all-target warnings-denied check/Clippy green. Run
-the full deterministic gates on the exact docs-fold head next, then freeze the boundary for fresh Sol/xhigh
-closure rereview. Run the single Fable/xhigh release/compatibility lens only after Sol approval. No production
-operator rebuild or swap is part of this slice; preserve the deferred lifecycle-sensitive unary-submit incident
-above for later reliability investigation.
+checkpointed at `2d90e759`; exact gate candidate `511ebf0` passes every deterministic gate, complete binary
+**759/0/0**, and canonical full serial workspace **2,499/0/12 ignored** across **72** groups (**55** nonempty).
+The docs-only commit containing this gate evidence is the intended review head; supply its exact-head deterministic
+reproduction directly to fresh Sol/xhigh closure rereview without another cursor mutation. Run the single
+Fable/xhigh release/compatibility lens only after Sol approval. No production operator rebuild or swap is part of
+this slice; preserve the deferred lifecycle-sensitive unary-submit incident above for later reliability
+investigation.
