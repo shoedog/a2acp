@@ -8,7 +8,7 @@
   `agent/reliability-r3d3-evidence-retention`, based directly on `06e22faf`; it is non-billable, default-off,
   and uses only injected owner-private roots, fake storage/runtime/notification adapters, and deterministic files
   in tests
-- **Current R3d3 implementation gate:** **TENTH SOL APPROVE / SINGLE FABLE LENS COMPLETE / DOCS-ONLY REMEDIATION FOLDED / FINAL EXACT-HEAD GATES NEXT**
+- **Current R3d3 implementation gate:** **TENTH SOL APPROVE / SINGLE FABLE LENS COMPLETE / DOCS-ONLY REMEDIATION FOLDED / FINAL GATE GREEN / NON-DRAFT PR NEXT**
   at code commit `1647fa6`, exact Sol-reviewed docs head `1637b5b`, and exact Fable-reviewed docs head `f7f9ebd`,
   after the original R3d3a-e checkpoints
   `21427e6`, `739495a`, `7ed0446`, `84fbbf3`, and `33ec5c3`.
@@ -187,7 +187,17 @@
   next-action cursor and the overbroad journal wording; the cosmetic source note is accepted as nonblocking so the
   Sol-approved implementation remains unchanged. The 11,224-byte Fable artifact has SHA-256
   `8b8bc4e0f71f30aba6af67bc7f9a683ea98e53ea7a82138affc79cc465f5bc07`. Per the approved one-lens policy and the
-  reviewer itself, there is no Fable rereview loop. Final exact-head deterministic gates are next.
+  reviewer itself, there is no Fable rereview loop. Exact remediation head `e4cd340` passes every deterministic
+  gate: complete binary **779/0/0** and canonical full serial workspace **2,519/0/12 ignored** across **72** groups
+  (**55** nonempty). Its 74,730-byte binary log and 216,264-byte workspace log have SHA-256
+  `f0aab23069ff1fe9ca5a87764de719d7502ed81d36d8a44ebda9ce5a8be1b8e8` and
+  `0248ef09df5acaf1b0f5a3e9246daae59df84d35fc5cce957fa78f56dcb6b4ef`; the provider-unexercised
+  26,796,144-byte release binary remains SHA-256
+  `9d24382603a637ad777cf58f2c16ed6d1e7a6f5e18f3635dd72a91ba6c9452a0`. One earlier noncanonical streamed
+  all-target/all-feature diagnostic and one isolated probe observed the pre-existing bridge-core start-probe
+  timeout; no source changed, and the later authoritative canonical suites at `f7f9ebd` and `e4cd340` both passed
+  that test. Preserve it as disclosed verifier/host timing evidence, not a rebaseline or an R3d3 fix. This docs-only
+  evidence fold is the PR boundary; reproduce the same gates once without another cursor mutation, then publish.
   The twelve ignored tests remain authenticated/live-provider integration coverage.
   A separate operator-server reliability incident is deferred without being treated as R3d3 review evidence:
   release `983398427c9f0486` served a healthy card/catalog and all Codex doctor/provenance checks were green, with
@@ -706,7 +716,7 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** rerun every deterministic gate on the exact docs-only Fable-remediation head, then publish one
+- **Next action:** reproduce every deterministic gate once on this exact docs-only evidence fold, then publish one
   non-draft R3d3 PR and require green CI/CLA. Do not launch another Sol or Fable review absent a source mutation;
   the single Fable lens is complete and its docs-only `WRONG` is folded here. No live compatibility gate, iCloud,
   runtime-image, notification, GitHub-side effect beyond that PR, launchd, or production-operator lifecycle action
@@ -737,7 +747,7 @@ R2a provenance (MERGED)
        -> R2d local non-billable fallback plan (MERGED)
             -> R3 compatibility manifest + pinned/floating canaries + OpenRouter/OpenCode
                (ACTIVE: R3a/R3b/R3c/R3d0/R3d1/R3d2 MERGED; R3d DESIGN MERGED;
-                R3d3 SOL APPROVED / SINGLE FABLE LENS COMPLETE / DOCS REMEDIATED / FINAL GATES NEXT)
+                R3d3 SOL APPROVED / SINGLE FABLE LENS COMPLETE / DOCS REMEDIATED / FINAL GATE GREEN / PR NEXT)
                  -> R4 reproducible dependency/image pins + release promotion gate
 
 R2e authenticated in-process fallback is DEFERRED and off the critical path.
@@ -764,7 +774,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (four incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at `b54840a` by PR #37; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`; R3d2 **MERGED** by PR #41 at `06e22faf` after seventh Sol approval, the single Fable approval lens, exact deterministic gates, and green CI/CLA. R3d3 is **ACTIVE / TENTH SOL APPROVE / SINGLE FABLE LENS COMPLETE / DOCS-ONLY REMEDIATION FOLDED / FINAL EXACT-HEAD GATES NEXT** at source checkpoint `1647fa6`, exact Sol-reviewed docs head `1637b5b`, and exact Fable-reviewed docs head `f7f9ebd` on `agent/reliability-r3d3-evidence-retention`, based directly on merged R3d2. Earlier review/remediation rounds are preserved in the focused plan and cursor detail above. Ninth remediation `1647fa6` closes the lockless status barrier-before-scan race by capturing one bounded name set before sync. Exact docs head `1637b5b` passes binary **779/0/0**, full workspace **2,519/0/12 ignored**, and every deterministic release/validator gate. The tenth Sol/xhigh closure review resolved all eighteen inherited items, found no fresh `WRONG` or `SMELL`, and returned **APPROVE**; artifact SHA-256 is `cbdfe1b7...3045`. The single Fable/xhigh lens of exact `f7f9ebd` returned **REVISE** for one stale next-action bullet and two minor non-mechanism `SMELL`s; every inspected mechanism checked out. This fold fixes that `WRONG` and the documentation-precision smell, accepts the cosmetic source smell as nonblocking without resetting Sol, and does not commission a prohibited Fable rereview. Artifact SHA-256 is `8b8bc4e0...bc07`. Final exact-head deterministic gates remain before PR readiness. No live compatibility gate or production state/iCloud/runtime/GitHub/notification effect occurred. `INC-SHARED-RESTART-RECOVERY-2026-07-19` records that stop/start recovered a deferred pre-prompt unary-submit incident; that lifecycle observation is neither R3d3 verification nor root-cause proof. | [R3d3 implementation plan](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md) | Evidence/index/retention foundation, sealing, cold storage, GC/migration, then status/outbox/notifications; one default-off merge boundary. |
+| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at `b54840a` by PR #37; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`; R3d2 **MERGED** by PR #41 at `06e22faf` after seventh Sol approval, the single Fable approval lens, exact deterministic gates, and green CI/CLA. R3d3 is **ACTIVE / TENTH SOL APPROVE / SINGLE FABLE LENS COMPLETE / DOCS-ONLY REMEDIATION FOLDED / FINAL GATE GREEN / NON-DRAFT PR NEXT** at source checkpoint `1647fa6`, exact Sol-reviewed docs head `1637b5b`, exact Fable-reviewed docs head `f7f9ebd`, and exact gate head `e4cd340` on `agent/reliability-r3d3-evidence-retention`, based directly on merged R3d2. Earlier review/remediation rounds are preserved in the focused plan and cursor detail above. Ninth remediation `1647fa6` closes the lockless status barrier-before-scan race by capturing one bounded name set before sync. The tenth Sol/xhigh closure review resolved all eighteen inherited items, found no fresh `WRONG` or `SMELL`, and returned **APPROVE**; artifact SHA-256 is `cbdfe1b7...3045`. The single Fable/xhigh lens of exact `f7f9ebd` returned **REVISE** for one stale next-action bullet and two minor non-mechanism `SMELL`s; every inspected mechanism checked out. The docs-only `e4cd340` fold fixes that `WRONG` and the documentation-precision smell, accepts the cosmetic source smell as nonblocking without resetting Sol, and does not commission a prohibited Fable rereview. Artifact SHA-256 is `8b8bc4e0...bc07`. Exact `e4cd340` passes binary **779/0/0**, full workspace **2,519/0/12 ignored**, and every deterministic release/validator gate; binary/workspace/release SHA-256 are `f0aab230...b8e8`, `0248ef09...b4ef`, and `9d243826...52a0`. This docs-only evidence fold must reproduce those gates once, then the non-draft PR is next. No live compatibility gate or production state/iCloud/runtime/GitHub/notification effect occurred. `INC-SHARED-RESTART-RECOVERY-2026-07-19` records that stop/start recovered a deferred pre-prompt unary-submit incident; that lifecycle observation is neither R3d3 verification nor root-cause proof. | [R3d3 implementation plan](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md) | Evidence/index/retention foundation, sealing, cold storage, GC/migration, then status/outbox/notifications; one default-off merge boundary. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -1117,8 +1127,11 @@ Next action:
   evidence-reader hygiene without a failure scenario. This fold corrects the `WRONG` and wording smell, accepts the
   cosmetic note as nonblocking without a source mutation, and intentionally does not run a Fable rereview. The
   11,224-byte artifact has SHA-256
-  `8b8bc4e0f71f30aba6af67bc7f9a683ea98e53ea7a82138affc79cc465f5bc07`. Run final exact-head deterministic gates,
-  then publish one non-draft PR with green CI/CLA required.
+  `8b8bc4e0f71f30aba6af67bc7f9a683ea98e53ea7a82138affc79cc465f5bc07`. Exact remediation head `e4cd340` passes
+  every deterministic gate, binary **779/0/0**, and full workspace **2,519/0/12 ignored** across **72** groups
+  (**55** nonempty). Binary-log, workspace-log, and release-binary SHA-256 are `f0aab230...b8e8`,
+  `0248ef09...b4ef`, and `9d243826...52a0`. Reproduce those gates once on this docs-only evidence fold, then
+  publish one non-draft PR with green CI/CLA required.
   Prior full-gate candidates `c75b082`, `990cf99`, and `317cfbf` remain
   historical evidence only. R3d2's
   closure history remains below. First reviewed candidate `1373985`

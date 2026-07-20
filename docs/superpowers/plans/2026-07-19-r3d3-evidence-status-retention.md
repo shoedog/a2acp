@@ -146,9 +146,15 @@ the single design-required Fable/xhigh release/compatibility lens. It returned *
 checked out. Two minor `SMELL`s covered overbroad shared-journal wording and cosmetic evidence-reader hygiene
 without a failure scenario. This docs-only fold fixes the `WRONG` and wording smell, accepts the cosmetic source
 note as nonblocking without resetting Sol approval, and does not commission a Fable rereview. The 11,224-byte
-artifact has SHA-256 `8b8bc4e0f71f30aba6af67bc7f9a683ea98e53ea7a82138affc79cc465f5bc07`. Final exact-head
-deterministic gates remain before PR readiness. The implementation remains local, non-billable, default-off, and
-has one merge boundary; the separately authorized Fable review was the only provider turn in this closure step.
+artifact has SHA-256 `8b8bc4e0f71f30aba6af67bc7f9a683ea98e53ea7a82138affc79cc465f5bc07`. Exact remediation
+head `e4cd340` passes every deterministic gate, complete binary **779/0/0**, and canonical full serial
+workspace **2,519/0/12 ignored** across **72** groups (**55** nonempty). Its 74,730-byte binary log and 216,264-byte
+workspace log have SHA-256 `f0aab23069ff1fe9ca5a87764de719d7502ed81d36d8a44ebda9ce5a8be1b8e8` and
+`0248ef09df5acaf1b0f5a3e9246daae59df84d35fc5cce957fa78f56dcb6b4ef`; the provider-unexercised 26,796,144-byte
+release binary remains SHA-256 `9d24382603a637ad777cf58f2c16ed6d1e7a6f5e18f3635dd72a91ba6c9452a0`. This docs-only
+evidence fold must reproduce those gates once before the non-draft PR. The implementation remains local,
+non-billable, default-off, and has one merge boundary; the separately authorized Fable review was the only provider
+turn in this closure step.
 
 The approved design of record is
 [`2026-07-11-r3-compatibility-canaries.md`](2026-07-11-r3-compatibility-canaries.md), especially D4/D8,
@@ -628,7 +634,13 @@ every inspected mechanism checked out. Two minor `SMELL`s covered overbroad jour
 evidence-reader hygiene without a failure scenario. This fold corrects the `WRONG` and wording smell, accepts the
 cosmetic source note as nonblocking without resetting Sol, and intentionally does not run a Fable rereview. The
 11,224-byte artifact has SHA-256 `8b8bc4e0f71f30aba6af67bc7f9a683ea98e53ea7a82138affc79cc465f5bc07`.
-Run final exact-head deterministic gates, then publish one non-draft PR with green CI/CLA required.
+Exact remediation head `e4cd340` passes every deterministic gate, binary **779/0/0**, and full workspace
+**2,519/0/12 ignored** across **72** groups (**55** nonempty). Its binary/workspace/release SHA-256 are
+`f0aab230...b8e8`, `0248ef09...b4ef`, and `9d243826...52a0`. One earlier noncanonical streamed diagnostic and an
+isolated probe observed the pre-existing bridge-core start-probe timeout; no source changed, and the later
+authoritative canonical suites at `f7f9ebd` and `e4cd340` passed it. Preserve that as verifier/host timing evidence,
+not a rebaseline or an R3d3 fix. Reproduce the gates on this docs-only evidence fold, then publish one non-draft PR
+with green CI/CLA required.
 
 One dogfood incident is deliberately deferred outside R3d3 correctness. Operator release `983398427c9f0486`
 served a healthy agent card/model catalog and green Codex doctor/provenance checks with zero unfinished tasks and
@@ -726,7 +738,8 @@ is green. Exact docs head `1637b5b` reproduced every deterministic gate and rece
 `cbdfe1b7...3045`. Exact docs head `f7f9ebd` received the single Fable/xhigh lens and returned **REVISE** for one
 stale next-action bullet while every inspected mechanism checked out. This fold fixes that docs-only `WRONG` and
 the documentation-precision `SMELL`, accepts one cosmetic source `SMELL` as nonblocking, and does not run a Fable
-rereview. Artifact SHA-256 is `8b8bc4e0...bc07`. Run final exact-head gates, then publish one non-draft PR. No
-production operator rebuild or swap is
+rereview. Artifact SHA-256 is `8b8bc4e0...bc07`. Exact remediation head `e4cd340` passes binary **779/0/0**, full
+workspace **2,519/0/12 ignored**, and every deterministic gate. Reproduce those gates on this docs-only evidence
+fold, then publish one non-draft PR. No production operator rebuild or swap is
 part of this slice; preserve `INC-SHARED-RESTART-RECOVERY-2026-07-19` for later R2f investigation rather than
 treating restart as a fix.
