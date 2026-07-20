@@ -63,9 +63,11 @@ exposed their final generation names before complete write and file sync. Its 16
 Sixth remediation is checkpointed at `43b429a`. Pending tombstones and Admitted cold copies are mutually exclusive
 in both transition directions and model validation, with a final pre-deletion check. Evidence, migration, outbox,
 status, and notification appends now fully write and file-sync a fixed owner-private temp before descriptor-relative
-no-replace rename and parent sync. Reopen ignores only that exact temp/removal-quarantine residue; the next owner
-append verifies and removes it before quota accounting; wrong-type, linked, wrong-owner, or wrong-mode residue fails
-closed. The corrected tombstone and truncated-outbox-tail regressions each failed **0/1** on the reviewed mechanism
+no-replace rename and parent sync. Each reader parses only its own validated final-name prefix; other namespaces
+sharing the directory and its exact temp/removal-quarantine names are not consumed as journal state and remain
+conservatively quota-counted. The next owner append verifies and removes its exact private residue before quota
+accounting; wrong-type, linked, wrong-owner, or wrong-mode residue fails closed. The corrected tombstone and
+truncated-outbox-tail regressions each failed **0/1** on the reviewed mechanism
 and now pass. Five journal interruption/reopen/retry tests and local atomic-publication, cleanup-quarantine, and
 untrusted-residue edges are also green. Affected suites are local file **17/0**, evidence **49/0**, outbox **8/0**,
 status **12/0**, and retention **35/0**. Exact source commit `43b429a` passes format/diff, workspace all-target/all-
@@ -138,9 +140,15 @@ SHA-256 `f9219b83d049c7956327b17d087da00ec76cdc7bff7238112f67d3183c49c771`; and 
 **779/0/0** and canonical full serial workspace **2,519/0/12 ignored** across **72** groups (**55** nonempty).
 The tenth Sol/xhigh closure review resolved all eighteen inherited items, reported no fresh `WRONG` or `SMELL`,
 and returned **APPROVE**. Its 13,292-byte artifact has SHA-256
-`cbdfe1b7339a6d27b203247029bfe95b8297027e682b09190e9af2eb622f3045`. The single design-required Fable/xhigh
-release/compatibility lens remains before final merge readiness. This slice remains local, non-billable,
-default-off, and has one merge boundary.
+`cbdfe1b7339a6d27b203247029bfe95b8297027e682b09190e9af2eb622f3045`. Exact docs head `f7f9ebd` then received
+the single design-required Fable/xhigh release/compatibility lens. It returned **REVISE** for one docs-only Medium
+`WRONG`: the durable next-action bullet still commissioned an eleventh Sol review. Every inspected mechanism
+checked out. Two minor `SMELL`s covered overbroad shared-journal wording and cosmetic evidence-reader hygiene
+without a failure scenario. This docs-only fold fixes the `WRONG` and wording smell, accepts the cosmetic source
+note as nonblocking without resetting Sol approval, and does not commission a Fable rereview. The 11,224-byte
+artifact has SHA-256 `8b8bc4e0f71f30aba6af67bc7f9a683ea98e53ea7a82138affc79cc465f5bc07`. Final exact-head
+deterministic gates remain before PR readiness. The implementation remains local, non-billable, default-off, and
+has one merge boundary; the separately authorized Fable review was the only provider turn in this closure step.
 
 The approved design of record is
 [`2026-07-11-r3-compatibility-canaries.md`](2026-07-11-r3-compatibility-canaries.md), especially D4/D8,
@@ -538,9 +546,11 @@ reopen. The 16,531-byte review artifact has SHA-256
 Sixth remediation commit `43b429a` closes both findings. Admitted cold copies and Pending tombstones are mutually
 exclusive in model validation and both transition directions, and deletion rechecks the exclusion before effects.
 All five journals share a descriptor-relative append primitive that writes and file-syncs a fixed mode-`0600`
-owner-private temp before atomic no-replace rename and parent sync. Read-only reopen ignores only that exact temp or
-its deterministic removal quarantine; the next owner append validates and removes residue before quota accounting.
-Unexpected type, links, owner, or mode fail closed. The corrected tombstone and truncated-tail assertions each
+owner-private temp before atomic no-replace rename and parent sync. Each reader parses only its own validated
+final-name prefix; other namespaces sharing the directory and its exact temp/removal quarantine are not consumed as
+journal state and remain conservatively quota-counted. The next owner append validates and removes its exact private
+residue before quota accounting. Unexpected residue type, links, owner, or mode fail closed. The corrected tombstone
+and truncated-tail assertions each
 failed **0/1** on the reviewed mechanism and now pass; five call-site interruption/reopen/retry tests plus local
 cleanup-quarantine and untrusted-residue edges cover the shared primitive. Affected suites pass local file **17/0**,
 evidence **49/0**, outbox **8/0**, status **12/0**, and retention **35/0**. Exact source head `43b429a` passes every
@@ -612,8 +622,13 @@ workspace-log, and release-binary SHA-256
 `9d24382603a637ad777cf58f2c16ed6d1e7a6f5e18f3635dd72a91ba6c9452a0`. Fresh Sol/xhigh/read-only closure
 rereview resolved all eighteen inherited items, reported no fresh `WRONG` or `SMELL`, and returned terminal
 `R3D3 IMPLEMENTATION: APPROVE`. The 13,292-byte artifact has SHA-256
-`cbdfe1b7339a6d27b203247029bfe95b8297027e682b09190e9af2eb622f3045`. Run the single Fable/xhigh
-release/compatibility lens next; do not use Fable as a rereview loop.
+`cbdfe1b7339a6d27b203247029bfe95b8297027e682b09190e9af2eb622f3045`. Exact docs head `f7f9ebd` received the
+single Fable/xhigh release/compatibility lens and returned **REVISE** for one stale docs-only next-action bullet;
+every inspected mechanism checked out. Two minor `SMELL`s covered overbroad journal-reader wording and cosmetic
+evidence-reader hygiene without a failure scenario. This fold corrects the `WRONG` and wording smell, accepts the
+cosmetic source note as nonblocking without resetting Sol, and intentionally does not run a Fable rereview. The
+11,224-byte artifact has SHA-256 `8b8bc4e0f71f30aba6af67bc7f9a683ea98e53ea7a82138affc79cc465f5bc07`.
+Run final exact-head deterministic gates, then publish one non-draft PR with green CI/CLA required.
 
 One dogfood incident is deliberately deferred outside R3d3 correctness. Operator release `983398427c9f0486`
 served a healthy agent card/model catalog and green Codex doctor/provenance checks with zero unfinished tasks and
@@ -708,7 +723,10 @@ interleaving regression failed **0/1** before the fix and now passes; status is 
 canonical workspace is **2,519/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic gate
 is green. Exact docs head `1637b5b` reproduced every deterministic gate and received the tenth Sol/xhigh
 **APPROVE**: all eighteen inherited items resolved and no fresh `WRONG` or `SMELL`; artifact SHA-256 is
-`cbdfe1b7...3045`. Run the single Fable/xhigh release/compatibility lens next and do not use Fable as a rereview
-loop. No production operator rebuild or swap is
+`cbdfe1b7...3045`. Exact docs head `f7f9ebd` received the single Fable/xhigh lens and returned **REVISE** for one
+stale next-action bullet while every inspected mechanism checked out. This fold fixes that docs-only `WRONG` and
+the documentation-precision `SMELL`, accepts one cosmetic source `SMELL` as nonblocking, and does not run a Fable
+rereview. Artifact SHA-256 is `8b8bc4e0...bc07`. Run final exact-head gates, then publish one non-draft PR. No
+production operator rebuild or swap is
 part of this slice; preserve `INC-SHARED-RESTART-RECOVERY-2026-07-19` for later R2f investigation rather than
 treating restart as a fix.
