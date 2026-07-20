@@ -1,16 +1,217 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5` on 2026-07-19
-  (PR #40 merged R3d1)
-- **Completed through:** R3d1 **MERGED** at `cbcfd1f`; R2e remains deferred and off the critical path
-- **Active slice:** R3d2 authority, admission, preflights, and accounting on
-  `agent/reliability-r3d2-authority-admission`, based directly on `cbcfd1f`; it is non-billable and uses only
-  fake clocks/process inventories/effect controls and owner-private temporary state roots in tests
-- **Current R3d2 implementation gate:** **R3D2A-R3D2E IMPLEMENTED / SEVENTH SOL APPROVE / SINGLE FABLE LENS
-  APPROVE / EXACT GATE GREEN / FINAL DOCS-ONLY REPRODUCTION REQUIRED BEFORE PR**. The restart
-  contract is
-  [`2026-07-19-r3d2-authority-admission-accounting.md`](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md).
+- **Current main base:** `origin/main` at `06e22fafaf33d67524b46f35d12124505b6ecf9a` on 2026-07-19
+  (PR #41 merged R3d2 with CI and CLA green)
+- **Completed through:** R3d2 **MERGED** at `06e22faf`; R2e remains deferred and off the critical path
+- **Active slice:** R3d3 evidence, status, and retention on
+  `agent/reliability-r3d3-evidence-retention`, based directly on `06e22faf`; it is non-billable, default-off,
+  and uses only injected owner-private roots, fake storage/runtime/notification adapters, and deterministic files
+  in tests
+- **Current R3d3 implementation gate:** **TENTH SOL APPROVE / SINGLE FABLE LENS COMPLETE / DOCS-ONLY REMEDIATION FOLDED / FINAL GATE GREEN / PR #42 OPEN / REQUIRED CHECKS MUST BE GREEN**
+  at code commit `1647fa6`, exact Sol-reviewed docs head `1637b5b`, and exact Fable-reviewed docs head `f7f9ebd`,
+  after the original R3d3a-e checkpoints
+  `21427e6`, `739495a`, `7ed0446`, `84fbbf3`, and `33ec5c3`.
+  Evidence state, generation-aware projection, retention/pin clocks, durable tombstone ordering and recovery
+  identity, cross-process leases, and 1/4/5 GiB quota primitives now feed descriptor-safe deterministic sealing,
+  strict sidecar/aggregate byte joining, bounded secret scanning, compact records, index-last local publication,
+  crash residue discovery, automatic incident pinning, independent cold admission, descriptor-relative
+  partial-to-final publication, explicit FileProvider state, rotating verification, recoverable hot eviction,
+  bounded reconstructible bundle/image GC with durable intent and fresh runtime fences, exact idempotent R3b
+  incident migration through the normal seal/publication/pin path, a local-only crash-recoverable publication
+  outbox, degraded status and transition-deduplicated fake-sink notifications, immutable quarantine-opening
+  dereference, and a read-only status CLI. Latest affected focused gates pass retention/GC **35/0**, retained state
+  **20/0**, status **15/0**, and outbox **9/0**; compatibility CLI **25/0**, evidence **51/0**, transaction/control
+  **33/0**, descriptor-local file **17/0**, and strict schema **32/0** are green or unchanged. Workspace all-target/
+  all-feature warnings-denied check and Clippy, format/diff, complete serial binary **779/0/0**, and canonical full
+  serial workspace **2,519/0/12 ignored** across **72** groups (**55** nonempty) are green,
+  and the unchanged authority seam was last verified at **15/0** in R3d3c. The restart contract is
+  [`2026-07-19-r3d3-evidence-status-retention.md`](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md).
+  Prior code-and-doc candidate `c75b082` passed workspace check/Clippy, dependency policy, locked release build,
+  hygiene **37/7**, manifest **9**, recipes **4**, foundation **6/4**, scheduler CLI **24/0 + 31/0 + 2/0**,
+  complete binary **734/0/0**, and canonical full serial workspace **2,473/0/12 ignored** across **72** groups
+  (**55** nonempty). Those historical full-gate totals are not attributed to `49dd5b3`. Exact `db109b7` received
+  bridge-mediated Sol/xhigh **REVISE** with eight `WRONG` findings and one `SMELL`; review evidence SHA-256 is
+  `82375d418777611eafc6a02f92ef3f8ba478782242bcabf47f321306797a37fd`. Exact remediation candidate `990cf99`
+  passes workspace all-target check/Clippy, dependency policy, locked release build, hygiene **37/7**, manifest
+  **9**, recipes **4**, foundation **6/4**, scheduler CLI **25/0 + 31/0 + 2/0**, complete binary **744/0/0**, and
+  canonical full serial workspace **2,484/0/12 ignored** across **72** groups (**55** nonempty). Its 212,124-byte
+  canonical log has SHA-256 `4702e78d...25f88`; the 26,795,344-byte provider-unexercised release binary has SHA-256
+  `d0b59d01...5fd01`. Fresh Sol rereview of exact `f485092` adjudicated seven inherited `WRONG` findings resolved,
+  retained the exact-unlink `WRONG` and CLI-proof `SMELL`, found two new `WRONG` findings for a pin added after
+  durable Pending and check-then-replace cold publication, and returned **REVISE**. Its 8,636-byte artifact has
+  SHA-256 `0b24f7275035fa470e18ea13ae74ddda0852efbae6a2c2a247138f492e005f6c`. Commit `bfa1d35` rejects the
+  pin/tombstone state at both transition and model validation, rechecks pins at the deletion fence, uses atomic
+  no-replace publication on macOS/Linux, and replaces path unlink with no-replace quarantine capture, captured-
+  inode revalidation, retained-descriptor zero-link proof, and hot/cold/bundle crash recovery. Exact atomic-
+  exchange, concurrent-publication, late-pin, ambiguous-quarantine, hot/cold quarantine-recovery, and bundle-
+  quarantine recovery regressions are green; the CLI test now claims only the redirected-HOME behavior it proves.
+  Exact second-remediation candidate `317cfbf3d5a743793edb1ef445f7ee2cf647d746` passes committed-diff and
+  worktree diff checks, format, workspace all-target warnings-denied check and Clippy, dependency policy, locked
+  release workspace build, hygiene **37/7**, manifest **9**, recipes **4**, foundation **6/4**, scheduler CLI
+  **25/0 + 31/0 + 2/0**, complete binary **752/0/0**, and canonical full serial workspace
+  **2,492/0/12 ignored** across **72** groups (**55** nonempty). Its 213,051-byte canonical log has SHA-256
+  `68869f0d86ab6860e58502af39c54cf3273de8d93ac501cad569a8814ca57a68`; the 26,795,344-byte
+  provider-unexercised release binary has SHA-256
+  `e04882b0e0f9b4b4f9ec2189ace81f93737eb8964b57a0d612356d9ee7358829`. Exact docs head `a3cd854` preserved those
+  totals with a 212,954-byte canonical log at SHA-256
+  `44255201055b57387b925d5e44bf5dd9cd2b7139bd23b21a37352507cc061459`. Fresh Sol/xhigh closure review of that
+  exact head returned **REVISE**: inherited findings 1-6, 8, and 10-12 were resolved; the cursor and
+  FileProvider-coordination deletion boundary remained unresolved; and two new High `WRONG` findings proved that
+  status sources were caller-fabricable and the 1 GiB state cap excluded status, notification, and outbox. Its
+  9,270-byte artifact has SHA-256
+  `edb1029795aee38486c1f6640cc1b00ef4ce41c75c2ff3e17313fe7898dc7241`.
+  Third remediation `2d90e759` derives status sources from validated real journals at append, applies one shared
+  1 GiB quota across all eight scheduler state-journal directories, and moves cold deletion behind a typed exact
+  FileProvider mutation contract whose live adapter remains R3d5-owned. It also independently closes missing
+  retry-sync fences for recovered cold publication, absent hot payload removal, and absent bundle-GC targets.
+  Seven new regressions have fail-first or one-mechanism mutation evidence: three directory-sync failures, real
+  missing/corrupt source acquisition, two aggregate-cap edges, and a same-length cold replacement introduced after
+  caller validation. Exact gate candidate `511ebf0d724c0cacb3d2f0e3ce97aa0146932da7` passes every deterministic
+  release/validator gate, complete binary **759/0/0**, and canonical full serial workspace **2,499/0/12 ignored**
+  across **72** groups (**55** nonempty). Its 213,919-byte canonical log has SHA-256
+  `166c337a5af678fa2190c24d0961a4a12a116a4f1b885fcd0c154ef05b61f3a4`; the provider-unexercised
+  26,793,248-byte release binary has SHA-256
+  `57676b30fa8565ad6f0cd209c07103858f997fd14f5875499cc080a766a55179`. The docs-only commit containing this
+  evidence became exact review head `527231e`; fresh Sol/xhigh closure rereview returned a fourth **REVISE**.
+  Inherited findings 1, 3-12, and 14 were resolved; policy-growable hot caps and caller-fabricable semantic status
+  remained High `WRONG`; no fresh finding was reported. Its 10,412-byte artifact has SHA-256
+  `73df466196237e74836224f968a52a06c7cd8d89f2f0d701d5c085cc41d9bb00`. Fourth remediation `55ef98b` makes the
+  exact approved 1/4/5/10-GiB caps the only production-constructible values and refuses test overrides above policy.
+  Raw journal status acquisition is typed degraded as `status_semantics_unverified`; durable append consumes a
+  non-clone verified-projection token tied to the owner-capability lifetime, with no production constructor until
+  R3d5 owns every semantic source. Both focused assertions failed **0/1** on the reviewed mechanism and now pass;
+  evidence is **47/0**, status is **10/0**, and complete binary is **760/0/0**. Exact source commit `55ef98b` passes
+  every deterministic release/validator gate and canonical full serial workspace **2,500/0/12 ignored** across
+  **72** groups (**55** nonempty). Its 214,028-byte canonical log has SHA-256
+  `25c13f5fc9aa8dedffda511d59c29ecabe96851f7e083e273b6428597557bb47`; the provider-unexercised
+  26,793,312-byte release binary has SHA-256
+  `57b47f37725e64a92fc28641121395c0915aac95edb60dae8c4974dbb919ba1e`. The docs-only commit containing this
+  evidence became exact review head `df2419498ecdf666fd665bd63e1be35c1d2b1f5f`; its deterministic reproduction
+  passed complete binary **760/0/0** and canonical workspace **2,500/0/12 ignored** across **72** groups
+  (**55** nonempty). Fresh Sol/xhigh closure rereview returned a fifth **REVISE** after resolving all fourteen
+  inherited findings. It found one new Medium `WRONG`: initial cold publication accepted an `Unknown` or
+  `Unavailable` object observation and durably installed `Published` without the required storage-integrity hold.
+  It also reported one `SMELL`: the runtime-image effect contract did not require the action-time running/stopped
+  reference recheck to be atomic with exact-digest removal. Its 11,334-byte artifact has SHA-256
+  `76aa06c567b5f131375801e0e6d2698d99d2d493ed43c468d5d7e4b8e00f3f8b`.
+  Fifth remediation `28682c1` returns a typed integrity-blocked outcome, durably retains `Admitted`, hot bytes, and
+  an absent cold index for either uncertain observation, and allows a later known-state publication while the
+  historical hold remains. It also makes the dormant runtime adapter contract atomically recheck every running
+  and stopped reference under runtime GC exclusion before exact-digest removal and maps a typed reference race to
+  a durable safe skip. The exact regressions each failed **0/1** on the reviewed mechanism and now pass, including
+  both uncertainty variants and both container lifecycle states; retention/GC is **35/0**. Exact source commit
+  `28682c1` passes every deterministic release/validator gate, complete binary **762/0/0**, and canonical full
+  serial workspace **2,502/0/12 ignored** across **72** groups (**55** nonempty). Its 214,265-byte canonical log
+  has SHA-256 `706077f6db0216d33a54e44dc074016178b33c6f14ec271b5c852c38426270fd`; the provider-unexercised
+  26,793,312-byte release binary remains SHA-256
+  `57b47f37725e64a92fc28641121395c0915aac95edb60dae8c4974dbb919ba1e`. Exact docs head
+  `58144d30bcb6192330a205718ddd280e3b3e961e` reproduced those gates and received a sixth Sol/xhigh **REVISE**.
+  All fourteen original findings and the runtime-image atomic-reference `SMELL` were resolved. The uncertain cold-
+  publication finding remained Medium `WRONG`: probe or hold-journal failure could leave an `Admitted` copy with
+  no hold, after which a tombstone could unlink hot bytes before cold indexing. One new High `WRONG` showed that
+  evidence, migration, outbox, status, and notification journals created their final generation names before
+  write and file sync, so process death could leave a permanently poisonous truncated tail. The 16,531-byte
+  review artifact has SHA-256
+  `ec65e03c59070f5125f81f4175bc5e782cc1e2f273ef082b388ed03f94e82f43`.
+  Sixth remediation `43b429a` makes `Admitted` cold-copy state and a Pending tombstone mutually exclusive in both
+  transition directions and model validation, then rechecks the exclusion immediately before deletion effects.
+  All five append-only journals now use one descriptor-relative atomic append primitive: an owner-private fixed
+  temporary is fully written and file-synced before no-replace rename and parent sync. Each reader parses only its
+  own validated final-name prefix; other shared-directory namespaces and its exact temp/removal-quarantine names
+  are not consumed as journal state and remain conservatively quota-counted. The next owner append validates and
+  removes its exact private residue before quota accounting; wrong-type, linked, wrong-owner, or wrong-mode residue
+  fails closed. The corrected tombstone and
+  truncated-outbox-tail regressions each failed **0/1** on the reviewed mechanism and now pass. Five call-site
+  interruption/reopen/retry tests plus local atomic-publication, cleanup-quarantine, and untrusted-residue edges
+  are green. Exact source commit `43b429a` passes every deterministic release/validator gate, complete binary
+  **770/0/0**, and canonical full serial workspace **2,510/0/12 ignored** across **72** groups (**55** nonempty).
+  Its 215,224-byte canonical log has SHA-256
+  `608aaa7136fa24655341d5e9aeccfb668b80de46ee82bde9bb94e751f210c4d9`; the provider-unexercised
+  26,793,312-byte release binary has SHA-256
+  `a5f08c29a161cee2e5da6742e980c00018f597a9814f93dd8f4b9c30728f4aa4`. Exact docs head
+  `5c1e03ec825b97132a906395f6a7096c96b1ac6d` reproduced those gates and received a seventh Sol/xhigh **REVISE**.
+  All seventeen inherited findings were resolved. One fresh High `WRONG` identified the branch-new admission-
+  control quarantine journal as a sixth direct-final append path: process death during write/sync could leave a
+  truncated `admission-control.N.json` that permanently poisoned reopen. The 12,852-byte artifact has SHA-256
+  `0af09fcb45b336a54b066e3fc9317b7a9c34347a69a74e76c9aea948613f2e20`.
+  Seventh remediation `34bcfcd` moves quarantine opening/closure append onto the same descriptor-relative atomic
+  journal primitive, including residue recovery before aggregate state-quota accounting. Its injected pre-publish
+  interruption and independently precreated private truncated-residue regressions each failed **0/1** on the
+  reviewed mechanism and now pass; transaction/control is **32/0**. Exact source commit `34bcfcd` passes every
+  deterministic release/validator gate, complete binary **772/0/0**, and canonical full serial workspace
+  **2,512/0/12 ignored** across **72** groups (**55** nonempty). Its 215,487-byte canonical log has SHA-256
+  `eb3cd35270d6e08be92f45c7ed4d5a09e559b4fb75dfcae482357bf5b8883151`; the provider-unexercised
+  26,793,312-byte release binary remains SHA-256
+  `a5f08c29a161cee2e5da6742e980c00018f597a9814f93dd8f4b9c30728f4aa4`. Exact docs head `50b3e84` reproduced
+  those gates and received an eighth Sol/xhigh **REVISE**. Items 2-16 were resolved; items 1, 17, and 18 remained
+  High `WRONG` through one mechanism: after complete-temp rename succeeded and parent sync failed, all six reopen
+  surfaces consumed the visible final without first making the surviving directory entry durable. There was no
+  additional fresh finding. The 10,572-byte artifact has SHA-256
+  `49227af3d09924c979326e6c4f6c830bd99baf7070a263ee3059f1c9fda2f2b7`.
+  Eighth remediation `4f3ccfc` adds one retained-directory recovery barrier before evidence initialization/reopen
+  and migration, outbox, status, notification, or admission scans. Barrier failure occurs before interpretation;
+  a later successful barrier makes each surviving complete final durable. Six post-rename sync-failure regressions
+  failed at that reopen assertion on the reviewed mechanism and now pass. The existing production-status tree
+  snapshot confirms that the barrier changes no namespace or file content. Affected suites are evidence **51/0**,
+  outbox **9/0**, status **14/0**, and transaction/control **33/0**. Exact source commit `4f3ccfc` passes every
+  deterministic release/validator gate, complete binary **778/0/0**, and canonical full serial workspace
+  **2,518/0/12 ignored** across **72** groups (**55** nonempty). Its 74,611-byte binary log has SHA-256
+  `71402ea9af088fdc009a36833880501998d2b764940b2d6b82aaf15527a82b99`; its 216,241-byte workspace log has
+  SHA-256 `261b215b22198a11192dfca0c5d237eb6c5357cc8433e7f37de05810dad24660`; and the provider-unexercised
+  26,795,184-byte release binary has SHA-256
+  `9ec0a066a5c90a0019f686229434fc012a492239f2756090fd42ca58211619c7`. Exact docs head `6fb6454` reproduced
+  those gates and received a ninth Sol/xhigh **REVISE**. Items 1-16 and 18 were resolved and no fresh finding was
+  reported. Item 17 remained High `WRONG`: the lockless production status CLI performed its sync barrier before
+  its live scan, so a writer could rename a complete green record afterward, fail its own parent sync, and have
+  that non-durable record reported green. The 9,711-byte artifact has SHA-256
+  `36208e3645b8a0ff57196f852833e8cb7e40fb37c06dd6906c0ece1878e51b1c`.
+  Ninth remediation `1647fa6` captures one bounded status-name set before successfully syncing the retained
+  directory, then parses only that set. The exact interleaving regression failed **0/1** on the reviewed ordering
+  and now passes through fail-closed then successful recovery. Status is **15/0**. Exact source commit `1647fa6`
+  passes every deterministic release/validator gate, complete binary **779/0/0**, and canonical full serial
+  workspace **2,519/0/12 ignored** across **72** groups (**55** nonempty). Its 74,826-byte binary log has SHA-256
+  `95f64ff9ac36f0cb66914d296ab72a44821590ac2f77cf44d38e6b84d6e4ef30`; its 216,361-byte workspace log has
+  SHA-256 `f9219b83d049c7956327b17d087da00ec76cdc7bff7238112f67d3183c49c771`; and the provider-unexercised
+  26,796,144-byte release binary has SHA-256
+  `9d24382603a637ad777cf58f2c16ed6d1e7a6f5e18f3635dd72a91ba6c9452a0`. Exact docs head
+  `1637b5b8693f65d4fab230ede694c12648f5528c` reproduced every deterministic gate with complete binary
+  **779/0/0** and canonical full serial workspace **2,519/0/12 ignored** across **72** groups (**55** nonempty),
+  then received the tenth Sol/xhigh **APPROVE**. All eighteen inherited items were resolved and the fresh
+  adversarial review reported no `WRONG` or `SMELL`. The 13,292-byte artifact has SHA-256
+  `cbdfe1b7339a6d27b203247029bfe95b8297027e682b09190e9af2eb622f3045`. Exact docs head `f7f9ebd` then received
+  the single design-required Fable/xhigh release/compatibility lens. It returned **REVISE** for one docs-only Medium
+  `WRONG`: the durable next-action bullet still commissioned an eleventh Sol review instead of this Fable lens.
+  Every inspected mechanism checked out. Its two minor `SMELL`s were documentation precision around shared journal
+  directories and cosmetic evidence-reader hygiene without a failure scenario. This docs-only fold corrects the
+  next-action cursor and the overbroad journal wording; the cosmetic source note is accepted as nonblocking so the
+  Sol-approved implementation remains unchanged. The 11,224-byte Fable artifact has SHA-256
+  `8b8bc4e0f71f30aba6af67bc7f9a683ea98e53ea7a82138affc79cc465f5bc07`. Per the approved one-lens policy and the
+  reviewer itself, there is no Fable rereview loop. Exact remediation head `e4cd340` passes every deterministic
+  gate: complete binary **779/0/0** and canonical full serial workspace **2,519/0/12 ignored** across **72** groups
+  (**55** nonempty). Its 74,730-byte binary log and 216,264-byte workspace log have SHA-256
+  `f0aab23069ff1fe9ca5a87764de719d7502ed81d36d8a44ebda9ce5a8be1b8e8` and
+  `0248ef09df5acaf1b0f5a3e9246daae59df84d35fc5cce957fa78f56dcb6b4ef`; the provider-unexercised
+  26,796,144-byte release binary remains SHA-256
+  `9d24382603a637ad777cf58f2c16ed6d1e7a6f5e18f3635dd72a91ba6c9452a0`. One earlier noncanonical streamed
+  all-target/all-feature diagnostic and one isolated probe observed the pre-existing bridge-core start-probe
+  timeout; no source changed, and the later authoritative canonical suites at `f7f9ebd` and `e4cd340` both passed
+  that test. Preserve it as disclosed verifier/host timing evidence, not a rebaseline or an R3d3 fix. This docs-only
+  evidence fold reproduced the same gates at exact head `d3bf503`: binary **779/0/0**, workspace
+  **2,519/0/12 ignored**, and every deterministic release/validator gate. Non-draft PR #42 is open from this branch;
+  at PR creation CLA was green and Build/Lint/Coverage was running. This docs-only PR-status fold changes no
+  implementation source.
+  The twelve ignored tests remain authenticated/live-provider integration coverage.
+  A separate operator-server reliability incident is deferred without being treated as R3d3 review evidence:
+  release `983398427c9f0486` served a healthy card/catalog and all Codex doctor/provenance checks were green, with
+  zero unfinished tasks and zero durable sessions, but two explicit unary `submit` requests for raw
+  `gpt-5.6-sol`/xhigh/read-only returned `agent crashed` before creating any task, turn-log, prompt-start, or usage
+  record. The operator reports that stopping and restarting the served bridge ultimately restored the affected
+  path, while one controlled exact unary reproduction after an earlier restart still failed pre-prompt. Treat the
+  restart as lifecycle-sensitive incident evidence, not root-cause proof or a fixed mechanism. Do not replay it
+  automatically. A later reliability increment must retain ACP child/session-new diagnostics, capture pre/post-
+  restart process and session state, and compare unary submit with the known-good review workflow shape.
+  R3d2 closure evidence follows for provenance.
   R3d2a closes the three inherited R3d1 integration smells, owns cancellation before `Running`, retains the
   exact runner child for exit proof, and adds the private local state-root plus nonblocking lock primitives.
   R3d2b adds sealed provider/storage authority, one-shot/manual lifecycle and append-only recovery, cross-process
@@ -518,16 +719,15 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** exact `e74f93f` is approved by the seventh Sol/xhigh implementation review and the single
-  Fable/xhigh release/compatibility lens; exact review-evidence head `9b63f42` passes every deterministic release
-  gate. Commit this final gate-recording three-doc fold, rerun format/diff, hygiene, and the canonical full suite on
-  its exact head, and publish one non-draft R3d2 PR only if **2,392/0/12** across **72** groups reproduces. Do not
-  rerun Sol or Fable. No live compatibility/provider gate or production-operator lifecycle action is authorized.
-  OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
+- **Next action:** require PR #42 Build/Lint/Coverage to join the already-green CLA check, then merge only when every
+  required check is green. Do not launch another Sol or Fable review absent a source mutation;
+  the single Fable lens is complete and its docs-only `WRONG` is folded here. No live compatibility gate, iCloud,
+  runtime-image, notification, GitHub-side effect beyond that PR, launchd, or production-operator lifecycle action
+  is authorized. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active implementation plan:**
-  [`superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md`](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md)
+  [`superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md`](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md)
 - **Operating runbook:**
   [`../skills/a2a-bridge-operator/SKILL.md`](../skills/a2a-bridge-operator/SKILL.md)
 
@@ -549,8 +749,8 @@ R2a provenance (MERGED)
   -> R2c explicit one-turn billable smoke (MERGED)
        -> R2d local non-billable fallback plan (MERGED)
             -> R3 compatibility manifest + pinned/floating canaries + OpenRouter/OpenCode
-               (ACTIVE: R3a/R3b/R3c/R3d0/R3d1 MERGED; R3d DESIGN MERGED;
-                R3d2 IMPLEMENTED / SOL APPROVE / FABLE APPROVE / EXACT GATE GREEN / FINAL DOCS REPRODUCTION)
+               (ACTIVE: R3a/R3b/R3c/R3d0/R3d1/R3d2 MERGED; R3d DESIGN MERGED;
+                R3d3 SOL APPROVED / SINGLE FABLE LENS COMPLETE / DOCS REMEDIATED / PR #42 CHECKS REQUIRED)
                  -> R4 reproducible dependency/image pins + release promotion gate
 
 R2e authenticated in-process fallback is DEFERRED and off the critical path.
@@ -576,8 +776,8 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2c — live smoke | **MERGED** at `be54bc51` by PR #28 (initial Fable/xhigh review `REVISE`; closure re-review `APPROVE` at `0e3b8ce`; attempt 1 rejected for initial `0644`; permission-fold review `APPROVE` at `23384622`; create-new closure review `APPROVE` at `ffb7e891`; full host workspace **1,933 / 0 / 12 ignored**; separately authorized attempt 2 on `1c9e4a43` passed artifact-exact in 8.770 s with mode `0600`, exact terminal `PONG`, no retry/fallback, and clean teardown) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
-| R2f — phase-aware liveness/takeover | **DEFERRED** (three incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at `b54840a` by PR #37; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`. R3d2 is **ACTIVE / R3D2A-R3D2E IMPLEMENTED / SEVENTH SOL APPROVE / SINGLE FABLE LENS APPROVE / EXACT GATE GREEN / FINAL DOCS-ONLY REPRODUCTION REQUIRED BEFORE PR** on `agent/reliability-r3d2-authority-admission`, with one merge boundary. Exact `e74f93f` closed both sixth-review residuals under Sol/xhigh with no fresh finding; the single Fable/xhigh lens found no `WRONG`, retained two Minor R3d5 hardening `SMELL`s, and approved. Exact review-evidence `9b63f42` passes binary **655/0/0**, canonical full workspace **2,392/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic release/validator gate. No live compatibility gate, production state-root creation, or production-operator lifecycle action occurred. | [R3d2 implementation plan](superpowers/plans/2026-07-19-r3d2-authority-admission-accounting.md) | Commit final three-doc gate fold, reproduce full totals, then publish one non-draft PR. |
+| R2f — phase-aware liveness/takeover | **DEFERRED** (four incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
+| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at `b54840a` by PR #37; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`; R3d2 **MERGED** by PR #41 at `06e22faf` after seventh Sol approval, the single Fable approval lens, exact deterministic gates, and green CI/CLA. R3d3 is **ACTIVE / TENTH SOL APPROVE / SINGLE FABLE LENS COMPLETE / DOCS-ONLY REMEDIATION FOLDED / FINAL GATE GREEN / PR #42 OPEN / REQUIRED CHECKS MUST BE GREEN** at source checkpoint `1647fa6`, exact Sol-reviewed docs head `1637b5b`, exact Fable-reviewed docs head `f7f9ebd`, exact remediation gate head `e4cd340`, and exact evidence-fold gate head `d3bf503` on `agent/reliability-r3d3-evidence-retention`, based directly on merged R3d2. Earlier review/remediation rounds are preserved in the focused plan and cursor detail above. The tenth Sol/xhigh closure review resolved all eighteen inherited items, found no fresh `WRONG` or `SMELL`, and returned **APPROVE**; artifact SHA-256 is `cbdfe1b7...3045`. The single Fable/xhigh lens of exact `f7f9ebd` returned **REVISE** for one stale next-action bullet and two minor non-mechanism `SMELL`s; every inspected mechanism checked out. The docs-only `e4cd340` fold fixes that `WRONG` and the documentation-precision smell, accepts the cosmetic source smell as nonblocking without resetting Sol, and does not commission a prohibited Fable rereview. Artifact SHA-256 is `8b8bc4e0...bc07`. Exact `d3bf503` passes binary **779/0/0**, full workspace **2,519/0/12 ignored**, and every deterministic release/validator gate; binary/workspace/release SHA-256 are `7a10121e...195a`, `61ffea8c...89a3`, and `9d243826...52a0`. Non-draft PR #42 is open and mergeable; at PR creation CLA was green and Build/Lint/Coverage was running. No live compatibility gate or production state/iCloud/runtime/GitHub/notification effect occurred. `INC-SHARED-RESTART-RECOVERY-2026-07-19` records that stop/start recovered a deferred pre-prompt unary-submit incident; that lifecycle observation is neither R3d3 verification nor root-cause proof. | [R3d3 implementation plan](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md) | Evidence/index/retention foundation, sealing, cold storage, GC/migration, then status/outbox/notifications; one default-off merge boundary. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -860,8 +1060,86 @@ Next action:
   `983398427c9f04861a2f1da501a7650c4a1cdd80`. R3d design merged through PR #37 at
   `6eeea6ce553b792dc92cef95ee45f2234f7afe4e`; R3d0 merged through PR #38 at
   `c2d147fb1f0df275f3c6452cdd212e185c002d08`; R3d1 merged through PR #40 at
-  `cbcfd1f06b914064456d1798be71bacdc294f3d5`. R3d2a-e are implemented on
-  `agent/reliability-r3d2-authority-admission`, based directly on that merge. First reviewed candidate `1373985`
+  `cbcfd1f06b914064456d1798be71bacdc294f3d5`; R3d2 merged through PR #41 at
+  `06e22fafaf33d67524b46f35d12124505b6ecf9a` with CI and CLA green. R3d3 is active on
+  `agent/reliability-r3d3-evidence-retention`, based directly on that merge, and its focused restart plan is
+  `2026-07-19-r3d3-evidence-status-retention.md`. R3d3a through R3d3e are checkpointed at `21427e6`,
+  `739495a`, `7ed0446`, `84fbbf3`, and `33ec5c3`. Exact `db109b7` received bridge-mediated Sol/xhigh **REVISE**
+  with eight `WRONG` findings and one `SMELL`; first remediation code is checkpointed at `49dd5b3`. Exact
+  `f485092` then received bridge-mediated Sol/xhigh **REVISE** with one inherited `WRONG`, one inherited `SMELL`,
+  and two new `WRONG`; second remediation code is checkpointed at `bfa1d358`. Exact review head `a3cd854` passed
+  format/diff, workspace all-target warnings-denied check and Clippy, dependency policy, locked release workspace
+  build, every deterministic validator, complete binary **752/0/0**, and canonical full serial workspace
+  **2,492/0/12 ignored** across **72** groups (**55** nonempty). Its canonical log and release-binary SHA-256 are
+  `44255201...061459` and `e04882b0...58829`. Third Sol closure review returned **REVISE**, retaining the cursor
+  and FileProvider-coordination boundary and adding two High `WRONG` findings for caller-fabricable status sources
+  and an incomplete state cap; artifact SHA-256 is `edb10297...7241`. Third remediation `2d90e759` closes those
+  mechanisms and three independently found retry-sync gaps. Current affected gates pass retention **33/0**, state
+  **20/0**, status **10/0**, outbox **6/0**, and complete binary **759/0/0**; format/diff and package all-target
+  warnings-denied check/Clippy are green. Exact gate candidate `511ebf0` passes full workspace **2,499/0/12
+  ignored** across **72** groups (**55** nonempty) and every deterministic release/validator gate; its log and
+  release-binary SHA-256 are `166c337a...f3a4` and `57676b30...5179`. Exact docs head `527231e` received the fourth
+  Sol **REVISE**, with no fresh findings and two unresolved inherited High `WRONG` items: policy-growable hot caps
+  and caller-fabricable semantic status. Artifact SHA-256 is `73df4661...bb00`. Fourth remediation `55ef98b`
+  closes both through canonical production caps and a closed owner-lifetime status token whose production
+  derivation remains R3d5-owned. Evidence **47/0**, status **10/0**, binary **760/0/0**, full workspace
+  **2,500/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic release/validator gate are
+  green; log and release-binary SHA-256 are `25c13f5f...bb47` and `57b47f37...ba1e`. The docs-only commit containing
+  this evidence became exact head `df24194`; the fifth Sol review resolved all inherited findings and returned
+  **REVISE** for one new Medium `WRONG` in uncertain initial cold publication plus one atomic runtime-image
+  reference `SMELL`. Artifact SHA-256 is `76aa06c5...f3f8b`. Fifth remediation `28682c1` durably blocks uncertain
+  publication and requires a runtime-GC-excluded reference-and-remove effect. Its exact regressions failed
+  **0/1 + 0/1** before the fix; retention/GC **35/0**, binary **762/0/0**, full workspace **2,502/0/12 ignored**
+  across **72** groups (**55** nonempty), and every deterministic release/validator gate are green. Log and
+  release-binary SHA-256 are `706077f6...70fd` and `57b47f37...ba1e`. Exact docs head `58144d3` then received the
+  sixth Sol **REVISE** after resolving all original findings and the runtime `SMELL`: uncertain publication could
+  still coexist with destructive tombstone recovery, and five journal writers could expose a truncated final
+  generation across process death. Artifact SHA-256 is `ec65e03c...82f43`. Sixth remediation `43b429a` makes
+  Admitted cold copies and Pending tombstones mutually exclusive and atomically publishes all five journals from
+  validated recoverable temp residue. Its two fail-first regressions and eight interruption/trust edges are green;
+  local file/evidence/outbox/status/retention are **17/0 + 49/0 + 8/0 + 12/0 + 35/0**. Binary **770/0/0**, full
+  workspace **2,510/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic release/validator
+  gate are green. Log and release-binary SHA-256 are `608aaa71...c4d9` and `a5f08c29...f4aa4`. Exact docs head
+  `5c1e03e` then received the seventh Sol **REVISE** after all seventeen inherited items resolved; its only fresh
+  High `WRONG` was the branch-new admission-control quarantine chain's remaining direct-final append. Artifact
+  SHA-256 is `0af09fcb...f2e20`. Seventh remediation `34bcfcd` routes that control writer through the same atomic
+  append and pre-quota residue recovery. Both exact regressions failed **0/1** before the fix and now pass;
+  transaction/control is **32/0**, binary is **772/0/0**, and full workspace is **2,512/0/12 ignored** across
+  **72** groups (**55** nonempty). Every deterministic release/validator gate is green. Log and release-binary
+  SHA-256 are `eb3cd352...83151` and `a5f08c29...f4aa4`. Exact docs head `50b3e84` received the eighth Sol
+  **REVISE**: items 2-16 resolved, while items 1, 17, and 18 remained High `WRONG` through one post-rename
+  parent-sync ambiguity at all six reopen surfaces; no additional fresh finding was reported. Artifact SHA-256 is
+  `49227af3...f2b7`. Eighth remediation `4f3ccfc` adds a descriptor-relative fail-closed durability barrier before
+  each affected scan. Its six fail-first regressions and focused suites are green; binary is **778/0/0**, full
+  workspace is **2,518/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic release/
+  validator gate is green. Binary-log, workspace-log, and release-binary SHA-256 are `71402ea9...2b99`,
+  `261b215b...4660`, and `9ec0a066...19c7`. Exact docs head `6fb6454` received the ninth Sol **REVISE** with items
+  1-16 and 18 resolved, no fresh finding, and item 17 still High `WRONG` through the lockless status barrier-before-
+  scan race. Artifact SHA-256 is `36208e36...1b1c`. Ninth remediation `1647fa6` captures the bounded name set before
+  sync and parses it only after successful sync. Its exact interleaving regression failed **0/1** before the fix
+  and now passes; status is **15/0**, binary is **779/0/0**, full workspace is **2,519/0/12 ignored** across **72**
+  groups (**55** nonempty), and every deterministic gate is green. Binary-log, workspace-log, and release-binary
+  SHA-256 are `95f64ff9...ef30`, `f9219b83...c771`, and `9d243826...52a0`. Exact docs head `1637b5b` reproduced
+  every deterministic gate: binary **779/0/0**, full workspace **2,519/0/12 ignored** across **72** groups
+  (**55** nonempty), and binary-log, workspace-log, and release-binary SHA-256 `612ba11d...85a`,
+  `c6f10f4b...d560`, and `9d243826...52a0`. The tenth Sol/xhigh closure review resolved all eighteen inherited
+  items, found no fresh `WRONG` or `SMELL`, and returned **APPROVE**. Its 13,292-byte artifact has SHA-256
+  `cbdfe1b7339a6d27b203247029bfe95b8297027e682b09190e9af2eb622f3045`. Exact docs head `f7f9ebd` received the
+  single Fable/xhigh release/compatibility lens and returned **REVISE** for one stale docs-only next-action bullet;
+  every inspected mechanism checked out. Two minor `SMELL`s covered overbroad shared-journal wording and cosmetic
+  evidence-reader hygiene without a failure scenario. This fold corrects the `WRONG` and wording smell, accepts the
+  cosmetic note as nonblocking without a source mutation, and intentionally does not run a Fable rereview. The
+  11,224-byte artifact has SHA-256
+  `8b8bc4e0f71f30aba6af67bc7f9a683ea98e53ea7a82138affc79cc465f5bc07`. Exact remediation head `e4cd340` passes
+  every deterministic gate, binary **779/0/0**, and full workspace **2,519/0/12 ignored** across **72** groups
+  (**55** nonempty). Binary-log, workspace-log, and release-binary SHA-256 are `f0aab230...b8e8`,
+  `0248ef09...b4ef`, and `9d243826...52a0`. Exact evidence-fold head `d3bf503` reproduced every gate with binary
+  **779/0/0** and workspace **2,519/0/12 ignored**; its binary/workspace/release SHA-256 are `7a10121e...195a`,
+  `61ffea8c...89a3`, and `9d243826...52a0`. Non-draft PR #42 is open and mergeable; CLA is green and
+  Build/Lint/Coverage is running. Merge only when every required check is green.
+  Prior full-gate candidates `c75b082`, `990cf99`, and `317cfbf` remain
+  historical evidence only. R3d2's
+  closure history remains below. First reviewed candidate `1373985`
   received four `WRONG`, one `SMELL`, and `REVISE`; remediation head `28e7d28` then passed **641/0/0** binary and
   **2,378/0/12 ignored** full workspace before Sol closure review returned three new `WRONG` and a stale-cursor
   residual. Commit `f18e74a` binds both preflights to the exact admission and makes them internal to one `admit`
@@ -895,8 +1173,14 @@ Next action:
   both residuals, preserved the other eleven closures, found no fresh finding, and returned `APPROVE`. The single
   Fable release/compatibility lens found no `WRONG`, retained two Minor nonblocking R3d5 hardening `SMELL`s, and
   returned `APPROVE`. Exact review-evidence head `9b63f42` passes every deterministic release gate at binary
-  **655/0/0** and canonical full workspace **2,392/0/12 ignored** across **72** groups (**55** nonempty). Commit the
-  final gate-recording docs fold, reproduce those full totals, then publish the non-draft PR.
+  **655/0/0** and canonical full workspace **2,392/0/12 ignored** across **72** groups (**55** nonempty). The final
+  docs-only reproduction matched those totals and PR #41 merged; R3d3a through R3d3e then checkpointed at
+  `21427e6`, `739495a`, `7ed0446`, `84fbbf3`, and `33ec5c3`. Candidate `c75b082` passed complete deterministic
+  R3d3 release gates. Sol/xhigh review of later exact candidate `db109b7` returned eight `WRONG`, one `SMELL`, and
+  **REVISE**. Commit `49dd5b3` remediates the locally reproduced mechanisms with fail-first coverage. Exact
+  candidate `990cf99` passes complete binary **744/0/0**, canonical full serial workspace **2,484/0/12 ignored**
+  across **72** groups (**55** nonempty), and every deterministic release/validator gate. The docs-only evidence
+  fold reproduces those gates before fresh Sol rereview; Fable remains deferred until Sol approval.
   No production state root,
   authority, trigger, live effect, or operator lifecycle action was created. The
   manifest still contains nine

@@ -27,6 +27,7 @@ use crate::compatibility_schedule_schema::{
     OptionalSupervisorKillCauseV1, OptionalSupervisorOutcomeV1, SafetyHoldReasonV1,
     SupervisorKillCauseV1, SupervisorPhaseV1, SupervisorRecordV1, SupervisorTerminalOutcomeV1,
 };
+use crate::compatibility_schedule_state::StateQuota;
 use crate::local_file::PinnedDirectory;
 use crate::BoxError;
 
@@ -770,6 +771,7 @@ fn validate_supervisor_transition(
 #[cfg(unix)]
 pub(super) struct FileSupervisorJournal {
     directory: PinnedDirectory,
+    state_quota: Option<StateQuota>,
     record_id: String,
     next_generation: u64,
     previous_sha256: Option<String>,
@@ -849,11 +851,16 @@ impl FileSupervisorJournal {
         format!("{record_id}.{generation:020}.json")
     }
 
-    pub(super) fn create(directory: &PinnedDirectory, record_id: &str) -> Result<Self, BoxError> {
+    fn create_inner(
+        directory: &PinnedDirectory,
+        record_id: &str,
+        state_quota: Option<StateQuota>,
+    ) -> Result<Self, BoxError> {
         Self::validate_record_id(record_id)?;
         Self::validate_directory(directory)?;
         let mut journal = Self {
             directory: directory.clone(),
+            state_quota,
             record_id: record_id.to_owned(),
             next_generation: 1,
             previous_sha256: None,
@@ -864,6 +871,19 @@ impl FileSupervisorJournal {
             return Err("schedule supervisor: journal already contains this record id".into());
         }
         Ok(journal)
+    }
+
+    #[cfg(test)]
+    pub(super) fn create(directory: &PinnedDirectory, record_id: &str) -> Result<Self, BoxError> {
+        Self::create_inner(directory, record_id, None)
+    }
+
+    fn create_with_quota(
+        directory: &PinnedDirectory,
+        record_id: &str,
+        state_quota: StateQuota,
+    ) -> Result<Self, BoxError> {
+        Self::create_inner(directory, record_id, Some(state_quota))
     }
 
     fn generation_entries(&mut self) -> Result<Vec<(u64, String)>, BoxError> {
@@ -942,14 +962,16 @@ impl FileSupervisorJournal {
         Ok((bytes, sha256))
     }
 
-    pub(super) fn open_existing(
+    fn open_existing_inner(
         directory: &PinnedDirectory,
         record_id: &str,
+        state_quota: Option<StateQuota>,
     ) -> Result<(Self, SupervisorRecordV1, String), BoxError> {
         Self::validate_record_id(record_id)?;
         Self::validate_directory(directory)?;
         let mut journal = Self {
             directory: directory.clone(),
+            state_quota,
             record_id: record_id.to_owned(),
             next_generation: 1,
             previous_sha256: None,
@@ -999,6 +1021,22 @@ impl FileSupervisorJournal {
         Ok((journal, latest, latest_sha256))
     }
 
+    #[cfg(test)]
+    pub(super) fn open_existing(
+        directory: &PinnedDirectory,
+        record_id: &str,
+    ) -> Result<(Self, SupervisorRecordV1, String), BoxError> {
+        Self::open_existing_inner(directory, record_id, None)
+    }
+
+    fn open_existing_with_quota(
+        directory: &PinnedDirectory,
+        record_id: &str,
+        state_quota: StateQuota,
+    ) -> Result<(Self, SupervisorRecordV1, String), BoxError> {
+        Self::open_existing_inner(directory, record_id, Some(state_quota))
+    }
+
     fn read_initial_record(&self) -> Result<SupervisorRecordV1, BoxError> {
         let name = Self::generation_name(&self.record_id, 1);
         let (bytes, _sha256) = self.read_generation(&name)?;
@@ -1010,18 +1048,57 @@ impl FileSupervisorJournal {
     }
 }
 
+pub(super) fn ownership_status_source_sha256(
+    directory: &PinnedDirectory,
+) -> Result<String, BoxError> {
+    FileSupervisorJournal::validate_directory(directory)?;
+    let mut record_ids = BTreeSet::new();
+    for entry in std::fs::read_dir(directory.canonical_path())? {
+        let name = entry?
+            .file_name()
+            .into_string()
+            .map_err(|_| "schedule supervisor: non-UTF8 status source entry")?;
+        let stem = name
+            .strip_suffix(".json")
+            .ok_or("schedule supervisor: malformed status source entry")?;
+        let (record_id, generation) = stem
+            .rsplit_once('.')
+            .ok_or("schedule supervisor: malformed status source entry")?;
+        if generation.len() != 20 || !generation.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("schedule supervisor: malformed status source generation".into());
+        }
+        FileSupervisorJournal::validate_record_id(record_id)?;
+        record_ids.insert(record_id.to_owned());
+    }
+    FileSupervisorJournal::validate_directory(directory)?;
+    let mut material = b"a2a-bridge:r3d3:status-source:ownership:v1\0".to_vec();
+    for record_id in record_ids {
+        let (_journal, _latest, latest_sha256) =
+            FileSupervisorJournal::open_existing_inner(directory, &record_id, None)?;
+        material.extend_from_slice(&(record_id.len() as u64).to_be_bytes());
+        material.extend_from_slice(record_id.as_bytes());
+        material.extend_from_slice(latest_sha256.as_bytes());
+    }
+    Ok(crate::local_file::sha256_hex(&material))
+}
+
 /// Makes the commit-bound Prepared generation durable exactly once. Existing later generations are
 /// accepted only when their immutable generation one is byte-equivalent to the supplied record.
 /// This recovery primitive cannot start a runner or signal a process group.
 #[cfg(unix)]
 pub(super) fn ensure_prepared_supervisor(
     directory: &PinnedDirectory,
+    state_quota: StateQuota,
     prepared: &SupervisorRecordV1,
 ) -> Result<(SupervisorRecordV1, String), BoxError> {
     if prepared.generation != 1 || prepared.phase != SupervisorPhaseV1::Prepared {
         return Err("schedule supervisor: prepared publication requires generation one".into());
     }
-    match FileSupervisorJournal::create(directory, &prepared.supervisor_record_id) {
+    match FileSupervisorJournal::create_with_quota(
+        directory,
+        &prepared.supervisor_record_id,
+        state_quota.clone(),
+    ) {
         Ok(journal) => {
             ScheduleSupervisor::initialize(prepared.clone(), journal)?;
         }
@@ -1030,8 +1107,11 @@ pub(super) fn ensure_prepared_supervisor(
             // complete chain; a malformed object or unrelated create failure remains an error.
         }
     }
-    let (journal, latest, latest_sha256) =
-        FileSupervisorJournal::open_existing(directory, &prepared.supervisor_record_id)?;
+    let (journal, latest, latest_sha256) = FileSupervisorJournal::open_existing_with_quota(
+        directory,
+        &prepared.supervisor_record_id,
+        state_quota,
+    )?;
     if journal.read_initial_record()? != *prepared {
         return Err("schedule supervisor: existing journal is rebound to another admission".into());
     }
@@ -1059,6 +1139,9 @@ impl SupervisorJournal for FileSupervisorJournal {
         bytes.push(b'\n');
         if bytes.len() as u64 > Self::MAX_JOURNAL_RECORD_BYTES {
             return Err("schedule supervisor: journal generation exceeds the byte bound".into());
+        }
+        if let Some(state_quota) = &self.state_quota {
+            state_quota.reserve(bytes.len() as u64)?;
         }
         let name = Self::generation_name(&self.record_id, record.generation);
         #[cfg(test)]

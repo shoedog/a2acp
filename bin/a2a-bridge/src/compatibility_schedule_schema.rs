@@ -1593,7 +1593,9 @@ struct PublicationOutboxIdentityInputV1<'a> {
     external_id: &'a str,
 }
 
-fn publication_outbox_identity_sha256(value: &PublicationOutboxV1) -> Result<String, BoxError> {
+pub(super) fn publication_outbox_identity_sha256(
+    value: &PublicationOutboxV1,
+) -> Result<String, BoxError> {
     canonical_input_sha256(
         "publication-outbox immutable identity",
         &PublicationOutboxIdentityInputV1 {
@@ -1614,7 +1616,7 @@ struct PublicationCheckRunBindingInputV1<'a> {
     check_run_id: u64,
 }
 
-fn publication_check_run_binding_sha256(
+pub(super) fn publication_check_run_binding_sha256(
     immutable_identity: &FingerprintV1,
     check_run_id: u64,
 ) -> Result<String, BoxError> {
@@ -3437,8 +3439,10 @@ impl ValidateRecord for ScheduleEvidenceRecordV1 {
             "affected case id",
             self.affected_case_ids.iter().map(String::as_str),
         )?;
-        if self.affected_case_ids.is_empty() {
-            return Err("schedule schema: sidecar must bind at least one affected case".into());
+        if self.affected_case_ids.is_empty() || self.affected_case_ids.len() > MAX_ITEMS {
+            return Err(
+                "schedule schema: sidecar must bind a bounded non-empty affected-case set".into(),
+            );
         }
         match (&self.check, self.trigger) {
             (
@@ -3651,7 +3655,7 @@ fn portable_path_component(label: &str, value: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
-fn portable_evidence_path_key(value: &RelativeEvidencePathV1) -> String {
+pub(super) fn portable_evidence_path_key(value: &RelativeEvidencePathV1) -> String {
     value
         .components
         .iter()
@@ -3660,7 +3664,10 @@ fn portable_evidence_path_key(value: &RelativeEvidencePathV1) -> String {
         .join("/")
 }
 
-fn relative_evidence_path(label: &str, value: &RelativeEvidencePathV1) -> Result<(), BoxError> {
+pub(super) fn relative_evidence_path(
+    label: &str,
+    value: &RelativeEvidencePathV1,
+) -> Result<(), BoxError> {
     if value.components.is_empty() || value.components.len() > 64 {
         return Err(format!(
             "schedule schema: {label} must contain 1..=64 relative path components"
@@ -4021,10 +4028,10 @@ impl ValidateRecord for DogfoodRoutingPolicyV1 {
     }
 }
 
-fn parse_and_validate<T: DeserializeOwned + ValidateRecord>(
+fn parse_and_validate_value<T: DeserializeOwned + ValidateRecord>(
     bytes: &[u8],
     label: &str,
-) -> Result<(), BoxError> {
+) -> Result<T, BoxError> {
     let raw = std::str::from_utf8(bytes)
         .map_err(|_| format!("schedule schema: invalid {label}: JSON must be UTF-8"))?;
     if compatibility::looks_like_secret(raw) {
@@ -4063,7 +4070,22 @@ fn parse_and_validate<T: DeserializeOwned + ValidateRecord>(
     scan(&untyped, label)?;
     let value: T = serde_json::from_slice(bytes)
         .map_err(|error| format!("schedule schema: invalid {label}: {error}"))?;
-    value.validate()
+    value.validate()?;
+    Ok(value)
+}
+
+fn parse_and_validate<T: DeserializeOwned + ValidateRecord>(
+    bytes: &[u8],
+    label: &str,
+) -> Result<(), BoxError> {
+    parse_and_validate_value::<T>(bytes, label).map(|_| ())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn parse_schedule_evidence_record(
+    bytes: &[u8],
+) -> Result<ScheduleEvidenceRecordV1, BoxError> {
+    parse_and_validate_value(bytes, "schedule-sidecar")
 }
 
 pub(super) fn validate_schedule_record(kind: &str, path: &Path) -> Result<(), BoxError> {

@@ -62,6 +62,7 @@ usage: a2a-bridge compatibility validate
               --environment-owner <id> --acknowledge-billable --out <path>
        a2a-bridge compatibility compare --current <aggregate.json>
               [--baseline <pinned.json>] [--mode pinned|floating-to-pinned]
+       a2a-bridge compatibility schedule status [--json]
        a2a-bridge compatibility schedule-tick
               (recognized but effect-disabled until R3d5 activation)
 
@@ -5268,6 +5269,22 @@ fn compare_command(args: CompareArgs) -> Result<(), BoxError> {
     }
 }
 
+fn parse_schedule_status_args(args: &[String]) -> Result<bool, BoxError> {
+    match args {
+        [status] if status == "status" => Ok(false),
+        [status, json] if status == "status" && json == "--json" => Ok(true),
+        [] => Err(format!("compatibility schedule: missing status subcommand\n{USAGE}").into()),
+        [other, ..] if other != "status" => Err(format!(
+            "compatibility schedule: unknown subcommand {other:?} (expected status)\n{USAGE}"
+        )
+        .into()),
+        _ => Err(format!(
+            "compatibility schedule status: expected no arguments or --json\n{USAGE}"
+        )
+        .into()),
+    }
+}
+
 pub(crate) async fn compatibility_cmd(
     args: &[String],
     process_entry: std::time::Instant,
@@ -5331,12 +5348,20 @@ pub(crate) async fn compatibility_cmd(
         "resolve" => resolve_command(parse_resolve_args(&args[1..])?).await,
         "run" => run_command(parse_run_args(&args[1..])?).await,
         "compare" => compare_command(parse_compare_args(&args[1..])?),
+        "schedule" => {
+            let json = parse_schedule_status_args(&args[1..])?;
+            print!(
+                "{}",
+                crate::compatibility_schedule_status::render_production_status(json)?
+            );
+            Ok(())
+        }
         "schedule-tick" => crate::compatibility_schedule_supervisor::schedule_tick_parent(
             process_entry,
             &args[1..],
         ),
         other => Err(format!(
-            "compatibility: unknown subcommand {other:?} (expected validate | resolve | run | compare | schedule-tick)\n{USAGE}"
+            "compatibility: unknown subcommand {other:?} (expected validate | resolve | run | compare | schedule | schedule-tick)\n{USAGE}"
         )
         .into()),
     }
@@ -5356,6 +5381,20 @@ mod tests {
     fn running_as_root() -> bool {
         // SAFETY: geteuid has no preconditions and only reads the process credential.
         unsafe { libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn schedule_status_parser_accepts_only_the_read_only_surface() {
+        assert!(!parse_schedule_status_args(&["status".into()]).unwrap());
+        assert!(parse_schedule_status_args(&["status".into(), "--json".into()]).unwrap());
+        for invalid in [
+            Vec::<String>::new(),
+            vec!["unknown".into()],
+            vec!["status".into(), "--write".into()],
+            vec!["status".into(), "--json".into(), "--json".into()],
+        ] {
+            assert!(parse_schedule_status_args(&invalid).is_err());
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -41,10 +41,14 @@ mod compatibility_resolution;
 mod compatibility_schedule;
 mod compatibility_schedule_admission;
 mod compatibility_schedule_authority;
+mod compatibility_schedule_evidence;
 mod compatibility_schedule_ledger;
+mod compatibility_schedule_outbox;
 mod compatibility_schedule_preflight;
+mod compatibility_schedule_retention;
 mod compatibility_schedule_schema;
 mod compatibility_schedule_state;
+mod compatibility_schedule_status;
 mod compatibility_schedule_supervisor;
 mod compatibility_schedule_transaction;
 mod config;
@@ -116,7 +120,8 @@ SUBCOMMANDS:
   batch               Batch store.  status <id> | list | cancel <id>
   models              List each agent's advertised models/effort/modes (probed live).  [--config <f>] [--agent <id>] [--json]
   compatibility       Validate recipes/manifests, resolve floating candidates, run exact canaries,
-                      and compare evidence.  validate | resolve | run | compare
+                      compare evidence, or inspect schedule status.
+                      validate | resolve | run | compare | schedule status [--json]
   smoke               Run one explicitly acknowledged, bounded, fixed PONG probe.
                       --agent <id> --config <f> --acknowledge-billable [--out <f>]
   fallback-plan       Validate a local failed artifact and emit a host fallback recommendation.

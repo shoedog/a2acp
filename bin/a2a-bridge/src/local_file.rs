@@ -4,15 +4,43 @@
 //! regular-file gate. On Unix, `O_NOFOLLOW` rejects a final symlink and `O_NONBLOCK` makes every special
 //! file return promptly; descriptor/path identity is then compared before the canonical path is trusted.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek as _};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bridge_core::session_cwd::SessionCwd;
 
 use crate::BoxError;
+
+const JOURNAL_APPEND_TEMP_NAME: &str = ".a2a-journal-append-v1.tmp";
+
+pub(crate) fn is_journal_append_residue_name(name: &OsStr) -> Result<bool, BoxError> {
+    let temporary = OsStr::new(JOURNAL_APPEND_TEMP_NAME);
+    Ok(name == temporary || name == removal_quarantine_name(temporary, "journal append residue")?)
+}
+
+#[cfg(unix)]
+pub(crate) fn removal_quarantine_name(name: &OsStr, label: &str) -> Result<OsString, BoxError> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    child_name_cstring(name, label)?;
+    let mut material = b"a2a-bridge:regular-child-removal-quarantine:v1\0".to_vec();
+    material.extend_from_slice(name.as_bytes());
+    Ok(OsString::from(format!(
+        ".a2a-delete-v1-{}",
+        sha256_hex(&material)
+    )))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn removal_quarantine_name(name: &OsStr, label: &str) -> Result<OsString, BoxError> {
+    let _ = name;
+    Err(format!("{label}: removal quarantine is unsupported on this platform").into())
+}
 
 #[derive(Debug)]
 pub(crate) struct LocalFileSnapshot {
@@ -363,6 +391,44 @@ pub(crate) struct DirectorySnapshot {
     pub(crate) identity: DirectoryIdentity,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ChildMetadataSnapshot {
+    mode: u32,
+    link_count: u64,
+    owner_uid: u32,
+    length: u64,
+}
+
+impl ChildMetadataSnapshot {
+    #[cfg_attr(not(test), allow(dead_code))]
+    // The libc mode constants already are u32 on Linux but require widening on macOS.
+    #[allow(clippy::unnecessary_cast)]
+    pub(crate) fn is_regular(self) -> bool {
+        self.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn link_count(self) -> u64 {
+        self.link_count
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn owner_uid(self) -> u32 {
+        self.owner_uid
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn permission_mode(self) -> u32 {
+        self.mode & 0o777
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn length(self) -> u64 {
+        self.length
+    }
+}
+
 /// An open directory object whose descriptor is retained through the host ACP
 /// process lifetime. The parent descriptor remains close-on-exec; the forked
 /// child binds its cwd with `fchdir` and may retain only its copy when the OS
@@ -374,6 +440,10 @@ pub(crate) struct PinnedDirectory {
     identity: DirectoryIdentity,
     acp_session_cwd: PathBuf,
     retain_descriptor_after_exec: bool,
+    #[cfg(test)]
+    sync_failure_countdown: Arc<AtomicUsize>,
+    #[cfg(test)]
+    journal_publish_failure_countdown: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Copy)]
@@ -528,6 +598,10 @@ impl PinnedDirectory {
             identity: snapshot.identity,
             acp_session_cwd,
             retain_descriptor_after_exec,
+            #[cfg(test)]
+            sync_failure_countdown: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            journal_publish_failure_countdown: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -543,10 +617,79 @@ impl PinnedDirectory {
         PathBuf::from(self.canonical_cwd.as_str())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn object_sha256(&self) -> &str {
+        &self.identity.object_sha256
+    }
+
     pub(crate) fn sync(&self) -> Result<(), BoxError> {
+        #[cfg(test)]
+        {
+            let mut remaining = self.sync_failure_countdown.load(Ordering::SeqCst);
+            while remaining != 0 {
+                match self.sync_failure_countdown.compare_exchange(
+                    remaining,
+                    remaining - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) if remaining == 1 => {
+                        return Err("pinned directory: injected sync failure".into());
+                    }
+                    Ok(_) => break,
+                    Err(observed) => remaining = observed,
+                }
+            }
+        }
         self.file
             .sync_all()
             .map_err(|error| format!("pinned directory: cannot sync: {error}").into())
+    }
+
+    /// Establish durability for every journal name currently visible beneath this retained
+    /// directory before recovery interprets any of them. This closes the ambiguous interval where
+    /// an atomic publication renamed its complete record but the caller observed a parent-sync
+    /// failure: a later successful barrier makes a surviving name durable, while a barrier failure
+    /// prevents recovery from consuming that name as committed state.
+    pub(crate) fn sync_journal_recovery_barrier(&self, label: &str) -> Result<(), BoxError> {
+        self.sync().map_err(|error| {
+            format!("{label}: cannot establish journal recovery barrier: {error}").into()
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_sync_on_nth_call_for_test(&self, call: usize) {
+        assert!(call > 0, "sync failure injection call must be positive");
+        self.sync_failure_countdown.store(call, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_journal_publish_on_nth_call_for_test(&self, call: usize) {
+        assert!(
+            call > 0,
+            "journal publication failure injection call must be positive"
+        );
+        self.journal_publish_failure_countdown
+            .store(call, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn journal_publish_failure_is_due(&self) -> bool {
+        let mut remaining = self
+            .journal_publish_failure_countdown
+            .load(Ordering::SeqCst);
+        while remaining != 0 {
+            match self.journal_publish_failure_countdown.compare_exchange(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return remaining == 1,
+                Err(observed) => remaining = observed,
+            }
+        }
+        false
     }
 
     pub(crate) fn retain_descriptor_after_exec(&self) -> bool {
@@ -560,6 +703,59 @@ impl PinnedDirectory {
         )
         .ok()
         .is_some_and(|(_file, snapshot)| snapshot.identity == self.identity)
+    }
+
+    /// Inspect one direct child without following a final symlink and without re-resolving the
+    /// retained parent directory pathname.
+    #[cfg_attr(not(test), allow(dead_code))]
+    // These libc stat fields match the stored widths on Linux but require widening on macOS.
+    #[allow(clippy::unnecessary_cast)]
+    pub(crate) fn child_metadata_no_follow(
+        &self,
+        name: &OsStr,
+        label: &str,
+    ) -> Result<Option<ChildMetadataSnapshot>, BoxError> {
+        #[cfg(unix)]
+        {
+            use std::mem::MaybeUninit;
+            use std::os::fd::AsRawFd as _;
+
+            let name = child_name_cstring(name, label)?;
+            let mut stat = MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: the retained directory descriptor, validated child name, and writable stat
+            // buffer are live. AT_SYMLINK_NOFOLLOW reports the directory entry itself.
+            if unsafe {
+                libc::fstatat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == -1
+            {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ENOENT) {
+                    return Ok(None);
+                }
+                return Err(
+                    format!("{label}: cannot inspect descriptor-relative child: {error}").into(),
+                );
+            }
+            // SAFETY: successful fstatat initialized the complete stat value.
+            let stat = unsafe { stat.assume_init() };
+            Ok(Some(ChildMetadataSnapshot {
+                mode: stat.st_mode as u32,
+                link_count: stat.st_nlink as u64,
+                owner_uid: stat.st_uid,
+                length: u64::try_from(stat.st_size)
+                    .map_err(|_| format!("{label}: child has a negative length"))?,
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            Err(format!("{label}: descriptor-relative child inspection is unsupported").into())
+        }
     }
 
     /// Create one owner-private regular file relative to the retained directory object. The effect
@@ -636,6 +832,72 @@ impl PinnedDirectory {
             let _ = (name, mode);
             Err(format!("{label}: descriptor-relative file creation is unsupported").into())
         }
+    }
+
+    /// Remove only the fixed, uncommitted journal-append residue beneath this retained directory.
+    /// Callers hold the owner-wide capability, so every journal in a shared directory uses one
+    /// serialized temporary namespace. Wrong-type, wrong-owner, linked, or broadened residue fails
+    /// closed instead of being unlinked.
+    pub(crate) fn recover_journal_append_residue(
+        &self,
+        mode: u32,
+        label: &str,
+    ) -> Result<(), BoxError> {
+        let temporary = OsStr::new(JOURNAL_APPEND_TEMP_NAME);
+        let Some(candidate_name) = self.regular_child_removal_candidate(temporary, label)? else {
+            return Ok(());
+        };
+        let file = self.open_regular_file(&candidate_name, label)?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("{label}: cannot inspect append residue: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o777 != mode {
+                return Err(format!(
+                    "{label}: journal append residue is not owner-only mode-{mode:04o}"
+                )
+                .into());
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (metadata, mode);
+            return Err(format!("{label}: journal residue recovery is unsupported").into());
+        }
+        self.remove_regular_child_candidate(
+            temporary,
+            RegularChildRef::new(&candidate_name, &file),
+            label,
+        )
+    }
+
+    /// Persist one new journal generation without exposing its final name until all bytes and the
+    /// file itself are durable. A crash before the no-replace rename leaves only the fixed temporary
+    /// residue; a surviving final name therefore always identifies a complete, synced record.
+    pub(crate) fn write_new_journal_record(
+        &self,
+        target_name: &OsStr,
+        bytes: &[u8],
+        mode: u32,
+        label: &str,
+    ) -> Result<(), BoxError> {
+        use std::io::Write as _;
+
+        self.recover_journal_append_residue(mode, label)?;
+        let temporary = OsStr::new(JOURNAL_APPEND_TEMP_NAME);
+        let mut file = self.create_new_file(temporary, mode, label)?;
+        // Intentionally retain a partial temporary entry on error. Recovery verifies and removes
+        // that exact owner-private regular file before quota accounting and the next append.
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("{label}: cannot sync journal append temporary: {error}"))?;
+        #[cfg(test)]
+        if self.journal_publish_failure_is_due() {
+            return Err(format!("{label}: injected failure before journal publication").into());
+        }
+        self.publish_new_regular_child(RegularChildRef::new(temporary, &file), target_name, label)
     }
 
     /// Create one symbolic link relative to the retained directory object. Callers remain
@@ -796,6 +1058,10 @@ impl PinnedDirectory {
                 identity,
                 acp_session_cwd,
                 retain_descriptor_after_exec,
+                #[cfg(test)]
+                sync_failure_countdown: Arc::new(AtomicUsize::new(0)),
+                #[cfg(test)]
+                journal_publish_failure_countdown: Arc::new(AtomicUsize::new(0)),
             }))
         }
         #[cfg(not(unix))]
@@ -881,6 +1147,10 @@ impl PinnedDirectory {
                 identity,
                 acp_session_cwd,
                 retain_descriptor_after_exec,
+                #[cfg(test)]
+                sync_failure_countdown: Arc::new(AtomicUsize::new(0)),
+                #[cfg(test)]
+                journal_publish_failure_countdown: Arc::new(AtomicUsize::new(0)),
             })
         }
         #[cfg(not(unix))]
@@ -984,6 +1254,267 @@ impl PinnedDirectory {
         {
             let _ = (name, directory);
             Err(format!("{label}: descriptor-relative removal is unsupported").into())
+        }
+    }
+
+    /// Resolve either the original name or a crash-surviving deterministic removal quarantine.
+    pub(crate) fn regular_child_removal_candidate(
+        &self,
+        original_name: &OsStr,
+        label: &str,
+    ) -> Result<Option<OsString>, BoxError> {
+        let quarantine_name = removal_quarantine_name(original_name, label)?;
+        let original_exists = self
+            .child_metadata_no_follow(original_name, label)?
+            .is_some();
+        let quarantine_exists = self
+            .child_metadata_no_follow(&quarantine_name, label)?
+            .is_some();
+        match (original_exists, quarantine_exists) {
+            (true, true) => {
+                Err(format!("{label}: source and removal quarantine both exist").into())
+            }
+            (true, false) => Ok(Some(original_name.to_os_string())),
+            (false, true) => Ok(Some(quarantine_name)),
+            (false, false) => Ok(None),
+        }
+    }
+
+    /// Capture one retained regular child under a deterministic quarantine name, revalidate the
+    /// captured inode, and remove only that quarantine entry. The no-replace capture prevents an
+    /// entry exchanged into the source name after verification from being unlinked as the source.
+    pub(crate) fn remove_regular_child_candidate(
+        &self,
+        original_name: &OsStr,
+        child: RegularChildRef<'_>,
+        label: &str,
+    ) -> Result<(), BoxError> {
+        self.remove_regular_child_candidate_with_hooks(
+            original_name,
+            child,
+            label,
+            || Ok(()),
+            || Ok(()),
+        )
+    }
+
+    fn remove_regular_child_candidate_with_hooks<F, G>(
+        &self,
+        original_name: &OsStr,
+        child: RegularChildRef<'_>,
+        label: &str,
+        before_capture: F,
+        after_capture: G,
+    ) -> Result<(), BoxError>
+    where
+        F: FnOnce() -> Result<(), BoxError>,
+        G: FnOnce() -> Result<(), BoxError>,
+    {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+
+            let original_c = child_name_cstring(original_name, label)?;
+            let quarantine_name = removal_quarantine_name(original_name, label)?;
+            let quarantine_c = child_name_cstring(&quarantine_name, label)?;
+            let captured_already = child.name == quarantine_name;
+            if child.name != original_name && !captured_already {
+                return Err(format!("{label}: removal candidate name is invalid").into());
+            }
+            let reopened = self.open_regular_file(child.name, label)?;
+            let retained_metadata = child
+                .file
+                .metadata()
+                .map_err(|error| format!("{label}: cannot inspect retained child: {error}"))?;
+            if !same_file(&reopened.metadata()?, &retained_metadata) {
+                return Err(format!("{label}: child identity changed before removal").into());
+            }
+            before_capture()?;
+
+            if !captured_already {
+                // SAFETY: both validated names are beneath the retained directory. Atomic
+                // no-replace capture cannot clobber recovery residue and isolates the entry
+                // selected at the rename linearization point before any unlink is attempted.
+                #[cfg(target_os = "macos")]
+                let capture_result = unsafe {
+                    libc::renameatx_np(
+                        self.file.as_raw_fd(),
+                        original_c.as_ptr(),
+                        self.file.as_raw_fd(),
+                        quarantine_c.as_ptr(),
+                        libc::RENAME_EXCL,
+                    )
+                };
+                #[cfg(target_os = "linux")]
+                let capture_result = unsafe {
+                    libc::renameat2(
+                        self.file.as_raw_fd(),
+                        original_c.as_ptr(),
+                        self.file.as_raw_fd(),
+                        quarantine_c.as_ptr(),
+                        libc::RENAME_NOREPLACE,
+                    )
+                };
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                return Err(format!(
+                    "{label}: atomic removal quarantine is unsupported on this platform"
+                )
+                .into());
+                if capture_result == -1 {
+                    return Err(format!(
+                        "{label}: cannot capture verified child for removal: {}",
+                        std::io::Error::last_os_error()
+                    )
+                    .into());
+                }
+                self.sync().map_err(|error| {
+                    format!("{label}: removal capture sync is ambiguous: {error}")
+                })?;
+            }
+
+            let captured = self.open_regular_file(&quarantine_name, label)?;
+            if !same_file(&captured.metadata()?, &retained_metadata) {
+                return Err(format!("{label}: child identity changed during removal").into());
+            }
+            after_capture()?;
+            // SAFETY: the quarantine entry was atomically captured and then reopened as the same
+            // retained inode. The owner lock excludes cooperating writers from the quarantine
+            // namespace; the retained descriptor below proves the indexed inode lost its link.
+            if unsafe { libc::unlinkat(self.file.as_raw_fd(), quarantine_c.as_ptr(), 0) } == -1 {
+                return Err(format!(
+                    "{label}: cannot remove captured descriptor-relative child: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            use std::os::unix::fs::MetadataExt as _;
+            if child.file.metadata()?.nlink() != 0 {
+                return Err(format!("{label}: retained child survived removal").into());
+            }
+            self.sync()?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (original_name, child, before_capture, after_capture);
+            Err(format!("{label}: verified descriptor-relative removal is unsupported").into())
+        }
+    }
+
+    /// Atomically publish one already-synced, retained regular child at a new name in this exact
+    /// directory. The target must be absent; callers serialize the check and rename under their
+    /// owner lock. A directory-sync error is reported as an ambiguous publication so recovery can
+    /// inspect the final name rather than retrying blindly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn publish_new_regular_child(
+        &self,
+        source: RegularChildRef<'_>,
+        target_name: &OsStr,
+        label: &str,
+    ) -> Result<(), BoxError> {
+        self.publish_new_regular_child_with_before_rename(source, target_name, label, || Ok(()))
+    }
+
+    fn publish_new_regular_child_with_before_rename<F>(
+        &self,
+        source: RegularChildRef<'_>,
+        target_name: &OsStr,
+        label: &str,
+        before_rename: F,
+    ) -> Result<(), BoxError>
+    where
+        F: FnOnce() -> Result<(), BoxError>,
+    {
+        #[cfg(unix)]
+        {
+            use std::mem::MaybeUninit;
+            use std::os::fd::AsRawFd as _;
+
+            let source_name = child_name_cstring(source.name, label)?;
+            let target_c = child_name_cstring(target_name, label)?;
+            if source_name.as_bytes() == target_c.as_bytes() {
+                return Err(format!("{label}: source and target names must differ").into());
+            }
+            let opened_source = self.open_regular_file(source.name, label)?;
+            let retained_metadata = source
+                .file
+                .metadata()
+                .map_err(|error| format!("{label}: cannot inspect retained source: {error}"))?;
+            if !same_file(&opened_source.metadata()?, &retained_metadata) {
+                return Err(format!("{label}: source identity changed before publication").into());
+            }
+
+            let mut target_metadata = MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: the retained directory descriptor, target C string, and output pointer are
+            // valid for this no-follow existence check.
+            let target_result = unsafe {
+                libc::fstatat(
+                    self.file.as_raw_fd(),
+                    target_c.as_ptr(),
+                    target_metadata.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if target_result == 0 {
+                return Err(format!("{label}: publication target already exists").into());
+            }
+            let target_error = std::io::Error::last_os_error();
+            if target_error.raw_os_error() != Some(libc::ENOENT) {
+                return Err(format!(
+                    "{label}: cannot prove publication target absence: {target_error}"
+                )
+                .into());
+            }
+            before_rename()?;
+
+            // SAFETY: both names are validated single components beneath the same retained
+            // directory descriptor. The no-replace flag makes target absence part of the atomic
+            // rename operation, including against actors that do not honor the owner lock.
+            #[cfg(target_os = "macos")]
+            let rename_result = unsafe {
+                libc::renameatx_np(
+                    self.file.as_raw_fd(),
+                    source_name.as_ptr(),
+                    self.file.as_raw_fd(),
+                    target_c.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            };
+            #[cfg(target_os = "linux")]
+            let rename_result = unsafe {
+                libc::renameat2(
+                    self.file.as_raw_fd(),
+                    source_name.as_ptr(),
+                    self.file.as_raw_fd(),
+                    target_c.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            return Err(format!(
+                "{label}: atomic no-replace publication is unsupported on this platform"
+            )
+            .into());
+            if rename_result == -1 {
+                return Err(format!(
+                    "{label}: cannot atomically publish new regular child: {}",
+                    std::io::Error::last_os_error()
+                )
+                .into());
+            }
+            self.sync().map_err(|error| {
+                format!("{label}: publication renamed but directory sync is ambiguous: {error}")
+            })?;
+            let opened_target = self.open_regular_file(target_name, label)?;
+            if !same_file(&opened_target.metadata()?, &retained_metadata) {
+                return Err(format!("{label}: published target identity diverged").into());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (source, target_name, before_rename);
+            Err(format!("{label}: descriptor-relative publication is unsupported").into())
         }
     }
 
@@ -1506,6 +2037,351 @@ mod tests {
             .unwrap();
         pin.remove_child(OsStr::new("evidence.json"), false, "test evidence cleanup")
             .unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn descriptor_relative_new_publication_is_atomic_and_never_clobbers() {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_directory(dir.path(), "test publication root").unwrap();
+        let pin = PinnedDirectory::open(
+            dir.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test publication root",
+        )
+        .unwrap();
+        let partial_name = OsStr::new("archive.partial");
+        let final_name = OsStr::new("archive.tar.gz");
+        let mut partial = pin
+            .create_new_file(partial_name, 0o600, "test publication partial")
+            .unwrap();
+        partial.write_all(b"new bytes").unwrap();
+        partial.sync_all().unwrap();
+
+        let mut existing = pin
+            .create_new_file(final_name, 0o600, "test existing final")
+            .unwrap();
+        existing.write_all(b"old bytes").unwrap();
+        existing.sync_all().unwrap();
+        assert!(pin
+            .publish_new_regular_child(
+                RegularChildRef::new(partial_name, &partial),
+                final_name,
+                "test cold publication",
+            )
+            .is_err());
+        assert_eq!(fs::read(dir.path().join(final_name)).unwrap(), b"old bytes");
+        assert_eq!(
+            fs::read(dir.path().join(partial_name)).unwrap(),
+            b"new bytes"
+        );
+
+        drop(existing);
+        pin.remove_child(final_name, false, "test existing final cleanup")
+            .unwrap();
+        pin.publish_new_regular_child(
+            RegularChildRef::new(partial_name, &partial),
+            final_name,
+            "test cold publication",
+        )
+        .unwrap();
+        assert!(!dir.path().join(partial_name).exists());
+        assert_eq!(fs::read(dir.path().join(final_name)).unwrap(), b"new bytes");
+        assert_eq!(
+            fs::metadata(dir.path().join(final_name)).unwrap().nlink(),
+            1
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn journal_append_publishes_only_a_complete_synced_record_and_recovers_its_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_directory(dir.path(), "test journal root").unwrap();
+        let pin = PinnedDirectory::open(
+            dir.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test journal root",
+        )
+        .unwrap();
+        let final_name = OsStr::new("journal.00000000000000000001.json");
+        let final_bytes = b"{\"complete\":true}\n";
+
+        pin.fail_journal_publish_on_nth_call_for_test(1);
+        let error = pin
+            .write_new_journal_record(final_name, final_bytes, 0o600, "test journal append")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected failure before journal publication"));
+        assert!(!dir.path().join(final_name).exists());
+        assert_eq!(
+            fs::read(dir.path().join(JOURNAL_APPEND_TEMP_NAME)).unwrap(),
+            final_bytes
+        );
+
+        let quarantine_name =
+            removal_quarantine_name(OsStr::new(JOURNAL_APPEND_TEMP_NAME), "test journal append")
+                .unwrap();
+        fs::rename(
+            dir.path().join(JOURNAL_APPEND_TEMP_NAME),
+            dir.path().join(&quarantine_name),
+        )
+        .unwrap();
+        pin.sync().unwrap();
+        assert!(is_journal_append_residue_name(&quarantine_name).unwrap());
+
+        pin.write_new_journal_record(final_name, final_bytes, 0o600, "test journal append")
+            .unwrap();
+        assert!(!dir.path().join(JOURNAL_APPEND_TEMP_NAME).exists());
+        assert!(!dir.path().join(quarantine_name).exists());
+        assert_eq!(fs::read(dir.path().join(final_name)).unwrap(), final_bytes);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn journal_append_refuses_to_remove_untrusted_residue() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_directory(dir.path(), "test journal root").unwrap();
+        let pin = PinnedDirectory::open(
+            dir.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test journal root",
+        )
+        .unwrap();
+        let temporary = dir.path().join(JOURNAL_APPEND_TEMP_NAME);
+        fs::write(&temporary, b"untrusted").unwrap();
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644)).unwrap();
+        let final_name = OsStr::new("journal.00000000000000000001.json");
+
+        let error = pin
+            .write_new_journal_record(final_name, b"trusted\n", 0o600, "test journal append")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("journal append residue is not owner-only mode-0600"));
+        assert_eq!(fs::read(&temporary).unwrap(), b"untrusted");
+        assert!(!dir.path().join(final_name).exists());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn descriptor_relative_removal_never_deletes_a_replacement_exchanged_after_verification() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_directory(dir.path(), "test removal root").unwrap();
+        let pin = PinnedDirectory::open(
+            dir.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test removal root",
+        )
+        .unwrap();
+        let original_name = OsStr::new("evidence.json");
+        let replacement_name = OsStr::new("replacement.json");
+        let mut original = pin
+            .create_new_file(original_name, 0o600, "test original")
+            .unwrap();
+        original.write_all(b"original bytes").unwrap();
+        original.sync_all().unwrap();
+        let mut replacement = pin
+            .create_new_file(replacement_name, 0o600, "test replacement")
+            .unwrap();
+        replacement.write_all(b"replacement bytes").unwrap();
+        replacement.sync_all().unwrap();
+
+        let error = pin
+            .remove_regular_child_candidate_with_hooks(
+                original_name,
+                RegularChildRef::new(original_name, &original),
+                "test exact removal",
+                || {
+                    let original_c = child_name_cstring(original_name, "test original")?;
+                    let replacement_c = child_name_cstring(replacement_name, "test replacement")?;
+                    #[cfg(target_os = "macos")]
+                    let exchange_result = unsafe {
+                        libc::renameatx_np(
+                            pin.file.as_raw_fd(),
+                            original_c.as_ptr(),
+                            pin.file.as_raw_fd(),
+                            replacement_c.as_ptr(),
+                            libc::RENAME_SWAP,
+                        )
+                    };
+                    #[cfg(target_os = "linux")]
+                    let exchange_result = unsafe {
+                        libc::renameat2(
+                            pin.file.as_raw_fd(),
+                            original_c.as_ptr(),
+                            pin.file.as_raw_fd(),
+                            replacement_c.as_ptr(),
+                            libc::RENAME_EXCHANGE,
+                        )
+                    };
+                    if exchange_result == -1 {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("identity changed during removal"));
+        assert_eq!(
+            fs::read(dir.path().join(replacement_name)).unwrap(),
+            b"original bytes"
+        );
+        let quarantine_name = removal_quarantine_name(original_name, "test exact removal").unwrap();
+        assert_eq!(
+            fs::read(dir.path().join(quarantine_name)).unwrap(),
+            b"replacement bytes"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn descriptor_relative_removal_recovers_a_synced_quarantine_and_refuses_ambiguity() {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_directory(dir.path(), "test removal root").unwrap();
+        let pin = PinnedDirectory::open(
+            dir.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test removal root",
+        )
+        .unwrap();
+        let original_name = OsStr::new("evidence.json");
+        let mut original = pin
+            .create_new_file(original_name, 0o600, "test original")
+            .unwrap();
+        original.write_all(b"original bytes").unwrap();
+        original.sync_all().unwrap();
+
+        let error = pin
+            .remove_regular_child_candidate_with_hooks(
+                original_name,
+                RegularChildRef::new(original_name, &original),
+                "test exact removal",
+                || Ok(()),
+                || Err("injected crash after removal capture".into()),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected crash after removal capture"));
+
+        let quarantine_name = removal_quarantine_name(original_name, "test exact removal").unwrap();
+        assert!(!dir.path().join(original_name).exists());
+        assert_eq!(
+            fs::read(dir.path().join(&quarantine_name)).unwrap(),
+            b"original bytes"
+        );
+
+        let mut replacement = pin
+            .create_new_file(original_name, 0o600, "test concurrent replacement")
+            .unwrap();
+        replacement.write_all(b"replacement bytes").unwrap();
+        replacement.sync_all().unwrap();
+        assert!(pin
+            .regular_child_removal_candidate(original_name, "test exact removal")
+            .unwrap_err()
+            .to_string()
+            .contains("source and removal quarantine both exist"));
+        assert_eq!(
+            fs::read(dir.path().join(original_name)).unwrap(),
+            b"replacement bytes"
+        );
+        assert_eq!(
+            fs::read(dir.path().join(&quarantine_name)).unwrap(),
+            b"original bytes"
+        );
+
+        drop(replacement);
+        pin.remove_child(original_name, false, "test replacement cleanup")
+            .unwrap();
+        let candidate_name = pin
+            .regular_child_removal_candidate(original_name, "test exact removal")
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate_name, quarantine_name);
+        let candidate = pin
+            .open_regular_file(&candidate_name, "test recovered quarantine")
+            .unwrap();
+        pin.remove_regular_child_candidate(
+            original_name,
+            RegularChildRef::new(&candidate_name, &candidate),
+            "test exact removal",
+        )
+        .unwrap();
+
+        assert!(pin
+            .regular_child_removal_candidate(original_name, "test exact removal")
+            .unwrap()
+            .is_none());
+        assert_eq!(original.metadata().unwrap().nlink(), 0);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn descriptor_relative_new_publication_rejects_a_target_created_after_the_absence_check() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_directory(dir.path(), "test publication root").unwrap();
+        let pin = PinnedDirectory::open(
+            dir.path(),
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "test publication root",
+        )
+        .unwrap();
+        let partial_name = OsStr::new("archive.partial");
+        let final_name = OsStr::new("archive.tar.gz");
+        let mut partial = pin
+            .create_new_file(partial_name, 0o600, "test publication partial")
+            .unwrap();
+        partial.write_all(b"new bytes").unwrap();
+        partial.sync_all().unwrap();
+
+        let error = pin
+            .publish_new_regular_child_with_before_rename(
+                RegularChildRef::new(partial_name, &partial),
+                final_name,
+                "test cold publication race",
+                || {
+                    fs::write(dir.path().join(final_name), b"concurrent bytes")?;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot atomically publish new regular child"));
+        assert_eq!(
+            fs::read(dir.path().join(final_name)).unwrap(),
+            b"concurrent bytes"
+        );
+        assert_eq!(
+            fs::read(dir.path().join(partial_name)).unwrap(),
+            b"new bytes"
+        );
     }
 
     #[cfg(unix)]
