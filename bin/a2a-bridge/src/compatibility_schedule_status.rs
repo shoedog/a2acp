@@ -878,6 +878,7 @@ impl<'lock> NotificationJournal<'lock> {
         let generation = u64::try_from(self.records.len())?
             .checked_add(1)
             .ok_or("schedule status: notification generation overflow")?;
+        validate_notification_generation(generation)?;
         let previous_sha256 = self.records.last().map(|(_, sha256)| sha256.as_str());
         let previous_time = self
             .records
@@ -954,6 +955,13 @@ fn notification_event_time(lifecycle: &NotificationLifecycleV1, created_at_ms: i
             completed_at_ms, ..
         } => *completed_at_ms,
     }
+}
+
+fn validate_notification_generation(generation: u64) -> Result<(), BoxError> {
+    if generation == 0 || usize::try_from(generation)? > MAX_STATUS_GENERATIONS {
+        return Err("schedule status: notification generation bound reached".into());
+    }
+    Ok(())
 }
 
 fn validate_notification_record(
@@ -1265,6 +1273,7 @@ mod tests {
     use crate::compatibility_schedule_state::SchedulerStateRoot;
     use std::cell::Cell;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::path::{Path, PathBuf};
 
     fn root() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
@@ -1308,6 +1317,101 @@ mod tests {
                 quarantine: OptionalRecordRefV1::Absent,
             }],
         }
+    }
+
+    fn tree_snapshot(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
+        fn walk(root: &Path, current: &Path, snapshot: &mut Vec<(PathBuf, u32, Vec<u8>)>) {
+            let mut entries = std::fs::read_dir(current)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                let path = entry.path();
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                let mode = metadata.permissions().mode() & 0o777;
+                if metadata.is_dir() {
+                    snapshot.push((relative, mode, Vec::new()));
+                    walk(root, &path, snapshot);
+                } else {
+                    snapshot.push((relative, mode, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+
+        let mut snapshot = Vec::new();
+        walk(root, root, &mut snapshot);
+        snapshot
+    }
+
+    #[test]
+    fn injected_operator_home_status_reads_are_complete_and_write_free() {
+        let operator_home = tempfile::tempdir().unwrap();
+        let missing_before = tree_snapshot(operator_home.path());
+        assert!(
+            crate::compatibility_schedule_state::open_production_status_directory_read_only_at(
+                operator_home.path(),
+                false,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(tree_snapshot(operator_home.path()), missing_before);
+
+        let production_root = operator_home
+            .path()
+            .join("Library/Application Support/a2a-bridge/operator/compatibility-scheduler");
+        std::fs::create_dir_all(&production_root).unwrap();
+        std::fs::set_permissions(&production_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let scheduler = SchedulerStateRoot::initialize_for_test(&production_root).unwrap();
+        let owner = scheduler
+            .try_owner_admission("test/injected-production-status")
+            .unwrap();
+        let mut journal = ScheduleStatusJournal::open(&owner).unwrap();
+        journal
+            .append(project_status(status(900), healthy_sources()).unwrap())
+            .unwrap();
+        drop(journal);
+        drop(owner);
+
+        let valid_before = tree_snapshot(operator_home.path());
+        let status_directory =
+            crate::compatibility_schedule_state::open_production_status_directory_read_only_at(
+                operator_home.path(),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        let valid = status_report(Some(&status_directory));
+        assert_eq!(valid.state, ProductionStatusStateV1::Green);
+        assert_eq!(valid.reason, "status_available");
+        assert!(render_report(&valid, false)
+            .unwrap()
+            .contains("effects: no_effects"));
+        drop(status_directory);
+        assert_eq!(tree_snapshot(operator_home.path()), valid_before);
+
+        std::fs::write(
+            production_root
+                .join("status")
+                .join(ScheduleStatusJournal::generation_name(1)),
+            b"{}\n",
+        )
+        .unwrap();
+        let corrupt_before = tree_snapshot(operator_home.path());
+        let status_directory =
+            crate::compatibility_schedule_state::open_production_status_directory_read_only_at(
+                operator_home.path(),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        let corrupt = status_report(Some(&status_directory));
+        assert_eq!(corrupt.state, ProductionStatusStateV1::Degraded);
+        assert_eq!(corrupt.reason, "status_state_corrupt");
+        drop(status_directory);
+        assert_eq!(tree_snapshot(operator_home.path()), corrupt_before);
     }
 
     fn healthy_sources() -> Vec<StatusSourceObservationV1> {
@@ -1393,6 +1497,13 @@ mod tests {
         restored.sync_all().unwrap();
         lock.status_directory().sync().unwrap();
         assert!(ScheduleStatusJournal::open(&lock).is_ok());
+    }
+
+    #[test]
+    fn notification_generation_bound_rejects_the_first_unreopenable_generation() {
+        let first_unreopenable = u64::try_from(MAX_STATUS_GENERATIONS).unwrap() + 1;
+        assert!(validate_notification_generation(first_unreopenable).is_err());
+        assert!(validate_notification_generation(first_unreopenable - 1).is_ok());
     }
 
     #[derive(Default)]

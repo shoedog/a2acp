@@ -120,7 +120,8 @@ SUBCOMMANDS:
   batch               Batch store.  status <id> | list | cancel <id>
   models              List each agent's advertised models/effort/modes (probed live).  [--config <f>] [--agent <id>] [--json]
   compatibility       Validate recipes/manifests, resolve floating candidates, run exact canaries,
-                      and compare evidence.  validate | resolve | run | compare
+                      compare evidence, or inspect schedule status.
+                      validate | resolve | run | compare | schedule status [--json]
   smoke               Run one explicitly acknowledged, bounded, fixed PONG probe.
                       --agent <id> --config <f> --acknowledge-billable [--out <f>]
   fallback-plan       Validate a local failed artifact and emit a host fallback recommendation.

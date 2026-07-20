@@ -20,7 +20,7 @@ use crate::compatibility_schedule_evidence::{
     ColdCopyLifecycleV1, ColdCopyRecordV1, EvidenceHotStoreV1, EvidenceStateModelV1,
     FileEvidenceJournal, FileProviderMaterializationV1, FileProviderObjectStateV1,
     FileProviderObservationV1, FileProviderSynchronizationV1, ImageGcActionV1, ImageGcLifecycleV1,
-    IndexedEvidenceV1, StorageIntegrityHoldV1, DAY_MS,
+    IndexedEvidenceV1, StorageIntegrityHoldV1, TombstoneLifecycleV1, DAY_MS,
 };
 use crate::compatibility_schedule_schema::{
     portable_evidence_path_key, relative_evidence_path, ColdStorageBindingV1, EvidenceClassV1,
@@ -1122,18 +1122,54 @@ fn verified_optional_hot_file(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn cleanup_hot_payload(
+pub(super) struct FullEvidenceUnlinkProofV1 {
+    tombstone_id: String,
+    evidence_id: String,
+    unlinked_at_ms: i64,
+}
+
+impl FullEvidenceUnlinkProofV1 {
+    pub(super) fn tombstone_id(&self) -> &str {
+        &self.tombstone_id
+    }
+
+    pub(super) fn evidence_id(&self) -> &str {
+        &self.evidence_id
+    }
+
+    pub(super) fn unlinked_at_ms(&self) -> i64 {
+        self.unlinked_at_ms
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(tombstone_id: &str, evidence_id: &str, unlinked_at_ms: i64) -> Self {
+        Self {
+            tombstone_id: tombstone_id.into(),
+            evidence_id: evidence_id.into(),
+            unlinked_at_ms,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
+fn cleanup_exact_hot_payload(
     hot: &EvidenceHotStoreV1,
-    entry: &IndexedEvidenceV1,
+    evidence_id: &str,
+    hot_path: &RelativeEvidencePathV1,
+    archive_bytes: u64,
+    archive_sha256: &str,
+    manifest_bytes: u64,
+    manifest_sha256: &str,
     failpoint: HotEvictionFailpointV1,
 ) -> Result<(), BoxError> {
-    if entry.hot_path.components.len() != 2
-        || entry.hot_path.components[0] != "sealed"
-        || entry.hot_path.components[1] != local_file::sha256_hex(entry.evidence_id.as_bytes())
+    if hot_path.components.len() != 2
+        || hot_path.components[0] != "sealed"
+        || hot_path.components[1] != local_file::sha256_hex(evidence_id.as_bytes())
     {
         return Err("schedule retention: indexed hot cleanup path is invalid".into());
     }
-    let object_name = &entry.hot_path.components[1];
+    let object_name = &hot_path.components[1];
     let Some(payload) = hot
         .sealed_directory()
         .open_child_directory_optional(OsStr::new(object_name), "hot evidence eviction payload")?
@@ -1156,18 +1192,10 @@ fn cleanup_hot_payload(
     {
         return Err("schedule retention: hot cleanup payload has an unexpected child".into());
     }
-    let archive = verified_optional_hot_file(
-        &payload,
-        "evidence.tar.gz",
-        entry.archive_bytes,
-        &entry.full_evidence_sha256,
-    )?;
-    let manifest = verified_optional_hot_file(
-        &payload,
-        "manifest.json",
-        entry.manifest_bytes,
-        &entry.manifest_sha256,
-    )?;
+    let archive =
+        verified_optional_hot_file(&payload, "evidence.tar.gz", archive_bytes, archive_sha256)?;
+    let manifest =
+        verified_optional_hot_file(&payload, "manifest.json", manifest_bytes, manifest_sha256)?;
     if let Some(file) = archive {
         payload.remove_regular_child(
             local_file::RegularChildRef::new(OsStr::new("evidence.tar.gz"), &file),
@@ -1192,6 +1220,24 @@ fn cleanup_hot_payload(
     )?;
     hot.sealed_directory().sync()?;
     Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn cleanup_hot_payload(
+    hot: &EvidenceHotStoreV1,
+    entry: &IndexedEvidenceV1,
+    failpoint: HotEvictionFailpointV1,
+) -> Result<(), BoxError> {
+    cleanup_exact_hot_payload(
+        hot,
+        &entry.evidence_id,
+        &entry.hot_path,
+        entry.archive_bytes,
+        &entry.full_evidence_sha256,
+        entry.manifest_bytes,
+        &entry.manifest_sha256,
+        failpoint,
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1315,6 +1361,321 @@ pub(super) fn cleanup_evicted_hot_evidence<C: EvidenceStateCapability + ?Sized>(
     }
     let _lease = try_acquire_evidence_gc_lease(capability, evidence_id)?;
     cleanup_hot_payload(hot, entry, HotEvictionFailpointV1::None)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) enum EvidenceTombstoneFailpointV1 {
+    None,
+    AfterPendingIntent,
+    AfterFirstUnlink,
+    AfterAllUnlinks,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) enum EvidenceTombstoneOutcomeV1 {
+    Completed { snapshot_sha256: String },
+    DeferredLeaseBusy,
+    AlreadyComplete,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn materialize_for_deletion(
+    cold: &ColdEvidenceStoreV1,
+    probe: &mut dyn FileProviderStateProbeV1,
+    copy: &ColdCopyRecordV1,
+    path: &RelativeEvidencePathV1,
+    observed_at_ms: i64,
+) -> Result<(), BoxError> {
+    let request = probe_request(
+        Some(copy),
+        cold,
+        &copy.file_provider_domain_id,
+        OptionalRelativeEvidencePathV1::RelativePath {
+            value: path.clone(),
+        },
+        observed_at_ms,
+    )?;
+    let observed = probe.probe(&request)?;
+    validate_observation(&request, &observed)?;
+    match observed.state {
+        FileProviderObjectStateV1::Known {
+            materialization: FileProviderMaterializationV1::Materialized,
+            ..
+        } => Ok(()),
+        FileProviderObjectStateV1::Known {
+            materialization: FileProviderMaterializationV1::Offloaded,
+            ..
+        } => {
+            let materialized = probe.materialize(&request)?;
+            validate_observation(&request, &materialized)?;
+            if !matches!(
+                materialized.state,
+                FileProviderObjectStateV1::Known {
+                    materialization: FileProviderMaterializationV1::Materialized,
+                    ..
+                }
+            ) {
+                return Err(
+                    "schedule retention: cold deletion materialization did not complete".into(),
+                );
+            }
+            Ok(())
+        }
+        FileProviderObjectStateV1::Unavailable { .. }
+        | FileProviderObjectStateV1::Unknown { .. } => {
+            Err("schedule retention: cold deletion provider state is blocking".into())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
+fn open_optional_cold_deletion_file(
+    cold: &ColdEvidenceStoreV1,
+    provider_probe: &mut Option<&mut dyn FileProviderStateProbeV1>,
+    copy: &ColdCopyRecordV1,
+    path: &RelativeEvidencePathV1,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    observed_at_ms: i64,
+    label: &str,
+) -> Result<Option<std::fs::File>, BoxError> {
+    let name = single_component(path, label)?;
+    match child_disposition(&cold.root, name)? {
+        ChildDispositionV1::Absent => return Ok(None),
+        ChildDispositionV1::Other => {
+            return Err(format!("schedule retention: {label} has unsafe metadata").into())
+        }
+        ChildDispositionV1::PrivateRegular => {}
+    }
+    let probe = provider_probe
+        .as_deref_mut()
+        .ok_or("schedule retention: cold deletion probe is unavailable")?;
+    materialize_for_deletion(cold, probe, copy, path, observed_at_ms)?;
+    let file = cold.root.open_regular_file(OsStr::new(name), label)?;
+    validate_private_file(&file.metadata()?, label)?;
+    let snapshot = local_file::read_open_regular_file_bounded(&file, label, expected_bytes)?;
+    if snapshot.bytes.len() as u64 != expected_bytes || snapshot.sha256 != expected_sha256 {
+        return Err(format!("schedule retention: {label} length or hash mismatch").into());
+    }
+    Ok(Some(file))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn cleanup_exact_cold_payload(
+    cold: &ColdEvidenceStoreV1,
+    mut provider_probe: Option<&mut dyn FileProviderStateProbeV1>,
+    copy: &ColdCopyRecordV1,
+    observed_at_ms: i64,
+    fail_after_first_unlink: bool,
+) -> Result<(), BoxError> {
+    validate_private_directory(&cold.root, "cold evidence deletion root")?;
+    if copy.cold_root_sha256 != cold.root_sha256() {
+        return Err("schedule retention: cold deletion root binding changed".into());
+    }
+    let archive_name = single_component(&copy.archive_path, "cold archive deletion path")?;
+    let manifest_name = single_component(&copy.manifest_path, "cold manifest deletion path")?;
+    let archive_partial_path = RelativeEvidencePathV1 {
+        components: vec![partial_name(archive_name)],
+    };
+    let manifest_partial_path = RelativeEvidencePathV1 {
+        components: vec![partial_name(manifest_name)],
+    };
+    let files = [
+        (
+            copy.archive_path.clone(),
+            copy.archive_bytes,
+            copy.archive_sha256.as_str(),
+            "cold evidence archive deletion",
+        ),
+        (
+            copy.manifest_path.clone(),
+            copy.manifest_bytes,
+            copy.manifest_sha256.as_str(),
+            "cold evidence manifest deletion",
+        ),
+        (
+            archive_partial_path,
+            copy.archive_bytes,
+            copy.archive_sha256.as_str(),
+            "cold evidence archive partial deletion",
+        ),
+        (
+            manifest_partial_path,
+            copy.manifest_bytes,
+            copy.manifest_sha256.as_str(),
+            "cold evidence manifest partial deletion",
+        ),
+    ];
+    let mut opened = Vec::with_capacity(files.len());
+    for (path, expected_bytes, expected_sha256, label) in &files {
+        let file = open_optional_cold_deletion_file(
+            cold,
+            &mut provider_probe,
+            copy,
+            path,
+            *expected_bytes,
+            expected_sha256,
+            observed_at_ms,
+            label,
+        )?;
+        opened.push((path.clone(), file, *label));
+    }
+    let mut unlinked_any = false;
+    for (path, file, label) in opened {
+        let Some(file) = file else {
+            continue;
+        };
+        let name = single_component(&path, label)?;
+        cold.root.remove_regular_child(
+            local_file::RegularChildRef::new(OsStr::new(name), &file),
+            label,
+        )?;
+        cold.root.sync()?;
+        if !unlinked_any && fail_after_first_unlink {
+            return Err("schedule retention: injected crash after first cold unlink".into());
+        }
+        unlinked_any = true;
+    }
+    for (path, _, _, label) in &files {
+        let name = single_component(path, label)?;
+        if child_disposition(&cold.root, name)? != ChildDispositionV1::Absent {
+            return Err("schedule retention: cold evidence remained after deletion".into());
+        }
+    }
+    cold.root.sync()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn execute_evidence_tombstone<C: EvidenceStateCapability + ?Sized>(
+    capability: &C,
+    journal: &mut FileEvidenceJournal<'_>,
+    state: &mut EvidenceStateModelV1,
+    hot: &EvidenceHotStoreV1,
+    cold: Option<&ColdEvidenceStoreV1>,
+    mut provider_probe: Option<&mut dyn FileProviderStateProbeV1>,
+    tombstone_id: &str,
+    evidence_id: &str,
+    reason_code: &str,
+    started_at_ms: i64,
+    completed_at_ms: i64,
+    failpoint: EvidenceTombstoneFailpointV1,
+) -> Result<EvidenceTombstoneOutcomeV1, BoxError> {
+    state.validate()?;
+    validate_private_directory(hot.root_directory(), "hot evidence deletion root")?;
+    if state.hot_root_sha256 != hot.root_sha256() || completed_at_ms <= started_at_ms {
+        return Err("schedule retention: tombstone root binding or time is invalid".into());
+    }
+    let existing = state.tombstones.get(tombstone_id);
+    if let Some(existing) = existing {
+        if existing.evidence_id != evidence_id
+            || existing.reason_code != reason_code
+            || started_at_ms < existing.created_at_ms
+        {
+            return Err("schedule retention: tombstone recovery identity changed".into());
+        }
+    } else {
+        if state
+            .storage_integrity_holds
+            .values()
+            .any(|hold| hold.evidence_id == evidence_id)
+        {
+            return Err("schedule retention: integrity hold blocks evidence deletion".into());
+        }
+        let mut candidate = state.clone();
+        candidate.begin_tombstone(tombstone_id, evidence_id, reason_code, started_at_ms)?;
+        journal.append(&candidate, started_at_ms)?;
+        *state = candidate;
+    }
+    if failpoint == EvidenceTombstoneFailpointV1::AfterPendingIntent {
+        return Err("schedule retention: injected crash after tombstone intent".into());
+    }
+
+    let Some(_lease) = try_acquire_evidence_gc_lease_optional(capability, evidence_id)? else {
+        return Ok(EvidenceTombstoneOutcomeV1::DeferredLeaseBusy);
+    };
+    let reopened = FileEvidenceJournal::open_existing(capability)?;
+    if reopened.snapshot.state != *state {
+        return Err("schedule retention: tombstone state changed before deletion".into());
+    }
+    drop(reopened);
+    let tombstone = state
+        .tombstones
+        .get(tombstone_id)
+        .ok_or("schedule retention: persisted tombstone disappeared")?
+        .clone();
+    if tombstone.lifecycle == TombstoneLifecycleV1::Pending
+        && state
+            .storage_integrity_holds
+            .values()
+            .any(|hold| hold.evidence_id == evidence_id)
+    {
+        return Err("schedule retention: integrity hold blocks evidence deletion".into());
+    }
+
+    cleanup_exact_hot_payload(
+        hot,
+        &tombstone.evidence_id,
+        &tombstone.hot_path,
+        tombstone.archive_bytes,
+        &tombstone.full_evidence_sha256,
+        tombstone.manifest_bytes,
+        &tombstone.manifest_sha256,
+        if failpoint == EvidenceTombstoneFailpointV1::AfterFirstUnlink && tombstone.hot_was_present
+        {
+            HotEvictionFailpointV1::AfterArchiveCleanup
+        } else {
+            HotEvictionFailpointV1::None
+        },
+    )?;
+
+    if let OptionalRelativeEvidencePathV1::RelativePath { value } = &tombstone.cold_path {
+        let copy = state
+            .cold_copies
+            .values()
+            .find(|copy| {
+                copy.evidence_id == evidence_id
+                    && matches!(copy.lifecycle, ColdCopyLifecycleV1::Published { .. })
+            })
+            .ok_or("schedule retention: tombstoned cold copy disappeared")?
+            .clone();
+        if &copy.archive_path != value {
+            return Err("schedule retention: tombstoned cold path identity changed".into());
+        }
+        let cold = cold.ok_or("schedule retention: cold deletion root is unavailable")?;
+        cleanup_exact_cold_payload(
+            cold,
+            provider_probe.take(),
+            &copy,
+            completed_at_ms,
+            failpoint == EvidenceTombstoneFailpointV1::AfterFirstUnlink
+                && !tombstone.hot_was_present,
+        )?;
+    }
+    if failpoint == EvidenceTombstoneFailpointV1::AfterAllUnlinks {
+        return Err("schedule retention: injected crash after all evidence unlinks".into());
+    }
+
+    if matches!(
+        tombstone.lifecycle,
+        TombstoneLifecycleV1::FullEvidenceUnlinked { .. }
+    ) {
+        return Ok(EvidenceTombstoneOutcomeV1::AlreadyComplete);
+    }
+    let proof = FullEvidenceUnlinkProofV1 {
+        tombstone_id: tombstone_id.into(),
+        evidence_id: evidence_id.into(),
+        unlinked_at_ms: completed_at_ms,
+    };
+    let mut candidate = state.clone();
+    candidate.complete_tombstone(proof)?;
+    let (_snapshot, snapshot_sha256) = journal.append(&candidate, completed_at_ms)?;
+    *state = candidate;
+    Ok(EvidenceTombstoneOutcomeV1::Completed { snapshot_sha256 })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1725,6 +2086,7 @@ impl BundleCacheEntryV1 {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct BundleCacheInventoryV1 {
     pub(super) cache_root_sha256: String,
+    pub(super) observed_at_ms: i64,
     pub(super) entries: Vec<BundleCacheEntryV1>,
     pub(super) referenced_bundle_ids: BTreeSet<String>,
 }
@@ -1733,7 +2095,8 @@ impl BundleCacheInventoryV1 {
     #[cfg_attr(not(test), allow(dead_code))]
     fn normalized(&self) -> Result<Self, BoxError> {
         lowercase_sha256("bundle cache root", &self.cache_root_sha256)?;
-        if self.entries.len() > MAX_CACHE_INVENTORY_ITEMS
+        if self.observed_at_ms <= 0
+            || self.entries.len() > MAX_CACHE_INVENTORY_ITEMS
             || self.referenced_bundle_ids.len() > MAX_CACHE_INVENTORY_ITEMS
         {
             return Err("schedule retention: bundle inventory exceeds its bound".into());
@@ -1768,6 +2131,20 @@ impl BundleCacheInventoryV1 {
         Ok(local_file::sha256_hex(&serde_json::to_vec(
             &self.normalized()?,
         )?))
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) trait BundleCacheInventoryProbeV1 {
+    fn inventory_all(&mut self) -> Result<BundleCacheInventoryV1, BoxError>;
+}
+
+impl<F> BundleCacheInventoryProbeV1 for F
+where
+    F: FnMut() -> Result<BundleCacheInventoryV1, BoxError>,
+{
+    fn inventory_all(&mut self) -> Result<BundleCacheInventoryV1, BoxError> {
+        self()
     }
 }
 
@@ -1879,6 +2256,9 @@ pub(super) fn plan_bundle_gc(
         return Err("schedule retention: bundle GC plan time must be positive".into());
     }
     let inventory = inventory.normalized()?;
+    if inventory.observed_at_ms > planned_at_ms {
+        return Err("schedule retention: bundle inventory postdates the GC plan".into());
+    }
     let inventory_sha256 = inventory.sha256()?;
     let mut routine_groups = BTreeMap::<(String, String), Vec<&BundleCacheEntryV1>>::new();
     for entry in &inventory.entries {
@@ -2067,12 +2447,16 @@ fn finish_bundle_safe_skip(
 // GC effect identity is intentionally explicit at this narrow effect boundary.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn execute_bundle_gc_item<C: EvidenceStateCapability + ?Sized>(
+pub(super) fn execute_bundle_gc_item<
+    C: EvidenceStateCapability + ?Sized,
+    P: BundleCacheInventoryProbeV1 + ?Sized,
+>(
     capability: &C,
     journal: &mut FileEvidenceJournal<'_>,
     state: &mut EvidenceStateModelV1,
     store: &BundleCacheStoreV1,
-    current_inventory: &BundleCacheInventoryV1,
+    planned_inventory: &BundleCacheInventoryV1,
+    inventory_probe: &mut P,
     item: &BundleGcPlanItemV1,
     started_at_ms: i64,
     completed_at_ms: i64,
@@ -2096,12 +2480,12 @@ pub(super) fn execute_bundle_gc_item<C: EvidenceStateCapability + ?Sized>(
         }
         Some(_) => {}
         None => {
-            if current_inventory.cache_root_sha256 != store.root_sha256()
-                || item.inventory_sha256 != current_inventory.sha256()?
+            if planned_inventory.cache_root_sha256 != store.root_sha256()
+                || item.inventory_sha256 != planned_inventory.sha256()?
             {
                 return Err("schedule retention: bundle GC inventory/root binding changed".into());
             }
-            let original_plan = plan_bundle_gc(state, current_inventory, item.planned_at_ms)?;
+            let original_plan = plan_bundle_gc(state, planned_inventory, item.planned_at_ms)?;
             if original_plan
                 .removals
                 .iter()
@@ -2127,7 +2511,19 @@ pub(super) fn execute_bundle_gc_item<C: EvidenceStateCapability + ?Sized>(
         return Ok(BundleGcOutcomeV1::DeferredLeaseBusy);
     };
 
-    let current_inventory = match current_inventory.normalized() {
+    let observed_inventory = match inventory_probe.inventory_all() {
+        Ok(inventory) => inventory,
+        Err(_) => {
+            return finish_bundle_safe_skip(
+                journal,
+                state,
+                &item.action_id,
+                "bundle_inventory_probe_failed",
+                completed_at_ms,
+            )
+        }
+    };
+    let current_inventory = match observed_inventory.normalized() {
         Ok(inventory) if inventory.cache_root_sha256 == store.root_sha256() => inventory,
         _ => {
             return finish_bundle_safe_skip(
@@ -2139,6 +2535,17 @@ pub(super) fn execute_bundle_gc_item<C: EvidenceStateCapability + ?Sized>(
             )
         }
     };
+    if current_inventory.observed_at_ms < started_at_ms
+        || current_inventory.observed_at_ms > completed_at_ms
+    {
+        return finish_bundle_safe_skip(
+            journal,
+            state,
+            &item.action_id,
+            "bundle_inventory_stale",
+            completed_at_ms,
+        );
+    }
     let current_entry = current_inventory
         .entries
         .iter()
@@ -2153,7 +2560,8 @@ pub(super) fn execute_bundle_gc_item<C: EvidenceStateCapability + ?Sized>(
                 completed_at_ms,
             );
         }
-        let current_plan = plan_bundle_gc(state, &current_inventory, started_at_ms)?;
+        let current_plan =
+            plan_bundle_gc(state, &current_inventory, current_inventory.observed_at_ms)?;
         if !current_plan
             .removals
             .iter()
@@ -3983,6 +4391,345 @@ mod tests {
         }
     }
 
+    fn fixed_bundle_inventory_probe(
+        inventory: BundleCacheInventoryV1,
+    ) -> impl BundleCacheInventoryProbeV1 {
+        move || -> Result<BundleCacheInventoryV1, BoxError> { Ok(inventory.clone()) }
+    }
+
+    #[test]
+    fn tombstone_persists_before_lease_and_recovers_after_the_first_exact_unlink() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3a-tombstone-effects")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let evidence_id = "evidence-1";
+        let object_name = local_file::sha256_hex(evidence_id.as_bytes());
+        let payload = fixture.hot_root.path().join("sealed").join(object_name);
+        let reader = acquire_evidence_read_lease(&owner, evidence_id).unwrap();
+
+        assert_eq!(
+            execute_evidence_tombstone(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &fixture.hot,
+                None,
+                None,
+                "tombstone-1",
+                evidence_id,
+                "retention_expired",
+                BASE + 1,
+                BASE + 2,
+                EvidenceTombstoneFailpointV1::None,
+            )
+            .unwrap(),
+            EvidenceTombstoneOutcomeV1::DeferredLeaseBusy
+        );
+        assert!(payload.join("evidence.tar.gz").exists());
+        assert!(payload.join("manifest.json").exists());
+        assert!(matches!(
+            state.tombstones["tombstone-1"].lifecycle,
+            crate::compatibility_schedule_evidence::TombstoneLifecycleV1::Pending
+        ));
+        drop(reader);
+
+        assert!(execute_evidence_tombstone(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            None,
+            None,
+            "tombstone-1",
+            evidence_id,
+            "retention_expired",
+            BASE + 3,
+            BASE + 4,
+            EvidenceTombstoneFailpointV1::AfterFirstUnlink,
+        )
+        .is_err());
+        assert!(!payload.join("evidence.tar.gz").exists());
+        assert!(payload.join("manifest.json").exists());
+        assert!(matches!(
+            state.tombstones["tombstone-1"].lifecycle,
+            crate::compatibility_schedule_evidence::TombstoneLifecycleV1::Pending
+        ));
+
+        let reopened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut recovered_state = reopened.snapshot.state.clone();
+        let mut recovered_journal = reopened.journal;
+        assert!(matches!(
+            execute_evidence_tombstone(
+                &owner,
+                &mut recovered_journal,
+                &mut recovered_state,
+                &fixture.hot,
+                None,
+                None,
+                "tombstone-1",
+                evidence_id,
+                "retention_expired",
+                BASE + 5,
+                BASE + 6,
+                EvidenceTombstoneFailpointV1::None,
+            )
+            .unwrap(),
+            EvidenceTombstoneOutcomeV1::Completed { .. }
+        ));
+        assert!(!payload.exists());
+        assert!(!recovered_state.entries.contains_key(evidence_id));
+        assert!(matches!(
+            recovered_state.tombstones["tombstone-1"].lifecycle,
+            crate::compatibility_schedule_evidence::TombstoneLifecycleV1::FullEvidenceUnlinked { .. }
+        ));
+    }
+
+    #[test]
+    fn tombstone_refuses_hash_tampering_without_unlinking_or_completing() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3a-tombstone-tamper")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let evidence_id = "evidence-1";
+        let payload = fixture
+            .hot_root
+            .path()
+            .join("sealed")
+            .join(local_file::sha256_hex(evidence_id.as_bytes()));
+        let manifest_path = payload.join("manifest.json");
+        let mut tampered = std::fs::read(&manifest_path).unwrap();
+        tampered[0] ^= 1;
+        write_private(&manifest_path, &tampered);
+
+        assert!(execute_evidence_tombstone(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            None,
+            None,
+            "tombstone-tamper",
+            evidence_id,
+            "retention_expired",
+            BASE + 1,
+            BASE + 2,
+            EvidenceTombstoneFailpointV1::None,
+        )
+        .is_err());
+        assert!(payload.join("evidence.tar.gz").exists());
+        assert!(manifest_path.exists());
+        assert!(state.entries.contains_key(evidence_id));
+        assert!(matches!(
+            state.tombstones["tombstone-tamper"].lifecycle,
+            TombstoneLifecycleV1::Pending
+        ));
+    }
+
+    #[test]
+    fn tombstone_recovers_crashes_after_pending_and_after_all_unlinks() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3a-tombstone-crash-boundaries")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let evidence_id = "evidence-1";
+        let payload = fixture
+            .hot_root
+            .path()
+            .join("sealed")
+            .join(local_file::sha256_hex(evidence_id.as_bytes()));
+
+        assert!(execute_evidence_tombstone(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            None,
+            None,
+            "tombstone-crash",
+            evidence_id,
+            "retention_expired",
+            BASE + 1,
+            BASE + 2,
+            EvidenceTombstoneFailpointV1::AfterPendingIntent,
+        )
+        .is_err());
+        assert!(payload.exists());
+        assert!(matches!(
+            state.tombstones["tombstone-crash"].lifecycle,
+            TombstoneLifecycleV1::Pending
+        ));
+
+        assert!(execute_evidence_tombstone(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            None,
+            None,
+            "tombstone-crash",
+            evidence_id,
+            "retention_expired",
+            BASE + 3,
+            BASE + 4,
+            EvidenceTombstoneFailpointV1::AfterAllUnlinks,
+        )
+        .is_err());
+        assert!(!payload.exists());
+        assert!(state.entries.contains_key(evidence_id));
+        assert!(matches!(
+            state.tombstones["tombstone-crash"].lifecycle,
+            TombstoneLifecycleV1::Pending
+        ));
+
+        assert!(matches!(
+            execute_evidence_tombstone(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &fixture.hot,
+                None,
+                None,
+                "tombstone-crash",
+                evidence_id,
+                "retention_expired",
+                BASE + 5,
+                BASE + 6,
+                EvidenceTombstoneFailpointV1::None,
+            )
+            .unwrap(),
+            EvidenceTombstoneOutcomeV1::Completed { .. }
+        ));
+        assert!(!state.entries.contains_key(evidence_id));
+    }
+
+    #[test]
+    fn cold_only_tombstone_recovers_after_the_first_cold_unlink() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let mut provider = FakeProvider::new(&fixture.cold);
+        provider.synchronization = FileProviderSynchronizationV1::Synchronized;
+        let admission = admit(&fixture, &mut provider, "evidence-1", BASE + 1);
+        let combined = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3a-cold-tombstone-owner")
+            .unwrap()
+            .try_authority_state("test/r3d3a-cold-tombstone-authority")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&combined).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        publish_admitted_cold_copy(
+            &combined,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            &fixture.cold,
+            &mut provider,
+            &fixture.consent,
+            &admission.copy_id,
+            BASE + 2,
+            ColdPublicationFailpointV1::None,
+        )
+        .unwrap();
+        evict_hot_evidence(
+            &combined,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            &fixture.cold,
+            &mut provider,
+            "evidence-1",
+            BASE + 3,
+            HotEvictionFailpointV1::None,
+        )
+        .unwrap();
+        assert!(!state.entries["evidence-1"].hot_present);
+
+        assert!(execute_evidence_tombstone(
+            &combined,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            Some(&fixture.cold),
+            Some(&mut provider),
+            "tombstone-cold",
+            "evidence-1",
+            "retention_expired",
+            BASE + 4,
+            BASE + 5,
+            EvidenceTombstoneFailpointV1::AfterFirstUnlink,
+        )
+        .is_err());
+        let archive_path = fixture
+            .cold_root
+            .path()
+            .join(&admission.archive_path.components[0]);
+        let manifest_path = fixture
+            .cold_root
+            .path()
+            .join(&admission.manifest_path.components[0]);
+        assert!(!archive_path.exists());
+        assert!(manifest_path.exists());
+        assert!(matches!(
+            state.tombstones["tombstone-cold"].lifecycle,
+            TombstoneLifecycleV1::Pending
+        ));
+
+        let reopened = FileEvidenceJournal::open_existing(&combined).unwrap();
+        let mut recovered_state = reopened.snapshot.state.clone();
+        let mut recovered_journal = reopened.journal;
+        assert!(matches!(
+            execute_evidence_tombstone(
+                &combined,
+                &mut recovered_journal,
+                &mut recovered_state,
+                &fixture.hot,
+                Some(&fixture.cold),
+                Some(&mut provider),
+                "tombstone-cold",
+                "evidence-1",
+                "retention_expired",
+                BASE + 6,
+                BASE + 7,
+                EvidenceTombstoneFailpointV1::None,
+            )
+            .unwrap(),
+            EvidenceTombstoneOutcomeV1::Completed { .. }
+        ));
+        assert!(!manifest_path.exists());
+        assert!(!recovered_state.entries.contains_key("evidence-1"));
+        assert_eq!(
+            execute_evidence_tombstone(
+                &combined,
+                &mut recovered_journal,
+                &mut recovered_state,
+                &fixture.hot,
+                Some(&fixture.cold),
+                None,
+                "tombstone-cold",
+                "evidence-1",
+                "retention_expired",
+                BASE + 8,
+                BASE + 9,
+                EvidenceTombstoneFailpointV1::None,
+            )
+            .unwrap(),
+            EvidenceTombstoneOutcomeV1::AlreadyComplete
+        );
+    }
+
     #[test]
     fn bundle_plan_honors_keep_age_pin_reference_and_full_evidence_precedence() {
         let fixture = Fixture::new();
@@ -4098,6 +4845,7 @@ mod tests {
         entries.push(unpreserved);
         let inventory = BundleCacheInventoryV1 {
             cache_root_sha256: digest('d'),
+            observed_at_ms: now,
             entries,
             referenced_bundle_ids: BTreeSet::from(["routine-referenced".into()]),
         };
@@ -4150,12 +4898,16 @@ mod tests {
         );
         let inventory = BundleCacheInventoryV1 {
             cache_root_sha256: store.root_sha256().into(),
+            observed_at_ms: now,
             entries: vec![entry],
             referenced_bundle_ids: BTreeSet::new(),
         };
         let plan = plan_bundle_gc(&state, &inventory, now).unwrap();
         let item = &plan.removals[0];
         let reader = acquire_bundle_read_lease(&owner, "old").unwrap();
+        let mut busy_inventory = inventory.clone();
+        busy_inventory.observed_at_ms = now + 1;
+        let mut busy_probe = fixed_bundle_inventory_probe(busy_inventory);
         assert_eq!(
             execute_bundle_gc_item(
                 &owner,
@@ -4163,6 +4915,7 @@ mod tests {
                 &mut state,
                 &store,
                 &inventory,
+                &mut busy_probe,
                 item,
                 now + 1,
                 now + 2,
@@ -4177,12 +4930,16 @@ mod tests {
             crate::compatibility_schedule_evidence::BundleGcLifecycleV1::Pending
         ));
         drop(reader);
+        let mut crash_inventory = inventory.clone();
+        crash_inventory.observed_at_ms = now + 3;
+        let mut crash_probe = fixed_bundle_inventory_probe(crash_inventory);
         assert!(execute_bundle_gc_item(
             &owner,
             &mut opened.journal,
             &mut state,
             &store,
             &inventory,
+            &mut crash_probe,
             item,
             now + 3,
             now + 4,
@@ -4193,16 +4950,19 @@ mod tests {
         assert!(bundle_root.path().join("unrelated.bundle").exists());
         let recovered_inventory = BundleCacheInventoryV1 {
             cache_root_sha256: store.root_sha256().into(),
+            observed_at_ms: now + 5,
             entries: Vec::new(),
             referenced_bundle_ids: BTreeSet::new(),
         };
+        let mut recovery_probe = fixed_bundle_inventory_probe(recovered_inventory.clone());
         assert_eq!(
             execute_bundle_gc_item(
                 &owner,
                 &mut opened.journal,
                 &mut state,
                 &store,
-                &recovered_inventory,
+                &inventory,
+                &mut recovery_probe,
                 item,
                 now + 5,
                 now + 6,
@@ -4240,6 +5000,7 @@ mod tests {
         );
         let inventory = BundleCacheInventoryV1 {
             cache_root_sha256: store.root_sha256().into(),
+            observed_at_ms: now,
             entries: vec![entry],
             referenced_bundle_ids: BTreeSet::new(),
         };
@@ -4247,6 +5008,9 @@ mod tests {
         let item = &plan.removals[0];
 
         let reader = acquire_bundle_read_lease(&owner, "old").unwrap();
+        let mut busy_inventory = inventory.clone();
+        busy_inventory.observed_at_ms = now + 1;
+        let mut busy_probe = fixed_bundle_inventory_probe(busy_inventory);
         assert_eq!(
             execute_bundle_gc_item(
                 &owner,
@@ -4254,6 +5018,7 @@ mod tests {
                 &mut state,
                 &store,
                 &inventory,
+                &mut busy_probe,
                 item,
                 now + 1,
                 now + 2,
@@ -4265,16 +5030,24 @@ mod tests {
         drop(reader);
 
         let mut referenced_inventory = inventory;
+        referenced_inventory.observed_at_ms = now + 3;
         referenced_inventory
             .referenced_bundle_ids
             .insert("old".into());
+        let planned_inventory = BundleCacheInventoryV1 {
+            observed_at_ms: now,
+            referenced_bundle_ids: BTreeSet::new(),
+            ..referenced_inventory.clone()
+        };
+        let mut referenced_probe = fixed_bundle_inventory_probe(referenced_inventory);
         assert_eq!(
             execute_bundle_gc_item(
                 &owner,
                 &mut opened.journal,
                 &mut state,
                 &store,
-                &referenced_inventory,
+                &planned_inventory,
+                &mut referenced_probe,
                 item,
                 now + 3,
                 now + 4,
@@ -4290,6 +5063,200 @@ mod tests {
             state.bundle_gc_actions[&item.action_id].lifecycle,
             crate::compatibility_schedule_evidence::BundleGcLifecycleV1::SafeSkipped { .. }
         ));
+    }
+
+    #[test]
+    fn bundle_gc_probes_for_new_references_after_acquiring_the_exclusive_lease() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let bundle_root = private_root();
+        write_private(&bundle_root.path().join("old.bundle"), b"old bundle\n");
+        let store =
+            BundleCacheStoreV1::open_existing(&pin(bundle_root.path(), "bundle cache")).unwrap();
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3d-bundle-action-time-inventory")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let now = BASE + 200 * DAY_MS;
+        let entry = bundle_entry(
+            &state,
+            "old",
+            "evidence-1",
+            "codex",
+            "case-a",
+            now - 40 * DAY_MS,
+            BundleCacheKindV1::ReconstructiblePayload,
+            b"old bundle\n",
+        );
+        let planned_inventory = BundleCacheInventoryV1 {
+            cache_root_sha256: store.root_sha256().into(),
+            observed_at_ms: now,
+            entries: vec![entry],
+            referenced_bundle_ids: BTreeSet::new(),
+        };
+        let item = plan_bundle_gc(&state, &planned_inventory, now)
+            .unwrap()
+            .removals
+            .remove(0);
+        let mut observed_inventory = planned_inventory.clone();
+        observed_inventory.observed_at_ms = now + 1;
+        observed_inventory
+            .referenced_bundle_ids
+            .insert("old".into());
+        let mut probe = || Ok(observed_inventory.clone());
+
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &planned_inventory,
+                &mut probe,
+                &item,
+                now + 1,
+                now + 2,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::SafeSkipped {
+                reason_code: "freshly_protected".into()
+            }
+        );
+        assert!(bundle_root.path().join("old.bundle").exists());
+    }
+
+    #[test]
+    fn bundle_gc_safe_skips_failed_stale_and_future_action_time_inventories() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let bundle_root = private_root();
+        for bundle_id in ["probe-failed", "stale", "future"] {
+            write_private(
+                &bundle_root.path().join(format!("{bundle_id}.bundle")),
+                format!("{bundle_id} bundle\n").as_bytes(),
+            );
+        }
+        let store =
+            BundleCacheStoreV1::open_existing(&pin(bundle_root.path(), "bundle cache")).unwrap();
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3d-bundle-action-time-bounds")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let now = BASE + 200 * DAY_MS;
+        let planned_inventory = BundleCacheInventoryV1 {
+            cache_root_sha256: store.root_sha256().into(),
+            observed_at_ms: now,
+            entries: ["probe-failed", "stale", "future"]
+                .into_iter()
+                .map(|bundle_id| {
+                    bundle_entry(
+                        &state,
+                        bundle_id,
+                        "evidence-1",
+                        "codex",
+                        "case-a",
+                        now - 40 * DAY_MS,
+                        BundleCacheKindV1::ReconstructiblePayload,
+                        format!("{bundle_id} bundle\n").as_bytes(),
+                    )
+                })
+                .collect(),
+            referenced_bundle_ids: BTreeSet::new(),
+        };
+        let plan = plan_bundle_gc(&state, &planned_inventory, now).unwrap();
+
+        let failed_item = plan
+            .removals
+            .iter()
+            .find(|item| item.entry.bundle_id == "probe-failed")
+            .unwrap();
+        let mut failed_probe = || -> Result<BundleCacheInventoryV1, BoxError> {
+            Err("injected inventory probe failure".into())
+        };
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &planned_inventory,
+                &mut failed_probe,
+                failed_item,
+                now + 1,
+                now + 2,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::SafeSkipped {
+                reason_code: "bundle_inventory_probe_failed".into()
+            }
+        );
+
+        let stale_item = plan
+            .removals
+            .iter()
+            .find(|item| item.entry.bundle_id == "stale")
+            .unwrap();
+        let mut stale_inventory = planned_inventory.clone();
+        stale_inventory.observed_at_ms = now + 2;
+        let mut stale_probe = fixed_bundle_inventory_probe(stale_inventory);
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &planned_inventory,
+                &mut stale_probe,
+                stale_item,
+                now + 3,
+                now + 4,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::SafeSkipped {
+                reason_code: "bundle_inventory_stale".into()
+            }
+        );
+
+        let future_item = plan
+            .removals
+            .iter()
+            .find(|item| item.entry.bundle_id == "future")
+            .unwrap();
+        let mut future_inventory = planned_inventory.clone();
+        future_inventory.observed_at_ms = now + 7;
+        let mut future_probe = fixed_bundle_inventory_probe(future_inventory);
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &planned_inventory,
+                &mut future_probe,
+                future_item,
+                now + 5,
+                now + 6,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::SafeSkipped {
+                reason_code: "bundle_inventory_stale".into()
+            }
+        );
+
+        for bundle_id in ["probe-failed", "stale", "future"] {
+            assert!(bundle_root
+                .path()
+                .join(format!("{bundle_id}.bundle"))
+                .exists());
+        }
     }
 
     #[test]
@@ -4314,6 +5281,7 @@ mod tests {
         let now = BASE + 200 * DAY_MS;
         let inventory = BundleCacheInventoryV1 {
             cache_root_sha256: store.root_sha256().into(),
+            observed_at_ms: now,
             entries: ["invalid", "changed", "omitted"]
                 .into_iter()
                 .map(|bundle_id| {
@@ -4337,6 +5305,9 @@ mod tests {
         for (index, item) in plan.removals.iter().enumerate() {
             let reader = acquire_bundle_read_lease(&owner, &item.entry.bundle_id).unwrap();
             let started_at_ms = now + 1 + index as i64 * 2;
+            let mut observed_inventory = inventory.clone();
+            observed_inventory.observed_at_ms = started_at_ms;
+            let mut probe = fixed_bundle_inventory_probe(observed_inventory);
             assert_eq!(
                 execute_bundle_gc_item(
                     &owner,
@@ -4344,6 +5315,7 @@ mod tests {
                     &mut state,
                     &store,
                     &inventory,
+                    &mut probe,
                     item,
                     started_at_ms,
                     started_at_ms + 1,
@@ -4362,13 +5334,16 @@ mod tests {
             .unwrap();
         let mut invalid_inventory = inventory.clone();
         invalid_inventory.cache_root_sha256 = digest('f');
+        invalid_inventory.observed_at_ms = now + 7;
+        let mut invalid_probe = fixed_bundle_inventory_probe(invalid_inventory);
         assert_eq!(
             execute_bundle_gc_item(
                 &owner,
                 &mut opened.journal,
                 &mut state,
                 &store,
-                &invalid_inventory,
+                &inventory,
+                &mut invalid_probe,
                 item,
                 now + 7,
                 now + 8,
@@ -4392,13 +5367,16 @@ mod tests {
             .find(|entry| entry.bundle_id == "changed")
             .unwrap()
             .content_sha256 = digest('e');
+        changed_inventory.observed_at_ms = now + 9;
+        let mut changed_probe = fixed_bundle_inventory_probe(changed_inventory);
         assert_eq!(
             execute_bundle_gc_item(
                 &owner,
                 &mut opened.journal,
                 &mut state,
                 &store,
-                &changed_inventory,
+                &inventory,
+                &mut changed_probe,
                 item,
                 now + 9,
                 now + 10,
@@ -4415,17 +5393,20 @@ mod tests {
             .iter()
             .find(|item| item.entry.bundle_id == "omitted")
             .unwrap();
-        let mut omitted_inventory = inventory;
+        let mut omitted_inventory = inventory.clone();
+        omitted_inventory.observed_at_ms = now + 11;
         omitted_inventory
             .entries
             .retain(|entry| entry.bundle_id != "omitted");
+        let mut omitted_probe = fixed_bundle_inventory_probe(omitted_inventory);
         assert_eq!(
             execute_bundle_gc_item(
                 &owner,
                 &mut opened.journal,
                 &mut state,
                 &store,
-                &omitted_inventory,
+                &inventory,
+                &mut omitted_probe,
                 item,
                 now + 11,
                 now + 12,

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::compatibility_schedule_retention::FullEvidenceUnlinkProofV1;
 use crate::compatibility_schedule_schema::{
     parse_schedule_evidence_record, portable_evidence_path_key, relative_evidence_path,
     ColdStorageBindingV1, EvidenceClassV1, EvidenceIndexEntryV1, EvidenceIndexV1,
@@ -1415,19 +1416,23 @@ impl EvidenceStateModelV1 {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn complete_tombstone(
         &mut self,
-        tombstone_id: &str,
-        unlinked_at_ms: i64,
+        proof: FullEvidenceUnlinkProofV1,
     ) -> Result<(), BoxError> {
         let mut candidate = self.clone();
         let tombstone = candidate
             .tombstones
-            .get_mut(tombstone_id)
+            .get_mut(proof.tombstone_id())
             .ok_or("schedule evidence: tombstone does not exist")?;
         if tombstone.lifecycle != TombstoneLifecycleV1::Pending {
             return Err("schedule evidence: tombstone is already complete".into());
         }
+        if tombstone.evidence_id != proof.evidence_id() {
+            return Err("schedule evidence: unlink proof targets different evidence".into());
+        }
         let evidence_id = tombstone.evidence_id.clone();
-        tombstone.lifecycle = TombstoneLifecycleV1::FullEvidenceUnlinked { unlinked_at_ms };
+        tombstone.lifecycle = TombstoneLifecycleV1::FullEvidenceUnlinked {
+            unlinked_at_ms: proof.unlinked_at_ms(),
+        };
         candidate
             .entries
             .remove(&evidence_id)
@@ -2404,6 +2409,9 @@ impl<'lock> FileEvidenceJournal<'lock> {
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn persist(&self, snapshot: &EvidenceStateSnapshotV1) -> Result<(), BoxError> {
+        if usize::try_from(snapshot.generation)? > MAX_STATE_GENERATIONS {
+            return Err("schedule evidence: state generation bound reached".into());
+        }
         let bytes = evidence_state_snapshot_bytes(snapshot)?;
         if bytes.len() as u64 > MAX_STATE_RECORD_BYTES {
             return Err("schedule evidence: state generation exceeds the byte bound".into());
@@ -2664,6 +2672,26 @@ pub(super) fn reserve_hot_bytes(
         return Err("schedule evidence: hot storage quota pressure".into());
     }
     Ok(next)
+}
+
+fn reserve_optional_hot_bytes(
+    caps: &HotStorageCapsV1,
+    usage: &HotStorageUsageV1,
+    allocation: HotAllocationV1,
+    bytes: u64,
+) -> Result<HotStorageUsageV1, BoxError> {
+    if bytes > 0 {
+        return reserve_hot_bytes(caps, usage, allocation, bytes);
+    }
+    caps.validate()?;
+    if usage.state_bytes > caps.state_bytes
+        || usage.scratch_bytes > caps.scratch_bytes
+        || usage.sealed_bytes > caps.sealed_bytes
+        || usage.total().is_none_or(|total| total > caps.total_bytes)
+    {
+        return Err("schedule evidence: existing hot storage usage exceeds quota".into());
+    }
+    Ok(*usage)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3438,7 +3466,7 @@ where
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct EvidenceHotStoreV1 {
     root: local_file::PinnedDirectory,
-    _state: local_file::PinnedDirectory,
+    state: local_file::PinnedDirectory,
     scratch: local_file::PinnedDirectory,
     sealed: local_file::PinnedDirectory,
 }
@@ -3465,7 +3493,7 @@ impl EvidenceHotStoreV1 {
         }
         Ok(Self {
             root: root.clone(),
-            _state: state,
+            state,
             scratch,
             sealed,
         })
@@ -3474,6 +3502,11 @@ impl EvidenceHotStoreV1 {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn root_sha256(&self) -> &str {
         self.root.object_sha256()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn root_directory(&self) -> &local_file::PinnedDirectory {
+        &self.root
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -3598,6 +3631,169 @@ fn write_verified_payload_file(
     Ok(())
 }
 
+fn expected_payload_files(prepared: &PreparedSealedEvidenceV1) -> [(&'static str, &[u8], &str); 2] {
+    [
+        (
+            "evidence.tar.gz",
+            prepared.archive.as_slice(),
+            prepared.archive_sha256.as_str(),
+        ),
+        (
+            "manifest.json",
+            prepared.manifest.as_slice(),
+            prepared.manifest_sha256.as_str(),
+        ),
+    ]
+}
+
+fn inspect_expected_payload_directory(
+    parent: &local_file::PinnedDirectory,
+    name: &str,
+    expected: &[(&str, &[u8], &str)],
+    label: &str,
+) -> Result<(Option<local_file::PinnedDirectory>, u64), BoxError> {
+    let Some(directory) = parent.open_child_directory_optional(OsStr::new(name), label)? else {
+        return Ok((None, 0));
+    };
+    validate_private_directory_metadata(&directory.file_handle().metadata()?, label)?;
+    let mut names = std::fs::read_dir(directory.acp_session_cwd())?
+        .map(|entry| {
+            entry?
+                .file_name()
+                .into_string()
+                .map_err(|_| std::io::Error::other("payload child is not UTF-8"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    if names.len() > expected.len()
+        || names
+            .iter()
+            .any(|name| !expected.iter().any(|(expected, _, _)| name == expected))
+    {
+        return Err(format!("schedule evidence: {label} has an unexpected child").into());
+    }
+    let mut bytes = 0_u64;
+    for (child_name, expected_bytes, expected_sha256) in expected {
+        let Some(metadata) = directory.child_metadata_no_follow(OsStr::new(child_name), label)?
+        else {
+            continue;
+        };
+        if !metadata.is_regular()
+            || metadata.link_count() != 1
+            || metadata.owner_uid() != unsafe { libc::geteuid() }
+            || metadata.permission_mode() != STATE_FILE_MODE
+            || metadata.length() != expected_bytes.len() as u64
+        {
+            return Err(format!("schedule evidence: {label} child metadata changed").into());
+        }
+        let file = directory.open_regular_file(OsStr::new(child_name), label)?;
+        validate_private_file_metadata(&file.metadata()?, label)?;
+        let snapshot =
+            local_file::read_open_regular_file_bounded(&file, label, expected_bytes.len() as u64)?;
+        if snapshot.bytes != *expected_bytes || snapshot.sha256 != *expected_sha256 {
+            return Err(format!("schedule evidence: {label} child bytes changed").into());
+        }
+        bytes = bytes
+            .checked_add(snapshot.bytes.len() as u64)
+            .ok_or("schedule evidence: payload residue byte count overflow")?;
+    }
+    if !directory.current_path_matches() || !parent.current_path_matches() {
+        return Err(format!("schedule evidence: {label} path changed").into());
+    }
+    Ok((Some(directory), bytes))
+}
+
+fn ensure_expected_payload_file(
+    directory: &local_file::PinnedDirectory,
+    child_name: &str,
+    bytes: &[u8],
+    sha256: &str,
+    label: &str,
+) -> Result<(), BoxError> {
+    if directory
+        .child_metadata_no_follow(OsStr::new(child_name), label)?
+        .is_none()
+    {
+        write_verified_payload_file(directory, child_name, bytes, sha256)?;
+    }
+    directory.sync()?;
+    let file = directory.open_regular_file(OsStr::new(child_name), label)?;
+    validate_private_file_metadata(&file.metadata()?, label)?;
+    let snapshot = local_file::read_open_regular_file_bounded(&file, label, bytes.len() as u64)?;
+    if snapshot.bytes != bytes || snapshot.sha256 != sha256 {
+        return Err(format!("schedule evidence: {label} child bytes changed").into());
+    }
+    Ok(())
+}
+
+fn measure_flat_private_file_bytes(
+    directory: &local_file::PinnedDirectory,
+    label: &str,
+) -> Result<u64, BoxError> {
+    if !directory.current_path_matches() {
+        return Err(format!("schedule evidence: {label} path changed").into());
+    }
+    let mut bytes = 0_u64;
+    let mut entries = 0_usize;
+    for entry in std::fs::read_dir(directory.acp_session_cwd())? {
+        let name = entry?.file_name();
+        let metadata = directory
+            .child_metadata_no_follow(&name, label)?
+            .ok_or_else(|| format!("schedule evidence: {label} entry disappeared"))?;
+        if !metadata.is_regular()
+            || metadata.link_count() != 1
+            || metadata.owner_uid() != unsafe { libc::geteuid() }
+            || metadata.permission_mode() != STATE_FILE_MODE
+        {
+            return Err(format!("schedule evidence: {label} contains an unsafe entry").into());
+        }
+        bytes = bytes
+            .checked_add(metadata.length())
+            .ok_or("schedule evidence: hot state byte count overflow")?;
+        entries += 1;
+        if entries > MAX_EVIDENCE_ITEMS * 4 {
+            return Err(format!("schedule evidence: {label} inventory exceeds its bound").into());
+        }
+    }
+    if !directory.current_path_matches() {
+        return Err(format!("schedule evidence: {label} changed during measurement").into());
+    }
+    Ok(bytes)
+}
+
+fn measure_payload_root_bytes(
+    directory: &local_file::PinnedDirectory,
+    label: &str,
+) -> Result<u64, BoxError> {
+    let names = list_payload_children(directory, label)?;
+    let mut bytes = 0_u64;
+    for name in names {
+        let payload = directory.open_child_directory(OsStr::new(&name), label)?;
+        validate_private_directory_metadata(&payload.file_handle().metadata()?, label)?;
+        bytes = bytes
+            .checked_add(measure_flat_private_file_bytes(&payload, label)?)
+            .ok_or("schedule evidence: hot payload byte count overflow")?;
+    }
+    Ok(bytes)
+}
+
+fn measure_hot_storage_usage(
+    store: &EvidenceHotStoreV1,
+    journal: &FileEvidenceJournal<'_>,
+) -> Result<HotStorageUsageV1, BoxError> {
+    let state_bytes = FileEvidenceJournal::persisted_bytes(journal.directory)?
+        .checked_add(measure_flat_private_file_bytes(
+            &store.state,
+            "hot evidence state",
+        )?)
+        .ok_or("schedule evidence: hot state usage overflow")?;
+    Ok(HotStorageUsageV1 {
+        state_bytes,
+        scratch_bytes: measure_payload_root_bytes(&store.scratch, "scratch payload")?,
+        sealed_bytes: measure_payload_root_bytes(&store.sealed, "sealed payload")?,
+    })
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn payload_object_name(evidence_id: &str) -> Result<String, BoxError> {
     stable_id("payload evidence id", evidence_id)?;
@@ -3697,9 +3893,6 @@ pub(super) fn inspect_unindexed_evidence(
     Ok(UnindexedEvidenceV1 { scratch, sealed })
 }
 
-// The explicit arguments are independently revalidated publication capabilities and bounds;
-// grouping them would hide which identity is fenced at the effect boundary.
-#[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn publish_prepared_evidence(
     store: &EvidenceHotStoreV1,
@@ -3707,7 +3900,6 @@ pub(super) fn publish_prepared_evidence(
     state: &mut EvidenceStateModelV1,
     prepared: &PreparedSealedEvidenceV1,
     caps: &HotStorageCapsV1,
-    usage: &HotStorageUsageV1,
     recorded_at_ms: i64,
     failpoint: SealPublicationFailpointV1,
 ) -> Result<PublishedEvidenceV1, BoxError> {
@@ -3727,8 +3919,7 @@ pub(super) fn publish_prepared_evidence(
     let hot_path = RelativeEvidencePathV1 {
         components: vec!["sealed".into(), object_name.clone()],
     };
-    let mut candidate = state.clone();
-    candidate.insert_entry(IndexedEvidenceV1 {
+    let indexed_entry = IndexedEvidenceV1 {
         evidence_id: prepared.evidence_id.clone(),
         evidence_class: prepared.evidence_class,
         full_evidence_sha256: prepared.archive_sha256.clone(),
@@ -3746,7 +3937,61 @@ pub(super) fn publish_prepared_evidence(
         compact_retain_until_ms: retention.compact_retain_until_ms,
         hot_retain_until_ms: retention.hot_retain_until_ms,
         hot_present: true,
-    })?;
+    };
+    let expected_files = expected_payload_files(prepared);
+    let sealed_bytes = (prepared.archive.len() as u64)
+        .checked_add(prepared.manifest.len() as u64)
+        .ok_or("schedule evidence: sealed payload byte overflow")?;
+    let scratch_name = format!("{object_name}.partial");
+
+    if let Some(existing) = state.entries.get(&prepared.evidence_id) {
+        if existing != &indexed_entry || journal.previous_snapshot.state != *state {
+            return Err("schedule evidence: existing publication identity diverged".into());
+        }
+        if prepared.evidence_class == EvidenceClassV1::Incident {
+            let pin_id = incident_pin_id(&prepared.evidence_id)?;
+            if !state.pins.get(&pin_id).is_some_and(|pin| {
+                pin.evidence_id == prepared.evidence_id && pin.lifecycle == PinLifecycleV1::Active
+            }) {
+                return Err("schedule evidence: existing incident publication lost its pin".into());
+            }
+        }
+        let (_, persisted_sealed_bytes) = inspect_expected_payload_directory(
+            &store.sealed,
+            &object_name,
+            &expected_files,
+            "sealed evidence recovery payload",
+        )?;
+        if persisted_sealed_bytes != sealed_bytes {
+            return Err("schedule evidence: indexed sealed payload is incomplete".into());
+        }
+        let (scratch, persisted_scratch_bytes) = inspect_expected_payload_directory(
+            &store.scratch,
+            &scratch_name,
+            &expected_files,
+            "scratch evidence recovery payload",
+        )?;
+        if scratch.is_some() && persisted_scratch_bytes != sealed_bytes {
+            return Err("schedule evidence: indexed scratch payload is incomplete".into());
+        }
+        let scratch_cleanup_required = scratch.is_some_and(|scratch| {
+            cleanup_complete_scratch_payload(&store.scratch, &scratch_name, &scratch).is_err()
+        });
+        let usage = measure_hot_storage_usage(store, journal)?;
+        reserve_optional_hot_bytes(caps, &usage, HotAllocationV1::State, 0)?;
+        let snapshot = journal.previous_snapshot.clone();
+        let snapshot_sha256 = evidence_state_snapshot_sha256(&snapshot)?;
+        return Ok(PublishedEvidenceV1 {
+            snapshot,
+            snapshot_sha256,
+            usage,
+            hot_path,
+            scratch_cleanup_required,
+        });
+    }
+
+    let mut candidate = state.clone();
+    candidate.insert_entry(indexed_entry)?;
     if prepared.evidence_class == EvidenceClassV1::Incident {
         candidate.pin(EvidencePinV1 {
             pin_id: incident_pin_id(&prepared.evidence_id)?,
@@ -3757,63 +4002,108 @@ pub(super) fn publish_prepared_evidence(
         })?;
     }
     let next_snapshot = journal.validate_append_candidate(&candidate, recorded_at_ms)?;
-
-    let sealed_bytes = (prepared.archive.len() as u64)
-        .checked_add(prepared.manifest.len() as u64)
-        .ok_or("schedule evidence: sealed payload byte overflow")?;
+    let (_, existing_scratch_bytes) = inspect_expected_payload_directory(
+        &store.scratch,
+        &scratch_name,
+        &expected_files,
+        "scratch evidence recovery payload",
+    )?;
+    let (_, existing_sealed_bytes) = inspect_expected_payload_directory(
+        &store.sealed,
+        &object_name,
+        &expected_files,
+        "sealed evidence recovery payload",
+    )?;
+    let missing_scratch_bytes = sealed_bytes
+        .checked_sub(existing_scratch_bytes)
+        .ok_or("schedule evidence: scratch residue exceeds expected payload")?;
+    let missing_sealed_bytes = sealed_bytes
+        .checked_sub(existing_sealed_bytes)
+        .ok_or("schedule evidence: sealed residue exceeds expected payload")?;
+    let usage = measure_hot_storage_usage(store, journal)?;
     let state_bytes = u64::try_from(evidence_state_snapshot_bytes(&next_snapshot)?.len())?;
-    let after_state = reserve_hot_bytes(caps, usage, HotAllocationV1::State, state_bytes)?;
-    let peak_scratch =
-        reserve_hot_bytes(caps, &after_state, HotAllocationV1::Scratch, sealed_bytes)?;
-    let _peak_both = reserve_hot_bytes(caps, &peak_scratch, HotAllocationV1::Sealed, sealed_bytes)?;
-    let steady_usage =
-        reserve_hot_bytes(caps, &after_state, HotAllocationV1::Sealed, sealed_bytes)?;
+    let after_state = reserve_hot_bytes(caps, &usage, HotAllocationV1::State, state_bytes)?;
+    let peak_scratch = reserve_optional_hot_bytes(
+        caps,
+        &after_state,
+        HotAllocationV1::Scratch,
+        missing_scratch_bytes,
+    )?;
+    let _peak_both = reserve_optional_hot_bytes(
+        caps,
+        &peak_scratch,
+        HotAllocationV1::Sealed,
+        missing_sealed_bytes,
+    )?;
 
-    let scratch_name = format!("{object_name}.partial");
-    let scratch = store.scratch.create_child_directory(
+    let scratch = store.scratch.open_or_create_child_directory(
         OsStr::new(&scratch_name),
         0o700,
         "evidence scratch payload",
     )?;
+    validate_private_directory_metadata(
+        &scratch.file_handle().metadata()?,
+        "evidence scratch payload",
+    )?;
     store.scratch.sync()?;
-    write_verified_payload_file(
+    inspect_expected_payload_directory(
+        &store.scratch,
+        &scratch_name,
+        &expected_files,
+        "evidence scratch payload",
+    )?;
+    ensure_expected_payload_file(
         &scratch,
         "evidence.tar.gz",
         &prepared.archive,
         &prepared.archive_sha256,
+        "evidence scratch archive",
     )?;
     if failpoint == SealPublicationFailpointV1::AfterScratchArchive {
         return Err("schedule evidence: injected crash after scratch archive".into());
     }
-    write_verified_payload_file(
+    ensure_expected_payload_file(
         &scratch,
         "manifest.json",
         &prepared.manifest,
         &prepared.manifest_sha256,
+        "evidence scratch manifest",
     )?;
     scratch.sync()?;
     store.scratch.sync()?;
 
-    let sealed = store.sealed.create_child_directory(
+    let sealed = store.sealed.open_or_create_child_directory(
         OsStr::new(&object_name),
         0o700,
         "sealed evidence payload",
     )?;
+    validate_private_directory_metadata(
+        &sealed.file_handle().metadata()?,
+        "sealed evidence payload",
+    )?;
     store.sealed.sync()?;
-    write_verified_payload_file(
+    inspect_expected_payload_directory(
+        &store.sealed,
+        &object_name,
+        &expected_files,
+        "sealed evidence payload",
+    )?;
+    ensure_expected_payload_file(
         &sealed,
         "evidence.tar.gz",
         &prepared.archive,
         &prepared.archive_sha256,
+        "sealed evidence archive",
     )?;
     if failpoint == SealPublicationFailpointV1::AfterSealedArchive {
         return Err("schedule evidence: injected crash after sealed archive".into());
     }
-    write_verified_payload_file(
+    ensure_expected_payload_file(
         &sealed,
         "manifest.json",
         &prepared.manifest,
         &prepared.manifest_sha256,
+        "sealed evidence manifest",
     )?;
     sealed.sync()?;
     store.sealed.sync()?;
@@ -3828,10 +4118,11 @@ pub(super) fn publish_prepared_evidence(
     *state = candidate;
     let scratch_cleanup_required =
         cleanup_complete_scratch_payload(&store.scratch, &scratch_name, &scratch).is_err();
+    let usage = measure_hot_storage_usage(store, journal)?;
     Ok(PublishedEvidenceV1 {
         snapshot,
         snapshot_sha256,
-        usage: steady_usage,
+        usage,
         hot_path,
         scratch_cleanup_required,
     })
@@ -4756,7 +5047,6 @@ pub(super) fn migrate_incident_evidence(
         state,
         &prepared,
         caps,
-        usage,
         recorded_at_ms,
         SealPublicationFailpointV1::None,
     )?;
@@ -5349,7 +5639,11 @@ mod tests {
             .unwrap();
         let pending = EvidenceStateSnapshotV1::first(state.clone(), 20_000_000_000).unwrap();
         state
-            .complete_tombstone("tombstone-1", pending.recorded_at_ms - 1)
+            .complete_tombstone(FullEvidenceUnlinkProofV1::for_test(
+                "tombstone-1",
+                "evidence-1",
+                pending.recorded_at_ms - 1,
+            ))
             .unwrap();
         let next = pending
             .successor(state, pending.recorded_at_ms + 1)
@@ -5394,7 +5688,11 @@ mod tests {
             .unwrap();
         let previous = EvidenceStateSnapshotV1::first(state.clone(), 20_000_000_000).unwrap();
         state
-            .complete_tombstone("tombstone-1", previous.recorded_at_ms + 2)
+            .complete_tombstone(FullEvidenceUnlinkProofV1::for_test(
+                "tombstone-1",
+                "evidence-1",
+                previous.recorded_at_ms + 2,
+            ))
             .unwrap();
         assert!(previous
             .successor(state, previous.recorded_at_ms + 1)
@@ -5630,7 +5928,11 @@ mod tests {
             )
             .unwrap();
         state
-            .complete_tombstone("tombstone-1", previous.recorded_at_ms + 2)
+            .complete_tombstone(FullEvidenceUnlinkProofV1::for_test(
+                "tombstone-1",
+                "evidence-1",
+                previous.recorded_at_ms + 2,
+            ))
             .unwrap();
         let next = previous
             .successor(state, previous.recorded_at_ms + 3)
@@ -5658,7 +5960,11 @@ mod tests {
         assert!(state.entries.contains_key("evidence-1"));
 
         state
-            .complete_tombstone("tombstone-1", 20_000_000_003)
+            .complete_tombstone(FullEvidenceUnlinkProofV1::for_test(
+                "tombstone-1",
+                "evidence-1",
+                20_000_000_003,
+            ))
             .unwrap();
         let complete = pending.successor(state.clone(), 20_000_000_004).unwrap();
         validate_evidence_state_transition(&pending, &complete).unwrap();
@@ -5843,6 +6149,31 @@ mod tests {
     }
 
     #[test]
+    fn evidence_journal_refuses_a_generation_beyond_its_reopen_bound() {
+        let fixture = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(fixture.path()).unwrap();
+        let owner = scheduler
+            .try_owner_admission("test/evidence-generation-bound")
+            .unwrap();
+        let state = model();
+        let opened = FileEvidenceJournal::initialize(&owner, &state, 1).unwrap();
+        let over_bound = EvidenceStateSnapshotV1 {
+            schema_version: 1,
+            generation: u64::try_from(MAX_STATE_GENERATIONS).unwrap() + 1,
+            previous_record: OptionalSha256V1::Sha256 { value: digest('f') },
+            recorded_at_ms: 2,
+            state,
+        };
+
+        assert!(opened.journal.persist(&over_bound).is_err());
+        assert!(!owner
+            .evidence_index_directory()
+            .canonical_path()
+            .join(FileEvidenceJournal::generation_name(over_bound.generation))
+            .exists());
+    }
+
+    #[test]
     fn quota_gc_selects_only_eligible_unpinned_oldest_evidence() {
         let now = 90 * DAY_MS;
         let mut state = EvidenceStateModelV1::new(
@@ -5899,7 +6230,11 @@ mod tests {
             .begin_tombstone("tombstone-1", "evidence-1", "quota_gc", 20_000_000_000)
             .unwrap();
         state
-            .complete_tombstone("tombstone-1", 20_000_000_001)
+            .complete_tombstone(FullEvidenceUnlinkProofV1::for_test(
+                "tombstone-1",
+                "evidence-1",
+                20_000_000_001,
+            ))
             .unwrap();
         let tombstone = state.tombstones.get("tombstone-1").unwrap();
         assert_eq!(tombstone.evidence_id, "evidence-1");
@@ -5944,7 +6279,11 @@ mod tests {
             .begin_tombstone("tombstone-1", "evidence-1", "quota_gc", 20_000_000_000)
             .unwrap();
         state
-            .complete_tombstone("tombstone-1", 20_000_000_001)
+            .complete_tombstone(FullEvidenceUnlinkProofV1::for_test(
+                "tombstone-1",
+                "evidence-1",
+                20_000_000_001,
+            ))
             .unwrap();
         let tombstone = state.tombstones.get_mut("tombstone-1").unwrap();
         let mut compact: CompactEvidenceRecordV1 =
@@ -6277,7 +6616,6 @@ mod tests {
             &mut state,
             &prepared,
             &HotStorageCapsV1::approved(),
-            &empty_hot_usage(),
             1_000_002,
             SealPublicationFailpointV1::None,
         )
@@ -6295,9 +6633,16 @@ mod tests {
         );
         assert_eq!(
             published.usage.state_bytes,
-            evidence_state_snapshot_bytes(&published.snapshot)
+            std::fs::read_dir(state_root.path().join("evidence-index"))
                 .unwrap()
-                .len() as u64
+                .filter_map(|entry| {
+                    let entry = entry.unwrap();
+                    let name = entry.file_name();
+                    let name = name.to_str().unwrap();
+                    (name.starts_with("evidence-state.") && name.ends_with(".json"))
+                        .then(|| entry.metadata().unwrap().len())
+                })
+                .sum::<u64>()
         );
         let indexed = state.entries.get("schedule-1").unwrap();
         assert_eq!(indexed.full_evidence_sha256, prepared.archive_sha256);
@@ -6327,17 +6672,17 @@ mod tests {
         let reopened = FileEvidenceJournal::open_existing(&lock).unwrap();
         assert_eq!(reopened.snapshot.generation, 2);
         assert!(reopened.snapshot.state.entries.contains_key("schedule-1"));
-        assert!(publish_prepared_evidence(
+        let repeated = publish_prepared_evidence(
             &store,
             &mut opened.journal,
             &mut state,
             &prepared,
             &HotStorageCapsV1::approved(),
-            &published.usage,
             1_000_003,
             SealPublicationFailpointV1::None,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(repeated.snapshot.generation, 2);
         assert!(inspect_unindexed_evidence(&store, &state)
             .unwrap()
             .is_empty());
@@ -6369,7 +6714,6 @@ mod tests {
                 &mut state,
                 &prepared,
                 &HotStorageCapsV1::approved(),
-                &empty_hot_usage(),
                 1_000_002,
                 failpoint,
             )
@@ -6405,6 +6749,22 @@ mod tests {
                 SealPublicationFailpointV1::None
                 | SealPublicationFailpointV1::AfterIndexPublication => unreachable!(),
             }
+
+            let recovered = publish_prepared_evidence(
+                &store,
+                &mut opened.journal,
+                &mut state,
+                &prepared,
+                &HotStorageCapsV1::approved(),
+                1_000_003,
+                SealPublicationFailpointV1::None,
+            )
+            .unwrap();
+            assert_eq!(recovered.snapshot.generation, 2);
+            assert!(state.entries.contains_key("schedule-1"));
+            assert!(inspect_unindexed_evidence(&store, &state)
+                .unwrap()
+                .is_empty());
         }
     }
 
@@ -6428,7 +6788,6 @@ mod tests {
             &mut state,
             &prepared,
             &HotStorageCapsV1::approved(),
-            &empty_hot_usage(),
             1_000_002,
             SealPublicationFailpointV1::AfterIndexPublication,
         )
@@ -6439,6 +6798,65 @@ mod tests {
         let residue = inspect_unindexed_evidence(&store, &reopened.snapshot.state).unwrap();
         assert_eq!(residue.scratch.len(), 1);
         assert!(residue.sealed.is_empty());
+
+        let mut recovered_state = reopened.snapshot.state.clone();
+        let mut recovered_journal = reopened.journal;
+        let recovered = publish_prepared_evidence(
+            &store,
+            &mut recovered_journal,
+            &mut recovered_state,
+            &prepared,
+            &HotStorageCapsV1::approved(),
+            1_000_003,
+            SealPublicationFailpointV1::None,
+        )
+        .unwrap();
+        assert_eq!(recovered.snapshot.generation, 2);
+        assert!(inspect_unindexed_evidence(&store, &recovered_state)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn publication_measures_unindexed_residue_before_enforcing_the_live_cap() {
+        let prepared = prepared_evidence();
+        let (hot_root, store) = test_hot_store();
+        let residue = hot_root.path().join("sealed/crash-residue");
+        std::fs::create_dir(&residue).unwrap();
+        std::fs::set_permissions(&residue, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_private(&residue.join("evidence.tar.gz"), b"residue\n");
+
+        let state_root = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(state_root.path()).unwrap();
+        let lock = scheduler
+            .try_owner_admission("test/evidence-live-cap-residue")
+            .unwrap();
+        let mut state =
+            EvidenceStateModelV1::new(store.root_sha256().to_owned(), ColdStorageBindingV1::Absent)
+                .unwrap();
+        let mut opened = FileEvidenceJournal::initialize(&lock, &state, 1_000_001).unwrap();
+        let new_sealed_bytes = (prepared.archive.len() + prepared.manifest.len()) as u64;
+        let residue_bytes = b"residue\n".len() as u64;
+        let caps = HotStorageCapsV1 {
+            total_bytes: HOT_STATE_CAP_BYTES + new_sealed_bytes + new_sealed_bytes + residue_bytes
+                - 1,
+            state_bytes: HOT_STATE_CAP_BYTES,
+            scratch_bytes: new_sealed_bytes,
+            sealed_bytes: new_sealed_bytes + residue_bytes - 1,
+        };
+
+        assert!(publish_prepared_evidence(
+            &store,
+            &mut opened.journal,
+            &mut state,
+            &prepared,
+            &caps,
+            1_000_002,
+            SealPublicationFailpointV1::None,
+        )
+        .is_err());
+        assert!(state.entries.is_empty());
+        assert!(residue.exists());
     }
 
     #[test]
@@ -6463,7 +6881,6 @@ mod tests {
             &mut state,
             &tampered,
             &HotStorageCapsV1::approved(),
-            &empty_hot_usage(),
             1_000_002,
             SealPublicationFailpointV1::None,
         )
@@ -6484,7 +6901,6 @@ mod tests {
             &mut state,
             &prepared,
             &caps,
-            &empty_hot_usage(),
             1_000_002,
             SealPublicationFailpointV1::None,
         )
@@ -6499,7 +6915,6 @@ mod tests {
             &mut state,
             &prepared,
             &HotStorageCapsV1::approved(),
-            &empty_hot_usage(),
             1_000_001,
             SealPublicationFailpointV1::None,
         )
@@ -6521,7 +6936,6 @@ mod tests {
             &mut state,
             &prepared,
             &HotStorageCapsV1::approved(),
-            &empty_hot_usage(),
             1_000_002,
             SealPublicationFailpointV1::None,
         )
@@ -6557,19 +6971,12 @@ mod tests {
             scratch_bytes: sealed_bytes,
             sealed_bytes,
         };
-        let usage = HotStorageUsageV1 {
-            state_bytes: existing_state_bytes,
-            scratch_bytes: 0,
-            sealed_bytes: 0,
-        };
-
         assert!(publish_prepared_evidence(
             &store,
             &mut opened.journal,
             &mut state,
             &prepared,
             &caps,
-            &usage,
             1_000_002,
             SealPublicationFailpointV1::None,
         )
@@ -6606,7 +7013,6 @@ mod tests {
             &mut state,
             &prepared,
             &HotStorageCapsV1::approved(),
-            &empty_hot_usage(),
             1_000_002,
             SealPublicationFailpointV1::None,
         )
@@ -7282,7 +7688,6 @@ mod tests {
             &mut state,
             &prepared,
             &HotStorageCapsV1::approved(),
-            &empty_hot_usage(),
             1_000_002,
             SealPublicationFailpointV1::None,
         )

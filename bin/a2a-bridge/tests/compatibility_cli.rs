@@ -6,7 +6,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[test]
-fn schedule_status_is_read_only_explicit_and_supports_json() {
+fn top_level_help_discovers_the_read_only_schedule_status_surface() {
+    let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("schedule status [--json]"), "{stdout}");
+}
+
+#[test]
+fn schedule_status_does_not_write_the_caller_home_or_echo_credential_environment() {
     let home = tempfile::tempdir().unwrap();
     let before = fs::read_dir(home.path()).unwrap().count();
 
