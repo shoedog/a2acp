@@ -74,6 +74,22 @@ manifest **9**, recipes **4**, foundation **6/4**, scheduler CLI **25/0 + 31/0 +
 and canonical full serial workspace **2,510/0/12 ignored** across **72** groups (**55** nonempty). Its 215,224-byte
 canonical log has SHA-256 `608aaa7136fa24655341d5e9aeccfb668b80de46ee82bde9bb94e751f210c4d9`; the
 provider-unexercised 26,793,312-byte release binary has SHA-256
+`a5f08c29a161cee2e5da6742e980c00018f597a9814f93dd8f4b9c30728f4aa4`. Exact docs head
+`5c1e03ec825b97132a906395f6a7096c96b1ac6d` reproduced those gates and received a seventh Sol/xhigh **REVISE**.
+All seventeen inherited findings were resolved. One fresh High `WRONG` showed that the branch-new admission-control
+quarantine chain remained a sixth direct-final journal writer, so process death during write/sync could poison
+every reopen with a truncated committed-looking control generation. Its 12,852-byte artifact has SHA-256
+`0af09fcb45b336a54b066e3fc9317b7a9c34347a69a74e76c9aea948613f2e20`.
+
+Seventh remediation is checkpointed at `34bcfcd`. Quarantine opening and closure now use the shared atomic append
+primitive and recover exact private residue before aggregate state-quota accounting. The injected interruption and
+independently precreated truncated-residue regressions each failed **0/1** on the reviewed writer and now pass;
+transaction/control is **32/0**. Exact source commit `34bcfcd` passes format/diff, workspace all-target/all-feature
+warnings-denied check and Clippy, dependency policy, locked release workspace build, hygiene **37/7**, manifest
+**9**, recipes **4**, foundation **6/4**, scheduler CLI **25/0 + 31/0 + 2/0**, complete binary **772/0/0**, and
+canonical full serial workspace **2,512/0/12 ignored** across **72** groups (**55** nonempty). Its 215,487-byte log
+has SHA-256 `eb3cd35270d6e08be92f45c7ed4d5a09e559b4fb75dfcae482357bf5b8883151`; the provider-unexercised
+26,793,312-byte release binary remains SHA-256
 `a5f08c29a161cee2e5da6742e980c00018f597a9814f93dd8f4b9c30728f4aa4`. The docs-only commit containing this
 evidence is the intended next review head. No approval is claimed. This slice remains local, non-billable,
 default-off, and has one merge boundary.
@@ -484,9 +500,24 @@ deterministic gate, complete binary **770/0/0**, and canonical full serial works
 **72** result groups (**55** nonempty). The complete log is 215,224 bytes at SHA-256
 `608aaa7136fa24655341d5e9aeccfb668b80de46ee82bde9bb94e751f210c4d9`; the provider-unexercised release binary is
 26,793,312 bytes at SHA-256 `a5f08c29a161cee2e5da6742e980c00018f597a9814f93dd8f4b9c30728f4aa4`.
-The docs-only commit containing this paragraph is the intended next review head. Reproduce deterministic gates on
-that exact unchanged head as supplied review evidence, then run fresh Sol closure rereview without another docs
-fold. No approval is claimed yet.
+Exact docs head `5c1e03ec825b97132a906395f6a7096c96b1ac6d` reproduced those gates. Fresh Sol/xhigh/read-only
+closure rereview returned a seventh **REVISE** after marking all seventeen inherited findings resolved. Its sole
+fresh High `WRONG` was the branch-new admission-control quarantine chain: opening and closure still created final
+`admission-control.N.json` names before complete write and file sync, so process death could leave a permanent
+corrupt tail. The 12,852-byte review artifact has SHA-256
+`0af09fcb45b336a54b066e3fc9317b7a9c34347a69a74e76c9aea948613f2e20`.
+
+Seventh remediation commit `34bcfcd` moves that sixth journal writer onto the shared descriptor-relative atomic
+append primitive, with exact private-residue recovery before aggregate quota accounting. Its pre-publication
+failpoint and independently precreated truncated-residue assertions each failed **0/1** on the reviewed mechanism
+and now pass. Transaction/control is **32/0**. Exact source head `34bcfcd` passes every deterministic gate, complete
+binary **772/0/0**, and canonical full serial workspace **2,512/0/12 ignored** across **72** result groups (**55**
+nonempty). The complete log is 215,487 bytes at SHA-256
+`eb3cd35270d6e08be92f45c7ed4d5a09e559b4fb75dfcae482357bf5b8883151`; the provider-unexercised release binary
+remains 26,793,312 bytes at SHA-256
+`a5f08c29a161cee2e5da6742e980c00018f597a9814f93dd8f4b9c30728f4aa4`. The docs-only commit containing this
+paragraph is the intended next review head. Reproduce deterministic gates on that exact unchanged head as supplied
+review evidence, then run fresh Sol closure rereview without another docs fold. No approval is claimed yet.
 
 One dogfood incident is deliberately deferred outside R3d3 correctness. Operator release `983398427c9f0486`
 served a healthy agent card/model catalog and green Codex doctor/provenance checks with zero unfinished tasks and
