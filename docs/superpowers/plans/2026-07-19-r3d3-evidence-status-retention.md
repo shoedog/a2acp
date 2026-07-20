@@ -1,9 +1,9 @@
 # R3d3 — evidence, status, and retention implementation plan
 
-**Status:** R3d3a through R3d3d are checkpointed at `21427e6`, `739495a`, `7ed0446`, and `84fbbf3` on
+**Status:** R3d3a through R3d3e are checkpointed at `21427e6`, `739495a`, `7ed0446`, `84fbbf3`, and `33ec5c3` on
 `agent/reliability-r3d3-evidence-retention` from merged R3d2 `origin/main`
-`06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41); R3d3e is next. This slice is local,
-non-billable, default-off, and has one merge boundary.
+`06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41); full deterministic release gates are next. This
+slice is local, non-billable, default-off, and has one merge boundary.
 
 The approved design of record is
 [`2026-07-11-r3-compatibility-canaries.md`](2026-07-11-r3-compatibility-canaries.md), especially D4/D8,
@@ -233,6 +233,17 @@ pending; duplicate/conflicting remote observation; green-to-red/recovery/auth/mi
 dedupe; notification failure; repeated unknown audit without suppression; fake quarantine opening hash; replaced
 opening file; absent/corrupt status state; JSON/human rendering; and production-root absence with zero writes.
 
+Checkpoint `33ec5c3` implements a contiguous owner-private publication-outbox chain with exact persisted remote
+observations and recovery-only actions; degraded-by-construction status plus append-only status/notification
+journals; recurrence-safe transition dedupe and ambiguous-delivery terminalization behind a fake sink; and an
+admission-control quarantine chain whose close reopens and hashes the exact immutable opening under the owner lock.
+It also adds the read-only status CLI without creating production state or reading provider credentials. Targeted
+mutations proved the terminal outbox-phase guard, nonhealthy-source degradation, and quarantine source reread
+(**0/1** each before restoration). Corrected focused gates are outbox **5/0**, status **7/0**, transaction/control
+**30/0**, compatibility CLI **24/0**, evidence **43/0**, retention/GC **19/0**, retained state **19/0**, strict
+schema **32/0**, and descriptor-local file **12/0**. Format, diff, and package all-target warnings-denied Clippy
+are green. Full-workspace and release gates remain pending for the complete R3d3 review candidate.
+
 ## Verification and review gates
 
 1. Add each focused test before its mechanism, run it against the pre-change state or a one-mechanism mutation, and
@@ -270,7 +281,8 @@ admitted handoff, independent storage consent, unchanged aggregate v1, and typed
 
 R3d2 merged by PR #41 with CI/CLA green. Its final local gate was complete binary **655/0/0** and canonical full
 workspace **2,392/0/12 ignored** across **72** result groups (**55** nonempty); the twelve ignored tests remain
-authenticated/live-provider integration tests. R3d3a through R3d3d are checkpointed at `21427e6`, `739495a`,
-`7ed0446`, and `84fbbf3`; the latest focused gates are evidence **43/0**, retention/GC **19/0**, retained state
-**19/0**, strict schema **32/0**, and descriptor-local file **12/0**. Continue with R3d3e. No production operator
-rebuild or swap is part of this slice.
+authenticated/live-provider integration tests. R3d3a through R3d3e are checkpointed at `21427e6`, `739495a`,
+`7ed0446`, `84fbbf3`, and `33ec5c3`; the latest focused gates are outbox **5/0**, status **7/0**, transaction/
+control **30/0**, compatibility CLI **24/0**, evidence **43/0**, retention/GC **19/0**, retained state **19/0**,
+strict schema **32/0**, and descriptor-local file **12/0**. Run the full deterministic release gates next, then
+freeze the exact review boundary. No production operator rebuild or swap is part of this slice.
