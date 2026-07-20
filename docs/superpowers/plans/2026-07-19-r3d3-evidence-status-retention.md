@@ -30,6 +30,27 @@ release workspace build, hygiene **37/7**, manifest **9**, recipes **4**, founda
 across **72** groups (**55** nonempty). Its 214,028-byte canonical log has SHA-256
 `25c13f5fc9aa8dedffda511d59c29ecabe96851f7e083e273b6428597557bb47`; the provider-unexercised 26,793,312-byte
 release binary has SHA-256 `57b47f37725e64a92fc28641121395c0915aac95edb60dae8c4974dbb919ba1e`.
+Exact docs head `df2419498ecdf666fd665bd63e1be35c1d2b1f5f` reproduced those gates and received a fifth Sol/xhigh
+**REVISE**. All fourteen inherited findings were resolved. One new Medium `WRONG` showed that initial cold
+publication could accept an `Unknown` or `Unavailable` object observation and durably install `Published` without
+a storage-integrity hold. One `SMELL` showed that runtime-image inventory and removal were separate without a
+contractually atomic running/stopped-reference recheck. The 11,334-byte review artifact has SHA-256
+`76aa06c567b5f131375801e0e6d2698d99d2d493ed43c468d5d7e4b8e00f3f8b`.
+
+Fifth remediation is checkpointed at `28682c1`. Initial cold uncertainty now returns a typed integrity-blocked
+outcome, durably leaves the copy `Admitted` and unindexed, retains hot bytes, and records/reuses the historical
+integrity hold. A later known observation may publish, but the hold remains and continues to block destructive hot
+eviction. The dormant runtime adapter must now hold runtime GC exclusion across a final query of every running and
+stopped reference and exact-digest removal; a typed reference found inside that critical section leaves the image
+unchanged and becomes a durable `runtime_reference_race` safe skip. The cold-uncertainty and between-inventory-and-
+remove regressions each failed **0/1** on the reviewed mechanisms and now pass, covering both uncertain states and
+both container lifecycle states. Retention/GC is **35/0**. Exact source commit `28682c1` passes format/diff,
+workspace all-target warnings-denied check and Clippy, dependency policy, locked release workspace build, hygiene
+**37/7**, manifest **9**, recipes **4**, foundation **6/4**, scheduler CLI **25/0 + 31/0 + 2/0**, complete binary
+**762/0/0**, and canonical full serial workspace **2,502/0/12 ignored** across **72** groups (**55** nonempty).
+Its 214,265-byte canonical log has SHA-256
+`706077f6db0216d33a54e44dc074016178b33c6f14ec271b5c852c38426270fd`; the provider-unexercised 26,793,312-byte
+release binary remains SHA-256 `57b47f37725e64a92fc28641121395c0915aac95edb60dae8c4974dbb919ba1e`.
 The docs-only commit containing this evidence is the intended review boundary: reproduce deterministic gates on
 that unchanged exact head and supply them to fresh Sol/xhigh closure rereview without another cursor mutation.
 This slice is local, non-billable, default-off, and has one merge boundary.
@@ -401,6 +422,24 @@ binary is **760/0/0**. Exact source head `55ef98b` passes every deterministic ga
 workspace **2,500/0/12 ignored** across **72** result groups (**55** nonempty). The complete log is 214,028 bytes at
 SHA-256 `25c13f5fc9aa8dedffda511d59c29ecabe96851f7e083e273b6428597557bb47`; the provider-unexercised release binary is
 26,793,312 bytes at SHA-256 `57b47f37725e64a92fc28641121395c0915aac95edb60dae8c4974dbb919ba1e`.
+The resulting docs head `df2419498ecdf666fd665bd63e1be35c1d2b1f5f` reproduced those gates. Fresh
+Sol/xhigh/read-only closure rereview returned a fifth **REVISE** after resolving all fourteen inherited findings.
+Its new Medium `WRONG` proved that an uncertain initial archive/manifest observation could terminalize as
+`Published` without a storage hold; its `SMELL` identified the missing atomic reference fence between runtime
+inventory and image removal. The 11,334-byte artifact has SHA-256
+`76aa06c567b5f131375801e0e6d2698d99d2d493ed43c468d5d7e4b8e00f3f8b`.
+
+Fifth remediation commit `28682c1` closes both. Initial `Unknown` or `Unavailable` observations now durably retain
+`Admitted`, hot evidence, an absent cold index, and a storage-integrity hold through a typed blocked outcome; a
+later known observation can finish publication without removing that hold. The runtime effect boundary now
+requires GC exclusion across the final running/stopped-reference query and exact-digest removal, with a typed
+reference race normalized to durable safe skip. Both exact assertions failed **0/1** on the reviewed mechanisms
+and now pass; the tests cover both uncertainty variants, known-state recovery, and both running and stopped races.
+Retention/GC is **35/0** and complete binary is **762/0/0**. Exact source head `28682c1` passes every deterministic
+gate and canonical full serial workspace **2,502/0/12 ignored** across **72** result groups (**55** nonempty). The
+complete log is 214,265 bytes at SHA-256
+`706077f6db0216d33a54e44dc074016178b33c6f14ec271b5c852c38426270fd`; the provider-unexercised release binary is
+26,793,312 bytes at SHA-256 `57b47f37725e64a92fc28641121395c0915aac95edb60dae8c4974dbb919ba1e`.
 The docs-only commit containing this paragraph is the intended review head. Reproduce deterministic gates on that
 exact unchanged head as supplied review evidence, then run fresh Sol closure rereview without another docs fold.
 No approval is claimed yet.
@@ -474,8 +513,14 @@ High `WRONG` items: policy-growable hot caps and caller-fabricable semantic stat
 closes both with canonical production-only caps and a closed owner-lifetime verified status token whose production
 derivation remains R3d5-owned. Its cap and status regressions failed **0/1 + 0/1** before the fix; evidence **47/0**,
 status **10/0**, complete binary **760/0/0**, canonical workspace **2,500/0/12 ignored** across **72** groups
-(**55** nonempty), and every deterministic gate are green. The docs-only commit containing this evidence is the
-intended review head; supply its exact-head deterministic reproduction directly to fresh Sol/xhigh closure
-rereview without another cursor mutation. Run the single Fable/xhigh release/compatibility lens only after Sol
-approval. No production operator rebuild or swap is part of this slice; preserve the deferred lifecycle-sensitive
-unary-submit incident above for later reliability investigation.
+(**55** nonempty), and every deterministic gate are green. Exact docs head `df24194` received the fifth Sol
+**REVISE**: all fourteen inherited findings were resolved, with one fresh Medium `WRONG` for uncertain initial cold
+publication and one runtime-image atomic-reference `SMELL`. Fifth remediation `28682c1` closes both through a
+typed durable publication hold and a runtime-GC-excluded reference-and-remove effect. Its exact regressions failed
+**0/1 + 0/1** before the fix; retention/GC **35/0**, binary **762/0/0**, canonical workspace
+**2,502/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic gate are green. The
+docs-only commit containing this evidence is the intended review head; supply its exact-head deterministic
+reproduction directly to fresh Sol/xhigh closure rereview without another cursor mutation. Run the single
+Fable/xhigh release/compatibility lens only after Sol approval. No production operator rebuild or swap is part of
+this slice; preserve the deferred lifecycle-sensitive unary-submit incident above for later reliability
+investigation.
