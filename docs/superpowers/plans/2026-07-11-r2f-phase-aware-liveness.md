@@ -31,11 +31,20 @@ boundary recurred against R3d2 exact `3e4508a`: no task/session/turn row or prom
 roughly two-day-old warm process tree remained alive, and the same release binary completed the review through one
 fresh one-shot bridge without touching the production generation.
 
+The incident stream later recurred against operator release `983398427c9f0486`: card/catalog and Codex
+doctor/provenance checks were healthy and there were zero unfinished tasks and zero durable sessions, yet two
+explicit unary raw-`gpt-5.6-sol`/xhigh/read-only submits failed before task, turn-log, prompt-start, or usage
+creation. The operator reports that stopping and restarting the served bridge ultimately restored the affected
+path, while one controlled exact unary reproduction after an earlier restart still failed pre-prompt. That makes
+pre/post-restart process, transport, ACP-child, and session state required evidence; it does not establish a
+session-count threshold, poisoned transport, or restart as the root cause or durable remedy.
+
 This rules out a general package/model/auth/cwd incompatibility for those incidents, but does not distinguish
 a capacity ceiling/session leak from a poisoned long-lived transport. Fifteen is evidence, not a threshold.
-No running turn, warm session, backend, image, or production operator was stopped or restarted, and no
-failed request was replayed. R2f owns this investigation and every lifecycle remedy. R3d only records that
-its fresh one-shot executions did not evaluate shared-operator health.
+The earlier isolated comparison stopped no running turn, warm session, backend, image, or production operator and
+replayed no failed request. The later stop/start was an independent operator recovery action, not an R3d gate.
+R2f owns this investigation and every lifecycle remedy. R3d only records that its fresh one-shot executions did
+not evaluate shared-operator health.
 
 ## R2f0 — Reproduction and meaningful-progress vocabulary
 
