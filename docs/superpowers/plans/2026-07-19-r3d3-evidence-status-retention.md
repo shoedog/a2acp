@@ -5,8 +5,9 @@
 `06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41). Exact candidate `db109b7` received a bridge-mediated
 Sol/xhigh adversarial implementation verdict of **REVISE** with eight `WRONG` findings and one `SMELL`; review
 evidence SHA-256 is `82375d418777611eafc6a02f92ef3f8ba478782242bcabf47f321306797a37fd`. Code remediation is checkpointed at
-`49dd5b381547c8d9f73516946d4e0f66430830bb`; focused gates are green, while exact full deterministic gates and a
-fresh Sol rereview remain next. This slice is local, non-billable, default-off, and has one merge boundary.
+`49dd5b381547c8d9f73516946d4e0f66430830bb`. Exact code-and-cursor candidate `990cf99` passes every deterministic
+release gate, and the docs-only gate-evidence fold reproduces those gates before freezing the fresh Sol/xhigh
+rereview boundary. This slice is local, non-billable, default-off, and has one merge boundary.
 
 The approved design of record is
 [`2026-07-11-r3-compatibility-canaries.md`](2026-07-11-r3-compatibility-canaries.md), especially D4/D8,
@@ -260,7 +261,13 @@ notification journals refuse the first unreopenable generation; top-level help d
 injected operator-home test fingerprints missing, valid, and corrupt status trees before and after read-only access.
 Fail-first regressions were red on the reviewed mechanism. Current focused gates pass evidence **45/0**, retention/
 GC **25/0**, status **9/0**, retained state **19/0**, and compatibility CLI **25/0**; format, diff, and package
-all-target warnings-denied Clippy are green. These are checkpoint gates, not a replacement for the exact full suite.
+all-target warnings-denied Clippy are green. Exact candidate `990cf99` also passes workspace all-target check and
+warnings-denied Clippy, dependency policy, locked release workspace build, repository hygiene **37/7**, pinned
+manifest **9**, floating recipes **4**, schedule foundation **6/4**, compatibility/foundation/supervisor CLI
+**25/0 + 31/0 + 2/0**, complete binary **744/0/0**, and canonical full serial workspace **2,484/0/12 ignored**
+across **72** result groups (**55** nonempty). The 212,124-byte canonical workspace log has SHA-256
+`4702e78d6cb5814c6829ba3bd1000afe626210e8b91568bfc9f0a30f37125f88`; the provider-unexercised release binary is
+26,795,344 bytes at SHA-256 `d0b59d01e96026480ed82f5a3336b0f45257804758d315bad8e8cf5d8f75fd01`.
 
 ## Verification and review gates
 
@@ -305,7 +312,8 @@ authenticated/live-provider integration tests. R3d3a through R3d3e are checkpoin
 status **9/0**, transaction/control **30/0**, compatibility CLI **25/0**, evidence **45/0**, retention/GC **25/0**,
 retained state **19/0**, strict schema **32/0**, and descriptor-local file **12/0**. The prior candidate `c75b082`
 passed complete binary **734/0/0** and canonical full serial workspace **2,473/0/12 ignored** across **72** groups
-(**55** nonempty), plus every deterministic release/validator gate; those historical totals are not attributed to
-`49dd5b3`. Rerun every deterministic gate on the exact docs-fold head, freeze it, then run a fresh Sol/xhigh
+(**55** nonempty). Exact remediation candidate `990cf99` passes complete binary **744/0/0** and canonical full
+serial workspace **2,484/0/12 ignored** across **72** groups (**55** nonempty), plus every deterministic release/
+validator gate. The docs-only gate-evidence fold reproduces the same exact-head gates before the fresh Sol/xhigh
 rereview. Run the single Fable/xhigh release/compatibility lens only after Sol approval. No production operator
 rebuild or swap is part of this slice.
