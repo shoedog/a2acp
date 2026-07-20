@@ -12,9 +12,13 @@ resolved, the exact-unlink `WRONG` and CLI-proof `SMELL` remained, and two new `
 after durable Pending and check-then-replace cold publication. Second remediation is checkpointed at
 `bfa1d35868cca4a2aa562ed9f74a9da3ed0021f2`;
 its affected focused gates are evidence **46/0**, retention/GC **29/0**, descriptor-local file **15/0**, and
-compatibility CLI **25/0**, with format, diff, and package all-target warnings-denied Clippy green. Full gates and
-fresh Sol closure review remain required. This slice is local, non-billable, default-off, and has one merge
-boundary.
+compatibility CLI **25/0**, with format, diff, and package all-target warnings-denied Clippy green. Exact-final
+gate reproduction and fresh Sol closure review remain required. Candidate
+`317cfbf3d5a743793edb1ef445f7ee2cf647d746` now passes
+the full deterministic gate set: complete binary **752/0/0** and canonical full serial workspace
+**2,492/0/12 ignored** across **72** groups (**55** nonempty), plus every release/validator gate. The exact-final
+docs head must reproduce those gates before closure review. This slice is local, non-billable, default-off, and has
+one merge boundary.
 
 The approved design of record is
 [`2026-07-11-r3-compatibility-canaries.md`](2026-07-11-r3-compatibility-canaries.md), especially D4/D8,
@@ -300,8 +304,19 @@ The late-pin, concurrent-final-publication, and atomic-exchange regressions each
 `pin()` returned `Ok`, ordinary rename returned `Ok` and clobbered the concurrent target, and pathname unlink
 returned `Ok` after deleting the exchanged replacement. Corrected focused gates are evidence **46/0**, retention/
 GC **29/0**, descriptor-local file **15/0**, and compatibility CLI **25/0**; format, diff, package all-target
-warnings-denied check, and Clippy are green. Full deterministic gates have not yet been rerun for `bfa1d358` or
-the subsequent docs fold.
+warnings-denied check, and Clippy are green. At that code checkpoint, full deterministic gates had not yet been
+rerun; the following exact code-and-cursor candidate supplies them.
+
+Exact gate candidate `317cfbf3d5a743793edb1ef445f7ee2cf647d746` passes committed-diff and worktree diff checks,
+format, workspace all-target warnings-denied check and Clippy, dependency policy, locked release workspace build,
+repository hygiene **37/7**, pinned manifest **9**, floating recipes **4**, schedule foundation **6/4**,
+compatibility/foundation/supervisor CLI **25/0 + 31/0 + 2/0**, complete binary **752/0/0**, and canonical full
+serial workspace **2,492/0/12 ignored** across **72** result groups (**55** nonempty). The 213,051-byte canonical
+workspace log has SHA-256 `68869f0d86ab6860e58502af39c54cf3273de8d93ac501cad569a8814ca57a68`; the
+provider-unexercised 26,795,344-byte release binary has SHA-256
+`e04882b0e0f9b4b4f9ec2189ace81f93737eb8964b57a0d612356d9ee7358829`. The twelve ignored tests remain
+authenticated/live-provider coverage. This gate-evidence docs fold requires one exact-final deterministic rerun
+before Sol closure review.
 
 One dogfood incident is deliberately deferred outside R3d3 correctness. Operator release `983398427c9f0486`
 served a healthy agent card/model catalog and green Codex doctor/provenance checks with zero unfinished tasks and
@@ -360,6 +375,9 @@ passed complete binary **734/0/0** and canonical full serial workspace **2,473/0
 (**55** nonempty). Exact remediation candidate `990cf99` passes complete binary **744/0/0** and canonical full
 serial workspace **2,484/0/12 ignored** across **72** groups (**55** nonempty), plus every deterministic release/
 validator gate. Full deterministic gates must now run on the second-remediation docs-fold head before fresh
-Sol/xhigh closure review. Run the single Fable/xhigh release/compatibility lens only after Sol approval. No
+Sol/xhigh closure review. Exact second-remediation gate candidate `317cfbf` passes complete binary **752/0/0** and
+canonical full serial workspace **2,492/0/12 ignored** across **72** groups (**55** nonempty), plus every
+deterministic release/validator gate; reproduce that evidence on this docs-fold head next. Run the single
+Fable/xhigh release/compatibility lens only after Sol approval. No
 production operator rebuild or swap is part of this slice; preserve the deferred pre-prompt unary-submit incident
 above for later reliability investigation.
