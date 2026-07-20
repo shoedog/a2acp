@@ -122,7 +122,10 @@ a2a-bridge models --config … --agent codex --json       # one agent, JSON (cap
 Probes live and degrades per-agent. Successful JSON values use the Agent Card `agent-models` capability
 shape. A failed probe is retained as `{available:false,failure:{agent,strategy,phase,...}}`; an explicitly
 requested failed agent exits nonzero after printing that machine-readable record, while an all-agent probe
-keeps partial-success exit behavior. Pass any listed value to the per-request override
+keeps partial-success exit behavior. Failure detail is returned in place: text includes the stable phase,
+category, and deepest bounded redacted error; JSON exposes those as `failure.phase`, `failure.category`, and
+`failure.error`, plus `failure.diagnostic` when the ACP boundary supplied a typed diagnostic. There is no
+implicit external “see logs” destination. Pass any listed value to the per-request override
 (`message.metadata` `a2a-bridge.{model,effort,mode}`) or an agent's config default.
 
 ## 4c. Run one explicit live smoke (billable)

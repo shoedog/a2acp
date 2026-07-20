@@ -296,6 +296,7 @@ impl DiagnosticRedactor {
         }
         sanitized = redact_url_query_and_fragment(sanitized);
         sanitized = redact_secret_markers(sanitized);
+        sanitized = redact_credential_prefixes(sanitized);
         if let Some(home) = &self.home_dir {
             sanitized = sanitized.replace(home, "~");
         }
@@ -460,6 +461,56 @@ fn redact_secret_markers(value: String) -> String {
         return "[REDACTED LINE]".to_owned();
     }
     format!("{} [REDACTED]", value[..start].trim_end())
+}
+
+fn redact_credential_prefixes(mut value: String) -> String {
+    const PREFIXES: [&str; 7] = [
+        "sk-",
+        "sk_",
+        "ghp_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+    ];
+    const REDACTED: &str = "[REDACTED]";
+
+    let mut search_from = 0;
+    loop {
+        let lowercase = value.to_ascii_lowercase();
+        let mut next: Option<usize> = None;
+        for prefix in PREFIXES {
+            let mut prefix_search = search_from;
+            while let Some(relative) = lowercase[prefix_search..].find(prefix) {
+                let start = prefix_search + relative;
+                let identifier =
+                    |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-');
+                if start == 0 || !identifier(lowercase.as_bytes()[start - 1]) {
+                    next = Some(next.map_or(start, |current| current.min(start)));
+                    break;
+                }
+                prefix_search = start + prefix.len();
+            }
+        }
+        let Some(start) = next else {
+            break;
+        };
+        let end = value[start..]
+            .char_indices()
+            .find_map(|(offset, ch)| {
+                (offset > 0
+                    && (ch.is_whitespace()
+                        || matches!(
+                            ch,
+                            '"' | '\'' | '`' | '<' | '>' | ',' | ';' | ')' | ']' | '}'
+                        )))
+                .then_some(start + offset)
+            })
+            .unwrap_or(value.len());
+        value.replace_range(start..end, REDACTED);
+        search_from = start + REDACTED.len();
+    }
+    value
 }
 
 fn looks_secret_shaped(value: &str) -> bool {

@@ -187,6 +187,22 @@ fn redactor_removes_markers_urls_home_and_controls() {
 }
 
 #[test]
+fn redactor_removes_unlabelled_credential_prefixes_without_erasing_context() {
+    let redactor = DiagnosticRedactor::default();
+    let mut input = base_failure("acp.initialize.transport");
+    input.summary =
+        "provider rejected sk-proj-abcdefghijklmnopqrstuvwxyz012345 during probe".into();
+    input.causes = vec!["github token ghp_abcdefghijklmnopqrstuvwxyz0123456789 rejected".into()];
+
+    let diagnostic = FailureDiagnostic::build(input, &redactor).unwrap();
+    let json = serde_json::to_string(&diagnostic).unwrap();
+    assert!(!json.contains("sk-proj-abcdefghijklmnopqrstuvwxyz012345"));
+    assert!(!json.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
+    assert!(diagnostic.summary().starts_with("provider rejected "));
+    assert!(json.contains("[REDACTED]"));
+}
+
+#[test]
 fn deserialization_resanitizes_mixed_case_url_secrets() {
     let diagnostic = FailureDiagnostic::build(
         base_failure("acp.initialize.transport"),
