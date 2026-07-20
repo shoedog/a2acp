@@ -3,22 +3,28 @@
 //! R3d5 remains the production root and FileProvider adapter owner. This module accepts only
 //! injected retained roots and probes.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::os::unix::fs::MetadataExt as _;
+
+use serde::{Deserialize, Serialize};
 
 use crate::compatibility_schedule_authority::{
     validate_sealed_storage_consent, validate_storage_consent, FileAuthorityJournal,
     StorageConsentRequestV1,
 };
 use crate::compatibility_schedule_evidence::{
-    acquire_evidence_read_lease, try_acquire_evidence_gc_lease, ColdCopyLifecycleV1,
-    ColdCopyRecordV1, EvidenceHotStoreV1, EvidenceStateModelV1, FileEvidenceJournal,
-    FileProviderMaterializationV1, FileProviderObjectStateV1, FileProviderObservationV1,
-    FileProviderSynchronizationV1, IndexedEvidenceV1, StorageIntegrityHoldV1,
+    acquire_evidence_read_lease, try_acquire_evidence_gc_lease,
+    try_acquire_evidence_gc_lease_optional, BundleGcActionV1, BundleGcLifecycleV1,
+    ColdCopyLifecycleV1, ColdCopyRecordV1, EvidenceHotStoreV1, EvidenceStateModelV1,
+    FileEvidenceJournal, FileProviderMaterializationV1, FileProviderObjectStateV1,
+    FileProviderObservationV1, FileProviderSynchronizationV1, ImageGcActionV1, ImageGcLifecycleV1,
+    IndexedEvidenceV1, StorageIntegrityHoldV1, DAY_MS,
 };
 use crate::compatibility_schedule_schema::{
-    ColdStorageBindingV1, OptionalRelativeEvidencePathV1, RelativeEvidencePathV1, StorageConsentV1,
+    portable_evidence_path_key, relative_evidence_path, ColdStorageBindingV1, EvidenceClassV1,
+    OptionalRelativeEvidencePathV1, RelativeEvidencePathV1, StorageConsentV1,
 };
 use crate::compatibility_schedule_state::{AuthorityStateCapability, EvidenceStateCapability};
 use crate::{local_file, BoxError};
@@ -1556,6 +1562,1037 @@ pub(super) fn reconcile_cold_metadata<
     })
 }
 
+const MAX_CACHE_INVENTORY_ITEMS: usize = 1_024;
+
+fn cache_stable_id(label: &str, value: &str) -> Result<(), BoxError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'-' | b'_' | b':' | b'/' | b'.')
+        })
+    {
+        return Err(format!("schedule retention: {label} is not a bounded stable id").into());
+    }
+    Ok(())
+}
+
+fn lowercase_sha256(label: &str, value: &str) -> Result<(), BoxError> {
+    if !local_file::valid_sha256(value)
+        || value.len() != 64
+        || value.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return Err(format!("schedule retention: {label} is not lowercase SHA-256").into());
+    }
+    Ok(())
+}
+
+fn add_retention_days(timestamp_ms: i64, days: u32) -> Result<i64, BoxError> {
+    if timestamp_ms <= 0 {
+        return Err("schedule retention: cache timestamp must be positive".into());
+    }
+    timestamp_ms
+        .checked_add(
+            i64::from(days)
+                .checked_mul(DAY_MS)
+                .ok_or("schedule retention: cache duration overflow")?,
+        )
+        .ok_or_else(|| "schedule retention: cache deadline overflow".into())
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum BundleCacheKindV1 {
+    ReconstructiblePayload,
+    ManifestOrInventory,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BundleCacheEntryV1 {
+    pub(super) bundle_id: String,
+    pub(super) evidence_id: String,
+    pub(super) provider_id: String,
+    pub(super) case_id: String,
+    pub(super) evidence_class: EvidenceClassV1,
+    pub(super) kind: BundleCacheKindV1,
+    pub(super) created_at_ms: i64,
+    pub(super) path: RelativeEvidencePathV1,
+    pub(super) content_sha256: String,
+    pub(super) length_bytes: u64,
+    pub(super) preserved_in_full_evidence_sha256: String,
+}
+
+impl BundleCacheEntryV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        cache_stable_id("bundle id", &self.bundle_id)?;
+        cache_stable_id("bundle evidence id", &self.evidence_id)?;
+        cache_stable_id("bundle provider id", &self.provider_id)?;
+        cache_stable_id("bundle case id", &self.case_id)?;
+        relative_evidence_path("bundle cache path", &self.path)?;
+        lowercase_sha256("bundle content", &self.content_sha256)?;
+        lowercase_sha256(
+            "bundle preserved full evidence",
+            &self.preserved_in_full_evidence_sha256,
+        )?;
+        if self.created_at_ms <= 0 || self.length_bytes == 0 || self.path.components.len() != 1 {
+            return Err("schedule retention: bundle cache entry identity is invalid".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BundleCacheInventoryV1 {
+    pub(super) cache_root_sha256: String,
+    pub(super) entries: Vec<BundleCacheEntryV1>,
+    pub(super) referenced_bundle_ids: BTreeSet<String>,
+}
+
+impl BundleCacheInventoryV1 {
+    fn normalized(&self) -> Result<Self, BoxError> {
+        lowercase_sha256("bundle cache root", &self.cache_root_sha256)?;
+        if self.entries.len() > MAX_CACHE_INVENTORY_ITEMS
+            || self.referenced_bundle_ids.len() > MAX_CACHE_INVENTORY_ITEMS
+        {
+            return Err("schedule retention: bundle inventory exceeds its bound".into());
+        }
+        let mut value = self.clone();
+        value.entries.sort_by(|left, right| {
+            left.bundle_id
+                .cmp(&right.bundle_id)
+                .then_with(|| left.path.components.cmp(&right.path.components))
+        });
+        let mut ids = BTreeSet::new();
+        let mut paths = BTreeSet::new();
+        for entry in &value.entries {
+            entry.validate()?;
+            if !ids.insert(entry.bundle_id.clone())
+                || !paths.insert(portable_evidence_path_key(&entry.path))
+            {
+                return Err("schedule retention: bundle inventory identity is duplicated".into());
+            }
+        }
+        for reference in &value.referenced_bundle_ids {
+            cache_stable_id("referenced bundle id", reference)?;
+            if !ids.contains(reference) {
+                return Err("schedule retention: bundle reference targets an absent entry".into());
+            }
+        }
+        Ok(value)
+    }
+
+    fn sha256(&self) -> Result<String, BoxError> {
+        Ok(local_file::sha256_hex(&serde_json::to_vec(
+            &self.normalized()?,
+        )?))
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct BundleCacheStoreV1 {
+    root: local_file::PinnedDirectory,
+}
+
+impl BundleCacheStoreV1 {
+    pub(super) fn open_existing(root: &local_file::PinnedDirectory) -> Result<Self, BoxError> {
+        validate_private_directory(root, "bundle cache root")?;
+        Ok(Self { root: root.clone() })
+    }
+
+    pub(super) fn root_sha256(&self) -> &str {
+        self.root.object_sha256()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BundleGcProtectionV1 {
+    MinimumAge,
+    KeepLatestThree,
+    ActivePin,
+    ActiveReference,
+    FullEvidenceNotPreserved,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ProtectedBundleV1 {
+    pub(super) bundle_id: String,
+    pub(super) reason: BundleGcProtectionV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct BundleGcPlanItemV1 {
+    pub(super) action_id: String,
+    pub(super) cache_root_sha256: String,
+    pub(super) inventory_sha256: String,
+    pub(super) planned_at_ms: i64,
+    pub(super) reason_code: String,
+    pub(super) entry: BundleCacheEntryV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct BundleGcPlanV1 {
+    pub(super) planned_at_ms: i64,
+    pub(super) inventory_sha256: String,
+    pub(super) removals: Vec<BundleGcPlanItemV1>,
+    pub(super) protected: Vec<ProtectedBundleV1>,
+}
+
+fn preserved_full_evidence_matches(
+    state: &EvidenceStateModelV1,
+    entry: &BundleCacheEntryV1,
+) -> bool {
+    state
+        .entries
+        .get(&entry.evidence_id)
+        .is_some_and(|evidence| {
+            evidence.evidence_class == entry.evidence_class
+                && evidence.full_evidence_sha256 == entry.preserved_in_full_evidence_sha256
+        })
+        || state.tombstones.values().any(|tombstone| {
+            tombstone.evidence_id == entry.evidence_id
+                && tombstone.evidence_class == entry.evidence_class
+                && tombstone.full_evidence_sha256 == entry.preserved_in_full_evidence_sha256
+                && matches!(
+                tombstone.lifecycle,
+                crate::compatibility_schedule_evidence::TombstoneLifecycleV1::FullEvidenceUnlinked {
+                    ..
+                }
+            )
+        })
+}
+
+fn bundle_deadline(entry: &BundleCacheEntryV1) -> Result<i64, BoxError> {
+    let days = match entry.kind {
+        BundleCacheKindV1::ManifestOrInventory => 180,
+        BundleCacheKindV1::ReconstructiblePayload => match entry.evidence_class {
+            EvidenceClassV1::RoutineGreen => 14,
+            EvidenceClassV1::FailedOrUnknown => 90,
+            EvidenceClassV1::PreflightBlocked | EvidenceClassV1::ManualCompatibility => 30,
+            EvidenceClassV1::Incident
+            | EvidenceClassV1::PromotionRelease
+            | EvidenceClassV1::AuthorizationBudgetAudit => 0,
+        },
+    };
+    add_retention_days(entry.created_at_ms, days)
+}
+
+pub(super) fn plan_bundle_gc(
+    state: &EvidenceStateModelV1,
+    inventory: &BundleCacheInventoryV1,
+    planned_at_ms: i64,
+) -> Result<BundleGcPlanV1, BoxError> {
+    state.validate()?;
+    if planned_at_ms <= 0 {
+        return Err("schedule retention: bundle GC plan time must be positive".into());
+    }
+    let inventory = inventory.normalized()?;
+    let inventory_sha256 = inventory.sha256()?;
+    let mut routine_groups = BTreeMap::<(String, String), Vec<&BundleCacheEntryV1>>::new();
+    for entry in &inventory.entries {
+        if entry.created_at_ms > planned_at_ms {
+            return Err("schedule retention: bundle entry postdates the plan".into());
+        }
+        if entry.kind == BundleCacheKindV1::ReconstructiblePayload
+            && entry.evidence_class == EvidenceClassV1::RoutineGreen
+        {
+            routine_groups
+                .entry((entry.provider_id.clone(), entry.case_id.clone()))
+                .or_default()
+                .push(entry);
+        }
+    }
+    let mut routine_rank = BTreeMap::new();
+    for entries in routine_groups.values_mut() {
+        entries.sort_by(|left, right| {
+            right
+                .created_at_ms
+                .cmp(&left.created_at_ms)
+                .then_with(|| right.bundle_id.cmp(&left.bundle_id))
+        });
+        for (rank, entry) in entries.iter().enumerate() {
+            routine_rank.insert(entry.bundle_id.clone(), rank);
+        }
+    }
+
+    let mut removals = Vec::new();
+    let mut protected = Vec::new();
+    for entry in inventory.entries {
+        let protection = if !preserved_full_evidence_matches(state, &entry) {
+            Some(BundleGcProtectionV1::FullEvidenceNotPreserved)
+        } else if state.has_active_pin(&entry.evidence_id) {
+            Some(BundleGcProtectionV1::ActivePin)
+        } else if inventory.referenced_bundle_ids.contains(&entry.bundle_id) {
+            Some(BundleGcProtectionV1::ActiveReference)
+        } else if planned_at_ms < bundle_deadline(&entry)? {
+            Some(BundleGcProtectionV1::MinimumAge)
+        } else if entry.kind == BundleCacheKindV1::ReconstructiblePayload
+            && entry.evidence_class == EvidenceClassV1::RoutineGreen
+            && routine_rank
+                .get(&entry.bundle_id)
+                .is_some_and(|rank| *rank < 3)
+            && planned_at_ms < add_retention_days(entry.created_at_ms, 30)?
+        {
+            Some(BundleGcProtectionV1::KeepLatestThree)
+        } else {
+            None
+        };
+        if let Some(reason) = protection {
+            protected.push(ProtectedBundleV1 {
+                bundle_id: entry.bundle_id,
+                reason,
+            });
+            continue;
+        }
+        let reason_code = match entry.kind {
+            BundleCacheKindV1::ManifestOrInventory => "manifest_inventory_retention_elapsed",
+            BundleCacheKindV1::ReconstructiblePayload
+                if entry.evidence_class == EvidenceClassV1::RoutineGreen
+                    && routine_rank
+                        .get(&entry.bundle_id)
+                        .is_some_and(|rank| *rank >= 3) =>
+            {
+                "routine_beyond_keep_three"
+            }
+            BundleCacheKindV1::ReconstructiblePayload => "bundle_cache_retention_elapsed",
+        };
+        let action_id = format!(
+            "bundle-gc:{}",
+            local_file::sha256_hex(
+                format!(
+                    "{}\0{}\0{}",
+                    inventory_sha256, entry.bundle_id, planned_at_ms
+                )
+                .as_bytes()
+            )
+        );
+        removals.push(BundleGcPlanItemV1 {
+            action_id,
+            cache_root_sha256: inventory.cache_root_sha256.clone(),
+            inventory_sha256: inventory_sha256.clone(),
+            planned_at_ms,
+            reason_code: reason_code.into(),
+            entry,
+        });
+    }
+    removals.sort_by(|left, right| left.entry.bundle_id.cmp(&right.entry.bundle_id));
+    protected.sort_by(|left, right| left.bundle_id.cmp(&right.bundle_id));
+    Ok(BundleGcPlanV1 {
+        planned_at_ms,
+        inventory_sha256,
+        removals,
+        protected,
+    })
+}
+
+fn bundle_lease_id(bundle_id: &str) -> Result<String, BoxError> {
+    cache_stable_id("bundle lease id", bundle_id)?;
+    Ok(format!("bundle:{bundle_id}"))
+}
+
+pub(super) fn acquire_bundle_read_lease<C: EvidenceStateCapability + ?Sized>(
+    capability: &C,
+    bundle_id: &str,
+) -> Result<std::fs::File, BoxError> {
+    acquire_evidence_read_lease(capability, &bundle_lease_id(bundle_id)?)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BundleGcFailpointV1 {
+    None,
+    AfterUnlink,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum BundleGcOutcomeV1 {
+    Removed,
+    RecoveredAlreadyAbsent,
+    DeferredLeaseBusy,
+    SafeSkipped { reason_code: String },
+    AlreadyTerminal,
+}
+
+fn bundle_action(item: &BundleGcPlanItemV1, started_at_ms: i64) -> BundleGcActionV1 {
+    BundleGcActionV1 {
+        action_id: item.action_id.clone(),
+        bundle_id: item.entry.bundle_id.clone(),
+        evidence_id: item.entry.evidence_id.clone(),
+        provider_id: item.entry.provider_id.clone(),
+        case_id: item.entry.case_id.clone(),
+        evidence_class: item.entry.evidence_class,
+        cache_root_sha256: item.cache_root_sha256.clone(),
+        path: item.entry.path.clone(),
+        content_sha256: item.entry.content_sha256.clone(),
+        length_bytes: item.entry.length_bytes,
+        preserved_in_full_evidence_sha256: item.entry.preserved_in_full_evidence_sha256.clone(),
+        reason_code: item.reason_code.clone(),
+        planned_at_ms: item.planned_at_ms,
+        started_at_ms,
+        lifecycle: BundleGcLifecycleV1::Pending,
+    }
+}
+
+fn bundle_action_matches_item(action: &BundleGcActionV1, item: &BundleGcPlanItemV1) -> bool {
+    action.action_id == item.action_id
+        && action.bundle_id == item.entry.bundle_id
+        && action.evidence_id == item.entry.evidence_id
+        && action.provider_id == item.entry.provider_id
+        && action.case_id == item.entry.case_id
+        && action.evidence_class == item.entry.evidence_class
+        && action.cache_root_sha256 == item.cache_root_sha256
+        && action.path == item.entry.path
+        && action.content_sha256 == item.entry.content_sha256
+        && action.length_bytes == item.entry.length_bytes
+        && action.preserved_in_full_evidence_sha256 == item.entry.preserved_in_full_evidence_sha256
+        && action.reason_code == item.reason_code
+        && action.planned_at_ms == item.planned_at_ms
+}
+
+fn finish_bundle_safe_skip(
+    journal: &mut FileEvidenceJournal<'_>,
+    state: &mut EvidenceStateModelV1,
+    action_id: &str,
+    reason_code: &str,
+    completed_at_ms: i64,
+) -> Result<BundleGcOutcomeV1, BoxError> {
+    cache_stable_id("bundle GC safe-skip reason", reason_code)?;
+    let mut candidate = state.clone();
+    candidate.safe_skip_bundle_gc(action_id, reason_code, completed_at_ms)?;
+    journal.append(&candidate, completed_at_ms)?;
+    *state = candidate;
+    Ok(BundleGcOutcomeV1::SafeSkipped {
+        reason_code: reason_code.into(),
+    })
+}
+
+pub(super) fn execute_bundle_gc_item<C: EvidenceStateCapability + ?Sized>(
+    capability: &C,
+    journal: &mut FileEvidenceJournal<'_>,
+    state: &mut EvidenceStateModelV1,
+    store: &BundleCacheStoreV1,
+    current_inventory: &BundleCacheInventoryV1,
+    item: &BundleGcPlanItemV1,
+    started_at_ms: i64,
+    completed_at_ms: i64,
+    failpoint: BundleGcFailpointV1,
+) -> Result<BundleGcOutcomeV1, BoxError> {
+    state.validate()?;
+    validate_private_directory(&store.root, "bundle cache root")?;
+    if item.cache_root_sha256 != store.root_sha256() {
+        return Err("schedule retention: bundle GC inventory/root binding changed".into());
+    }
+    if completed_at_ms <= started_at_ms {
+        return Err("schedule retention: bundle GC completion time is invalid".into());
+    }
+    let existing_action = state.bundle_gc_actions.get(&item.action_id);
+    match existing_action {
+        Some(action) if !bundle_action_matches_item(action, item) => {
+            return Err("schedule retention: bundle GC action identity conflicts".into())
+        }
+        Some(action) if action.lifecycle != BundleGcLifecycleV1::Pending => {
+            return Ok(BundleGcOutcomeV1::AlreadyTerminal)
+        }
+        Some(_) => {}
+        None => {
+            if current_inventory.cache_root_sha256 != store.root_sha256()
+                || item.inventory_sha256 != current_inventory.sha256()?
+            {
+                return Err("schedule retention: bundle GC inventory/root binding changed".into());
+            }
+            let original_plan = plan_bundle_gc(state, current_inventory, item.planned_at_ms)?;
+            if original_plan
+                .removals
+                .iter()
+                .find(|candidate| candidate.action_id == item.action_id)
+                != Some(item)
+            {
+                return Err(
+                    "schedule retention: bundle is not eligible for its exact GC intent".into(),
+                );
+            }
+            let mut candidate = state.clone();
+            candidate.begin_bundle_gc(bundle_action(item, started_at_ms))?;
+            journal.append(&candidate, started_at_ms)?;
+            *state = candidate;
+        }
+    }
+
+    let Some(_lease) = try_acquire_evidence_gc_lease_optional(
+        capability,
+        &bundle_lease_id(&item.entry.bundle_id)?,
+    )?
+    else {
+        return Ok(BundleGcOutcomeV1::DeferredLeaseBusy);
+    };
+
+    let current_inventory = match current_inventory.normalized() {
+        Ok(inventory) if inventory.cache_root_sha256 == store.root_sha256() => inventory,
+        _ => {
+            return finish_bundle_safe_skip(
+                journal,
+                state,
+                &item.action_id,
+                "bundle_inventory_invalid",
+                completed_at_ms,
+            )
+        }
+    };
+    let current_entry = current_inventory
+        .entries
+        .iter()
+        .find(|entry| entry.bundle_id == item.entry.bundle_id);
+    if let Some(current_entry) = current_entry {
+        if current_entry != &item.entry {
+            return finish_bundle_safe_skip(
+                journal,
+                state,
+                &item.action_id,
+                "bundle_identity_changed",
+                completed_at_ms,
+            );
+        }
+        let current_plan = plan_bundle_gc(state, &current_inventory, started_at_ms)?;
+        if !current_plan
+            .removals
+            .iter()
+            .any(|candidate| candidate.entry == item.entry)
+        {
+            return finish_bundle_safe_skip(
+                journal,
+                state,
+                &item.action_id,
+                "freshly_protected",
+                completed_at_ms,
+            );
+        }
+    } else if store
+        .root
+        .child_metadata_no_follow(
+            OsStr::new(&item.entry.path.components[0]),
+            "bundle GC target",
+        )?
+        .is_some()
+    {
+        return finish_bundle_safe_skip(
+            journal,
+            state,
+            &item.action_id,
+            "inventory_target_missing",
+            completed_at_ms,
+        );
+    }
+
+    let name = OsStr::new(&item.entry.path.components[0]);
+    let existed = if store
+        .root
+        .child_metadata_no_follow(name, "bundle GC target")?
+        .is_some()
+    {
+        let file = store.root.open_regular_file(name, "bundle GC target")?;
+        validate_private_file(&file.metadata()?, "bundle GC target")?;
+        let snapshot = local_file::read_open_regular_file_bounded(
+            &file,
+            "bundle GC target",
+            item.entry.length_bytes,
+        )?;
+        if snapshot.bytes.len() as u64 != item.entry.length_bytes
+            || snapshot.sha256 != item.entry.content_sha256
+        {
+            return Err("schedule retention: bundle GC target identity changed".into());
+        }
+        store.root.remove_regular_child(
+            local_file::RegularChildRef::new(name, &file),
+            "bundle GC target",
+        )?;
+        store.root.sync()?;
+        true
+    } else {
+        false
+    };
+    if failpoint == BundleGcFailpointV1::AfterUnlink {
+        return Err("schedule retention: injected crash after bundle unlink".into());
+    }
+    let mut candidate = state.clone();
+    candidate.complete_bundle_gc(&item.action_id, completed_at_ms)?;
+    journal.append(&candidate, completed_at_ms)?;
+    *state = candidate;
+    Ok(if existed {
+        BundleGcOutcomeV1::Removed
+    } else {
+        BundleGcOutcomeV1::RecoveredAlreadyAbsent
+    })
+}
+
+fn immutable_image_digest(label: &str, value: &str) -> Result<(), BoxError> {
+    let Some(sha256) = value.strip_prefix("sha256:") else {
+        return Err(format!("schedule retention: {label} is not an immutable digest").into());
+    };
+    lowercase_sha256(label, sha256)
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RuntimeImageOwnershipV1 {
+    BridgeManaged,
+    Unrelated,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RuntimeImageV1 {
+    pub(super) digest: String,
+    pub(super) ownership: RuntimeImageOwnershipV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SuccessfulImageCandidateV1 {
+    pub(super) provider_id: String,
+    pub(super) digest: String,
+    pub(super) succeeded_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ContainerLifecycleV1 {
+    Running,
+    Stopped,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ContainerImageReferenceV1 {
+    pub(super) container_id: String,
+    pub(super) digest: String,
+    pub(super) state: ContainerLifecycleV1,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RuntimeImageInventoryV1 {
+    pub(super) observed_at_ms: i64,
+    pub(super) images: Vec<RuntimeImageV1>,
+    pub(super) current_production_digests: BTreeSet<String>,
+    pub(super) pinned_digests: BTreeSet<String>,
+    pub(super) successful_candidates: Vec<SuccessfulImageCandidateV1>,
+    pub(super) container_references: Vec<ContainerImageReferenceV1>,
+}
+
+impl RuntimeImageInventoryV1 {
+    fn normalized(&self) -> Result<Self, BoxError> {
+        if self.observed_at_ms <= 0
+            || self.images.len() > MAX_CACHE_INVENTORY_ITEMS
+            || self.current_production_digests.len() > MAX_CACHE_INVENTORY_ITEMS
+            || self.pinned_digests.len() > MAX_CACHE_INVENTORY_ITEMS
+            || self.successful_candidates.len() > MAX_CACHE_INVENTORY_ITEMS * 4
+            || self.container_references.len() > MAX_CACHE_INVENTORY_ITEMS * 4
+        {
+            return Err(
+                "schedule retention: runtime image inventory is invalid or unbounded".into(),
+            );
+        }
+        let mut value = self.clone();
+        value
+            .images
+            .sort_by(|left, right| left.digest.cmp(&right.digest));
+        value.successful_candidates.sort_by(|left, right| {
+            left.provider_id
+                .cmp(&right.provider_id)
+                .then_with(|| right.succeeded_at_ms.cmp(&left.succeeded_at_ms))
+                .then_with(|| left.digest.cmp(&right.digest))
+        });
+        value.container_references.sort_by(|left, right| {
+            left.container_id
+                .cmp(&right.container_id)
+                .then_with(|| left.digest.cmp(&right.digest))
+        });
+        let mut image_digests = BTreeSet::new();
+        for image in &value.images {
+            immutable_image_digest("runtime image", &image.digest)?;
+            if !image_digests.insert(image.digest.clone()) {
+                return Err("schedule retention: runtime image digest is duplicated".into());
+            }
+        }
+        for digest in value
+            .current_production_digests
+            .iter()
+            .chain(value.pinned_digests.iter())
+        {
+            immutable_image_digest("protected runtime image", digest)?;
+        }
+        let mut candidate_keys = BTreeSet::new();
+        for candidate in &value.successful_candidates {
+            cache_stable_id("image candidate provider", &candidate.provider_id)?;
+            immutable_image_digest("image candidate", &candidate.digest)?;
+            if candidate.succeeded_at_ms <= 0
+                || candidate.succeeded_at_ms > value.observed_at_ms
+                || !candidate_keys.insert((
+                    candidate.provider_id.clone(),
+                    candidate.digest.clone(),
+                    candidate.succeeded_at_ms,
+                ))
+            {
+                return Err("schedule retention: image candidate identity is invalid".into());
+            }
+        }
+        let mut container_ids = BTreeSet::new();
+        for reference in &value.container_references {
+            cache_stable_id("container reference id", &reference.container_id)?;
+            immutable_image_digest("container image reference", &reference.digest)?;
+            if !container_ids.insert(reference.container_id.clone()) {
+                return Err("schedule retention: container reference id is duplicated".into());
+            }
+        }
+        Ok(value)
+    }
+
+    fn sha256(&self) -> Result<String, BoxError> {
+        Ok(local_file::sha256_hex(&serde_json::to_vec(
+            &self.normalized()?,
+        )?))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ImageGcProtectionV1 {
+    CurrentProduction,
+    LatestSuccessfulCandidate,
+    Pinned,
+    ContainerReference,
+    Unrelated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ProtectedImageV1 {
+    pub(super) digest: String,
+    pub(super) reason: ImageGcProtectionV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ImageGcPlanItemV1 {
+    pub(super) action_id: String,
+    pub(super) digest: String,
+    pub(super) inventory_sha256: String,
+    pub(super) planned_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ImageGcPlanV1 {
+    pub(super) planned_at_ms: i64,
+    pub(super) inventory_sha256: String,
+    pub(super) removals: Vec<ImageGcPlanItemV1>,
+    pub(super) protected: Vec<ProtectedImageV1>,
+}
+
+pub(super) fn plan_image_gc(
+    inventory: &RuntimeImageInventoryV1,
+    planned_at_ms: i64,
+) -> Result<ImageGcPlanV1, BoxError> {
+    let inventory = inventory.normalized()?;
+    if planned_at_ms <= 0 || inventory.observed_at_ms > planned_at_ms {
+        return Err("schedule retention: image GC plan has no current observation".into());
+    }
+    let inventory_sha256 = inventory.sha256()?;
+    let mut latest_successful = BTreeSet::new();
+    let mut by_provider = BTreeMap::<String, Vec<&SuccessfulImageCandidateV1>>::new();
+    for candidate in &inventory.successful_candidates {
+        by_provider
+            .entry(candidate.provider_id.clone())
+            .or_default()
+            .push(candidate);
+    }
+    for candidates in by_provider.values_mut() {
+        candidates.sort_by(|left, right| {
+            right
+                .succeeded_at_ms
+                .cmp(&left.succeeded_at_ms)
+                .then_with(|| right.digest.cmp(&left.digest))
+        });
+        for candidate in candidates.iter().take(2) {
+            latest_successful.insert(candidate.digest.clone());
+        }
+    }
+    let container_references = inventory
+        .container_references
+        .iter()
+        .map(|reference| reference.digest.clone())
+        .collect::<BTreeSet<_>>();
+    let mut removals = Vec::new();
+    let mut protected = Vec::new();
+    for image in inventory.images {
+        let protection = if image.ownership == RuntimeImageOwnershipV1::Unrelated {
+            Some(ImageGcProtectionV1::Unrelated)
+        } else if container_references.contains(&image.digest) {
+            Some(ImageGcProtectionV1::ContainerReference)
+        } else if inventory.current_production_digests.contains(&image.digest) {
+            Some(ImageGcProtectionV1::CurrentProduction)
+        } else if inventory.pinned_digests.contains(&image.digest) {
+            Some(ImageGcProtectionV1::Pinned)
+        } else if latest_successful.contains(&image.digest) {
+            Some(ImageGcProtectionV1::LatestSuccessfulCandidate)
+        } else {
+            None
+        };
+        if let Some(reason) = protection {
+            protected.push(ProtectedImageV1 {
+                digest: image.digest,
+                reason,
+            });
+            continue;
+        }
+        let action_id = format!(
+            "image-gc:{}",
+            local_file::sha256_hex(
+                format!("{}\0{}\0{}", inventory_sha256, image.digest, planned_at_ms).as_bytes()
+            )
+        );
+        removals.push(ImageGcPlanItemV1 {
+            action_id,
+            digest: image.digest,
+            inventory_sha256: inventory_sha256.clone(),
+            planned_at_ms,
+        });
+    }
+    removals.sort_by(|left, right| left.digest.cmp(&right.digest));
+    protected.sort_by(|left, right| left.digest.cmp(&right.digest));
+    Ok(ImageGcPlanV1 {
+        planned_at_ms,
+        inventory_sha256,
+        removals,
+        protected,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum RuntimeImageRemovalV1 {
+    Removed,
+    Absent,
+    Refused { reason_code: String },
+}
+
+pub(super) trait RuntimeImageEffectsV1 {
+    fn inventory_all(&mut self) -> Result<RuntimeImageInventoryV1, BoxError>;
+
+    fn remove_exact_digest(&mut self, digest: &str) -> Result<RuntimeImageRemovalV1, BoxError>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ImageGcFailpointV1 {
+    None,
+    AfterRemoval,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ImageGcOutcomeV1 {
+    Removed,
+    RecoveredAlreadyAbsent,
+    SafeSkipped { reason_code: String },
+    AlreadyTerminal,
+}
+
+fn image_action(item: &ImageGcPlanItemV1, started_at_ms: i64) -> ImageGcActionV1 {
+    ImageGcActionV1 {
+        action_id: item.action_id.clone(),
+        digest: item.digest.clone(),
+        planned_inventory_sha256: item.inventory_sha256.clone(),
+        planned_at_ms: item.planned_at_ms,
+        started_at_ms,
+        lifecycle: ImageGcLifecycleV1::Pending,
+    }
+}
+
+fn image_action_matches_item(action: &ImageGcActionV1, item: &ImageGcPlanItemV1) -> bool {
+    action.action_id == item.action_id
+        && action.digest == item.digest
+        && action.planned_inventory_sha256 == item.inventory_sha256
+        && action.planned_at_ms == item.planned_at_ms
+}
+
+fn validate_image_gc_item(item: &ImageGcPlanItemV1) -> Result<(), BoxError> {
+    immutable_image_digest("image GC item", &item.digest)?;
+    lowercase_sha256("image GC planned inventory", &item.inventory_sha256)?;
+    if item.planned_at_ms <= 0 {
+        return Err("schedule retention: image GC plan time is invalid".into());
+    }
+    let expected_action_id = format!(
+        "image-gc:{}",
+        local_file::sha256_hex(
+            format!(
+                "{}\0{}\0{}",
+                item.inventory_sha256, item.digest, item.planned_at_ms
+            )
+            .as_bytes()
+        )
+    );
+    if item.action_id != expected_action_id {
+        return Err("schedule retention: image GC action identity is not deterministic".into());
+    }
+    Ok(())
+}
+
+fn finish_image_safe_skip(
+    journal: &mut FileEvidenceJournal<'_>,
+    state: &mut EvidenceStateModelV1,
+    action_id: &str,
+    reason_code: &str,
+    completed_at_ms: i64,
+) -> Result<ImageGcOutcomeV1, BoxError> {
+    cache_stable_id("image GC safe-skip reason", reason_code)?;
+    let mut candidate = state.clone();
+    candidate.safe_skip_image_gc(action_id, reason_code, completed_at_ms)?;
+    journal.append(&candidate, completed_at_ms)?;
+    *state = candidate;
+    Ok(ImageGcOutcomeV1::SafeSkipped {
+        reason_code: reason_code.into(),
+    })
+}
+
+pub(super) fn execute_image_gc_item<
+    C: EvidenceStateCapability + ?Sized,
+    R: RuntimeImageEffectsV1 + ?Sized,
+>(
+    _capability: &C,
+    journal: &mut FileEvidenceJournal<'_>,
+    state: &mut EvidenceStateModelV1,
+    runtime: &mut R,
+    planned_inventory: Option<&RuntimeImageInventoryV1>,
+    item: &ImageGcPlanItemV1,
+    started_at_ms: i64,
+    completed_at_ms: i64,
+    failpoint: ImageGcFailpointV1,
+) -> Result<ImageGcOutcomeV1, BoxError> {
+    state.validate()?;
+    validate_image_gc_item(item)?;
+    if completed_at_ms <= started_at_ms {
+        return Err("schedule retention: image GC completion time is invalid".into());
+    }
+    match state.image_gc_actions.get(&item.action_id) {
+        Some(action) if !image_action_matches_item(action, item) => {
+            return Err("schedule retention: image GC action identity conflicts".into())
+        }
+        Some(action) if action.lifecycle != ImageGcLifecycleV1::Pending => {
+            return Ok(ImageGcOutcomeV1::AlreadyTerminal)
+        }
+        Some(_) => {}
+        None => {
+            let planned_inventory = planned_inventory
+                .ok_or("schedule retention: image GC first intent has no planned inventory")?;
+            if item.inventory_sha256 != planned_inventory.sha256()? {
+                return Err(
+                    "schedule retention: image GC planned inventory binding changed".into(),
+                );
+            }
+            let original_plan = plan_image_gc(planned_inventory, item.planned_at_ms)?;
+            if original_plan
+                .removals
+                .iter()
+                .find(|candidate| candidate.action_id == item.action_id)
+                != Some(item)
+            {
+                return Err(
+                    "schedule retention: image is not eligible for its exact GC intent".into(),
+                );
+            }
+            let mut candidate = state.clone();
+            candidate.begin_image_gc(image_action(item, started_at_ms))?;
+            journal.append(&candidate, started_at_ms)?;
+            *state = candidate;
+        }
+    }
+
+    let fresh = match runtime.inventory_all() {
+        Ok(inventory) => inventory,
+        Err(_) => {
+            return finish_image_safe_skip(
+                journal,
+                state,
+                &item.action_id,
+                "runtime_inventory_failed",
+                completed_at_ms,
+            )
+        }
+    };
+    let fresh = match fresh.normalized() {
+        Ok(inventory)
+            if inventory.observed_at_ms >= started_at_ms
+                && inventory.observed_at_ms <= completed_at_ms =>
+        {
+            inventory
+        }
+        _ => {
+            return finish_image_safe_skip(
+                journal,
+                state,
+                &item.action_id,
+                "runtime_inventory_invalid",
+                completed_at_ms,
+            )
+        }
+    };
+    if !fresh.images.iter().any(|image| image.digest == item.digest) {
+        let mut candidate = state.clone();
+        candidate.complete_image_gc(&item.action_id, completed_at_ms)?;
+        journal.append(&candidate, completed_at_ms)?;
+        *state = candidate;
+        return Ok(ImageGcOutcomeV1::RecoveredAlreadyAbsent);
+    }
+    let fresh_plan = plan_image_gc(&fresh, fresh.observed_at_ms)?;
+    if !fresh_plan
+        .removals
+        .iter()
+        .any(|candidate| candidate.digest == item.digest)
+    {
+        return finish_image_safe_skip(
+            journal,
+            state,
+            &item.action_id,
+            "freshly_protected",
+            completed_at_ms,
+        );
+    }
+
+    let removal = match runtime.remove_exact_digest(&item.digest) {
+        Ok(removal) => removal,
+        Err(_) => {
+            return finish_image_safe_skip(
+                journal,
+                state,
+                &item.action_id,
+                "runtime_remove_failed",
+                completed_at_ms,
+            )
+        }
+    };
+    match removal {
+        RuntimeImageRemovalV1::Refused { .. } => finish_image_safe_skip(
+            journal,
+            state,
+            &item.action_id,
+            "runtime_remove_refused",
+            completed_at_ms,
+        ),
+        RuntimeImageRemovalV1::Removed => {
+            if failpoint == ImageGcFailpointV1::AfterRemoval {
+                return Err("schedule retention: injected crash after image removal".into());
+            }
+            let mut candidate = state.clone();
+            candidate.complete_image_gc(&item.action_id, completed_at_ms)?;
+            journal.append(&candidate, completed_at_ms)?;
+            *state = candidate;
+            Ok(ImageGcOutcomeV1::Removed)
+        }
+        RuntimeImageRemovalV1::Absent => {
+            let mut candidate = state.clone();
+            candidate.complete_image_gc(&item.action_id, completed_at_ms)?;
+            journal.append(&candidate, completed_at_ms)?;
+            *state = candidate;
+            Ok(ImageGcOutcomeV1::RecoveredAlreadyAbsent)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1588,6 +2625,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         root
+    }
+
+    fn gc_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GC_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GC_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn pin(path: &Path, label: &str) -> local_file::PinnedDirectory {
@@ -2778,5 +3823,876 @@ mod tests {
         .unwrap();
         assert_ne!(replacement.copy_id, admission.copy_id);
         assert_ne!(replacement.archive_path, admission.archive_path);
+    }
+
+    fn bundle_entry(
+        state: &EvidenceStateModelV1,
+        bundle_id: &str,
+        evidence_id: &str,
+        provider_id: &str,
+        case_id: &str,
+        created_at_ms: i64,
+        kind: BundleCacheKindV1,
+        bytes: &[u8],
+    ) -> BundleCacheEntryV1 {
+        BundleCacheEntryV1 {
+            bundle_id: bundle_id.into(),
+            evidence_id: evidence_id.into(),
+            provider_id: provider_id.into(),
+            case_id: case_id.into(),
+            evidence_class: state.entries[evidence_id].evidence_class,
+            kind,
+            created_at_ms,
+            path: RelativeEvidencePathV1 {
+                components: vec![format!("{bundle_id}.bundle")],
+            },
+            content_sha256: local_file::sha256_hex(bytes),
+            length_bytes: bytes.len() as u64,
+            preserved_in_full_evidence_sha256: state.entries[evidence_id]
+                .full_evidence_sha256
+                .clone(),
+        }
+    }
+
+    #[test]
+    fn bundle_plan_honors_keep_age_pin_reference_and_full_evidence_precedence() {
+        let fixture = Fixture::new();
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3d-bundle-plan")
+            .unwrap();
+        let opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        state
+            .pin(crate::compatibility_schedule_evidence::EvidencePinV1 {
+                pin_id: "pin-evidence-2".into(),
+                evidence_id: "evidence-2".into(),
+                reason: "active incident investigation".into(),
+                created_at_ms: BASE + 1,
+                lifecycle: crate::compatibility_schedule_evidence::PinLifecycleV1::Active,
+            })
+            .unwrap();
+        let now = BASE + 200 * DAY_MS;
+        let mut entries = vec![
+            bundle_entry(
+                &state,
+                "routine-new-1",
+                "evidence-1",
+                "codex",
+                "case-a",
+                now - 1 * DAY_MS,
+                BundleCacheKindV1::ReconstructiblePayload,
+                b"new-1",
+            ),
+            bundle_entry(
+                &state,
+                "routine-new-2",
+                "evidence-1",
+                "codex",
+                "case-a",
+                now - 2 * DAY_MS,
+                BundleCacheKindV1::ReconstructiblePayload,
+                b"new-2",
+            ),
+            bundle_entry(
+                &state,
+                "routine-new-3",
+                "evidence-1",
+                "codex",
+                "case-a",
+                now - 3 * DAY_MS,
+                BundleCacheKindV1::ReconstructiblePayload,
+                b"new-3",
+            ),
+            bundle_entry(
+                &state,
+                "routine-old",
+                "evidence-1",
+                "codex",
+                "case-a",
+                now - 20 * DAY_MS,
+                BundleCacheKindV1::ReconstructiblePayload,
+                b"old",
+            ),
+            bundle_entry(
+                &state,
+                "routine-referenced",
+                "evidence-1",
+                "codex",
+                "case-a",
+                now - 21 * DAY_MS,
+                BundleCacheKindV1::ReconstructiblePayload,
+                b"referenced",
+            ),
+            bundle_entry(
+                &state,
+                "routine-pinned",
+                "evidence-2",
+                "codex",
+                "case-a",
+                now - 22 * DAY_MS,
+                BundleCacheKindV1::ReconstructiblePayload,
+                b"pinned",
+            ),
+            bundle_entry(
+                &state,
+                "manifest-young",
+                "evidence-1",
+                "codex",
+                "case-b",
+                now - 179 * DAY_MS,
+                BundleCacheKindV1::ManifestOrInventory,
+                b"manifest-young",
+            ),
+            bundle_entry(
+                &state,
+                "manifest-old",
+                "evidence-1",
+                "codex",
+                "case-b",
+                now - 181 * DAY_MS,
+                BundleCacheKindV1::ManifestOrInventory,
+                b"manifest-old",
+            ),
+        ];
+        let mut unpreserved = bundle_entry(
+            &state,
+            "unpreserved",
+            "evidence-1",
+            "claude",
+            "case-c",
+            now - 181 * DAY_MS,
+            BundleCacheKindV1::ManifestOrInventory,
+            b"unpreserved",
+        );
+        unpreserved.preserved_in_full_evidence_sha256 = digest('f');
+        entries.push(unpreserved);
+        let inventory = BundleCacheInventoryV1 {
+            cache_root_sha256: digest('d'),
+            entries,
+            referenced_bundle_ids: BTreeSet::from(["routine-referenced".into()]),
+        };
+
+        let plan = plan_bundle_gc(&state, &inventory, now).unwrap();
+        let removed = plan
+            .removals
+            .iter()
+            .map(|item| item.entry.bundle_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(removed, BTreeSet::from(["manifest-old", "routine-old"]));
+        assert!(plan.protected.iter().any(|item| {
+            item.bundle_id == "routine-referenced"
+                && item.reason == BundleGcProtectionV1::ActiveReference
+        }));
+        assert!(plan.protected.iter().any(|item| {
+            item.bundle_id == "routine-pinned" && item.reason == BundleGcProtectionV1::ActivePin
+        }));
+        assert!(plan.protected.iter().any(|item| {
+            item.bundle_id == "unpreserved"
+                && item.reason == BundleGcProtectionV1::FullEvidenceNotPreserved
+        }));
+    }
+
+    #[test]
+    fn bundle_gc_persists_before_unlink_and_recovers_after_open_reader_or_crash() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let bundle_root = private_root();
+        write_private(&bundle_root.path().join("old.bundle"), b"old bundle\n");
+        write_private(&bundle_root.path().join("unrelated.bundle"), b"unrelated\n");
+        let store =
+            BundleCacheStoreV1::open_existing(&pin(bundle_root.path(), "bundle cache")).unwrap();
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3d-bundle-gc")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let now = BASE + 200 * DAY_MS;
+        let entry = bundle_entry(
+            &state,
+            "old",
+            "evidence-1",
+            "codex",
+            "case-a",
+            now - 40 * DAY_MS,
+            BundleCacheKindV1::ReconstructiblePayload,
+            b"old bundle\n",
+        );
+        let inventory = BundleCacheInventoryV1 {
+            cache_root_sha256: store.root_sha256().into(),
+            entries: vec![entry],
+            referenced_bundle_ids: BTreeSet::new(),
+        };
+        let plan = plan_bundle_gc(&state, &inventory, now).unwrap();
+        let item = &plan.removals[0];
+        let reader = acquire_bundle_read_lease(&owner, "old").unwrap();
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &inventory,
+                item,
+                now + 1,
+                now + 2,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::DeferredLeaseBusy
+        );
+        assert!(bundle_root.path().join("old.bundle").exists());
+        assert!(matches!(
+            state.bundle_gc_actions[&item.action_id].lifecycle,
+            crate::compatibility_schedule_evidence::BundleGcLifecycleV1::Pending
+        ));
+        drop(reader);
+        assert!(execute_bundle_gc_item(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &store,
+            &inventory,
+            item,
+            now + 3,
+            now + 4,
+            BundleGcFailpointV1::AfterUnlink,
+        )
+        .is_err());
+        assert!(!bundle_root.path().join("old.bundle").exists());
+        assert!(bundle_root.path().join("unrelated.bundle").exists());
+        let recovered_inventory = BundleCacheInventoryV1 {
+            cache_root_sha256: store.root_sha256().into(),
+            entries: Vec::new(),
+            referenced_bundle_ids: BTreeSet::new(),
+        };
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &recovered_inventory,
+                item,
+                now + 5,
+                now + 6,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::RecoveredAlreadyAbsent
+        );
+    }
+
+    #[test]
+    fn bundle_gc_pending_intent_safely_skips_a_new_reference_without_unlinking() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let bundle_root = private_root();
+        write_private(&bundle_root.path().join("old.bundle"), b"old bundle\n");
+        let store =
+            BundleCacheStoreV1::open_existing(&pin(bundle_root.path(), "bundle cache")).unwrap();
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3d-bundle-new-reference")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let now = BASE + 200 * DAY_MS;
+        let entry = bundle_entry(
+            &state,
+            "old",
+            "evidence-1",
+            "codex",
+            "case-a",
+            now - 40 * DAY_MS,
+            BundleCacheKindV1::ReconstructiblePayload,
+            b"old bundle\n",
+        );
+        let inventory = BundleCacheInventoryV1 {
+            cache_root_sha256: store.root_sha256().into(),
+            entries: vec![entry],
+            referenced_bundle_ids: BTreeSet::new(),
+        };
+        let plan = plan_bundle_gc(&state, &inventory, now).unwrap();
+        let item = &plan.removals[0];
+
+        let reader = acquire_bundle_read_lease(&owner, "old").unwrap();
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &inventory,
+                item,
+                now + 1,
+                now + 2,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::DeferredLeaseBusy
+        );
+        drop(reader);
+
+        let mut referenced_inventory = inventory;
+        referenced_inventory
+            .referenced_bundle_ids
+            .insert("old".into());
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &referenced_inventory,
+                item,
+                now + 3,
+                now + 4,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::SafeSkipped {
+                reason_code: "freshly_protected".into()
+            }
+        );
+        assert!(bundle_root.path().join("old.bundle").exists());
+        assert!(matches!(
+            state.bundle_gc_actions[&item.action_id].lifecycle,
+            crate::compatibility_schedule_evidence::BundleGcLifecycleV1::SafeSkipped { .. }
+        ));
+    }
+
+    #[test]
+    fn bundle_gc_pending_intents_safely_skip_invalid_changed_or_omitted_inventory() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let bundle_root = private_root();
+        for bundle_id in ["invalid", "changed", "omitted"] {
+            write_private(
+                &bundle_root.path().join(format!("{bundle_id}.bundle")),
+                format!("{bundle_id} bundle\n").as_bytes(),
+            );
+        }
+        let store =
+            BundleCacheStoreV1::open_existing(&pin(bundle_root.path(), "bundle cache")).unwrap();
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3d-bundle-current-inventory")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let now = BASE + 200 * DAY_MS;
+        let inventory = BundleCacheInventoryV1 {
+            cache_root_sha256: store.root_sha256().into(),
+            entries: ["invalid", "changed", "omitted"]
+                .into_iter()
+                .map(|bundle_id| {
+                    bundle_entry(
+                        &state,
+                        bundle_id,
+                        "evidence-1",
+                        "codex",
+                        "case-a",
+                        now - 40 * DAY_MS,
+                        BundleCacheKindV1::ReconstructiblePayload,
+                        format!("{bundle_id} bundle\n").as_bytes(),
+                    )
+                })
+                .collect(),
+            referenced_bundle_ids: BTreeSet::new(),
+        };
+        let plan = plan_bundle_gc(&state, &inventory, now).unwrap();
+        assert_eq!(plan.removals.len(), 3);
+
+        for (index, item) in plan.removals.iter().enumerate() {
+            let reader = acquire_bundle_read_lease(&owner, &item.entry.bundle_id).unwrap();
+            let started_at_ms = now + 1 + index as i64 * 2;
+            assert_eq!(
+                execute_bundle_gc_item(
+                    &owner,
+                    &mut opened.journal,
+                    &mut state,
+                    &store,
+                    &inventory,
+                    item,
+                    started_at_ms,
+                    started_at_ms + 1,
+                    BundleGcFailpointV1::None,
+                )
+                .unwrap(),
+                BundleGcOutcomeV1::DeferredLeaseBusy
+            );
+            drop(reader);
+        }
+
+        let item = plan
+            .removals
+            .iter()
+            .find(|item| item.entry.bundle_id == "invalid")
+            .unwrap();
+        let mut invalid_inventory = inventory.clone();
+        invalid_inventory.cache_root_sha256 = digest('f');
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &invalid_inventory,
+                item,
+                now + 7,
+                now + 8,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::SafeSkipped {
+                reason_code: "bundle_inventory_invalid".into()
+            }
+        );
+
+        let item = plan
+            .removals
+            .iter()
+            .find(|item| item.entry.bundle_id == "changed")
+            .unwrap();
+        let mut changed_inventory = inventory.clone();
+        changed_inventory
+            .entries
+            .iter_mut()
+            .find(|entry| entry.bundle_id == "changed")
+            .unwrap()
+            .content_sha256 = digest('e');
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &changed_inventory,
+                item,
+                now + 9,
+                now + 10,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::SafeSkipped {
+                reason_code: "bundle_identity_changed".into()
+            }
+        );
+
+        let item = plan
+            .removals
+            .iter()
+            .find(|item| item.entry.bundle_id == "omitted")
+            .unwrap();
+        let mut omitted_inventory = inventory;
+        omitted_inventory
+            .entries
+            .retain(|entry| entry.bundle_id != "omitted");
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &omitted_inventory,
+                item,
+                now + 11,
+                now + 12,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::SafeSkipped {
+                reason_code: "inventory_target_missing".into()
+            }
+        );
+        for bundle_id in ["invalid", "changed", "omitted"] {
+            assert!(bundle_root
+                .path()
+                .join(format!("{bundle_id}.bundle"))
+                .exists());
+        }
+    }
+
+    fn image(digest_char: char, ownership: RuntimeImageOwnershipV1) -> RuntimeImageV1 {
+        RuntimeImageV1 {
+            digest: format!("sha256:{}", digest(digest_char)),
+            ownership,
+        }
+    }
+
+    fn image_inventory() -> RuntimeImageInventoryV1 {
+        RuntimeImageInventoryV1 {
+            observed_at_ms: BASE + 1,
+            images: vec![
+                image('1', RuntimeImageOwnershipV1::BridgeManaged),
+                image('2', RuntimeImageOwnershipV1::BridgeManaged),
+                image('3', RuntimeImageOwnershipV1::BridgeManaged),
+                image('4', RuntimeImageOwnershipV1::BridgeManaged),
+                image('5', RuntimeImageOwnershipV1::BridgeManaged),
+                image('6', RuntimeImageOwnershipV1::BridgeManaged),
+                image('7', RuntimeImageOwnershipV1::BridgeManaged),
+                image('8', RuntimeImageOwnershipV1::Unrelated),
+            ],
+            current_production_digests: BTreeSet::from([format!("sha256:{}", digest('1'))]),
+            pinned_digests: BTreeSet::from([format!("sha256:{}", digest('2'))]),
+            successful_candidates: vec![
+                SuccessfulImageCandidateV1 {
+                    provider_id: "codex".into(),
+                    digest: format!("sha256:{}", digest('3')),
+                    succeeded_at_ms: BASE - 1,
+                },
+                SuccessfulImageCandidateV1 {
+                    provider_id: "codex".into(),
+                    digest: format!("sha256:{}", digest('4')),
+                    succeeded_at_ms: BASE - 2,
+                },
+                SuccessfulImageCandidateV1 {
+                    provider_id: "codex".into(),
+                    digest: format!("sha256:{}", digest('5')),
+                    succeeded_at_ms: BASE - 3,
+                },
+            ],
+            container_references: vec![
+                ContainerImageReferenceV1 {
+                    container_id: "running-1".into(),
+                    digest: format!("sha256:{}", digest('6')),
+                    state: ContainerLifecycleV1::Running,
+                },
+                ContainerImageReferenceV1 {
+                    container_id: "stopped-1".into(),
+                    digest: format!("sha256:{}", digest('7')),
+                    state: ContainerLifecycleV1::Stopped,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn image_plan_keeps_production_two_latest_pins_all_containers_and_unrelated_images() {
+        let plan = plan_image_gc(&image_inventory(), BASE + 2).unwrap();
+        assert_eq!(
+            plan.removals
+                .iter()
+                .map(|item| item.digest.as_str())
+                .collect::<Vec<_>>(),
+            vec![format!("sha256:{}", digest('5'))]
+        );
+        assert!(plan.protected.iter().any(|item| {
+            item.digest == format!("sha256:{}", digest('6'))
+                && item.reason == ImageGcProtectionV1::ContainerReference
+        }));
+        assert!(plan.protected.iter().any(|item| {
+            item.digest == format!("sha256:{}", digest('7'))
+                && item.reason == ImageGcProtectionV1::ContainerReference
+        }));
+        assert!(plan.protected.iter().any(|item| {
+            item.digest == format!("sha256:{}", digest('8'))
+                && item.reason == ImageGcProtectionV1::Unrelated
+        }));
+    }
+
+    struct FakeImageRuntime {
+        inventory: RuntimeImageInventoryV1,
+        inventory_error: bool,
+        remove_error: bool,
+        refuse_removal: bool,
+        remove_calls: Vec<String>,
+    }
+
+    impl RuntimeImageEffectsV1 for FakeImageRuntime {
+        fn inventory_all(&mut self) -> Result<RuntimeImageInventoryV1, crate::BoxError> {
+            if self.inventory_error {
+                Err("injected runtime inventory failure".into())
+            } else {
+                Ok(self.inventory.clone())
+            }
+        }
+
+        fn remove_exact_digest(
+            &mut self,
+            digest: &str,
+        ) -> Result<RuntimeImageRemovalV1, crate::BoxError> {
+            self.remove_calls.push(digest.into());
+            if self.remove_error {
+                return Err("injected runtime removal failure".into());
+            }
+            if self.refuse_removal {
+                return Ok(RuntimeImageRemovalV1::Refused {
+                    reason_code: "Image is in use by container 123".into(),
+                });
+            }
+            if let Some(index) = self
+                .inventory
+                .images
+                .iter()
+                .position(|image| image.digest == digest)
+            {
+                self.inventory.images.remove(index);
+                Ok(RuntimeImageRemovalV1::Removed)
+            } else {
+                Ok(RuntimeImageRemovalV1::Absent)
+            }
+        }
+    }
+
+    #[test]
+    fn image_gc_requeries_before_effect_and_safely_skips_new_stopped_reference_or_error() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let initial = image_inventory();
+        let plan = plan_image_gc(&initial, BASE + 2).unwrap();
+        let item = &plan.removals[0];
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3d-image-race")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let mut fresh = initial.clone();
+        fresh.container_references.push(ContainerImageReferenceV1 {
+            container_id: "newly-stopped".into(),
+            digest: item.digest.clone(),
+            state: ContainerLifecycleV1::Stopped,
+        });
+        fresh.observed_at_ms = BASE + 3;
+        let mut runtime = FakeImageRuntime {
+            inventory: fresh,
+            inventory_error: false,
+            remove_error: false,
+            refuse_removal: false,
+            remove_calls: Vec::new(),
+        };
+        assert_eq!(
+            execute_image_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &mut runtime,
+                Some(&initial),
+                item,
+                BASE + 3,
+                BASE + 4,
+                ImageGcFailpointV1::None,
+            )
+            .unwrap(),
+            ImageGcOutcomeV1::SafeSkipped {
+                reason_code: "freshly_protected".into()
+            }
+        );
+        assert!(runtime.remove_calls.is_empty());
+
+        let remove_error_plan = plan_image_gc(&initial, BASE + 30).unwrap();
+        let remove_error_item = &remove_error_plan.removals[0];
+        runtime.inventory = initial.clone();
+        runtime.inventory.observed_at_ms = BASE + 31;
+        runtime.remove_error = true;
+        assert_eq!(
+            execute_image_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &mut runtime,
+                Some(&initial),
+                remove_error_item,
+                BASE + 31,
+                BASE + 32,
+                ImageGcFailpointV1::None,
+            )
+            .unwrap(),
+            ImageGcOutcomeV1::SafeSkipped {
+                reason_code: "runtime_remove_failed".into()
+            }
+        );
+        assert_eq!(runtime.remove_calls, vec![remove_error_item.digest.clone()]);
+
+        let error_plan = plan_image_gc(&initial, BASE + 40).unwrap();
+        let error_item = &error_plan.removals[0];
+        runtime.inventory_error = true;
+        assert_eq!(
+            execute_image_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &mut runtime,
+                Some(&initial),
+                error_item,
+                BASE + 41,
+                BASE + 42,
+                ImageGcFailpointV1::None,
+            )
+            .unwrap(),
+            ImageGcOutcomeV1::SafeSkipped {
+                reason_code: "runtime_inventory_failed".into()
+            }
+        );
+        assert_eq!(runtime.remove_calls, vec![remove_error_item.digest.clone()]);
+
+        let future_plan = plan_image_gc(&initial, BASE + 50).unwrap();
+        let future_item = &future_plan.removals[0];
+        runtime.inventory_error = false;
+        runtime.inventory = initial.clone();
+        runtime.inventory.observed_at_ms = BASE + 53;
+        assert_eq!(
+            execute_image_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &mut runtime,
+                Some(&initial),
+                future_item,
+                BASE + 51,
+                BASE + 52,
+                ImageGcFailpointV1::None,
+            )
+            .unwrap(),
+            ImageGcOutcomeV1::SafeSkipped {
+                reason_code: "runtime_inventory_invalid".into()
+            }
+        );
+        assert_eq!(runtime.remove_calls, vec![remove_error_item.digest.clone()]);
+    }
+
+    #[test]
+    fn image_gc_recovers_a_crash_after_exact_digest_removal_without_touching_other_images() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let inventory = image_inventory();
+        let plan = plan_image_gc(&inventory, BASE + 2).unwrap();
+        let item = &plan.removals[0];
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3d-image-crash")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let mut runtime_inventory = inventory.clone();
+        runtime_inventory.observed_at_ms = BASE + 3;
+        let mut runtime = FakeImageRuntime {
+            inventory: runtime_inventory,
+            inventory_error: false,
+            remove_error: false,
+            refuse_removal: false,
+            remove_calls: Vec::new(),
+        };
+        assert!(execute_image_gc_item(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &mut runtime,
+            Some(&inventory),
+            item,
+            BASE + 3,
+            BASE + 4,
+            ImageGcFailpointV1::AfterRemoval,
+        )
+        .is_err());
+        assert_eq!(runtime.remove_calls, vec![item.digest.clone()]);
+        assert_eq!(runtime.inventory.images.len(), 7);
+        runtime.inventory.observed_at_ms = BASE + 5;
+        assert_eq!(
+            execute_image_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &mut runtime,
+                None,
+                item,
+                BASE + 5,
+                BASE + 6,
+                ImageGcFailpointV1::None,
+            )
+            .unwrap(),
+            ImageGcOutcomeV1::RecoveredAlreadyAbsent
+        );
+        assert_eq!(runtime.remove_calls, vec![item.digest.clone()]);
+    }
+
+    #[test]
+    fn image_gc_normalizes_runtime_refusal_and_rejects_forged_intent_before_effect() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let inventory = image_inventory();
+        let plan = plan_image_gc(&inventory, BASE + 2).unwrap();
+        let item = &plan.removals[0];
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3d-image-refusal")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let mut runtime_inventory = inventory.clone();
+        runtime_inventory.observed_at_ms = BASE + 3;
+        let mut runtime = FakeImageRuntime {
+            inventory: runtime_inventory,
+            inventory_error: false,
+            remove_error: false,
+            refuse_removal: true,
+            remove_calls: Vec::new(),
+        };
+
+        assert_eq!(
+            execute_image_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &mut runtime,
+                Some(&inventory),
+                item,
+                BASE + 3,
+                BASE + 4,
+                ImageGcFailpointV1::None,
+            )
+            .unwrap(),
+            ImageGcOutcomeV1::SafeSkipped {
+                reason_code: "runtime_remove_refused".into()
+            }
+        );
+        assert_eq!(runtime.remove_calls, vec![item.digest.clone()]);
+        assert!(matches!(
+            state.image_gc_actions[&item.action_id].lifecycle,
+            crate::compatibility_schedule_evidence::ImageGcLifecycleV1::SafeSkipped { .. }
+        ));
+
+        let mut forged = plan.removals[0].clone();
+        forged.inventory_sha256 = digest('a');
+        forged.action_id = format!(
+            "image-gc:{}",
+            local_file::sha256_hex(
+                format!(
+                    "{}\0{}\0{}",
+                    forged.inventory_sha256, forged.digest, forged.planned_at_ms
+                )
+                .as_bytes()
+            )
+        );
+        let mut forged_inventory = inventory.clone();
+        forged_inventory.observed_at_ms = BASE + 5;
+        let mut forged_runtime = FakeImageRuntime {
+            inventory: forged_inventory,
+            inventory_error: false,
+            remove_error: false,
+            refuse_removal: false,
+            remove_calls: Vec::new(),
+        };
+        let action_count = state.image_gc_actions.len();
+        let error = execute_image_gc_item(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &mut forged_runtime,
+            Some(&inventory),
+            &forged,
+            BASE + 5,
+            BASE + 6,
+            ImageGcFailpointV1::None,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("image GC planned inventory binding changed"));
+        assert!(forged_runtime.remove_calls.is_empty());
+        assert_eq!(state.image_gc_actions.len(), action_count);
     }
 }

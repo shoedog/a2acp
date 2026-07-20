@@ -440,6 +440,142 @@ impl StorageIntegrityHoldV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum BundleGcLifecycleV1 {
+    Pending,
+    Unlinked {
+        unlinked_at_ms: i64,
+    },
+    SafeSkipped {
+        skipped_at_ms: i64,
+        reason_code: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BundleGcActionV1 {
+    pub(super) action_id: String,
+    pub(super) bundle_id: String,
+    pub(super) evidence_id: String,
+    pub(super) provider_id: String,
+    pub(super) case_id: String,
+    pub(super) evidence_class: EvidenceClassV1,
+    pub(super) cache_root_sha256: String,
+    pub(super) path: RelativeEvidencePathV1,
+    pub(super) content_sha256: String,
+    pub(super) length_bytes: u64,
+    pub(super) preserved_in_full_evidence_sha256: String,
+    pub(super) reason_code: String,
+    pub(super) planned_at_ms: i64,
+    pub(super) started_at_ms: i64,
+    pub(super) lifecycle: BundleGcLifecycleV1,
+}
+
+impl BundleGcActionV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        stable_id("bundle GC action id", &self.action_id)?;
+        stable_id("bundle GC bundle id", &self.bundle_id)?;
+        stable_id("bundle GC evidence id", &self.evidence_id)?;
+        stable_id("bundle GC provider id", &self.provider_id)?;
+        stable_id("bundle GC case id", &self.case_id)?;
+        stable_id("bundle GC reason", &self.reason_code)?;
+        require_sha256("bundle GC cache root", &self.cache_root_sha256)?;
+        require_sha256("bundle GC content", &self.content_sha256)?;
+        require_sha256(
+            "bundle GC preserved full evidence",
+            &self.preserved_in_full_evidence_sha256,
+        )?;
+        relative_evidence_path("bundle GC path", &self.path)?;
+        if self.path.components.len() != 1
+            || self.length_bytes == 0
+            || self.planned_at_ms <= 0
+            || self.started_at_ms < self.planned_at_ms
+        {
+            return Err("schedule evidence: bundle GC action identity is invalid".into());
+        }
+        match &self.lifecycle {
+            BundleGcLifecycleV1::Pending => {}
+            BundleGcLifecycleV1::Unlinked { unlinked_at_ms } => {
+                if *unlinked_at_ms < self.started_at_ms {
+                    return Err("schedule evidence: bundle GC unlink predates its intent".into());
+                }
+            }
+            BundleGcLifecycleV1::SafeSkipped {
+                skipped_at_ms,
+                reason_code,
+            } => {
+                stable_id("bundle GC skip reason", reason_code)?;
+                if *skipped_at_ms < self.started_at_ms {
+                    return Err("schedule evidence: bundle GC skip predates its intent".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ImageGcLifecycleV1 {
+    Pending,
+    Removed {
+        removed_at_ms: i64,
+    },
+    SafeSkipped {
+        skipped_at_ms: i64,
+        reason_code: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ImageGcActionV1 {
+    pub(super) action_id: String,
+    pub(super) digest: String,
+    pub(super) planned_inventory_sha256: String,
+    pub(super) planned_at_ms: i64,
+    pub(super) started_at_ms: i64,
+    pub(super) lifecycle: ImageGcLifecycleV1,
+}
+
+fn require_image_digest(label: &str, value: &str) -> Result<(), BoxError> {
+    let Some(sha256) = value.strip_prefix("sha256:") else {
+        return Err(format!("schedule evidence: {label} is not an immutable digest").into());
+    };
+    require_sha256(label, sha256)
+}
+
+impl ImageGcActionV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        stable_id("image GC action id", &self.action_id)?;
+        require_image_digest("image GC digest", &self.digest)?;
+        require_sha256("image GC planned inventory", &self.planned_inventory_sha256)?;
+        if self.planned_at_ms <= 0 || self.started_at_ms < self.planned_at_ms {
+            return Err("schedule evidence: image GC action time is invalid".into());
+        }
+        match &self.lifecycle {
+            ImageGcLifecycleV1::Pending => {}
+            ImageGcLifecycleV1::Removed { removed_at_ms } => {
+                if *removed_at_ms < self.started_at_ms {
+                    return Err("schedule evidence: image GC removal predates its intent".into());
+                }
+            }
+            ImageGcLifecycleV1::SafeSkipped {
+                skipped_at_ms,
+                reason_code,
+            } => {
+                stable_id("image GC skip reason", reason_code)?;
+                if *skipped_at_ms < self.started_at_ms {
+                    return Err("schedule evidence: image GC skip predates its intent".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct EvidenceStateModelV1 {
     pub(super) hot_root_sha256: String,
@@ -452,6 +588,10 @@ pub(super) struct EvidenceStateModelV1 {
     pub(super) cold_copies: BTreeMap<String, ColdCopyRecordV1>,
     #[serde(default)]
     pub(super) storage_integrity_holds: BTreeMap<String, StorageIntegrityHoldV1>,
+    #[serde(default)]
+    pub(super) bundle_gc_actions: BTreeMap<String, BundleGcActionV1>,
+    #[serde(default)]
+    pub(super) image_gc_actions: BTreeMap<String, ImageGcActionV1>,
 }
 
 impl EvidenceStateModelV1 {
@@ -468,6 +608,8 @@ impl EvidenceStateModelV1 {
             retired_evidence_ids: BTreeSet::new(),
             cold_copies: BTreeMap::new(),
             storage_integrity_holds: BTreeMap::new(),
+            bundle_gc_actions: BTreeMap::new(),
+            image_gc_actions: BTreeMap::new(),
         };
         value.validate()?;
         Ok(value)
@@ -481,6 +623,8 @@ impl EvidenceStateModelV1 {
             || self.retired_evidence_ids.len() > MAX_EVIDENCE_ITEMS * 4
             || self.cold_copies.len() > MAX_EVIDENCE_ITEMS * 4
             || self.storage_integrity_holds.len() > MAX_EVIDENCE_ITEMS * 4
+            || self.bundle_gc_actions.len() > MAX_EVIDENCE_ITEMS * 4
+            || self.image_gc_actions.len() > MAX_EVIDENCE_ITEMS * 4
         {
             return Err("schedule evidence: state collections exceed their bounds".into());
         }
@@ -806,6 +950,32 @@ impl EvidenceStateModelV1 {
                 return Err("schedule evidence: storage-integrity hold target is invalid".into());
             }
             hold.validate()?;
+        }
+
+        let mut pending_bundles = BTreeSet::new();
+        for (id, action) in &self.bundle_gc_actions {
+            if id != &action.action_id {
+                return Err("schedule evidence: bundle GC action key is invalid".into());
+            }
+            action.validate()?;
+            if action.lifecycle == BundleGcLifecycleV1::Pending
+                && !pending_bundles.insert(action.bundle_id.clone())
+            {
+                return Err("schedule evidence: bundle has multiple pending GC actions".into());
+            }
+        }
+
+        let mut pending_images = BTreeSet::new();
+        for (id, action) in &self.image_gc_actions {
+            if id != &action.action_id {
+                return Err("schedule evidence: image GC action key is invalid".into());
+            }
+            action.validate()?;
+            if action.lifecycle == ImageGcLifecycleV1::Pending
+                && !pending_images.insert(action.digest.clone())
+            {
+                return Err("schedule evidence: image has multiple pending GC actions".into());
+            }
         }
 
         for retired in &self.retired_evidence_ids {
@@ -1206,6 +1376,158 @@ impl EvidenceStateModelV1 {
         *self = candidate;
         Ok(())
     }
+
+    pub(super) fn begin_bundle_gc(&mut self, action: BundleGcActionV1) -> Result<(), BoxError> {
+        let mut candidate = self.clone();
+        action.validate()?;
+        if action.lifecycle != BundleGcLifecycleV1::Pending
+            || candidate.bundle_gc_actions.contains_key(&action.action_id)
+            || candidate.bundle_gc_actions.values().any(|existing| {
+                existing.bundle_id == action.bundle_id
+                    && existing.lifecycle == BundleGcLifecycleV1::Pending
+            })
+        {
+            return Err("schedule evidence: bundle GC intent is duplicate or not pending".into());
+        }
+        if candidate.bundle_gc_actions.len() >= MAX_EVIDENCE_ITEMS * 4 {
+            let oldest_terminal = candidate
+                .bundle_gc_actions
+                .values()
+                .filter(|existing| existing.lifecycle != BundleGcLifecycleV1::Pending)
+                .min_by(|left, right| {
+                    left.started_at_ms
+                        .cmp(&right.started_at_ms)
+                        .then_with(|| left.action_id.cmp(&right.action_id))
+                })
+                .map(|existing| existing.action_id.clone())
+                .ok_or("schedule evidence: pending bundle GC actions fill the bounded state")?;
+            candidate.bundle_gc_actions.remove(&oldest_terminal);
+        }
+        candidate
+            .bundle_gc_actions
+            .insert(action.action_id.clone(), action);
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(super) fn complete_bundle_gc(
+        &mut self,
+        action_id: &str,
+        unlinked_at_ms: i64,
+    ) -> Result<(), BoxError> {
+        let mut candidate = self.clone();
+        let action = candidate
+            .bundle_gc_actions
+            .get_mut(action_id)
+            .ok_or("schedule evidence: bundle GC action does not exist")?;
+        if action.lifecycle != BundleGcLifecycleV1::Pending {
+            return Err("schedule evidence: bundle GC action is already terminal".into());
+        }
+        action.lifecycle = BundleGcLifecycleV1::Unlinked { unlinked_at_ms };
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(super) fn safe_skip_bundle_gc(
+        &mut self,
+        action_id: &str,
+        reason_code: &str,
+        skipped_at_ms: i64,
+    ) -> Result<(), BoxError> {
+        let mut candidate = self.clone();
+        let action = candidate
+            .bundle_gc_actions
+            .get_mut(action_id)
+            .ok_or("schedule evidence: bundle GC action does not exist")?;
+        if action.lifecycle != BundleGcLifecycleV1::Pending {
+            return Err("schedule evidence: bundle GC action is already terminal".into());
+        }
+        action.lifecycle = BundleGcLifecycleV1::SafeSkipped {
+            skipped_at_ms,
+            reason_code: reason_code.into(),
+        };
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(super) fn begin_image_gc(&mut self, action: ImageGcActionV1) -> Result<(), BoxError> {
+        let mut candidate = self.clone();
+        action.validate()?;
+        if action.lifecycle != ImageGcLifecycleV1::Pending
+            || candidate.image_gc_actions.contains_key(&action.action_id)
+            || candidate.image_gc_actions.values().any(|existing| {
+                existing.digest == action.digest
+                    && existing.lifecycle == ImageGcLifecycleV1::Pending
+            })
+        {
+            return Err("schedule evidence: image GC intent is duplicate or not pending".into());
+        }
+        if candidate.image_gc_actions.len() >= MAX_EVIDENCE_ITEMS * 4 {
+            let oldest_terminal = candidate
+                .image_gc_actions
+                .values()
+                .filter(|existing| existing.lifecycle != ImageGcLifecycleV1::Pending)
+                .min_by(|left, right| {
+                    left.started_at_ms
+                        .cmp(&right.started_at_ms)
+                        .then_with(|| left.action_id.cmp(&right.action_id))
+                })
+                .map(|existing| existing.action_id.clone())
+                .ok_or("schedule evidence: pending image GC actions fill the bounded state")?;
+            candidate.image_gc_actions.remove(&oldest_terminal);
+        }
+        candidate
+            .image_gc_actions
+            .insert(action.action_id.clone(), action);
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(super) fn complete_image_gc(
+        &mut self,
+        action_id: &str,
+        removed_at_ms: i64,
+    ) -> Result<(), BoxError> {
+        let mut candidate = self.clone();
+        let action = candidate
+            .image_gc_actions
+            .get_mut(action_id)
+            .ok_or("schedule evidence: image GC action does not exist")?;
+        if action.lifecycle != ImageGcLifecycleV1::Pending {
+            return Err("schedule evidence: image GC action is already terminal".into());
+        }
+        action.lifecycle = ImageGcLifecycleV1::Removed { removed_at_ms };
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub(super) fn safe_skip_image_gc(
+        &mut self,
+        action_id: &str,
+        reason_code: &str,
+        skipped_at_ms: i64,
+    ) -> Result<(), BoxError> {
+        let mut candidate = self.clone();
+        let action = candidate
+            .image_gc_actions
+            .get_mut(action_id)
+            .ok_or("schedule evidence: image GC action does not exist")?;
+        if action.lifecycle != ImageGcLifecycleV1::Pending {
+            return Err("schedule evidence: image GC action is already terminal".into());
+        }
+        action.lifecycle = ImageGcLifecycleV1::SafeSkipped {
+            skipped_at_ms,
+            reason_code: reason_code.into(),
+        };
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
 }
 
 fn pin_transition_allowed(previous: &EvidencePinV1, next: &EvidencePinV1) -> bool {
@@ -1327,6 +1649,47 @@ fn cold_copy_transition_allowed(previous: &ColdCopyRecordV1, next: &ColdCopyReco
     }
 }
 
+fn bundle_gc_transition_allowed(previous: &BundleGcActionV1, next: &BundleGcActionV1) -> bool {
+    previous.action_id == next.action_id
+        && previous.bundle_id == next.bundle_id
+        && previous.evidence_id == next.evidence_id
+        && previous.provider_id == next.provider_id
+        && previous.case_id == next.case_id
+        && previous.evidence_class == next.evidence_class
+        && previous.cache_root_sha256 == next.cache_root_sha256
+        && previous.path == next.path
+        && previous.content_sha256 == next.content_sha256
+        && previous.length_bytes == next.length_bytes
+        && previous.preserved_in_full_evidence_sha256 == next.preserved_in_full_evidence_sha256
+        && previous.reason_code == next.reason_code
+        && previous.planned_at_ms == next.planned_at_ms
+        && previous.started_at_ms == next.started_at_ms
+        && (previous.lifecycle == next.lifecycle
+            || matches!(
+                (&previous.lifecycle, &next.lifecycle),
+                (
+                    BundleGcLifecycleV1::Pending,
+                    BundleGcLifecycleV1::Unlinked { .. } | BundleGcLifecycleV1::SafeSkipped { .. }
+                )
+            ))
+}
+
+fn image_gc_transition_allowed(previous: &ImageGcActionV1, next: &ImageGcActionV1) -> bool {
+    previous.action_id == next.action_id
+        && previous.digest == next.digest
+        && previous.planned_inventory_sha256 == next.planned_inventory_sha256
+        && previous.planned_at_ms == next.planned_at_ms
+        && previous.started_at_ms == next.started_at_ms
+        && (previous.lifecycle == next.lifecycle
+            || matches!(
+                (&previous.lifecycle, &next.lifecycle),
+                (
+                    ImageGcLifecycleV1::Pending,
+                    ImageGcLifecycleV1::Removed { .. } | ImageGcLifecycleV1::SafeSkipped { .. }
+                )
+            ))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct EvidenceStateSnapshotV1 {
@@ -1439,6 +1802,32 @@ impl EvidenceStateSnapshotV1 {
                 .storage_integrity_holds
                 .values()
                 .any(|value| value.detected_at_ms > self.recorded_at_ms)
+            || self.state.bundle_gc_actions.values().any(|value| {
+                value.started_at_ms > self.recorded_at_ms
+                    || matches!(
+                        value.lifecycle,
+                        BundleGcLifecycleV1::Unlinked { unlinked_at_ms }
+                            if unlinked_at_ms > self.recorded_at_ms
+                    )
+                    || matches!(
+                        value.lifecycle,
+                        BundleGcLifecycleV1::SafeSkipped { skipped_at_ms, .. }
+                            if skipped_at_ms > self.recorded_at_ms
+                    )
+            })
+            || self.state.image_gc_actions.values().any(|value| {
+                value.started_at_ms > self.recorded_at_ms
+                    || matches!(
+                        value.lifecycle,
+                        ImageGcLifecycleV1::Removed { removed_at_ms }
+                            if removed_at_ms > self.recorded_at_ms
+                    )
+                    || matches!(
+                        value.lifecycle,
+                        ImageGcLifecycleV1::SafeSkipped { skipped_at_ms, .. }
+                            if skipped_at_ms > self.recorded_at_ms
+                    )
+            })
         {
             return Err("schedule evidence: state event postdates its snapshot".into());
         }
@@ -1636,6 +2025,70 @@ pub(super) fn validate_evidence_state_transition(
             && current.detected_at_ms <= previous.recorded_at_ms
         {
             return Err("schedule evidence: storage-integrity hold was backdated".into());
+        }
+    }
+    for (id, prior) in &previous.state.bundle_gc_actions {
+        let Some(current) = next.state.bundle_gc_actions.get(id) else {
+            if prior.lifecycle == BundleGcLifecycleV1::Pending {
+                return Err("schedule evidence: pending bundle GC history was removed".into());
+            }
+            continue;
+        };
+        if !bundle_gc_transition_allowed(prior, current) {
+            return Err("schedule evidence: bundle GC action changed nonmonotonically".into());
+        }
+        let transition_at_ms = match (&prior.lifecycle, &current.lifecycle) {
+            (BundleGcLifecycleV1::Pending, BundleGcLifecycleV1::Unlinked { unlinked_at_ms }) => {
+                Some(*unlinked_at_ms)
+            }
+            (
+                BundleGcLifecycleV1::Pending,
+                BundleGcLifecycleV1::SafeSkipped { skipped_at_ms, .. },
+            ) => Some(*skipped_at_ms),
+            _ => None,
+        };
+        if transition_at_ms.is_some_and(|value| value <= previous.recorded_at_ms) {
+            return Err("schedule evidence: bundle GC completion was backdated".into());
+        }
+    }
+    for (id, current) in &next.state.bundle_gc_actions {
+        if !previous.state.bundle_gc_actions.contains_key(id)
+            && (current.started_at_ms <= previous.recorded_at_ms
+                || current.lifecycle != BundleGcLifecycleV1::Pending)
+        {
+            return Err("schedule evidence: bundle GC intent was backdated or terminal".into());
+        }
+    }
+    for (id, prior) in &previous.state.image_gc_actions {
+        let Some(current) = next.state.image_gc_actions.get(id) else {
+            if prior.lifecycle == ImageGcLifecycleV1::Pending {
+                return Err("schedule evidence: pending image GC history was removed".into());
+            }
+            continue;
+        };
+        if !image_gc_transition_allowed(prior, current) {
+            return Err("schedule evidence: image GC action changed nonmonotonically".into());
+        }
+        let transition_at_ms = match (&prior.lifecycle, &current.lifecycle) {
+            (ImageGcLifecycleV1::Pending, ImageGcLifecycleV1::Removed { removed_at_ms }) => {
+                Some(*removed_at_ms)
+            }
+            (
+                ImageGcLifecycleV1::Pending,
+                ImageGcLifecycleV1::SafeSkipped { skipped_at_ms, .. },
+            ) => Some(*skipped_at_ms),
+            _ => None,
+        };
+        if transition_at_ms.is_some_and(|value| value <= previous.recorded_at_ms) {
+            return Err("schedule evidence: image GC terminal state was backdated".into());
+        }
+    }
+    for (id, current) in &next.state.image_gc_actions {
+        if !previous.state.image_gc_actions.contains_key(id)
+            && (current.started_at_ms <= previous.recorded_at_ms
+                || current.lifecycle != ImageGcLifecycleV1::Pending)
+        {
+            return Err("schedule evidence: image GC intent was backdated or terminal".into());
         }
     }
     for (id, prior) in &previous.state.entries {
@@ -1997,6 +2450,25 @@ pub(super) fn try_acquire_evidence_gc_lease<C: EvidenceStateCapability + ?Sized>
     evidence_id: &str,
 ) -> Result<File, BoxError> {
     acquire_lease(capability, evidence_id, libc::LOCK_EX)
+}
+
+pub(super) fn try_acquire_evidence_gc_lease_optional<C: EvidenceStateCapability + ?Sized>(
+    capability: &C,
+    evidence_id: &str,
+) -> Result<Option<File>, BoxError> {
+    let file = open_or_create_lease_file(capability.evidence_index_directory(), evidence_id)?;
+    // SAFETY: the verified single-link regular file descriptor is live. LOCK_NB refuses rather
+    // than queueing across scheduler processes.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK)
+            || error.raw_os_error() == Some(libc::EAGAIN)
+        {
+            return Ok(None);
+        }
+        return Err(format!("schedule evidence: cannot acquire GC lease: {error}").into());
+    }
+    Ok(Some(file))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3201,6 +3673,908 @@ pub(super) fn publish_prepared_evidence(
     })
 }
 
+const INCIDENT_MIGRATION_PREFIX: &str = "incident-migration.";
+const MAX_INCIDENT_MIGRATIONS: usize = 1_024;
+const MAX_INCIDENT_MIGRATION_RECORD_BYTES: u64 = 64 * 1024;
+const R3B_INCIDENT_MIGRATION_MANIFEST: &[u8] =
+    include_bytes!("../../../compatibility/r3b-incident-migration-v1.json");
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct IncidentMigrationManifestV1 {
+    pub(super) schema_version: u16,
+    pub(super) incidents: Vec<IncidentMigrationItemV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct IncidentMigrationItemV1 {
+    pub(super) incident_id: String,
+    pub(super) incident_reference: String,
+    pub(super) source_path: String,
+    pub(super) expected_mode: u32,
+    pub(super) expected_length_bytes: u64,
+    pub(super) expected_sha256: String,
+    pub(super) affected_case_ids: Vec<String>,
+}
+
+impl IncidentMigrationItemV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        stable_id("incident migration id", &self.incident_id)?;
+        require_sha256("incident migration source", &self.expected_sha256)?;
+        if self.incident_reference.is_empty()
+            || self.incident_reference.len() > 128
+            || !self.incident_reference.bytes().all(|byte| {
+                byte.is_ascii_uppercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+            })
+            || self.source_path.is_empty()
+            || self.source_path.len() > 4_096
+            || self.source_path.bytes().any(|byte| byte == 0)
+            || !std::path::Path::new(&self.source_path).is_absolute()
+            || self.expected_mode != STATE_FILE_MODE
+            || self.expected_length_bytes == 0
+            || self.expected_length_bytes > MAX_SEAL_FILE_BYTES
+            || self.affected_case_ids.is_empty()
+            || self.affected_case_ids.len() > MAX_EVIDENCE_ITEMS
+        {
+            return Err("schedule evidence: incident migration item shape is invalid".into());
+        }
+        let mut normalized_cases = self.affected_case_ids.clone();
+        for case_id in &normalized_cases {
+            stable_id("incident migration affected case", case_id)?;
+        }
+        normalized_cases.sort();
+        normalized_cases.dedup();
+        if normalized_cases != self.affected_case_ids {
+            return Err(
+                "schedule evidence: incident migration cases are not sorted and unique".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl IncidentMigrationManifestV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        if self.schema_version != 1
+            || self.incidents.is_empty()
+            || self.incidents.len() > MAX_EVIDENCE_ITEMS
+        {
+            return Err("schedule evidence: incident migration manifest shape is invalid".into());
+        }
+        let mut incident_ids = BTreeSet::new();
+        let mut source_paths = BTreeSet::new();
+        for item in &self.incidents {
+            item.validate()?;
+            if !incident_ids.insert(item.incident_id.clone())
+                || !source_paths.insert(item.source_path.clone())
+            {
+                return Err(
+                    "schedule evidence: incident migration manifest identity is duplicated".into(),
+                );
+            }
+        }
+        let mut sorted = self.incidents.clone();
+        sorted.sort_by(|left, right| left.incident_id.cmp(&right.incident_id));
+        if sorted != self.incidents {
+            return Err("schedule evidence: incident migration manifest is not sorted".into());
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn r3b_incident_migration_manifest() -> Result<IncidentMigrationManifestV1, BoxError> {
+    let value: IncidentMigrationManifestV1 =
+        serde_json::from_slice(R3B_INCIDENT_MIGRATION_MANIFEST)?;
+    value.validate()?;
+    if value.incidents.len() != 2
+        || canonical_json(&value)?.as_slice() != R3B_INCIDENT_MIGRATION_MANIFEST
+    {
+        return Err(
+            "schedule evidence: checked-in R3b incident migration manifest is not exact".into(),
+        );
+    }
+    Ok(value)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "disposition", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum IncidentMigrationDispositionV1 {
+    Missing,
+    Mismatch {
+        reason_code: String,
+        observed_mode: u32,
+        observed_length_bytes: u64,
+        observed_sha256: OptionalSha256V1,
+    },
+    Migrated {
+        archive_sha256: String,
+        manifest_sha256: String,
+        compact_record_sha256: String,
+    },
+}
+
+impl IncidentMigrationDispositionV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        match self {
+            Self::Missing => Ok(()),
+            Self::Mismatch {
+                reason_code,
+                observed_mode,
+                observed_sha256,
+                ..
+            } => {
+                stable_id("incident migration mismatch reason", reason_code)?;
+                if *observed_mode > 0o777 {
+                    return Err(
+                        "schedule evidence: incident migration observed mode is invalid".into(),
+                    );
+                }
+                if let OptionalSha256V1::Sha256 { value } = observed_sha256 {
+                    require_sha256("incident migration observed source", value)?;
+                }
+                Ok(())
+            }
+            Self::Migrated {
+                archive_sha256,
+                manifest_sha256,
+                compact_record_sha256,
+            } => {
+                require_sha256("migrated incident archive", archive_sha256)?;
+                require_sha256("migrated incident manifest", manifest_sha256)?;
+                require_sha256("migrated incident compact record", compact_record_sha256)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct IncidentMigrationRecordV1 {
+    schema_version: u16,
+    generation: u64,
+    previous_record: OptionalSha256V1,
+    recorded_at_ms: i64,
+    item: IncidentMigrationItemV1,
+    disposition: IncidentMigrationDispositionV1,
+}
+
+impl IncidentMigrationRecordV1 {
+    fn validate(&self) -> Result<(), BoxError> {
+        if self.schema_version != 1 || self.generation == 0 || self.recorded_at_ms <= 0 {
+            return Err("schedule evidence: incident migration record header is invalid".into());
+        }
+        match (&self.previous_record, self.generation) {
+            (OptionalSha256V1::Absent, 1) => {}
+            (OptionalSha256V1::Sha256 { value }, generation) if generation > 1 => {
+                require_sha256("incident migration predecessor", value)?;
+            }
+            _ => {
+                return Err(
+                    "schedule evidence: incident migration predecessor shape is invalid".into(),
+                )
+            }
+        }
+        self.item.validate()?;
+        self.disposition.validate()
+    }
+}
+
+fn incident_migration_record_sha256(
+    record: &IncidentMigrationRecordV1,
+) -> Result<String, BoxError> {
+    record.validate()?;
+    Ok(local_file::sha256_hex(&canonical_json(record)?))
+}
+
+pub(super) struct FileIncidentMigrationJournal<'lock> {
+    directory: &'lock local_file::PinnedDirectory,
+    records: Vec<IncidentMigrationRecordV1>,
+}
+
+impl<'lock> FileIncidentMigrationJournal<'lock> {
+    fn generation_name(generation: u64) -> String {
+        format!("{INCIDENT_MIGRATION_PREFIX}{generation:020}.json")
+    }
+
+    fn generation_entries(
+        directory: &local_file::PinnedDirectory,
+    ) -> Result<Vec<(u64, String)>, BoxError> {
+        if !directory.current_path_matches() {
+            return Err("schedule evidence: incident migration directory path changed".into());
+        }
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(directory.canonical_path())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.starts_with(INCIDENT_MIGRATION_PREFIX) {
+                continue;
+            }
+            let Some(raw) = name
+                .strip_prefix(INCIDENT_MIGRATION_PREFIX)
+                .and_then(|value| value.strip_suffix(".json"))
+            else {
+                return Err("schedule evidence: malformed incident migration generation".into());
+            };
+            if raw.len() != 20 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("schedule evidence: malformed incident migration generation".into());
+            }
+            entries.push((raw.parse()?, name.into()));
+        }
+        if entries.len() > MAX_INCIDENT_MIGRATIONS || !directory.current_path_matches() {
+            return Err(
+                "schedule evidence: incident migration scan is unbounded or unstable".into(),
+            );
+        }
+        entries.sort_by_key(|(generation, _)| *generation);
+        Ok(entries)
+    }
+
+    fn read_generation(
+        directory: &local_file::PinnedDirectory,
+        name: &str,
+    ) -> Result<IncidentMigrationRecordV1, BoxError> {
+        let file = directory.open_regular_file(OsStr::new(name), "incident migration record")?;
+        let metadata = file.metadata()?;
+        validate_private_file_metadata(&metadata, "incident migration record")?;
+        if metadata.len() > MAX_INCIDENT_MIGRATION_RECORD_BYTES {
+            return Err("schedule evidence: incident migration record is oversized".into());
+        }
+        let snapshot = local_file::read_open_regular_file_bounded(
+            &file,
+            "incident migration record",
+            MAX_INCIDENT_MIGRATION_RECORD_BYTES,
+        )?;
+        let record: IncidentMigrationRecordV1 = serde_json::from_slice(&snapshot.bytes)?;
+        if canonical_json(&record)? != snapshot.bytes {
+            return Err(
+                "schedule evidence: incident migration record is not canonical JSON".into(),
+            );
+        }
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn validate_records(records: &[IncidentMigrationRecordV1]) -> Result<(), BoxError> {
+        if records.len() > MAX_INCIDENT_MIGRATIONS {
+            return Err("schedule evidence: incident migration history exceeds its bound".into());
+        }
+        let mut prior_global: Option<&IncidentMigrationRecordV1> = None;
+        let mut latest_by_incident = BTreeMap::<String, &IncidentMigrationRecordV1>::new();
+        for (index, record) in records.iter().enumerate() {
+            record.validate()?;
+            let expected_generation = u64::try_from(index + 1)?;
+            if record.generation != expected_generation {
+                return Err(
+                    "schedule evidence: incident migration generations are not contiguous".into(),
+                );
+            }
+            if let Some(previous) = prior_global {
+                if record.recorded_at_ms <= previous.recorded_at_ms
+                    || record.previous_record
+                        != (OptionalSha256V1::Sha256 {
+                            value: incident_migration_record_sha256(previous)?,
+                        })
+                {
+                    return Err(
+                        "schedule evidence: incident migration chain is not monotonic".into(),
+                    );
+                }
+            }
+            if let Some(previous) = latest_by_incident.get(&record.item.incident_id) {
+                if previous.item != record.item
+                    || matches!(
+                        previous.disposition,
+                        IncidentMigrationDispositionV1::Migrated { .. }
+                    )
+                {
+                    return Err(
+                        "schedule evidence: incident migration identity changed after recording"
+                            .into(),
+                    );
+                }
+            }
+            latest_by_incident.insert(record.item.incident_id.clone(), record);
+            prior_global = Some(record);
+        }
+        Ok(())
+    }
+
+    pub(super) fn open_existing_or_empty<C: EvidenceStateCapability + ?Sized>(
+        capability: &'lock C,
+    ) -> Result<Self, BoxError> {
+        let directory = capability.migration_directory();
+        let mut records = Vec::new();
+        for (index, (generation, name)) in
+            Self::generation_entries(directory)?.into_iter().enumerate()
+        {
+            if generation != u64::try_from(index + 1)? {
+                return Err(
+                    "schedule evidence: incident migration filenames are not contiguous".into(),
+                );
+            }
+            let record = Self::read_generation(directory, &name)?;
+            if record.generation != generation {
+                return Err(
+                    "schedule evidence: incident migration filename/record mismatch".into(),
+                );
+            }
+            records.push(record);
+        }
+        Self::validate_records(&records)?;
+        Ok(Self { directory, records })
+    }
+
+    fn latest_for(&self, incident_id: &str) -> Option<&IncidentMigrationRecordV1> {
+        self.records
+            .iter()
+            .rev()
+            .find(|record| record.item.incident_id == incident_id)
+    }
+
+    fn append(
+        &mut self,
+        item: &IncidentMigrationItemV1,
+        disposition: IncidentMigrationDispositionV1,
+        recorded_at_ms: i64,
+    ) -> Result<(), BoxError> {
+        item.validate()?;
+        disposition.validate()?;
+        if self.records.len() >= MAX_INCIDENT_MIGRATIONS
+            || self
+                .records
+                .last()
+                .is_some_and(|record| recorded_at_ms <= record.recorded_at_ms)
+        {
+            return Err(
+                "schedule evidence: incident migration append time/bound is invalid".into(),
+            );
+        }
+        if let Some(previous) = self.latest_for(&item.incident_id) {
+            if previous.item != *item
+                || matches!(
+                    previous.disposition,
+                    IncidentMigrationDispositionV1::Migrated { .. }
+                )
+            {
+                return Err(
+                    "schedule evidence: incident migration cannot change or repin identity".into(),
+                );
+            }
+        }
+        let generation = u64::try_from(self.records.len() + 1)?;
+        let previous_record = match self.records.last() {
+            Some(previous) => OptionalSha256V1::Sha256 {
+                value: incident_migration_record_sha256(previous)?,
+            },
+            None => OptionalSha256V1::Absent,
+        };
+        let record = IncidentMigrationRecordV1 {
+            schema_version: 1,
+            generation,
+            previous_record,
+            recorded_at_ms,
+            item: item.clone(),
+            disposition,
+        };
+        let mut candidate = self.records.clone();
+        candidate.push(record.clone());
+        Self::validate_records(&candidate)?;
+        let bytes = canonical_json(&record)?;
+        if bytes.len() as u64 > MAX_INCIDENT_MIGRATION_RECORD_BYTES {
+            return Err("schedule evidence: incident migration record exceeds its bound".into());
+        }
+        let name = Self::generation_name(generation);
+        let mut file = self.directory.create_new_file(
+            OsStr::new(&name),
+            STATE_FILE_MODE,
+            "incident migration record",
+        )?;
+        if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = self.directory.remove_child(
+                OsStr::new(&name),
+                false,
+                "failed incident migration record",
+            );
+            return Err(
+                format!("schedule evidence: cannot persist incident migration: {error}").into(),
+            );
+        }
+        self.directory.sync()?;
+        self.records = candidate;
+        Ok(())
+    }
+
+    fn records(&self) -> &[IncidentMigrationRecordV1] {
+        &self.records
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IncidentMigrationSidecarV1 {
+    schema_version: u16,
+    migration_kind: String,
+    incident_id: String,
+    incident_reference: String,
+    manifest_item_sha256: String,
+    source_path_sha256: String,
+    source_mode: u32,
+    source_length_bytes: u64,
+    source_sha256: String,
+    affected_case_ids: Vec<String>,
+}
+
+fn incident_migration_sidecar(
+    item: &IncidentMigrationItemV1,
+) -> Result<(Vec<u8>, String), BoxError> {
+    item.validate()?;
+    let value = IncidentMigrationSidecarV1 {
+        schema_version: 1,
+        migration_kind: "r3b_incident_aggregate".into(),
+        incident_id: item.incident_id.clone(),
+        incident_reference: item.incident_reference.clone(),
+        manifest_item_sha256: local_file::sha256_hex(&canonical_json(item)?),
+        source_path_sha256: local_file::sha256_hex(item.source_path.as_bytes()),
+        source_mode: item.expected_mode,
+        source_length_bytes: item.expected_length_bytes,
+        source_sha256: item.expected_sha256.clone(),
+        affected_case_ids: item.affected_case_ids.clone(),
+    };
+    let bytes = canonical_json(&value)?;
+    let sha256 = local_file::sha256_hex(&bytes);
+    scan_sealed_file(&["incident-migration-sidecar.json".into()], &bytes)?;
+    Ok((bytes, sha256))
+}
+
+enum IncidentSourceObservationV1 {
+    Missing,
+    Mismatch(IncidentMigrationDispositionV1),
+    Exact(Vec<u8>),
+}
+
+fn mismatch_disposition(
+    reason_code: &str,
+    observed_mode: u32,
+    observed_length_bytes: u64,
+    observed_sha256: OptionalSha256V1,
+) -> IncidentMigrationDispositionV1 {
+    IncidentMigrationDispositionV1::Mismatch {
+        reason_code: reason_code.into(),
+        observed_mode,
+        observed_length_bytes,
+        observed_sha256,
+    }
+}
+
+fn inspect_incident_source(
+    item: &IncidentMigrationItemV1,
+) -> Result<IncidentSourceObservationV1, BoxError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    item.validate()?;
+    let path = std::path::Path::new(&item.source_path);
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(IncidentSourceObservationV1::Missing)
+        }
+        Err(error) => {
+            return Err(format!(
+                "schedule evidence: cannot inspect incident source {}: {error}",
+                path.display()
+            )
+            .into())
+        }
+    };
+    let observed_mode = metadata.mode() & 0o777;
+    let observed_length_bytes = metadata.len();
+    let metadata_reason = if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+    {
+        Some("unsafe_source_metadata")
+    } else if observed_mode != item.expected_mode {
+        Some("mode_mismatch")
+    } else if observed_length_bytes != item.expected_length_bytes {
+        Some("length_mismatch")
+    } else {
+        None
+    };
+    if let Some(reason) = metadata_reason {
+        return Ok(IncidentSourceObservationV1::Mismatch(mismatch_disposition(
+            reason,
+            observed_mode,
+            observed_length_bytes,
+            OptionalSha256V1::Absent,
+        )));
+    }
+
+    let snapshot = local_file::read_regular_file_bounded(
+        path,
+        "R3b incident migration source",
+        item.expected_length_bytes,
+    )?;
+    let final_metadata = std::fs::symlink_metadata(path)?;
+    if !final_metadata.is_file()
+        || final_metadata.uid() != unsafe { libc::geteuid() }
+        || final_metadata.nlink() != 1
+        || final_metadata.mode() & 0o777 != observed_mode
+        || final_metadata.len() != observed_length_bytes
+    {
+        return Err("schedule evidence: incident source metadata changed during inspection".into());
+    }
+    if snapshot.bytes.len() as u64 != item.expected_length_bytes
+        || snapshot.sha256 != item.expected_sha256
+    {
+        return Ok(IncidentSourceObservationV1::Mismatch(mismatch_disposition(
+            "hash_mismatch",
+            observed_mode,
+            observed_length_bytes,
+            OptionalSha256V1::Sha256 {
+                value: snapshot.sha256,
+            },
+        )));
+    }
+    crate::compatibility::validate_child_aggregate_bytes(&snapshot.bytes)?;
+    Ok(IncidentSourceObservationV1::Exact(snapshot.bytes))
+}
+
+fn prepare_incident_migration_evidence(
+    item: &IncidentMigrationItemV1,
+    aggregate: Vec<u8>,
+    recorded_at_ms: i64,
+) -> Result<PreparedSealedEvidenceV1, BoxError> {
+    item.validate()?;
+    if recorded_at_ms <= 0
+        || aggregate.len() as u64 != item.expected_length_bytes
+        || local_file::sha256_hex(&aggregate) != item.expected_sha256
+    {
+        return Err("schedule evidence: incident migration source identity diverged".into());
+    }
+    crate::compatibility::validate_child_aggregate_bytes(&aggregate)?;
+    let (sidecar, sidecar_sha256) = incident_migration_sidecar(item)?;
+    let files = vec![
+        SnapshottedSealFileV1 {
+            path: vec!["incident-migration-sidecar.json".into()],
+            bytes: sidecar,
+            sha256: sidecar_sha256.clone(),
+        },
+        SnapshottedSealFileV1 {
+            path: vec!["pinned-aggregate.json".into()],
+            bytes: aggregate,
+            sha256: item.expected_sha256.clone(),
+        },
+    ];
+    for file in &files {
+        scan_sealed_file(&file.path, &file.bytes)?;
+    }
+    let archive = deterministic_archive(&[], &files)?;
+    let archive_sha256 = local_file::sha256_hex(&archive);
+    let manifest_files = files
+        .iter()
+        .map(|file| SealedEvidenceFileV1 {
+            path: evidence_path_string(&file.path),
+            length_bytes: file.bytes.len() as u64,
+            sha256: file.sha256.clone(),
+        })
+        .collect::<Vec<_>>();
+    let manifest_directories = Vec::<String>::new();
+    let source_tree_sha256 =
+        local_file::sha256_hex(&canonical_json(&(&manifest_directories, &manifest_files))?);
+    let manifest_value = SealedEvidenceManifestV1 {
+        schema_version: 1,
+        evidence_id: item.incident_id.clone(),
+        created_at_ms: recorded_at_ms,
+        terminal_at_ms: recorded_at_ms,
+        source_tree_sha256,
+        directories: manifest_directories,
+        files: manifest_files,
+        sidecar_path: "incident-migration-sidecar.json".into(),
+        sidecar_sha256: sidecar_sha256.clone(),
+        aggregate_sha256: OptionalSha256V1::Sha256 {
+            value: item.expected_sha256.clone(),
+        },
+        archive_sha256: archive_sha256.clone(),
+        archive_bytes: archive.len() as u64,
+    };
+    let manifest = canonical_json(&manifest_value)?;
+    let manifest_sha256 = local_file::sha256_hex(&manifest);
+    let compact_value = CompactEvidenceRecordV1 {
+        schema_version: 1,
+        evidence_id: item.incident_id.clone(),
+        evidence_class: EvidenceClassV1::Incident,
+        terminal_at_ms: recorded_at_ms,
+        affected_case_ids: item.affected_case_ids.clone(),
+        sidecar_sha256,
+        aggregate_sha256: OptionalSha256V1::Sha256 {
+            value: item.expected_sha256.clone(),
+        },
+        archive_sha256: archive_sha256.clone(),
+        manifest_sha256: manifest_sha256.clone(),
+    };
+    compact_value.validate()?;
+    let compact_record = canonical_json(&compact_value)?;
+    let compact_record_sha256 = local_file::sha256_hex(&compact_record);
+    let prepared = PreparedSealedEvidenceV1 {
+        evidence_id: item.incident_id.clone(),
+        evidence_class: EvidenceClassV1::Incident,
+        terminal_at_ms: recorded_at_ms,
+        case_minimum_days: 0,
+        release_retain_until_ms: None,
+        sidecar_sha256: manifest_value.sidecar_sha256,
+        aggregate_sha256: manifest_value.aggregate_sha256,
+        archive,
+        archive_sha256,
+        manifest,
+        manifest_sha256,
+        compact_record,
+        compact_record_sha256,
+    };
+    prepared.validate()?;
+    Ok(prepared)
+}
+
+fn existing_incident_migration_disposition(
+    store: &EvidenceHotStoreV1,
+    state: &EvidenceStateModelV1,
+    item: &IncidentMigrationItemV1,
+) -> Result<Option<IncidentMigrationDispositionV1>, BoxError> {
+    state.validate()?;
+    let Some(entry) = state.entries.get(&item.incident_id) else {
+        if state.retired_evidence_ids.contains(&item.incident_id)
+            || state
+                .tombstones
+                .values()
+                .any(|tombstone| tombstone.evidence_id == item.incident_id)
+        {
+            return Err(
+                "schedule evidence: incident migration id has retired evidence history".into(),
+            );
+        }
+        return Ok(None);
+    };
+    let compact: CompactEvidenceRecordV1 = serde_json::from_str(&entry.compact_record)?;
+    let expected_path = RelativeEvidencePathV1 {
+        components: vec!["sealed".into(), payload_object_name(&item.incident_id)?],
+    };
+    let pin_id = incident_pin_id(&item.incident_id)?;
+    if entry.evidence_class != EvidenceClassV1::Incident
+        || !entry.hot_present
+        || entry.hot_path != expected_path
+        || compact.aggregate_sha256
+            != (OptionalSha256V1::Sha256 {
+                value: item.expected_sha256.clone(),
+            })
+        || !matches!(
+            state.pins.get(&pin_id).map(|pin| &pin.lifecycle),
+            Some(PinLifecycleV1::Active)
+        )
+    {
+        return Err(
+            "schedule evidence: existing incident id does not match the migration identity".into(),
+        );
+    }
+
+    let object_name = entry
+        .hot_path
+        .components
+        .last()
+        .ok_or("schedule evidence: migrated incident hot path is empty")?;
+    let object = store
+        .sealed
+        .open_child_directory(OsStr::new(object_name), "migrated incident payload")?;
+    let archive_file =
+        object.open_regular_file(OsStr::new("evidence.tar.gz"), "migrated incident archive")?;
+    validate_private_file_metadata(&archive_file.metadata()?, "migrated incident archive")?;
+    let archive = local_file::read_open_regular_file_bounded(
+        &archive_file,
+        "migrated incident archive",
+        MAX_SEAL_TOTAL_BYTES,
+    )?;
+    let manifest_file =
+        object.open_regular_file(OsStr::new("manifest.json"), "migrated incident manifest")?;
+    validate_private_file_metadata(&manifest_file.metadata()?, "migrated incident manifest")?;
+    let manifest = local_file::read_open_regular_file_bounded(
+        &manifest_file,
+        "migrated incident manifest",
+        MAX_SEAL_FILE_BYTES,
+    )?;
+    if archive.sha256 != entry.full_evidence_sha256
+        || archive.bytes.len() as u64 != entry.archive_bytes
+        || manifest.sha256 != entry.manifest_sha256
+        || manifest.bytes.len() as u64 != entry.manifest_bytes
+    {
+        return Err("schedule evidence: migrated incident payload hash diverged".into());
+    }
+    let manifest_value: SealedEvidenceManifestV1 = serde_json::from_slice(&manifest.bytes)?;
+    let (sidecar, sidecar_sha256) = incident_migration_sidecar(item)?;
+    let expected_files = vec![
+        SealedEvidenceFileV1 {
+            path: "incident-migration-sidecar.json".into(),
+            length_bytes: sidecar.len() as u64,
+            sha256: sidecar_sha256.clone(),
+        },
+        SealedEvidenceFileV1 {
+            path: "pinned-aggregate.json".into(),
+            length_bytes: item.expected_length_bytes,
+            sha256: item.expected_sha256.clone(),
+        },
+    ];
+    let expected_directories = Vec::<String>::new();
+    let expected_source_tree_sha256 =
+        local_file::sha256_hex(&canonical_json(&(&expected_directories, &expected_files))?);
+    if canonical_json(&manifest_value)? != manifest.bytes
+        || manifest_value.schema_version != 1
+        || manifest_value.evidence_id != item.incident_id
+        || manifest_value.created_at_ms != entry.terminal_at_ms
+        || manifest_value.terminal_at_ms != entry.terminal_at_ms
+        || manifest_value.source_tree_sha256 != expected_source_tree_sha256
+        || manifest_value.directories != expected_directories
+        || manifest_value.files != expected_files
+        || manifest_value.sidecar_path != "incident-migration-sidecar.json"
+        || manifest_value.sidecar_sha256 != sidecar_sha256
+        || manifest_value.aggregate_sha256
+            != (OptionalSha256V1::Sha256 {
+                value: item.expected_sha256.clone(),
+            })
+        || manifest_value.archive_sha256 != entry.full_evidence_sha256
+        || manifest_value.archive_bytes != entry.archive_bytes
+        || compact.affected_case_ids != item.affected_case_ids
+        || compact.sidecar_sha256 != sidecar_sha256
+    {
+        return Err("schedule evidence: existing incident payload is not this migration".into());
+    }
+    Ok(Some(IncidentMigrationDispositionV1::Migrated {
+        archive_sha256: entry.full_evidence_sha256.clone(),
+        manifest_sha256: entry.manifest_sha256.clone(),
+        compact_record_sha256: entry.compact_record_sha256.clone(),
+    }))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum IncidentMigrationFailpointV1 {
+    None,
+    AfterEvidencePublication,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct IncidentMigrationResultV1 {
+    pub(super) disposition: IncidentMigrationDispositionV1,
+    pub(super) evidence_published: bool,
+    pub(super) journal_appended: bool,
+}
+
+fn record_incident_migration_disposition(
+    journal: &mut FileIncidentMigrationJournal<'_>,
+    item: &IncidentMigrationItemV1,
+    disposition: IncidentMigrationDispositionV1,
+    recorded_at_ms: i64,
+) -> Result<IncidentMigrationResultV1, BoxError> {
+    if let Some(previous) = journal.latest_for(&item.incident_id) {
+        if previous.item != *item {
+            return Err("schedule evidence: incident migration identity changed".into());
+        }
+        if previous.disposition == disposition {
+            return Ok(IncidentMigrationResultV1 {
+                disposition,
+                evidence_published: false,
+                journal_appended: false,
+            });
+        }
+    }
+    journal.append(item, disposition.clone(), recorded_at_ms)?;
+    Ok(IncidentMigrationResultV1 {
+        disposition,
+        evidence_published: false,
+        journal_appended: true,
+    })
+}
+
+pub(super) fn migrate_incident_evidence(
+    store: &EvidenceHotStoreV1,
+    evidence_journal: &mut FileEvidenceJournal<'_>,
+    state: &mut EvidenceStateModelV1,
+    migration_journal: &mut FileIncidentMigrationJournal<'_>,
+    item: &IncidentMigrationItemV1,
+    caps: &HotStorageCapsV1,
+    usage: &mut HotStorageUsageV1,
+    recorded_at_ms: i64,
+    failpoint: IncidentMigrationFailpointV1,
+) -> Result<IncidentMigrationResultV1, BoxError> {
+    item.validate()?;
+    state.validate()?;
+    if recorded_at_ms <= 0 || state.hot_root_sha256 != store.root_sha256() {
+        return Err("schedule evidence: incident migration state/root/time is invalid".into());
+    }
+    if let Some(previous) = migration_journal.latest_for(&item.incident_id) {
+        if previous.item != *item {
+            return Err(
+                "schedule evidence: incident migration cannot repin changed source bytes".into(),
+            );
+        }
+    }
+    if let Some(disposition) = existing_incident_migration_disposition(store, state, item)? {
+        if let Some(previous) = migration_journal.latest_for(&item.incident_id) {
+            if matches!(
+                previous.disposition,
+                IncidentMigrationDispositionV1::Migrated { .. }
+            ) && previous.disposition != disposition
+            {
+                return Err(
+                    "schedule evidence: migrated incident journal/payload identity diverged".into(),
+                );
+            }
+        }
+        return record_incident_migration_disposition(
+            migration_journal,
+            item,
+            disposition,
+            recorded_at_ms,
+        );
+    }
+    if migration_journal
+        .latest_for(&item.incident_id)
+        .is_some_and(|record| {
+            matches!(
+                record.disposition,
+                IncidentMigrationDispositionV1::Migrated { .. }
+            )
+        })
+    {
+        return Err("schedule evidence: migrated incident payload disappeared".into());
+    }
+
+    let aggregate = match inspect_incident_source(item)? {
+        IncidentSourceObservationV1::Missing => {
+            return record_incident_migration_disposition(
+                migration_journal,
+                item,
+                IncidentMigrationDispositionV1::Missing,
+                recorded_at_ms,
+            )
+        }
+        IncidentSourceObservationV1::Mismatch(disposition) => {
+            return record_incident_migration_disposition(
+                migration_journal,
+                item,
+                disposition,
+                recorded_at_ms,
+            )
+        }
+        IncidentSourceObservationV1::Exact(bytes) => bytes,
+    };
+    let prepared = prepare_incident_migration_evidence(item, aggregate, recorded_at_ms)?;
+    let published = publish_prepared_evidence(
+        store,
+        evidence_journal,
+        state,
+        &prepared,
+        caps,
+        usage,
+        recorded_at_ms,
+        SealPublicationFailpointV1::None,
+    )?;
+    *usage = published.usage;
+    if failpoint == IncidentMigrationFailpointV1::AfterEvidencePublication {
+        return Err("schedule evidence: injected crash after incident evidence publication".into());
+    }
+    let disposition = existing_incident_migration_disposition(store, state, item)?
+        .ok_or("schedule evidence: migrated incident was not indexed after publication")?;
+    let mut result = record_incident_migration_disposition(
+        migration_journal,
+        item,
+        disposition,
+        recorded_at_ms,
+    )?;
+    result.evidence_published = true;
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3290,6 +4664,39 @@ mod tests {
 
     fn model() -> EvidenceStateModelV1 {
         EvidenceStateModelV1::new(digest('c'), ColdStorageBindingV1::Absent).unwrap()
+    }
+
+    fn bundle_gc_action(action_id: &str, bundle_id: &str, started_at_ms: i64) -> BundleGcActionV1 {
+        BundleGcActionV1 {
+            action_id: action_id.into(),
+            bundle_id: bundle_id.into(),
+            evidence_id: "evidence-1".into(),
+            provider_id: "provider-1".into(),
+            case_id: "case-1".into(),
+            evidence_class: EvidenceClassV1::RoutineGreen,
+            cache_root_sha256: digest('1'),
+            path: RelativeEvidencePathV1 {
+                components: vec![format!("{bundle_id}.json")],
+            },
+            content_sha256: digest('2'),
+            length_bytes: 512,
+            preserved_in_full_evidence_sha256: digest('3'),
+            reason_code: "retention_expired".into(),
+            planned_at_ms: started_at_ms - 1,
+            started_at_ms,
+            lifecycle: BundleGcLifecycleV1::Pending,
+        }
+    }
+
+    fn image_gc_action(action_id: &str, digest_char: char, started_at_ms: i64) -> ImageGcActionV1 {
+        ImageGcActionV1 {
+            action_id: action_id.into(),
+            digest: format!("sha256:{}", digest(digest_char)),
+            planned_inventory_sha256: digest('4'),
+            planned_at_ms: started_at_ms - 1,
+            started_at_ms,
+            lifecycle: ImageGcLifecycleV1::Pending,
+        }
     }
 
     fn publish_test_cold_copy(
@@ -3511,6 +4918,22 @@ mod tests {
             state_bytes: 0,
             scratch_bytes: 0,
             sealed_bytes: 0,
+        }
+    }
+
+    fn migration_item(
+        incident_id: &str,
+        source_path: &Path,
+        bytes: &[u8],
+    ) -> IncidentMigrationItemV1 {
+        IncidentMigrationItemV1 {
+            incident_id: incident_id.into(),
+            incident_reference: format!("TEST-{}", incident_id.to_ascii_uppercase()),
+            source_path: source_path.to_string_lossy().into_owned(),
+            expected_mode: 0o600,
+            expected_length_bytes: bytes.len() as u64,
+            expected_sha256: local_file::sha256_hex(bytes),
+            affected_case_ids: vec!["case-1".into()],
         }
     }
 
@@ -3775,6 +5198,219 @@ mod tests {
         assert!(previous
             .successor(state, previous.recorded_at_ms + 1)
             .is_err());
+    }
+
+    #[test]
+    fn gc_transitions_require_a_durable_pending_generation_and_immutable_identity() {
+        let first = EvidenceStateSnapshotV1::first(model(), 20_000_000_000).unwrap();
+
+        let mut bundle_terminal = model();
+        bundle_terminal
+            .begin_bundle_gc(bundle_gc_action(
+                "bundle-action-1",
+                "bundle-1",
+                first.recorded_at_ms + 1,
+            ))
+            .unwrap();
+        bundle_terminal
+            .complete_bundle_gc("bundle-action-1", first.recorded_at_ms + 2)
+            .unwrap();
+        let skipped_pending = first
+            .successor(bundle_terminal, first.recorded_at_ms + 3)
+            .unwrap();
+        assert!(validate_evidence_state_transition(&first, &skipped_pending).is_err());
+
+        let mut image_terminal = model();
+        image_terminal
+            .begin_image_gc(image_gc_action(
+                "image-action-1",
+                '5',
+                first.recorded_at_ms + 1,
+            ))
+            .unwrap();
+        image_terminal
+            .safe_skip_image_gc(
+                "image-action-1",
+                "runtime_inventory_changed",
+                first.recorded_at_ms + 2,
+            )
+            .unwrap();
+        let skipped_pending = first
+            .successor(image_terminal, first.recorded_at_ms + 3)
+            .unwrap();
+        assert!(validate_evidence_state_transition(&first, &skipped_pending).is_err());
+
+        let mut pending_state = model();
+        pending_state
+            .begin_bundle_gc(bundle_gc_action(
+                "bundle-action-2",
+                "bundle-2",
+                first.recorded_at_ms + 1,
+            ))
+            .unwrap();
+        let pending = first
+            .successor(pending_state.clone(), first.recorded_at_ms + 2)
+            .unwrap();
+        validate_evidence_state_transition(&first, &pending).unwrap();
+
+        pending_state
+            .bundle_gc_actions
+            .get_mut("bundle-action-2")
+            .unwrap()
+            .provider_id = "provider-2".into();
+        let changed = pending
+            .successor(pending_state, pending.recorded_at_ms + 1)
+            .unwrap();
+        assert!(validate_evidence_state_transition(&pending, &changed).is_err());
+    }
+
+    #[test]
+    fn gc_transitions_reject_backdated_intents_and_terminal_events() {
+        let first = EvidenceStateSnapshotV1::first(model(), 20_000_000_000).unwrap();
+
+        let mut backdated_bundle = model();
+        backdated_bundle
+            .begin_bundle_gc(bundle_gc_action(
+                "bundle-action-1",
+                "bundle-1",
+                first.recorded_at_ms,
+            ))
+            .unwrap();
+        let next = first
+            .successor(backdated_bundle, first.recorded_at_ms + 1)
+            .unwrap();
+        assert!(validate_evidence_state_transition(&first, &next).is_err());
+
+        let mut pending_state = model();
+        pending_state
+            .begin_image_gc(image_gc_action(
+                "image-action-1",
+                '5',
+                first.recorded_at_ms + 1,
+            ))
+            .unwrap();
+        let pending = first
+            .successor(pending_state.clone(), first.recorded_at_ms + 2)
+            .unwrap();
+        validate_evidence_state_transition(&first, &pending).unwrap();
+        pending_state
+            .complete_image_gc("image-action-1", pending.recorded_at_ms)
+            .unwrap();
+        let next = pending
+            .successor(pending_state, pending.recorded_at_ms + 1)
+            .unwrap();
+        assert!(validate_evidence_state_transition(&pending, &next).is_err());
+    }
+
+    #[test]
+    fn gc_state_rejects_duplicate_pending_targets_and_future_terminal_events() {
+        let mut duplicate = model();
+        duplicate
+            .begin_bundle_gc(bundle_gc_action("bundle-action-1", "bundle-1", 1_000_001))
+            .unwrap();
+        duplicate.bundle_gc_actions.insert(
+            "bundle-action-2".into(),
+            bundle_gc_action("bundle-action-2", "bundle-1", 1_000_002),
+        );
+        assert!(duplicate.validate().is_err());
+
+        let mut future_bundle = model();
+        future_bundle
+            .begin_bundle_gc(bundle_gc_action("bundle-action-1", "bundle-1", 1_000_001))
+            .unwrap();
+        future_bundle
+            .complete_bundle_gc("bundle-action-1", 1_000_003)
+            .unwrap();
+        assert!(EvidenceStateSnapshotV1::first(future_bundle, 1_000_002).is_err());
+
+        let mut future_image = model();
+        future_image
+            .begin_image_gc(image_gc_action("image-action-1", '5', 1_000_001))
+            .unwrap();
+        future_image
+            .safe_skip_image_gc("image-action-1", "runtime_error", 1_000_003)
+            .unwrap();
+        assert!(EvidenceStateSnapshotV1::first(future_image, 1_000_002).is_err());
+    }
+
+    #[test]
+    fn gc_state_compacts_only_terminal_actions_and_keeps_the_journal_transition_valid() {
+        let mut state = model();
+        for index in 0..MAX_EVIDENCE_ITEMS * 4 {
+            let started_at_ms = 1_000_000 + index as i64 * 2;
+            let mut bundle = bundle_gc_action(
+                &format!("bundle-action-{index}"),
+                &format!("bundle-{index}"),
+                started_at_ms,
+            );
+            bundle.lifecycle = BundleGcLifecycleV1::Unlinked {
+                unlinked_at_ms: started_at_ms + 1,
+            };
+            state
+                .bundle_gc_actions
+                .insert(bundle.action_id.clone(), bundle);
+
+            let mut image = ImageGcActionV1 {
+                action_id: format!("image-action-{index}"),
+                digest: format!("sha256:{index:064x}"),
+                planned_inventory_sha256: digest('4'),
+                planned_at_ms: started_at_ms - 1,
+                started_at_ms,
+                lifecycle: ImageGcLifecycleV1::Pending,
+            };
+            image.lifecycle = ImageGcLifecycleV1::Removed {
+                removed_at_ms: started_at_ms + 1,
+            };
+            state
+                .image_gc_actions
+                .insert(image.action_id.clone(), image);
+        }
+        state.validate().unwrap();
+        let previous = EvidenceStateSnapshotV1::first(state.clone(), 20_000_000_000).unwrap();
+
+        state
+            .begin_bundle_gc(bundle_gc_action(
+                "bundle-action-new",
+                "bundle-new",
+                previous.recorded_at_ms + 1,
+            ))
+            .unwrap();
+        state
+            .begin_image_gc(image_gc_action(
+                "image-action-new",
+                'f',
+                previous.recorded_at_ms + 1,
+            ))
+            .unwrap();
+        state
+            .begin_bundle_gc(bundle_gc_action(
+                "bundle-action-newer",
+                "bundle-newer",
+                previous.recorded_at_ms + 2,
+            ))
+            .unwrap();
+        state
+            .begin_image_gc(image_gc_action(
+                "image-action-newer",
+                'e',
+                previous.recorded_at_ms + 2,
+            ))
+            .unwrap();
+        assert_eq!(state.bundle_gc_actions.len(), MAX_EVIDENCE_ITEMS * 4);
+        assert_eq!(state.image_gc_actions.len(), MAX_EVIDENCE_ITEMS * 4);
+        assert!(!state.bundle_gc_actions.contains_key("bundle-action-0"));
+        assert!(!state.bundle_gc_actions.contains_key("bundle-action-1"));
+        assert!(!state.image_gc_actions.contains_key("image-action-0"));
+        assert!(!state.image_gc_actions.contains_key("image-action-1"));
+        assert!(state.bundle_gc_actions.contains_key("bundle-action-new"));
+        assert!(state.bundle_gc_actions.contains_key("bundle-action-newer"));
+        assert!(state.image_gc_actions.contains_key("image-action-new"));
+        assert!(state.image_gc_actions.contains_key("image-action-newer"));
+
+        let next = previous
+            .successor(state, previous.recorded_at_ms + 2)
+            .unwrap();
+        validate_evidence_state_transition(&previous, &next).unwrap();
     }
 
     #[test]
@@ -4963,6 +6599,525 @@ mod tests {
             )
             .unwrap();
         state.mark_hot_evidence_absent("evidence-1").unwrap();
+    }
+
+    #[test]
+    fn checked_in_r3b_migration_manifest_binds_both_exact_incidents() {
+        let manifest = r3b_incident_migration_manifest().unwrap();
+        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.incidents.len(), 2);
+        assert_eq!(
+            manifest.incidents[0],
+            IncidentMigrationItemV1 {
+                incident_id: "inc-r3b-claude-oauth-expiry-2026-07-16".into(),
+                incident_reference: "INC-R3B-CLAUDE-OAUTH-EXPIRY-2026-07-16".into(),
+                source_path: "/private/tmp/a2a-bridge-r3b-live.EeBAyf/pinned-aggregate.json".into(),
+                expected_mode: 0o600,
+                expected_length_bytes: 25_128,
+                expected_sha256: "7f718f32743170fd7ae73a3027c870f052a8fabbd282762554922abf5e1571c1"
+                    .into(),
+                affected_case_ids: vec![
+                    "claude-host-acp-044-fable".into(),
+                    "claude-reader-055-fable".into(),
+                    "codex-host-bridge-gpt56-sol".into(),
+                    "codex-reader-bridge-gpt56-sol".into(),
+                ],
+            }
+        );
+        assert_eq!(
+            manifest.incidents[1],
+            IncidentMigrationItemV1 {
+                incident_id: "inc-r3b-container-start-stall-2026-07-16".into(),
+                incident_reference: "INC-R3B-CONTAINER-START-STALL-2026-07-16".into(),
+                source_path: "/private/tmp/a2a-bridge-r3b-live2.mbOljW/pinned-aggregate.json"
+                    .into(),
+                expected_mode: 0o600,
+                expected_length_bytes: 19_894,
+                expected_sha256: "319b3cf4b92a36b1f2e2cdd71b7a97fb6d5c4309c2f919a4e3bce39dd28a9b3e"
+                    .into(),
+                affected_case_ids: vec![
+                    "claude-host-acp-044-fable".into(),
+                    "claude-reader-055-fable".into(),
+                    "codex-host-bridge-gpt56-sol".into(),
+                    "codex-reader-bridge-gpt56-sol".into(),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn incident_migration_journal_reopen_rejects_gaps_and_chain_tampering() {
+        let source = root();
+        let aggregate = aggregate_bytes();
+        let first_item = migration_item(
+            "incident-journal-first",
+            &source.path().join("missing-first.json"),
+            &aggregate,
+        );
+        let second_item = migration_item(
+            "incident-journal-second",
+            &source.path().join("missing-second.json"),
+            &aggregate,
+        );
+        let state_root = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(state_root.path()).unwrap();
+        let lock = scheduler
+            .try_owner_admission("test/incident-migration-journal-reopen")
+            .unwrap();
+        let mut migration = FileIncidentMigrationJournal::open_existing_or_empty(&lock).unwrap();
+        migration
+            .append(
+                &first_item,
+                IncidentMigrationDispositionV1::Missing,
+                1_000_001,
+            )
+            .unwrap();
+        migration
+            .append(
+                &second_item,
+                IncidentMigrationDispositionV1::Missing,
+                1_000_002,
+            )
+            .unwrap();
+        drop(migration);
+
+        let first_path = state_root
+            .path()
+            .join("migration/incident-migration.00000000000000000001.json");
+        let second_path = state_root
+            .path()
+            .join("migration/incident-migration.00000000000000000002.json");
+        let first_bytes = std::fs::read(&first_path).unwrap();
+        std::fs::remove_file(&first_path).unwrap();
+        let gap_error = FileIncidentMigrationJournal::open_existing_or_empty(&lock)
+            .err()
+            .unwrap();
+        assert!(gap_error
+            .to_string()
+            .contains("incident migration filenames are not contiguous"));
+        write_private(&first_path, &first_bytes);
+        assert_eq!(
+            FileIncidentMigrationJournal::open_existing_or_empty(&lock)
+                .unwrap()
+                .records()
+                .len(),
+            2
+        );
+
+        let mut second: IncidentMigrationRecordV1 =
+            serde_json::from_slice(&std::fs::read(&second_path).unwrap()).unwrap();
+        second.previous_record = OptionalSha256V1::Sha256 { value: digest('f') };
+        write_private(&second_path, &canonical_json(&second).unwrap());
+        let chain_error = FileIncidentMigrationJournal::open_existing_or_empty(&lock)
+            .err()
+            .unwrap();
+        assert!(chain_error
+            .to_string()
+            .contains("incident migration chain is not monotonic"));
+    }
+
+    #[test]
+    fn incident_migration_publishes_and_pins_exact_source_once() {
+        let source = root();
+        let aggregate = aggregate_bytes();
+        let source_path = source.path().join("pinned-aggregate.json");
+        write_private(&source_path, &aggregate);
+        let item = migration_item("incident-migration-1", &source_path, &aggregate);
+
+        let (_hot_root, store) = test_hot_store();
+        let state_root = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(state_root.path()).unwrap();
+        let lock = scheduler
+            .try_owner_admission("test/incident-migration")
+            .unwrap();
+        let mut state =
+            EvidenceStateModelV1::new(store.root_sha256().to_owned(), ColdStorageBindingV1::Absent)
+                .unwrap();
+        let mut evidence = FileEvidenceJournal::initialize(&lock, &state, 1_000_001).unwrap();
+        let mut migration = FileIncidentMigrationJournal::open_existing_or_empty(&lock).unwrap();
+        let mut usage = empty_hot_usage();
+
+        let first = migrate_incident_evidence(
+            &store,
+            &mut evidence.journal,
+            &mut state,
+            &mut migration,
+            &item,
+            &HotStorageCapsV1::approved(),
+            &mut usage,
+            1_000_002,
+            IncidentMigrationFailpointV1::None,
+        )
+        .unwrap();
+        assert!(first.evidence_published);
+        assert!(first.journal_appended);
+        assert!(matches!(
+            first.disposition,
+            IncidentMigrationDispositionV1::Migrated { .. }
+        ));
+        assert_eq!(
+            state.entries[&item.incident_id].evidence_class,
+            EvidenceClassV1::Incident
+        );
+        assert_eq!(
+            serde_json::from_str::<CompactEvidenceRecordV1>(
+                &state.entries[&item.incident_id].compact_record
+            )
+            .unwrap()
+            .aggregate_sha256,
+            OptionalSha256V1::Sha256 {
+                value: item.expected_sha256.clone()
+            }
+        );
+        assert_eq!(
+            state
+                .pins
+                .values()
+                .filter(|pin| pin.evidence_id == item.incident_id)
+                .count(),
+            1
+        );
+        assert_eq!(migration.records().len(), 1);
+
+        let duplicate = migrate_incident_evidence(
+            &store,
+            &mut evidence.journal,
+            &mut state,
+            &mut migration,
+            &item,
+            &HotStorageCapsV1::approved(),
+            &mut usage,
+            1_000_003,
+            IncidentMigrationFailpointV1::None,
+        )
+        .unwrap();
+        assert!(!duplicate.evidence_published);
+        assert!(!duplicate.journal_appended);
+        assert_eq!(migration.records().len(), 1);
+        assert_eq!(
+            FileEvidenceJournal::open_existing(&lock)
+                .unwrap()
+                .snapshot
+                .generation,
+            2
+        );
+    }
+
+    #[test]
+    fn incident_migration_records_missing_and_mismatch_without_evidence() {
+        let source = root();
+        let aggregate = aggregate_bytes();
+        let missing_path = source.path().join("missing-aggregate.json");
+        let missing_item = migration_item("incident-missing", &missing_path, &aggregate);
+
+        let (_hot_root, store) = test_hot_store();
+        let state_root = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(state_root.path()).unwrap();
+        let lock = scheduler
+            .try_owner_admission("test/incident-migration-missing")
+            .unwrap();
+        let mut state =
+            EvidenceStateModelV1::new(store.root_sha256().to_owned(), ColdStorageBindingV1::Absent)
+                .unwrap();
+        let mut evidence = FileEvidenceJournal::initialize(&lock, &state, 1_000_001).unwrap();
+        let mut migration = FileIncidentMigrationJournal::open_existing_or_empty(&lock).unwrap();
+        let mut usage = empty_hot_usage();
+        let missing = migrate_incident_evidence(
+            &store,
+            &mut evidence.journal,
+            &mut state,
+            &mut migration,
+            &missing_item,
+            &HotStorageCapsV1::approved(),
+            &mut usage,
+            1_000_002,
+            IncidentMigrationFailpointV1::None,
+        )
+        .unwrap();
+        assert_eq!(missing.disposition, IncidentMigrationDispositionV1::Missing);
+        assert!(missing.journal_appended);
+        assert!(!missing.evidence_published);
+        assert!(state.entries.is_empty());
+
+        let mismatch_path = source.path().join("mismatch-aggregate.json");
+        let mut changed = aggregate.clone();
+        let changed_index = changed.iter().position(|byte| *byte == b'1').unwrap();
+        changed[changed_index] = b'2';
+        write_private(&mismatch_path, &changed);
+        let mismatch_item = migration_item("incident-mismatch", &mismatch_path, &aggregate);
+        let mismatch = migrate_incident_evidence(
+            &store,
+            &mut evidence.journal,
+            &mut state,
+            &mut migration,
+            &mismatch_item,
+            &HotStorageCapsV1::approved(),
+            &mut usage,
+            1_000_003,
+            IncidentMigrationFailpointV1::None,
+        )
+        .unwrap();
+        assert!(matches!(
+            mismatch.disposition,
+            IncidentMigrationDispositionV1::Mismatch {
+                ref reason_code,
+                observed_sha256: OptionalSha256V1::Sha256 { ref value },
+                ..
+            } if reason_code == "hash_mismatch" && value == &local_file::sha256_hex(&changed)
+        ));
+
+        let mode_path = source.path().join("mode-mismatch-aggregate.json");
+        write_private(&mode_path, &aggregate);
+        std::fs::set_permissions(&mode_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let mode_item = migration_item("incident-mode-mismatch", &mode_path, &aggregate);
+        let mode_mismatch = migrate_incident_evidence(
+            &store,
+            &mut evidence.journal,
+            &mut state,
+            &mut migration,
+            &mode_item,
+            &HotStorageCapsV1::approved(),
+            &mut usage,
+            1_000_004,
+            IncidentMigrationFailpointV1::None,
+        )
+        .unwrap();
+        assert!(matches!(
+            mode_mismatch.disposition,
+            IncidentMigrationDispositionV1::Mismatch {
+                ref reason_code,
+                observed_mode: 0o640,
+                observed_sha256: OptionalSha256V1::Absent,
+                ..
+            } if reason_code == "mode_mismatch"
+        ));
+
+        let length_path = source.path().join("length-mismatch-aggregate.json");
+        let mut longer = aggregate.clone();
+        longer.push(b'\n');
+        write_private(&length_path, &longer);
+        let length_item = migration_item("incident-length-mismatch", &length_path, &aggregate);
+        let length_mismatch = migrate_incident_evidence(
+            &store,
+            &mut evidence.journal,
+            &mut state,
+            &mut migration,
+            &length_item,
+            &HotStorageCapsV1::approved(),
+            &mut usage,
+            1_000_005,
+            IncidentMigrationFailpointV1::None,
+        )
+        .unwrap();
+        assert!(matches!(
+            length_mismatch.disposition,
+            IncidentMigrationDispositionV1::Mismatch {
+                ref reason_code,
+                observed_length_bytes,
+                ..
+            } if reason_code == "length_mismatch"
+                && observed_length_bytes == longer.len() as u64
+        ));
+
+        let linked_path = source.path().join("linked-aggregate.json");
+        let linked_peer = source.path().join("linked-peer.json");
+        write_private(&linked_path, &aggregate);
+        std::fs::hard_link(&linked_path, &linked_peer).unwrap();
+        let linked_item = migration_item("incident-linked", &linked_path, &aggregate);
+        let linked = migrate_incident_evidence(
+            &store,
+            &mut evidence.journal,
+            &mut state,
+            &mut migration,
+            &linked_item,
+            &HotStorageCapsV1::approved(),
+            &mut usage,
+            1_000_006,
+            IncidentMigrationFailpointV1::None,
+        )
+        .unwrap();
+        assert!(matches!(
+            linked.disposition,
+            IncidentMigrationDispositionV1::Mismatch {
+                ref reason_code,
+                ..
+            } if reason_code == "unsafe_source_metadata"
+        ));
+
+        let invalid_path = source.path().join("invalid-aggregate.json");
+        let invalid = b"{\"not\":\"an aggregate\"}\n";
+        write_private(&invalid_path, invalid);
+        let invalid_item = migration_item("incident-invalid-aggregate", &invalid_path, invalid);
+        assert!(migrate_incident_evidence(
+            &store,
+            &mut evidence.journal,
+            &mut state,
+            &mut migration,
+            &invalid_item,
+            &HotStorageCapsV1::approved(),
+            &mut usage,
+            1_000_007,
+            IncidentMigrationFailpointV1::None,
+        )
+        .is_err());
+        assert!(state.entries.is_empty());
+        assert_eq!(migration.records().len(), 5);
+        assert_eq!(
+            std::fs::metadata(
+                state_root
+                    .path()
+                    .join("migration/incident-migration.00000000000000000001.json")
+            )
+            .unwrap()
+            .permissions()
+            .mode()
+                & 0o777,
+            0o600
+        );
+        drop(migration);
+        assert_eq!(
+            FileIncidentMigrationJournal::open_existing_or_empty(&lock)
+                .unwrap()
+                .records()
+                .len(),
+            5
+        );
+    }
+
+    #[test]
+    fn incident_migration_recovers_post_publication_crash_without_repinning() {
+        let source = root();
+        let aggregate = aggregate_bytes();
+        let source_path = source.path().join("pinned-aggregate.json");
+        write_private(&source_path, &aggregate);
+        let item = migration_item("incident-crash-recovery", &source_path, &aggregate);
+
+        let (_hot_root, store) = test_hot_store();
+        let state_root = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(state_root.path()).unwrap();
+        let lock = scheduler
+            .try_owner_admission("test/incident-migration-crash")
+            .unwrap();
+        let mut state =
+            EvidenceStateModelV1::new(store.root_sha256().to_owned(), ColdStorageBindingV1::Absent)
+                .unwrap();
+        let mut evidence = FileEvidenceJournal::initialize(&lock, &state, 1_000_001).unwrap();
+        let mut migration = FileIncidentMigrationJournal::open_existing_or_empty(&lock).unwrap();
+        let mut usage = empty_hot_usage();
+
+        assert!(migrate_incident_evidence(
+            &store,
+            &mut evidence.journal,
+            &mut state,
+            &mut migration,
+            &item,
+            &HotStorageCapsV1::approved(),
+            &mut usage,
+            1_000_002,
+            IncidentMigrationFailpointV1::AfterEvidencePublication,
+        )
+        .is_err());
+        assert!(state.entries.contains_key(&item.incident_id));
+        assert!(migration.records().is_empty());
+        assert_eq!(state.pins.len(), 1);
+
+        let recovered = migrate_incident_evidence(
+            &store,
+            &mut evidence.journal,
+            &mut state,
+            &mut migration,
+            &item,
+            &HotStorageCapsV1::approved(),
+            &mut usage,
+            1_000_003,
+            IncidentMigrationFailpointV1::None,
+        )
+        .unwrap();
+        assert!(!recovered.evidence_published);
+        assert!(recovered.journal_appended);
+        assert_eq!(state.pins.len(), 1);
+        assert_eq!(migration.records().len(), 1);
+
+        let mut changed_identity = item.clone();
+        changed_identity.expected_sha256 = digest('f');
+        assert!(migrate_incident_evidence(
+            &store,
+            &mut evidence.journal,
+            &mut state,
+            &mut migration,
+            &changed_identity,
+            &HotStorageCapsV1::approved(),
+            &mut usage,
+            1_000_004,
+            IncidentMigrationFailpointV1::None,
+        )
+        .is_err());
+        assert_eq!(state.pins.len(), 1);
+        assert_eq!(migration.records().len(), 1);
+    }
+
+    #[test]
+    fn incident_migration_recovery_rejects_coherent_noncanonical_payload_identity() {
+        let source = root();
+        let aggregate = aggregate_bytes();
+        let source_path = source.path().join("pinned-aggregate.json");
+        write_private(&source_path, &aggregate);
+        let item = migration_item("incident-recovery-identity", &source_path, &aggregate);
+
+        let (hot_root, store) = test_hot_store();
+        let state_root = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(state_root.path()).unwrap();
+        let lock = scheduler
+            .try_owner_admission("test/incident-migration-recovery-identity")
+            .unwrap();
+        let mut state =
+            EvidenceStateModelV1::new(store.root_sha256().to_owned(), ColdStorageBindingV1::Absent)
+                .unwrap();
+        let mut evidence = FileEvidenceJournal::initialize(&lock, &state, 1_000_001).unwrap();
+        let prepared = prepare_incident_migration_evidence(&item, aggregate, 1_000_002).unwrap();
+        publish_prepared_evidence(
+            &store,
+            &mut evidence.journal,
+            &mut state,
+            &prepared,
+            &HotStorageCapsV1::approved(),
+            &empty_hot_usage(),
+            1_000_002,
+            SealPublicationFailpointV1::None,
+        )
+        .unwrap();
+
+        let object_name = payload_object_name(&item.incident_id).unwrap();
+        let manifest_path = hot_root
+            .path()
+            .join("sealed")
+            .join(object_name)
+            .join("manifest.json");
+        let mut manifest: SealedEvidenceManifestV1 =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.created_at_ms += 1;
+        manifest.source_tree_sha256 = digest('f');
+        let manifest_bytes = canonical_json(&manifest).unwrap();
+        let manifest_sha256 = local_file::sha256_hex(&manifest_bytes);
+        write_private(&manifest_path, &manifest_bytes);
+
+        let entry = state.entries.get_mut(&item.incident_id).unwrap();
+        let mut compact: CompactEvidenceRecordV1 =
+            serde_json::from_str(&entry.compact_record).unwrap();
+        compact.affected_case_ids = vec!["case-2".into()];
+        compact.manifest_sha256 = manifest_sha256.clone();
+        let compact_bytes = canonical_json(&compact).unwrap();
+        entry.manifest_sha256 = manifest_sha256;
+        entry.manifest_bytes = manifest_bytes.len() as u64;
+        entry.compact_record_sha256 = local_file::sha256_hex(&compact_bytes);
+        entry.compact_record_bytes = compact_bytes.len() as u64;
+        entry.compact_record = String::from_utf8(compact_bytes).unwrap();
+        state.validate().unwrap();
+
+        let error = existing_incident_migration_disposition(&store, &state, &item).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("existing incident payload is not this migration"));
     }
 
     #[test]
