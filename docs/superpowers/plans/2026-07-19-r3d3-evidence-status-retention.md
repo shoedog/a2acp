@@ -1,8 +1,8 @@
 # R3d3 — evidence, status, and retention implementation plan
 
-**Status:** R3d3a, R3d3b, and R3d3c are checkpointed at `21427e6`, `739495a`, and `7ed0446` on
+**Status:** R3d3a through R3d3d are checkpointed at `21427e6`, `739495a`, `7ed0446`, and `84fbbf3` on
 `agent/reliability-r3d3-evidence-retention` from merged R3d2 `origin/main`
-`06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41); R3d3d is next. This slice is local,
+`06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41); R3d3e is next. This slice is local,
 non-billable, default-off, and has one merge boundary.
 
 The approved design of record is
@@ -201,6 +201,18 @@ Pre-change-red/edge proof: open reader, newly started/stopped container between 
 pin/keep/age precedence, runtime inventory failure, unrelated artifact immunity, exact source present, absent source,
 hash mismatch, crash after copy before migration record, duplicate migration, and changed bytes under the same id.
 
+Checkpoint `84fbbf3` implements bounded persistent bundle/image GC action journals, exact plan and immutable-digest
+binding, intent-before-effect recovery, terminal safe skips, exclusive bundle leases, fresh running-and-stopped
+runtime inventory fences, and terminal-only action compaction. It also checks in the exact two-item R3b migration
+manifest and implements a hash-chained migration journal that records missing/mismatch outcomes or seals, publishes,
+and pins the exact aggregate through the normal incident path without duplicating or changing identity. Fail-first
+regressions demonstrated absent GC/migration APIs, unsafe recovery from changed inventories, unbounded terminal
+action growth, incomplete recovery identity, and unbound image-plan provenance. A targeted mutation removing the
+planned-inventory rederivation let a forged intent reach the runtime removal adapter (**0/1**); the restored guard
+rejects it before effect. Corrected focused gates are evidence **43/0**, retention/GC **19/0**, retained state
+**19/0**, strict schema **32/0**, and descriptor-local file **12/0**, with format and diff checks green.
+Full-workspace and release gates remain deferred until the complete R3d3 review candidate.
+
 ### R3d3e — outbox journal, status, notifications, quarantine close, and read-only CLI
 
 1. Persist `PublicationOutboxV1` as a contiguous append-only chain. Enforce immutable remote identity, legal
@@ -258,5 +270,7 @@ admitted handoff, independent storage consent, unchanged aggregate v1, and typed
 
 R3d2 merged by PR #41 with CI/CLA green. Its final local gate was complete binary **655/0/0** and canonical full
 workspace **2,392/0/12 ignored** across **72** result groups (**55** nonempty); the twelve ignored tests remain
-authenticated/live-provider integration tests. Begin with R3d3a. No production operator rebuild or swap is part of
-this slice.
+authenticated/live-provider integration tests. R3d3a through R3d3d are checkpointed at `21427e6`, `739495a`,
+`7ed0446`, and `84fbbf3`; the latest focused gates are evidence **43/0**, retention/GC **19/0**, retained state
+**19/0**, strict schema **32/0**, and descriptor-local file **12/0**. Continue with R3d3e. No production operator
+rebuild or swap is part of this slice.

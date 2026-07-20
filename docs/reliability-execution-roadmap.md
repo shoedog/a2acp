@@ -8,15 +8,17 @@
   `agent/reliability-r3d3-evidence-retention`, based directly on `06e22faf`; it is non-billable, default-off,
   and uses only injected owner-private roots, fake storage/runtime/notification adapters, and deterministic files
   in tests
-- **Current R3d3 implementation gate:** **R3D3A-C CHECKPOINTED / R3D3D NEXT** at `21427e6`, `739495a`, and
-  `7ed0446`.
+- **Current R3d3 implementation gate:** **R3D3A-D CHECKPOINTED / R3D3E NEXT** at `21427e6`, `739495a`, `7ed0446`,
+  and `84fbbf3`.
   Evidence state, generation-aware projection, retention/pin clocks, durable tombstone ordering and recovery
   identity, cross-process leases, and 1/4/5 GiB quota primitives now feed descriptor-safe deterministic sealing,
   strict sidecar/aggregate byte joining, bounded secret scanning, compact records, index-last local publication,
   crash residue discovery, automatic incident pinning, independent cold admission, descriptor-relative
-  partial-to-final publication, explicit FileProvider state, rotating verification, and recoverable hot eviction.
-  Focused gates pass cold retention **11/0**, evidence **33/0**, retained state **19/0**, strict schema **32/0**,
-  authority **15/0**, and descriptor-local file **12/0**. The restart contract is
+  partial-to-final publication, explicit FileProvider state, rotating verification, recoverable hot eviction,
+  bounded reconstructible bundle/image GC with durable intent and fresh runtime fences, and exact idempotent R3b
+  incident migration through the normal seal/publication/pin path. Latest focused gates pass retention/GC **19/0**,
+  evidence **43/0**, retained state **19/0**, strict schema **32/0**, and descriptor-local file **12/0**; the
+  unchanged authority seam was last verified at **15/0** in R3d3c. The restart contract is
   [`2026-07-19-r3d3-evidence-status-retention.md`](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md).
   R3d2 closure evidence follows for provenance.
   R3d2a closes the three inherited R3d1 integration smells, owns cancellation before `Running`, retains the
@@ -526,9 +528,10 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** implement R3d3d from the focused restart plan: reconstructible bundle retention/GC, immutable-
-  digest runtime-image GC with running-and-stopped inventory fences, and the explicit two-item R3b incident
-  migration journal, with every mechanism demonstrated red first.
+- **Next action:** implement R3d3e from the focused restart plan: crash-consistent local publication outbox,
+  degraded-by-construction status projection, transition-deduplicated fake-sink notifications, quarantine-close
+  dereference, and a read-only `compatibility schedule status [--json]` command, with every mechanism demonstrated
+  red first.
   No live compatibility/provider, iCloud, runtime-image, notification, GitHub, launchd, or production-operator
   lifecycle action is authorized. OpenRouter/OpenCode remain R3e/R3f after the R3 core and before R4.
 - **Design of record:**
@@ -557,7 +560,7 @@ R2a provenance (MERGED)
        -> R2d local non-billable fallback plan (MERGED)
             -> R3 compatibility manifest + pinned/floating canaries + OpenRouter/OpenCode
                (ACTIVE: R3a/R3b/R3c/R3d0/R3d1/R3d2 MERGED; R3d DESIGN MERGED;
-                R3d3 FOCUSED PLAN WRITTEN / R3d3a STARTING)
+                R3d3a-d CHECKPOINTED / R3d3e NEXT)
                  -> R4 reproducible dependency/image pins + release promotion gate
 
 R2e authenticated in-process fallback is DEFERRED and off the critical path.
@@ -584,7 +587,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
 | R2f — phase-aware liveness/takeover | **DEFERRED** (three incidents recorded) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Instrument verification progress first; preserve exact process-tree takeover; separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at `b54840a` by PR #37; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`; R3d2 **MERGED** by PR #41 at `06e22faf` after seventh Sol approval, the single Fable approval lens, exact deterministic gates, and green CI/CLA. R3d3 is **ACTIVE / R3D3A-C CHECKPOINTED / R3D3D NEXT** at `21427e6`, `739495a`, and `7ed0446` on `agent/reliability-r3d3-evidence-retention`, based directly on merged R3d2. No live compatibility gate, production state/evidence root creation, iCloud/runtime/GitHub/notification effect, or production-operator lifecycle action occurred. | [R3d3 implementation plan](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md) | Evidence/index/retention foundation, sealing, cold storage, GC/migration, then status/outbox/notifications; one default-off merge boundary. |
+| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at `b54840a` by PR #37; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`; R3d2 **MERGED** by PR #41 at `06e22faf` after seventh Sol approval, the single Fable approval lens, exact deterministic gates, and green CI/CLA. R3d3 is **ACTIVE / R3D3A-D CHECKPOINTED / R3D3E NEXT** at `21427e6`, `739495a`, `7ed0446`, and `84fbbf3` on `agent/reliability-r3d3-evidence-retention`, based directly on merged R3d2. No live compatibility gate, production state/evidence root creation, iCloud/runtime/GitHub/notification effect, or production-operator lifecycle action occurred. | [R3d3 implementation plan](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md) | Evidence/index/retention foundation, sealing, cold storage, GC/migration, then status/outbox/notifications; one default-off merge boundary. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -870,10 +873,10 @@ Next action:
   `cbcfd1f06b914064456d1798be71bacdc294f3d5`; R3d2 merged through PR #41 at
   `06e22fafaf33d67524b46f35d12124505b6ecf9a` with CI and CLA green. R3d3 is active on
   `agent/reliability-r3d3-evidence-retention`, based directly on that merge, and its focused restart plan is
-  `2026-07-19-r3d3-evidence-status-retention.md`. R3d3a, R3d3b, and R3d3c are checkpointed at `21427e6`,
-  `739495a`, and `7ed0446`; focused gates pass cold retention **11/0**, evidence **33/0**, retained state **19/0**,
-  strict schema **32/0**, authority **15/0**, and descriptor-local file **12/0**. Continue with R3d3d
-  reconstructible bundle/image GC and the explicit R3b incident migration. R3d2's
+  `2026-07-19-r3d3-evidence-status-retention.md`. R3d3a through R3d3d are checkpointed at `21427e6`,
+  `739495a`, `7ed0446`, and `84fbbf3`; latest focused gates pass retention/GC **19/0**, evidence **43/0**,
+  retained state **19/0**, strict schema **32/0**, and descriptor-local file **12/0**. Continue with R3d3e outbox,
+  status, notifications, quarantine-close dereference, and read-only CLI work. R3d2's
   closure history remains below. First reviewed candidate `1373985`
   received four `WRONG`, one `SMELL`, and `REVISE`; remediation head `28e7d28` then passed **641/0/0** binary and
   **2,378/0/12 ignored** full workspace before Sol closure review returned three new `WRONG` and a stale-cursor
@@ -909,9 +912,9 @@ Next action:
   Fable release/compatibility lens found no `WRONG`, retained two Minor nonblocking R3d5 hardening `SMELL`s, and
   returned `APPROVE`. Exact review-evidence head `9b63f42` passes every deterministic release gate at binary
   **655/0/0** and canonical full workspace **2,392/0/12 ignored** across **72** groups (**55** nonempty). The final
-  docs-only reproduction matched those totals and PR #41 merged; R3d3a and R3d3b then checkpointed at `21427e6`
-  and `739495a`; R3d3c then checkpointed at `7ed0446`, and R3d3d is the next implementation step from the focused
-  restart plan.
+  docs-only reproduction matched those totals and PR #41 merged; R3d3a through R3d3d then checkpointed at
+  `21427e6`, `739495a`, `7ed0446`, and `84fbbf3`; R3d3e is the next implementation step from the focused restart
+  plan.
   No production state root,
   authority, trigger, live effect, or operator lifecycle action was created. The
   manifest still contains nine
