@@ -133,8 +133,13 @@ complete binary **779/0/0**, and canonical full serial workspace **2,519/0/12 ig
 `95f64ff9ac36f0cb66914d296ab72a44821590ac2f77cf44d38e6b84d6e4ef30`; the workspace log is 216,361 bytes at
 SHA-256 `f9219b83d049c7956327b17d087da00ec76cdc7bff7238112f67d3183c49c771`; and the provider-unexercised
 26,796,144-byte release binary has SHA-256
-`9d24382603a637ad777cf58f2c16ed6d1e7a6f5e18f3635dd72a91ba6c9452a0`. The docs-only commit containing this
-evidence is the intended next review head. No approval is claimed. This slice remains local, non-billable,
+`9d24382603a637ad777cf58f2c16ed6d1e7a6f5e18f3635dd72a91ba6c9452a0`. Exact docs head
+`1637b5b8693f65d4fab230ede694c12648f5528c` reproduced every deterministic gate with complete binary
+**779/0/0** and canonical full serial workspace **2,519/0/12 ignored** across **72** groups (**55** nonempty).
+The tenth Sol/xhigh closure review resolved all eighteen inherited items, reported no fresh `WRONG` or `SMELL`,
+and returned **APPROVE**. Its 13,292-byte artifact has SHA-256
+`cbdfe1b7339a6d27b203247029bfe95b8297027e682b09190e9af2eb622f3045`. The single design-required Fable/xhigh
+release/compatibility lens remains before final merge readiness. This slice remains local, non-billable,
 default-off, and has one merge boundary.
 
 The approved design of record is
@@ -599,9 +604,16 @@ log is 74,826 bytes at SHA-256 `95f64ff9ac36f0cb66914d296ab72a44821590ac2f77cf44
 workspace log is 216,361 bytes at SHA-256
 `f9219b83d049c7956327b17d087da00ec76cdc7bff7238112f67d3183c49c771`; and the provider-unexercised release
 binary is 26,796,144 bytes at SHA-256 `9d24382603a637ad777cf58f2c16ed6d1e7a6f5e18f3635dd72a91ba6c9452a0`.
-The docs-only commit containing this paragraph is the intended next review head. Reproduce deterministic gates on
-that exact unchanged head as supplied review evidence, then run fresh Sol closure rereview without another docs
-fold. No approval is claimed yet.
+Exact docs head `1637b5b8693f65d4fab230ede694c12648f5528c` reproduced every deterministic gate: complete binary
+**779/0/0**, canonical workspace **2,519/0/12 ignored** across **72** groups (**55** nonempty), and binary-log,
+workspace-log, and release-binary SHA-256
+`612ba11d20b4706189451578d5a02f92373013d24c329d3a1de62e973f16885a`,
+`c6f10f4bfd42a7da62187e4eb08788f6ffaf3594d50237b7f8a20276b541d560`, and
+`9d24382603a637ad777cf58f2c16ed6d1e7a6f5e18f3635dd72a91ba6c9452a0`. Fresh Sol/xhigh/read-only closure
+rereview resolved all eighteen inherited items, reported no fresh `WRONG` or `SMELL`, and returned terminal
+`R3D3 IMPLEMENTATION: APPROVE`. The 13,292-byte artifact has SHA-256
+`cbdfe1b7339a6d27b203247029bfe95b8297027e682b09190e9af2eb622f3045`. Run the single Fable/xhigh
+release/compatibility lens next; do not use Fable as a rereview loop.
 
 One dogfood incident is deliberately deferred outside R3d3 correctness. Operator release `983398427c9f0486`
 served a healthy agent card/model catalog and green Codex doctor/provenance checks with zero unfinished tasks and
@@ -694,8 +706,9 @@ finding, and item 17 still wrong through the lockless status barrier-before-scan
 captures the bounded status name set before syncing and parses only after successful sync. Its deterministic
 interleaving regression failed **0/1** before the fix and now passes; status is **15/0**, binary is **779/0/0**,
 canonical workspace is **2,519/0/12 ignored** across **72** groups (**55** nonempty), and every deterministic gate
-is green. The docs-only commit containing this evidence is the intended review head; supply its exact-head
-deterministic reproduction directly to fresh Sol/xhigh closure rereview without another cursor mutation. Run the
-single Fable/xhigh release/compatibility lens only after Sol approval. No production operator rebuild or swap is
+is green. Exact docs head `1637b5b` reproduced every deterministic gate and received the tenth Sol/xhigh
+**APPROVE**: all eighteen inherited items resolved and no fresh `WRONG` or `SMELL`; artifact SHA-256 is
+`cbdfe1b7...3045`. Run the single Fable/xhigh release/compatibility lens next and do not use Fable as a rereview
+loop. No production operator rebuild or swap is
 part of this slice; preserve `INC-SHARED-RESTART-RECOVERY-2026-07-19` for later R2f investigation rather than
 treating restart as a fix.
