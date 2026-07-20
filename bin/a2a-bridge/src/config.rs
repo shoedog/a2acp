@@ -607,6 +607,15 @@ fn is_toml_bare_key(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+fn is_direct_bridge_mcp_loopback(command: &str, args: &[String]) -> bool {
+    let base = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    let is_bridge = {
+        let name = base;
+        name.eq_ignore_ascii_case("a2a-bridge") || name.eq_ignore_ascii_case("a2a-bridge.exe")
+    };
+    is_bridge && args.first().map(String::as_str) == Some("mcp")
+}
+
 fn build_mcp_specs(
     mcp: &[McpToml],
     agent_id: &str,
@@ -637,6 +646,12 @@ fn build_mcp_specs(
                 m.name
             )));
         }
+        if is_direct_bridge_mcp_loopback(&m.command, &m.args) {
+            return Err(err(format!(
+                "mcp {:?}: managed-agent loopback to `a2a-bridge mcp` is unsupported; invoke the bridge MCP from an external controller",
+                m.name
+            )));
+        }
         for a in &m.args {
             validate_cwd_template(a).map_err(|e| err(format!("mcp {:?} arg: {e}", m.name)))?;
         }
@@ -649,6 +664,14 @@ fn build_mcp_specs(
             if !is_toml_bare_key(&e.name) {
                 return Err(err(format!(
                     "mcp {:?}: env name {:?} must be a bare key (A-Za-z0-9_-)",
+                    m.name, e.name
+                )));
+            }
+            if e.name
+                .eq_ignore_ascii_case(bridge_core::mcp::MANAGED_MCP_CALL_DEPTH_ENV)
+            {
+                return Err(err(format!(
+                    "mcp {:?}: env name {:?} is reserved for bridge-managed MCP lineage",
                     m.name, e.name
                 )));
             }
@@ -4104,6 +4127,40 @@ path = "/tmp/x.db"
         assert!(super::build_mcp_specs(&[mcp_toml("p.x", "/a", &[])], "a").is_err());
         // empty name
         assert!(super::build_mcp_specs(&[mcp_toml("", "/a", &[])], "a").is_err());
+    }
+
+    #[test]
+    fn build_mcp_specs_rejects_direct_bridge_loopback_and_reserved_depth_env() {
+        let direct = mcp_toml(
+            "bridge",
+            "/opt/a2a-bridge",
+            &["mcp", "--config", "/tmp/bridge.toml"],
+        );
+        let err = super::build_mcp_specs(&[direct], "reviewer")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("managed-agent loopback"), "got: {err}");
+
+        let windows_case = mcp_toml("bridge", r"C:\tools\A2A-BRIDGE.EXE", &["mcp"]);
+        let err = super::build_mcp_specs(&[windows_case], "reviewer")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("managed-agent loopback"), "got: {err}");
+
+        let mut reserved = mcp_toml("wrapped", "/opt/wrapper", &[]);
+        reserved.env.push(super::EnvToml {
+            name: "a2a_bridge_mcp_call_depth".into(),
+            value: "0".into(),
+        });
+        let err = super::build_mcp_specs(&[reserved], "reviewer")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reserved"), "got: {err}");
+
+        assert!(
+            super::build_mcp_specs(&[mcp_toml("prism", "/opt/prism", &[])], "reviewer").is_ok(),
+            "ordinary MCP servers remain valid"
+        );
     }
 
     #[test]

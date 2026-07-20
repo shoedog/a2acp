@@ -100,7 +100,7 @@ containers) see [AGENTS.md](AGENTS.md); for running your own multi-agent bridge 
 | `validate` | Validate config schema, registry, workflow DAGs, and prompt refs — or `--repo-hygiene` (this repo's own workflow-artifact hygiene gate) |
 | `doctor` | Run a bounded, read-only preflight for config, commands/runtimes, egress, credentials, store, verify/review, and MCP/LSP. `[--config <f>] [--json]` |
 | `serve` | Run the A2A server. `[--config <path>]` |
-| `mcp` | Serve the MCP protocol over stdio, backed by the same `Coordinator` service API. `[--config <path>] [--store <path>]` |
+| `mcp` | Serve the external-controller MCP protocol over stdio, backed by the same `Coordinator` service API. Managed-agent loopback is refused. `[--config <path>] [--store <path>]` |
 | `task-spec` | Inspect/scaffold/validate typed task-spec inputs: `schema` \| `template <type>` \| `input <file>` |
 | `prompt` | Inspect the named `[[prompts]]` registry: `list` \| `show <id>` |
 | `containers` | List/reap this config's managed containers (crash-orphan cleanup): `list [--all]` \| `reap [--stale] [--force <name>]` |
@@ -135,6 +135,10 @@ A2A caller ──HTTP/JSON-RPC/SSE──▶ bridge-a2a-inbound (axum)
 every protocol adapter (A2A, CLI, MCP alike — Slice 8, ADR pending consolidation). Today
 `bridge-mcp`'s stdio adapter (`a2a-bridge mcp`) is built directly on `Arc<Coordinator>`, and the
 CLI's `submit`/`task`/`session` subcommands are thin A2A HTTP clients against a running `serve`.
+The stdio MCP adapter is supported for external operators and controllers, not as an MCP server handed
+back to an agent already managed by the same bridge. Config validation rejects the direct loopback, and a
+reserved inherited depth marker makes indirect marked launches fail before config or state-store work;
+see [ADR-0028](docs/adr/0028-per-agent-mcp.md#managed-agent-loopback-boundary).
 The A2A inbound server (`bridge-a2a-inbound`) has **not yet** been migrated onto `Coordinator`
 — it still owns its own parallel `SessionManager`/task-store wiring, duplicating some
 turn-lifecycle logic that `Coordinator` also implements. This is a known, tracked gap (see

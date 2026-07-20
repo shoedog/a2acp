@@ -134,6 +134,10 @@ fn new_session_request_includes_substituted_mcp_servers() {
         s.contains("prism") && s.contains("RUST_LOG") && s.contains("warn"),
         "server name + env name/value present: {s}"
     );
+    assert!(
+        s.contains("A2A_BRIDGE_MCP_CALL_DEPTH") && s.contains("\"1\""),
+        "managed-agent MCP lineage marker present: {s}"
+    );
     // Empty input still yields an explicit empty array (the no-MCP path).
     let empty = serde_json::to_value(AcpBackend::new_session_request("/r", &[])).unwrap();
     assert_eq!(empty.get("mcpServers").unwrap(), &serde_json::json!([]));

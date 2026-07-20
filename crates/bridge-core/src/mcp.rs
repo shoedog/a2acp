@@ -8,6 +8,14 @@
 /// The only template token allowed in MCP `args`/`env` values: the agent's working repo.
 pub const CWD_TOKEN: &str = "{cwd}";
 
+/// Reserved process-lineage marker applied to every MCP server delivered to a bridge-managed agent.
+/// A nested `a2a-bridge mcp` reads this before config or store work and refuses the unsupported
+/// managed-agent loopback. This is a deterministic safety guard, not a security boundary against a
+/// deliberately hostile wrapper that removes its own environment.
+pub const MANAGED_MCP_CALL_DEPTH_ENV: &str = "A2A_BRIDGE_MCP_CALL_DEPTH";
+
+const FIRST_MANAGED_MCP_CALL_DEPTH: &str = "1";
+
 /// A single MCP server to offer an agent. Vendor-neutral — no ACP SDK types — so `bridge-core`
 /// stays SDK-free and the same spec feeds every delivery channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +41,21 @@ impl McpServerSpec {
                 .map(|(k, v)| (k.clone(), substitute_cwd(v, cwd)))
                 .collect(),
         }
+    }
+
+    /// Render this server for delivery to a bridge-managed agent and stamp the reserved lineage
+    /// marker last. Config validation rejects the reserved name, while the replacement here keeps
+    /// programmatic callers fail-closed and prevents a duplicate from changing last-wins behavior.
+    pub fn substituted_for_managed_agent(&self, cwd: &str) -> McpServerSpec {
+        let mut delivered = self.substituted(cwd);
+        delivered
+            .env
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(MANAGED_MCP_CALL_DEPTH_ENV));
+        delivered.env.push((
+            MANAGED_MCP_CALL_DEPTH_ENV.to_string(),
+            FIRST_MANAGED_MCP_CALL_DEPTH.to_string(),
+        ));
+        delivered
     }
 }
 
@@ -125,7 +148,7 @@ fn toml_str(s: &str) -> String {
 pub fn render_codex_mcp_args(mcp: &[McpServerSpec], cwd: &str) -> Vec<String> {
     let mut out = Vec::new();
     for spec in mcp {
-        let s = spec.substituted(cwd);
+        let s = spec.substituted_for_managed_agent(cwd);
         let p = format!("mcp_servers.{}", s.name);
         out.push("-c".to_string());
         out.push(format!("{p}.command={}", toml_str(&s.command)));
@@ -166,7 +189,7 @@ pub fn render_kiro_agent_config(mcp: &[McpServerSpec], cwd: &str, agent_name: &s
     let mut tools: Vec<Value> = vec![json!("*")];
     let mut allowed: Vec<Value> = Vec::new();
     for spec in mcp {
-        let s = spec.substituted(cwd);
+        let s = spec.substituted_for_managed_agent(cwd);
         let mut entry = Map::new();
         entry.insert("command".into(), json!(s.command));
         entry.insert("args".into(), json!(s.args));
@@ -262,6 +285,34 @@ mod tests {
     }
 
     #[test]
+    fn managed_substitution_replaces_programmatic_reserved_marker_once() {
+        let spec = McpServerSpec {
+            name: "wrapped".into(),
+            command: "/opt/wrapper".into(),
+            args: vec![],
+            env: vec![
+                (MANAGED_MCP_CALL_DEPTH_ENV.to_ascii_lowercase(), "0".into()),
+                ("KEEP".into(), "yes".into()),
+                (MANAGED_MCP_CALL_DEPTH_ENV.into(), "999".into()),
+            ],
+        };
+
+        let delivered = spec.substituted_for_managed_agent("/repo");
+        assert_eq!(
+            delivered
+                .env
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(MANAGED_MCP_CALL_DEPTH_ENV))
+                .count(),
+            1
+        );
+        assert!(delivered
+            .env
+            .contains(&(MANAGED_MCP_CALL_DEPTH_ENV.into(), "1".into())));
+        assert!(delivered.env.contains(&("KEEP".into(), "yes".into())));
+    }
+
+    #[test]
     fn mcp_delivery_defaults_to_acp() {
         assert_eq!(McpDelivery::default(), McpDelivery::Acp);
     }
@@ -293,8 +344,13 @@ mod tests {
         assert_eq!(args[4], "-c");
         assert_eq!(args[5], r#"mcp_servers.prism.env.RUST_LOG="warn""#);
         assert_eq!(args[6], "-c");
-        assert_eq!(args[7], "mcp_servers.prism.startup_timeout_sec=120");
-        assert_eq!(args.len(), 8);
+        assert_eq!(
+            args[7],
+            r#"mcp_servers.prism.env.A2A_BRIDGE_MCP_CALL_DEPTH="1""#
+        );
+        assert_eq!(args[8], "-c");
+        assert_eq!(args[9], "mcp_servers.prism.startup_timeout_sec=120");
+        assert_eq!(args.len(), 10);
         assert!(!args.iter().any(|a| a.contains("{cwd}")));
     }
 
@@ -347,6 +403,10 @@ mod tests {
             serde_json::json!(["--repo", "/repo", "--cache-dir", "/cache"])
         );
         assert_eq!(v["mcpServers"]["prism"]["env"]["RUST_LOG"], "warn");
+        assert_eq!(
+            v["mcpServers"]["prism"]["env"]["A2A_BRIDGE_MCP_CALL_DEPTH"],
+            "1"
+        );
         // `@prism` in tools + allowedTools so kiro registers + auto-trusts the server's tools.
         assert!(v["tools"].as_array().unwrap().iter().any(|t| t == "@prism"));
         assert!(v["allowedTools"]

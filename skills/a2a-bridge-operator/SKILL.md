@@ -28,6 +28,16 @@ This skill is the stable operating runbook, not a release-status cursor. Current
 state is owned only by
 [`../../docs/reliability-execution-roadmap.md`](../../docs/reliability-execution-roadmap.md).
 
+## Keep the bridge MCP surface external
+
+Use `a2a-bridge mcp` for an external operator or controller. Do not configure a bridge-managed agent's
+`[[agents.mcp]]` entry to launch `a2a-bridge mcp`: config validation rejects the direct loopback and every
+MCP spec delivered to a managed agent is stamped with the reserved `A2A_BRIDGE_MCP_CALL_DEPTH=1` marker.
+A marked bridge MCP process refuses before config resolution or durable-state work. Do not set or override
+that variable in agent MCP configuration. Wrapper and symlink launches inherit it, but this is a safety guard
+against accidental recursion rather than a security boundary against a malicious wrapper that strips its
+environment. External invocations with no marker (or explicit depth zero) remain supported.
+
 ## Choose the execution tier before running
 
 Use the content and action class, not container availability, to choose the tier:

@@ -136,7 +136,7 @@ SUBCOMMANDS:
                       [--config <f>] [--examples-policy off|warn|deny] [--project-marker <text>]...
                       or --repo-hygiene [--artifact-allowlist <path>]
   serve               Run the A2A server.  [--config <path>]
-  mcp                 Serve the MCP protocol over stdio (one stable Coordinator; A2A/CLI/MCP are thin adapters).
+  mcp                 Serve external-controller MCP over stdio; managed-agent loopback is refused.
                       [--config <path>] [--store <path>]
   task-spec           Inspect or validate typed task-spec inputs. schema | template | input
   prompt              Inspect the named prompt registry ([[prompts]]). list | show <id>  [--config <f>]
@@ -152,7 +152,8 @@ const MCP_USAGE: &str = "\
 usage: a2a-bridge mcp [--config <path>] [--store <path>]
                       [--examples-policy off|warn|deny] [--project-marker <text>]...
 
-Serve the MCP protocol over stdio. STDOUT is reserved for NDJSON MCP replies; tracing is written to STDERR.
+Serve the external-controller MCP protocol over stdio. Managed-agent loopback is refused.
+STDOUT is reserved for NDJSON MCP replies; tracing is written to STDERR.
 
   --config <path>  registry config (default: ./a2a-bridge.toml)
   --store <path>   override the [store] path for this MCP process
@@ -5010,6 +5011,30 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
                 return Err(format!("mcp: unknown flag {other:?}\n{MCP_USAGE}").into());
             }
         }
+    }
+
+    let call_depth = match std::env::var(bridge_core::mcp::MANAGED_MCP_CALL_DEPTH_ENV) {
+        Ok(raw) => raw.parse::<u32>().map_err(|_| {
+            format!(
+                "a2a-bridge mcp: invalid {} value; expected a non-negative integer",
+                bridge_core::mcp::MANAGED_MCP_CALL_DEPTH_ENV
+            )
+        })?,
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!(
+                "a2a-bridge mcp: invalid non-Unicode {} value",
+                bridge_core::mcp::MANAGED_MCP_CALL_DEPTH_ENV
+            )
+            .into())
+        }
+    };
+    if call_depth > 0 {
+        return Err(format!(
+            "a2a-bridge mcp: managed-agent MCP loopback is unsupported ({}={call_depth}); invoke `a2a-bridge mcp` from an external controller",
+            bridge_core::mcp::MANAGED_MCP_CALL_DEPTH_ENV
+        )
+        .into());
     }
 
     let config_path = require_config_path(explicit_config)?;
