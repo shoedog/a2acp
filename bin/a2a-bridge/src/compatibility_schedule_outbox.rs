@@ -754,6 +754,7 @@ impl<'lock> PublicationOutboxJournal<'lock> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn outbox_status_source_sha256<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
 ) -> Result<String, BoxError> {

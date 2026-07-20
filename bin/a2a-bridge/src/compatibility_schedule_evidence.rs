@@ -2476,6 +2476,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn evidence_status_source_sha256<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
 ) -> Result<Option<String>, BoxError> {
@@ -2596,10 +2597,12 @@ pub(super) enum HotAllocationV1 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct HotStorageCapsV1 {
-    pub(super) total_bytes: u64,
-    pub(super) state_bytes: u64,
-    pub(super) scratch_bytes: u64,
-    pub(super) sealed_bytes: u64,
+    total_bytes: u64,
+    state_bytes: u64,
+    scratch_bytes: u64,
+    sealed_bytes: u64,
+    #[cfg(test)]
+    reduced_for_test: bool,
 }
 
 impl HotStorageCapsV1 {
@@ -2610,11 +2613,54 @@ impl HotStorageCapsV1 {
             state_bytes: HOT_STATE_CAP_BYTES,
             scratch_bytes: HOT_SCRATCH_CAP_BYTES,
             sealed_bytes: HOT_SEALED_CAP_BYTES,
+            #[cfg(test)]
+            reduced_for_test: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn reduced_for_test(
+        total_bytes: u64,
+        state_bytes: u64,
+        scratch_bytes: u64,
+        sealed_bytes: u64,
+    ) -> Self {
+        Self {
+            total_bytes,
+            state_bytes,
+            scratch_bytes,
+            sealed_bytes,
+            reduced_for_test: true,
         }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self) -> Result<(), BoxError> {
+        let approved = self.total_bytes == HOT_TOTAL_CAP_BYTES
+            && self.state_bytes == HOT_STATE_CAP_BYTES
+            && self.scratch_bytes == HOT_SCRATCH_CAP_BYTES
+            && self.sealed_bytes == HOT_SEALED_CAP_BYTES;
+        #[cfg(not(test))]
+        if !approved {
+            return Err(
+                "schedule evidence: hot allocation caps diverge from approved policy".into(),
+            );
+        }
+        #[cfg(test)]
+        if !approved && !self.reduced_for_test {
+            return Err(
+                "schedule evidence: hot allocation caps diverge from approved policy".into(),
+            );
+        }
+        #[cfg(test)]
+        if self.reduced_for_test
+            && (self.total_bytes > HOT_TOTAL_CAP_BYTES
+                || self.state_bytes > HOT_STATE_CAP_BYTES
+                || self.scratch_bytes > HOT_SCRATCH_CAP_BYTES
+                || self.sealed_bytes > HOT_SEALED_CAP_BYTES)
+        {
+            return Err("schedule evidence: test caps may only reduce approved policy".into());
+        }
         if self.state_bytes == 0
             || self.scratch_bytes == 0
             || self.sealed_bytes == 0
@@ -6864,6 +6910,23 @@ mod tests {
     }
 
     #[test]
+    fn approved_hot_storage_caps_cannot_be_enlarged_by_a_caller() {
+        let mut caps = HotStorageCapsV1::approved();
+        caps.sealed_bytes += 1;
+        caps.total_bytes += 1;
+
+        assert!(caps.validate().is_err());
+        assert!(HotStorageCapsV1::reduced_for_test(
+            HOT_TOTAL_CAP_BYTES + 1,
+            HOT_STATE_CAP_BYTES,
+            HOT_SCRATCH_CAP_BYTES,
+            HOT_SEALED_CAP_BYTES + 1,
+        )
+        .validate()
+        .is_err());
+    }
+
+    #[test]
     fn publication_measures_unindexed_residue_before_enforcing_the_live_cap() {
         let prepared = prepared_evidence();
         let (hot_root, store) = test_hot_store();
@@ -6883,13 +6946,12 @@ mod tests {
         let mut opened = FileEvidenceJournal::initialize(&lock, &state, 1_000_001).unwrap();
         let new_sealed_bytes = (prepared.archive.len() + prepared.manifest.len()) as u64;
         let residue_bytes = b"residue\n".len() as u64;
-        let caps = HotStorageCapsV1 {
-            total_bytes: HOT_STATE_CAP_BYTES + new_sealed_bytes + new_sealed_bytes + residue_bytes
-                - 1,
-            state_bytes: HOT_STATE_CAP_BYTES,
-            scratch_bytes: new_sealed_bytes,
-            sealed_bytes: new_sealed_bytes + residue_bytes - 1,
-        };
+        let caps = HotStorageCapsV1::reduced_for_test(
+            HOT_STATE_CAP_BYTES + new_sealed_bytes + new_sealed_bytes + residue_bytes - 1,
+            HOT_STATE_CAP_BYTES,
+            new_sealed_bytes,
+            new_sealed_bytes + residue_bytes - 1,
+        );
 
         assert!(publish_prepared_evidence(
             &store,
@@ -6935,12 +6997,12 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        let caps = HotStorageCapsV1 {
-            total_bytes: HOT_STATE_CAP_BYTES + 1 + HOT_SEALED_CAP_BYTES,
-            state_bytes: HOT_STATE_CAP_BYTES,
-            scratch_bytes: 1,
-            sealed_bytes: HOT_SEALED_CAP_BYTES,
-        };
+        let caps = HotStorageCapsV1::reduced_for_test(
+            HOT_STATE_CAP_BYTES + 1 + HOT_SEALED_CAP_BYTES,
+            HOT_STATE_CAP_BYTES,
+            1,
+            HOT_SEALED_CAP_BYTES,
+        );
         assert!(publish_prepared_evidence(
             &store,
             &mut opened.journal,
@@ -7011,12 +7073,12 @@ mod tests {
         let compact_bytes = prepared.compact_record.len() as u64;
         let sealed_bytes = (prepared.archive.len() + prepared.manifest.len()) as u64;
         let state_cap = existing_state_bytes + compact_bytes;
-        let caps = HotStorageCapsV1 {
-            total_bytes: state_cap + sealed_bytes * 2,
-            state_bytes: state_cap,
-            scratch_bytes: sealed_bytes,
+        let caps = HotStorageCapsV1::reduced_for_test(
+            state_cap + sealed_bytes * 2,
+            state_cap,
             sealed_bytes,
-        };
+            sealed_bytes,
+        );
         assert!(publish_prepared_evidence(
             &store,
             &mut opened.journal,

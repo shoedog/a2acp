@@ -92,10 +92,11 @@ pub(super) enum StatusSourceKindV1 {
     Outbox,
     Notifications,
     Ownership,
+    Semantics,
 }
 
 impl StatusSourceKindV1 {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Authority,
         Self::Ledger,
         Self::Evidence,
@@ -105,6 +106,7 @@ impl StatusSourceKindV1 {
         Self::Outbox,
         Self::Notifications,
         Self::Ownership,
+        Self::Semantics,
     ];
 
     fn wire(self) -> &'static str {
@@ -118,6 +120,7 @@ impl StatusSourceKindV1 {
             Self::Outbox => "outbox",
             Self::Notifications => "notifications",
             Self::Ownership => "ownership",
+            Self::Semantics => "semantics",
         }
     }
 }
@@ -323,6 +326,7 @@ impl ProjectedScheduleStatusV1 {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn project_status_from_verified_sources(
     status: ScheduleStatusV1,
     mut sources: Vec<StatusSourceObservationV1>,
@@ -346,6 +350,7 @@ fn project_status_from_verified_sources(
     Ok(projected)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn healthy_source(source: StatusSourceKindV1, sha256: String) -> StatusSourceObservationV1 {
     StatusSourceObservationV1 {
         source,
@@ -353,6 +358,7 @@ fn healthy_source(source: StatusSourceKindV1, sha256: String) -> StatusSourceObs
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn missing_source(source: StatusSourceKindV1, code: &str) -> StatusSourceObservationV1 {
     StatusSourceObservationV1 {
         source,
@@ -360,6 +366,7 @@ fn missing_source(source: StatusSourceKindV1, code: &str) -> StatusSourceObserva
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn corrupt_source(source: StatusSourceKindV1, code: &str) -> StatusSourceObservationV1 {
     StatusSourceObservationV1 {
         source,
@@ -367,12 +374,22 @@ fn corrupt_source(source: StatusSourceKindV1, code: &str) -> StatusSourceObserva
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn blocked_source(source: StatusSourceKindV1, code: &str) -> StatusSourceObservationV1 {
+    StatusSourceObservationV1 {
+        source,
+        state: StatusSourceStateV1::Blocked { code: code.into() },
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn domain_source_sha256(domain: &[u8], source_sha256: &str) -> String {
     let mut material = domain.to_vec();
     material.extend_from_slice(source_sha256.as_bytes());
     local_file::sha256_hex(&material)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn optional_source(
     source: StatusSourceKindV1,
     acquired: Result<Option<String>, BoxError>,
@@ -386,6 +403,7 @@ fn optional_source(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn required_source(
     source: StatusSourceKindV1,
     acquired: Result<String, BoxError>,
@@ -397,6 +415,7 @@ fn required_source(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn project_status_from_journals<C>(
     capability: &C,
     status: ScheduleStatusV1,
@@ -462,6 +481,11 @@ where
         ownership_status_source_sha256(capability.supervisor_directory()),
         "ownership_state_corrupt",
     );
+    // R3d3 has no authoritative scheduler-policy/window projection owner. Hashes prove that the
+    // retained journals were acquired, not that a caller-supplied summary agrees with them. Keep
+    // this raw acquisition path visibly degraded. R3d5 may add the sole production constructor
+    // for `VerifiedScheduleStatusV1` after it derives every semantic field from owned state.
+    let semantics = blocked_source(StatusSourceKindV1::Semantics, "status_semantics_unverified");
     project_status_from_verified_sources(
         status,
         vec![
@@ -474,6 +498,7 @@ where
             outbox,
             notifications,
             ownership,
+            semantics,
         ],
     )
 }
@@ -494,6 +519,36 @@ struct StatusJournalRecordV1 {
     previous_record: OptionalSha256V1,
     recorded_at_ms: i64,
     projection: ProjectedScheduleStatusV1,
+}
+
+/// Closed proof that every semantic field in a status projection was derived from authoritative
+/// owner state. R3d3 deliberately supplies no production constructor: R3d5 owns the scheduler
+/// policy/window lifecycle needed to create one. This keeps the durable append mechanism present
+/// without accepting a raw caller-built `ScheduleStatusV1`.
+#[allow(dead_code)]
+pub(super) struct VerifiedScheduleStatusV1<'lock> {
+    projection: ProjectedScheduleStatusV1,
+    _owner_lock: std::marker::PhantomData<&'lock ()>,
+}
+
+impl<'lock> VerifiedScheduleStatusV1<'lock> {
+    #[cfg(test)]
+    fn from_projection_for_test<C: EvidenceStateCapability + ?Sized>(
+        _capability: &'lock C,
+        projection: ProjectedScheduleStatusV1,
+    ) -> Result<Self, BoxError> {
+        projection.validate()?;
+        if !projection.sources.iter().any(|source| {
+            source.source == StatusSourceKindV1::Semantics
+                && matches!(source.state, StatusSourceStateV1::Healthy { .. })
+        }) {
+            return Err("schedule status: semantic projection is not verified".into());
+        }
+        Ok(Self {
+            projection,
+            _owner_lock: std::marker::PhantomData,
+        })
+    }
 }
 
 #[allow(dead_code)] // The R3d5 scheduler will append projections; the R3d3 CLI is read-only.
@@ -639,15 +694,11 @@ impl<'lock> ScheduleStatusJournal<'lock> {
         Ok(sha256)
     }
 
-    pub(super) fn append<C>(
+    pub(super) fn append_verified(
         &mut self,
-        capability: &C,
-        status: ScheduleStatusV1,
-    ) -> Result<String, BoxError>
-    where
-        C: AuthorityStateCapability + AdmissionStateCapability + EvidenceStateCapability + ?Sized,
-    {
-        self.append_projected(project_status_from_journals(capability, status)?)
+        verified: VerifiedScheduleStatusV1<'lock>,
+    ) -> Result<String, BoxError> {
+        self.append_projected(verified.projection)
     }
 
     #[cfg(test)]
@@ -1126,6 +1177,7 @@ impl<'lock> NotificationJournal<'lock> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn notification_status_source_sha256<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
 ) -> Result<String, BoxError> {
@@ -1684,14 +1736,14 @@ mod tests {
         let evidence =
             EvidenceStateModelV1::new("d".repeat(64), ColdStorageBindingV1::Absent).unwrap();
         FileEvidenceJournal::initialize(&combined, &evidence, 2).unwrap();
-        let mut journal = ScheduleStatusJournal::open(&combined).unwrap();
-        journal.append(&combined, status(211)).unwrap();
-        let healthy = journal.latest().unwrap().clone();
-        assert_eq!(healthy.overall, ScheduleOverallStateV1::Green);
-        assert!(healthy
-            .sources
-            .iter()
-            .all(|source| matches!(source.state, StatusSourceStateV1::Healthy { .. })));
+        let unverified = project_status_from_journals(&combined, status(211)).unwrap();
+        assert_eq!(unverified.overall, ScheduleOverallStateV1::Degraded);
+        assert!(unverified.sources.iter().any(|source| matches!(
+            source.state,
+            StatusSourceStateV1::Blocked { ref code }
+                if code == "status_semantics_unverified"
+        )));
+        assert!(VerifiedScheduleStatusV1::from_projection_for_test(&combined, unverified).is_err());
 
         let evidence_path = combined
             .evidence_index_directory()
@@ -1717,7 +1769,11 @@ mod tests {
         let lock = root.try_owner_admission("status-journal").unwrap();
         let mut journal = ScheduleStatusJournal::open(&lock).unwrap();
         let first = project_status(status(300), healthy_sources()).unwrap();
-        journal.append_projected_for_test(first.clone()).unwrap();
+        journal
+            .append_verified(
+                VerifiedScheduleStatusV1::from_projection_for_test(&lock, first.clone()).unwrap(),
+            )
+            .unwrap();
         let second = project_status(status(301), healthy_sources()).unwrap();
         journal.append_projected_for_test(second.clone()).unwrap();
         assert!(journal
