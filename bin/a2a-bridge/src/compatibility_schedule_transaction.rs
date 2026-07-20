@@ -2796,6 +2796,7 @@ impl<'lock> FileAdmissionJournal<'lock> {
         capability: &'lock C,
     ) -> Result<AdmissionJournalOpen<'lock>, BoxError> {
         let directory = capability.admission_directory();
+        directory.sync_journal_recovery_barrier("schedule admission")?;
         let commit_entries = Self::entries(directory)?;
         let commit_count = u64::try_from(commit_entries.len())?;
         let mut controls_by_generation: BTreeMap<
@@ -4582,6 +4583,45 @@ mod tests {
         assert!(final_record.is_file());
         assert_eq!(
             reopened
+                .read_active_opening(&profile.sha256)
+                .unwrap()
+                .opening,
+            opening
+        );
+    }
+
+    #[test]
+    fn quarantine_control_ambiguous_sync_requires_recovery_barrier_before_reopen() {
+        let (_state_temp, state) = state_root();
+        let owner = state
+            .try_owner_admission("test:quarantine-ambiguous-directory-sync")
+            .unwrap();
+        let admission_directory = owner.admission_directory();
+        let final_record = admission_directory
+            .canonical_path()
+            .join(FileAdmissionJournal::control_name(1));
+        let profile = fingerprint('d');
+        let opening = quarantine_opening(profile.clone(), 2);
+        let mut store = FileAdmissionQuarantineStore::open_quarantine_controls(&owner).unwrap();
+
+        admission_directory.fail_sync_on_nth_call_for_test(1);
+        let error = store.append_opening(opening.clone()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("publication renamed but directory sync is ambiguous"));
+        assert!(final_record.is_file());
+        drop(store);
+
+        admission_directory.fail_sync_on_nth_call_for_test(1);
+        let recovery_error = FileAdmissionQuarantineStore::open_quarantine_controls(&owner)
+            .err()
+            .expect("reopen must fail closed until the visible control is durable");
+        assert!(recovery_error
+            .to_string()
+            .contains("journal recovery barrier"));
+        assert_eq!(
+            FileAdmissionQuarantineStore::open_quarantine_controls(&owner)
+                .unwrap()
                 .read_active_opening(&profile.sha256)
                 .unwrap()
                 .opening,

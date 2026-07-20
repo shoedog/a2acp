@@ -469,6 +469,7 @@ impl<'lock> PublicationOutboxJournal<'lock> {
         capability: &'lock C,
     ) -> Result<Self, BoxError> {
         let directory = capability.publication_outbox_directory();
+        directory.sync_journal_recovery_barrier("schedule publication outbox")?;
         let mut records = Vec::new();
         let mut latest = BTreeMap::new();
         let mut previous_journal_sha256: Option<String> = None;
@@ -980,6 +981,42 @@ mod tests {
             .unwrap();
         assert!(!temporary.exists());
         assert!(final_record.is_file());
+        assert_eq!(
+            PublicationOutboxJournal::open(&lock).unwrap().records.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn outbox_ambiguous_directory_sync_requires_recovery_barrier_before_reopen() {
+        let directory = root();
+        let root = SchedulerStateRoot::initialize_for_test(directory.path()).unwrap();
+        let lock = root
+            .try_owner_admission("outbox-ambiguous-directory-sync")
+            .unwrap();
+        let outbox_directory = lock.publication_outbox_directory();
+        let final_record = outbox_directory
+            .canonical_path()
+            .join(PublicationOutboxJournal::generation_name(1));
+        let mut journal = PublicationOutboxJournal::open(&lock).unwrap();
+
+        outbox_directory.fail_sync_on_nth_call_for_test(1);
+        let error = journal
+            .start(identity("external-ambiguous-directory-sync"), 10)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("publication renamed but directory sync is ambiguous"));
+        assert!(final_record.is_file());
+        drop(journal);
+
+        outbox_directory.fail_sync_on_nth_call_for_test(1);
+        let recovery_error = PublicationOutboxJournal::open(&lock)
+            .err()
+            .expect("reopen must fail closed until the visible outbox record is durable");
+        assert!(recovery_error
+            .to_string()
+            .contains("journal recovery barrier"));
         assert_eq!(
             PublicationOutboxJournal::open(&lock).unwrap().records.len(),
             1

@@ -644,6 +644,17 @@ impl PinnedDirectory {
             .map_err(|error| format!("pinned directory: cannot sync: {error}").into())
     }
 
+    /// Establish durability for every journal name currently visible beneath this retained
+    /// directory before recovery interprets any of them. This closes the ambiguous interval where
+    /// an atomic publication renamed its complete record but the caller observed a parent-sync
+    /// failure: a later successful barrier makes a surviving name durable, while a barrier failure
+    /// prevents recovery from consuming that name as committed state.
+    pub(crate) fn sync_journal_recovery_barrier(&self, label: &str) -> Result<(), BoxError> {
+        self.sync().map_err(|error| {
+            format!("{label}: cannot establish journal recovery barrier: {error}").into()
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_sync_on_nth_call_for_test(&self, call: usize) {
         assert!(call > 0, "sync failure injection call must be positive");

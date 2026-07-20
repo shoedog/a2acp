@@ -623,6 +623,7 @@ impl<'lock> ScheduleStatusJournal<'lock> {
     }
 
     fn open_directory(directory: &'lock local_file::PinnedDirectory) -> Result<Self, BoxError> {
+        directory.sync_journal_recovery_barrier("schedule status")?;
         let mut records = Vec::new();
         let mut previous_sha256: Option<String> = None;
         let mut previous_time = None;
@@ -1061,6 +1062,7 @@ impl<'lock> NotificationJournal<'lock> {
         capability: &'lock C,
     ) -> Result<Self, BoxError> {
         let directory = capability.status_directory();
+        directory.sync_journal_recovery_barrier("schedule notification")?;
         let mut records = Vec::new();
         let mut latest = BTreeMap::new();
         let mut previous_sha256: Option<String> = None;
@@ -1843,6 +1845,41 @@ mod tests {
     }
 
     #[test]
+    fn status_ambiguous_directory_sync_requires_recovery_barrier_before_reopen() {
+        let directory = root();
+        let root = SchedulerStateRoot::initialize_for_test(directory.path()).unwrap();
+        let lock = root
+            .try_owner_admission("status-ambiguous-directory-sync")
+            .unwrap();
+        let status_directory = lock.status_directory();
+        let final_record = status_directory
+            .canonical_path()
+            .join(ScheduleStatusJournal::generation_name(1));
+        let projection = project_status(status(355), healthy_sources()).unwrap();
+        let mut journal = ScheduleStatusJournal::open(&lock).unwrap();
+
+        status_directory.fail_sync_on_nth_call_for_test(1);
+        let error = journal.append_projected_for_test(projection).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("publication renamed but directory sync is ambiguous"));
+        assert!(final_record.is_file());
+        drop(journal);
+
+        status_directory.fail_sync_on_nth_call_for_test(1);
+        let recovery_error = ScheduleStatusJournal::open(&lock)
+            .err()
+            .expect("reopen must fail closed until the visible status record is durable");
+        assert!(recovery_error
+            .to_string()
+            .contains("journal recovery barrier"));
+        assert!(ScheduleStatusJournal::open(&lock)
+            .unwrap()
+            .latest()
+            .is_some());
+    }
+
+    #[test]
     fn notification_generation_bound_rejects_the_first_unreopenable_generation() {
         let first_unreopenable = u64::try_from(MAX_STATUS_GENERATIONS).unwrap() + 1;
         assert!(validate_notification_generation(first_unreopenable).is_err());
@@ -1896,6 +1933,51 @@ mod tests {
             .unwrap();
         assert!(!temporary.exists());
         assert!(final_record.is_file());
+        assert_eq!(NotificationJournal::open(&lock).unwrap().records.len(), 1);
+    }
+
+    #[test]
+    fn notification_ambiguous_directory_sync_requires_recovery_barrier_before_reopen() {
+        let directory = root();
+        let root = SchedulerStateRoot::initialize_for_test(directory.path()).unwrap();
+        let lock = root
+            .try_owner_admission("notification-ambiguous-directory-sync")
+            .unwrap();
+        let status_directory = lock.status_directory();
+        let final_record = status_directory
+            .canonical_path()
+            .join(NotificationJournal::generation_name(1));
+        let green = project_status(status(365), healthy_sources()).unwrap();
+        let mut unknown_status = status(366);
+        unknown_status.fresh_one_shot_compatibility = OneShotCompatibilityStateV1::Unknown;
+        unknown_status.cases[0].last_outcome = OptionalTextV1::Text {
+            value: "candidate_unknown:catalog_unavailable".into(),
+        };
+        let unknown = project_status(unknown_status, healthy_sources()).unwrap();
+        let notification = status_notifications(Some(&green), &unknown)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("green-to-unknown transition must notify");
+        let mut journal = NotificationJournal::open(&lock).unwrap();
+
+        status_directory.fail_sync_on_nth_call_for_test(1);
+        let error = journal
+            .append(notification, 500, NotificationLifecycleV1::Pending)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("publication renamed but directory sync is ambiguous"));
+        assert!(final_record.is_file());
+        drop(journal);
+
+        status_directory.fail_sync_on_nth_call_for_test(1);
+        let recovery_error = NotificationJournal::open(&lock)
+            .err()
+            .expect("reopen must fail closed until the visible notification is durable");
+        assert!(recovery_error
+            .to_string()
+            .contains("journal recovery barrier"));
         assert_eq!(NotificationJournal::open(&lock).unwrap().records.len(), 1);
     }
 

@@ -2352,6 +2352,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
         recorded_at_ms: i64,
     ) -> Result<EvidenceJournalOpen<'lock>, BoxError> {
         let directory = capability.evidence_index_directory();
+        directory.sync_journal_recovery_barrier("schedule evidence state")?;
         if !Self::generation_entries(directory)?.is_empty() {
             return Err("schedule evidence: state journal already exists".into());
         }
@@ -2387,6 +2388,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
         capability: &'lock C,
     ) -> Result<EvidenceJournalOpen<'lock>, BoxError> {
         let directory = capability.evidence_index_directory();
+        directory.sync_journal_recovery_barrier("schedule evidence state")?;
         let entries = Self::generation_entries(directory)?;
         if entries.is_empty() {
             return Err("schedule evidence: state journal has no generations".into());
@@ -4531,6 +4533,7 @@ impl<'lock> FileIncidentMigrationJournal<'lock> {
         capability: &'lock C,
     ) -> Result<Self, BoxError> {
         let directory = capability.migration_directory();
+        directory.sync_journal_recovery_barrier("schedule incident migration")?;
         let mut records = Vec::new();
         for (index, (generation, name)) in
             Self::generation_entries(directory)?.into_iter().enumerate()
@@ -6178,6 +6181,47 @@ mod tests {
     }
 
     #[test]
+    fn evidence_ambiguous_directory_sync_requires_recovery_barrier_before_reopen() {
+        let root = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
+        let lock = scheduler
+            .try_owner_admission("test/evidence-ambiguous-directory-sync")
+            .unwrap();
+        let evidence_directory = lock.evidence_index_directory();
+        let final_record = evidence_directory
+            .canonical_path()
+            .join(FileEvidenceJournal::generation_name(2));
+        let mut state = model();
+        let mut opened = FileEvidenceJournal::initialize(&lock, &state, 1).unwrap();
+        state
+            .insert_entry(entry("evidence-ambiguous-sync", 1_000_000, 512))
+            .unwrap();
+
+        evidence_directory.fail_sync_on_nth_call_for_test(1);
+        let error = opened.journal.append(&state, 2_000_000).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("publication renamed but directory sync is ambiguous"));
+        assert!(final_record.is_file());
+        drop(opened);
+
+        evidence_directory.fail_sync_on_nth_call_for_test(1);
+        let recovery_error = FileEvidenceJournal::open_existing(&lock)
+            .err()
+            .expect("reopen must fail closed until the visible generation is durable");
+        assert!(recovery_error
+            .to_string()
+            .contains("journal recovery barrier"));
+        assert_eq!(
+            FileEvidenceJournal::open_existing(&lock)
+                .unwrap()
+                .snapshot
+                .generation,
+            2
+        );
+    }
+
+    #[test]
     fn evidence_journal_rejects_gap_corruption_and_same_path_replacement() {
         let root = root();
         let scheduler = SchedulerStateRoot::initialize_for_test(root.path()).unwrap();
@@ -7528,6 +7572,52 @@ mod tests {
             .unwrap();
         assert!(!temporary.exists());
         assert!(final_record.is_file());
+        assert_eq!(
+            FileIncidentMigrationJournal::open_existing_or_empty(&lock)
+                .unwrap()
+                .records()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn migration_ambiguous_directory_sync_requires_recovery_barrier_before_reopen() {
+        let source = root();
+        let aggregate = aggregate_bytes();
+        let item = migration_item(
+            "incident-ambiguous-directory-sync",
+            &source.path().join("missing-ambiguous-sync.json"),
+            &aggregate,
+        );
+        let state_root = root();
+        let scheduler = SchedulerStateRoot::initialize_for_test(state_root.path()).unwrap();
+        let lock = scheduler
+            .try_owner_admission("test/migration-ambiguous-directory-sync")
+            .unwrap();
+        let migration_directory = lock.migration_directory();
+        let final_record = migration_directory
+            .canonical_path()
+            .join(FileIncidentMigrationJournal::generation_name(1));
+        let mut journal = FileIncidentMigrationJournal::open_existing_or_empty(&lock).unwrap();
+
+        migration_directory.fail_sync_on_nth_call_for_test(1);
+        let error = journal
+            .append(&item, IncidentMigrationDispositionV1::Missing, 1_000_001)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("publication renamed but directory sync is ambiguous"));
+        assert!(final_record.is_file());
+        drop(journal);
+
+        migration_directory.fail_sync_on_nth_call_for_test(1);
+        let recovery_error = FileIncidentMigrationJournal::open_existing_or_empty(&lock)
+            .err()
+            .expect("reopen must fail closed until the visible migration is durable");
+        assert!(recovery_error
+            .to_string()
+            .contains("journal recovery barrier"));
         assert_eq!(
             FileIncidentMigrationJournal::open_existing_or_empty(&lock)
                 .unwrap()
