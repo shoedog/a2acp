@@ -3468,7 +3468,8 @@ usage: a2a-bridge models [--config <path>] [--agent <id>] [--json]
   --config <path>  registry config (default: ./a2a-bridge.toml)
   --agent <id>     show only this agent
   --json           emit an agent map; successful values match the card's agent-models shape, while
-                   failed probes are explicit {available:false,failure:{...}} records";
+                   failed probes are explicit {available:false,failure:{...}} records. Failure detail
+                   is in failure.phase/category/error/diagnostic; dynamic text is bounded and redacted";
 
 struct ModelsArgs {
     config: Option<String>,

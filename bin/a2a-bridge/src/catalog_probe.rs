@@ -28,6 +28,7 @@ use serde::Serialize;
 /// Per-agent probe bound. The kiro host-side ACP hang made this load-bearing (spec §2): without it a
 /// single unresponsive adapter would block startup/CLI forever.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const PROCESS_STDERR_LINE_BYTES: usize = 4 * 1024;
 
 /// Which discovery strategy an entry uses. Pure (kind/cmd only) so the dispatch decision is unit-tested
 /// without spawning a real adapter.
@@ -47,6 +48,34 @@ enum CatalogProbePhase {
     Timeout,
 }
 
+/// Stable operator-facing failure category. This is additive to [`CatalogProbePhase`]: phase says
+/// where discovery stopped, while category distinguishes failures that share that phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CatalogProbeCategory {
+    Spawn,
+    Timeout,
+    ProcessExit,
+    ProviderAcp,
+    ResponseParse,
+    Transport,
+    Configuration,
+}
+
+impl CatalogProbeCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn",
+            Self::Timeout => "timeout",
+            Self::ProcessExit => "process_exit",
+            Self::ProviderAcp => "provider_acp",
+            Self::ResponseParse => "response_parse",
+            Self::Transport => "transport",
+            Self::Configuration => "configuration",
+        }
+    }
+}
+
 impl CatalogProbePhase {
     fn as_str(self) -> &'static str {
         match self {
@@ -60,6 +89,7 @@ impl CatalogProbePhase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProbeError {
     phase: CatalogProbePhase,
+    category: CatalogProbeCategory,
     reason: String,
     diagnostic: Option<FailureDiagnostic>,
 }
@@ -68,14 +98,52 @@ impl ProbeError {
     fn spawn(reason: impl Into<String>) -> Self {
         Self {
             phase: CatalogProbePhase::Spawn,
+            category: CatalogProbeCategory::Spawn,
             reason: reason.into(),
             diagnostic: None,
         }
     }
 
-    fn discovery(reason: impl Into<String>) -> Self {
+    fn configuration(reason: impl Into<String>) -> Self {
         Self {
             phase: CatalogProbePhase::Discovery,
+            category: CatalogProbeCategory::Configuration,
+            reason: reason.into(),
+            diagnostic: None,
+        }
+    }
+
+    fn transport(reason: impl Into<String>) -> Self {
+        Self {
+            phase: CatalogProbePhase::Discovery,
+            category: CatalogProbeCategory::Transport,
+            reason: reason.into(),
+            diagnostic: None,
+        }
+    }
+
+    fn process_exit(reason: impl Into<String>) -> Self {
+        Self {
+            phase: CatalogProbePhase::Discovery,
+            category: CatalogProbeCategory::ProcessExit,
+            reason: reason.into(),
+            diagnostic: None,
+        }
+    }
+
+    fn provider_acp(reason: impl Into<String>) -> Self {
+        Self {
+            phase: CatalogProbePhase::Discovery,
+            category: CatalogProbeCategory::ProviderAcp,
+            reason: reason.into(),
+            diagnostic: None,
+        }
+    }
+
+    fn response_parse(reason: impl Into<String>) -> Self {
+        Self {
+            phase: CatalogProbePhase::Discovery,
+            category: CatalogProbeCategory::ResponseParse,
             reason: reason.into(),
             diagnostic: None,
         }
@@ -84,6 +152,7 @@ impl ProbeError {
     fn timeout() -> Self {
         Self {
             phase: CatalogProbePhase::Timeout,
+            category: CatalogProbeCategory::Timeout,
             reason: format!("probe timed out after {} seconds", PROBE_TIMEOUT.as_secs()),
             diagnostic: None,
         }
@@ -91,6 +160,7 @@ impl ProbeError {
 
     fn from_bridge(
         phase: CatalogProbePhase,
+        fallback_category: CatalogProbeCategory,
         context: impl AsRef<str>,
         error: bridge_core::error::BridgeError,
     ) -> Self {
@@ -100,12 +170,28 @@ impl ProbeError {
             }
             _ => None,
         };
+        let category = diagnostic.as_ref().map_or(fallback_category, |diagnostic| {
+            use bridge_core::diagnostics::DiagnosticFailureClass;
+
+            match diagnostic.class() {
+                DiagnosticFailureClass::Timeout => CatalogProbeCategory::Timeout,
+                DiagnosticFailureClass::AgentProcess
+                    if phase == CatalogProbePhase::Spawn
+                        && diagnostic.code().as_str().starts_with("acp.spawn.") =>
+                {
+                    CatalogProbeCategory::Spawn
+                }
+                DiagnosticFailureClass::AgentProcess => CatalogProbeCategory::ProcessExit,
+                _ => fallback_category,
+            }
+        });
         let deepest = diagnostic
             .as_ref()
             .and_then(|diagnostic| diagnostic.causes().last().cloned())
             .unwrap_or_else(|| error.to_string());
         Self {
             phase,
+            category,
             reason: format!("{}: {deepest}", context.as_ref()),
             diagnostic,
         }
@@ -119,6 +205,7 @@ pub(super) struct CatalogProbeFailure {
     agent: String,
     strategy: Strategy,
     phase: CatalogProbePhase,
+    category: CatalogProbeCategory,
     #[serde(skip_serializing_if = "Option::is_none")]
     executable: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -140,6 +227,7 @@ impl CatalogProbeFailure {
             agent: redactor.sanitize_stderr_line(entry.id.as_str(), 64),
             strategy,
             phase: error.phase,
+            category: error.category,
             executable: entry
                 .cmd
                 .as_deref()
@@ -155,9 +243,10 @@ impl CatalogProbeFailure {
 
     pub(super) fn cli_message(&self) -> String {
         format!(
-            "models: probe failed for agent '{}' during {}: {}",
+            "models: probe failed for agent '{}' during {} (category={}): {}",
             self.agent,
             self.phase.as_str(),
+            self.category.as_str(),
             self.error
         )
     }
@@ -221,14 +310,31 @@ async fn probe_kiro(entry: &AgentEntry) -> Result<AgentCaps, ProbeError> {
         .await
         .map_err(|e| ProbeError::spawn(format!("spawn {cmd}: {e}")))?;
     if !out.status.success() {
-        return Err(ProbeError::discovery(format!(
-            "{cmd} exited {:?}",
-            out.status.code()
-        )));
+        let mut reason = format!("{cmd} exited with {}", out.status);
+        if let Some(deepest) = deepest_process_stderr_line(&out.stderr) {
+            reason.push_str(": ");
+            reason.push_str(&deepest);
+        }
+        return Err(ProbeError::process_exit(reason));
     }
     Ok(parse_kiro_list_models(&String::from_utf8_lossy(
         &out.stdout,
     )))
+}
+
+/// Retain only the deepest non-empty process-stderr line and cap it before UTF-8 decoding. The final
+/// [`CatalogProbeFailure`] constructor applies the shared credential/path redactor and tighter output
+/// bound before this text can reach logs or CLI output.
+fn deepest_process_stderr_line(stderr: &[u8]) -> Option<String> {
+    stderr.rsplit(|byte| *byte == b'\n').find_map(|line| {
+        let start = line.iter().position(|byte| !byte.is_ascii_whitespace())?;
+        let end = line
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())?
+            .saturating_add(1);
+        let bounded_end = start.saturating_add(PROCESS_STDERR_LINE_BYTES).min(end);
+        Some(String::from_utf8_lossy(&line[start..bounded_end]).into_owned())
+    })
 }
 
 /// api (ollama) list: OpenAI `GET {base_url}/models`. `base_url` already ends in `/v1` per the example
@@ -237,17 +343,33 @@ async fn probe_api(entry: &AgentEntry) -> Result<AgentCaps, ProbeError> {
     let base = entry
         .base_url
         .as_deref()
-        .ok_or_else(|| ProbeError::discovery("api agent missing base_url"))?;
+        .ok_or_else(|| ProbeError::configuration("api agent missing base_url"))?;
     let url = format!("{}/models", base.trim_end_matches('/'));
-    let body = reqwest::Client::new()
+    let response = reqwest::Client::new()
         .get(&url)
         .send()
         .await
-        .map_err(|e| ProbeError::discovery(format!("GET {url}: {e}")))?
-        .text()
-        .await
-        .map_err(|e| ProbeError::discovery(format!("read {url}: {e}")))?;
-    parse_ollama_models(&body).map_err(|e| ProbeError::discovery(format!("parse {url}: {e}")))
+        .map_err(|error| {
+            ProbeError::transport(format!(
+                "GET models endpoint failed: {}",
+                error.without_url()
+            ))
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ProbeError::provider_acp(format!(
+            "GET models endpoint returned HTTP {}",
+            status.as_u16()
+        )));
+    }
+    let body = response.text().await.map_err(|error| {
+        ProbeError::transport(format!(
+            "read models response failed: {}",
+            error.without_url()
+        ))
+    })?;
+    parse_ollama_models(&body)
+        .map_err(|error| ProbeError::response_parse(format!("parse models response: {error}")))
 }
 
 #[async_trait::async_trait]
@@ -341,12 +463,24 @@ async fn probe_acp_host_with(
         .spawn_observed(&cmd, &argv, acp, observer.clone())
         .await
         .map_err(|e| {
-            ProbeError::from_bridge(CatalogProbePhase::Spawn, format!("spawn {cmd}"), e)
+            ProbeError::from_bridge(
+                CatalogProbePhase::Spawn,
+                CatalogProbeCategory::Spawn,
+                format!("spawn {cmd}"),
+                e,
+            )
         })?;
     let caps = backend
         .describe_options_observed(cwd, observer)
         .await
-        .map_err(|e| ProbeError::from_bridge(CatalogProbePhase::Discovery, "describe_options", e));
+        .map_err(|e| {
+            ProbeError::from_bridge(
+                CatalogProbePhase::Discovery,
+                CatalogProbeCategory::ProviderAcp,
+                "describe_options",
+                e,
+            )
+        });
     // Graceful teardown (SIGTERM→SIGKILL of the host child). If the outer timeout cancels this future
     // mid-await, dropping `backend` SIGKILLs the child (`kill_on_drop`) — so neither path leaks.
     let _ = backend.retire().await;
@@ -535,7 +669,7 @@ mod tests {
     fn collect_probe_report_keeps_failures_outside_server_catalog() {
         let bad_entry = entry("bad", Some("bad-acp"), AgentKind::Acp);
         let failure =
-            CatalogProbeFailure::build(&bad_entry, Strategy::Acp, ProbeError::discovery("boom"));
+            CatalogProbeFailure::build(&bad_entry, Strategy::Acp, ProbeError::provider_acp("boom"));
         let results = vec![
             (
                 "ok".to_string(),
@@ -563,10 +697,11 @@ mod tests {
         let failure = CatalogProbeFailure::build(
             &bad_entry,
             Strategy::Acp,
-            ProbeError::discovery(format!("authorization: top-secret {}", "x".repeat(800))),
+            ProbeError::provider_acp(format!("authorization: top-secret {}", "x".repeat(800))),
         );
         let value = serde_json::to_value(&failure).unwrap();
         assert_eq!(value["phase"], "discovery");
+        assert_eq!(value["category"], "provider_acp");
         assert_eq!(value["strategy"], "acp");
         assert!(value["error"].as_str().unwrap().len() <= 512);
         assert!(!value.to_string().contains("top-secret"));
@@ -579,9 +714,75 @@ mod tests {
         let failure = CatalogProbeFailure::build(&bad_entry, Strategy::Acp, ProbeError::timeout());
         let value = serde_json::to_value(&failure).unwrap();
         assert_eq!(value["phase"], "timeout");
+        assert_eq!(value["category"], "timeout");
         assert_eq!(
             value["error"],
             format!("probe timed out after {} seconds", PROBE_TIMEOUT.as_secs())
         );
+    }
+
+    #[test]
+    fn failure_categories_have_stable_text_and_json_tokens() {
+        let cases = [
+            (CatalogProbeCategory::Spawn, "spawn"),
+            (CatalogProbeCategory::Timeout, "timeout"),
+            (CatalogProbeCategory::ProcessExit, "process_exit"),
+            (CatalogProbeCategory::ProviderAcp, "provider_acp"),
+            (CatalogProbeCategory::ResponseParse, "response_parse"),
+            (CatalogProbeCategory::Transport, "transport"),
+            (CatalogProbeCategory::Configuration, "configuration"),
+        ];
+        for (category, expected) in cases {
+            assert_eq!(category.as_str(), expected);
+            assert_eq!(serde_json::to_value(category).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn typed_acp_failure_keeps_provider_category_and_deepest_safe_cause() {
+        use bridge_core::diagnostics::{
+            DiagnosticFailureClass, DiagnosticPhase, FailureDiagnosticInput, FailureDisposition,
+        };
+
+        let diagnostic = FailureDiagnostic::build_static_code(
+            FailureDiagnosticInput {
+                failed_phase: DiagnosticPhase::SessionCreate,
+                last_completed_phase: Some(DiagnosticPhase::Authenticate),
+                class: DiagnosticFailureClass::Transport,
+                disposition: FailureDisposition::RetrySameTarget,
+                code: String::new(),
+                summary: "ACP discovery failed".into(),
+                causes: vec!["deepest-acp-probe-sentinel-30".into()],
+                stderr_observed: false,
+                stderr_line_count: 0,
+                stderr_scope: None,
+                stderr_tail: None,
+                stderr_redaction: None,
+                retry_after_ms: None,
+                reset_at_ms: None,
+                prompt_may_have_been_accepted: false,
+            },
+            "acp.discovery.test_failure",
+            &DiagnosticRedactor::default(),
+        )
+        .unwrap();
+        let error = ProbeError::from_bridge(
+            CatalogProbePhase::Discovery,
+            CatalogProbeCategory::ProviderAcp,
+            "describe_options",
+            bridge_core::error::BridgeError::agent_failure(diagnostic.clone()),
+        );
+        assert_eq!(error.category, CatalogProbeCategory::ProviderAcp);
+        assert!(error.reason.contains("deepest-acp-probe-sentinel-30"));
+        assert_eq!(error.diagnostic, Some(diagnostic));
+    }
+
+    #[test]
+    fn deepest_process_stderr_is_one_prefix_bounded_nonempty_line() {
+        let oversized = format!("first\n  deepest-{}  \n\n", "x".repeat(8 * 1024));
+        let deepest = deepest_process_stderr_line(oversized.as_bytes()).unwrap();
+        assert!(deepest.starts_with("deepest-"));
+        assert_eq!(deepest.len(), PROCESS_STDERR_LINE_BYTES);
+        assert!(!deepest.contains("first"));
     }
 }
