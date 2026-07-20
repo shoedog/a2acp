@@ -1593,7 +1593,9 @@ struct PublicationOutboxIdentityInputV1<'a> {
     external_id: &'a str,
 }
 
-fn publication_outbox_identity_sha256(value: &PublicationOutboxV1) -> Result<String, BoxError> {
+pub(super) fn publication_outbox_identity_sha256(
+    value: &PublicationOutboxV1,
+) -> Result<String, BoxError> {
     canonical_input_sha256(
         "publication-outbox immutable identity",
         &PublicationOutboxIdentityInputV1 {
@@ -1614,7 +1616,7 @@ struct PublicationCheckRunBindingInputV1<'a> {
     check_run_id: u64,
 }
 
-fn publication_check_run_binding_sha256(
+pub(super) fn publication_check_run_binding_sha256(
     immutable_identity: &FingerprintV1,
     check_run_id: u64,
 ) -> Result<String, BoxError> {
@@ -4079,6 +4081,7 @@ fn parse_and_validate<T: DeserializeOwned + ValidateRecord>(
     parse_and_validate_value::<T>(bytes, label).map(|_| ())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn parse_schedule_evidence_record(
     bytes: &[u8],
 ) -> Result<ScheduleEvidenceRecordV1, BoxError> {

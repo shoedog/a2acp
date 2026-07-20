@@ -376,6 +376,23 @@ pub(super) fn production_scheduler_state_present() -> Result<bool, SchedulerStat
     production_scheduler_state_present_at(&current_operator_home()?, true)
 }
 
+/// Opens only an already-existing production status directory. This path never creates or repairs
+/// the scheduler root or any child; R3d5 remains the sole production initialization owner.
+pub(super) fn open_production_status_directory_read_only(
+) -> Result<Option<PinnedDirectory>, SchedulerStateError> {
+    let Some(root) = open_production_root(&current_operator_home()?)? else {
+        return Ok(None);
+    };
+    verify_local_apfs(&root)?;
+    let status = root
+        .open_child_directory_optional(OsStr::new("status"), "production scheduler status")
+        .map_err(invalid)?;
+    if let Some(status) = &status {
+        verify_private_directory(status, "scheduler state status")?;
+    }
+    Ok(status)
+}
+
 fn open_or_create_private_child(
     parent: &PinnedDirectory,
     name: &str,

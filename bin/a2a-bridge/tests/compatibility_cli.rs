@@ -6,6 +6,66 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[test]
+fn schedule_status_is_read_only_explicit_and_supports_json() {
+    let home = tempfile::tempdir().unwrap();
+    let before = fs::read_dir(home.path()).unwrap().count();
+
+    let human = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+        .arg("compatibility")
+        .arg("schedule")
+        .arg("status")
+        .env("HOME", home.path())
+        .env("OPENAI_API_KEY", "must-not-be-read")
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(human_stdout.contains("state: "));
+    assert!(human_stdout.contains("activation: r3d5_activation_not_enabled"));
+    assert!(human_stdout.contains("effects: no_effects"));
+    assert!(!human_stdout.contains("must-not-be-read"));
+    assert!(human.stderr.is_empty());
+
+    let json = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+        .arg("compatibility")
+        .arg("schedule")
+        .arg("status")
+        .arg("--json")
+        .env("HOME", home.path())
+        .env("OPENAI_API_KEY", "must-not-be-read")
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["activation"], "r3d5_activation_not_enabled");
+    assert_eq!(value["effects"], "no_effects");
+    assert!(json.stderr.is_empty());
+    assert_eq!(fs::read_dir(home.path()).unwrap().count(), before);
+}
+
+#[test]
+fn schedule_status_rejects_unknown_or_duplicate_flags_without_writes() {
+    let home = tempfile::tempdir().unwrap();
+    let before = fs::read_dir(home.path()).unwrap().count();
+    for args in [
+        vec!["schedule", "status", "--write"],
+        vec!["schedule", "status", "--json", "--json"],
+        vec!["schedule", "unknown"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+            .arg("compatibility")
+            .args(args)
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("compatibility schedule"));
+    }
+    assert_eq!(fs::read_dir(home.path()).unwrap().count(), before);
+}
+
+#[test]
 fn schedule_tick_is_recognized_but_refuses_before_provider_capable_spawn() {
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("provider-spawned");

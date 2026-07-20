@@ -46,10 +46,13 @@ use crate::compatibility_schedule_schema::{
     ConsumptionEvidenceProvenanceV1, ConsumptionRecordV1, DeadlineDerivationV1,
     EffectiveIdentityV1, EquivalentWorkReservationV1, LedgerReservationV1,
     OptionalChildArtifactRefV1, OptionalSha256V1, OptionalSupervisorOutcomeV1, OptionalTextV1,
-    ScheduledExecutionSourceV1, SupervisorPhaseV1, SupervisorRecordV1, SupervisorTerminalOutcomeV1,
-    UsageChargeV1, ValidateRecord,
+    QuarantineV1, ScheduledExecutionSourceV1, SupervisorPhaseV1, SupervisorRecordV1,
+    SupervisorTerminalOutcomeV1, UsageChargeV1, ValidateRecord,
 };
 use crate::compatibility_schedule_state::{AdmissionStateCapability, AuthorityStateCapability};
+use crate::compatibility_schedule_status::{
+    PersistedQuarantineOpeningV1, QuarantineClosureStoreV1,
+};
 use crate::compatibility_schedule_supervisor::{
     ensure_prepared_supervisor, HardDeadline, PreparedSupervisorV1, VerifiedChildTerminalProofV1,
 };
@@ -59,6 +62,7 @@ const MAX_COMMIT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_COMMIT_GENERATIONS: usize = 100_000;
 const COMMIT_PREFIX: &str = "admission-commit.";
 const TERMINAL_PREFIX: &str = "admission-terminal.";
+const CONTROL_PREFIX: &str = "admission-control.";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -2317,6 +2321,51 @@ pub(super) fn handoff_admitted<R: AdmittedRunnerHandoff>(
     runner.handoff(capability)
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum AdmissionControlActionV1 {
+    OpenQuarantine {
+        opening: QuarantineV1,
+    },
+    CloseQuarantine {
+        source_generation: u64,
+        source_record_sha256: String,
+        opening: QuarantineV1,
+        closure: QuarantineV1,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AdmissionControlRecordV1 {
+    schema_version: u16,
+    sequence: u64,
+    after_commit_generation: u64,
+    previous_control_record: OptionalSha256V1,
+    admission_state_before_sha256: String,
+    admission_state_after: AdmissionStateV1,
+    action: AdmissionControlActionV1,
+    recorded_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionStateSourceKindV1 {
+    Commit,
+    Terminal,
+    Control,
+}
+
+#[derive(Clone, Debug)]
+struct AdmissionStateSourceV1 {
+    kind: AdmissionStateSourceKindV1,
+    generation: u64,
+    name: String,
+    sha256: String,
+    state: AdmissionStateV1,
+    recorded_at_ms: i64,
+    quarantine_opening: Option<QuarantineV1>,
+}
+
 #[derive(Clone, Debug)]
 struct AdmissionJournalOpen<'lock> {
     journal: FileAdmissionJournal<'lock>,
@@ -2332,6 +2381,151 @@ struct FileAdmissionJournal<'lock> {
     previous_sha256: Option<String>,
     state: AdmissionStateV1,
     pending_reserved: Option<AdmissionCommitV1>,
+    control_records: Vec<(AdmissionControlRecordV1, String)>,
+    state_sources: Vec<AdmissionStateSourceV1>,
+}
+
+fn source_contains_opening(
+    sources: &[AdmissionStateSourceV1],
+    source_generation: u64,
+    source_record_sha256: &str,
+    opening: &QuarantineV1,
+) -> bool {
+    let QuarantineV1::Open { quarantine_id, .. } = opening else {
+        return false;
+    };
+    sources.iter().any(|source| {
+        source.kind == AdmissionStateSourceKindV1::Control
+            && source.generation == source_generation
+            && source.sha256 == source_record_sha256
+            && source.quarantine_opening.as_ref() == Some(opening)
+            && source.state.controls.quarantine_openings.get(quarantine_id) == Some(opening)
+    })
+}
+
+fn validate_control_against_state(
+    record: &AdmissionControlRecordV1,
+    state_before: &AdmissionStateV1,
+    state_sources: &[AdmissionStateSourceV1],
+    expected_sequence: u64,
+    expected_after_generation: u64,
+    previous_control_sha256: Option<&str>,
+    previous_control_time: Option<i64>,
+) -> Result<(), BoxError> {
+    if record.schema_version != 1
+        || record.sequence != expected_sequence
+        || record.after_commit_generation != expected_after_generation
+        || record.previous_control_record
+            != match previous_control_sha256 {
+                Some(value) => OptionalSha256V1::Sha256 {
+                    value: value.to_owned(),
+                },
+                None => OptionalSha256V1::Absent,
+            }
+        || record.admission_state_before_sha256 != admission_state_sha256(state_before)?
+        || record.recorded_at_ms <= 0
+        || previous_control_time.is_some_and(|previous| record.recorded_at_ms <= previous)
+        || state_sources
+            .iter()
+            .filter(|source| source.generation <= expected_after_generation)
+            .map(|source| source.recorded_at_ms)
+            .max()
+            .is_some_and(|previous| record.recorded_at_ms <= previous)
+    {
+        return Err("schedule transaction: control identity, chain, or time is invalid".into());
+    }
+    let mut expected = state_before.clone();
+    match &record.action {
+        AdmissionControlActionV1::OpenQuarantine { opening } => {
+            let QuarantineV1::Open {
+                profile,
+                operator,
+                reason,
+                created_at_ms,
+                expires_at_ms,
+                ..
+            } = opening
+            else {
+                return Err("schedule transaction: quarantine control opening is not open".into());
+            };
+            let derived = expected.controls.open_quarantine(
+                profile.clone(),
+                operator.clone(),
+                reason.clone(),
+                *created_at_ms,
+                *expires_at_ms,
+            )?;
+            if &derived != opening || record.recorded_at_ms != *created_at_ms {
+                return Err(
+                    "schedule transaction: quarantine opening was not reducer-derived".into(),
+                );
+            }
+        }
+        AdmissionControlActionV1::CloseQuarantine {
+            source_generation,
+            source_record_sha256,
+            opening,
+            closure,
+        } => {
+            if !local_file::valid_sha256(source_record_sha256)
+                || !source_contains_opening(
+                    state_sources,
+                    *source_generation,
+                    source_record_sha256,
+                    opening,
+                )
+            {
+                return Err(
+                    "schedule transaction: quarantine close does not dereference persisted opening"
+                        .into(),
+                );
+            }
+            let QuarantineV1::Open {
+                profile,
+                quarantine_id,
+                ..
+            } = opening
+            else {
+                return Err("schedule transaction: quarantine control source is not open".into());
+            };
+            if expected
+                .controls
+                .active_quarantine_by_profile
+                .get(&profile.sha256)
+                != Some(quarantine_id)
+                || expected.controls.quarantine_openings.get(quarantine_id) != Some(opening)
+            {
+                return Err(
+                    "schedule transaction: quarantine source is not the active opening".into(),
+                );
+            }
+            let QuarantineV1::Closed {
+                operator,
+                reason,
+                closed_at_ms,
+                ..
+            } = closure
+            else {
+                return Err("schedule transaction: quarantine control is not a closure".into());
+            };
+            let derived = expected.controls.close_quarantine(
+                profile,
+                operator.clone(),
+                reason.clone(),
+                *closed_at_ms,
+            )?;
+            if &derived != closure || record.recorded_at_ms != *closed_at_ms {
+                return Err(
+                    "schedule transaction: quarantine closure was not reducer-derived".into(),
+                );
+            }
+        }
+    }
+    expected.validate()?;
+    if record.admission_state_after != expected {
+        return Err("schedule transaction: control state was not reducer-derived".into());
+    }
+    Ok(())
 }
 
 impl<'lock> FileAdmissionJournal<'lock> {
@@ -2341,6 +2535,10 @@ impl<'lock> FileAdmissionJournal<'lock> {
 
     fn terminal_name(generation: u64) -> String {
         format!("{TERMINAL_PREFIX}{generation:020}.json")
+    }
+
+    fn control_name(sequence: u64) -> String {
+        format!("{CONTROL_PREFIX}{sequence:020}.json")
     }
 
     fn entries(directory: &local_file::PinnedDirectory) -> Result<Vec<(u64, String)>, BoxError> {
@@ -2410,6 +2608,38 @@ impl<'lock> FileAdmissionJournal<'lock> {
         Ok(entries)
     }
 
+    fn control_entries(
+        directory: &local_file::PinnedDirectory,
+    ) -> Result<Vec<(u64, String)>, BoxError> {
+        if !directory.current_path_matches() {
+            return Err("schedule transaction: retained admission directory changed".into());
+        }
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(directory.canonical_path())? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "schedule transaction: non-UTF8 control entry")?;
+            if !name.starts_with(CONTROL_PREFIX) {
+                continue;
+            }
+            let raw = name
+                .strip_prefix(CONTROL_PREFIX)
+                .and_then(|value| value.strip_suffix(".json"))
+                .ok_or("schedule transaction: malformed control generation name")?;
+            if raw.len() != 20 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("schedule transaction: malformed control sequence".into());
+            }
+            entries.push((raw.parse::<u64>()?, name));
+        }
+        if entries.len() > MAX_COMMIT_GENERATIONS || !directory.current_path_matches() {
+            return Err("schedule transaction: control scan is unbounded or unstable".into());
+        }
+        entries.sort_by_key(|(sequence, _)| *sequence);
+        Ok(entries)
+    }
+
     fn read_commit(
         directory: &local_file::PinnedDirectory,
         name: &str,
@@ -2470,19 +2700,140 @@ impl<'lock> FileAdmissionJournal<'lock> {
         Ok((value, read.sha256))
     }
 
+    fn read_control(
+        directory: &local_file::PinnedDirectory,
+        name: &str,
+    ) -> Result<(AdmissionControlRecordV1, String), BoxError> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let file = directory.open_regular_file(OsStr::new(name), "admission control")?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.len() > MAX_COMMIT_BYTES
+        {
+            return Err("schedule transaction: control is not owner-only mode-0600".into());
+        }
+        let read = local_file::read_open_regular_file_bounded(
+            &file,
+            "admission control",
+            MAX_COMMIT_BYTES,
+        )?;
+        let value: AdmissionControlRecordV1 = serde_json::from_slice(&read.bytes)
+            .map_err(|error| format!("schedule transaction: invalid control record: {error}"))?;
+        if canonical_bytes(&value)? != read.bytes {
+            return Err("schedule transaction: control is not canonical JSON".into());
+        }
+        Ok((value, read.sha256))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_controls_at_generation(
+        records: Option<Vec<(AdmissionControlRecordV1, String, String)>>,
+        generation: u64,
+        pending_reserved: bool,
+        state: &mut AdmissionStateV1,
+        state_sources: &mut Vec<AdmissionStateSourceV1>,
+        control_records: &mut Vec<(AdmissionControlRecordV1, String)>,
+        previous_control_sha256: &mut Option<String>,
+        previous_control_time: &mut Option<i64>,
+    ) -> Result<(), BoxError> {
+        let Some(records) = records else {
+            return Ok(());
+        };
+        if pending_reserved {
+            return Err("schedule transaction: control bypassed terminal reconciliation".into());
+        }
+        for (control, name, control_sha256) in records {
+            let expected_sequence = u64::try_from(control_records.len())?
+                .checked_add(1)
+                .ok_or("schedule transaction: control sequence overflow")?;
+            validate_control_against_state(
+                &control,
+                state,
+                state_sources,
+                expected_sequence,
+                generation,
+                previous_control_sha256.as_deref(),
+                *previous_control_time,
+            )?;
+            *state = control.admission_state_after.clone();
+            let quarantine_opening = match &control.action {
+                AdmissionControlActionV1::OpenQuarantine { opening } => Some(opening.clone()),
+                AdmissionControlActionV1::CloseQuarantine { .. } => None,
+            };
+            state_sources.push(AdmissionStateSourceV1 {
+                kind: AdmissionStateSourceKindV1::Control,
+                generation: control.sequence,
+                name,
+                sha256: control_sha256.clone(),
+                state: state.clone(),
+                recorded_at_ms: control.recorded_at_ms,
+                quarantine_opening,
+            });
+            *previous_control_time = Some(control.recorded_at_ms);
+            *previous_control_sha256 = Some(control_sha256.clone());
+            control_records.push((control, control_sha256));
+        }
+        Ok(())
+    }
+
     fn open<C: AdmissionStateCapability + ?Sized>(
         capability: &'lock C,
     ) -> Result<AdmissionJournalOpen<'lock>, BoxError> {
         let directory = capability.admission_directory();
+        let commit_entries = Self::entries(directory)?;
+        let commit_count = u64::try_from(commit_entries.len())?;
+        let mut controls_by_generation: BTreeMap<
+            u64,
+            Vec<(AdmissionControlRecordV1, String, String)>,
+        > = BTreeMap::new();
+        let mut prior_control_generation = 0_u64;
+        for (index, (sequence, name)) in Self::control_entries(directory)?.into_iter().enumerate() {
+            let expected_sequence = u64::try_from(index + 1)?;
+            if sequence != expected_sequence {
+                return Err("schedule transaction: control sequences are not contiguous".into());
+            }
+            let (control, sha256) = Self::read_control(directory, &name)?;
+            if control.sequence != sequence
+                || control.after_commit_generation > commit_count
+                || control.after_commit_generation < prior_control_generation
+            {
+                return Err(
+                    "schedule transaction: control filename or commit position diverged".into(),
+                );
+            }
+            prior_control_generation = control.after_commit_generation;
+            controls_by_generation
+                .entry(control.after_commit_generation)
+                .or_default()
+                .push((control, name, sha256));
+        }
         let mut state = AdmissionStateV1::new();
         let mut previous_sha256: Option<String> = None;
         let mut commits = Vec::new();
         let mut terminals = Vec::new();
+        let mut state_sources = Vec::new();
+        let mut control_records = Vec::new();
+        let mut previous_control_sha256: Option<String> = None;
+        let mut previous_control_time: Option<i64> = None;
         let mut terminal_entries = Self::terminal_entries(directory)?
             .into_iter()
             .collect::<BTreeMap<_, _>>();
         let mut pending_reserved: Option<AdmissionCommitV1> = None;
-        for (index, (generation, name)) in Self::entries(directory)?.into_iter().enumerate() {
+        Self::apply_controls_at_generation(
+            controls_by_generation.remove(&0),
+            0,
+            false,
+            &mut state,
+            &mut state_sources,
+            &mut control_records,
+            &mut previous_control_sha256,
+            &mut previous_control_time,
+        )?;
+        for (index, (generation, name)) in commit_entries.into_iter().enumerate() {
             if pending_reserved.is_some() {
                 return Err(
                     "schedule transaction: a later commit bypassed terminal reconciliation".into(),
@@ -2500,6 +2851,13 @@ impl<'lock> FileAdmissionJournal<'lock> {
                     "schedule transaction: admission filename/record generation diverged".into(),
                 );
             }
+            if previous_control_time
+                .is_some_and(|control_time| commit.recorded_at_ms <= control_time)
+            {
+                return Err(
+                    "schedule transaction: admission commit predates its control state".into(),
+                );
+            }
             match (&commit.previous_commit, previous_sha256.as_deref()) {
                 (OptionalSha256V1::Absent, None) => {}
                 (OptionalSha256V1::Sha256 { value }, Some(previous)) if value == previous => {}
@@ -2512,12 +2870,30 @@ impl<'lock> FileAdmissionJournal<'lock> {
             validate_commit_against_state(&commit, &state)?;
             state = commit.admission_state_after.clone();
             previous_sha256 = Some(sha256.clone());
+            state_sources.push(AdmissionStateSourceV1 {
+                kind: AdmissionStateSourceKindV1::Commit,
+                generation,
+                name: name.clone(),
+                sha256: sha256.clone(),
+                state: state.clone(),
+                recorded_at_ms: commit.recorded_at_ms,
+                quarantine_opening: None,
+            });
             let terminal_name = terminal_entries.remove(&generation);
             match (&commit.disposition, terminal_name) {
                 (AdmissionDispositionV1::Reserved { .. }, Some(name)) => {
                     let (terminal, terminal_sha256) = Self::read_terminal(directory, &name)?;
                     validate_terminal_against_state(&terminal, &commit, &state)?;
                     state = terminal.admission_state_after.clone();
+                    state_sources.push(AdmissionStateSourceV1 {
+                        kind: AdmissionStateSourceKindV1::Terminal,
+                        generation,
+                        name,
+                        sha256: terminal_sha256.clone(),
+                        state: state.clone(),
+                        recorded_at_ms: terminal.recorded_at_ms,
+                        quarantine_opening: None,
+                    });
                     terminals.push((terminal, terminal_sha256));
                 }
                 (AdmissionDispositionV1::Reserved { .. }, None) => {
@@ -2529,9 +2905,22 @@ impl<'lock> FileAdmissionJournal<'lock> {
                 (AdmissionDispositionV1::Reused { .. }, None) => {}
             }
             commits.push((commit, sha256));
+
+            Self::apply_controls_at_generation(
+                controls_by_generation.remove(&generation),
+                generation,
+                pending_reserved.is_some(),
+                &mut state,
+                &mut state_sources,
+                &mut control_records,
+                &mut previous_control_sha256,
+                &mut previous_control_time,
+            )?;
         }
-        if !terminal_entries.is_empty() {
-            return Err("schedule transaction: terminal has no matching admission commit".into());
+        if !terminal_entries.is_empty() || !controls_by_generation.is_empty() {
+            return Err(
+                "schedule transaction: terminal or control has no matching admission commit".into(),
+            );
         }
         state.validate()?;
         Ok(AdmissionJournalOpen {
@@ -2541,6 +2930,8 @@ impl<'lock> FileAdmissionJournal<'lock> {
                 previous_sha256,
                 state: state.clone(),
                 pending_reserved,
+                control_records,
+                state_sources,
             },
             state,
             commits,
@@ -2569,6 +2960,10 @@ impl<'lock> FileAdmissionJournal<'lock> {
         if self.pending_reserved.is_some()
             || value.generation != self.next_generation
             || value.previous_commit != self.previous_record()
+            || self
+                .control_records
+                .last()
+                .is_some_and(|(control, _)| value.recorded_at_ms <= control.recorded_at_ms)
         {
             return Err("schedule transaction: admission append generation diverged".into());
         }
@@ -2586,6 +2981,15 @@ impl<'lock> FileAdmissionJournal<'lock> {
         self.directory.sync()?;
         let sha256 = local_file::sha256_hex(&bytes);
         self.state = value.admission_state_after.clone();
+        self.state_sources.push(AdmissionStateSourceV1 {
+            kind: AdmissionStateSourceKindV1::Commit,
+            generation: value.generation,
+            name,
+            sha256: sha256.clone(),
+            state: self.state.clone(),
+            recorded_at_ms: value.recorded_at_ms,
+            quarantine_opening: None,
+        });
         if matches!(value.disposition, AdmissionDispositionV1::Reserved { .. }) {
             self.pending_reserved = Some(value);
         }
@@ -2614,9 +3018,323 @@ impl<'lock> FileAdmissionJournal<'lock> {
             .map_err(|error| format!("schedule transaction: cannot persist terminal: {error}"))?;
         self.directory.sync()?;
         let sha256 = local_file::sha256_hex(&bytes);
-        self.state = value.admission_state_after;
+        self.state = value.admission_state_after.clone();
+        self.state_sources.push(AdmissionStateSourceV1 {
+            kind: AdmissionStateSourceKindV1::Terminal,
+            generation: value.generation,
+            name,
+            sha256: sha256.clone(),
+            state: self.state.clone(),
+            recorded_at_ms: value.recorded_at_ms,
+            quarantine_opening: None,
+        });
         self.pending_reserved = None;
         Ok(sha256)
+    }
+
+    fn verify_state_source(&self, source: &AdmissionStateSourceV1) -> Result<(), BoxError> {
+        if !self.directory.current_path_matches() {
+            return Err("schedule transaction: retained admission directory changed".into());
+        }
+        let (sha256, generation, state, quarantine_opening) = match source.kind {
+            AdmissionStateSourceKindV1::Commit => {
+                let (record, sha256) = Self::read_commit(self.directory, &source.name)?;
+                (
+                    sha256,
+                    record.generation,
+                    record.admission_state_after,
+                    None,
+                )
+            }
+            AdmissionStateSourceKindV1::Terminal => {
+                let (record, sha256) = Self::read_terminal(self.directory, &source.name)?;
+                (
+                    sha256,
+                    record.generation,
+                    record.admission_state_after,
+                    None,
+                )
+            }
+            AdmissionStateSourceKindV1::Control => {
+                let (record, sha256) = Self::read_control(self.directory, &source.name)?;
+                let opening = match &record.action {
+                    AdmissionControlActionV1::OpenQuarantine { opening } => Some(opening.clone()),
+                    AdmissionControlActionV1::CloseQuarantine { .. } => None,
+                };
+                (
+                    sha256,
+                    record.sequence,
+                    record.admission_state_after,
+                    opening,
+                )
+            }
+        };
+        if sha256 != source.sha256
+            || generation != source.generation
+            || state != source.state
+            || quarantine_opening != source.quarantine_opening
+        {
+            return Err("schedule transaction: persisted admission state source changed".into());
+        }
+        Ok(())
+    }
+
+    fn append_control(&mut self, record: AdmissionControlRecordV1) -> Result<String, BoxError> {
+        if self.pending_reserved.is_some() {
+            return Err(
+                "schedule transaction: control cannot bypass terminal reconciliation".into(),
+            );
+        }
+        let sequence = u64::try_from(self.control_records.len())?
+            .checked_add(1)
+            .ok_or("schedule transaction: control sequence overflow")?;
+        let after_commit_generation = self
+            .next_generation
+            .checked_sub(1)
+            .ok_or("schedule transaction: invalid admission head")?;
+        let previous_control_sha256 = self
+            .control_records
+            .last()
+            .map(|(_, sha256)| sha256.as_str());
+        let previous_control_time = self
+            .control_records
+            .last()
+            .map(|(control, _)| control.recorded_at_ms);
+        validate_control_against_state(
+            &record,
+            &self.state,
+            &self.state_sources,
+            sequence,
+            after_commit_generation,
+            previous_control_sha256,
+            previous_control_time,
+        )?;
+        let bytes = canonical_bytes(&record)?;
+        let name = Self::control_name(sequence);
+        let mut file =
+            self.directory
+                .create_new_file(OsStr::new(&name), 0o600, "admission control")?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("schedule transaction: cannot persist control: {error}"))?;
+        self.directory.sync()?;
+        let sha256 = local_file::sha256_hex(&bytes);
+        self.state = record.admission_state_after.clone();
+        let quarantine_opening = match &record.action {
+            AdmissionControlActionV1::OpenQuarantine { opening } => Some(opening.clone()),
+            AdmissionControlActionV1::CloseQuarantine { .. } => None,
+        };
+        self.state_sources.push(AdmissionStateSourceV1 {
+            kind: AdmissionStateSourceKindV1::Control,
+            generation: sequence,
+            name,
+            sha256: sha256.clone(),
+            state: self.state.clone(),
+            recorded_at_ms: record.recorded_at_ms,
+            quarantine_opening,
+        });
+        self.control_records.push((record, sha256.clone()));
+        Ok(sha256)
+    }
+
+    fn append_quarantine_opening(&mut self, opening: QuarantineV1) -> Result<String, BoxError> {
+        let QuarantineV1::Open {
+            profile,
+            operator,
+            reason,
+            created_at_ms,
+            expires_at_ms,
+            ..
+        } = &opening
+        else {
+            return Err("schedule transaction: quarantine source is not open".into());
+        };
+        let mut state_after = self.state.clone();
+        let derived = state_after.controls.open_quarantine(
+            profile.clone(),
+            operator.clone(),
+            reason.clone(),
+            *created_at_ms,
+            *expires_at_ms,
+        )?;
+        if derived != opening {
+            return Err(
+                "schedule transaction: quarantine opening does not match persisted state".into(),
+            );
+        }
+        let recorded_at_ms = *created_at_ms;
+        let sequence = u64::try_from(self.control_records.len())?
+            .checked_add(1)
+            .ok_or("schedule transaction: control sequence overflow")?;
+        let after_commit_generation = self
+            .next_generation
+            .checked_sub(1)
+            .ok_or("schedule transaction: invalid admission head")?;
+        let record = AdmissionControlRecordV1 {
+            schema_version: 1,
+            sequence,
+            after_commit_generation,
+            previous_control_record: match self.control_records.last() {
+                Some((_, sha256)) => OptionalSha256V1::Sha256 {
+                    value: sha256.clone(),
+                },
+                None => OptionalSha256V1::Absent,
+            },
+            admission_state_before_sha256: admission_state_sha256(&self.state)?,
+            admission_state_after: state_after,
+            action: AdmissionControlActionV1::OpenQuarantine { opening },
+            recorded_at_ms,
+        };
+        self.append_control(record)
+    }
+
+    fn active_quarantine_opening(
+        &self,
+        profile_sha256: &str,
+    ) -> Result<PersistedQuarantineOpeningV1, BoxError> {
+        if self.pending_reserved.is_some() {
+            return Err(
+                "schedule transaction: quarantine cannot close during terminal reconciliation"
+                    .into(),
+            );
+        }
+        let quarantine_id = self
+            .state
+            .controls
+            .active_quarantine_by_profile
+            .get(profile_sha256)
+            .ok_or("schedule transaction: profile has no active quarantine")?;
+        let opening = self
+            .state
+            .controls
+            .quarantine_openings
+            .get(quarantine_id)
+            .ok_or("schedule transaction: active quarantine opening disappeared")?
+            .clone();
+        let source = self
+            .state_sources
+            .iter()
+            .find(|source| {
+                source.kind == AdmissionStateSourceKindV1::Control
+                    && source.quarantine_opening.as_ref() == Some(&opening)
+                    && source.state.controls.quarantine_openings.get(quarantine_id)
+                        == Some(&opening)
+            })
+            .ok_or("schedule transaction: active quarantine has no persisted source generation")?;
+        self.verify_state_source(source)?;
+        Ok(PersistedQuarantineOpeningV1 {
+            source_generation: source.generation,
+            source_record_sha256: source.sha256.clone(),
+            opening,
+        })
+    }
+
+    fn append_quarantine_closure(
+        &mut self,
+        opening: &PersistedQuarantineOpeningV1,
+        closure: &QuarantineV1,
+    ) -> Result<(), BoxError> {
+        let QuarantineV1::Open { profile, .. } = &opening.opening else {
+            return Err("schedule transaction: quarantine source is not open".into());
+        };
+        let current = self.active_quarantine_opening(&profile.sha256)?;
+        if &current != opening {
+            return Err("schedule transaction: persisted quarantine opening changed".into());
+        }
+        let QuarantineV1::Closed {
+            operator,
+            reason,
+            closed_at_ms,
+            ..
+        } = closure
+        else {
+            return Err("schedule transaction: quarantine action is not a closure".into());
+        };
+        let mut state_after = self.state.clone();
+        let derived = state_after.controls.close_quarantine(
+            profile,
+            operator.clone(),
+            reason.clone(),
+            *closed_at_ms,
+        )?;
+        if &derived != closure {
+            return Err(
+                "schedule transaction: quarantine closure does not match persisted state".into(),
+            );
+        }
+        let sequence = u64::try_from(self.control_records.len())?
+            .checked_add(1)
+            .ok_or("schedule transaction: control sequence overflow")?;
+        let after_commit_generation = self
+            .next_generation
+            .checked_sub(1)
+            .ok_or("schedule transaction: quarantine has no admission generation")?;
+        let previous_control_sha256 = self
+            .control_records
+            .last()
+            .map(|(_, sha256)| sha256.as_str());
+        let record = AdmissionControlRecordV1 {
+            schema_version: 1,
+            sequence,
+            after_commit_generation,
+            previous_control_record: match previous_control_sha256 {
+                Some(value) => OptionalSha256V1::Sha256 {
+                    value: value.to_owned(),
+                },
+                None => OptionalSha256V1::Absent,
+            },
+            admission_state_before_sha256: admission_state_sha256(&self.state)?,
+            admission_state_after: state_after,
+            action: AdmissionControlActionV1::CloseQuarantine {
+                source_generation: opening.source_generation,
+                source_record_sha256: opening.source_record_sha256.clone(),
+                opening: opening.opening.clone(),
+                closure: closure.clone(),
+            },
+            recorded_at_ms: *closed_at_ms,
+        };
+        self.append_control(record)?;
+        Ok(())
+    }
+}
+
+/// Concrete owner-lock-bound adapter for the status module's quarantine-close policy. It exposes
+/// neither admission append nor provider authority; only exact persisted-opening dereference and
+/// one reducer-derived close action are available.
+#[allow(dead_code)] // The local quarantine CLI is activated after R3d5 production initialization.
+pub(super) struct FileAdmissionQuarantineStore<'lock> {
+    journal: FileAdmissionJournal<'lock>,
+}
+
+#[allow(dead_code)] // The local quarantine CLI is activated after R3d5 production initialization.
+impl<'lock> FileAdmissionQuarantineStore<'lock> {
+    pub(super) fn open_quarantine_controls<C: AdmissionStateCapability + ?Sized>(
+        capability: &'lock C,
+    ) -> Result<Self, BoxError> {
+        Ok(Self {
+            journal: FileAdmissionJournal::open(capability)?.journal,
+        })
+    }
+
+    fn append_opening(&mut self, opening: QuarantineV1) -> Result<String, BoxError> {
+        self.journal.append_quarantine_opening(opening)
+    }
+}
+
+impl QuarantineClosureStoreV1 for FileAdmissionQuarantineStore<'_> {
+    fn read_active_opening(
+        &self,
+        profile_sha256: &str,
+    ) -> Result<PersistedQuarantineOpeningV1, BoxError> {
+        self.journal.active_quarantine_opening(profile_sha256)
+    }
+
+    fn append_closure(
+        &mut self,
+        opening: &PersistedQuarantineOpeningV1,
+        closure: &QuarantineV1,
+    ) -> Result<(), BoxError> {
+        self.journal.append_quarantine_closure(opening, closure)
     }
 }
 
@@ -2733,6 +3451,19 @@ mod tests {
             schema_version: 1,
             sha256: digest(ch),
         }
+    }
+
+    fn quarantine_opening(profile: FingerprintV1, created_at_ms: i64) -> QuarantineV1 {
+        let mut controls = ControlStateV1::new();
+        controls
+            .open_quarantine(
+                profile,
+                "operator".into(),
+                "known issue".into(),
+                created_at_ms,
+                created_at_ms + 100,
+            )
+            .unwrap()
     }
 
     fn caps() -> EffectCapsV1 {
@@ -3697,6 +4428,225 @@ mod tests {
             .append(commit.clone())
             .unwrap();
         recover_committed_state(&locks).unwrap();
+    }
+
+    #[test]
+    fn quarantine_open_and_dereferenced_close_replay_into_future_admission_state() {
+        let (_state_temp, state) = state_root();
+        let (_action_temp, trusted_root, requested_cwd) = action_bindings();
+        let locks = state
+            .try_owner_admission("test:quarantine-control-replay")
+            .unwrap()
+            .try_authority_state("test:quarantine-control-replay")
+            .unwrap();
+        let authority = FileAuthorityJournal::initialize(&locks, 1).unwrap();
+        let profile = fingerprint('d');
+        let opening = quarantine_opening(profile.clone(), 2);
+        let quarantine_id = match &opening {
+            QuarantineV1::Open { quarantine_id, .. } => quarantine_id.clone(),
+            QuarantineV1::Closed { .. } => unreachable!(),
+        };
+
+        let mut store = FileAdmissionQuarantineStore::open_quarantine_controls(&locks).unwrap();
+        let opening_record_sha256 = store.append_opening(opening.clone()).unwrap();
+        let persisted = store.read_active_opening(&profile.sha256).unwrap();
+        assert_eq!(persisted.source_generation, 1);
+        assert_eq!(persisted.source_record_sha256, opening_record_sha256);
+        assert_eq!(persisted.opening, opening);
+        let closure = crate::compatibility_schedule_status::close_quarantine_dereferenced(
+            &mut store,
+            &profile.sha256,
+            "operator".into(),
+            "reviewed clear".into(),
+            3,
+        )
+        .unwrap();
+        drop(store);
+
+        let admission = FileAdmissionJournal::open(&locks).unwrap();
+        assert_eq!(admission.journal.control_records.len(), 2);
+        assert!(!admission.state.controls.is_quarantined(&profile));
+        assert_eq!(
+            admission
+                .state
+                .controls
+                .quarantine_closures
+                .get(&quarantine_id),
+            Some(&closure)
+        );
+        for sequence in 1..=2 {
+            let mode = std::fs::metadata(
+                locks
+                    .admission_directory()
+                    .canonical_path()
+                    .join(FileAdmissionJournal::control_name(sequence)),
+            )
+            .unwrap()
+            .permissions()
+            .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let proposal = manual_proposal(&locks, trusted_root, requested_cwd);
+        let (commit, _deadline) =
+            build_admission_commit(&admission.journal, &authority, proposal).unwrap();
+        assert_eq!(
+            commit.admission_state_before_sha256,
+            admission_state_sha256(&admission.state).unwrap()
+        );
+        assert_eq!(
+            commit
+                .admission_state_after
+                .controls
+                .quarantine_closures
+                .get(&quarantine_id),
+            Some(&closure)
+        );
+        let mut journal = admission.journal;
+        journal.append(commit).unwrap();
+        drop(journal);
+        let reopened = FileAdmissionJournal::open(&locks).unwrap();
+        assert!(!reopened.state.controls.is_quarantined(&profile));
+        assert_eq!(reopened.journal.control_records.len(), 2);
+    }
+
+    #[test]
+    fn quarantine_close_rejects_replaced_opening_and_pending_admission() {
+        {
+            let (_state_temp, state) = state_root();
+            let owner = state
+                .try_owner_admission("test:quarantine-replaced-opening")
+                .unwrap();
+            let profile = fingerprint('d');
+            let opening = quarantine_opening(profile.clone(), 2);
+            let mut store = FileAdmissionQuarantineStore::open_quarantine_controls(&owner).unwrap();
+            store.append_opening(opening).unwrap();
+            store.read_active_opening(&profile.sha256).unwrap();
+
+            let path = owner
+                .admission_directory()
+                .canonical_path()
+                .join(FileAdmissionJournal::control_name(1));
+            let mut record: AdmissionControlRecordV1 =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let AdmissionControlActionV1::OpenQuarantine { opening } = &mut record.action else {
+                unreachable!()
+            };
+            let QuarantineV1::Open { reason, .. } = opening else {
+                unreachable!()
+            };
+            *reason = "replaced bytes".into();
+            std::fs::remove_file(&path).unwrap();
+            let mut replacement = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            replacement
+                .write_all(&canonical_bytes(&record).unwrap())
+                .unwrap();
+            replacement.sync_all().unwrap();
+
+            assert!(
+                crate::compatibility_schedule_status::close_quarantine_dereferenced(
+                    &mut store,
+                    &profile.sha256,
+                    "operator".into(),
+                    "must not clear replacement".into(),
+                    3,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                FileAdmissionJournal::control_entries(owner.admission_directory())
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        {
+            let (_state_temp, _action_temp, state, commit) = fixture_commit();
+            let owner = state
+                .try_owner_admission("test:quarantine-pending-admission")
+                .unwrap();
+            FileAdmissionJournal::open(&owner)
+                .unwrap()
+                .journal
+                .append(commit)
+                .unwrap();
+            let mut store = FileAdmissionQuarantineStore::open_quarantine_controls(&owner).unwrap();
+            assert!(store
+                .append_opening(quarantine_opening(fingerprint('d'), 11))
+                .is_err());
+            assert!(
+                FileAdmissionJournal::control_entries(owner.admission_directory())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn quarantine_control_gap_and_predecessor_corruption_fail_closed() {
+        {
+            let (_state_temp, state) = state_root();
+            let owner = state.try_owner_admission("test:quarantine-gap").unwrap();
+            let profile = fingerprint('d');
+            let mut store = FileAdmissionQuarantineStore::open_quarantine_controls(&owner).unwrap();
+            store
+                .append_opening(quarantine_opening(profile.clone(), 2))
+                .unwrap();
+            crate::compatibility_schedule_status::close_quarantine_dereferenced(
+                &mut store,
+                &profile.sha256,
+                "operator".into(),
+                "reviewed clear".into(),
+                3,
+            )
+            .unwrap();
+            drop(store);
+            std::fs::remove_file(
+                owner
+                    .admission_directory()
+                    .canonical_path()
+                    .join(FileAdmissionJournal::control_name(1)),
+            )
+            .unwrap();
+            assert!(FileAdmissionJournal::open(&owner).is_err());
+        }
+
+        {
+            let (_state_temp, state) = state_root();
+            let owner = state
+                .try_owner_admission("test:quarantine-control-predecessor")
+                .unwrap();
+            let profile = fingerprint('d');
+            let mut store = FileAdmissionQuarantineStore::open_quarantine_controls(&owner).unwrap();
+            store
+                .append_opening(quarantine_opening(profile.clone(), 2))
+                .unwrap();
+            crate::compatibility_schedule_status::close_quarantine_dereferenced(
+                &mut store,
+                &profile.sha256,
+                "operator".into(),
+                "reviewed clear".into(),
+                3,
+            )
+            .unwrap();
+            drop(store);
+            let path = owner
+                .admission_directory()
+                .canonical_path()
+                .join(FileAdmissionJournal::control_name(2));
+            let mut record: AdmissionControlRecordV1 =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            record.previous_control_record = OptionalSha256V1::Sha256 { value: digest('f') };
+            std::fs::write(&path, canonical_bytes(&record).unwrap()).unwrap();
+            assert!(FileAdmissionJournal::open(&owner).is_err());
+        }
     }
 
     fn persist_cancelled_before_running(

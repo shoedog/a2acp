@@ -364,6 +364,7 @@ pub(crate) struct DirectorySnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ChildMetadataSnapshot {
     mode: u32,
     link_count: u64,
@@ -372,22 +373,27 @@ pub(crate) struct ChildMetadataSnapshot {
 }
 
 impl ChildMetadataSnapshot {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_regular(self) -> bool {
         self.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn link_count(self) -> u64 {
         self.link_count
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn owner_uid(self) -> u32 {
         self.owner_uid
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn permission_mode(self) -> u32 {
         self.mode & 0o777
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn length(self) -> u64 {
         self.length
     }
@@ -573,6 +579,7 @@ impl PinnedDirectory {
         PathBuf::from(self.canonical_cwd.as_str())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn object_sha256(&self) -> &str {
         &self.identity.object_sha256
     }
@@ -598,6 +605,7 @@ impl PinnedDirectory {
 
     /// Inspect one direct child without following a final symlink and without re-resolving the
     /// retained parent directory pathname.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn child_metadata_no_follow(
         &self,
         name: &OsStr,
@@ -634,7 +642,7 @@ impl PinnedDirectory {
             Ok(Some(ChildMetadataSnapshot {
                 mode: stat.st_mode as u32,
                 link_count: stat.st_nlink as u64,
-                owner_uid: stat.st_uid as u32,
+                owner_uid: stat.st_uid,
                 length: u64::try_from(stat.st_size)
                     .map_err(|_| format!("{label}: child has a negative length"))?,
             }))
@@ -1074,6 +1082,7 @@ impl PinnedDirectory {
     /// Remove one retained regular child only while its descriptor still matches the same name
     /// beneath this retained directory. Callers serialize the final comparison and unlink under
     /// their owner lock.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn remove_regular_child(
         &self,
         child: RegularChildRef<'_>,
@@ -1114,6 +1123,7 @@ impl PinnedDirectory {
     /// directory. The target must be absent; callers serialize the check and rename under their
     /// owner lock. A directory-sync error is reported as an ambiguous publication so recovery can
     /// inspect the final name rather than retrying blindly.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn publish_new_regular_child(
         &self,
         source: RegularChildRef<'_>,

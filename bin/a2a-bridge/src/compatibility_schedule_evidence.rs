@@ -21,17 +21,28 @@ use crate::compatibility_schedule_schema::{
 use crate::compatibility_schedule_state::EvidenceStateCapability;
 use crate::{local_file, BoxError};
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) const DAY_MS: i64 = 86_400_000;
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_EVIDENCE_ITEMS: usize = 256;
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_STATE_RECORD_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_STATE_GENERATIONS: usize = 10_000;
+#[cfg_attr(not(test), allow(dead_code))]
 const STATE_FILE_MODE: u32 = 0o600;
+#[cfg_attr(not(test), allow(dead_code))]
 const STATE_PREFIX: &str = "evidence-state.";
+#[cfg_attr(not(test), allow(dead_code))]
 const HOT_TOTAL_CAP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
 const HOT_STATE_CAP_BYTES: u64 = 1024 * 1024 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
 const HOT_SCRATCH_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
 const HOT_SEALED_CAP_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn require_sha256(label: &str, value: &str) -> Result<(), BoxError> {
     if !local_file::valid_sha256(value) || value.bytes().any(|byte| byte.is_ascii_uppercase()) {
         return Err(format!("schedule evidence: {label} is not lowercase SHA-256").into());
@@ -39,6 +50,7 @@ fn require_sha256(label: &str, value: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn stable_id(label: &str, value: &str) -> Result<(), BoxError> {
     if value.is_empty()
         || value.len() > 128
@@ -53,6 +65,7 @@ fn stable_id(label: &str, value: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn bounded_text(label: &str, value: &str) -> Result<(), BoxError> {
     if value.is_empty() || value.len() > 4096 || value.bytes().any(|byte| byte == 0) {
         return Err(
@@ -65,6 +78,7 @@ fn bounded_text(label: &str, value: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn add_days(timestamp_ms: i64, days: u32) -> Result<i64, BoxError> {
     if timestamp_ms <= 0 {
         return Err("schedule evidence: terminal time must be positive".into());
@@ -78,6 +92,7 @@ fn add_days(timestamp_ms: i64, days: u32) -> Result<i64, BoxError> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct EvidenceRetentionRequestV1 {
     pub(super) evidence_class: EvidenceClassV1,
     pub(super) terminal_at_ms: i64,
@@ -87,12 +102,14 @@ pub(super) struct EvidenceRetentionRequestV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct RetentionDecisionV1 {
     pub(super) full_retain_until_ms: i64,
     pub(super) compact_retain_until_ms: i64,
     pub(super) hot_retain_until_ms: i64,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn class_retention_days(class: EvidenceClassV1) -> (u32, Option<u32>, u32) {
     match class {
         EvidenceClassV1::RoutineGreen => (30, Some(180), 14),
@@ -105,6 +122,7 @@ fn class_retention_days(class: EvidenceClassV1) -> (u32, Option<u32>, u32) {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn decide_retention(
     request: &EvidenceRetentionRequestV1,
 ) -> Result<RetentionDecisionV1, BoxError> {
@@ -149,6 +167,7 @@ pub(super) fn decide_retention(
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct IndexedEvidenceV1 {
     pub(super) evidence_id: String,
     pub(super) evidence_class: EvidenceClassV1,
@@ -170,18 +189,21 @@ pub(super) struct IndexedEvidenceV1 {
 }
 
 impl IndexedEvidenceV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn sealed_hot_bytes(&self) -> Result<u64, BoxError> {
         self.archive_bytes
             .checked_add(self.manifest_bytes)
             .ok_or_else(|| "schedule evidence: indexed sealed byte total overflow".into())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn total_indexed_bytes(&self) -> Result<u64, BoxError> {
         self.sealed_hot_bytes()?
             .checked_add(self.compact_record_bytes)
             .ok_or_else(|| "schedule evidence: indexed hot byte total overflow".into())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn immutable_eq(&self, other: &Self) -> bool {
         self.evidence_id == other.evidence_id
             && self.evidence_class == other.evidence_class
@@ -200,6 +222,7 @@ impl IndexedEvidenceV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum PinLifecycleV1 {
     Active,
     Released { released_at_ms: i64, reason: String },
@@ -207,6 +230,7 @@ pub(super) enum PinLifecycleV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct EvidencePinV1 {
     pub(super) pin_id: String,
     pub(super) evidence_id: String,
@@ -217,6 +241,7 @@ pub(super) struct EvidencePinV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum TombstoneLifecycleV1 {
     Pending,
     FullEvidenceUnlinked { unlinked_at_ms: i64 },
@@ -224,6 +249,7 @@ pub(super) enum TombstoneLifecycleV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct EvidenceTombstoneV1 {
     pub(super) tombstone_id: String,
     pub(super) evidence_id: String,
@@ -248,6 +274,7 @@ pub(super) struct EvidenceTombstoneV1 {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum FileProviderMaterializationV1 {
     Materialized,
     Offloaded,
@@ -255,6 +282,7 @@ pub(super) enum FileProviderMaterializationV1 {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum FileProviderSynchronizationV1 {
     NotUploaded,
     Uploading,
@@ -263,6 +291,7 @@ pub(super) enum FileProviderSynchronizationV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum FileProviderObjectStateV1 {
     Known {
         materialization: FileProviderMaterializationV1,
@@ -278,6 +307,7 @@ pub(super) enum FileProviderObjectStateV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct FileProviderObservationV1 {
     pub(super) cold_root_sha256: String,
     pub(super) file_provider_domain_id: String,
@@ -287,6 +317,7 @@ pub(super) struct FileProviderObservationV1 {
 }
 
 impl FileProviderObservationV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn validate(&self) -> Result<(), BoxError> {
         require_sha256("FileProvider cold root", &self.cold_root_sha256)?;
         bounded_text(
@@ -311,7 +342,11 @@ impl FileProviderObservationV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+// The larger terminal variant keeps both exact file-provider observations inline in the immutable
+// journal record; indirection would not reduce the serialized record or this default-off path's risk.
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum ColdCopyLifecycleV1 {
     Admitted,
     Abandoned {
@@ -328,6 +363,7 @@ pub(super) enum ColdCopyLifecycleV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ColdCopyRecordV1 {
     pub(super) copy_id: String,
     pub(super) evidence_id: String,
@@ -348,6 +384,7 @@ pub(super) struct ColdCopyRecordV1 {
 }
 
 impl ColdCopyRecordV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self) -> Result<(), BoxError> {
         stable_id("cold-copy id", &self.copy_id)?;
         stable_id("cold-copy evidence id", &self.evidence_id)?;
@@ -420,6 +457,7 @@ impl ColdCopyRecordV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct StorageIntegrityHoldV1 {
     pub(super) hold_id: String,
     pub(super) evidence_id: String,
@@ -428,6 +466,7 @@ pub(super) struct StorageIntegrityHoldV1 {
 }
 
 impl StorageIntegrityHoldV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self) -> Result<(), BoxError> {
         stable_id("storage-integrity hold id", &self.hold_id)?;
         stable_id("storage-integrity evidence id", &self.evidence_id)?;
@@ -441,6 +480,7 @@ impl StorageIntegrityHoldV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum BundleGcLifecycleV1 {
     Pending,
     Unlinked {
@@ -454,6 +494,7 @@ pub(super) enum BundleGcLifecycleV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct BundleGcActionV1 {
     pub(super) action_id: String,
     pub(super) bundle_id: String,
@@ -473,6 +514,7 @@ pub(super) struct BundleGcActionV1 {
 }
 
 impl BundleGcActionV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self) -> Result<(), BoxError> {
         stable_id("bundle GC action id", &self.action_id)?;
         stable_id("bundle GC bundle id", &self.bundle_id)?;
@@ -517,6 +559,7 @@ impl BundleGcActionV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum ImageGcLifecycleV1 {
     Pending,
     Removed {
@@ -530,6 +573,7 @@ pub(super) enum ImageGcLifecycleV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ImageGcActionV1 {
     pub(super) action_id: String,
     pub(super) digest: String,
@@ -539,6 +583,7 @@ pub(super) struct ImageGcActionV1 {
     pub(super) lifecycle: ImageGcLifecycleV1,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn require_image_digest(label: &str, value: &str) -> Result<(), BoxError> {
     let Some(sha256) = value.strip_prefix("sha256:") else {
         return Err(format!("schedule evidence: {label} is not an immutable digest").into());
@@ -547,6 +592,7 @@ fn require_image_digest(label: &str, value: &str) -> Result<(), BoxError> {
 }
 
 impl ImageGcActionV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self) -> Result<(), BoxError> {
         stable_id("image GC action id", &self.action_id)?;
         require_image_digest("image GC digest", &self.digest)?;
@@ -577,6 +623,7 @@ impl ImageGcActionV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct EvidenceStateModelV1 {
     pub(super) hot_root_sha256: String,
     pub(super) cold_storage: ColdStorageBindingV1,
@@ -595,6 +642,7 @@ pub(super) struct EvidenceStateModelV1 {
 }
 
 impl EvidenceStateModelV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn new(
         hot_root_sha256: String,
         cold_storage: ColdStorageBindingV1,
@@ -615,6 +663,7 @@ impl EvidenceStateModelV1 {
         Ok(value)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn validate(&self) -> Result<(), BoxError> {
         require_sha256("hot root", &self.hot_root_sha256)?;
         if self.entries.len() > MAX_EVIDENCE_ITEMS
@@ -639,7 +688,7 @@ impl EvidenceStateModelV1 {
             if entry.archive_bytes == 0
                 || entry.manifest_bytes == 0
                 || entry.compact_record_bytes == 0
-                || entry.compact_record.as_bytes().len() as u64 != entry.compact_record_bytes
+                || entry.compact_record.len() as u64 != entry.compact_record_bytes
                 || local_file::sha256_hex(entry.compact_record.as_bytes())
                     != entry.compact_record_sha256
                 || !entry.compact_record.ends_with('\n')
@@ -744,8 +793,7 @@ impl EvidenceStateModelV1 {
             if tombstone.archive_bytes == 0
                 || tombstone.manifest_bytes == 0
                 || tombstone.compact_record_bytes == 0
-                || tombstone.compact_record.as_bytes().len() as u64
-                    != tombstone.compact_record_bytes
+                || tombstone.compact_record.len() as u64 != tombstone.compact_record_bytes
                 || local_file::sha256_hex(tombstone.compact_record.as_bytes())
                     != tombstone.compact_record_sha256
                 || !tombstone.compact_record.ends_with('\n')
@@ -993,6 +1041,7 @@ impl EvidenceStateModelV1 {
         self.project_index_at(1)?.validate()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn project_index_at(&self, generation: u64) -> Result<EvidenceIndexV1, BoxError> {
         let entries = self
             .entries
@@ -1026,6 +1075,7 @@ impl EvidenceStateModelV1 {
         Ok(index)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn insert_entry(&mut self, entry: IndexedEvidenceV1) -> Result<(), BoxError> {
         let mut candidate = self.clone();
         if candidate.entries.contains_key(&entry.evidence_id)
@@ -1043,6 +1093,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn admit_cold_copy(
         &mut self,
         binding: ColdStorageBindingV1,
@@ -1105,6 +1156,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn abandon_cold_copy(
         &mut self,
         copy_id: &str,
@@ -1131,6 +1183,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn publish_cold_copy(
         &mut self,
         copy_id: &str,
@@ -1172,6 +1225,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn update_published_cold_copy(
         &mut self,
         copy_id: &str,
@@ -1207,6 +1261,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn mark_hot_evidence_absent(&mut self, evidence_id: &str) -> Result<(), BoxError> {
         let mut candidate = self.clone();
         if candidate.has_active_pin(evidence_id) {
@@ -1230,6 +1285,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn add_storage_integrity_hold(
         &mut self,
         hold: StorageIntegrityHoldV1,
@@ -1250,6 +1306,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn pin(&mut self, pin: EvidencePinV1) -> Result<(), BoxError> {
         let mut candidate = self.clone();
         if candidate.pins.contains_key(&pin.pin_id) || pin.lifecycle != PinLifecycleV1::Active {
@@ -1261,6 +1318,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn unpin(
         &mut self,
         pin_id: &str,
@@ -1300,12 +1358,14 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn has_active_pin(&self, evidence_id: &str) -> bool {
         self.pins
             .values()
             .any(|pin| pin.evidence_id == evidence_id && pin.lifecycle == PinLifecycleV1::Active)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn begin_tombstone(
         &mut self,
         tombstone_id: &str,
@@ -1352,6 +1412,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn complete_tombstone(
         &mut self,
         tombstone_id: &str,
@@ -1377,6 +1438,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn begin_bundle_gc(&mut self, action: BundleGcActionV1) -> Result<(), BoxError> {
         let mut candidate = self.clone();
         action.validate()?;
@@ -1411,6 +1473,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn complete_bundle_gc(
         &mut self,
         action_id: &str,
@@ -1430,6 +1493,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn safe_skip_bundle_gc(
         &mut self,
         action_id: &str,
@@ -1453,6 +1517,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn begin_image_gc(&mut self, action: ImageGcActionV1) -> Result<(), BoxError> {
         let mut candidate = self.clone();
         action.validate()?;
@@ -1487,6 +1552,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn complete_image_gc(
         &mut self,
         action_id: &str,
@@ -1506,6 +1572,7 @@ impl EvidenceStateModelV1 {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn safe_skip_image_gc(
         &mut self,
         action_id: &str,
@@ -1530,6 +1597,7 @@ impl EvidenceStateModelV1 {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn pin_transition_allowed(previous: &EvidencePinV1, next: &EvidencePinV1) -> bool {
     previous.pin_id == next.pin_id
         && previous.evidence_id == next.evidence_id
@@ -1542,6 +1610,7 @@ fn pin_transition_allowed(previous: &EvidencePinV1, next: &EvidencePinV1) -> boo
             ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn tombstone_transition_allowed(
     previous: &EvidenceTombstoneV1,
     next: &EvidenceTombstoneV1,
@@ -1574,6 +1643,7 @@ fn tombstone_transition_allowed(
             ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn cold_storage_transition_allowed(
     previous: &ColdStorageBindingV1,
     next: &ColdStorageBindingV1,
@@ -1603,6 +1673,7 @@ fn cold_storage_transition_allowed(
         )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn cold_copy_transition_allowed(previous: &ColdCopyRecordV1, next: &ColdCopyRecordV1) -> bool {
     let immutable = previous.copy_id == next.copy_id
         && previous.evidence_id == next.evidence_id
@@ -1649,6 +1720,7 @@ fn cold_copy_transition_allowed(previous: &ColdCopyRecordV1, next: &ColdCopyReco
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn bundle_gc_transition_allowed(previous: &BundleGcActionV1, next: &BundleGcActionV1) -> bool {
     previous.action_id == next.action_id
         && previous.bundle_id == next.bundle_id
@@ -1674,6 +1746,7 @@ fn bundle_gc_transition_allowed(previous: &BundleGcActionV1, next: &BundleGcActi
             ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn image_gc_transition_allowed(previous: &ImageGcActionV1, next: &ImageGcActionV1) -> bool {
     previous.action_id == next.action_id
         && previous.digest == next.digest
@@ -1692,6 +1765,7 @@ fn image_gc_transition_allowed(previous: &ImageGcActionV1, next: &ImageGcActionV
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct EvidenceStateSnapshotV1 {
     pub(super) schema_version: u16,
     pub(super) generation: u64,
@@ -1701,6 +1775,7 @@ pub(super) struct EvidenceStateSnapshotV1 {
 }
 
 impl EvidenceStateSnapshotV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn first(
         state: EvidenceStateModelV1,
         recorded_at_ms: i64,
@@ -1716,6 +1791,7 @@ impl EvidenceStateSnapshotV1 {
         Ok(value)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn successor(
         &self,
         state: EvidenceStateModelV1,
@@ -1737,11 +1813,13 @@ impl EvidenceStateSnapshotV1 {
         Ok(value)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn project_index(&self) -> Result<EvidenceIndexV1, BoxError> {
         self.validate()?;
         self.state.project_index_at(self.generation)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn validate(&self) -> Result<(), BoxError> {
         if self.schema_version != 1 || self.generation == 0 || self.recorded_at_ms <= 0 {
             return Err("schedule evidence: snapshot header is invalid".into());
@@ -1835,6 +1913,7 @@ impl EvidenceStateSnapshotV1 {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn evidence_state_snapshot_bytes(value: &EvidenceStateSnapshotV1) -> Result<Vec<u8>, BoxError> {
     value.validate()?;
     let mut bytes = serde_json::to_vec(value)?;
@@ -1842,6 +1921,7 @@ fn evidence_state_snapshot_bytes(value: &EvidenceStateSnapshotV1) -> Result<Vec<
     Ok(bytes)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn evidence_state_snapshot_sha256(
     value: &EvidenceStateSnapshotV1,
 ) -> Result<String, BoxError> {
@@ -1850,6 +1930,7 @@ pub(super) fn evidence_state_snapshot_sha256(
     )?))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn validate_evidence_state_transition(
     previous: &EvidenceStateSnapshotV1,
     next: &EvidenceStateSnapshotV1,
@@ -2128,23 +2209,28 @@ pub(super) fn validate_evidence_state_transition(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct FileEvidenceJournal<'lock> {
     directory: &'lock local_file::PinnedDirectory,
     next_generation: u64,
     previous_snapshot: EvidenceStateSnapshotV1,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct EvidenceJournalOpen<'lock> {
     pub(super) journal: FileEvidenceJournal<'lock>,
     pub(super) snapshot: EvidenceStateSnapshotV1,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) snapshot_sha256: String,
 }
 
 impl<'lock> FileEvidenceJournal<'lock> {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn generation_name(generation: u64) -> String {
         format!("{STATE_PREFIX}{generation:020}.json")
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn generation_entries(
         directory: &local_file::PinnedDirectory,
     ) -> Result<Vec<(u64, String)>, BoxError> {
@@ -2179,6 +2265,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
         Ok(entries)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn read_generation(
         directory: &local_file::PinnedDirectory,
         name: &str,
@@ -2212,6 +2299,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
         Ok((value, snapshot.sha256))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn persisted_bytes(directory: &local_file::PinnedDirectory) -> Result<u64, BoxError> {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -2236,6 +2324,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
         Ok(bytes)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn initialize<C: EvidenceStateCapability + ?Sized>(
         capability: &'lock C,
         state: &EvidenceStateModelV1,
@@ -2259,6 +2348,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn append_initial(
         &mut self,
         snapshot: EvidenceStateSnapshotV1,
@@ -2270,6 +2360,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
         Ok((snapshot, sha256))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn open_existing<C: EvidenceStateCapability + ?Sized>(
         capability: &'lock C,
     ) -> Result<EvidenceJournalOpen<'lock>, BoxError> {
@@ -2311,6 +2402,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn persist(&self, snapshot: &EvidenceStateSnapshotV1) -> Result<(), BoxError> {
         let bytes = evidence_state_snapshot_bytes(snapshot)?;
         if bytes.len() as u64 > MAX_STATE_RECORD_BYTES {
@@ -2338,6 +2430,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate_append_candidate(
         &self,
         state: &EvidenceStateModelV1,
@@ -2362,6 +2455,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
         Ok(snapshot)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn append(
         &mut self,
         state: &EvidenceStateModelV1,
@@ -2379,6 +2473,7 @@ impl<'lock> FileEvidenceJournal<'lock> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn lease_name(evidence_id: &str) -> Result<String, BoxError> {
     stable_id("lease evidence id", evidence_id)?;
     Ok(format!(
@@ -2387,6 +2482,7 @@ fn lease_name(evidence_id: &str) -> Result<String, BoxError> {
     ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn open_or_create_lease_file(
     directory: &local_file::PinnedDirectory,
     evidence_id: &str,
@@ -2420,6 +2516,7 @@ fn open_or_create_lease_file(
     Ok(file)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn acquire_lease<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
     evidence_id: &str,
@@ -2438,6 +2535,7 @@ fn acquire_lease<C: EvidenceStateCapability + ?Sized>(
     Ok(file)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn acquire_evidence_read_lease<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
     evidence_id: &str,
@@ -2445,6 +2543,7 @@ pub(super) fn acquire_evidence_read_lease<C: EvidenceStateCapability + ?Sized>(
     acquire_lease(capability, evidence_id, libc::LOCK_SH)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn try_acquire_evidence_gc_lease<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
     evidence_id: &str,
@@ -2452,6 +2551,7 @@ pub(super) fn try_acquire_evidence_gc_lease<C: EvidenceStateCapability + ?Sized>
     acquire_lease(capability, evidence_id, libc::LOCK_EX)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn try_acquire_evidence_gc_lease_optional<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
     evidence_id: &str,
@@ -2472,6 +2572,7 @@ pub(super) fn try_acquire_evidence_gc_lease_optional<C: EvidenceStateCapability 
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum HotAllocationV1 {
     State,
     Scratch,
@@ -2479,6 +2580,7 @@ pub(super) enum HotAllocationV1 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct HotStorageCapsV1 {
     pub(super) total_bytes: u64,
     pub(super) state_bytes: u64,
@@ -2487,6 +2589,7 @@ pub(super) struct HotStorageCapsV1 {
 }
 
 impl HotStorageCapsV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn approved() -> Self {
         Self {
             total_bytes: HOT_TOTAL_CAP_BYTES,
@@ -2496,6 +2599,7 @@ impl HotStorageCapsV1 {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self) -> Result<(), BoxError> {
         if self.state_bytes == 0
             || self.scratch_bytes == 0
@@ -2513,6 +2617,7 @@ impl HotStorageCapsV1 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct HotStorageUsageV1 {
     pub(super) state_bytes: u64,
     pub(super) scratch_bytes: u64,
@@ -2520,6 +2625,7 @@ pub(super) struct HotStorageUsageV1 {
 }
 
 impl HotStorageUsageV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn total(self) -> Option<u64> {
         self.state_bytes
             .checked_add(self.scratch_bytes)
@@ -2527,6 +2633,7 @@ impl HotStorageUsageV1 {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn reserve_hot_bytes(
     caps: &HotStorageCapsV1,
     usage: &HotStorageUsageV1,
@@ -2559,6 +2666,7 @@ pub(super) fn reserve_hot_bytes(
     Ok(next)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn reserve_state_journal_bytes(current_bytes: u64, new_bytes: u64) -> Result<u64, BoxError> {
     if new_bytes == 0 {
         return Err("schedule evidence: state journal reservation must be positive".into());
@@ -2572,6 +2680,7 @@ fn reserve_state_journal_bytes(current_bytes: u64, new_bytes: u64) -> Result<u64
     Ok(next)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn plan_hot_evictions(
     state: &EvidenceStateModelV1,
     now_ms: i64,
@@ -2617,13 +2726,19 @@ pub(super) fn plan_hot_evictions(
     Err("schedule evidence: protected evidence prevents quota recovery".into())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 const SCHEDULE_SIDECAR_NAME: &str = "schedule-sidecar.json";
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_SEAL_ENTRIES: usize = 4_096;
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_SEAL_FILE_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_SEAL_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_SEAL_PATH_BYTES: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct SealLimitsV1 {
     pub(super) max_entries: usize,
     pub(super) max_file_bytes: u64,
@@ -2631,6 +2746,7 @@ pub(super) struct SealLimitsV1 {
 }
 
 impl SealLimitsV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn approved() -> Self {
         Self {
             max_entries: MAX_SEAL_ENTRIES,
@@ -2639,6 +2755,7 @@ impl SealLimitsV1 {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(self) -> Result<(), BoxError> {
         if self.max_entries == 0
             || self.max_entries > MAX_SEAL_ENTRIES
@@ -2655,6 +2772,7 @@ impl SealLimitsV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct SealEvidenceRequestV1 {
     pub(super) evidence_class: EvidenceClassV1,
     pub(super) terminal_at_ms: i64,
@@ -2664,6 +2782,7 @@ pub(super) struct SealEvidenceRequestV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct SealedEvidenceFileV1 {
     path: String,
     length_bytes: u64,
@@ -2672,6 +2791,7 @@ struct SealedEvidenceFileV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct SealedEvidenceManifestV1 {
     schema_version: u16,
     evidence_id: String,
@@ -2689,6 +2809,7 @@ struct SealedEvidenceManifestV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct CompactEvidenceRecordV1 {
     schema_version: u16,
     evidence_id: String,
@@ -2702,6 +2823,7 @@ struct CompactEvidenceRecordV1 {
 }
 
 impl CompactEvidenceRecordV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self) -> Result<(), BoxError> {
         if self.schema_version != 1
             || self.terminal_at_ms <= 0
@@ -2731,6 +2853,7 @@ impl CompactEvidenceRecordV1 {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_compact_record_material(
     raw: &str,
     expected_evidence_id: &str,
@@ -2754,6 +2877,7 @@ fn validate_compact_record_material(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct PreparedSealedEvidenceV1 {
     evidence_id: String,
     evidence_class: EvidenceClassV1,
@@ -2771,6 +2895,7 @@ pub(super) struct PreparedSealedEvidenceV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct FilesystemIdentityV1 {
     device: u64,
     inode: u64,
@@ -2785,6 +2910,7 @@ struct FilesystemIdentityV1 {
 }
 
 impl FilesystemIdentityV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn from_metadata(metadata: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -2802,12 +2928,14 @@ impl FilesystemIdentityV1 {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn matches(&self, metadata: &std::fs::Metadata) -> bool {
         self == &Self::from_metadata(metadata)
     }
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct PlannedSealDirectoryV1 {
     path: Vec<String>,
     directory: local_file::PinnedDirectory,
@@ -2815,6 +2943,7 @@ struct PlannedSealDirectoryV1 {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct PlannedSealFileV1 {
     path: Vec<String>,
     parent: local_file::PinnedDirectory,
@@ -2823,20 +2952,24 @@ struct PlannedSealFileV1 {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct SnapshottedSealFileV1 {
     path: Vec<String>,
     bytes: Vec<u8>,
     sha256: String,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn evidence_path_string(components: &[String]) -> String {
     components.join("/")
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn evidence_path_buf(components: &[String]) -> PathBuf {
     components.iter().collect()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn admit_portable_source_path(
     portable_paths: &mut BTreeSet<String>,
     components: &[String],
@@ -2853,6 +2986,7 @@ fn admit_portable_source_path(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_private_directory_metadata(
     metadata: &std::fs::Metadata,
     label: &str,
@@ -2871,6 +3005,7 @@ fn validate_private_directory_metadata(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_private_file_metadata(
     metadata: &std::fs::Metadata,
     label: &str,
@@ -2890,6 +3025,7 @@ fn validate_private_file_metadata(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn inventory_seal_directory(
     directory: &local_file::PinnedDirectory,
     path: &[String],
@@ -2980,6 +3116,7 @@ fn inventory_seal_directory(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn json_value_contains_secret(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::String(value) => crate::compatibility::looks_like_secret(value),
@@ -2995,6 +3132,7 @@ fn json_value_contains_secret(value: &serde_json::Value) -> bool {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn scan_sealed_file(path: &[String], bytes: &[u8]) -> Result<(), BoxError> {
     if crate::compatibility::looks_like_secret(&String::from_utf8_lossy(bytes)) {
         return Err(format!(
@@ -3024,6 +3162,7 @@ fn scan_sealed_file(path: &[String], bytes: &[u8]) -> Result<(), BoxError> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn snapshot_planned_file(
     planned: &PlannedSealFileV1,
     limits: SealLimitsV1,
@@ -3060,6 +3199,7 @@ fn snapshot_planned_file(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn append_archive_directory<W: std::io::Write>(
     archive: &mut tar::Builder<W>,
     path: &[String],
@@ -3076,6 +3216,7 @@ fn append_archive_directory<W: std::io::Write>(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn append_archive_file<W: std::io::Write>(
     archive: &mut tar::Builder<W>,
     file: &SnapshottedSealFileV1,
@@ -3096,6 +3237,7 @@ fn append_archive_file<W: std::io::Write>(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn deterministic_archive(
     directories: &[PlannedSealDirectoryV1],
     files: &[SnapshottedSealFileV1],
@@ -3116,12 +3258,14 @@ fn deterministic_archive(
     Ok(encoder.finish()?)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, BoxError> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
     Ok(bytes)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn prepare_sealed_evidence(
     source: &local_file::PinnedDirectory,
     request: &SealEvidenceRequestV1,
@@ -3129,6 +3273,7 @@ pub(super) fn prepare_sealed_evidence(
     prepare_sealed_evidence_with_hook(source, request, &SealLimitsV1::approved(), || {})
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn prepare_sealed_evidence_with_hook<F>(
     source: &local_file::PinnedDirectory,
     request: &SealEvidenceRequestV1,
@@ -3290,6 +3435,7 @@ where
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct EvidenceHotStoreV1 {
     root: local_file::PinnedDirectory,
     _state: local_file::PinnedDirectory,
@@ -3298,6 +3444,7 @@ pub(super) struct EvidenceHotStoreV1 {
 }
 
 impl EvidenceHotStoreV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn open_existing(root: &local_file::PinnedDirectory) -> Result<Self, BoxError> {
         validate_private_directory_metadata(&root.file_handle().metadata()?, "hot evidence root")?;
         if !root.current_path_matches() {
@@ -3324,16 +3471,19 @@ impl EvidenceHotStoreV1 {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn root_sha256(&self) -> &str {
         self.root.object_sha256()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn sealed_directory(&self) -> &local_file::PinnedDirectory {
         &self.sealed
     }
 }
 
 impl PreparedSealedEvidenceV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self) -> Result<(), BoxError> {
         stable_id("prepared evidence id", &self.evidence_id)?;
         if self.terminal_at_ms <= 0
@@ -3389,6 +3539,7 @@ impl PreparedSealedEvidenceV1 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum SealPublicationFailpointV1 {
     None,
     AfterScratchArchive,
@@ -3398,6 +3549,7 @@ pub(super) enum SealPublicationFailpointV1 {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct PublishedEvidenceV1 {
     pub(super) snapshot: EvidenceStateSnapshotV1,
     pub(super) snapshot_sha256: String,
@@ -3407,17 +3559,20 @@ pub(super) struct PublishedEvidenceV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct UnindexedEvidenceV1 {
     pub(super) scratch: Vec<String>,
     pub(super) sealed: Vec<String>,
 }
 
 impl UnindexedEvidenceV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn is_empty(&self) -> bool {
         self.scratch.is_empty() && self.sealed.is_empty()
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_verified_payload_file(
     directory: &local_file::PinnedDirectory,
     name: &str,
@@ -3443,11 +3598,13 @@ fn write_verified_payload_file(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn payload_object_name(evidence_id: &str) -> Result<String, BoxError> {
     stable_id("payload evidence id", evidence_id)?;
     Ok(local_file::sha256_hex(evidence_id.as_bytes()))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn incident_pin_id(evidence_id: &str) -> Result<String, BoxError> {
     stable_id("incident evidence id", evidence_id)?;
     Ok(format!(
@@ -3456,6 +3613,7 @@ fn incident_pin_id(evidence_id: &str) -> Result<String, BoxError> {
     ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn cleanup_complete_scratch_payload(
     parent: &local_file::PinnedDirectory,
     name: &str,
@@ -3478,6 +3636,7 @@ fn cleanup_complete_scratch_payload(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn list_payload_children(
     directory: &local_file::PinnedDirectory,
     label: &str,
@@ -3507,6 +3666,7 @@ fn list_payload_children(
     Ok(names)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn inspect_unindexed_evidence(
     store: &EvidenceHotStoreV1,
     state: &EvidenceStateModelV1,
@@ -3518,16 +3678,16 @@ pub(super) fn inspect_unindexed_evidence(
     let referenced = state
         .entries
         .values()
-        .filter_map(|entry| {
-            (entry.hot_present
+        .filter(|entry| {
+            entry.hot_present
                 && entry.hot_path.components.len() == 2
                 && entry
                     .hot_path
                     .components
                     .first()
-                    .is_some_and(|value| value == "sealed"))
-            .then(|| entry.hot_path.components[1].clone())
+                    .is_some_and(|value| value == "sealed")
         })
+        .map(|entry| entry.hot_path.components[1].clone())
         .collect::<BTreeSet<_>>();
     let scratch = list_payload_children(&store.scratch, "scratch payload")?;
     let sealed = list_payload_children(&store.sealed, "sealed payload")?
@@ -3537,6 +3697,10 @@ pub(super) fn inspect_unindexed_evidence(
     Ok(UnindexedEvidenceV1 { scratch, sealed })
 }
 
+// The explicit arguments are independently revalidated publication capabilities and bounds;
+// grouping them would hide which identity is fenced at the effect boundary.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn publish_prepared_evidence(
     store: &EvidenceHotStoreV1,
     journal: &mut FileEvidenceJournal<'_>,
@@ -3673,14 +3837,19 @@ pub(super) fn publish_prepared_evidence(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 const INCIDENT_MIGRATION_PREFIX: &str = "incident-migration.";
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_INCIDENT_MIGRATIONS: usize = 1_024;
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_INCIDENT_MIGRATION_RECORD_BYTES: u64 = 64 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
 const R3B_INCIDENT_MIGRATION_MANIFEST: &[u8] =
     include_bytes!("../../../compatibility/r3b-incident-migration-v1.json");
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct IncidentMigrationManifestV1 {
     pub(super) schema_version: u16,
     pub(super) incidents: Vec<IncidentMigrationItemV1>,
@@ -3688,6 +3857,7 @@ pub(super) struct IncidentMigrationManifestV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct IncidentMigrationItemV1 {
     pub(super) incident_id: String,
     pub(super) incident_reference: String,
@@ -3699,6 +3869,7 @@ pub(super) struct IncidentMigrationItemV1 {
 }
 
 impl IncidentMigrationItemV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self) -> Result<(), BoxError> {
         stable_id("incident migration id", &self.incident_id)?;
         require_sha256("incident migration source", &self.expected_sha256)?;
@@ -3735,6 +3906,7 @@ impl IncidentMigrationItemV1 {
 }
 
 impl IncidentMigrationManifestV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self) -> Result<(), BoxError> {
         if self.schema_version != 1
             || self.incidents.is_empty()
@@ -3763,6 +3935,7 @@ impl IncidentMigrationManifestV1 {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn r3b_incident_migration_manifest() -> Result<IncidentMigrationManifestV1, BoxError> {
     let value: IncidentMigrationManifestV1 =
         serde_json::from_slice(R3B_INCIDENT_MIGRATION_MANIFEST)?;
@@ -3779,6 +3952,7 @@ pub(super) fn r3b_incident_migration_manifest() -> Result<IncidentMigrationManif
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "disposition", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum IncidentMigrationDispositionV1 {
     Missing,
     Mismatch {
@@ -3795,6 +3969,7 @@ pub(super) enum IncidentMigrationDispositionV1 {
 }
 
 impl IncidentMigrationDispositionV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self) -> Result<(), BoxError> {
         match self {
             Self::Missing => Ok(()),
@@ -3830,6 +4005,7 @@ impl IncidentMigrationDispositionV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct IncidentMigrationRecordV1 {
     schema_version: u16,
     generation: u64,
@@ -3840,6 +4016,7 @@ struct IncidentMigrationRecordV1 {
 }
 
 impl IncidentMigrationRecordV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self) -> Result<(), BoxError> {
         if self.schema_version != 1 || self.generation == 0 || self.recorded_at_ms <= 0 {
             return Err("schedule evidence: incident migration record header is invalid".into());
@@ -3860,6 +4037,7 @@ impl IncidentMigrationRecordV1 {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn incident_migration_record_sha256(
     record: &IncidentMigrationRecordV1,
 ) -> Result<String, BoxError> {
@@ -3867,16 +4045,19 @@ fn incident_migration_record_sha256(
     Ok(local_file::sha256_hex(&canonical_json(record)?))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct FileIncidentMigrationJournal<'lock> {
     directory: &'lock local_file::PinnedDirectory,
     records: Vec<IncidentMigrationRecordV1>,
 }
 
 impl<'lock> FileIncidentMigrationJournal<'lock> {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn generation_name(generation: u64) -> String {
         format!("{INCIDENT_MIGRATION_PREFIX}{generation:020}.json")
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn generation_entries(
         directory: &local_file::PinnedDirectory,
     ) -> Result<Vec<(u64, String)>, BoxError> {
@@ -3913,6 +4094,7 @@ impl<'lock> FileIncidentMigrationJournal<'lock> {
         Ok(entries)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn read_generation(
         directory: &local_file::PinnedDirectory,
         name: &str,
@@ -3938,6 +4120,7 @@ impl<'lock> FileIncidentMigrationJournal<'lock> {
         Ok(record)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate_records(records: &[IncidentMigrationRecordV1]) -> Result<(), BoxError> {
         if records.len() > MAX_INCIDENT_MIGRATIONS {
             return Err("schedule evidence: incident migration history exceeds its bound".into());
@@ -3983,6 +4166,7 @@ impl<'lock> FileIncidentMigrationJournal<'lock> {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn open_existing_or_empty<C: EvidenceStateCapability + ?Sized>(
         capability: &'lock C,
     ) -> Result<Self, BoxError> {
@@ -4008,6 +4192,7 @@ impl<'lock> FileIncidentMigrationJournal<'lock> {
         Ok(Self { directory, records })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn latest_for(&self, incident_id: &str) -> Option<&IncidentMigrationRecordV1> {
         self.records
             .iter()
@@ -4015,6 +4200,7 @@ impl<'lock> FileIncidentMigrationJournal<'lock> {
             .find(|record| record.item.incident_id == incident_id)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn append(
         &mut self,
         item: &IncidentMigrationItemV1,
@@ -4089,6 +4275,7 @@ impl<'lock> FileIncidentMigrationJournal<'lock> {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn records(&self) -> &[IncidentMigrationRecordV1] {
         &self.records
     }
@@ -4096,6 +4283,7 @@ impl<'lock> FileIncidentMigrationJournal<'lock> {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct IncidentMigrationSidecarV1 {
     schema_version: u16,
     migration_kind: String,
@@ -4109,6 +4297,7 @@ struct IncidentMigrationSidecarV1 {
     affected_case_ids: Vec<String>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn incident_migration_sidecar(
     item: &IncidentMigrationItemV1,
 ) -> Result<(Vec<u8>, String), BoxError> {
@@ -4131,12 +4320,14 @@ fn incident_migration_sidecar(
     Ok((bytes, sha256))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 enum IncidentSourceObservationV1 {
     Missing,
     Mismatch(IncidentMigrationDispositionV1),
     Exact(Vec<u8>),
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn mismatch_disposition(
     reason_code: &str,
     observed_mode: u32,
@@ -4151,6 +4342,7 @@ fn mismatch_disposition(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn inspect_incident_source(
     item: &IncidentMigrationItemV1,
 ) -> Result<IncidentSourceObservationV1, BoxError> {
@@ -4224,6 +4416,7 @@ fn inspect_incident_source(
     Ok(IncidentSourceObservationV1::Exact(snapshot.bytes))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn prepare_incident_migration_evidence(
     item: &IncidentMigrationItemV1,
     aggregate: Vec<u8>,
@@ -4319,6 +4512,7 @@ fn prepare_incident_migration_evidence(
     Ok(prepared)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn existing_incident_migration_disposition(
     store: &EvidenceHotStoreV1,
     state: &EvidenceStateModelV1,
@@ -4437,18 +4631,21 @@ fn existing_incident_migration_disposition(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum IncidentMigrationFailpointV1 {
     None,
     AfterEvidencePublication,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct IncidentMigrationResultV1 {
     pub(super) disposition: IncidentMigrationDispositionV1,
     pub(super) evidence_published: bool,
     pub(super) journal_appended: bool,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn record_incident_migration_disposition(
     journal: &mut FileIncidentMigrationJournal<'_>,
     item: &IncidentMigrationItemV1,
@@ -4475,6 +4672,10 @@ fn record_incident_migration_disposition(
     })
 }
 
+// Migration receives each journal, retained state, quota view, and failpoint independently so
+// recovery cannot smuggle an implicit effect bundle across this boundary.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn migrate_incident_evidence(
     store: &EvidenceHotStoreV1,
     evidence_journal: &mut FileEvidenceJournal<'_>,

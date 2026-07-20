@@ -29,28 +29,37 @@ use crate::compatibility_schedule_schema::{
 use crate::compatibility_schedule_state::{AuthorityStateCapability, EvidenceStateCapability};
 use crate::{local_file, BoxError};
 
+#[cfg_attr(not(test), allow(dead_code))]
 const COLD_ROOT_LITERAL: &str = "~/Documents/a2a-bridge/evidence-archive";
+#[cfg_attr(not(test), allow(dead_code))]
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+#[cfg_attr(not(test), allow(dead_code))]
 const PRIVATE_FILE_MODE: u32 = 0o600;
+#[cfg_attr(not(test), allow(dead_code))]
 const COLD_CAP_BYTES: u64 = 25 * 1024 * 1024 * 1024;
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_COLD_ROOT_ENTRIES: usize = 2_048;
 
 #[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ColdEvidenceStoreV1 {
     root: local_file::PinnedDirectory,
 }
 
 impl ColdEvidenceStoreV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn open_existing(root: &local_file::PinnedDirectory) -> Result<Self, BoxError> {
         validate_private_directory(root, "cold evidence root")?;
         Ok(Self { root: root.clone() })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn root_sha256(&self) -> &str {
         self.root.object_sha256()
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_private_directory(
     directory: &local_file::PinnedDirectory,
     label: &str,
@@ -69,6 +78,7 @@ fn validate_private_directory(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_private_file(metadata: &std::fs::Metadata, label: &str) -> Result<(), BoxError> {
     if !metadata.is_file()
         || metadata.nlink() != 1
@@ -83,6 +93,7 @@ fn validate_private_file(metadata: &std::fs::Metadata, label: &str) -> Result<()
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_private_child(
     metadata: local_file::ChildMetadataSnapshot,
     label: &str,
@@ -100,6 +111,7 @@ fn validate_private_child(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn reserve_cold_capacity(current_bytes: u64, reserved_bytes: u64) -> Result<u64, BoxError> {
     let total = current_bytes
         .checked_add(reserved_bytes)
@@ -110,6 +122,7 @@ fn reserve_cold_capacity(current_bytes: u64, reserved_bytes: u64) -> Result<u64,
     Ok(total)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn cold_usage_bytes(cold: &ColdEvidenceStoreV1) -> Result<u64, BoxError> {
     validate_private_directory(&cold.root, "cold evidence root")?;
     let mut total = 0_u64;
@@ -140,12 +153,14 @@ fn cold_usage_bytes(cold: &ColdEvidenceStoreV1) -> Result<u64, BoxError> {
     Ok(total)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn cold_copy_bytes(copy: &ColdCopyRecordV1) -> Result<u64, BoxError> {
     copy.archive_bytes
         .checked_add(copy.manifest_bytes)
         .ok_or_else(|| "schedule retention: cold-copy bytes overflow".into())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_cold_capacity(
     cold: &ColdEvidenceStoreV1,
     state: &EvidenceStateModelV1,
@@ -190,6 +205,7 @@ fn validate_cold_capacity(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct FileProviderProbeRequestV1 {
     pub(super) cold_root_sha256: String,
     pub(super) file_provider_domain_id: String,
@@ -197,6 +213,7 @@ pub(super) struct FileProviderProbeRequestV1 {
     pub(super) observed_at_ms: i64,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) trait FileProviderStateProbeV1 {
     fn probe(
         &mut self,
@@ -209,6 +226,7 @@ pub(super) trait FileProviderStateProbeV1 {
     ) -> Result<FileProviderObservationV1, BoxError>;
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn probe_request(
     copy: Option<&ColdCopyRecordV1>,
     cold: &ColdEvidenceStoreV1,
@@ -233,6 +251,7 @@ fn probe_request(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_observation(
     request: &FileProviderProbeRequestV1,
     observation: &FileProviderObservationV1,
@@ -248,6 +267,7 @@ fn validate_observation(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn probe_root_ready<P: FileProviderStateProbeV1 + ?Sized>(
     cold: &ColdEvidenceStoreV1,
     probe: &mut P,
@@ -277,6 +297,7 @@ fn probe_root_ready<P: FileProviderStateProbeV1 + ?Sized>(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ColdCopyAdmissionRequestV1 {
     pub(super) evidence_id: String,
     pub(super) consent_id: String,
@@ -285,11 +306,13 @@ pub(super) struct ColdCopyAdmissionRequestV1 {
     pub(super) deadline_ms: i64,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn cold_copy_id(evidence_id: &str, consent_sha256: &str, admitted_at_ms: i64) -> String {
     let material = format!("{evidence_id}\n{consent_sha256}\n{admitted_at_ms}\n");
     format!("cold-copy:{}", local_file::sha256_hex(material.as_bytes()))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn cold_paths(
     evidence_id: &str,
     copy_id: &str,
@@ -305,6 +328,7 @@ fn cold_paths(
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn admit_cold_copy<
     C: EvidenceStateCapability + AuthorityStateCapability + ?Sized,
     P: FileProviderStateProbeV1 + ?Sized,
@@ -393,6 +417,7 @@ pub(super) fn admit_cold_copy<
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum ColdPublicationFailpointV1 {
     None,
     AfterArchivePartial,
@@ -402,6 +427,7 @@ pub(super) enum ColdPublicationFailpointV1 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum ColdResidueDispositionV1 {
     None,
     ArchivePartialOnly,
@@ -413,18 +439,23 @@ pub(super) enum ColdResidueDispositionV1 {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ColdPublicationResultV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) snapshot_sha256: String,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) archive_path: RelativeEvidencePathV1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum ChildDispositionV1 {
     Absent,
     PrivateRegular,
     Other,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn child_disposition(
     directory: &local_file::PinnedDirectory,
     name: &str,
@@ -445,6 +476,7 @@ fn child_disposition(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn single_component<'a>(
     path: &'a RelativeEvidencePathV1,
     label: &str,
@@ -455,10 +487,12 @@ fn single_component<'a>(
     Ok(&path.components[0])
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn partial_name(final_name: &str) -> String {
     format!("{final_name}.partial")
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn inspect_cold_copy_residue(
     cold: &ColdEvidenceStoreV1,
     copy: &ColdCopyRecordV1,
@@ -502,11 +536,13 @@ pub(super) fn inspect_cold_copy_residue(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct PayloadBytesV1 {
     archive: Vec<u8>,
     manifest: Vec<u8>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn read_exact_payload_file(
     directory: &local_file::PinnedDirectory,
     name: &str,
@@ -523,6 +559,7 @@ fn read_exact_payload_file(
     Ok(snapshot.bytes)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn load_hot_payload(
     hot: &EvidenceHotStoreV1,
     entry: &IndexedEvidenceV1,
@@ -559,6 +596,7 @@ fn load_hot_payload(
     Ok(PayloadBytesV1 { archive, manifest })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn load_cold_payload(
     cold: &ColdEvidenceStoreV1,
     copy: &ColdCopyRecordV1,
@@ -586,6 +624,7 @@ fn load_cold_payload(
     Ok(PayloadBytesV1 { archive, manifest })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_or_verify_partial(
     cold: &ColdEvidenceStoreV1,
     name: &str,
@@ -621,6 +660,7 @@ fn write_or_verify_partial(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn publish_partial(
     cold: &ColdEvidenceStoreV1,
     partial: &str,
@@ -637,6 +677,7 @@ fn publish_partial(
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_admitted_consent(
     consent: &StorageConsentV1,
     copy: &ColdCopyRecordV1,
@@ -661,6 +702,7 @@ fn validate_admitted_consent(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn probe_object<P: FileProviderStateProbeV1 + ?Sized>(
     cold: &ColdEvidenceStoreV1,
     probe: &mut P,
@@ -682,6 +724,9 @@ fn probe_object<P: FileProviderStateProbeV1 + ?Sized>(
     Ok(observation)
 }
 
+// Each argument is a separately validated consent, storage, quota, or crash-recovery fence.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn publish_admitted_cold_copy<
     C: EvidenceStateCapability + ?Sized,
     P: FileProviderStateProbeV1 + ?Sized,
@@ -861,6 +906,7 @@ pub(super) fn publish_admitted_cold_copy<
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn cleanup_exact_partial(
     cold: &ColdEvidenceStoreV1,
     name: &str,
@@ -888,12 +934,14 @@ fn cleanup_exact_partial(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ColdAbandonmentResultV1 {
     pub(super) snapshot_sha256: String,
     pub(super) residue: ColdResidueDispositionV1,
     pub(super) cleanup_required: bool,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn abandon_cold_copy<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
     journal: &mut FileEvidenceJournal<'_>,
@@ -928,6 +976,7 @@ pub(super) fn abandon_cold_copy<C: EvidenceStateCapability + ?Sized>(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn cleanup_abandoned_cold_copy<C: EvidenceStateCapability + ?Sized>(
     _capability: &C,
     state: &EvidenceStateModelV1,
@@ -993,6 +1042,7 @@ pub(super) fn cleanup_abandoned_cold_copy<C: EvidenceStateCapability + ?Sized>(
     Ok(residue)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn require_materialized_synchronized(
     observation: &FileProviderObservationV1,
 ) -> Result<(), BoxError> {
@@ -1010,6 +1060,7 @@ fn require_materialized_synchronized(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_current_eviction_consent<C: AuthorityStateCapability + ?Sized>(
     capability: &C,
     copy: &ColdCopyRecordV1,
@@ -1044,6 +1095,7 @@ fn validate_current_eviction_consent<C: AuthorityStateCapability + ?Sized>(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn verified_optional_hot_file(
     payload: &local_file::PinnedDirectory,
     name: &str,
@@ -1069,6 +1121,7 @@ fn verified_optional_hot_file(
     Ok(Some(file))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn cleanup_hot_payload(
     hot: &EvidenceHotStoreV1,
     entry: &IndexedEvidenceV1,
@@ -1142,6 +1195,7 @@ fn cleanup_hot_payload(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum HotEvictionFailpointV1 {
     None,
     AfterIndexPublication,
@@ -1149,11 +1203,15 @@ pub(super) enum HotEvictionFailpointV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct HotEvictionResultV1 {
     pub(super) snapshot_sha256: String,
     pub(super) cleanup_required: bool,
 }
 
+// Eviction keeps its action-time consent, inventory, lease, and journal fences explicit.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn evict_hot_evidence<
     C: EvidenceStateCapability + AuthorityStateCapability + ?Sized,
     P: FileProviderStateProbeV1 + ?Sized,
@@ -1237,6 +1295,7 @@ pub(super) fn evict_hot_evidence<
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn cleanup_evicted_hot_evidence<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
     state: &EvidenceStateModelV1,
@@ -1258,8 +1317,10 @@ pub(super) fn cleanup_evicted_hot_evidence<C: EvidenceStateCapability + ?Sized>(
     cleanup_hot_payload(hot, entry, HotEvictionFailpointV1::None)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_ROTATING_VERIFICATION_BATCH: usize = 64;
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn plan_rotating_cold_verifications(
     state: &EvidenceStateModelV1,
     max_items: usize,
@@ -1293,6 +1354,7 @@ pub(super) fn plan_rotating_cold_verifications(
         .collect())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn materialize_for_verification<P: FileProviderStateProbeV1 + ?Sized>(
     cold: &ColdEvidenceStoreV1,
     probe: &mut P,
@@ -1329,6 +1391,7 @@ fn materialize_for_verification<P: FileProviderStateProbeV1 + ?Sized>(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn integrity_hold_id(evidence_id: &str) -> String {
     format!(
         "cold-integrity:{}",
@@ -1336,6 +1399,7 @@ fn integrity_hold_id(evidence_id: &str) -> String {
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn persist_integrity_hold(
     journal: &mut FileEvidenceJournal<'_>,
     state: &mut EvidenceStateModelV1,
@@ -1364,6 +1428,7 @@ fn persist_integrity_hold(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum ColdVerificationOutcomeV1 {
     Verified {
         snapshot_sha256: String,
@@ -1374,6 +1439,7 @@ pub(super) enum ColdVerificationOutcomeV1 {
     },
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn verify_cold_evidence<
     C: EvidenceStateCapability + ?Sized,
     P: FileProviderStateProbeV1 + ?Sized,
@@ -1456,6 +1522,7 @@ pub(super) fn verify_cold_evidence<
     Ok(ColdVerificationOutcomeV1::Verified { snapshot_sha256 })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn observation_is_integrity_blocking(observation: &FileProviderObservationV1) -> bool {
     matches!(
         observation.state,
@@ -1463,6 +1530,7 @@ fn observation_is_integrity_blocking(observation: &FileProviderObservationV1) ->
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn add_integrity_hold_if_absent(
     state: &mut EvidenceStateModelV1,
     evidence_id: &str,
@@ -1485,12 +1553,14 @@ fn add_integrity_hold_if_absent(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ColdMetadataReconciliationV1 {
     pub(super) observed_objects: usize,
     pub(super) blocked_evidence_ids: Vec<String>,
     pub(super) snapshot_sha256: String,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn reconcile_cold_metadata<
     C: EvidenceStateCapability + ?Sized,
     P: FileProviderStateProbeV1 + ?Sized,
@@ -1562,8 +1632,10 @@ pub(super) fn reconcile_cold_metadata<
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_CACHE_INVENTORY_ITEMS: usize = 1_024;
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn cache_stable_id(label: &str, value: &str) -> Result<(), BoxError> {
     if value.is_empty()
         || value.len() > 128
@@ -1578,6 +1650,7 @@ fn cache_stable_id(label: &str, value: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn lowercase_sha256(label: &str, value: &str) -> Result<(), BoxError> {
     if !local_file::valid_sha256(value)
         || value.len() != 64
@@ -1588,6 +1661,7 @@ fn lowercase_sha256(label: &str, value: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn add_retention_days(timestamp_ms: i64, days: u32) -> Result<i64, BoxError> {
     if timestamp_ms <= 0 {
         return Err("schedule retention: cache timestamp must be positive".into());
@@ -1603,6 +1677,7 @@ fn add_retention_days(timestamp_ms: i64, days: u32) -> Result<i64, BoxError> {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum BundleCacheKindV1 {
     ReconstructiblePayload,
     ManifestOrInventory,
@@ -1610,6 +1685,7 @@ pub(super) enum BundleCacheKindV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct BundleCacheEntryV1 {
     pub(super) bundle_id: String,
     pub(super) evidence_id: String,
@@ -1625,6 +1701,7 @@ pub(super) struct BundleCacheEntryV1 {
 }
 
 impl BundleCacheEntryV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate(&self) -> Result<(), BoxError> {
         cache_stable_id("bundle id", &self.bundle_id)?;
         cache_stable_id("bundle evidence id", &self.evidence_id)?;
@@ -1645,6 +1722,7 @@ impl BundleCacheEntryV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct BundleCacheInventoryV1 {
     pub(super) cache_root_sha256: String,
     pub(super) entries: Vec<BundleCacheEntryV1>,
@@ -1652,6 +1730,7 @@ pub(super) struct BundleCacheInventoryV1 {
 }
 
 impl BundleCacheInventoryV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn normalized(&self) -> Result<Self, BoxError> {
         lowercase_sha256("bundle cache root", &self.cache_root_sha256)?;
         if self.entries.len() > MAX_CACHE_INVENTORY_ITEMS
@@ -1684,6 +1763,7 @@ impl BundleCacheInventoryV1 {
         Ok(value)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn sha256(&self) -> Result<String, BoxError> {
         Ok(local_file::sha256_hex(&serde_json::to_vec(
             &self.normalized()?,
@@ -1692,22 +1772,26 @@ impl BundleCacheInventoryV1 {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct BundleCacheStoreV1 {
     root: local_file::PinnedDirectory,
 }
 
 impl BundleCacheStoreV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn open_existing(root: &local_file::PinnedDirectory) -> Result<Self, BoxError> {
         validate_private_directory(root, "bundle cache root")?;
         Ok(Self { root: root.clone() })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn root_sha256(&self) -> &str {
         self.root.object_sha256()
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum BundleGcProtectionV1 {
     MinimumAge,
     KeepLatestThree,
@@ -1717,12 +1801,14 @@ pub(super) enum BundleGcProtectionV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ProtectedBundleV1 {
     pub(super) bundle_id: String,
     pub(super) reason: BundleGcProtectionV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct BundleGcPlanItemV1 {
     pub(super) action_id: String,
     pub(super) cache_root_sha256: String,
@@ -1733,6 +1819,7 @@ pub(super) struct BundleGcPlanItemV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct BundleGcPlanV1 {
     pub(super) planned_at_ms: i64,
     pub(super) inventory_sha256: String,
@@ -1740,6 +1827,7 @@ pub(super) struct BundleGcPlanV1 {
     pub(super) protected: Vec<ProtectedBundleV1>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn preserved_full_evidence_matches(
     state: &EvidenceStateModelV1,
     entry: &BundleCacheEntryV1,
@@ -1764,6 +1852,7 @@ fn preserved_full_evidence_matches(
         })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn bundle_deadline(entry: &BundleCacheEntryV1) -> Result<i64, BoxError> {
     let days = match entry.kind {
         BundleCacheKindV1::ManifestOrInventory => 180,
@@ -1779,6 +1868,7 @@ fn bundle_deadline(entry: &BundleCacheEntryV1) -> Result<i64, BoxError> {
     add_retention_days(entry.created_at_ms, days)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn plan_bundle_gc(
     state: &EvidenceStateModelV1,
     inventory: &BundleCacheInventoryV1,
@@ -1887,11 +1977,13 @@ pub(super) fn plan_bundle_gc(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn bundle_lease_id(bundle_id: &str) -> Result<String, BoxError> {
     cache_stable_id("bundle lease id", bundle_id)?;
     Ok(format!("bundle:{bundle_id}"))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn acquire_bundle_read_lease<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
     bundle_id: &str,
@@ -1900,12 +1992,14 @@ pub(super) fn acquire_bundle_read_lease<C: EvidenceStateCapability + ?Sized>(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum BundleGcFailpointV1 {
     None,
     AfterUnlink,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum BundleGcOutcomeV1 {
     Removed,
     RecoveredAlreadyAbsent,
@@ -1914,6 +2008,7 @@ pub(super) enum BundleGcOutcomeV1 {
     AlreadyTerminal,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn bundle_action(item: &BundleGcPlanItemV1, started_at_ms: i64) -> BundleGcActionV1 {
     BundleGcActionV1 {
         action_id: item.action_id.clone(),
@@ -1934,6 +2029,7 @@ fn bundle_action(item: &BundleGcPlanItemV1, started_at_ms: i64) -> BundleGcActio
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn bundle_action_matches_item(action: &BundleGcActionV1, item: &BundleGcPlanItemV1) -> bool {
     action.action_id == item.action_id
         && action.bundle_id == item.entry.bundle_id
@@ -1950,6 +2046,7 @@ fn bundle_action_matches_item(action: &BundleGcActionV1, item: &BundleGcPlanItem
         && action.planned_at_ms == item.planned_at_ms
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn finish_bundle_safe_skip(
     journal: &mut FileEvidenceJournal<'_>,
     state: &mut EvidenceStateModelV1,
@@ -1967,6 +2064,9 @@ fn finish_bundle_safe_skip(
     })
 }
 
+// GC effect identity is intentionally explicit at this narrow effect boundary.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn execute_bundle_gc_item<C: EvidenceStateCapability + ?Sized>(
     capability: &C,
     journal: &mut FileEvidenceJournal<'_>,
@@ -2125,6 +2225,7 @@ pub(super) fn execute_bundle_gc_item<C: EvidenceStateCapability + ?Sized>(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn immutable_image_digest(label: &str, value: &str) -> Result<(), BoxError> {
     let Some(sha256) = value.strip_prefix("sha256:") else {
         return Err(format!("schedule retention: {label} is not an immutable digest").into());
@@ -2134,6 +2235,7 @@ fn immutable_image_digest(label: &str, value: &str) -> Result<(), BoxError> {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum RuntimeImageOwnershipV1 {
     BridgeManaged,
     Unrelated,
@@ -2141,6 +2243,7 @@ pub(super) enum RuntimeImageOwnershipV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct RuntimeImageV1 {
     pub(super) digest: String,
     pub(super) ownership: RuntimeImageOwnershipV1,
@@ -2148,6 +2251,7 @@ pub(super) struct RuntimeImageV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct SuccessfulImageCandidateV1 {
     pub(super) provider_id: String,
     pub(super) digest: String,
@@ -2156,6 +2260,7 @@ pub(super) struct SuccessfulImageCandidateV1 {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum ContainerLifecycleV1 {
     Running,
     Stopped,
@@ -2163,6 +2268,7 @@ pub(super) enum ContainerLifecycleV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ContainerImageReferenceV1 {
     pub(super) container_id: String,
     pub(super) digest: String,
@@ -2171,6 +2277,7 @@ pub(super) struct ContainerImageReferenceV1 {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct RuntimeImageInventoryV1 {
     pub(super) observed_at_ms: i64,
     pub(super) images: Vec<RuntimeImageV1>,
@@ -2181,6 +2288,7 @@ pub(super) struct RuntimeImageInventoryV1 {
 }
 
 impl RuntimeImageInventoryV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn normalized(&self) -> Result<Self, BoxError> {
         if self.observed_at_ms <= 0
             || self.images.len() > MAX_CACHE_INVENTORY_ITEMS
@@ -2248,6 +2356,7 @@ impl RuntimeImageInventoryV1 {
         Ok(value)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn sha256(&self) -> Result<String, BoxError> {
         Ok(local_file::sha256_hex(&serde_json::to_vec(
             &self.normalized()?,
@@ -2256,6 +2365,7 @@ impl RuntimeImageInventoryV1 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum ImageGcProtectionV1 {
     CurrentProduction,
     LatestSuccessfulCandidate,
@@ -2265,12 +2375,14 @@ pub(super) enum ImageGcProtectionV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ProtectedImageV1 {
     pub(super) digest: String,
     pub(super) reason: ImageGcProtectionV1,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ImageGcPlanItemV1 {
     pub(super) action_id: String,
     pub(super) digest: String,
@@ -2279,6 +2391,7 @@ pub(super) struct ImageGcPlanItemV1 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct ImageGcPlanV1 {
     pub(super) planned_at_ms: i64,
     pub(super) inventory_sha256: String,
@@ -2286,6 +2399,7 @@ pub(super) struct ImageGcPlanV1 {
     pub(super) protected: Vec<ProtectedImageV1>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn plan_image_gc(
     inventory: &RuntimeImageInventoryV1,
     planned_at_ms: i64,
@@ -2366,12 +2480,14 @@ pub(super) fn plan_image_gc(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum RuntimeImageRemovalV1 {
     Removed,
     Absent,
     Refused { reason_code: String },
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) trait RuntimeImageEffectsV1 {
     fn inventory_all(&mut self) -> Result<RuntimeImageInventoryV1, BoxError>;
 
@@ -2379,12 +2495,14 @@ pub(super) trait RuntimeImageEffectsV1 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum ImageGcFailpointV1 {
     None,
     AfterRemoval,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum ImageGcOutcomeV1 {
     Removed,
     RecoveredAlreadyAbsent,
@@ -2392,6 +2510,7 @@ pub(super) enum ImageGcOutcomeV1 {
     AlreadyTerminal,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn image_action(item: &ImageGcPlanItemV1, started_at_ms: i64) -> ImageGcActionV1 {
     ImageGcActionV1 {
         action_id: item.action_id.clone(),
@@ -2403,6 +2522,7 @@ fn image_action(item: &ImageGcPlanItemV1, started_at_ms: i64) -> ImageGcActionV1
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn image_action_matches_item(action: &ImageGcActionV1, item: &ImageGcPlanItemV1) -> bool {
     action.action_id == item.action_id
         && action.digest == item.digest
@@ -2410,6 +2530,7 @@ fn image_action_matches_item(action: &ImageGcActionV1, item: &ImageGcPlanItemV1)
         && action.planned_at_ms == item.planned_at_ms
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_image_gc_item(item: &ImageGcPlanItemV1) -> Result<(), BoxError> {
     immutable_image_digest("image GC item", &item.digest)?;
     lowercase_sha256("image GC planned inventory", &item.inventory_sha256)?;
@@ -2432,6 +2553,7 @@ fn validate_image_gc_item(item: &ImageGcPlanItemV1) -> Result<(), BoxError> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn finish_image_safe_skip(
     journal: &mut FileEvidenceJournal<'_>,
     state: &mut EvidenceStateModelV1,
@@ -2449,6 +2571,9 @@ fn finish_image_safe_skip(
     })
 }
 
+// Runtime removal keeps the fresh inventory, plan, journal, lease, and injected effect separate.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn execute_image_gc_item<
     C: EvidenceStateCapability + ?Sized,
     R: RuntimeImageEffectsV1 + ?Sized,
@@ -3055,7 +3180,7 @@ mod tests {
             .unwrap();
         let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
         let mut state = opened.snapshot.state.clone();
-        publish_admitted_cold_copy(
+        let publication = publish_admitted_cold_copy(
             &owner,
             &mut opened.journal,
             &mut state,
@@ -3068,6 +3193,9 @@ mod tests {
             ColdPublicationFailpointV1::None,
         )
         .unwrap();
+        assert_eq!(publication.archive_path, admission.archive_path);
+        let reopened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        assert_eq!(publication.snapshot_sha256, reopened.snapshot_sha256);
         assert_eq!(
             inspect_cold_copy_residue(&fixture.cold, &admission).unwrap(),
             ColdResidueDispositionV1::Published
@@ -3825,6 +3953,7 @@ mod tests {
         assert_ne!(replacement.archive_path, admission.archive_path);
     }
 
+    #[allow(clippy::too_many_arguments)] // Fixture spells out every GC selection dimension.
     fn bundle_entry(
         state: &EvidenceStateModelV1,
         bundle_id: &str,
@@ -3880,7 +4009,7 @@ mod tests {
                 "evidence-1",
                 "codex",
                 "case-a",
-                now - 1 * DAY_MS,
+                now - DAY_MS,
                 BundleCacheKindV1::ReconstructiblePayload,
                 b"new-1",
             ),
