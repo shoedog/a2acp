@@ -3125,15 +3125,16 @@ impl<'lock> FileAdmissionJournal<'lock> {
             previous_control_time,
         )?;
         let bytes = canonical_bytes(&record)?;
+        self.directory
+            .recover_journal_append_residue(0o600, "admission control")?;
         self.state_quota.reserve(bytes.len() as u64)?;
         let name = Self::control_name(sequence);
-        let mut file =
-            self.directory
-                .create_new_file(OsStr::new(&name), 0o600, "admission control")?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|error| format!("schedule transaction: cannot persist control: {error}"))?;
-        self.directory.sync()?;
+        self.directory.write_new_journal_record(
+            OsStr::new(&name),
+            &bytes,
+            0o600,
+            "admission control",
+        )?;
         let sha256 = local_file::sha256_hex(&bytes);
         self.state = record.admission_state_after.clone();
         let quarantine_opening = match &record.action {
@@ -4547,6 +4548,74 @@ mod tests {
         let reopened = FileAdmissionJournal::open(&locks).unwrap();
         assert!(!reopened.state.controls.is_quarantined(&profile));
         assert_eq!(reopened.journal.control_records.len(), 2);
+    }
+
+    #[test]
+    fn quarantine_control_interruption_before_atomic_publish_reopens_and_retries_same_sequence() {
+        let (_state_temp, state) = state_root();
+        let owner = state
+            .try_owner_admission("test:quarantine-interrupted-publication")
+            .unwrap();
+        let admission_directory = owner.admission_directory();
+        let temporary = admission_directory
+            .canonical_path()
+            .join(".a2a-journal-append-v1.tmp");
+        let final_record = admission_directory
+            .canonical_path()
+            .join(FileAdmissionJournal::control_name(1));
+        let profile = fingerprint('d');
+        let opening = quarantine_opening(profile.clone(), 2);
+        let mut store = FileAdmissionQuarantineStore::open_quarantine_controls(&owner).unwrap();
+
+        admission_directory.fail_journal_publish_on_nth_call_for_test(1);
+        let error = store.append_opening(opening.clone()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected failure before journal publication"));
+        assert!(temporary.is_file());
+        assert!(!final_record.exists());
+        drop(store);
+
+        let mut reopened = FileAdmissionQuarantineStore::open_quarantine_controls(&owner).unwrap();
+        reopened.append_opening(opening.clone()).unwrap();
+        assert!(!temporary.exists());
+        assert!(final_record.is_file());
+        assert_eq!(
+            reopened
+                .read_active_opening(&profile.sha256)
+                .unwrap()
+                .opening,
+            opening
+        );
+    }
+
+    #[test]
+    fn quarantine_control_recovers_a_private_interrupted_append_residue() {
+        let (_state_temp, state) = state_root();
+        let owner = state
+            .try_owner_admission("test:quarantine-interrupted-residue")
+            .unwrap();
+        let temporary = owner
+            .admission_directory()
+            .canonical_path()
+            .join(".a2a-journal-append-v1.tmp");
+        std::fs::write(&temporary, b"truncated-uncommitted-control").unwrap();
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let profile = fingerprint('d');
+        let opening = quarantine_opening(profile.clone(), 2);
+
+        let mut store = FileAdmissionQuarantineStore::open_quarantine_controls(&owner).unwrap();
+        store.append_opening(opening.clone()).unwrap();
+
+        assert!(!temporary.exists());
+        assert_eq!(
+            FileAdmissionQuarantineStore::open_quarantine_controls(&owner)
+                .unwrap()
+                .read_active_opening(&profile.sha256)
+                .unwrap()
+                .opening,
+            opening
+        );
     }
 
     #[test]
