@@ -2,8 +2,9 @@
 
 **Status:** R3d3a through R3d3e are checkpointed at `21427e6`, `739495a`, `7ed0446`, `84fbbf3`, and `33ec5c3` on
 `agent/reliability-r3d3-evidence-retention` from merged R3d2 `origin/main`
-`06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41); full deterministic release gates are next. This
-slice is local, non-billable, default-off, and has one merge boundary.
+`06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41). Exact code-and-doc candidate `c75b082` passed the
+complete deterministic release gates; the bridge-mediated Sol/xhigh adversarial implementation review is next.
+This slice is local, non-billable, default-off, and has one merge boundary.
 
 The approved design of record is
 [`2026-07-11-r3-compatibility-canaries.md`](2026-07-11-r3-compatibility-canaries.md), especially D4/D8,
@@ -242,7 +243,11 @@ mutations proved the terminal outbox-phase guard, nonhealthy-source degradation,
 (**0/1** each before restoration). Corrected focused gates are outbox **5/0**, status **7/0**, transaction/control
 **30/0**, compatibility CLI **24/0**, evidence **43/0**, retention/GC **19/0**, retained state **19/0**, strict
 schema **32/0**, and descriptor-local file **12/0**. Format, diff, and package all-target warnings-denied Clippy
-are green. Full-workspace and release gates remain pending for the complete R3d3 review candidate.
+are green. Exact code-and-doc candidate `c75b082` also passes workspace all-target check and warnings-denied
+Clippy, dependency policy, locked release workspace build, repository hygiene **37/7**, pinned manifest **9**,
+floating recipes **4**, schedule foundation **6/4**, compatibility/foundation/supervisor CLI **24/0 + 31/0 +
+2/0**, complete binary **734/0/0**, and canonical full serial workspace **2,473/0/12 ignored** across **72**
+result groups (**55** nonempty). The ignored set remains authenticated/live-provider integration coverage.
 
 ## Verification and review gates
 
@@ -284,5 +289,8 @@ workspace **2,392/0/12 ignored** across **72** result groups (**55** nonempty); 
 authenticated/live-provider integration tests. R3d3a through R3d3e are checkpointed at `21427e6`, `739495a`,
 `7ed0446`, `84fbbf3`, and `33ec5c3`; the latest focused gates are outbox **5/0**, status **7/0**, transaction/
 control **30/0**, compatibility CLI **24/0**, evidence **43/0**, retention/GC **19/0**, retained state **19/0**,
-strict schema **32/0**, and descriptor-local file **12/0**. Run the full deterministic release gates next, then
-freeze the exact review boundary. No production operator rebuild or swap is part of this slice.
+strict schema **32/0**, and descriptor-local file **12/0**. Exact candidate `c75b082` passes complete binary
+**734/0/0** and canonical full serial workspace **2,473/0/12 ignored** across **72** groups (**55** nonempty),
+plus every deterministic release/validator gate. Rerun those gates after this docs fold, freeze the exact review
+boundary, then run the Sol/xhigh adversarial implementation review. No production operator rebuild or swap is
+part of this slice.
