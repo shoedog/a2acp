@@ -137,10 +137,15 @@ Deferred R2f follow-up: phase-aware liveness and safe takeover after useful edit
 session/backend health. The verification trigger is `INC-VERIFY-STALL-2026-07-11`, where a Luna run
 completed edits quickly and then parked in verification for nearly three hours. The shared-service triggers
 are `INC-SHARED-WARM-CRASH-2026-07-16` and `INC-SHARED-SESSION-CAPACITY-2026-07-17`, where the long-lived
-operator failed before observable prompt start while a fresh one-shot control succeeded. R2f must distinguish
-a silent healthy verifier from provider/adapter/child/waiter failure and distinguish poisoned transport from
-session-capacity debt before adding action. It owns capability-gated close and non-disruptive generation
-drain/rotation that preserves running turns and warm sessions; see the [R2f
+operator failed before observable prompt start while a fresh one-shot control succeeded; the later
+`INC-SHARED-RESTART-RECOVERY-2026-07-19` records recovery after an operator stop/start without treating restart as
+a proved remedy. [Issue #22](https://github.com/shoedog/a2acp/issues/22) adds a deterministically confirmed failed
+fan-out root plus unbounded silent sibling, while [issue #24](https://github.com/shoedog/a2acp/issues/24) adds a
+partially confirmed silent provider stream and an explicitly unproved Kiro-specific cause. R2f must distinguish a
+silent healthy verifier from provider/adapter/child/waiter failure, choose an explicit bounded fan-out failure policy
+without breaking intentional graceful degradation, and distinguish poisoned transport from session-capacity debt
+before adding action. It owns shared offline/served attempt identity, the takeover artifact, capability-gated close,
+and non-disruptive generation drain/rotation that preserves running turns and warm sessions; see the [R2f
 plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
 
 ### R3 — compatibility harness and canaries
