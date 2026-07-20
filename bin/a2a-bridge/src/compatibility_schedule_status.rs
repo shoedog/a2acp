@@ -623,11 +623,26 @@ impl<'lock> ScheduleStatusJournal<'lock> {
     }
 
     fn open_directory(directory: &'lock local_file::PinnedDirectory) -> Result<Self, BoxError> {
+        Self::open_directory_with_before_capture(directory, || Ok(()))
+    }
+
+    fn open_directory_with_before_capture<F>(
+        directory: &'lock local_file::PinnedDirectory,
+        before_capture: F,
+    ) -> Result<Self, BoxError>
+    where
+        F: FnOnce() -> Result<(), BoxError>,
+    {
+        before_capture()?;
+        let entries = Self::entries(directory)?;
+        // The production status CLI intentionally holds no owner lock. Capture the exact names
+        // first, then make every captured rename durable before parsing it. A later append is not
+        // part of this read and will be observed on the next invocation.
         directory.sync_journal_recovery_barrier("schedule status")?;
         let mut records = Vec::new();
         let mut previous_sha256: Option<String> = None;
         let mut previous_time = None;
-        for (index, (generation, name)) in Self::entries(directory)?.into_iter().enumerate() {
+        for (index, (generation, name)) in entries.into_iter().enumerate() {
             let expected = u64::try_from(index + 1)?;
             if generation != expected {
                 return Err("schedule status: status generations are not contiguous".into());
@@ -1873,6 +1888,47 @@ mod tests {
         assert!(recovery_error
             .to_string()
             .contains("journal recovery barrier"));
+        assert!(ScheduleStatusJournal::open(&lock)
+            .unwrap()
+            .latest()
+            .is_some());
+    }
+
+    #[test]
+    fn lockless_status_capture_rejects_a_post_barrier_ambiguous_publication() {
+        let directory = root();
+        let root = SchedulerStateRoot::initialize_for_test(directory.path()).unwrap();
+        let lock = root
+            .try_owner_admission("status-lockless-capture-race")
+            .unwrap();
+        let status_directory = lock.status_directory();
+        let final_record = status_directory
+            .canonical_path()
+            .join(ScheduleStatusJournal::generation_name(1));
+        let projection = project_status(status(357), healthy_sources()).unwrap();
+        let mut writer = ScheduleStatusJournal::open(&lock).unwrap();
+
+        let observed =
+            ScheduleStatusJournal::open_directory_with_before_capture(status_directory, || {
+                status_directory.fail_sync_on_nth_call_for_test(1);
+                let error = writer
+                    .append_projected_for_test(projection.clone())
+                    .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("publication renamed but directory sync is ambiguous"));
+                assert!(final_record.is_file());
+                status_directory.fail_sync_on_nth_call_for_test(1);
+                Ok(())
+            });
+        let recovery_error = observed
+            .err()
+            .expect("lockless capture must fail closed until the captured final is durable");
+        assert!(recovery_error
+            .to_string()
+            .contains("journal recovery barrier"));
+        drop(writer);
+
         assert!(ScheduleStatusJournal::open(&lock)
             .unwrap()
             .latest()
