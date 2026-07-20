@@ -7,7 +7,14 @@ Sol/xhigh adversarial implementation verdict of **REVISE** with eight `WRONG` fi
 evidence SHA-256 is `82375d418777611eafc6a02f92ef3f8ba478782242bcabf47f321306797a37fd`. Code remediation is checkpointed at
 `49dd5b381547c8d9f73516946d4e0f66430830bb`. Exact code-and-cursor candidate `990cf99` passes every deterministic
 release gate, and the docs-only gate-evidence fold reproduces those gates before freezing the fresh Sol/xhigh
-rereview boundary. This slice is local, non-billable, default-off, and has one merge boundary.
+rereview boundary. That rereview returned **REVISE** on exact `f485092`: seven inherited `WRONG` findings were
+resolved, the exact-unlink `WRONG` and CLI-proof `SMELL` remained, and two new `WRONG` findings covered a pin added
+after durable Pending and check-then-replace cold publication. Second remediation is checkpointed at
+`bfa1d35868cca4a2aa562ed9f74a9da3ed0021f2`;
+its affected focused gates are evidence **46/0**, retention/GC **29/0**, descriptor-local file **15/0**, and
+compatibility CLI **25/0**, with format, diff, and package all-target warnings-denied Clippy green. Full gates and
+fresh Sol closure review remain required. This slice is local, non-billable, default-off, and has one merge
+boundary.
 
 The approved design of record is
 [`2026-07-11-r3-compatibility-canaries.md`](2026-07-11-r3-compatibility-canaries.md), especially D4/D8,
@@ -259,8 +266,9 @@ effect proof; publication self-measures live state/scratch/sealed bytes and idem
 post-index residue; bundle GC obtains a fresh timestamped inventory only after its exclusive lease; evidence and
 notification journals refuse the first unreopenable generation; top-level help discovers schedule status; and an
 injected operator-home test fingerprints missing, valid, and corrupt status trees before and after read-only access.
-Fail-first regressions were red on the reviewed mechanism. Current focused gates pass evidence **45/0**, retention/
-GC **25/0**, status **9/0**, retained state **19/0**, and compatibility CLI **25/0**; format, diff, and package
+Fail-first regressions were red on the reviewed mechanism. At that first-remediation checkpoint, focused gates pass
+evidence **45/0**, retention/GC **25/0**, status **9/0**, retained state **19/0**, and compatibility CLI **25/0**;
+format, diff, and package
 all-target warnings-denied Clippy are green. Exact candidate `990cf99` also passes workspace all-target check and
 warnings-denied Clippy, dependency policy, locked release workspace build, repository hygiene **37/7**, pinned
 manifest **9**, floating recipes **4**, schedule foundation **6/4**, compatibility/foundation/supervisor CLI
@@ -268,6 +276,40 @@ manifest **9**, floating recipes **4**, schedule foundation **6/4**, compatibili
 across **72** result groups (**55** nonempty). The 212,124-byte canonical workspace log has SHA-256
 `4702e78d6cb5814c6829ba3bd1000afe626210e8b91568bfc9f0a30f37125f88`; the provider-unexercised release binary is
 26,795,344 bytes at SHA-256 `d0b59d01e96026480ed82f5a3336b0f45257804758d315bad8e8cf5d8f75fd01`.
+
+Fresh Sol/xhigh/read-only rereview of exact `f485092` produced an 8,636-byte artifact at SHA-256
+`0b24f7275035fa470e18ea13ae74ddda0852efbae6a2c2a247138f492e005f6c` and returned **REVISE**. It marked initial
+findings 2 through 8 resolved; retained initial finding 1 because comparison followed by pathname `unlinkat` could
+delete an exchanged replacement and retire state while the verified inode survived; retained the CLI proof as a
+low `SMELL`; and added two `WRONG` findings for an active pin admitted after a durable Pending tombstone and
+ordinary `renameat` overwriting a final cold object created after the absence check.
+
+Second remediation commit `bfa1d358` closes the reproduced mechanisms without claiming review closure. Active
+pin plus Pending is rejected at the transition and model-invariant layers and checked again at the action-time
+deletion fence. New publication uses atomic no-replace rename (`RENAME_EXCL` on macOS, `RENAME_NOREPLACE` on
+Linux). Exact removal first captures the selected name into a deterministic no-replace quarantine, syncs the
+directory, revalidates the captured inode, unlinks only the quarantine, and requires the retained descriptor's
+link count to reach zero. Recovery recognizes the same quarantine for hot evidence, cold/FileProvider evidence,
+abandoned partials, and bundle GC; simultaneous source and quarantine names refuse without deletion. An actively
+malicious same-effective-UID process is not a claimed containment boundary because it can directly mutate any
+owner file, but a noncooperating exchange at the public source name no longer deletes the replacement or fabricates
+retirement. The CLI integration name and assertions now claim only redirected-HOME behavior; credential non-access
+remains established by the direct source call path, not by a non-echo sentinel.
+
+The late-pin, concurrent-final-publication, and atomic-exchange regressions each failed on the reviewed mechanism:
+`pin()` returned `Ok`, ordinary rename returned `Ok` and clobbered the concurrent target, and pathname unlink
+returned `Ok` after deleting the exchanged replacement. Corrected focused gates are evidence **46/0**, retention/
+GC **29/0**, descriptor-local file **15/0**, and compatibility CLI **25/0**; format, diff, package all-target
+warnings-denied check, and Clippy are green. Full deterministic gates have not yet been rerun for `bfa1d358` or
+the subsequent docs fold.
+
+One dogfood incident is deliberately deferred outside R3d3 correctness. Operator release `983398427c9f0486`
+served a healthy agent card/model catalog and green Codex doctor/provenance checks with zero unfinished tasks and
+zero durable sessions, yet two unary raw-`gpt-5.6-sol`/xhigh/read-only submits returned `agent crashed` before any
+task, turn-log, prompt-start, or usage record. The operator restarted the server between attempts and observed
+recovery on their path; the exact unary request still failed pre-prompt afterward. No retry is authorized here.
+Later bridge-reliability work must retain the ACP child/session-new failure and compare unary submit with the
+known-good review workflow request shape.
 
 ## Verification and review gates
 
@@ -292,7 +334,8 @@ across **72** result groups (**55** nonempty). The 212,124-byte canonical worksp
 - No GitHub check is created, updated, read, or required; the outbox remains local state only.
 - No launchd timer/watcher is installed or loaded.
 - No provider/model/credential/registry/image-build effect or compatibility turn runs.
-- No production operator lifecycle action occurs.
+- R3d3 code/tests perform no production operator lifecycle action. The operator independently restarted the
+  served bridge during the deferred unary-submit diagnostic above; that restart is not R3d3 verification evidence.
 - The two R3b incident sources are not migrated into production storage by this implementation slice; only the
   tested migration mechanism and exact migration manifest land. R3d5 rollout executes it after owner review.
 
@@ -308,12 +351,15 @@ R3d2 merged by PR #41 with CI/CLA green. Its final local gate was complete binar
 workspace **2,392/0/12 ignored** across **72** result groups (**55** nonempty); the twelve ignored tests remain
 authenticated/live-provider integration tests. R3d3a through R3d3e are checkpointed at `21427e6`, `739495a`,
 `7ed0446`, `84fbbf3`, and `33ec5c3`. Exact reviewed candidate `db109b7` received Sol/xhigh **REVISE** with eight
-`WRONG` findings and one `SMELL`; `49dd5b3` is the remediation checkpoint. Latest focused gates are outbox **5/0**,
-status **9/0**, transaction/control **30/0**, compatibility CLI **25/0**, evidence **45/0**, retention/GC **25/0**,
-retained state **19/0**, strict schema **32/0**, and descriptor-local file **12/0**. The prior candidate `c75b082`
+`WRONG` findings and one `SMELL`; `49dd5b3` is the first remediation checkpoint. Exact `f485092` received a second
+Sol/xhigh **REVISE** with one inherited `WRONG`, one inherited `SMELL`, and two new `WRONG` findings; `bfa1d358` is
+the second remediation checkpoint. Latest focused gates are outbox **5/0**, status **9/0**, transaction/control
+**30/0**, compatibility CLI **25/0**, evidence **46/0**, retention/GC **29/0**, retained state **19/0**, strict
+schema **32/0**, and descriptor-local file **15/0**. The prior candidate `c75b082`
 passed complete binary **734/0/0** and canonical full serial workspace **2,473/0/12 ignored** across **72** groups
 (**55** nonempty). Exact remediation candidate `990cf99` passes complete binary **744/0/0** and canonical full
 serial workspace **2,484/0/12 ignored** across **72** groups (**55** nonempty), plus every deterministic release/
-validator gate. The docs-only gate-evidence fold reproduces the same exact-head gates before the fresh Sol/xhigh
-rereview. Run the single Fable/xhigh release/compatibility lens only after Sol approval. No production operator
-rebuild or swap is part of this slice.
+validator gate. Full deterministic gates must now run on the second-remediation docs-fold head before fresh
+Sol/xhigh closure review. Run the single Fable/xhigh release/compatibility lens only after Sol approval. No
+production operator rebuild or swap is part of this slice; preserve the deferred pre-prompt unary-submit incident
+above for later reliability investigation.
