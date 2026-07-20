@@ -53,7 +53,30 @@ Its 214,265-byte canonical log has SHA-256
 release binary remains SHA-256 `57b47f37725e64a92fc28641121395c0915aac95edb60dae8c4974dbb919ba1e`.
 The docs-only commit containing this evidence is the intended review boundary: reproduce deterministic gates on
 that unchanged exact head and supply them to fresh Sol/xhigh closure rereview without another cursor mutation.
-This slice is local, non-billable, default-off, and has one merge boundary.
+That exact docs head became `58144d30bcb6192330a205718ddd280e3b3e961e` and received a sixth Sol/xhigh
+**REVISE**. All fourteen original findings and the runtime-image `SMELL` were resolved. The uncertain-publication
+finding remained Medium `WRONG`: a probe or hold-journal failure could leave `Admitted` without a hold, allowing a
+tombstone to unlink hot bytes before cold indexing. One new High `WRONG` showed that five append-only journals
+exposed their final generation names before complete write and file sync. Its 16,531-byte artifact has SHA-256
+`ec65e03c59070f5125f81f4175bc5e782cc1e2f273ef082b388ed03f94e82f43`.
+
+Sixth remediation is checkpointed at `43b429a`. Pending tombstones and Admitted cold copies are mutually exclusive
+in both transition directions and model validation, with a final pre-deletion check. Evidence, migration, outbox,
+status, and notification appends now fully write and file-sync a fixed owner-private temp before descriptor-relative
+no-replace rename and parent sync. Reopen ignores only that exact temp/removal-quarantine residue; the next owner
+append verifies and removes it before quota accounting; wrong-type, linked, wrong-owner, or wrong-mode residue fails
+closed. The corrected tombstone and truncated-outbox-tail regressions each failed **0/1** on the reviewed mechanism
+and now pass. Five journal interruption/reopen/retry tests and local atomic-publication, cleanup-quarantine, and
+untrusted-residue edges are also green. Affected suites are local file **17/0**, evidence **49/0**, outbox **8/0**,
+status **12/0**, and retention **35/0**. Exact source commit `43b429a` passes format/diff, workspace all-target/all-
+feature warnings-denied check and Clippy, dependency policy, locked release workspace build, hygiene **37/7**,
+manifest **9**, recipes **4**, foundation **6/4**, scheduler CLI **25/0 + 31/0 + 2/0**, complete binary **770/0/0**,
+and canonical full serial workspace **2,510/0/12 ignored** across **72** groups (**55** nonempty). Its 215,224-byte
+canonical log has SHA-256 `608aaa7136fa24655341d5e9aeccfb668b80de46ee82bde9bb94e751f210c4d9`; the
+provider-unexercised 26,793,312-byte release binary has SHA-256
+`a5f08c29a161cee2e5da6742e980c00018f597a9814f93dd8f4b9c30728f4aa4`. The docs-only commit containing this
+evidence is the intended next review head. No approval is claimed. This slice remains local, non-billable,
+default-off, and has one merge boundary.
 
 The approved design of record is
 [`2026-07-11-r3-compatibility-canaries.md`](2026-07-11-r3-compatibility-canaries.md), especially D4/D8,
@@ -440,9 +463,30 @@ gate and canonical full serial workspace **2,502/0/12 ignored** across **72** re
 complete log is 214,265 bytes at SHA-256
 `706077f6db0216d33a54e44dc074016178b33c6f14ec271b5c852c38426270fd`; the provider-unexercised release binary is
 26,793,312 bytes at SHA-256 `57b47f37725e64a92fc28641121395c0915aac95edb60dae8c4974dbb919ba1e`.
-The docs-only commit containing this paragraph is the intended review head. Reproduce deterministic gates on that
-exact unchanged head as supplied review evidence, then run fresh Sol closure rereview without another docs fold.
-No approval is claimed yet.
+Exact docs head `58144d30bcb6192330a205718ddd280e3b3e961e` reproduced those gates. Fresh Sol/xhigh/read-only
+closure rereview returned a sixth **REVISE**. It resolved all fourteen original findings and the runtime-image
+atomic-reference `SMELL`, retained the uncertain-publication finding as Medium `WRONG`, and added one High `WRONG`:
+evidence, migration, outbox, status, and notification append paths exposed their final generation names before
+complete write and file sync. A crash could therefore leave a truncated committed-looking tail that poisoned every
+reopen. The 16,531-byte review artifact has SHA-256
+`ec65e03c59070f5125f81f4175bc5e782cc1e2f273ef082b388ed03f94e82f43`.
+
+Sixth remediation commit `43b429a` closes both findings. Admitted cold copies and Pending tombstones are mutually
+exclusive in model validation and both transition directions, and deletion rechecks the exclusion before effects.
+All five journals share a descriptor-relative append primitive that writes and file-syncs a fixed mode-`0600`
+owner-private temp before atomic no-replace rename and parent sync. Read-only reopen ignores only that exact temp or
+its deterministic removal quarantine; the next owner append validates and removes residue before quota accounting.
+Unexpected type, links, owner, or mode fail closed. The corrected tombstone and truncated-tail assertions each
+failed **0/1** on the reviewed mechanism and now pass; five call-site interruption/reopen/retry tests plus local
+cleanup-quarantine and untrusted-residue edges cover the shared primitive. Affected suites pass local file **17/0**,
+evidence **49/0**, outbox **8/0**, status **12/0**, and retention **35/0**. Exact source head `43b429a` passes every
+deterministic gate, complete binary **770/0/0**, and canonical full serial workspace **2,510/0/12 ignored** across
+**72** result groups (**55** nonempty). The complete log is 215,224 bytes at SHA-256
+`608aaa7136fa24655341d5e9aeccfb668b80de46ee82bde9bb94e751f210c4d9`; the provider-unexercised release binary is
+26,793,312 bytes at SHA-256 `a5f08c29a161cee2e5da6742e980c00018f597a9814f93dd8f4b9c30728f4aa4`.
+The docs-only commit containing this paragraph is the intended next review head. Reproduce deterministic gates on
+that exact unchanged head as supplied review evidence, then run fresh Sol closure rereview without another docs
+fold. No approval is claimed yet.
 
 One dogfood incident is deliberately deferred outside R3d3 correctness. Operator release `983398427c9f0486`
 served a healthy agent card/model catalog and green Codex doctor/provenance checks with zero unfinished tasks and
