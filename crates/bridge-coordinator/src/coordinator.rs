@@ -2363,6 +2363,114 @@ mod tests {
             }
         }
 
+        struct PendingBackend;
+
+        #[async_trait::async_trait]
+        impl AgentBackend for PendingBackend {
+            async fn prompt(
+                &self,
+                _session: &SessionId,
+                _parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                Ok(Box::pin(futures::stream::pending()))
+            }
+
+            async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+
+        fn in_flight(observer: &bridge_observ::PrometheusObserver) -> i64 {
+            observer
+                .endpoint()
+                .render()
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("bridge_turns_in_flight "))
+                .expect("in-flight gauge is registered")
+                .parse()
+                .expect("in-flight gauge is an integer")
+        }
+
+        #[tokio::test]
+        async fn direct_prompt_metric_matches_running_then_idle_lifecycle() {
+            let observer = Arc::new(
+                bridge_observ::PrometheusObserver::new(bridge_observ::LabelVocabulary::default())
+                    .unwrap(),
+            );
+            let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+                backend: Arc::new(PendingBackend),
+            });
+            let sm = Arc::new(crate::session_manager::SessionManager::new(
+                registry.clone(),
+                std::time::Duration::from_secs(60),
+            ));
+            let coord = Arc::new(Coordinator::new(
+                sm,
+                None,
+                Arc::new(std::collections::HashMap::new()),
+                Arc::new(MemoryTaskStore::new()),
+                Arc::new(super::FakeSessionStore::default()),
+                Arc::new(super::AllowPolicy),
+                registry,
+                Arc::new(crate::clock::SystemClock),
+                None,
+                None,
+                observer.clone(),
+                3,
+            ));
+            let context = ContextId::parse("ctx-metric-running").unwrap();
+            let params = OpParams {
+                input: "hold".into(),
+                context: Some(context.clone()),
+                agent: Some(AgentId::parse("codex").unwrap()),
+                model: None,
+                effort: None,
+                mode: None,
+                cwd: None,
+                workflow: None,
+                skill: None,
+            };
+
+            let running_coord = coord.clone();
+            let running = tokio::spawn(async move { running_coord.prompt(params).await });
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if in_flight(&observer) == 1
+                        && coord
+                            .session_manager
+                            .status(&context)
+                            .await
+                            .is_some_and(|status| status.state == "running")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("direct turn must become visible as running and in-flight");
+
+            running.abort();
+            let _ = running.await;
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if in_flight(&observer) == 0
+                        && coord
+                            .session_manager
+                            .status(&context)
+                            .await
+                            .is_some_and(|status| status.state == "idle")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("dropped direct turn must return to idle and leave in-flight accounting");
+        }
+
         #[tokio::test]
         async fn collect_turn_dropped_with_usage_emits_canceled_and_usage_finalized() {
             let usage_snap = UsageSnapshot {
