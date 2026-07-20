@@ -752,6 +752,16 @@ impl EvidenceStateModelV1 {
                 PinLifecycleV1::Active if !self.entries.contains_key(&pin.evidence_id) => {
                     return Err("schedule evidence: active pin has no live evidence".into())
                 }
+                PinLifecycleV1::Active
+                    if self.tombstones.values().any(|tombstone| {
+                        tombstone.evidence_id == pin.evidence_id
+                            && tombstone.lifecycle == TombstoneLifecycleV1::Pending
+                    }) =>
+                {
+                    return Err(
+                        "schedule evidence: active pin conflicts with pending tombstone".into(),
+                    )
+                }
                 PinLifecycleV1::Released {
                     released_at_ms,
                     reason,
@@ -1312,6 +1322,12 @@ impl EvidenceStateModelV1 {
         let mut candidate = self.clone();
         if candidate.pins.contains_key(&pin.pin_id) || pin.lifecycle != PinLifecycleV1::Active {
             return Err("schedule evidence: pin must be a new active record".into());
+        }
+        if candidate.tombstones.values().any(|tombstone| {
+            tombstone.evidence_id == pin.evidence_id
+                && tombstone.lifecycle == TombstoneLifecycleV1::Pending
+        }) {
+            return Err("schedule evidence: pending tombstone blocks a new pin".into());
         }
         candidate.pins.insert(pin.pin_id.clone(), pin);
         candidate.validate()?;
@@ -5649,6 +5665,38 @@ mod tests {
             .successor(state, pending.recorded_at_ms + 1)
             .unwrap();
         assert!(validate_evidence_state_transition(&pending, &next).is_err());
+    }
+
+    #[test]
+    fn model_rejects_an_active_pin_combined_with_a_pending_tombstone() {
+        let mut state = model();
+        state
+            .insert_entry(entry("evidence-1", 1_000_000, 512))
+            .unwrap();
+        state
+            .begin_tombstone(
+                "tombstone-1",
+                "evidence-1",
+                "retention_expired",
+                20_000_000_000,
+            )
+            .unwrap();
+        state.pins.insert(
+            "pin-1".into(),
+            EvidencePinV1 {
+                pin_id: "pin-1".into(),
+                evidence_id: "evidence-1".into(),
+                reason: "invalid late pin".into(),
+                created_at_ms: 20_000_000_001,
+                lifecycle: PinLifecycleV1::Active,
+            },
+        );
+
+        assert!(state
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("active pin conflicts with pending tombstone"));
     }
 
     #[test]

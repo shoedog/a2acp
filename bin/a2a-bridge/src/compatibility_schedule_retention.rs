@@ -477,6 +477,32 @@ fn child_disposition(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+fn removal_child_disposition(
+    directory: &local_file::PinnedDirectory,
+    name: &str,
+) -> Result<ChildDispositionV1, BoxError> {
+    let Some(candidate_name) = directory
+        .regular_child_removal_candidate(OsStr::new(name), "cold evidence removal candidate")?
+    else {
+        return Ok(ChildDispositionV1::Absent);
+    };
+    let Some(metadata) =
+        directory.child_metadata_no_follow(&candidate_name, "cold evidence removal candidate")?
+    else {
+        return Err("schedule retention: cold removal candidate disappeared".into());
+    };
+    if metadata.is_regular()
+        && metadata.link_count() == 1
+        && metadata.owner_uid() == unsafe { libc::geteuid() }
+        && metadata.permission_mode() == PRIVATE_FILE_MODE
+    {
+        Ok(ChildDispositionV1::PrivateRegular)
+    } else {
+        Ok(ChildDispositionV1::Other)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn single_component<'a>(
     path: &'a RelativeEvidencePathV1,
     label: &str,
@@ -504,10 +530,10 @@ pub(super) fn inspect_cold_copy_residue(
     let archive = single_component(&copy.archive_path, "cold archive path")?;
     let manifest = single_component(&copy.manifest_path, "cold manifest path")?;
     let states = [
-        child_disposition(&cold.root, &partial_name(archive))?,
-        child_disposition(&cold.root, &partial_name(manifest))?,
-        child_disposition(&cold.root, archive)?,
-        child_disposition(&cold.root, manifest)?,
+        removal_child_disposition(&cold.root, &partial_name(archive))?,
+        removal_child_disposition(&cold.root, &partial_name(manifest))?,
+        removal_child_disposition(&cold.root, archive)?,
+        removal_child_disposition(&cold.root, manifest)?,
     ];
     if states.contains(&ChildDispositionV1::Other) {
         return Ok(ColdResidueDispositionV1::Ambiguous);
@@ -913,9 +939,15 @@ fn cleanup_exact_partial(
     expected_bytes: u64,
     expected_sha256: &str,
 ) -> Result<(), BoxError> {
+    let Some(candidate_name) = cold
+        .root
+        .regular_child_removal_candidate(OsStr::new(name), "abandoned cold partial")?
+    else {
+        return Ok(());
+    };
     let file = cold
         .root
-        .open_regular_file(OsStr::new(name), "abandoned cold partial")?;
+        .open_regular_file(&candidate_name, "abandoned cold partial")?;
     validate_private_file(&file.metadata()?, "abandoned cold partial")?;
     let snapshot = local_file::read_open_regular_file_bounded(
         &file,
@@ -925,8 +957,9 @@ fn cleanup_exact_partial(
     if snapshot.bytes.len() as u64 != expected_bytes || snapshot.sha256 != expected_sha256 {
         return Err("schedule retention: abandoned cold partial length or hash mismatch".into());
     }
-    cold.root.remove_regular_child(
-        local_file::RegularChildRef::new(OsStr::new(name), &file),
+    cold.root.remove_regular_child_candidate(
+        OsStr::new(name),
+        local_file::RegularChildRef::new(&candidate_name, &file),
         "abandoned cold partial cleanup",
     )?;
     cold.root.sync()?;
@@ -1101,14 +1134,17 @@ fn verified_optional_hot_file(
     name: &str,
     expected_bytes: u64,
     expected_sha256: &str,
-) -> Result<Option<std::fs::File>, BoxError> {
-    let Some(metadata) =
-        payload.child_metadata_no_follow(OsStr::new(name), "hot evidence cleanup payload child")?
+) -> Result<Option<(std::ffi::OsString, std::fs::File)>, BoxError> {
+    let Some(candidate_name) = payload
+        .regular_child_removal_candidate(OsStr::new(name), "hot evidence cleanup payload child")?
     else {
         return Ok(None);
     };
+    let metadata = payload
+        .child_metadata_no_follow(&candidate_name, "hot evidence cleanup payload child")?
+        .ok_or("schedule retention: hot cleanup candidate disappeared")?;
     validate_private_child(metadata, "hot evidence cleanup payload child")?;
-    let file = payload.open_regular_file(OsStr::new(name), "hot evidence cleanup payload child")?;
+    let file = payload.open_regular_file(&candidate_name, "hot evidence cleanup payload child")?;
     validate_private_file(&file.metadata()?, "hot evidence cleanup payload child")?;
     let snapshot = local_file::read_open_regular_file_bounded(
         &file,
@@ -1118,7 +1154,7 @@ fn verified_optional_hot_file(
     if snapshot.bytes.len() as u64 != expected_bytes || snapshot.sha256 != expected_sha256 {
         return Err("schedule retention: hot cleanup payload length or hash mismatch".into());
     }
-    Ok(Some(file))
+    Ok(Some((candidate_name, file)))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1186,19 +1222,34 @@ fn cleanup_exact_hot_payload(
         })
         .collect::<Result<Vec<_>, _>>()?;
     names.sort();
-    if names
-        .iter()
-        .any(|name| name != "evidence.tar.gz" && name != "manifest.json")
-    {
+    let archive_quarantine = local_file::removal_quarantine_name(
+        OsStr::new("evidence.tar.gz"),
+        "hot evidence archive eviction",
+    )?
+    .into_string()
+    .map_err(|_| "schedule retention: hot archive quarantine name is not UTF-8")?;
+    let manifest_quarantine = local_file::removal_quarantine_name(
+        OsStr::new("manifest.json"),
+        "hot evidence manifest eviction",
+    )?
+    .into_string()
+    .map_err(|_| "schedule retention: hot manifest quarantine name is not UTF-8")?;
+    if names.iter().any(|name| {
+        name != "evidence.tar.gz"
+            && name != "manifest.json"
+            && name != &archive_quarantine
+            && name != &manifest_quarantine
+    }) {
         return Err("schedule retention: hot cleanup payload has an unexpected child".into());
     }
     let archive =
         verified_optional_hot_file(&payload, "evidence.tar.gz", archive_bytes, archive_sha256)?;
     let manifest =
         verified_optional_hot_file(&payload, "manifest.json", manifest_bytes, manifest_sha256)?;
-    if let Some(file) = archive {
-        payload.remove_regular_child(
-            local_file::RegularChildRef::new(OsStr::new("evidence.tar.gz"), &file),
+    if let Some((candidate_name, file)) = archive {
+        payload.remove_regular_child_candidate(
+            OsStr::new("evidence.tar.gz"),
+            local_file::RegularChildRef::new(&candidate_name, &file),
             "hot evidence archive eviction",
         )?;
         payload.sync()?;
@@ -1206,9 +1257,10 @@ fn cleanup_exact_hot_payload(
             return Err("schedule retention: injected crash after hot archive cleanup".into());
         }
     }
-    if let Some(file) = manifest {
-        payload.remove_regular_child(
-            local_file::RegularChildRef::new(OsStr::new("manifest.json"), &file),
+    if let Some((candidate_name, file)) = manifest {
+        payload.remove_regular_child_candidate(
+            OsStr::new("manifest.json"),
+            local_file::RegularChildRef::new(&candidate_name, &file),
             "hot evidence manifest eviction",
         )?;
     }
@@ -1441,9 +1493,18 @@ fn open_optional_cold_deletion_file(
     expected_sha256: &str,
     observed_at_ms: i64,
     label: &str,
-) -> Result<Option<std::fs::File>, BoxError> {
+) -> Result<Option<(std::ffi::OsString, std::fs::File)>, BoxError> {
     let name = single_component(path, label)?;
-    match child_disposition(&cold.root, name)? {
+    let Some(candidate_name) = cold
+        .root
+        .regular_child_removal_candidate(OsStr::new(name), label)?
+    else {
+        return Ok(None);
+    };
+    let candidate_component = candidate_name
+        .to_str()
+        .ok_or_else(|| format!("schedule retention: {label} candidate is not UTF-8"))?;
+    match child_disposition(&cold.root, candidate_component)? {
         ChildDispositionV1::Absent => return Ok(None),
         ChildDispositionV1::Other => {
             return Err(format!("schedule retention: {label} has unsafe metadata").into())
@@ -1453,14 +1514,17 @@ fn open_optional_cold_deletion_file(
     let probe = provider_probe
         .as_deref_mut()
         .ok_or("schedule retention: cold deletion probe is unavailable")?;
-    materialize_for_deletion(cold, probe, copy, path, observed_at_ms)?;
-    let file = cold.root.open_regular_file(OsStr::new(name), label)?;
+    let candidate_path = RelativeEvidencePathV1 {
+        components: vec![candidate_component.into()],
+    };
+    materialize_for_deletion(cold, probe, copy, &candidate_path, observed_at_ms)?;
+    let file = cold.root.open_regular_file(&candidate_name, label)?;
     validate_private_file(&file.metadata()?, label)?;
     let snapshot = local_file::read_open_regular_file_bounded(&file, label, expected_bytes)?;
     if snapshot.bytes.len() as u64 != expected_bytes || snapshot.sha256 != expected_sha256 {
         return Err(format!("schedule retention: {label} length or hash mismatch").into());
     }
-    Ok(Some(file))
+    Ok(Some((candidate_name, file)))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1524,13 +1588,14 @@ fn cleanup_exact_cold_payload(
         opened.push((path.clone(), file, *label));
     }
     let mut unlinked_any = false;
-    for (path, file, label) in opened {
-        let Some(file) = file else {
+    for (path, candidate, label) in opened {
+        let Some((candidate_name, file)) = candidate else {
             continue;
         };
         let name = single_component(&path, label)?;
-        cold.root.remove_regular_child(
-            local_file::RegularChildRef::new(OsStr::new(name), &file),
+        cold.root.remove_regular_child_candidate(
+            OsStr::new(name),
+            local_file::RegularChildRef::new(&candidate_name, &file),
             label,
         )?;
         cold.root.sync()?;
@@ -1541,7 +1606,11 @@ fn cleanup_exact_cold_payload(
     }
     for (path, _, _, label) in &files {
         let name = single_component(path, label)?;
-        if child_disposition(&cold.root, name)? != ChildDispositionV1::Absent {
+        if cold
+            .root
+            .regular_child_removal_candidate(OsStr::new(name), label)?
+            .is_some()
+        {
             return Err("schedule retention: cold evidence remained after deletion".into());
         }
     }
@@ -1615,6 +1684,9 @@ pub(super) fn execute_evidence_tombstone<C: EvidenceStateCapability + ?Sized>(
             .any(|hold| hold.evidence_id == evidence_id)
     {
         return Err("schedule retention: integrity hold blocks evidence deletion".into());
+    }
+    if tombstone.lifecycle == TombstoneLifecycleV1::Pending && state.has_active_pin(evidence_id) {
+        return Err("schedule retention: active pin blocks evidence deletion".into());
     }
 
     cleanup_exact_hot_payload(
@@ -2550,6 +2622,10 @@ pub(super) fn execute_bundle_gc_item<
         .entries
         .iter()
         .find(|entry| entry.bundle_id == item.entry.bundle_id);
+    let name = OsStr::new(&item.entry.path.components[0]);
+    let removal_candidate = store
+        .root
+        .regular_child_removal_candidate(name, "bundle GC target")?;
     if let Some(current_entry) = current_entry {
         if current_entry != &item.entry {
             return finish_bundle_safe_skip(
@@ -2575,14 +2651,7 @@ pub(super) fn execute_bundle_gc_item<
                 completed_at_ms,
             );
         }
-    } else if store
-        .root
-        .child_metadata_no_follow(
-            OsStr::new(&item.entry.path.components[0]),
-            "bundle GC target",
-        )?
-        .is_some()
-    {
+    } else if removal_candidate.as_deref() == Some(name) {
         return finish_bundle_safe_skip(
             journal,
             state,
@@ -2592,13 +2661,10 @@ pub(super) fn execute_bundle_gc_item<
         );
     }
 
-    let name = OsStr::new(&item.entry.path.components[0]);
-    let existed = if store
-        .root
-        .child_metadata_no_follow(name, "bundle GC target")?
-        .is_some()
-    {
-        let file = store.root.open_regular_file(name, "bundle GC target")?;
+    let existed = if let Some(candidate_name) = removal_candidate {
+        let file = store
+            .root
+            .open_regular_file(&candidate_name, "bundle GC target")?;
         validate_private_file(&file.metadata()?, "bundle GC target")?;
         let snapshot = local_file::read_open_regular_file_bounded(
             &file,
@@ -2610,8 +2676,9 @@ pub(super) fn execute_bundle_gc_item<
         {
             return Err("schedule retention: bundle GC target identity changed".into());
         }
-        store.root.remove_regular_child(
-            local_file::RegularChildRef::new(name, &file),
+        store.root.remove_regular_child_candidate(
+            name,
+            local_file::RegularChildRef::new(&candidate_name, &file),
             "bundle GC target",
         )?;
         store.root.sync()?;
@@ -4616,6 +4683,124 @@ mod tests {
     }
 
     #[test]
+    fn tombstone_recovers_a_synced_hot_removal_quarantine_without_fabricating_absence() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3a-tombstone-quarantine-recovery")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let evidence_id = "evidence-1";
+        let payload = fixture
+            .hot_root
+            .path()
+            .join("sealed")
+            .join(local_file::sha256_hex(evidence_id.as_bytes()));
+
+        assert!(execute_evidence_tombstone(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            None,
+            None,
+            "tombstone-quarantine",
+            evidence_id,
+            "retention_expired",
+            BASE + 1,
+            BASE + 2,
+            EvidenceTombstoneFailpointV1::AfterPendingIntent,
+        )
+        .is_err());
+
+        let archive_name = OsStr::new("evidence.tar.gz");
+        let quarantine_name =
+            local_file::removal_quarantine_name(archive_name, "hot evidence archive eviction")
+                .unwrap();
+        std::fs::rename(payload.join(archive_name), payload.join(&quarantine_name)).unwrap();
+        pin(&payload, "test hot quarantine").sync().unwrap();
+        assert!(!payload.join(archive_name).exists());
+        assert!(payload.join(&quarantine_name).exists());
+        assert!(state.entries.contains_key(evidence_id));
+
+        assert!(matches!(
+            execute_evidence_tombstone(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &fixture.hot,
+                None,
+                None,
+                "tombstone-quarantine",
+                evidence_id,
+                "retention_expired",
+                BASE + 3,
+                BASE + 4,
+                EvidenceTombstoneFailpointV1::None,
+            )
+            .unwrap(),
+            EvidenceTombstoneOutcomeV1::Completed { .. }
+        ));
+        assert!(!payload.exists());
+        assert!(!state.entries.contains_key(evidence_id));
+        assert!(matches!(
+            state.tombstones["tombstone-quarantine"].lifecycle,
+            TombstoneLifecycleV1::FullEvidenceUnlinked { .. }
+        ));
+    }
+
+    #[test]
+    fn pending_tombstone_rejects_a_later_pin_without_deleting_evidence() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3a-tombstone-pin-race")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let evidence_id = "evidence-1";
+        let payload = fixture
+            .hot_root
+            .path()
+            .join("sealed")
+            .join(local_file::sha256_hex(evidence_id.as_bytes()));
+
+        assert!(execute_evidence_tombstone(
+            &owner,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            None,
+            None,
+            "tombstone-pin-race",
+            evidence_id,
+            "retention_expired",
+            BASE + 1,
+            BASE + 2,
+            EvidenceTombstoneFailpointV1::AfterPendingIntent,
+        )
+        .is_err());
+        let pending = state.clone();
+
+        let error = state
+            .pin(crate::compatibility_schedule_evidence::EvidencePinV1 {
+                pin_id: "pin-after-pending".into(),
+                evidence_id: evidence_id.into(),
+                reason: "late incident investigation".into(),
+                created_at_ms: BASE + 3,
+                lifecycle: crate::compatibility_schedule_evidence::PinLifecycleV1::Active,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("pending tombstone"));
+        assert_eq!(state, pending);
+        assert!(payload.join("evidence.tar.gz").exists());
+        assert!(payload.join("manifest.json").exists());
+    }
+
+    #[test]
     fn cold_only_tombstone_recovers_after_the_first_cold_unlink() {
         let _gc_test_guard = gc_test_guard();
         let fixture = Fixture::new();
@@ -4728,6 +4913,102 @@ mod tests {
             .unwrap(),
             EvidenceTombstoneOutcomeV1::AlreadyComplete
         );
+    }
+
+    #[test]
+    fn cold_tombstone_recovers_a_synced_removal_quarantine_through_provider_probe() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let mut provider = FakeProvider::new(&fixture.cold);
+        provider.synchronization = FileProviderSynchronizationV1::Synchronized;
+        let admission = admit(&fixture, &mut provider, "evidence-1", BASE + 1);
+        let combined = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3a-cold-quarantine-owner")
+            .unwrap()
+            .try_authority_state("test/r3d3a-cold-quarantine-authority")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&combined).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        publish_admitted_cold_copy(
+            &combined,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            &fixture.cold,
+            &mut provider,
+            &fixture.consent,
+            &admission.copy_id,
+            BASE + 2,
+            ColdPublicationFailpointV1::None,
+        )
+        .unwrap();
+        evict_hot_evidence(
+            &combined,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            &fixture.cold,
+            &mut provider,
+            "evidence-1",
+            BASE + 3,
+            HotEvictionFailpointV1::None,
+        )
+        .unwrap();
+
+        assert!(execute_evidence_tombstone(
+            &combined,
+            &mut opened.journal,
+            &mut state,
+            &fixture.hot,
+            Some(&fixture.cold),
+            Some(&mut provider),
+            "tombstone-cold-quarantine",
+            "evidence-1",
+            "retention_expired",
+            BASE + 4,
+            BASE + 5,
+            EvidenceTombstoneFailpointV1::AfterPendingIntent,
+        )
+        .is_err());
+
+        let archive_name = OsStr::new(&admission.archive_path.components[0]);
+        let quarantine_name =
+            local_file::removal_quarantine_name(archive_name, "cold evidence archive deletion")
+                .unwrap();
+        let archive_path = fixture.cold_root.path().join(archive_name);
+        let quarantine_path = fixture.cold_root.path().join(&quarantine_name);
+        std::fs::rename(&archive_path, &quarantine_path).unwrap();
+        fixture.cold.root.sync().unwrap();
+        assert!(!archive_path.exists());
+        assert!(quarantine_path.exists());
+
+        assert!(matches!(
+            execute_evidence_tombstone(
+                &combined,
+                &mut opened.journal,
+                &mut state,
+                &fixture.hot,
+                Some(&fixture.cold),
+                Some(&mut provider),
+                "tombstone-cold-quarantine",
+                "evidence-1",
+                "retention_expired",
+                BASE + 6,
+                BASE + 7,
+                EvidenceTombstoneFailpointV1::None,
+            )
+            .unwrap(),
+            EvidenceTombstoneOutcomeV1::Completed { .. }
+        ));
+        assert!(!archive_path.exists());
+        assert!(!quarantine_path.exists());
+        assert!(!fixture
+            .cold_root
+            .path()
+            .join(&admission.manifest_path.components[0])
+            .exists());
+        assert!(!state.entries.contains_key("evidence-1"));
     }
 
     #[test]
@@ -4971,6 +5252,103 @@ mod tests {
             .unwrap(),
             BundleGcOutcomeV1::RecoveredAlreadyAbsent
         );
+    }
+
+    #[test]
+    fn bundle_gc_recovers_a_pending_synced_removal_quarantine() {
+        let _gc_test_guard = gc_test_guard();
+        let fixture = Fixture::new();
+        let bundle_root = private_root();
+        write_private(&bundle_root.path().join("old.bundle"), b"old bundle\n");
+        let store =
+            BundleCacheStoreV1::open_existing(&pin(bundle_root.path(), "bundle cache")).unwrap();
+        let owner = fixture
+            .scheduler
+            .try_owner_admission("test/r3d3d-bundle-gc-quarantine")
+            .unwrap();
+        let mut opened = FileEvidenceJournal::open_existing(&owner).unwrap();
+        let mut state = opened.snapshot.state.clone();
+        let now = BASE + 200 * DAY_MS;
+        let entry = bundle_entry(
+            &state,
+            "old",
+            "evidence-1",
+            "codex",
+            "case-a",
+            now - 40 * DAY_MS,
+            BundleCacheKindV1::ReconstructiblePayload,
+            b"old bundle\n",
+        );
+        let inventory = BundleCacheInventoryV1 {
+            cache_root_sha256: store.root_sha256().into(),
+            observed_at_ms: now,
+            entries: vec![entry],
+            referenced_bundle_ids: BTreeSet::new(),
+        };
+        let plan = plan_bundle_gc(&state, &inventory, now).unwrap();
+        let item = &plan.removals[0];
+
+        let reader = acquire_bundle_read_lease(&owner, "old").unwrap();
+        let mut busy_inventory = inventory.clone();
+        busy_inventory.observed_at_ms = now + 1;
+        let mut busy_probe = fixed_bundle_inventory_probe(busy_inventory);
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &inventory,
+                &mut busy_probe,
+                item,
+                now + 1,
+                now + 2,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::DeferredLeaseBusy
+        );
+        drop(reader);
+
+        let original_name = OsStr::new("old.bundle");
+        let quarantine_name =
+            local_file::removal_quarantine_name(original_name, "bundle GC target").unwrap();
+        std::fs::rename(
+            bundle_root.path().join(original_name),
+            bundle_root.path().join(&quarantine_name),
+        )
+        .unwrap();
+        store.root.sync().unwrap();
+
+        let recovered_inventory = BundleCacheInventoryV1 {
+            cache_root_sha256: store.root_sha256().into(),
+            observed_at_ms: now + 3,
+            entries: Vec::new(),
+            referenced_bundle_ids: BTreeSet::new(),
+        };
+        let mut recovery_probe = fixed_bundle_inventory_probe(recovered_inventory);
+        assert_eq!(
+            execute_bundle_gc_item(
+                &owner,
+                &mut opened.journal,
+                &mut state,
+                &store,
+                &inventory,
+                &mut recovery_probe,
+                item,
+                now + 3,
+                now + 4,
+                BundleGcFailpointV1::None,
+            )
+            .unwrap(),
+            BundleGcOutcomeV1::Removed
+        );
+        assert!(!bundle_root.path().join(original_name).exists());
+        assert!(!bundle_root.path().join(quarantine_name).exists());
+        assert!(matches!(
+            state.bundle_gc_actions[&item.action_id].lifecycle,
+            crate::compatibility_schedule_evidence::BundleGcLifecycleV1::Unlinked { .. }
+        ));
     }
 
     #[test]

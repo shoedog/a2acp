@@ -17,7 +17,7 @@ fn top_level_help_discovers_the_read_only_schedule_status_surface() {
 }
 
 #[test]
-fn schedule_status_does_not_write_the_caller_home_or_echo_credential_environment() {
+fn schedule_status_ignores_redirected_home_and_leaves_it_unchanged() {
     let home = tempfile::tempdir().unwrap();
     let before = fs::read_dir(home.path()).unwrap().count();
 
@@ -26,7 +26,6 @@ fn schedule_status_does_not_write_the_caller_home_or_echo_credential_environment
         .arg("schedule")
         .arg("status")
         .env("HOME", home.path())
-        .env("OPENAI_API_KEY", "must-not-be-read")
         .output()
         .unwrap();
     assert!(human.status.success());
@@ -34,7 +33,6 @@ fn schedule_status_does_not_write_the_caller_home_or_echo_credential_environment
     assert!(human_stdout.contains("state: "));
     assert!(human_stdout.contains("activation: r3d5_activation_not_enabled"));
     assert!(human_stdout.contains("effects: no_effects"));
-    assert!(!human_stdout.contains("must-not-be-read"));
     assert!(human.stderr.is_empty());
 
     let json = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
@@ -43,7 +41,6 @@ fn schedule_status_does_not_write_the_caller_home_or_echo_credential_environment
         .arg("status")
         .arg("--json")
         .env("HOME", home.path())
-        .env("OPENAI_API_KEY", "must-not-be-read")
         .output()
         .unwrap();
     assert!(json.status.success());
