@@ -1,11 +1,29 @@
 # R2f — Phase-aware liveness and safe takeover plan
 
-- **Status:** INTAKE REVALIDATED; focused owner design not started
+- **Status:** DESIGN APPROVED by clean-room Sol/xhigh closure review 5; D1-D11 settled; every inherited item fixed;
+  no new `WRONG` or `SMELL`; source implementation not started; next slice R2f0a
 - **Prerequisite:** R2b structured diagnostics merged; may proceed independently of R2c–R2e afterward
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
+- **Focused owner design:** [`../specs/2026-07-20-r2f-owner-design.md`](../specs/2026-07-20-r2f-owner-design.md)
+- **Queued process-deployment increment:** [`2026-07-20-r2g-stable-ingress.md`](2026-07-20-r2g-stable-ingress.md)
+- **Short-bound validation spike:**
+  [`../spikes/2026-07-20-r2f-short-bound-validation.md`](../spikes/2026-07-20-r2f-short-bound-validation.md)
+- **Adversarial review 1:**
+  [`../reviews/2026-07-20-r2f-owner-design-sol-review-1.md`](../reviews/2026-07-20-r2f-owner-design-sol-review-1.md)
+- **Closure review 1:**
+  [`../reviews/2026-07-20-r2f-owner-design-sol-closure-review-1.md`](../reviews/2026-07-20-r2f-owner-design-sol-closure-review-1.md)
+- **Failed closure re-review 2:**
+  [`../reviews/2026-07-20-r2f-owner-design-sol-closure-review-2-failed.md`](../reviews/2026-07-20-r2f-owner-design-sol-closure-review-2-failed.md)
+- **Closure review 3:**
+  [`../reviews/2026-07-20-r2f-owner-design-sol-closure-review-3.md`](../reviews/2026-07-20-r2f-owner-design-sol-closure-review-3.md)
+- **Closure review 4:**
+  [`../reviews/2026-07-20-r2f-owner-design-sol-closure-review-4.md`](../reviews/2026-07-20-r2f-owner-design-sol-closure-review-4.md)
+- **Closure review 5 — APPROVE:**
+  [`../reviews/2026-07-20-r2f-owner-design-sol-closure-review-5.md`](../reviews/2026-07-20-r2f-owner-design-sol-closure-review-5.md)
 - **Incident ids:** `INC-VERIFY-STALL-2026-07-11`, `INC-SHARED-WARM-CRASH-2026-07-16`,
   `INC-SHARED-SESSION-CAPACITY-2026-07-17`, `INC-SHARED-RESTART-RECOVERY-2026-07-19`,
+  `INC-UNARY-NULL-FINAL-2026-07-20`,
   [GitHub #22](https://github.com/shoedog/a2acp/issues/22), and
   [GitHub #24](https://github.com/shoedog/a2acp/issues/24)
 
@@ -47,6 +65,15 @@ The earlier isolated comparison stopped no running turn, warm session, backend, 
 replayed no failed request. The later stop/start was an independent operator recovery action, not an R3d gate.
 R2f owns this investigation and every lifecycle remedy. R3d only records that its fresh one-shot executions did
 not evaluate shared-operator health.
+
+The second R2f owner-design closure attempt exposed a separate accepted-work finalization failure on 2026-07-20.
+The exact served bridge and read-only ACP/app-server PIDs stayed alive. The prompt is present in the Codex journal,
+four assistant commentary messages prove active review work, and turn `019f8223-4447-7922-b967-71c4db938ce3`
+emitted `task_complete` after 185.355 seconds with `last_agent_message: null`. The unary client nevertheless returned
+`AgentCrashed`, and no task/turn row was written. The attempt produced no final review and was not retried. Preserve
+this as `INC-UNARY-NULL-FINAL-2026-07-20`: accepted-work, progress, final-message, and transport disposition must be
+separate evidence, and null-final completion must not be mislabeled as proved process death. The durable evidence is
+the [failed review-attempt report](../reviews/2026-07-20-r2f-owner-design-sol-closure-review-2-failed.md).
 
 ## Workflow-node wedge evidence and current-main disposition
 
@@ -107,87 +134,191 @@ owned by R2f; no current evidence attributes the original #24 incident specifica
 - Offline and served execution must converge on the same identifier, phase/progress, completed/pending-node, and
   takeover-artifact contract. A durable id that the invoking operator cannot discover is insufficient.
 
-## R2f0 — Reproduction and meaningful-progress vocabulary
+## R2f0a — Execution/attempt identity, run ledger, and stats
 
-- Capture attempt/provider/adapter/runtime provenance and monotonic timestamps for phase entry, agent
-  update, tool start/end, child spawn/exit, bounded stdout/stderr activity, file mutation, and test result.
-- Define `meaningful_progress` by phase. Verification progress includes command start/exit and bounded
-  output/heartbeat from an owned child; file edits are evidence but never the sole criterion.
-- Reproduce at least: a child blocked forever, an agent waiter parked after a child exits, a silent but
-  healthy long-running verification command, a failed fan-out root beside a silent sibling, a delivered provider
-  limit, a silent provider stream, and a provider turn still emitting non-tool updates.
-- Preserve a hypothesis/probe/result log. Do not label the incident root cause until the observations
-  distinguish provider silence, adapter loss, child-process deadlock, and orchestration wait leakage.
-- Run the focused owner design increment before source implementation. It must settle fan-out failure policy,
-  phase-specific warning/hard thresholds, offline/served attempt identity, takeover authorization, and what evidence
-  is sufficient to disposition a provider-specific incident without forcing billable failure conditions.
+- Mint and expose distinct `execution_id` and `attempt_id` before registry/session/provider effects. `execution_id`
+  remains stable across served resume and operator takeover; every resume/takeover gets a new attempt id, ordinal,
+  parent link, and monotonic clock. Print the offline ids before execution, print the served task/execution locator
+  before SSE, return them through MCP, and retain them on transport loss.
+- For direct unary, require the caller to mint validated high-entropy execution/attempt ids and carry both in the
+  request. `submit` prints them before network I/O. Missing, invalid, or colliding ids refuse before effects; the
+  server never substitutes `task-1`, silently reuses an attempt, or treats a duplicate locator as prompt replay.
+- Give direct served unary submissions a mandatory bounded safety row in the already selected ledger before any
+  registry/session/provider/prompt effect, even when they do not use a workflow task envelope. Initial ledger open
+  or core-reservation failure returns typed pre-effect `durable_evidence_unavailable` and sends no prompt. Once the
+  core row exists, optional summary enrichment may fail open without erasing accepted-work/progress/terminal
+  evidence or the caller-visible recovery ids.
+- Before first effect, select exactly one configured-store or platform-state ledger and reserve one bounded attempt
+  slot plus conservative byte/WAL charge. Every no-store surface, including served/in-memory task execution, selects
+  the platform ledger. Enforce 180 days, 100,000 terminal rows, and 128 MiB for workflow-history allocation.
+  Protected capacity or permission/lock/migration/corruption/I/O/open failure produces a bounded
+  `telemetry_unavailable` reason in status/terminal output while an otherwise admissible workflow proceeds; it never
+  falls through to a second ledger, changes primary outcome, or exceeds the cap. Direct unary is the explicit
+  exception above: its minimal safety reservation is admission-critical, while only later enrichment is fail-open.
+- Commit primary task terminality first and independently for workflow/task surfaces. For direct unary, terminalize
+  the mandatory core row's producer/final/process fields as its primary durable state. Add optional bounded
+  enrichment only afterward. Boot marks a surviving nonterminal reservation interrupted before creating a resume
+  attempt. Store failure cannot roll back primary terminal state or double count reconstructed metrics.
+- Record workflow/task class, execution surface, policy version, workload fingerprint, start/completion clocks,
+  work/end-to-end/cancel/cleanup/finalization durations, outcome, degraded/prompt/cleanup state, phase totals, node
+  disposition counts, and completeness flags. Do not retain prompt/output/process command text or use ids as metric
+  labels.
+- Export multi-hour buckets and a read-only report with count, min, mean, median, p90/p95/p99, max, partitions, and
+  excluded populations. Calibration consumes only healthy non-degraded successes; applying a recommendation remains
+  a separate reviewed policy edit.
 
-## R2f1 — Phase-aware watchdog and stagnation snapshot
+## R2f0b — Meaningful progress, terminal evidence, and recorder
 
-- Add an append-only phase/progress state machine with separate warning and hard-stagnation thresholds;
-  use monotonic time and bounded low-cardinality reason codes.
-- A warning snapshots the exact owned process tree, current phase/command category, last meaningful
-  progress by category, elapsed phase time, worktree status/diff hash, and completed/pending verification
-  gates. It does not cancel, retry, resume, or start another billable attempt.
-- The hard threshold requires both phase stagnation and absence of a live owned child making bounded
-  progress. A quiet process, old file mtime, or large total wall time alone is insufficient.
-- Provider/adapter watchdogs and verification watchdogs remain distinct evidence; neither rewrites the
-  other's diagnosis.
+- Add an append-only activity/progress/absolute-clock recorder with bounded low-cardinality phase/reason codes and no
+  timeout behavior change. Capture phase transitions, agent updates, tool start/end, owned-child spawn/exit and
+  bounded output, file digest change, verification gate start/exit, and completed-gate-set growth. Empty/duplicate
+  events are activity at most, never progress.
+- Use fake monotonic clocks and distinguish provider/adapter, tool, verification, waiter, cleanup, and terminal-store
+  phases. Wall time identifies records/retention only.
+- Record producer terminal event, final assistant message presence, and exact process-liveness observation as
+  independent fields. `task_complete` plus a null/absent final message becomes typed `protocol_incomplete_final`,
+  never `AgentCrashed`, success, or pre-prompt refusal; accepted prompt state stays sticky and no retry is authorized.
+- Implement the owner design's negotiated `a2a_bridge.turn_evidence.v1` ACP extension. Advertise support explicitly,
+  carry opaque attempt correlation in prompt `_meta`, and emit one exact generation/session/adapter-turn/attempt-bound
+  `a2a_bridge/turn_evidence` envelope before the prompt RPC resolves or rejects. For codex-acp, producer disposition
+  comes from native Codex turn terminal evidence; final `nonempty` comes only from a same-turn nonempty assistant item
+  tagged `phase=final_answer` (or an equivalent native terminal field), and `absent` requires authoritative producer
+  completion plus ordered notification drain. Commentary, message id, stop reason, generic error, and process
+  liveness never synthesize either fact.
+- Preserve duplicate-identical envelopes idempotently. Unsupported, advertised-but-missing, malformed, late,
+  mismatched, and duplicate-conflicting evidence produces bounded `protocol_terminal_evidence_*` or
+  `protocol_terminal_unknown`, leaves producer/final unknown where necessary, retains independent process state and
+  sticky acceptance, and never authorizes success, `AgentCrashed`, or retry. The Codex incident lane cannot close
+  until the selected adapter advertises the version and passes conformance against its real mapping.
+- Reproduce blocked child, exited-child/wedged waiter, silent healthy verification, failed fan-out plus silent sibling,
+  delivered provider limit, silent provider stream, and active non-tool model updates. Preserve the
+  hypothesis/probe/result log and do not assign the historical incident a provider/adapter root cause.
 
-## R2f2 — Scoped termination and takeover artifact
+## R2f1a — Profile validation, fan-out policy, and per-node control
 
-- Termination is explicit operator action by default and targets one recorded attempt/process tree. Never
-  use a broad name-based kill, kill unrelated repository tests, or discard the working tree.
-- Stop children before the owned root using recorded identity plus start-time/generation checks so PID
-  reuse cannot target an unrelated process. Record survivors and return partial failure rather than
-  claiming success.
-- Emit a bounded sanitized takeover artifact containing provenance, phase, last progress, exact scoped
-  termination result, worktree diff/hash, gates completed, gates pending, and the command/result needed to
-  resume verification. It contains no credential values or unbounded process output.
-- A takeover reuses the preserved repository state only after an operator selects it. It is a new attempt;
-  no automatic duplicate reviewer/model turn is started, and possibly accepted prompt work is never
-  replayed silently.
+- Check in `legacy_bounded_v1` and `review_high_xhigh_v1` exactly as D4.1 defines them: 30-minute queue cap,
+  30-minute no-progress snapshots, 31-second pre-dispatch control bound, two-hour work cutoff, cancellation observable
+  by six seconds inside 60-second cleanup, and terminal observable by 2:01:10. Explicit unknown profiles/classes fail
+  before effects; true omission alone maps to legacy/`other`; Max requires reason and larger finite work cutoff.
+- Validate one frozen `bounded_independent`, `fail_fast`, or `fixed_grace` policy before prompt. Give every running
+  node its own cancellation source while retaining one workflow-wide source. `fixed_grace`/`fail_fast` use their
+  separately recorded failure trigger; only `bounded_independent` promises a failed sibling never shortens clocks.
+- Preserve deepest bounded causes, structured per-node terminal/cleanup state, and `completed_degraded` synthesis.
+  Exercise manual/fake policy triggers only in this slice; no real automatic deadline ships yet.
 
-## R2f3 — Shared backend/session health and non-disruptive rotation
+## R2f1b — Worktree preservation, warning, deadline, and cleanup ownership
 
-- Preserve structured pre-turn ACP errors instead of collapsing session creation, configuration, transport,
-  and capacity failures into generic `AgentCrashed`.
-- Track created, active, warm, released, close-attempted, closed, retained, and unknown session state per
-  exact backend generation. A local release cannot erase unresolved remote capacity debt.
-- Negotiate and use `session/close` only when the exact adapter capability/protocol proves it exists. If it
-  is absent or close fails, retain typed debt and use backend-generation ownership rather than inventing a
-  successful close.
-- Separate a poisoned transport from a capacity threshold with deterministic fake backends and bounded
-  health evidence. Never hard-code the observed count 15 as a limit.
-- Design rotation as side-by-side generations: new sessions select the new generation while every running
-  turn and warm session remains on its owning generation. No automatic replay, forced warm-session close,
-  broad process kill, or production restart is allowed.
-- Before implementation, run a focused owner design increment for warm-session definition/expiry,
-  generation retirement, health thresholds, operator authorization, and the exact non-disruptive swap
-  protocol. An indefinitely retained warm session must remain visible rather than being killed to make a
-  rotation appear complete.
+- **Prerequisite before enabling any deadline:** add result-bearing `preserve_after_cancel`. Under the sweep/run-end
+  coordination boundary and before cancellation/process effects, parent-sync a protective `preservation_prepared`
+  intent, atomically replace it with a durable identity-bound preserved-worktree claim, then transfer the volatile
+  lease. Run-end and boot sweeps exclude either durable state even for matching run id/free flock; corrupt or
+  ambiguous evidence fails safe without deletion. Resume atomically exchanges the claim for a live lease; only exact
+  retain/archive/delete disposition may release it. Never call provider remove, `git worktree remove --force`, reset,
+  clean, checkout, or delete during cancellation/takeover.
+- Retain each `OwnedProcessTree`-equivalent capability from spawn in exactly one resource flight: generation-scoped
+  for a multiplexed ACP/shared container, exact-resource-scoped for a proved dedicated child/container. Per-node
+  session/worktree flights reference it. Close generation admission and journal intent before signaling; automatic
+  cleanup, manual takeover, release escalation, and retirement that request a resource action join it and publish one
+  result to every collateral owner; ordinary session-only close remains on its per-session flight.
+  Missing/ambiguous capability refuses or returns partial; numeric PID/name artifacts never recreate authority.
+- A 30-minute no-progress crossing snapshots evidence but does not cancel. Before the two-hour work cutoff, only
+  mechanical orphan/impossibility may auto-cancel; silence plus absent observed progress is insufficient. At two
+  hours, request cancel, publish initiating turn disposition by six seconds or transfer its exact owner, settle or
+  type partial/unknown cleanup by 60 seconds, and publish primary terminal/reporting by 2:01:10.
+- Report every collateral session on a shared-process escalation. Close #22 only when failed root plus nonterminating
+  sibling reaches bounded terminal state with all node/cleanup dispositions and preserved worktree state.
+- This merge boundary cannot turn timers on unless preservation, retained-capability single-flight, unrelated-process
+  survival, and worktree-diff survival tests are already green.
 
-## R2f4 — Tests and dogfood
+## R2f2 — Local scoped takeover artifact and resume
 
-- deterministic fake-clock tests for warning/hard thresholds and monotonic rollback immunity;
-- silent healthy child versus blocked child versus exited-child/wedged-waiter classification;
-- active test output prevents a false stall even when the last file edit is old;
-- exact process-tree identity, PID-reuse defense, unrelated-process survival, partial-kill reporting;
-- worktree edits survive termination and the takeover artifact names completed/pending gates exactly;
-- observer/store failure cannot trigger termination or erase the primary diagnostic;
-- no automatic retry, fallback, or second billable attempt;
-- failed root plus nonterminating sibling reaches the selected bounded policy, preserves every final node state, and
-  proves cleanup does not strand the silent sibling;
-- deliberate graceful degradation remains possible for a failed root plus a healthy sibling and synthesis node;
-- offline and served commands expose the same usable attempt/recovery identity on success, failure, cancellation,
-  transport loss, and operator interruption;
-- structured session-new/configure/transport/capacity failures retain their exact phase and cause;
-- capability-present close success, capability-absent retention, close failure, duplicate close, and
-  concurrent release preserve exact session/generation ownership;
-- poisoned transport versus bounded fake capacity exhaustion are distinguishable without assuming a count;
-- generation rotation routes new sessions to the successor while running and warm sessions continue on the
-  predecessor, and an incomplete drain remains visible without interruption;
-- one opt-in dogfood run that intentionally wedges a disposable verifier and proves targeted takeover.
+- Add only local OS-owner CLI authority for manual takeover and explicit generation retirement. Remote controllers
+  retain status/recovery reads and ordinary cancellation; no new destructive remote scope exists.
+- Select exact execution/attempt/node/generation and join its retained generation/resource process flight. Stop enumerated children
+  before the anchored root, record every disposition, and return typed refusal/partial rather than using a late
+  PID/PGID/name signal or claiming success with survivors.
+- Emit an owner-private bounded artifact with provenance, last progress, phase, capability identity, termination and
+  collateral result, preserved worktree diff/hash, completed/pending gates, and exact recovery locator. No credential,
+  unbounded output, or arbitrary command line is retained.
+- Operator-selected resume reuses the recovery-owned worktree from the first unfinished gate under a new attempt id;
+  it never replays a possibly accepted prompt or starts a provider automatically. Explicit final disposition alone
+  may remove the preserved worktree.
+
+## R2f3a — ACP close, durable debt, and capacity
+
+- Separate `forget`, `close_session`, and `retire_generation`. Final cold release no longer treats config-only forget
+  as remote session cleanup. Negotiate close from the exact initialized generation capability.
+- Implement the durable `(generation_id, session_id)` state machine from owner design §6.1: write-before-effect
+  prepared/dispatched boundaries, one idempotency key and serialized flight, capacity claim, acknowledged,
+  unsupported, retry-due, exhausted, and generation-exit resolution.
+- Retry only definitely-not-accepted or contract-idempotent effects. A recovered `close_prepared` has crossed no
+  dispatch barrier, so it dispatches still-unspent ordinal 0 at the first one-minute safe-recovery bound. Only after a
+  recorded ordinal-0 dispatch failure do retry ordinals 1/2/3 run after 1/5/30 minutes from the preceding safe failure.
+  Unsafe/ambiguous dispatch never auto-replays. Boot reconstructs wall timestamps with rollback-safe monotonic delays;
+  concurrent release, retry, drain, and retirement join one flight; generation exit resolves only its exact claims.
+- Source session capacity from a truthful finite adapter capability and/or checked-in
+  `session_capacity_limit`, using the lower when both exist. Durably reserve a creation-attempt claim before
+  `session/new`, bind it to the accepted session id, release it on definitely-not-accepted creation, and retain
+  accepted-or-unknown/no-id as generation-owned `creation_unknown` without replay. Bound claims release only on close
+  ack or exact generation exit. Unknown capacity reports exact claims but never fabricates fullness, automatic
+  replacement, or repair; a known-full generation refuses only a new cold session before provider effect.
+- Cover close capability present/absent, ack/failure, crash before/after dispatch, unspent-ordinal recovery,
+  duplicate/concurrent release, safe/unsafe retry, initial-attempt-plus-third-retry exhaustion,
+  advertised/configured/minimum/unknown capacity, create-acceptance boundaries, known-full refusal, boot recovery,
+  and generation exit.
+
+## R2f3b — Backend health axes and non-disruptive generation drain
+
+- Implement `ephemeral`, actionless `observe`, and production-only `enforce` with separate state roots/namespaces.
+  Promotion creates a fresh production generation and never imports development strikes.
+- Store and serialize the D8 ownership lifecycle (`active`, `draining`, `dead`, `retired`) independently from health
+  (`healthy`, `suspect`, `auth_required`, `degraded_external`, `isolated_unknown`, `quarantined`, `probation`). Enforce
+  routing precedence, illegal transitions, persisted evidence, successor relation, and rollback-safe cooldowns.
+- Exclude auth/config/model/provider-limit/quota/cancel from strikes. Two distinct ambiguous pre-dispatch failures in
+  15 minutes permit one prompt-free same-config successor comparison. Shared external failure self-clears through
+  bounded control; instance-local differential evidence quarantines; inconclusive remains isolated unknown.
+- Default selection favors a healthy active successor. Probation requires exact local authorization and one turn;
+  quarantine blocks warm turns. Mechanical exact-generation exit alone is dead. No provider prompt is retried.
+- Planned drain routes new sessions to the successor while running/warm ownership remains predecessor-affine until
+  TTL/clear/release. Drain age only warns. `urgent_security` freezes future warm turns after the current turn. Retire
+  only after close/debt/process settlement; indefinite ownership stays visible.
+
+## R2f3c — Bridge-process handoff contract
+
+- Expose stable release/process identity, readiness distinct from accepting work, lifecycle/health/drain state,
+  task/execution/attempt/context/session/generation affinity, exact running/warm/producer/debt counts, and bounded
+  refusal/recovery locators required by R2g.
+- Refuse missing/conflicting affinity without replay or guessing. Terminal drain cannot become true while any
+  process-local or debt ownership remains.
+- Do not start another served binary, share the exclusively locked SQLite store, proxy traffic, or claim
+  non-disruptive binary replacement. Stable ingress, cross-process store/SSE ownership, promotion, and rollback remain
+  the dedicated [`R2g plan`](2026-07-20-r2g-stable-ingress.md) immediately after R2f.
+
+## R2f4 — Provider-free matrix, dogfood, and closure
+
+- Run exhaustive fake-clock/profile/fan-out/state-transition/debt/crash/cleanup tests, including wall rollback,
+  duplicate wake, healthy silence, active output, orphaned waiter, exact PID reuse defense, two-node/one-generation
+  escalation, collateral result fan-out, run-end/boot/corrupt-claim worktree survival, telemetry capacity and
+  open/permission/lock/migration/corruption refusal, and primary-terminal/store-failure ordering.
+- Prove no automatic retry/fallback/second billable attempt; offline/served/resume/transport-loss/cancel/takeover all
+  expose both ids and a recovery locator; degraded and fail-fast paths retain every node state/deepest cause.
+- Reproduce `INC-UNARY-NULL-FINAL-2026-07-20` provider-free: accepted work plus progress plus producer
+  `task_complete`/null final yields `protocol_incomplete_final`, a durable direct-unary attempt/turn record, live
+  process disposition, no fabricated final text, and no retry.
+- Prove the adapter evidence boundary separately: negotiated capability and exact correlation; commentary-only then
+  null-final; genuine per-turn failure after commentary; nonempty final-answer; unsupported, missing, malformed,
+  late, duplicate-identical, duplicate-conflicting, reordered, and transport-loss cases. A fake that injects fields
+  proves the state machine only; Codex closure additionally requires captured adapter conformance or separately
+  authorized live evidence from the actual selected lane.
+- Prove direct unary prints its caller-minted ids before network I/O and that missing/invalid/colliding ids plus
+  configured/platform-ledger initial-open and core-reservation failures all refuse before registry/session/provider/
+  prompt effects; optional post-reservation enrichment failure preserves the core record and primary outcome.
+- Run the provider-free matrix before any live gate. Then separately authorize one disposable verifier wedge and
+  targeted takeover. A provider-specific #24 disposition requires captured protocol evidence or separate live
+  authorization; do not manufacture quota exhaustion.
+- Run fresh Sol/xhigh adversarial implementation/full-branch review. Use a hard/complex second lens only if the
+  primary review identifies a qualifying unresolved problem. Report full serial workspace totals and every live/
+  production/deployment path not exercised.
 
 ## Completion
 
