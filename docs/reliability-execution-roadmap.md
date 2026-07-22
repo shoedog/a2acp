@@ -10,7 +10,9 @@
   **MERGED** by PR #45 at `db0eb28f`; R2e remains deferred and off the critical path
 - **Active slice:** R2f design is **APPROVED** on `agent/r2f-owner-design`, based directly on `345941db`; clean-room
   Sol/xhigh closure review 5 fixed every inherited item, found no new `WRONG` or `SMELL`, and returned `APPROVE`;
-  source implementation is not started and R2f0a is next
+  R2f0a is implementation-complete and fully host-verified on `agent/r2f0a-identity-ledger` at source checkpoint
+  `74bb1283`; final frozen-head Sol/xhigh full-branch review is pending, and R2f0b follows only after the R2f0a
+  review/merge boundary
 - **Issue #36 closure:** **FAIL-FIRST REGRESSIONS PROVED / TWO-LAYER GUARD IMPLEMENTED / FOCUSED GATES GREEN /
   FULL WORKSPACE GATE GREEN / PR #46 MERGED**. Config admission is **1/0**, core Codex/Kiro delivery is **14/0**,
   ACP framing is **1/0**, and the real-process MCP boundary is **6/0**. The canonical full serial workspace is
@@ -19,7 +21,8 @@
   green. No provider, compatibility, production-server, or live controller turn was exercised.
 - **R2f intake/design:** **#22 CONFIRMED / #24 PARTIALLY CONFIRMED / DETERMINISTIC CURRENT-MAIN PROBES GREEN /
   D1-D11 OWNER-APPROVED / CLOSURE REVIEW 5 APPROVE / EVERY INHERITED ITEM FIXED / NO NEW WRONG OR SMELL /
-  SOURCE IMPLEMENTATION NOT STARTED / R2f0a NEXT**. Fan-out policy, the three liveness clocks, workflow telemetry and its
+  R2f0a IMPLEMENTATION COMPLETE / HOST-VERIFIED / FINAL FROZEN-HEAD REVIEW PENDING / R2f0b NEXT AFTER REVIEW/MERGE**.
+  Fan-out policy, the three liveness clocks, workflow telemetry and its
   180-day/100,000-row/128-MiB retention boundary, provisional review budgets, and local-only destructive takeover
   were owner-approved on 2026-07-20. Health enforcement is explicitly production-operator-only; two-strike
   differential recovery, self-clearing external/auth states, sticky instance-local quarantine, and proved-dead
@@ -777,9 +780,11 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** preserve the approved design and review chain, then implement R2f0a only: execution/attempt
-  identity, caller-visible direct-unary ids, mandatory core-ledger reservation, terminal summary/store, bounded
-  metrics, and read-only stats, with no timeout behavior change. R2f0b follows only after R2f0a's reviewed boundary.
+- **Next action:** preserve the approved design and review chain, then complete the final frozen-head Sol/xhigh
+  full-branch review and merge boundary for R2f0a: execution/attempt identity, caller-visible direct-unary ids,
+  mandatory core-ledger reservation, terminal summary/store, bounded metrics, and read-only stats, with no timeout
+  behavior change. R2f0a is complete and fully host-verified at source checkpoint `74bb1283`; R2f0b follows only
+  after that review/merge boundary.
   Do not launch a provider-specific reproduction or intentionally exhaust Kiro quota for R2f; that live gate requires
   separate authorization from any design-review turn. OpenRouter/OpenCode remain R3e/R3f after the reliability/
   open-issue work and before R4.
@@ -822,7 +827,8 @@ inherited families, returned `REVISE` on the direct-unary durability/identity bo
 `SMELL` are folded. Distinct closure review 4 fixed those items and all six older families, retained the incident
 terminal contract `PARTIAL`, and returned `REVISE` on the missing authoritative ACP terminal-evidence mechanism. That
 `WRONG` is folded. Distinct closure review 5 fixed that item and all review-4 regression families, found no new
-`WRONG` or `SMELL`, and returned `APPROVE`; R2f0a source implementation is next.
+`WRONG` or `SMELL`, and returned `APPROVE`; R2f0a is now complete at source checkpoint `74bb1283`, with final
+frozen-head review pending before its merge boundary.
 Health
 enforcement is explicit-production-only with approved differential and self-clearing recovery, planned drain
 preserves exact running/warm ownership, and process deployment is split at an approved R2f3c-to-R2g boundary. No
@@ -849,7 +855,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2c — live smoke | **MERGED** at `be54bc51` by PR #28 (initial Fable/xhigh review `REVISE`; closure re-review `APPROVE` at `0e3b8ce`; attempt 1 rejected for initial `0644`; permission-fold review `APPROVE` at `23384622`; create-new closure review `APPROVE` at `ffb7e891`; full host workspace **1,933 / 0 / 12 ignored**; separately authorized attempt 2 on `1c9e4a43` passed artifact-exact in 8.770 s with mode `0600`, exact terminal `PONG`, no retry/fallback, and clean teardown) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
-| R2f — phase-aware liveness/takeover | **DESIGN APPROVED / D1-D11 OWNER-APPROVED / CLOSURE REVIEW 5 APPROVE / EVERY INHERITED ITEM FIXED / NO NEW WRONG OR SMELL / SOURCE IMPLEMENTATION NOT STARTED** (31-second ACP and 6-second cancellation observable bounds) | [R2f owner design](superpowers/specs/2026-07-20-r2f-owner-design.md), [implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md), [short-bound spike](superpowers/spikes/2026-07-20-r2f-short-bound-validation.md), [review 1](superpowers/reviews/2026-07-20-r2f-owner-design-sol-review-1.md), [closure review 1](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-1.md), [failed closure re-review 2](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-2-failed.md), [closure review 3](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-3.md), [closure review 4](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-4.md), and [closure review 5](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-5.md) | Implement `0a/0b/1a/1b/2/3a/3b/3c/4` in order, beginning with independently reviewed R2f0a. |
+| R2f — phase-aware liveness/takeover | **ACTIVE / R2f0a IMPLEMENTATION COMPLETE / FULLY HOST-VERIFIED / FINAL FROZEN-HEAD REVIEW PENDING / R2f0b NEXT AFTER REVIEW/MERGE** (31-second ACP and 6-second cancellation observable bounds) at source checkpoint `74bb1283` on `agent/r2f0a-identity-ledger` | [R2f owner design](superpowers/specs/2026-07-20-r2f-owner-design.md), [implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md), [short-bound spike](superpowers/spikes/2026-07-20-r2f-short-bound-validation.md), [review 1](superpowers/reviews/2026-07-20-r2f-owner-design-sol-review-1.md), [closure review 1](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-1.md), [failed closure re-review 2](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-2-failed.md), [closure review 3](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-3.md), [closure review 4](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-4.md), and [closure review 5](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-5.md) | Complete final frozen-head review, then merge R2f0a; implement `0b/1a/1b/2/3a/3b/3c/4` only after that boundary. |
 | R2g — stable ingress/release handoff | **QUEUED AFTER R2f / SCOPE BOUNDARY APPROVED / FOCUSED OWNER DESIGN NOT STARTED** | [R2g queued plan](superpowers/plans/2026-07-20-r2g-stable-ingress.md) | Stable local ingress, exact task/session/SSE affinity, side-by-side release promotion/rollback, safe store ownership, predecessor drain, and operator integration. No provider integration is mixed into this slice. |
 | R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at `b54840a` by PR #37; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`; R3d2 **MERGED** by PR #41 at `06e22faf`; R3d3 **MERGED** by PR #42 at `3c02bf3f` after the tenth Sol approval, single Fable release/compatibility lens, docs remediation, exact deterministic gates, and green CI/CLA. Exact R3d3 evidence-fold head `d3bf503` passed binary **779/0/0**, full workspace **2,519/0/12 ignored**, and every deterministic release/validator gate; the full review/remediation chain and hashes remain in the focused plan and cursor detail above. No live compatibility gate or production state/iCloud/runtime/notification effect was part of R3d3. `INC-SHARED-RESTART-RECOVERY-2026-07-19` remains R2f lifecycle evidence, not R3d3 verification or root-cause proof. | [R3d3 implementation plan](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md) | Evidence/index/retention foundation, sealing, cold storage, GC/migration, then status/outbox/notifications; merged default-off boundary. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
@@ -1140,8 +1146,8 @@ Next action:
   PR #43 at `0f84a5ca9975d260279282f4198e11a080767dcb`, then #30 merged through PR #44 at
   `0d628271a910168230491e8610a31f92f7063cbc`. R2f incident intake merged through PR #45 at
   `db0eb28f48ad5f15e6848d1975d6de6776e13692`, and issue #36 merged through PR #46 at
-  `345941db91a7d898884bfe79e573433484ccafcc`, the current main. The active branch is
-  `agent/r2f-owner-design`, based directly on that commit; D1-D11 are approved and closure review 1 is folded.
+  `345941db91a7d898884bfe79e573433484ccafcc`, the current main. The active R2f0a source branch is
+  `agent/r2f0a-identity-ledger` at source checkpoint `74bb1283`; D1-D11 are approved and closure review 1 is folded.
   Closure re-review 2 accepted work but failed null-final with no verdict and no retry ran. One newly authorized,
   distinct clean-room Sol/xhigh closure review 3 fixed all six inherited families and returned `REVISE` on one
   direct-unary durability `WRONG` plus one caller-visible-id `SMELL`; both are folded through mandatory pre-effect
@@ -1151,7 +1157,8 @@ Next action:
   per-turn error while the process remains live. The fold defines negotiated versioned terminal evidence, exact
   correlation, authoritative Codex sources, typed unknown/conflict behavior, and no retry. Distinct clean-room
   closure review 5 adjudicated that correction and every review-4 regression family `FIXED`, found no new `WRONG` or
-  `SMELL`, and returned `APPROVE`. Source implementation has not started; R2f0a is next. The
+  `SMELL`, and returned `APPROVE`. R2f0a is implementation-complete and fully host-verified at source checkpoint
+  `74bb1283`; final frozen-head Sol/xhigh full-branch review is pending before the review/merge boundary. The
   design and exact slice order are in
   `2026-07-20-r2f-owner-design.md` and `2026-07-11-r2f-phase-aware-liveness.md`. R3d3's focused restart plan remains
   `2026-07-19-r3d3-evidence-status-retention.md`. R3d3a through R3d3e are checkpointed at `21427e6`,

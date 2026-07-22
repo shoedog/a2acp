@@ -1,7 +1,9 @@
 # R2f focused owner design — bounded liveness, telemetry, and non-disruptive ownership (v1)
 
 - **Status:** DESIGN APPROVED by clean-room Sol/xhigh closure review 5; D1-D11 settled; every inherited item fixed;
-  no new `WRONG` or `SMELL`; source implementation not started; next slice R2f0a
+  no new `WRONG` or `SMELL`; R2f0a implementation-complete and fully host-verified at source checkpoint
+  `74bb1283` on `agent/r2f0a-identity-ledger`; final frozen-head Sol/xhigh full-branch review is pending; R2f0b
+  follows only after the R2f0a review/merge boundary
 - **Base:** `345941db91a7d898884bfe79e573433484ccafcc`
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Execution plan:** [`../plans/2026-07-11-r2f-phase-aware-liveness.md`](../plans/2026-07-11-r2f-phase-aware-liveness.md)
@@ -19,11 +21,13 @@
   `INC-SHARED-SESSION-CAPACITY-2026-07-17`, `INC-SHARED-RESTART-RECOVERY-2026-07-19`,
   `INC-UNARY-NULL-FINAL-2026-07-20`, GitHub #22, and GitHub #24
 
-This document records owner policy before implementation. It does not claim that current `main` can detect a
+This document records owner policy and does not claim that current `main` can detect a
 stagnant workflow, persist workflow durations, close ACP sessions, take over a process tree, or rotate a live
 backend generation safely. The implementation plan remains the slice breakdown; this document is the normative
 decision surface now that every owner item is settled. Review 1 and closure reviews 1, 3, and 4 are folded; closure
-review 5 approved the corrected design; the failed null-final attempt remains incident evidence only.
+review 5 approved the corrected design; R2f0a is now implementation-complete and fully host-verified at source
+checkpoint `74bb1283`, while the final frozen-head review and merge boundary remain pending. The failed null-final
+attempt remains incident evidence only.
 
 ## 1. Current-main facts
 
@@ -922,6 +926,7 @@ correction and every closure-review-4 regression family `FIXED`, found no new `W
 The review confirmed that ACP prompt/capability metadata and vendor notifications provide an implementable extension
 seam; current codex-acp exposes the native turn-terminal, phase, turn-id, and ordered-drain sources required by the
 planned mapping; every unsupported/missing/order/conflict path remains conservative; and the design does not claim
-the actual Codex incident closed before adapter conformance. The next work is source slice R2f0a. No implementation,
-provider/live gate, automatic re-review, retry, fallback provider, or second billable attempt is authorized by the
-approval turn itself.
+the actual Codex incident closed before adapter conformance. R2f0a is implementation-complete and fully host-verified
+at source checkpoint `74bb1283`; final frozen-head Sol/xhigh full-branch review is pending before the review/merge
+boundary, and R2f0b follows only after that boundary. No provider/live gate, automatic re-review, retry, fallback
+provider, or second billable attempt is authorized by the approval turn itself.

@@ -1,7 +1,9 @@
 # R2f — Phase-aware liveness and safe takeover plan
 
 - **Status:** DESIGN APPROVED by clean-room Sol/xhigh closure review 5; D1-D11 settled; every inherited item fixed;
-  no new `WRONG` or `SMELL`; source implementation not started; next slice R2f0a
+  no new `WRONG` or `SMELL`; R2f0a implementation-complete and fully host-verified at source checkpoint
+  `74bb1283` on `agent/r2f0a-identity-ledger`; final frozen-head Sol/xhigh full-branch review is pending; R2f0b
+  follows only after the R2f0a review/merge boundary
 - **Prerequisite:** R2b structured diagnostics merged; may proceed independently of R2c–R2e afterward
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -135,6 +137,30 @@ owned by R2f; no current evidence attributes the original #24 incident specifica
   takeover-artifact contract. A durable id that the invoking operator cannot discover is insufficient.
 
 ## R2f0a — Execution/attempt identity, run ledger, and stats
+
+**Implementation checkpoint:** Owner-run host verification for source checkpoint `74bb1283` on
+`agent/r2f0a-identity-ledger` reports these gates and results:
+
+- `cargo fmt --all -- --check`: pass;
+- `git diff --check`: pass;
+- `cargo check --workspace --all-targets --all-features --locked`: pass;
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: pass;
+- `cargo build --release --locked --bin a2a-bridge`: pass;
+- `cargo deny check`: pass with `advisories ok`, `bans ok`, `licenses ok`, and `sources ok`; the existing
+  duplicate-version warnings remained warnings;
+- `cargo run -p a2a-bridge -- validate --repo-hygiene`: pass with 37 tracked artifacts and 7 validated example
+  configs;
+- `cargo test -p a2a-bridge --bin a2a-bridge --locked
+  cli_tests::workflow_stats_resolves_relative_store_from_canonical_config_owner -- --exact --nocapture
+  --test-threads=1`: 1 passed, 0 failed;
+- `cargo test --workspace --locked -- --test-threads=1`: 2,654 passed, 0 failed, 12 ignored, 0 measured, 0
+  filtered out.
+
+Incremental/cumulative implementation review and host-only portability correction review approved their exact
+inputs. Final frozen-head Sol/xhigh full-branch review remains pending. These are supplied host-verification
+results, not gates rerun from this documentation-only fold. No live or billable provider smoke, production
+served-server update, deployment, release, merge, GitHub CI, or provider-compatibility claim is made; #22, #24,
+and the overall R2f completion contract remain open. R2f0b is next only after the R2f0a review/merge boundary.
 
 - Mint and expose distinct `execution_id` and `attempt_id` before registry/session/provider effects. `execution_id`
   remains stable across served resume and operator takeover; every resume/takeover gets a new attempt id, ordinal,
