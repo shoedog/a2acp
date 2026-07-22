@@ -255,7 +255,7 @@ fn build_workflow_server() -> Arc<InboundServer> {
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
 
     Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
@@ -291,7 +291,7 @@ fn build_workflow_server_with_task_store(
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
     Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
@@ -364,7 +364,54 @@ fn jsonrpc_body(method: &str, params: Value) -> axum::body::Body {
     )
 }
 
-fn post_request(method: &str, params: Value) -> axum::http::Request<axum::body::Body> {
+fn post_request(method: &str, mut params: Value) -> axum::http::Request<axum::body::Body> {
+    let requires_identity = method == methods::SEND_MESSAGE
+        || (method == methods::SEND_STREAMING_MESSAGE
+            && params
+                .pointer("/message/metadata/a2a-bridge.skill")
+                .is_some());
+    if requires_identity {
+        let supplied = params
+            .pointer("/message/metadata")
+            .and_then(Value::as_object)
+            .and_then(|metadata| {
+                Some((
+                    bridge_core::ids::ExecutionId::parse(
+                        metadata.get("a2a-bridge.execution_id")?.as_str()?,
+                    )
+                    .ok()?,
+                    bridge_core::ids::AttemptId::parse(
+                        metadata.get("a2a-bridge.attempt_id")?.as_str()?,
+                    )
+                    .ok()?,
+                ))
+            });
+        let (execution_id, attempt_id) = supplied.unwrap_or_else(|| {
+            let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+            (identity.execution_id, identity.attempt_id)
+        });
+        let message = params
+            .get_mut("message")
+            .and_then(Value::as_object_mut)
+            .expect("send fixture has a message object");
+        message.insert("taskId".into(), execution_id.as_str().into());
+        let metadata = message
+            .entry("metadata")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .expect("send fixture metadata is an object");
+        metadata.insert(
+            "a2a-bridge.execution_id".into(),
+            execution_id.as_str().into(),
+        );
+        metadata.insert("a2a-bridge.attempt_id".into(), attempt_id.as_str().into());
+        if params.get("taskId").is_some() {
+            params
+                .as_object_mut()
+                .unwrap()
+                .insert("taskId".into(), execution_id.as_str().into());
+        }
+    }
     axum::http::Request::builder()
         .method("POST")
         .uri("/")
@@ -675,7 +722,7 @@ fn build_server_per_agent(backends: HashMap<String, Arc<dyn AgentBackend>>) -> A
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
 
     Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
@@ -708,7 +755,7 @@ fn build_server_per_agent_with_session_manager(
     // #10 slice 7: the SessionManager is MANDATORY and built by `coordinator_over`
     // (a REAL SM over the fake registry). This puts every contextId-carrying Local
     // send on the warm path.
-    let coord = bridge_a2a_inbound::server::coordinator_over(
+    let coord = bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
         registry as Arc<dyn AgentRegistry>,
         store as Arc<dyn SessionStore>,
         Arc::new(AutoApprove),
@@ -738,6 +785,25 @@ fn workflow_stream_params(task: &str, ctx: &str) -> Value {
             "metadata": { "a2a-bridge.skill": "code-review" }
         }
     })
+}
+
+fn bound_workflow_stream_params(ctx: &str) -> (String, Value) {
+    let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+    let task_id = identity.execution_id.as_str().to_owned();
+    let params = json!({
+        "taskId": task_id.clone(),
+        "message": {
+            "taskId": task_id.clone(),
+            "contextId": ctx,
+            "text": "---\ntask-type: freeform\n---\nDIFF",
+            "metadata": {
+                "a2a-bridge.skill": "code-review",
+                "a2a-bridge.execution_id": identity.execution_id.as_str(),
+                "a2a-bridge.attempt_id": identity.attempt_id.as_str()
+            }
+        }
+    });
+    (task_id, params)
 }
 
 async fn json_response(resp: axum::response::Response) -> Value {
@@ -856,6 +922,181 @@ fn release_gate(gate: &Arc<(std::sync::atomic::AtomicBool, tokio::sync::Notify)>
     gate.1.notify_waiters();
 }
 
+#[tokio::test]
+async fn workflow_stream_disconnect_keeps_durable_owner_and_exact_replay() {
+    use bridge_core::ids::AttemptIdentity;
+    use bridge_core::task_store::TaskRecordStatus;
+
+    let gate = Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        tokio::sync::Notify::new(),
+    ));
+    let stats = Arc::new(CancelStats::default());
+    let srv = build_server_per_agent_with_session_manager(
+        Arc::new(FakeStore::default()),
+        blocking_backends(gate.clone(), stats.clone()),
+    );
+    let identity = AttemptIdentity::initial().unwrap();
+    let task_id = identity.execution_id.as_str().to_owned();
+    let params = json!({
+        "taskId": task_id,
+        "message": {
+            "taskId": task_id,
+            "contextId": "ctx-durable-disconnect",
+            "text": "---\ntask-type: freeform\n---\nDIFF",
+            "metadata": {
+                "a2a-bridge.skill": "code-review",
+                "a2a-bridge.execution_id": identity.execution_id.as_str(),
+                "a2a-bridge.attempt_id": identity.attempt_id.as_str()
+            }
+        }
+    });
+    let task = TaskId::parse(task_id.clone()).unwrap();
+
+    let response = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::SEND_STREAMING_MESSAGE,
+            params.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    drop(response); // transport loss must not own or cancel the durable execution
+
+    wait_for(
+        || stats.prompts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "durable workflow did not start its root nodes after transport loss",
+    )
+    .await;
+    assert_eq!(
+        srv.coordinator()
+            .task_store()
+            .get(&task)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskRecordStatus::Working
+    );
+
+    release_gate(&gate);
+    let durable_store = srv.coordinator().task_store();
+    let record = poll_to_terminal(&durable_store, &task).await;
+    assert_eq!(record.status, TaskRecordStatus::Completed);
+    assert_eq!(record.result.as_deref(), Some("SYNTH_FINAL"));
+    let locator = durable_store
+        .get_attempt_locator(&task)
+        .await
+        .unwrap()
+        .expect("durable task has an exact attempt locator");
+    assert_eq!(locator.identity, identity);
+    assert_eq!(
+        stats.prompts.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "each of the three workflow nodes must be prompted exactly once"
+    );
+
+    let get = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::GET_TASK,
+            json!({ "taskId": task_id }),
+        ))
+        .await
+        .unwrap();
+    let get = json_response(get).await;
+    assert_eq!(
+        get["result"]["task"]["metadata"]["execution_id"],
+        identity.execution_id.as_str()
+    );
+    assert_eq!(
+        get["result"]["task"]["metadata"]["attempt_id"],
+        identity.attempt_id.as_str()
+    );
+    assert_eq!(
+        get["result"]["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
+
+    let replay = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::SUBSCRIBE_TO_TASK,
+            json!({ "id": task_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), axum::http::StatusCode::OK);
+    let replay = axum::body::to_bytes(replay.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let replay = String::from_utf8(replay.to_vec()).unwrap();
+    let frames: Vec<Value> = sse_data_payloads(&replay)
+        .iter()
+        .map(|payload| serde_json::from_str(payload).unwrap())
+        .collect();
+    let locator_index = frames
+        .iter()
+        .position(|frame| {
+            frame["kind"] == "attempt_locator"
+                && frame["execution_id"] == identity.execution_id.as_str()
+                && frame["attempt_id"] == identity.attempt_id.as_str()
+        })
+        .expect("terminal replay carries the authoritative locator");
+    let terminal_index = frames
+        .iter()
+        .position(|frame| frame["kind"] == "terminal" && frame["outcome"] == "completed")
+        .expect("terminal outcome is replayable after transport loss");
+    assert!(
+        locator_index < terminal_index,
+        "locator must precede terminal replay"
+    );
+
+    let duplicate = srv
+        .clone()
+        .router()
+        .oneshot(post_request(methods::SEND_STREAMING_MESSAGE, params))
+        .await
+        .unwrap();
+    let duplicate = json_response(duplicate).await;
+    assert!(duplicate.get("error").is_some(), "{duplicate}");
+    assert_eq!(
+        stats.prompts.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "an exact replay/collision must not start a second execution"
+    );
+
+    let history = srv
+        .coordinator()
+        .workflow_history()
+        .expect("history selection is mandatory")
+        .expect("test history opens");
+    let attempt = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let attempt = history
+                .attempt(&identity.attempt_id)
+                .await
+                .unwrap()
+                .expect("exact attempt remains queryable");
+            if attempt.terminal.is_some() {
+                break attempt;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("exact attempt terminalizes");
+    assert_eq!(attempt.reservation.identity, identity);
+    assert_eq!(
+        attempt.terminal.expect("attempt terminalized").outcome,
+        "completed"
+    );
+}
+
 async fn start_warm_stream(
     srv: &Arc<InboundServer>,
     task: &str,
@@ -876,6 +1117,26 @@ async fn start_warm_stream(
             .await
             .unwrap()
     })
+}
+
+async fn start_bound_warm_stream(
+    srv: &Arc<InboundServer>,
+    ctx: &str,
+) -> (tokio::task::JoinHandle<axum::body::Bytes>, String) {
+    let (task_id, params) = bound_workflow_stream_params(ctx);
+    let resp = srv
+        .clone()
+        .router()
+        .oneshot(post_request(methods::SEND_STREAMING_MESSAGE, params))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = tokio::spawn(async move {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    });
+    (body, task_id)
 }
 
 fn assert_terminal_state(body: &[u8], state: a2a::TaskState) {
@@ -912,24 +1173,47 @@ async fn concurrent_same_context_workflow_handle_busy() {
     )
     .await;
 
+    let (second_task, second_params) = bound_workflow_stream_params("ctx-busy");
+    let second_attempt = bridge_core::ids::AttemptId::parse(
+        second_params
+            .pointer("/message/metadata/a2a-bridge.attempt_id")
+            .and_then(Value::as_str)
+            .unwrap(),
+    )
+    .unwrap();
     let second = srv
         .clone()
         .router()
-        .oneshot(post_request(
-            methods::SEND_STREAMING_MESSAGE,
-            workflow_stream_params("busy-2", "ctx-busy"),
-        ))
+        .oneshot(post_request(methods::SEND_STREAMING_MESSAGE, second_params))
         .await
         .unwrap();
     let body_json = json_response(second).await;
     assert_eq!(body_json["error"]["code"], -32600, "{body_json}");
     assert!(
         store
-            .session_for(&TaskId::parse("busy-2").unwrap())
+            .session_for(&TaskId::parse(second_task.clone()).unwrap())
             .await
             .unwrap()
             .is_none(),
         "HandleBusy must be returned before SessionStore::put"
+    );
+    let history = srv
+        .coordinator()
+        .workflow_history()
+        .expect("test server selects history")
+        .expect("test history opens");
+    assert!(
+        history.attempt(&second_attempt).await.unwrap().is_none(),
+        "same-context refusal occurs before attempt admission"
+    );
+    assert!(
+        srv.coordinator()
+            .task_store()
+            .get(&TaskId::parse(second_task).unwrap())
+            .await
+            .unwrap()
+            .is_none(),
+        "same-context refusal must not leave a partial primary task"
     );
 
     release_gate(&gate);
@@ -962,7 +1246,7 @@ async fn session_cancel_cancels_workflow_run() {
 }
 
 #[tokio::test]
-async fn session_cancel_workflow_parent_sweeps_children() {
+async fn completed_durable_workflow_is_observed_by_task_not_session() {
     let gate = Arc::new((
         std::sync::atomic::AtomicBool::new(true),
         tokio::sync::Notify::new(),
@@ -972,12 +1256,37 @@ async fn session_cancel_workflow_parent_sweeps_children() {
         Arc::new(FakeStore::default()),
         blocking_backends(gate, stats),
     );
-    let body = start_warm_stream(&srv, "sweep-1", "ctx-sweep").await;
+    let (body, task_id) = start_bound_warm_stream(&srv, "ctx-completed-owner").await;
     let raw = body.await.unwrap();
     assert_terminal_state(&raw, a2a::TaskState::Completed);
 
-    let cancel = session_cancel_response(&srv, "ctx-sweep").await;
-    assert_eq!(cancel["result"]["canceled"], true, "{cancel}");
+    let cancel = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            "SessionCancel",
+            json!({ "contextId": "ctx-completed-owner" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), axum::http::StatusCode::BAD_REQUEST);
+    let cancel = json_response(cancel).await;
+    assert!(cancel.get("error").is_some(), "{cancel}");
+
+    let get = srv
+        .clone()
+        .router()
+        .oneshot(post_request(
+            methods::GET_TASK,
+            json!({ "taskId": task_id }),
+        ))
+        .await
+        .unwrap();
+    let get = json_response(get).await;
+    assert_eq!(
+        get["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "terminal ownership remains task-scoped: {get}"
+    );
 }
 
 #[tokio::test]
@@ -1073,7 +1382,7 @@ async fn active_session_cancel_one_backend_cancel_per_child() {
 }
 
 #[tokio::test]
-async fn cancel_task_warm_workflow_cancels_checked_out_child() {
+async fn cancel_task_durable_workflow_cancels_active_nodes() {
     let gate = Arc::new((
         std::sync::atomic::AtomicBool::new(false),
         tokio::sync::Notify::new(),
@@ -1083,7 +1392,7 @@ async fn cancel_task_warm_workflow_cancels_checked_out_child() {
         Arc::new(FakeStore::default()),
         blocking_backends(gate, stats.clone()),
     );
-    let body = start_warm_stream(&srv, "warm-cancel-task-1", "ctx-warm-cancel-task").await;
+    let (body, task_id) = start_bound_warm_stream(&srv, "ctx-warm-cancel-task").await;
     wait_for(
         || stats.prompts.load(std::sync::atomic::Ordering::SeqCst) >= 1,
         "workflow did not park a checked-out child in prompt before CancelTask",
@@ -1095,7 +1404,7 @@ async fn cancel_task_warm_workflow_cancels_checked_out_child() {
         .router()
         .oneshot(post_request(
             methods::CANCEL_TASK,
-            json!({ "taskId": "warm-cancel-task-1" }),
+            json!({ "taskId": task_id }),
         ))
         .await
         .unwrap();
@@ -1109,11 +1418,12 @@ async fn cancel_task_warm_workflow_cancels_checked_out_child() {
     let raw = body.await.unwrap();
     assert_terminal_state(&raw, a2a::TaskState::Canceled);
     let cancels = stats.cancels.lock().unwrap();
+    assert_eq!(cancels.len(), 2, "both active root nodes are canceled once");
     assert!(
         cancels
             .iter()
-            .any(|s| s.contains("ctx-warm-cancel-task::workflow::code-review::node::")),
-        "CancelTask must cancel a checked-out warm child: {cancels:?}"
+            .all(|session| session.starts_with("workflow-code-review-")),
+        "CancelTask must address the detached owner's node sessions: {cancels:?}"
     );
 }
 
@@ -1128,13 +1438,11 @@ async fn cancel_task_immediately_after_warm_stream_send_cancels_workflow() {
     .into();
     let srv = build_server_per_agent_with_session_manager(Arc::new(FakeStore::default()), backends);
 
+    let (task_id, params) = bound_workflow_stream_params("ctx-warm-immediate-cancel");
     let resp = srv
         .clone()
         .router()
-        .oneshot(post_request(
-            methods::SEND_STREAMING_MESSAGE,
-            workflow_stream_params("warm-immediate-cancel-1", "ctx-warm-immediate-cancel"),
-        ))
+        .oneshot(post_request(methods::SEND_STREAMING_MESSAGE, params))
         .await
         .unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
@@ -1144,7 +1452,7 @@ async fn cancel_task_immediately_after_warm_stream_send_cancels_workflow() {
         .router()
         .oneshot(post_request(
             methods::CANCEL_TASK,
-            json!({ "taskId": "warm-immediate-cancel-1" }),
+            json!({ "taskId": task_id }),
         ))
         .await
         .unwrap();
@@ -1176,12 +1484,13 @@ async fn cancel_task_before_warm_workflow_token_registration_cancels_run() {
     .into();
     let srv = build_server_per_agent_with_session_manager(Arc::new(FakeStore::default()), backends);
 
+    let (task_id, params) = bound_workflow_stream_params("ctx-warm-early-cancel");
     let cancel_resp = srv
         .clone()
         .router()
         .oneshot(post_request(
             methods::CANCEL_TASK,
-            json!({ "taskId": "warm-early-cancel-1" }),
+            json!({ "taskId": task_id.clone() }),
         ))
         .await
         .unwrap();
@@ -1195,10 +1504,7 @@ async fn cancel_task_before_warm_workflow_token_registration_cancels_run() {
     let resp = srv
         .clone()
         .router()
-        .oneshot(post_request(
-            methods::SEND_STREAMING_MESSAGE,
-            workflow_stream_params("warm-early-cancel-1", "ctx-warm-early-cancel"),
-        ))
+        .oneshot(post_request(methods::SEND_STREAMING_MESSAGE, params))
         .await
         .unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
@@ -1248,12 +1554,14 @@ async fn active_session_cancel_propagates_child_backend_error() {
     .await;
 
     let cancel = session_cancel_response(&srv, "ctx-err").await;
-    assert!(
-        cancel.get("error").is_some(),
-        "cancel error must propagate: {cancel}"
-    );
+    assert_eq!(cancel["result"]["canceled"], true, "{cancel}");
     let raw = body.await.unwrap();
-    assert_terminal_state(&raw, a2a::TaskState::Canceled);
+    assert_terminal_state(&raw, a2a::TaskState::Failed);
+    assert_eq!(
+        stats.cancels.lock().unwrap().len(),
+        2,
+        "a failing node cancel must not skip its active sibling"
+    );
 }
 
 #[tokio::test]
@@ -1450,7 +1758,8 @@ async fn cancel_task_fires_workflow_token_stream_ends_canceled() {
     // ── start the streaming task with a known, fixed task id ─────────────────
     // `task_id_from_params` accepts a top-level `taskId` field — provide one so
     // we don't have to parse the first SSE frame to discover the id.
-    const TASK_ID: &str = "task-wf-cancel-dod7";
+    let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+    let task_id = identity.execution_id.as_str().to_owned();
     let stream_req = axum::http::Request::builder()
         .method("POST")
         .uri("/")
@@ -1462,10 +1771,15 @@ async fn cancel_task_fires_workflow_token_stream_ends_canceled() {
                 "id": 1,
                 "method": methods::SEND_STREAMING_MESSAGE,
                 "params": {
-                    "taskId": TASK_ID,
+                    "taskId": task_id.clone(),
                     "message": {
+                        "taskId": task_id.clone(),
                         "text": "---\ntask-type: freeform\n---\nDIFF",
-                        "metadata": { "a2a-bridge.skill": "code-review" }
+                        "metadata": {
+                            "a2a-bridge.skill": "code-review",
+                            "a2a-bridge.execution_id": identity.execution_id.as_str(),
+                            "a2a-bridge.attempt_id": identity.attempt_id.as_str()
+                        }
                     }
                 }
             }))
@@ -1497,7 +1811,7 @@ async fn cancel_task_fires_workflow_token_stream_ends_canceled() {
     }
 
     // ── issue CancelTask via the same shared InboundServer ───────────────────
-    let cancel_req = post_request(methods::CANCEL_TASK, json!({ "taskId": TASK_ID }));
+    let cancel_req = post_request(methods::CANCEL_TASK, json!({ "taskId": task_id }));
     let cancel_resp = srv.clone().router().oneshot(cancel_req).await.unwrap();
     assert_eq!(
         cancel_resp.status(),
@@ -1623,22 +1937,31 @@ async fn warm_unary_cancel_by_wire_id_hits_real_session() {
     let store = Arc::new(FakeStore::default());
     let srv = build_server_per_agent_with_session_manager(store.clone(), backends);
 
-    const TASK_ID: &str = "warm-unary-cancel-1";
     const CTX: &str = "ctx-warm-unary-cancel";
+    let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+    let task_id = identity.execution_id.as_str().to_owned();
 
     // Warm UNARY send (Local codex — no skill metadata), held open by the gate.
     // The unary handler blocks until the turn completes, so drive it off-thread.
     let send_srv = srv.clone();
+    let send_task_id = task_id.clone();
+    let send_execution_id = identity.execution_id.clone();
+    let send_attempt_id = identity.attempt_id.clone();
     let send = tokio::spawn(async move {
         send_srv
             .router()
             .oneshot(post_request(
                 methods::SEND_MESSAGE,
                 json!({
-                    "taskId": TASK_ID,
+                    "taskId": send_task_id,
                     "message": {
+                        "taskId": send_execution_id.as_str(),
                         "contextId": CTX,
-                        "text": "---\ntask-type: freeform\n---\nPING"
+                        "text": "---\ntask-type: freeform\n---\nPING",
+                        "metadata": {
+                            "a2a-bridge.execution_id": send_execution_id.as_str(),
+                            "a2a-bridge.attempt_id": send_attempt_id.as_str()
+                        }
                     }
                 }),
             ))
@@ -1660,13 +1983,13 @@ async fn warm_unary_cancel_by_wire_id_hits_real_session() {
     // uses on a store miss — otherwise a delegated no-op could pass this test.
     assert_ne!(
         real_session,
-        format!("session-{TASK_ID}"),
+        format!("session-{task_id}"),
         "real warm session must differ from the synthetic cancel fallback"
     );
 
     // The wire task-id maps to the real warm session BEFORE the turn is cancelled.
     let mapped = store
-        .session_for(&TaskId::parse(TASK_ID).unwrap())
+        .session_for(&TaskId::parse(&task_id).unwrap())
         .await
         .unwrap()
         .map(|s| s.as_str().to_owned());
@@ -1682,7 +2005,7 @@ async fn warm_unary_cancel_by_wire_id_hits_real_session() {
         .router()
         .oneshot(post_request(
             methods::CANCEL_TASK,
-            json!({ "taskId": TASK_ID }),
+            json!({ "taskId": task_id }),
         ))
         .await
         .unwrap();
@@ -2011,7 +2334,7 @@ fn build_gated_workflow_server(
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
     Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
@@ -2171,7 +2494,7 @@ fn build_failing_synth_workflow_server(
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
     Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
@@ -2223,7 +2546,7 @@ fn build_panicking_workflow_server(
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
     Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
@@ -2989,7 +3312,7 @@ async fn detached_unknown_workflow_rejected_pre_create() {
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
     let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
     let srv = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
@@ -3047,15 +3370,17 @@ async fn detached_unknown_workflow_rejected_pre_create() {
 /// go through the sequenced path (non-NULL `terminal_seq`) and leave no hub.
 #[tokio::test]
 async fn resume_short_circuit_sets_terminal_seq() {
-    use bridge_core::ids::{NodeId, TaskId};
+    use bridge_core::ids::NodeId;
     use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
     use std::sync::Arc;
 
     let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
     let (srv, _prompted) = build_recording_resume_server(store.clone());
-    let task = TaskId::parse("resume-short-seq").unwrap();
-    store
-        .create(&TaskRecord {
+    let (task, locator) = initial_task_locator();
+    admit_recoverable_attempt(
+        &srv,
+        &store,
+        TaskRecord {
             id: task.clone(),
             workflow: "code-review".into(),
             status: TaskRecordStatus::Working,
@@ -3071,9 +3396,10 @@ async fn resume_short_circuit_sets_terminal_seq() {
             batch_id: None,
             item_id: None,
             artifacts_purged_at: None,
-        })
-        .await
-        .unwrap();
+        },
+        &locator,
+    )
+    .await;
     for (node, out) in [
         ("codex", "CODEX_DONE"),
         ("claude", "CLAUDE_DONE"),
@@ -3085,7 +3411,9 @@ async fn resume_short_circuit_sets_terminal_seq() {
             .unwrap();
     }
 
-    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3)
+        .await
+        .unwrap();
 
     let rec = store.get(&task).await.unwrap().unwrap();
     assert_eq!(rec.status, TaskRecordStatus::Completed);
@@ -3133,7 +3461,9 @@ async fn resume_no_snapshot_interrupt_sets_terminal_seq() {
         .await
         .unwrap();
 
-    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3)
+        .await
+        .unwrap();
 
     let rec = store.get(&task).await.unwrap().unwrap();
     assert_eq!(rec.status, TaskRecordStatus::Interrupted);
@@ -3233,7 +3563,7 @@ fn build_recording_resume_server(
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
     let srv = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
@@ -3258,6 +3588,60 @@ fn build_recording_resume_server(
 /// `unary_message`). `v=1` is the live version; `v=2` exercises the forward-compat door.
 fn review_snapshot(v: u32) -> String {
     serde_json::json!({ "v": v, "graph": &*review_graph() }).to_string()
+}
+
+fn initial_task_locator() -> (
+    bridge_core::ids::TaskId,
+    bridge_core::task_store::TaskAttemptLocator,
+) {
+    let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+    let task = bridge_core::ids::TaskId::parse(identity.execution_id.as_str().to_owned()).unwrap();
+    (
+        task,
+        bridge_core::task_store::TaskAttemptLocator {
+            identity,
+            telemetry_unavailable: None,
+        },
+    )
+}
+
+async fn admit_recoverable_attempt(
+    srv: &Arc<InboundServer>,
+    store: &Arc<dyn bridge_core::task_store::TaskStore>,
+    record: bridge_core::task_store::TaskRecord,
+    locator: &bridge_core::task_store::TaskAttemptLocator,
+) {
+    store
+        .create_with_attempt_locator(&record, locator)
+        .await
+        .unwrap();
+    let history = srv
+        .coordinator()
+        .workflow_history()
+        .expect("test server selects history")
+        .expect("test history opens");
+    history
+        .reserve(&bridge_core::workflow_history::AttemptReservation {
+            identity: locator.identity.clone(),
+            task_id: Some(record.id.clone()),
+            workflow: record.workflow.clone(),
+            task_class: "workflow".into(),
+            surface: bridge_core::workflow_history::ExecutionSurface::ServedTask,
+            policy: "r2f0a".into(),
+            workload_fingerprint: bridge_core::workflow_history::fingerprint_workload_shape(
+                record
+                    .workflow_spec_json
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes(),
+            ),
+            started_ms: record.created_ms,
+            workload_fingerprint_complete: true,
+            prompt_acceptance: "dispatch_uncertain".into(),
+            pinned: false,
+        })
+        .await
+        .unwrap();
 }
 
 /// Poll the store until the task reaches a terminal status (any non-Working), or panic
@@ -3286,13 +3670,13 @@ async fn poll_to_terminal(
 /// and the task finalizes `Completed`.
 #[tokio::test]
 async fn resume_runs_only_pending_nodes() {
-    use bridge_core::ids::{NodeId, TaskId};
+    use bridge_core::ids::NodeId;
     use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
     use std::sync::Arc;
 
     let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
     let (srv, prompted) = build_recording_resume_server(store.clone());
-    let task = TaskId::parse("resume-pending-1").unwrap();
+    let (task, locator) = initial_task_locator();
     store
         .create(&TaskRecord {
             id: task.clone(),
@@ -3313,6 +3697,7 @@ async fn resume_runs_only_pending_nodes() {
         })
         .await
         .unwrap();
+    store.put_attempt_locator(&task, &locator).await.unwrap();
     // codex already finished before the crash → its checkpoint is the resume seed.
     store
         .put_node_checkpoint(
@@ -3325,7 +3710,9 @@ async fn resume_runs_only_pending_nodes() {
         .await
         .unwrap();
 
-    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3)
+        .await
+        .unwrap();
 
     let rec = poll_to_terminal(&store, &task).await;
     assert_eq!(
@@ -3386,7 +3773,9 @@ async fn resume_no_snapshot_interrupts() {
         .await
         .unwrap();
 
-    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3)
+        .await
+        .unwrap();
 
     let rec = store.get(&task).await.unwrap().unwrap();
     assert_eq!(rec.status, TaskRecordStatus::Interrupted);
@@ -3423,7 +3812,9 @@ async fn resume_unparseable_snapshot_interrupts() {
         .await
         .unwrap();
 
-    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3)
+        .await
+        .unwrap();
 
     let rec = store.get(&task).await.unwrap().unwrap();
     assert_eq!(rec.status, TaskRecordStatus::Interrupted);
@@ -3462,7 +3853,9 @@ async fn resume_unknown_version_interrupts() {
         .await
         .unwrap();
 
-    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3)
+        .await
+        .unwrap();
 
     let rec = store.get(&task).await.unwrap().unwrap();
     assert_eq!(rec.status, TaskRecordStatus::Interrupted);
@@ -3502,7 +3895,9 @@ async fn resume_cap_exhausted_interrupts() {
         .await
         .unwrap();
 
-    bridge_a2a_inbound::server::resume_working_tasks(&srv, cap).await;
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, cap)
+        .await
+        .unwrap();
 
     let rec = store.get(&task).await.unwrap().unwrap();
     assert_eq!(rec.status, TaskRecordStatus::Interrupted);
@@ -3628,7 +4023,9 @@ async fn resume_poison_task_terminates_at_cap() {
 
     // ── Step 2: call resume_working_tasks — it must detect Exhausted and flip to
     // Interrupted WITHOUT spawning a runner (no node is prompted).
-    bridge_a2a_inbound::server::resume_working_tasks(&srv, cap).await;
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, cap)
+        .await
+        .unwrap();
 
     let final_rec = store.get(&task).await.unwrap().unwrap();
     assert_eq!(
@@ -3660,15 +4057,17 @@ async fn resume_poison_task_terminates_at_cap() {
 /// SYNTH_FINAL), with NO backend prompted and NO resume attempt consumed.
 #[tokio::test]
 async fn resume_terminal_checkpoint_short_circuits() {
-    use bridge_core::ids::{NodeId, TaskId};
+    use bridge_core::ids::NodeId;
     use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
     use std::sync::Arc;
 
     let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
     let (srv, prompted) = build_recording_resume_server(store.clone());
-    let task = TaskId::parse("resume-short-circuit").unwrap();
-    store
-        .create(&TaskRecord {
+    let (task, locator) = initial_task_locator();
+    admit_recoverable_attempt(
+        &srv,
+        &store,
+        TaskRecord {
             id: task.clone(),
             workflow: "code-review".into(),
             status: TaskRecordStatus::Working,
@@ -3684,9 +4083,10 @@ async fn resume_terminal_checkpoint_short_circuits() {
             batch_id: None,
             item_id: None,
             artifacts_purged_at: None,
-        })
-        .await
-        .unwrap();
+        },
+        &locator,
+    )
+    .await;
     // Pre-write checkpoints for all upstream nodes AND the terminal node — the terminal
     // output was produced but the row was never flipped (the W3a §8 write-failure gap).
     store
@@ -3720,7 +4120,9 @@ async fn resume_terminal_checkpoint_short_circuits() {
         .await
         .unwrap();
 
-    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3)
+        .await
+        .unwrap();
 
     let rec = store.get(&task).await.unwrap().unwrap();
     assert_eq!(
@@ -3807,7 +4209,7 @@ fn build_pending_resume_server(
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
     let srv = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
@@ -3849,7 +4251,7 @@ fn build_pending_resume_server(
 #[tokio::test]
 async fn resume_then_cancel_mid_run_finalizes_canceled() {
     use a2a::methods;
-    use bridge_core::ids::{NodeId, TaskId};
+    use bridge_core::ids::NodeId;
     use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
     use std::sync::Arc;
 
@@ -3857,7 +4259,7 @@ async fn resume_then_cancel_mid_run_finalizes_canceled() {
     let (srv, codex_prompted) = build_pending_resume_server(store.clone());
 
     // ── 1. Seed a Working task with the review snapshot + codex checkpoint ──
-    let task = TaskId::parse("resume-cancel-mid-run").unwrap();
+    let (task, locator) = initial_task_locator();
     store
         .create(&TaskRecord {
             id: task.clone(),
@@ -3878,6 +4280,7 @@ async fn resume_then_cancel_mid_run_finalizes_canceled() {
         })
         .await
         .unwrap();
+    store.put_attempt_locator(&task, &locator).await.unwrap();
     // codex already finished before the crash → seeded; claude + synth are pending.
     store
         .put_node_checkpoint(
@@ -3894,7 +4297,9 @@ async fn resume_then_cancel_mid_run_finalizes_canceled() {
     //    The runner's claude/synth backends block on PendingBackend::prompt. After
     //    resume_working_tasks returns, the token is already inserted (the insert
     //    happens synchronously before spawn_detached_workflow is called).
-    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3)
+        .await
+        .unwrap();
 
     // Yield a few times so the spawned runner can get scheduled and reach the
     // PendingBackend.prompt() await point — making the cancel observable in the
@@ -3913,7 +4318,7 @@ async fn resume_then_cancel_mid_run_finalizes_canceled() {
         .router()
         .oneshot(post_request(
             methods::CANCEL_TASK,
-            serde_json::json!({ "taskId": "resume-cancel-mid-run" }),
+            serde_json::json!({ "taskId": task.as_str() }),
         ))
         .await
         .unwrap();
@@ -4004,7 +4409,7 @@ fn build_cwd_cap_server(
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
     Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
@@ -4103,7 +4508,7 @@ async fn detached_workflow_threads_cwd_to_every_node() {
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
     let srv: Arc<InboundServer> = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
@@ -4205,7 +4610,7 @@ fn build_cwd_cap_resume_server(
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
     Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             registry as Arc<dyn AgentRegistry>,
             Arc::new(FakeStore::default()),
             Arc::new(AutoApprove),
@@ -4230,7 +4635,7 @@ fn build_cwd_cap_resume_server(
 /// un-checkpointed nodes with `SessionSpec.cwd == Some("/req")`.
 #[tokio::test]
 async fn resume_restores_session_cwd() {
-    use bridge_core::ids::{NodeId, TaskId};
+    use bridge_core::ids::NodeId;
     use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
     use std::sync::Arc;
 
@@ -4238,7 +4643,7 @@ async fn resume_restores_session_cwd() {
     let cwds: Arc<std::sync::Mutex<Vec<Option<bridge_core::SessionCwd>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let srv = build_cwd_cap_resume_server(store.clone(), cwds.clone());
-    let task = TaskId::parse("resume-cwd-1").unwrap();
+    let (task, locator) = initial_task_locator();
     store
         .create(&TaskRecord {
             id: task.clone(),
@@ -4259,6 +4664,7 @@ async fn resume_restores_session_cwd() {
         })
         .await
         .unwrap();
+    store.put_attempt_locator(&task, &locator).await.unwrap();
     // codex already finished before the crash → its checkpoint is the resume seed.
     store
         .put_node_checkpoint(
@@ -4271,7 +4677,9 @@ async fn resume_restores_session_cwd() {
         .await
         .unwrap();
 
-    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3)
+        .await
+        .unwrap();
 
     let rec = poll_to_terminal(&store, &task).await;
     assert_eq!(
@@ -4334,7 +4742,9 @@ async fn resume_corrupt_session_cwd_interrupts() {
         .await
         .unwrap();
 
-    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3).await;
+    bridge_a2a_inbound::server::resume_working_tasks(&srv, 3)
+        .await
+        .unwrap();
 
     let rec = store.get(&task).await.unwrap().unwrap();
     assert_eq!(
@@ -4427,7 +4837,7 @@ fn build_coordinator_batch_server() -> Arc<InboundServer> {
     ));
     let mut map: HashMap<WorkflowId, Arc<WorkflowGraph>> = HashMap::new();
     map.insert(WorkflowId::parse("code-review").unwrap(), review_graph());
-    let coord = bridge_a2a_inbound::server::coordinator_over(
+    let coord = bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
         registry as Arc<dyn AgentRegistry>,
         Arc::new(FakeStore::default()) as Arc<dyn SessionStore>,
         Arc::new(AutoApprove),

@@ -263,7 +263,7 @@ async fn delegate_skill_round_trips_through_peer() {
     let backend = Arc::new(PanicBackend);
 
     let server = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             common::single_agent_registry("kiro", backend),
             store,
             policy,

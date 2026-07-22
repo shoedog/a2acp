@@ -7,8 +7,8 @@ use bridge_core::ids::{BatchId, TaskId, WorkflowId};
 use bridge_core::ports::{ObsEvent, Observer};
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{
-    BatchItem, BatchRecord, BatchStatus, BatchSummary, ChildClaim, ResumeClaim, TaskRecord,
-    TaskRecordStatus,
+    BatchChildAttempt, BatchItem, BatchRecord, BatchStatus, BatchSummary, ChildClaim, ResumeClaim,
+    TaskRecord, TaskRecordStatus,
 };
 use bridge_workflow::executor::WorkflowRunContext;
 use bridge_workflow::graph::WorkflowGraph;
@@ -19,8 +19,10 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::detached::{
-    encode_workflow_spec, finalize_detached, new_detached_task_id, spawn_detached_workflow,
-    TaskProgressHub, SUPPORTED_SNAPSHOT_VERSION,
+    encode_workflow_spec, finalize_detached, finalize_detached_with_barrier,
+    spawn_detached_workflow_with_attempt_barriers, workflow_prompt_dispatch_barrier_with_state,
+    workflow_terminal_summary_barrier, AttemptTelemetryState, TaskProgressHub,
+    SUPPORTED_SNAPSHOT_VERSION,
 };
 use crate::params::validate_cwd_str;
 
@@ -250,7 +252,7 @@ pub async fn batch_status(deps: &BatchDeps, id: &BatchId) -> Result<BatchSummary
         .await?
         .ok_or(BridgeError::TaskNotFound)?;
     let kids = deps.detached.task_store.batch_children(id).await?;
-    let summary = summarize_batch(&rec, &kids);
+    let summary = summarize_batch_with_attempts(deps, &rec, &kids).await?;
     if let Some(term) = is_settleable(&summary) {
         deps.detached
             .task_store
@@ -262,7 +264,7 @@ pub async fn batch_status(deps: &BatchDeps, id: &BatchId) -> Result<BatchSummary
             .get_batch(id)
             .await?
             .ok_or(BridgeError::TaskNotFound)?;
-        return Ok(summarize_batch(&rec, &kids));
+        return summarize_batch_with_attempts(deps, &rec, &kids).await;
     }
     Ok(summary)
 }
@@ -272,7 +274,7 @@ pub async fn batch_list(deps: &BatchDeps, limit: usize) -> Result<Vec<BatchSumma
     let mut out = Vec::with_capacity(batches.len());
     for rec in batches {
         let kids = deps.detached.task_store.batch_children(&rec.id).await?;
-        out.push(summarize_batch(&rec, &kids));
+        out.push(summarize_batch_with_attempts(deps, &rec, &kids).await?);
     }
     Ok(out)
 }
@@ -392,6 +394,8 @@ async fn resumed_child_future(
     child: &TaskRecord,
     cap: u32,
     permit: OwnedSemaphorePermit,
+    attempt_started: Instant,
+    queue_ms: u64,
 ) -> Option<(BoxFuture<'static, TaskId>, TaskId, CancellationToken)> {
     let task = child.id.clone();
     let Some(spec_json) = child.workflow_spec_json.as_deref() else {
@@ -482,34 +486,7 @@ async fn resumed_child_future(
         return None;
     }
 
-    let attempt = match deps
-        .detached
-        .task_store
-        .claim_resume_attempt(&task, cap, deps.detached.clock.now_ms())
-        .await
-    {
-        Ok(ResumeClaim::Exhausted) => {
-            let _ = finalize_detached(
-                &deps.detached.task_store,
-                &deps.detached.progress_hubs,
-                &task,
-                TaskRecordStatus::Interrupted,
-                None,
-                Some("resume attempt cap exceeded"),
-                None,
-            )
-            .await;
-            drop(permit);
-            return None;
-        }
-        Ok(ResumeClaim::Resumable { attempt }) => attempt,
-        Err(e) => {
-            tracing::warn!(task = task.as_str(), error = ?e, "batch resume: claim_resume_attempt() failed; skipping task");
-            drop(permit);
-            return None;
-        }
-    };
-
+    // Validate the persisted cwd before consuming a resume slot.
     let ctx = match child.session_cwd.as_deref() {
         Some(s) => match SessionCwd::parse(s) {
             Ok(c) => WorkflowRunContext {
@@ -541,6 +518,164 @@ async fn resumed_child_future(
         },
     };
 
+    let previous = match deps.detached.task_store.get_attempt_locator(&task).await {
+        Ok(Some(locator)) => locator,
+        _ => {
+            let _ = finalize_detached(
+                &deps.detached.task_store,
+                &deps.detached.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("not resumable: missing durable attempt lineage"),
+                None,
+            )
+            .await;
+            drop(permit);
+            return None;
+        }
+    };
+    let identity = match previous.identity.resume() {
+        Ok(identity) => identity,
+        Err(_) => {
+            let _ = finalize_detached(
+                &deps.detached.task_store,
+                &deps.detached.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("resume attempt identity overflow"),
+                None,
+            )
+            .await;
+            drop(permit);
+            return None;
+        }
+    };
+    let next_locator = bridge_core::task_store::TaskAttemptLocator {
+        identity: identity.clone(),
+        telemetry_unavailable: None,
+    };
+    match deps
+        .detached
+        .task_store
+        .claim_resume_attempt_with_locator(
+            &task,
+            cap,
+            deps.detached.clock.now_ms(),
+            &previous,
+            &next_locator,
+        )
+        .await
+    {
+        Ok(ResumeClaim::Exhausted) => {
+            let _ = finalize_detached(
+                &deps.detached.task_store,
+                &deps.detached.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("resume attempt cap exceeded"),
+                None,
+            )
+            .await;
+            drop(permit);
+            return None;
+        }
+        Ok(ResumeClaim::Resumable { .. }) => {}
+        Err(error) => {
+            tracing::warn!(task = task.as_str(), error = ?error, "batch resume: atomic resume claim failed; skipping task");
+            drop(permit);
+            return None;
+        }
+    };
+
+    let mut summary_history = None;
+    let (workload_fingerprint, workload_fingerprint_complete) = deps
+        .detached
+        .executor
+        .as_ref()
+        .map(|executor| executor.workload_fingerprint(&graph))
+        .unwrap_or_else(|| bridge_workflow::graph::workload_fingerprint_with(&graph, |_| None));
+    let reservation = bridge_core::workflow_history::AttemptReservation {
+        identity: identity.clone(),
+        task_id: Some(task.clone()),
+        workflow: child.workflow.clone(),
+        task_class: "workflow".into(),
+        surface: bridge_core::workflow_history::ExecutionSurface::ServedTask,
+        policy: "r2f0a".into(),
+        workload_fingerprint,
+        started_ms: deps.detached.clock.now_ms(),
+        workload_fingerprint_complete,
+        prompt_acceptance: "not_dispatched".into(),
+        pinned: false,
+    };
+    let telemetry_unavailable = match &deps.detached.workflow_history {
+        Some(Ok(history)) => match history.reserve(&reservation).await {
+            Ok(()) => {
+                summary_history = Some(history.clone());
+                None
+            }
+            Err(error) => Some(error.reason),
+        },
+        Some(Err(reason)) => Some(*reason),
+        None => Some(bridge_core::workflow_history::LedgerUnavailableReason::Open),
+    };
+    let attempt_telemetry = AttemptTelemetryState::default();
+    if let Some(reason) = telemetry_unavailable {
+        attempt_telemetry.record(reason);
+        deps.detached.observer.record_workflow(
+            &bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable { reason },
+        );
+        if let Err(error) = deps
+            .detached
+            .task_store
+            .mark_attempt_telemetry_unavailable(&task, &identity.attempt_id, reason)
+            .await
+        {
+            tracing::warn!(task = task.as_str(), error = ?error, "batch resume: telemetry marker persistence failed");
+        }
+    }
+    let prompt_dispatch = summary_history.as_ref().map(|history| {
+        workflow_prompt_dispatch_barrier_with_state(
+            history.clone(),
+            deps.detached.task_store.clone(),
+            task.clone(),
+            identity.attempt_id.clone(),
+            deps.detached.observer.clone(),
+            attempt_telemetry.clone(),
+        )
+    });
+    let terminal_barrier = workflow_terminal_summary_barrier(
+        summary_history,
+        attempt_telemetry,
+        deps.detached.task_store.clone(),
+        task.clone(),
+        identity.clone(),
+        deps.detached.observer.clone(),
+        child.workflow.clone(),
+        attempt_started,
+        queue_ms,
+    );
+    if telemetry_unavailable
+        == Some(bridge_core::workflow_history::LedgerUnavailableReason::Collision)
+    {
+        let _ = finalize_detached_with_barrier(
+            &deps.detached.task_store,
+            &deps.detached.progress_hubs,
+            &task,
+            TaskRecordStatus::Interrupted,
+            None,
+            Some("attempt identity collision"),
+            None,
+            Some(&terminal_barrier),
+            "not_needed",
+        )
+        .await;
+        drop(permit);
+        return None;
+    }
+
     let hub = Arc::new(TaskProgressHub::new());
     deps.detached
         .progress_hubs
@@ -553,8 +688,8 @@ async fn resumed_child_future(
         .lock()
         .await
         .insert(task.clone(), token.clone());
-    let run_id = format!("{}-resume-{}", task.as_str(), attempt);
-    let h = spawn_detached_workflow(
+    let run_id = identity.run_id().to_string();
+    let handle = spawn_detached_workflow_with_attempt_barriers(
         &deps.detached,
         task.clone(),
         child.input.clone(),
@@ -564,12 +699,14 @@ async fn resumed_child_future(
         seed,
         ctx,
         hub,
+        prompt_dispatch,
+        Some(terminal_barrier),
     );
     let task_id = child.id.clone();
     Some((
         Box::pin(async move {
             let _permit = permit;
-            let _ = h.await;
+            let _ = handle.await;
             task
         }),
         task_id,
@@ -690,6 +827,9 @@ pub async fn run_admission(
     token: CancellationToken,
     cap: u32,
 ) {
+    // Every child attempt's end-to-end clock begins when this batch owner starts,
+    // before local pending and the serve-wide semaphore wait.
+    let batch_attempt_started = Instant::now();
     let mut inflight: FuturesUnordered<BoxFuture<'static, TaskId>> = FuturesUnordered::new();
     let mut live: HashMap<TaskId, CancellationToken> = HashMap::new();
     let mut drain_only = token.is_cancelled();
@@ -729,6 +869,8 @@ pub async fn run_admission(
             };
 
             queue_guard.admitted();
+            let queue_ms =
+                u64::try_from(batch_attempt_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
             // Resume an existing Working child first (its row already exists; re-run from
             // checkpoints). The permit is owned by the returned future, or dropped inside
@@ -736,8 +878,15 @@ pub async fn run_admission(
             // permit HERE (inside the drain-aware loop) keeps the cap honored on boot without
             // the cross-batch deadlock of acquiring inline before the loop runs.
             if let Some(child) = to_resume.front().cloned() {
-                if let Some((fut, task, ctok)) =
-                    resumed_child_future(&deps, &child, cap, permit).await
+                if let Some((fut, task, ctok)) = resumed_child_future(
+                    &deps,
+                    &child,
+                    cap,
+                    permit,
+                    batch_attempt_started,
+                    queue_ms,
+                )
+                .await
                 {
                     live.insert(task, ctok);
                     let queue_guard = queue_guard;
@@ -778,7 +927,17 @@ pub async fn run_admission(
                 break;
             };
 
-            let task = new_detached_task_id();
+            let identity = match bridge_core::ids::AttemptIdentity::initial() {
+                Ok(identity) => identity,
+                Err(_) => {
+                    drop(permit);
+                    fail_batch_unavailable(&deps, &bid).await;
+                    claim_failed = true;
+                    break;
+                }
+            };
+            let task = TaskId::parse(identity.execution_id.as_str().to_string())
+                .expect("execution id is a valid task id");
             let hub = Arc::new(TaskProgressHub::new());
             let ctok = CancellationToken::new();
             deps.detached
@@ -815,13 +974,112 @@ pub async fn run_admission(
                 artifacts_purged_at: None,
             };
 
+            let initial_locator = bridge_core::task_store::TaskAttemptLocator {
+                identity: identity.clone(),
+                telemetry_unavailable: None,
+            };
             match deps
                 .detached
                 .task_store
-                .claim_batch_child(&bid, &item.item_id, &rec)
+                .claim_batch_child_with_locator(&bid, &item.item_id, &rec, &initial_locator)
                 .await
             {
                 Ok(ChildClaim::Created) => {
+                    let (workload_fingerprint, workload_fingerprint_complete) = deps
+                        .detached
+                        .executor
+                        .as_ref()
+                        .map(|executor| executor.workload_fingerprint(&graph))
+                        .unwrap_or_else(|| {
+                            bridge_workflow::graph::workload_fingerprint_with(&graph, |_| None)
+                        });
+                    let reservation = bridge_core::workflow_history::AttemptReservation {
+                        identity: identity.clone(),
+                        task_id: Some(task.clone()),
+                        workflow: workflow.as_str().to_string(),
+                        task_class: "workflow".into(),
+                        surface: bridge_core::workflow_history::ExecutionSurface::ServedTask,
+                        policy: "r2f0a".into(),
+                        workload_fingerprint,
+                        started_ms: now,
+                        workload_fingerprint_complete,
+                        prompt_acceptance: "not_dispatched".into(),
+                        pinned: false,
+                    };
+                    let (summary_history, telemetry_unavailable) =
+                        match &deps.detached.workflow_history {
+                            Some(Ok(history)) => match history.reserve(&reservation).await {
+                                Ok(()) => (Some(history.clone()), None),
+                                Err(error) => (None, Some(error.reason)),
+                            },
+                            Some(Err(reason)) => (None, Some(*reason)),
+                            None => (
+                                None,
+                                Some(bridge_core::workflow_history::LedgerUnavailableReason::Open),
+                            ),
+                        };
+                    let attempt_telemetry = AttemptTelemetryState::default();
+                    if let Some(reason) = telemetry_unavailable {
+                        attempt_telemetry.record(reason);
+                        deps.detached.observer.record_workflow(
+                            &bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable { reason },
+                        );
+                        if let Err(error) = deps
+                            .detached
+                            .task_store
+                            .mark_attempt_telemetry_unavailable(&task, &identity.attempt_id, reason)
+                            .await
+                        {
+                            tracing::warn!(
+                                task = task.as_str(),
+                                error = ?error,
+                                "batch telemetry marker persistence failed"
+                            );
+                        }
+                    }
+                    let prompt_dispatch = summary_history.as_ref().map(|history| {
+                        workflow_prompt_dispatch_barrier_with_state(
+                            history.clone(),
+                            deps.detached.task_store.clone(),
+                            task.clone(),
+                            identity.attempt_id.clone(),
+                            deps.detached.observer.clone(),
+                            attempt_telemetry.clone(),
+                        )
+                    });
+                    let terminal_barrier = workflow_terminal_summary_barrier(
+                        summary_history,
+                        attempt_telemetry,
+                        deps.detached.task_store.clone(),
+                        task.clone(),
+                        identity.clone(),
+                        deps.detached.observer.clone(),
+                        workflow.as_str().to_owned(),
+                        batch_attempt_started,
+                        queue_ms,
+                    );
+
+                    if telemetry_unavailable
+                        == Some(bridge_core::workflow_history::LedgerUnavailableReason::Collision)
+                    {
+                        let _ = finalize_detached_with_barrier(
+                            &deps.detached.task_store,
+                            &deps.detached.progress_hubs,
+                            &task,
+                            TaskRecordStatus::Interrupted,
+                            None,
+                            Some("attempt identity collision"),
+                            Some(&hub),
+                            Some(&terminal_barrier),
+                            "not_needed",
+                        )
+                        .await;
+                        deps.detached.workflow_cancels.lock().await.remove(&task);
+                        drop(permit);
+                        pending.pop_front();
+                        continue;
+                    }
+
                     let batch_canceling = deps
                         .detached
                         .task_store
@@ -841,7 +1099,7 @@ pub async fn run_admission(
                         .map(|r| r.status.is_terminal())
                         .unwrap_or(false);
                     if batch_canceling || child_terminal || token.is_cancelled() {
-                        let _ = finalize_detached(
+                        let _ = finalize_detached_with_barrier(
                             &deps.detached.task_store,
                             &deps.detached.progress_hubs,
                             &task,
@@ -849,10 +1107,11 @@ pub async fn run_admission(
                             None,
                             Some("batch canceled before spawn"),
                             Some(&hub),
+                            Some(&terminal_barrier),
+                            "not_needed",
                         )
                         .await;
                         deps.detached.workflow_cancels.lock().await.remove(&task);
-                        deps.detached.progress_hubs.lock().await.remove(&task);
                         drop(permit);
                         pending.pop_front();
                         if token.is_cancelled() {
@@ -861,12 +1120,12 @@ pub async fn run_admission(
                         continue;
                     }
 
-                    let h = spawn_detached_workflow(
+                    let handle = spawn_detached_workflow_with_attempt_barriers(
                         &deps.detached,
                         task.clone(),
                         item.input.clone(),
                         graph,
-                        task.as_str().to_string(),
+                        identity.run_id().to_string(),
                         ctok.clone(),
                         HashMap::new(),
                         WorkflowRunContext {
@@ -877,13 +1136,15 @@ pub async fn run_admission(
                             ..WorkflowRunContext::default()
                         },
                         hub,
+                        prompt_dispatch,
+                        Some(terminal_barrier),
                     );
                     live.insert(task.clone(), ctok);
                     let queue_guard = queue_guard;
                     inflight.push(Box::pin(async move {
                         let _permit = permit;
                         let _queue_guard = queue_guard;
-                        let _ = h.await;
+                        let _ = handle.await;
                         task
                     }));
                     pending.pop_front();
@@ -1013,7 +1274,41 @@ pub fn summarize_batch(rec: &BatchRecord, children: &[TaskRecord]) -> BatchSumma
         running,
         pending,
         children: kids,
+        child_attempts: Vec::new(),
     }
+}
+
+async fn summarize_batch_with_attempts(
+    deps: &BatchDeps,
+    record: &BatchRecord,
+    children: &[TaskRecord],
+) -> Result<BatchSummary, BridgeError> {
+    let mut summary = summarize_batch(record, children);
+    summary.child_attempts = batch_child_attempts(&deps.detached.task_store, children).await?;
+    Ok(summary)
+}
+
+async fn batch_child_attempts(
+    store: &Arc<dyn bridge_core::task_store::TaskStore>,
+    children: &[TaskRecord],
+) -> Result<Vec<BatchChildAttempt>, BridgeError> {
+    let mut attempts = Vec::with_capacity(children.len());
+    for child in children {
+        let Some(locator) = store.get_attempt_locator(&child.id).await? else {
+            continue;
+        };
+        attempts.push(BatchChildAttempt {
+            item_id: child.item_id.clone().unwrap_or_default(),
+            task_id: child.id.clone(),
+            status: child.status,
+            execution_id: locator.identity.execution_id,
+            attempt_id: locator.identity.attempt_id,
+            attempt_ordinal: locator.identity.ordinal,
+            parent_attempt_id: locator.identity.parent_attempt_id,
+            telemetry_unavailable: locator.telemetry_unavailable,
+        });
+    }
+    Ok(attempts)
 }
 
 /// The SINGLE settle predicate (RR-FIX-8): Working drained -> Completed; Canceling with
@@ -1041,6 +1336,7 @@ mod tests {
             BatchItem, BatchRecord, BatchStatus, MemoryTaskStore, TaskRecord, TaskRecordStatus,
             TaskStore,
         },
+        workflow_history::{MemoryWorkflowHistoryStore, WorkflowHistoryStore},
     };
     use bridge_observ::{DropCounter, TurnLogObserver};
     use bridge_workflow::executor::WorkflowExecutor;
@@ -1256,11 +1552,42 @@ mod tests {
                 progress_hubs: Arc::new(Mutex::new(HashMap::new())),
                 clock: Arc::new(ManualClock::new(100)),
                 observer: Arc::new(NoopObserver),
+                workflow_history: None,
             },
             runtime: BatchRuntime::new(max, max, Arc::new(NoopObserver)),
             allowed_cwd_root: None,
         };
         (deps, store)
+    }
+
+    fn batch_deps_with_history(
+        max: u32,
+        gate: Arc<Gate>,
+    ) -> (
+        BatchDeps,
+        Arc<dyn TaskStore>,
+        Arc<MemoryWorkflowHistoryStore>,
+    ) {
+        let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+        let history = Arc::new(MemoryWorkflowHistoryStore::new());
+        let graph = test_graph();
+        let deps = BatchDeps {
+            detached: DetachedDeps {
+                task_store: store.clone(),
+                executor: Some(Arc::new(WorkflowExecutor::new(Arc::new(GatedRegistry {
+                    gate,
+                })))),
+                workflows: Arc::new(HashMap::from([(graph.id.clone(), graph)])),
+                workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
+                progress_hubs: Arc::new(Mutex::new(HashMap::new())),
+                clock: Arc::new(ManualClock::new(100)),
+                observer: Arc::new(NoopObserver),
+                workflow_history: Some(Ok(history.clone())),
+            },
+            runtime: BatchRuntime::new(max, max, Arc::new(NoopObserver)),
+            allowed_cwd_root: None,
+        };
+        (deps, store, history)
     }
 
     fn batch_deps_with_turnlog(
@@ -1286,6 +1613,7 @@ mod tests {
                 progress_hubs: Arc::new(Mutex::new(HashMap::new())),
                 clock: Arc::new(ManualClock::new(100)),
                 observer: turnlog.clone(),
+                workflow_history: None,
             },
             runtime: BatchRuntime::new(max, max, Arc::new(NoopObserver)),
             allowed_cwd_root: None,
@@ -1350,6 +1678,29 @@ mod tests {
             item_id: Some(item_id.into()),
             artifacts_purged_at: None,
         }
+    }
+
+    async fn create_resumable_batch_child(
+        store: &Arc<dyn TaskStore>,
+        batch: &BatchId,
+        item_id: &str,
+    ) -> TaskId {
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str().to_owned()).unwrap();
+        let mut record = batch_child(batch, item_id, TaskRecordStatus::Working, true);
+        record.id = task.clone();
+        store.create(&record).await.unwrap();
+        store
+            .put_attempt_locator(
+                &task,
+                &bridge_core::task_store::TaskAttemptLocator {
+                    identity,
+                    telemetry_unavailable: None,
+                },
+            )
+            .await
+            .unwrap();
+        task
     }
 
     async fn wait_batch_status(
@@ -1435,15 +1786,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        store
-            .create(&batch_child(
-                &bid,
-                "item-0",
-                TaskRecordStatus::Working,
-                true,
-            ))
-            .await
-            .unwrap();
+        let child_task = create_resumable_batch_child(&store, &bid, "item-0").await;
 
         resume_batches(&deps, 3).await;
         gate.wait_calls(1).await;
@@ -1451,7 +1794,6 @@ mod tests {
         wait_batch_status(&store, &bid, BatchStatus::Completed).await;
         turnlog.flush().await;
 
-        let child_task = TaskId::parse("task-batch-resume-owner-item-0").unwrap();
         let rows = wait_turn_rows_for_task(&store, &child_task).await;
         assert!(rows
             .iter()
@@ -1552,15 +1894,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        store
-            .create(&batch_child(
-                &bid,
-                "item-1",
-                TaskRecordStatus::Working,
-                true,
-            ))
-            .await
-            .unwrap();
+        create_resumable_batch_child(&store, &bid, "item-1").await;
 
         resume_batches(&deps, 3).await;
         gate.wait_calls(3).await;
@@ -1602,14 +1936,8 @@ mod tests {
             ))
             .await
             .unwrap();
-        store
-            .create(&batch_child(&a, "item-0", TaskRecordStatus::Working, true))
-            .await
-            .unwrap();
-        store
-            .create(&batch_child(&b, "item-0", TaskRecordStatus::Working, true))
-            .await
-            .unwrap();
+        create_resumable_batch_child(&store, &a, "item-0").await;
+        create_resumable_batch_child(&store, &b, "item-0").await;
 
         let deps_for_resume = deps.clone();
         let h = tokio::spawn(async move {
@@ -1744,24 +2072,8 @@ mod tests {
             ))
             .await
             .unwrap();
-        store
-            .create(&batch_child(
-                &bid,
-                "item-0",
-                TaskRecordStatus::Working,
-                true,
-            ))
-            .await
-            .unwrap();
-        store
-            .create(&batch_child(
-                &bid,
-                "item-1",
-                TaskRecordStatus::Working,
-                true,
-            ))
-            .await
-            .unwrap();
+        create_resumable_batch_child(&store, &bid, "item-0").await;
+        create_resumable_batch_child(&store, &bid, "item-1").await;
 
         resume_batches(&deps, 3).await;
         gate.wait_calls(1).await;
@@ -1788,15 +2100,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        store
-            .create(&batch_child(
-                &bid,
-                "item-0",
-                TaskRecordStatus::Working,
-                true,
-            ))
-            .await
-            .unwrap();
+        create_resumable_batch_child(&store, &bid, "item-0").await;
 
         resume_batches(&deps, 3).await;
         gate.wait_calls(1).await; // the resumed child is in-flight, parked on the gate
@@ -1857,6 +2161,130 @@ mod tests {
 
         wait_batch_status(&store, &bid, BatchStatus::Completed).await;
         assert!(gate.max.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[tokio::test]
+    async fn child_queue_and_end_to_end_include_local_batch_pending() {
+        let gate = Gate::new(None);
+        let (deps, store, history) = batch_deps_with_history(1, gate.clone());
+        let bid = run_batch(
+            &deps,
+            BatchParams {
+                workflow: "batch-test".into(),
+                concurrency: Some(1),
+                items: items(2),
+            },
+        )
+        .await
+        .unwrap();
+
+        gate.wait_calls(1).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        gate.release(1);
+        gate.wait_calls(2).await;
+        gate.release(1);
+        wait_batch_status(&store, &bid, BatchStatus::Completed).await;
+
+        let children = store.batch_children(&bid).await.unwrap();
+        let task_for = |item: &str| {
+            children
+                .iter()
+                .find(|child| child.item_id.as_deref() == Some(item))
+                .unwrap()
+                .id
+                .clone()
+        };
+        let first_task = task_for("item-0");
+        let second_task = task_for("item-1");
+        let rows = history.completed_between(0, i64::MAX).await.unwrap();
+        let terminal_for = |task: &TaskId| {
+            rows.iter()
+                .find(|row| row.reservation.task_id.as_ref() == Some(task))
+                .unwrap()
+                .terminal
+                .clone()
+        };
+        let first = terminal_for(&first_task);
+        let second = terminal_for(&second_task);
+
+        assert!(first.end_to_end_ms >= first.queue_ms);
+        assert!(second.end_to_end_ms >= second.queue_ms);
+        assert!(
+            second.queue_ms >= first.queue_ms.saturating_add(50),
+            "the pending child must include the first child's controlled 80ms occupancy: first={first:?} second={second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_queue_and_end_to_end_include_global_semaphore_wait() {
+        let gate = Gate::new(None);
+        let (deps, store, history) = batch_deps_with_history(1, gate.clone());
+        let bid = BatchId::parse("batch-global-queue-clock").unwrap();
+        store
+            .create_batch(&batch_record(
+                "batch-global-queue-clock",
+                BatchStatus::Working,
+                1,
+                1,
+            ))
+            .await
+            .unwrap();
+        let held = deps
+            .runtime
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let task_deps = deps.clone();
+        let task_bid = bid.clone();
+        let owner = tokio::spawn(async move {
+            run_admission(
+                task_deps,
+                task_bid,
+                VecDeque::new(),
+                VecDeque::from(items(1)),
+                1,
+                CancellationToken::new(),
+                0,
+            )
+            .await;
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let queued = deps.runtime.queue_counts.lock().unwrap().queued;
+            if queued == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child never entered global queue"
+            );
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        drop(held);
+        gate.wait_calls(1).await;
+        gate.release(1);
+        tokio::time::timeout(Duration::from_secs(5), owner)
+            .await
+            .expect("batch owner completes")
+            .unwrap();
+
+        let row = history
+            .completed_between(0, i64::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("one child attempt summary");
+        assert!(
+            row.terminal.queue_ms >= 50,
+            "queue metric must include the controlled 80ms global wait: {:?}",
+            row.terminal
+        );
+        assert!(row.terminal.end_to_end_ms >= row.terminal.queue_ms);
     }
 
     #[tokio::test]

@@ -327,7 +327,7 @@ fn build_server_ex(
         backends,
         default: AgentId::parse("codex").unwrap(),
     });
-    let coord = bridge_a2a_inbound::server::coordinator_over(
+    let coord = bridge_a2a_inbound::server::coordinator_over_with_workflow_history(
         registry as Arc<dyn AgentRegistry>,
         store as Arc<dyn SessionStore>,
         Arc::new(AutoApprove),
@@ -337,6 +337,9 @@ fn build_server_ex(
         None,
         None,
         None,
+        Ok(Arc::new(
+            bridge_core::workflow_history::MemoryWorkflowHistoryStore::new(),
+        )),
     );
     Arc::new(InboundServer::from_coordinator(
         coord,
@@ -379,6 +382,37 @@ fn jsonrpc_body(method: &str, id: i64, params: Value) -> axum::body::Body {
     )
 }
 
+fn bind_send_identity(method: &str, params: &mut Value) {
+    if method != methods::SEND_MESSAGE {
+        return;
+    }
+    let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+    let message = params
+        .get_mut("message")
+        .and_then(Value::as_object_mut)
+        .expect("SendMessage fixture has a message object");
+    message.insert("taskId".into(), identity.execution_id.as_str().into());
+    let metadata = message
+        .entry("metadata")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .expect("SendMessage metadata is an object");
+    metadata.insert(
+        "a2a-bridge.execution_id".into(),
+        identity.execution_id.as_str().into(),
+    );
+    metadata.insert(
+        "a2a-bridge.attempt_id".into(),
+        identity.attempt_id.as_str().into(),
+    );
+    if params.get("taskId").is_some() {
+        params
+            .as_object_mut()
+            .unwrap()
+            .insert("taskId".into(), identity.execution_id.as_str().into());
+    }
+}
+
 fn post_request(method: &str, params: Value) -> axum::http::Request<axum::body::Body> {
     post_request_with_id(method, 1, params)
 }
@@ -386,8 +420,9 @@ fn post_request(method: &str, params: Value) -> axum::http::Request<axum::body::
 fn post_request_with_id(
     method: &str,
     id: i64,
-    params: Value,
+    mut params: Value,
 ) -> axum::http::Request<axum::body::Body> {
+    bind_send_identity(method, &mut params);
     axum::http::Request::builder()
         .method("POST")
         .uri("/")
@@ -412,15 +447,25 @@ fn post_request_with_cursor(
         .unwrap()
 }
 
-/// POST an already-fully-formed JSON-RPC request body verbatim (used by the
-/// corpus replay tests, which POST a captured/reconstructed request AS-IS).
+/// Replay a captured request after attaching the runtime-mandatory identity
+/// envelope. The historical corpus remains unchanged so its captured shape can
+/// still be compared independently of the admission contract.
 fn post_raw(body: &Value) -> axum::http::Request<axum::body::Body> {
+    let mut body = body.clone();
+    let method = body
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    if let Some(params) = body.get_mut("params") {
+        bind_send_identity(&method, params);
+    }
     axum::http::Request::builder()
         .method("POST")
         .uri("/")
         .header("content-type", "application/json")
         .header(SVC_PARAM_VERSION, VERSION)
-        .body(axum::body::Body::from(serde_json::to_vec(body).unwrap()))
+        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
 }
 
@@ -735,6 +780,46 @@ async fn subscribe_terminal_snapshot_orders_frames_and_flattens_kind() {
     assert!(
         body.contains("\"kind\":\"node_finished\"") && body.contains("\"node\":\"node-a\""),
         "kind must be a flattened top-level discriminator, not a nested wrapper: {body}"
+    );
+}
+
+#[tokio::test]
+async fn subscribe_terminal_without_checkpoints_keeps_terminal_id_unique() {
+    let task_store = Arc::new(MemoryTaskStore::new());
+    let task = seed_working_record(&task_store, "sub-term-no-checkpoints").await;
+    let op = operation_id_for(&task);
+    let terminal_seq = task_store
+        .set_terminal_sequenced(
+            &task,
+            &op,
+            TaskRecordStatus::Completed,
+            Some("done"),
+            None,
+            now_ms(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(terminal_seq, 1);
+
+    let srv = build_server_ex(HashMap::new(), Arc::new(FakeStore::default()), task_store);
+    let resp = srv
+        .router()
+        .oneshot(post_request(
+            methods::SUBSCRIBE_TO_TASK,
+            json!({ "id": "sub-term-no-checkpoints" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = sse_body(resp).await;
+
+    assert_eq!(
+        sse_frames(&body),
+        vec![
+            (0, "snapshot_complete".to_owned()),
+            (1, "terminal".to_owned()),
+        ],
+        "SnapshotComplete must not share the terminal ID: {body}"
     );
 }
 

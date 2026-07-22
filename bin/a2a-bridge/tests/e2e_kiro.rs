@@ -75,7 +75,7 @@ async fn real_kiro_round_trip_returns_pong() {
     let base_url = format!("http://{addr}");
 
     let server = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             common::single_agent_registry("kiro", backend),
             store,
             policy,

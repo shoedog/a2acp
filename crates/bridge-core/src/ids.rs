@@ -1,6 +1,7 @@
 // ids.rs — parse-don't-validate newtypes for domain identifiers (spec §5.1/§5.4).
 
 use crate::error::BridgeError;
+use ring::rand::{SecureRandom, SystemRandom};
 
 macro_rules! id_newtype {
     ($name:ident) => {
@@ -90,6 +91,102 @@ macro_rules! id_newtype_strict {
 }
 id_newtype_strict!(WorkflowId);
 id_newtype_strict!(NodeId);
+
+macro_rules! high_entropy_id {
+    ($name:ident, $prefix:literal, $field:literal) => {
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(String);
+        impl $name {
+            pub const PREFIX: &'static str = $prefix;
+            pub const ENCODED_LEN: usize = $prefix.len() + 32;
+            pub fn mint() -> Result<Self, BridgeError> {
+                let mut bytes = [0_u8; 16];
+                SystemRandom::new()
+                    .fill(&mut bytes)
+                    .map_err(|_| BridgeError::IdentityUnavailable)?;
+                let mut value = String::with_capacity(Self::ENCODED_LEN);
+                value.push_str($prefix);
+                for byte in bytes {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut value, "{byte:02x}");
+                }
+                Ok(Self(value))
+            }
+            pub fn parse(value: impl Into<String>) -> Result<Self, BridgeError> {
+                let value = value.into();
+                let suffix = value
+                    .strip_prefix($prefix)
+                    .ok_or(BridgeError::InvalidRequest { field: $field })?;
+                if value.len() != Self::ENCODED_LEN
+                    || suffix.bytes().all(|b| b == b'0')
+                    || !suffix
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err(BridgeError::InvalidRequest { field: $field });
+                }
+                Ok(Self(value))
+            }
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+        impl serde::Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+                Self::parse(value).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+high_entropy_id!(ExecutionId, "exec-", "execution_id");
+high_entropy_id!(AttemptId, "attempt-", "attempt_id");
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttemptIdentity {
+    pub execution_id: ExecutionId,
+    pub attempt_id: AttemptId,
+    pub ordinal: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_attempt_id: Option<AttemptId>,
+}
+impl AttemptIdentity {
+    pub fn initial() -> Result<Self, BridgeError> {
+        Ok(Self {
+            execution_id: ExecutionId::mint()?,
+            attempt_id: AttemptId::mint()?,
+            ordinal: 0,
+            parent_attempt_id: None,
+        })
+    }
+    pub fn resume(&self) -> Result<Self, BridgeError> {
+        Ok(Self {
+            execution_id: self.execution_id.clone(),
+            attempt_id: AttemptId::mint()?,
+            ordinal: self
+                .ordinal
+                .checked_add(1)
+                .ok_or(BridgeError::InvalidRequest {
+                    field: "attempt ordinal overflow",
+                })?,
+            parent_attempt_id: Some(self.attempt_id.clone()),
+        })
+    }
+    pub fn run_id(&self) -> &str {
+        self.attempt_id.as_str()
+    }
+}
 
 /// Prompt registry id (E8a). Deliberately MORE permissive than `id_newtype_strict!` (admits uppercase,
 /// `/`, `.`) so E8b namespaced partials (`_preamble/review-readonly`) need no grammar change. Derives
@@ -219,5 +316,39 @@ mod tests {
         assert!(NodeId::parse("has space").is_err());
         assert!(NodeId::parse("br{{ace").is_err());
         assert!(WorkflowId::parse("UPPER").is_err()); // lowercase only
+    }
+}
+
+#[cfg(test)]
+mod r2f0a_identity_tests {
+    use super::*;
+
+    #[test]
+    fn identities_are_distinct_validated_and_json_cannot_bypass_validation() {
+        let first = AttemptIdentity::initial().unwrap();
+        let second = AttemptIdentity::initial().unwrap();
+        assert_ne!(first.execution_id, second.execution_id);
+        assert_ne!(first.attempt_id, second.attempt_id);
+        assert_eq!(first.execution_id.as_str().len(), ExecutionId::ENCODED_LEN);
+        for invalid in [
+            "",
+            "exec-1",
+            "exec-00000000000000000000000000000000",
+            "exec-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            assert!(ExecutionId::parse(invalid).is_err());
+        }
+        assert!(serde_json::from_str::<AttemptId>("\"attempt-short\"").is_err());
+    }
+
+    #[test]
+    fn resume_preserves_execution_and_links_a_fresh_attempt() {
+        let first = AttemptIdentity::initial().unwrap();
+        let next = first.resume().unwrap();
+        assert_eq!(next.execution_id, first.execution_id);
+        assert_ne!(next.attempt_id, first.attempt_id);
+        assert_eq!(next.ordinal, 1);
+        assert_eq!(next.parent_attempt_id.as_ref(), Some(&first.attempt_id));
+        assert_eq!(next.run_id(), next.attempt_id.as_str());
     }
 }

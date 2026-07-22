@@ -447,8 +447,37 @@ pub enum ObsEvent<'a> {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum WorkflowObsEvent<'a> {
+    Started {
+        task_class: &'a str,
+        surface: &'a str,
+    },
+    Finished {
+        attempt_id: &'a crate::ids::AttemptId,
+        workflow: &'a str,
+        task_class: &'a str,
+        surface: &'a str,
+        policy: &'a str,
+        outcome: &'a str,
+        work_seconds: f64,
+        end_to_end_seconds: f64,
+    },
+    /// Balance a previously emitted `Started` event when no trustworthy primary
+    /// terminal record can be read. This must not create a terminal counter or
+    /// duration sample.
+    Stopped {
+        task_class: &'a str,
+        surface: &'a str,
+    },
+    TelemetryUnavailable {
+        reason: crate::workflow_history::LedgerUnavailableReason,
+    },
+}
+
 pub trait Observer: Send + Sync {
     fn record(&self, e: &ObsEvent<'_>);
+    fn record_workflow(&self, _event: &WorkflowObsEvent<'_>) {}
 }
 
 // ─── Registry / config-source ports (Increment 3b §4.5) ──────────────────────
@@ -484,6 +513,15 @@ pub trait AgentRegistry: Send + Sync {
     }
     /// Return the default agent id for this registry.
     fn default_id(&self) -> crate::ids::AgentId;
+    /// Return the currently configured model/effort/mode without resolving or
+    /// spawning a backend. Registries that cannot prove this shape return None;
+    /// callers must mark the resulting workload fingerprint incomplete.
+    fn configured_effective(
+        &self,
+        _id: &crate::ids::AgentId,
+    ) -> Option<crate::domain::EffectiveConfig> {
+        None
+    }
     /// Atomically reconcile the registry to the given snapshot. [§4.5]
     async fn apply(&self, snapshot: RegistrySnapshot) -> Result<(), BridgeError>;
     /// Drop the cached backend for `agent` so the next `resolve` RESPAWNS a fresh process (E6 retry

@@ -184,6 +184,8 @@ mod tests {
         match e {
             BridgeError::A2aVersionMismatch => "A2aVersionMismatch",
             BridgeError::InvalidRequest { .. } => "InvalidRequest",
+            BridgeError::IdentityUnavailable => "IdentityUnavailable",
+            BridgeError::DurableEvidenceUnavailable { .. } => "DurableEvidenceUnavailable",
             BridgeError::TaskNotFound => "TaskNotFound",
             BridgeError::SessionNotFound => "SessionNotFound",
             BridgeError::AuthRequired { .. } => "AuthRequired",

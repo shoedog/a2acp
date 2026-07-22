@@ -102,7 +102,7 @@ async fn bridge_a_delegates_through_bridge_b_to_kiro() {
     let store_b = Arc::new(SqliteStore::open_in_memory().expect("sqlite in-memory (B)"));
 
     let server_b = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             common::single_agent_registry("kiro", backend_b),
             store_b,
             Arc::new(AutoPolicy),
@@ -142,7 +142,7 @@ async fn bridge_a_delegates_through_bridge_b_to_kiro() {
     let backend_a: Arc<dyn bridge_core::ports::AgentBackend> = Arc::new(BridgeABackend);
 
     let server_a = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             common::single_agent_registry("kiro", backend_a),
             store_a,
             Arc::new(AutoPolicy),

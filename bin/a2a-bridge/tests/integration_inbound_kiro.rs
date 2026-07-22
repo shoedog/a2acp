@@ -59,7 +59,7 @@ fn build_router() -> axum::Router {
     let auth = Arc::new(AlwaysGrant);
 
     let server = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             common::single_agent_registry("kiro", backend),
             store,
             policy,

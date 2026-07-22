@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use a2a;
-use bridge_core::domain::{InjectRequest, Part, PermitDecision};
+use bridge_core::domain::{AgentOverride, Effort, InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
 #[cfg(test)]
 use bridge_core::ids::OperationId;
-use bridge_core::ids::{BatchId, ContextId, TaskId, WorkflowId};
+use bridge_core::ids::{AgentId, BatchId, ContextId, TaskId, WorkflowId};
 use bridge_core::orch::{AgentSessionCaps, TerminalUsage, UsageSnapshot};
 use bridge_core::permission::{PermKey, PermissionRegistry, PermissionResolution, TurnMeta};
 use bridge_core::ports::{
@@ -27,8 +27,9 @@ use tokio_util::sync::CancellationToken;
 use crate::batch::{BatchDeps, BatchParams, BatchRuntime};
 use crate::clock::Clock;
 use crate::detached::{
-    new_detached_task_id, resume_working_tasks, spawn_detached_workflow, DetachedDeps,
-    TaskProgressHub,
+    reconcile_pending_terminal_projections, reconcile_terminal_checkpoints, resume_working_tasks,
+    spawn_detached_workflow_with_attempt_barriers, workflow_prompt_dispatch_barrier_with_state,
+    workflow_terminal_summary_barrier, AttemptTelemetryState, DetachedDeps, TaskProgressHub,
 };
 use crate::dispatch::{TaskBinding, WarmCompletionExit, WarmCompletionGuard};
 use crate::params::{OpParams, PermitParams};
@@ -68,7 +69,7 @@ fn percent_encode_segment(raw: &str) -> String {
     for b in raw.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(char::from(b));
+                out.push(char::from(b))
             }
             _ => {
                 out.push('%');
@@ -82,14 +83,12 @@ fn percent_encode_segment(raw: &str) -> String {
 fn turn_ref(turn_id: &bridge_core::ids::TurnId) -> String {
     format!("/turns/{}", percent_encode_segment(turn_id.as_str()))
 }
-
 fn journal_ref(task_id: &TaskId) -> String {
     format!(
         "/tasks/{}/journal.jsonl",
         percent_encode_segment(task_id.as_str())
     )
 }
-
 fn artifact_ref(task_id: &TaskId, node: &bridge_core::ids::NodeId) -> String {
     format!(
         "/tasks/{}/artifacts/{}",
@@ -123,6 +122,236 @@ pub struct TaskStatusDto {
     pub usage: Option<UsageSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace: Option<TraceRefs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<bridge_core::ids::ExecutionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<bridge_core::ids::AttemptId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_ordinal: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_attempt_id: Option<bridge_core::ids::AttemptId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_unavailable: Option<bridge_core::workflow_history::LedgerUnavailableReason>,
+}
+
+pub struct DirectAttemptHandle {
+    barrier: bridge_core::workflow_history::DirectAttemptBarrier,
+    pub identity: bridge_core::ids::AttemptIdentity,
+    observer: Arc<dyn Observer>,
+    workflow: &'static str,
+    task_class: &'static str,
+    surface: &'static str,
+    finished: bool,
+}
+
+impl DirectAttemptHandle {
+    fn stop_observation(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.observer
+            .record_workflow(&bridge_core::ports::WorkflowObsEvent::Stopped {
+                task_class: self.task_class,
+                surface: self.surface,
+            });
+    }
+
+    pub async fn mark_prompt_dispatch(&mut self) -> Result<(), BridgeError> {
+        match self.barrier.mark_prompt_dispatch().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let reason = error.reason;
+                self.observer.record_workflow(
+                    &bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable { reason },
+                );
+                Err(BridgeError::DurableEvidenceUnavailable {
+                    reason: reason.as_str(),
+                })
+            }
+        }
+    }
+
+    pub async fn finish(
+        &mut self,
+        outcome: &'static str,
+        reason: &'static str,
+        degraded: bool,
+        cleanup_disposition: &'static str,
+    ) -> Result<(), BridgeError> {
+        self.finish_with_completeness(outcome, reason, degraded, cleanup_disposition, true)
+            .await
+    }
+
+    pub async fn finish_with_completeness(
+        &mut self,
+        outcome: &'static str,
+        reason: &'static str,
+        degraded: bool,
+        cleanup_disposition: &'static str,
+        telemetry_complete: bool,
+    ) -> Result<(), BridgeError> {
+        match self
+            .barrier
+            .finish(
+                outcome,
+                reason,
+                degraded,
+                cleanup_disposition,
+                telemetry_complete,
+            )
+            .await
+        {
+            Ok((bridge_core::workflow_history::TerminalWrite::Applied, terminal)) => {
+                self.finished = true;
+                self.observer
+                    .record_workflow(&bridge_core::ports::WorkflowObsEvent::Finished {
+                        attempt_id: &self.identity.attempt_id,
+                        workflow: self.workflow,
+                        task_class: self.task_class,
+                        surface: self.surface,
+                        policy: "r2f0a",
+                        outcome: terminal.outcome.as_str(),
+                        work_seconds: terminal.work_ms as f64 / 1000.0,
+                        end_to_end_seconds: terminal.end_to_end_ms as f64 / 1000.0,
+                    });
+                Ok(())
+            }
+            Ok((bridge_core::workflow_history::TerminalWrite::Replayed, _)) => {
+                self.stop_observation();
+                Ok(())
+            }
+            Ok((bridge_core::workflow_history::TerminalWrite::Conflict, _)) => {
+                unreachable!("the shared direct barrier maps conflicts to a typed error")
+            }
+            Err(error) => {
+                if error.reason == bridge_core::workflow_history::LedgerUnavailableReason::Collision
+                {
+                    // A conflicting durable terminal belongs to the same admitted
+                    // attempt but cannot be represented as our Finished sample.
+                    // Balance the admission exactly once so the in-flight gauge
+                    // cannot remain permanently elevated.
+                    self.stop_observation();
+                }
+                self.observer.record_workflow(
+                    &bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable {
+                        reason: error.reason,
+                    },
+                );
+                Err(BridgeError::DurableEvidenceUnavailable {
+                    reason: error.reason.as_str(),
+                })
+            }
+        }
+    }
+}
+
+impl Drop for DirectAttemptHandle {
+    fn drop(&mut self) {
+        self.stop_observation();
+    }
+}
+
+pub type WorkflowHistorySelection = Result<
+    Arc<dyn bridge_core::workflow_history::WorkflowHistoryStore>,
+    bridge_core::workflow_history::LedgerUnavailableReason,
+>;
+
+/// Mandatory coordinator-owned admission for every direct execution surface.
+/// Callers may select their durable store before constructing a full coordinator
+/// instance, but admission, dispatch uncertainty, terminalization, and
+/// conservative drop behavior remain one shared state machine.
+#[allow(clippy::too_many_arguments)]
+pub async fn admit_direct_attempt_with_history(
+    selection: WorkflowHistorySelection,
+    observer: Arc<dyn Observer>,
+    identity: bridge_core::ids::AttemptIdentity,
+    surface: bridge_core::workflow_history::ExecutionSurface,
+    workflow: &'static str,
+    task_class: &'static str,
+    workload_fingerprint: String,
+    workload_fingerprint_complete: bool,
+    started_ms: i64,
+    abort_reason: &'static str,
+) -> Result<DirectAttemptHandle, BridgeError> {
+    use bridge_core::workflow_history::{DirectAttemptBarrier, ExecutionSurface};
+
+    if identity.ordinal != 0 || identity.parent_attempt_id.is_some() {
+        return Err(BridgeError::InvalidRequest {
+            field: "attempt linkage",
+        });
+    }
+    if !matches!(
+        surface,
+        ExecutionSurface::DirectUnary | ExecutionSurface::Mcp | ExecutionSurface::Smoke
+    ) {
+        return Err(BridgeError::InvalidRequest {
+            field: "direct execution surface",
+        });
+    }
+    let store = match selection {
+        Ok(store) => store,
+        Err(reason) => {
+            observer.record_workflow(
+                &bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable { reason },
+            );
+            return Err(BridgeError::DurableEvidenceUnavailable {
+                reason: reason.as_str(),
+            });
+        }
+    };
+    let task = TaskId::parse(identity.execution_id.as_str().to_owned())?;
+    let reservation = bridge_core::workflow_history::AttemptReservation {
+        identity: identity.clone(),
+        task_id: Some(task),
+        workflow: workflow.into(),
+        task_class: task_class.into(),
+        surface,
+        policy: "r2f0a".into(),
+        workload_fingerprint,
+        started_ms,
+        workload_fingerprint_complete,
+        prompt_acceptance: "not_dispatched".into(),
+        pinned: false,
+    };
+    let barrier = match DirectAttemptBarrier::admit(store, reservation, abort_reason).await {
+        Ok(barrier) => barrier,
+        Err(error) => {
+            observer.record_workflow(
+                &bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable {
+                    reason: error.reason,
+                },
+            );
+            return Err(BridgeError::DurableEvidenceUnavailable {
+                reason: error.reason.as_str(),
+            });
+        }
+    };
+    observer.record_workflow(&bridge_core::ports::WorkflowObsEvent::Started {
+        task_class,
+        surface: surface.as_str(),
+    });
+    Ok(DirectAttemptHandle {
+        barrier,
+        identity,
+        observer,
+        workflow,
+        task_class,
+        surface: surface.as_str(),
+        finished: false,
+    })
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WorkflowLocator {
+    pub task_id: TaskId,
+    pub execution_id: bridge_core::ids::ExecutionId,
+    pub attempt_id: bridge_core::ids::AttemptId,
+    pub attempt_ordinal: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_attempt_id: Option<bridge_core::ids::AttemptId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_unavailable: Option<bridge_core::workflow_history::LedgerUnavailableReason>,
 }
 
 pub struct TurnOutput {
@@ -166,6 +395,11 @@ impl From<&TaskRecord> for TaskStatusDto {
             updated_ms: rec.updated_ms,
             usage: None,
             trace: None,
+            execution_id: None,
+            attempt_id: None,
+            attempt_ordinal: None,
+            parent_attempt_id: None,
+            telemetry_unavailable: None,
         }
     }
 }
@@ -192,6 +426,12 @@ pub struct Coordinator {
     resume_attempt_cap: u32,
     trace_refs_enabled: bool,
     max_task_turns: usize,
+    workflow_history: Option<
+        Result<
+            Arc<dyn bridge_core::workflow_history::WorkflowHistoryStore>,
+            bridge_core::workflow_history::LedgerUnavailableReason,
+        >,
+    >,
 }
 
 pub fn apply_permit(reg: &PermissionRegistry, p: &PermitParams) -> bool {
@@ -243,7 +483,22 @@ impl Coordinator {
             resume_attempt_cap,
             trace_refs_enabled: false,
             max_task_turns: 512,
+            workflow_history: Some(Err(
+                bridge_core::workflow_history::LedgerUnavailableReason::Open,
+            )),
         }
+    }
+
+    #[must_use]
+    pub fn with_workflow_history(
+        mut self,
+        history: Result<
+            Arc<dyn bridge_core::workflow_history::WorkflowHistoryStore>,
+            bridge_core::workflow_history::LedgerUnavailableReason,
+        >,
+    ) -> Self {
+        self.workflow_history = Some(history);
+        self
     }
 
     #[must_use]
@@ -305,6 +560,16 @@ impl Coordinator {
     pub fn observer(&self) -> Arc<dyn Observer> {
         self.observer.clone()
     }
+    pub fn workflow_history(
+        &self,
+    ) -> Option<
+        Result<
+            Arc<dyn bridge_core::workflow_history::WorkflowHistoryStore>,
+            bridge_core::workflow_history::LedgerUnavailableReason,
+        >,
+    > {
+        self.workflow_history.clone()
+    }
     pub fn allowed_cwd_root(&self) -> Option<SessionCwd> {
         self.allowed_cwd_root.clone()
     }
@@ -316,6 +581,16 @@ impl Coordinator {
     // Arc from the Coordinator the adapter holds behind its own `Arc<Coordinator>`.
     pub fn registry_ref(&self) -> &Arc<dyn AgentRegistry> {
         &self.registry
+    }
+    pub fn workflow_history_ref(
+        &self,
+    ) -> &Option<
+        Result<
+            Arc<dyn bridge_core::workflow_history::WorkflowHistoryStore>,
+            bridge_core::workflow_history::LedgerUnavailableReason,
+        >,
+    > {
+        &self.workflow_history
     }
     pub fn policy_ref(&self) -> &Arc<dyn PolicyEngine> {
         &self.policy
@@ -358,6 +633,7 @@ impl Coordinator {
             progress_hubs: self.progress_hubs.clone(),
             clock: self.clock.clone(),
             observer: self.observer.clone(),
+            workflow_history: self.workflow_history.clone(),
         }
     }
 
@@ -409,9 +685,107 @@ impl Coordinator {
             .expect("minted task id is non-empty")
     }
 
-    /// FIX-3/PFIX-M: a warm single-turn against a context (minted if absent), collected to one TurnOutput.
-    /// Context-less local dispatch is a follow-up; this method always uses the warm checkout path.
+    pub fn direct_workload_fingerprint(
+        &self,
+        agent: &AgentId,
+        overrides: Option<&AgentOverride>,
+        route_kind: &'static str,
+    ) -> (String, bool) {
+        // This shape is intentionally request-derived. Reading registry defaults
+        // before mandatory attempt admission would let a colliding identity reach
+        // registry work. Unknown defaults make the row ineligible for calibration.
+        let effort = overrides
+            .and_then(|value| value.effort)
+            .map(|effort| match effort {
+                Effort::Minimal => "minimal",
+                Effort::Low => "low",
+                Effort::Medium => "medium",
+                Effort::High => "high",
+                Effort::Xhigh => "xhigh",
+                Effort::Max => "max",
+            });
+        let canonical = serde_json::to_vec(&serde_json::json!({
+            "route": route_kind,
+            "agent": agent.as_str(),
+            "model": overrides.and_then(|value| value.model.as_deref()),
+            "effort": effort,
+            "mode": overrides.and_then(|value| value.mode.as_deref()),
+            "config_known": false,
+        }))
+        .expect("fixed direct request shape is serializable");
+        (
+            bridge_core::workflow_history::fingerprint_workload_shape(&canonical),
+            false,
+        )
+    }
+
+    pub async fn admit_direct_attempt(
+        &self,
+        identity: bridge_core::ids::AttemptIdentity,
+        surface: bridge_core::workflow_history::ExecutionSurface,
+        task_class: &'static str,
+        workload_fingerprint: String,
+        workload_fingerprint_complete: bool,
+    ) -> Result<DirectAttemptHandle, BridgeError> {
+        let selection = self.workflow_history.clone().unwrap_or(Err(
+            bridge_core::workflow_history::LedgerUnavailableReason::Open,
+        ));
+        admit_direct_attempt_with_history(
+            selection,
+            self.observer.clone(),
+            identity,
+            surface,
+            "direct",
+            task_class,
+            workload_fingerprint,
+            workload_fingerprint_complete,
+            self.clock.now_ms(),
+            "caller_disconnected",
+        )
+        .await
+    }
+
+    /// Compatibility-only service entry used by embedders with no selected history.
+    /// Production MCP/A2A callers must use `prompt_with_identity`.
+    #[cfg(test)]
     pub async fn prompt(&self, p: OpParams) -> Result<TurnOutput, BridgeError> {
+        if matches!(&self.workflow_history, Some(Ok(_))) {
+            return Err(BridgeError::InvalidRequest {
+                field: "execution_id/attempt_id",
+            });
+        }
+        self.prompt_inner(p, None).await
+    }
+
+    pub async fn prompt_with_identity(
+        &self,
+        p: OpParams,
+        identity: bridge_core::ids::AttemptIdentity,
+    ) -> Result<TurnOutput, BridgeError> {
+        let _ = p.validate_cwd(self.allowed_cwd_root.as_ref())?;
+        let fingerprint_agent = p.agent.clone().unwrap_or_else(|| {
+            AgentId::parse("unresolved").expect("fixed unresolved agent id is valid")
+        });
+        let overrides = p.agent_override();
+        let (fingerprint, fingerprint_complete) =
+            self.direct_workload_fingerprint(&fingerprint_agent, Some(&overrides), "mcp_prompt");
+        let attempt = self
+            .admit_direct_attempt(
+                identity,
+                bridge_core::workflow_history::ExecutionSurface::Mcp,
+                "direct",
+                fingerprint,
+                fingerprint_complete,
+            )
+            .await?;
+        self.prompt_inner(p, Some(attempt)).await
+    }
+
+    async fn prompt_inner(
+        &self,
+        p: OpParams,
+        mut attempt: Option<DirectAttemptHandle>,
+    ) -> Result<TurnOutput, BridgeError> {
         let _deferred_cold_bindings = &self.bindings;
         let cwd = p.validate_cwd(self.allowed_cwd_root.as_ref())?;
         let agent = p
@@ -420,7 +794,7 @@ impl Coordinator {
             .unwrap_or_else(|| self.registry.default_id());
         let ctx = p.context.clone().unwrap_or_else(|| self.mint_context_id());
         let diagnostic = direct_diagnostic_observer();
-        let turn = self
+        let turn = match self
             .session_manager
             .checkout_turn_observed(
                 &ctx,
@@ -429,8 +803,19 @@ impl Coordinator {
                 cwd,
                 diagnostic.clone(),
             )
-            .await?;
-        self.collect_turn_observed(ctx, turn, p.input, diagnostic)
+            .await
+        {
+            Ok(turn) => turn,
+            Err(error) => {
+                if let Some(attempt) = attempt.as_mut() {
+                    attempt
+                        .finish("failed", "pre_prompt_failure", true, "not_needed")
+                        .await?;
+                }
+                return Err(error);
+            }
+        };
+        self.collect_turn_observed_with_attempt(ctx, turn, p.input, diagnostic, attempt)
             .await
     }
 
@@ -438,14 +823,62 @@ impl Coordinator {
     /// (agent/config/cwd) instead of re-deriving it from params: the `continue` surface advertises only
     /// `{input, context}`, so omitted agent/cwd/overrides must NOT be read as a config change (which
     /// `checkout_turn` rejects as `ConfigMismatch`). A context that was never minted → `SessionNotFound`.
+    #[cfg(test)]
     pub async fn continue_turn(&self, p: OpParams) -> Result<TurnOutput, BridgeError> {
+        if matches!(&self.workflow_history, Some(Ok(_))) {
+            return Err(BridgeError::InvalidRequest {
+                field: "execution_id/attempt_id",
+            });
+        }
+        self.continue_turn_inner(p, None).await
+    }
+
+    pub async fn continue_turn_with_identity(
+        &self,
+        p: OpParams,
+        identity: bridge_core::ids::AttemptIdentity,
+    ) -> Result<TurnOutput, BridgeError> {
+        if p.context.is_none() {
+            return Err(BridgeError::InvalidRequest { field: "context" });
+        }
+        let fingerprint_agent =
+            AgentId::parse("unresolved").expect("fixed unresolved agent id is valid");
+        let (fingerprint, _) =
+            self.direct_workload_fingerprint(&fingerprint_agent, None, "mcp_warm_continuation");
+        let attempt = self
+            .admit_direct_attempt(
+                identity,
+                bridge_core::workflow_history::ExecutionSurface::Mcp,
+                "direct",
+                fingerprint,
+                false,
+            )
+            .await?;
+        self.continue_turn_inner(p, Some(attempt)).await
+    }
+
+    async fn continue_turn_inner(
+        &self,
+        p: OpParams,
+        mut attempt: Option<DirectAttemptHandle>,
+    ) -> Result<TurnOutput, BridgeError> {
         let ctx = p
             .context
             .clone()
             .ok_or(BridgeError::InvalidRequest { field: "context" })?;
         let diagnostic = direct_diagnostic_observer();
-        let turn = self.session_manager.checkout_existing_turn(&ctx).await?;
-        self.collect_turn_observed(ctx, turn, p.input, diagnostic)
+        let turn = match self.session_manager.checkout_existing_turn(&ctx).await {
+            Ok(turn) => turn,
+            Err(error) => {
+                if let Some(attempt) = attempt.as_mut() {
+                    attempt
+                        .finish("failed", "pre_prompt_failure", true, "not_needed")
+                        .await?;
+                }
+                return Err(error);
+            }
+        };
+        self.collect_turn_observed_with_attempt(ctx, turn, p.input, diagnostic, attempt)
             .await
     }
 
@@ -508,6 +941,7 @@ impl Coordinator {
         .await
     }
 
+    #[cfg(test)]
     async fn collect_turn_observed(
         &self,
         ctx: ContextId,
@@ -515,7 +949,22 @@ impl Coordinator {
         input: String,
         diagnostic: Arc<dyn DiagnosticObserver>,
     ) -> Result<TurnOutput, BridgeError> {
-        let task = self.mint_prompt_task_id();
+        self.collect_turn_observed_with_attempt(ctx, turn, input, diagnostic, None)
+            .await
+    }
+
+    async fn collect_turn_observed_with_attempt(
+        &self,
+        ctx: ContextId,
+        turn: crate::session_manager::WarmTurn,
+        input: String,
+        diagnostic: Arc<dyn DiagnosticObserver>,
+        mut attempt: Option<DirectAttemptHandle>,
+    ) -> Result<TurnOutput, BridgeError> {
+        let task = match attempt.as_ref() {
+            Some(attempt) => TaskId::parse(attempt.identity.execution_id.as_str().to_string())?,
+            None => self.mint_prompt_task_id(),
+        };
         let obs_ctx = Self::turn_context_for_warm(&ctx, Some(task.clone()), &turn);
         let started = Instant::now();
         let mut ttft = None;
@@ -570,6 +1019,7 @@ impl Coordinator {
         );
         let mut collected = Vec::new();
         let mut aborted = false;
+        let mut prompt_polled = false;
         loop {
             let ev = tokio::select! {
                 biased;
@@ -580,9 +1030,25 @@ impl Coordinator {
                     aborted = true;
                     break;
                 }
-            maybe = events.next() => match maybe {
-                    Some(ev) => ev,
-                    None => break,
+                maybe = async {
+                    if !prompt_polled {
+                        if let Some(attempt) = attempt.as_mut() {
+                            attempt.mark_prompt_dispatch().await?;
+                        }
+                        // The async block continues in this same poll to
+                        // events.next(), so this state is never advanced by an
+                        // unpolled provider future.
+                        prompt_polled = true;
+                    }
+                    Ok::<_, BridgeError>(events.next().await)
+                } => match maybe {
+                    Ok(Some(ev)) => ev,
+                    Ok(None) => break,
+                    Err(error) => {
+                        finish_guard.observe_exit(WarmCompletionExit::Error(&error));
+                        collected.push(Err(error));
+                        break;
+                    }
                 },
             };
             if ttft.is_none() {
@@ -630,6 +1096,11 @@ impl Coordinator {
         // to the checked unobserved path.
         let cleanup_result = finish_guard.complete().await;
         finish_guard.disarm();
+        let cleanup_disposition = if cleanup_result.is_ok() {
+            "complete"
+        } else {
+            "failed"
+        };
 
         if let Some(Err(e)) = collected.iter().find(|r| r.is_err()) {
             let outcome = TurnOutcome::Failed(classify_failure(e));
@@ -644,9 +1115,24 @@ impl Coordinator {
                 usage: last_usage.as_ref(),
                 fin: UsageFinalization::TurnFinal,
             });
+            if let Some(attempt) = attempt.as_mut() {
+                if let Err(terminal_error) = attempt
+                    .finish("failed", "prompt_failed", true, cleanup_disposition)
+                    .await
+                {
+                    tracing::warn!(error = ?terminal_error, "direct attempt finalization failed after prompt error");
+                }
+            }
             return Err(e.clone());
         }
-        cleanup_result?;
+        if let Err(error) = cleanup_result {
+            if let Some(attempt) = attempt.as_mut() {
+                attempt
+                    .finish("failed", "cleanup_failed", true, "failed")
+                    .await?;
+            }
+            return Err(error);
+        }
         let events: Vec<Event> = collected.into_iter().filter_map(Result::ok).collect();
         let out_text = if let Some(artifact_text) = events
             .iter()
@@ -695,6 +1181,17 @@ impl Coordinator {
             fin: UsageFinalization::TurnFinal,
         });
 
+        if let Some(attempt) = attempt.as_mut() {
+            let (terminal_outcome, terminal_reason, degraded) = match outcome {
+                TurnOutcome::Success => ("completed", "completed", false),
+                TurnOutcome::Canceled => ("canceled", "canceled", true),
+                TurnOutcome::Failed(_) => ("failed", "prompt_failed", true),
+            };
+            attempt
+                .finish(terminal_outcome, terminal_reason, degraded, "complete")
+                .await?;
+        }
+
         Ok(TurnOutput {
             text: out_text,
             stop_reason,
@@ -703,7 +1200,15 @@ impl Coordinator {
     }
 
     /// Submit a detached workflow run and return its durable task id.
-    pub async fn run_workflow(&self, p: OpParams) -> Result<TaskId, BridgeError> {
+    pub async fn run_workflow(&self, p: OpParams) -> Result<WorkflowLocator, BridgeError> {
+        self.run_workflow_with_identity(p, None).await
+    }
+
+    pub async fn run_workflow_with_identity(
+        &self,
+        p: OpParams,
+        supplied_identity: Option<bridge_core::ids::AttemptIdentity>,
+    ) -> Result<WorkflowLocator, BridgeError> {
         if p.agent.is_some() || p.model.is_some() || p.effort.is_some() || p.mode.is_some() {
             return Err(BridgeError::InvalidRequest {
                 field: "agent/model/effort/mode (run_workflow ignores overrides)",
@@ -722,10 +1227,34 @@ impl Coordinator {
         let session_cwd = p.validate_cwd(self.allowed_cwd_root.as_ref())?;
         bridge_core::task_spec::validate_input(&p.input)?;
 
-        let task = new_detached_task_id();
+        let identity = match supplied_identity {
+            Some(identity) if identity.ordinal == 0 && identity.parent_attempt_id.is_none() => {
+                identity
+            }
+            Some(_) => {
+                return Err(BridgeError::InvalidRequest {
+                    field: "attempt linkage",
+                });
+            }
+            None => bridge_core::ids::AttemptIdentity::initial()?,
+        };
+        let task = TaskId::parse(identity.execution_id.as_str().to_string())?;
         let now = self.clock.now_ms();
+        let attempt_started = Instant::now();
+        let context = p.context.clone();
+        let token = CancellationToken::new();
+        if let Some(context) = context.as_ref() {
+            let mut runs = self.workflow_runs.lock().await;
+            if runs.contains_key(context) {
+                return Err(BridgeError::HandleBusy);
+            }
+            // The context points at the detached owner's token before durable
+            // admission. SessionCancel during admission therefore cannot fall
+            // into a registration gap, and a concurrent same-context submit
+            // refuses before task, ledger, session, workflow, or provider effects.
+            runs.insert(context.clone(), token.clone());
+        }
         let input = p.input;
-        let workflow_spec_json = Some(crate::detached::encode_workflow_spec(&graph));
         let rec = TaskRecord {
             id: task.clone(),
             workflow: wf_id.as_str().to_string(),
@@ -736,32 +1265,160 @@ impl Coordinator {
             updated_ms: now,
             last_artifact_ms: None,
             input: input.clone(),
-            workflow_spec_json,
+            workflow_spec_json: Some(crate::detached::encode_workflow_spec(&graph)),
             resume_attempts: 0,
             session_cwd: session_cwd.as_ref().map(|c| c.as_str().to_string()),
             batch_id: None,
             item_id: None,
             artifacts_purged_at: None,
         };
-        self.task_store.create(&rec).await?;
+        // The primary task row, current locator, and global attempt-identity
+        // admission are one transaction. A colliding attempt therefore refuses
+        // before provider, workflow, or optional-ledger effects.
+        let initial_locator = bridge_core::task_store::TaskAttemptLocator {
+            identity: identity.clone(),
+            telemetry_unavailable: None,
+        };
+        if let Err(error) = self
+            .task_store
+            .create_with_attempt_locator(&rec, &initial_locator)
+            .await
+        {
+            if let Some(context) = context.as_ref() {
+                self.workflow_runs.lock().await.remove(context);
+            }
+            return Err(error);
+        }
 
+        let (workload_fingerprint, workload_fingerprint_complete) =
+            bridge_workflow::graph::workload_fingerprint(&graph, self.registry.as_ref());
+        let reservation = bridge_core::workflow_history::AttemptReservation {
+            identity: identity.clone(),
+            task_id: Some(task.clone()),
+            workflow: wf_id.as_str().to_string(),
+            task_class: "workflow".into(),
+            surface: bridge_core::workflow_history::ExecutionSurface::ServedTask,
+            policy: "r2f0a".into(),
+            workload_fingerprint,
+            started_ms: now,
+            workload_fingerprint_complete,
+            prompt_acceptance: "not_dispatched".into(),
+            pinned: false,
+        };
+        let (history, telemetry_unavailable) = match &self.workflow_history {
+            Some(Ok(history)) => match history.reserve(&reservation).await {
+                Ok(()) => (Some(history.clone()), None),
+                Err(error)
+                    if error.reason
+                        == bridge_core::workflow_history::LedgerUnavailableReason::Collision =>
+                {
+                    let _ = self
+                        .task_store
+                        .mark_attempt_telemetry_unavailable(
+                            &task,
+                            &identity.attempt_id,
+                            error.reason,
+                        )
+                        .await;
+                    let _ = self
+                        .task_store
+                        .set_terminal(
+                            &task,
+                            TaskRecordStatus::Interrupted,
+                            None,
+                            Some("attempt identity collision"),
+                            self.clock.now_ms(),
+                        )
+                        .await;
+                    if let Some(context) = context.as_ref() {
+                        self.workflow_runs.lock().await.remove(context);
+                    }
+                    return Err(BridgeError::DurableEvidenceUnavailable {
+                        reason: error.reason.as_str(),
+                    });
+                }
+                Err(error) => (None, Some(error.reason)),
+            },
+            Some(Err(reason)) => (None, Some(*reason)),
+            None => (
+                None,
+                Some(bridge_core::workflow_history::LedgerUnavailableReason::Open),
+            ),
+        };
+        let attempt_telemetry = AttemptTelemetryState::default();
+        if let Some(reason) = telemetry_unavailable {
+            attempt_telemetry.record(reason);
+            self.observer.record_workflow(
+                &bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable { reason },
+            );
+            tracing::warn!(
+                reason = reason.as_str(),
+                "workflow summary telemetry unavailable"
+            );
+            if let Err(error) = self
+                .task_store
+                .mark_attempt_telemetry_unavailable(&task, &identity.attempt_id, reason)
+                .await
+            {
+                tracing::warn!(error = ?error, "workflow telemetry marker persistence failed");
+            }
+        }
+        let locator = WorkflowLocator {
+            task_id: task.clone(),
+            execution_id: identity.execution_id.clone(),
+            attempt_id: identity.attempt_id.clone(),
+            attempt_ordinal: identity.ordinal,
+            parent_attempt_id: identity.parent_attempt_id.clone(),
+            telemetry_unavailable,
+        };
         let hub = Arc::new(TaskProgressHub::new());
         self.progress_hubs
             .lock()
             .await
             .insert(task.clone(), hub.clone());
-        let token = CancellationToken::new();
         self.workflow_cancels
             .lock()
             .await
             .insert(task.clone(), token.clone());
-        drop(spawn_detached_workflow(
+        // Preserve CancelTask's pre-admission latch. Once the task row exists,
+        // later cancels address `workflow_cancels` directly; this closes the only
+        // gap before that registration becomes visible.
+        if self
+            .session_store
+            .cancel_requested(&task)
+            .await
+            .unwrap_or(false)
+        {
+            token.cancel();
+        }
+        let prompt_dispatch = history.as_ref().map(|history| {
+            workflow_prompt_dispatch_barrier_with_state(
+                history.clone(),
+                self.task_store.clone(),
+                task.clone(),
+                identity.attempt_id.clone(),
+                self.observer.clone(),
+                attempt_telemetry.clone(),
+            )
+        });
+        let terminal_barrier = workflow_terminal_summary_barrier(
+            history,
+            attempt_telemetry,
+            self.task_store.clone(),
+            task.clone(),
+            identity.clone(),
+            self.observer.clone(),
+            wf_id.as_str().to_owned(),
+            attempt_started,
+            0,
+        );
+        let runner = spawn_detached_workflow_with_attempt_barriers(
             &self.detached_deps(),
             task.clone(),
             input,
             graph,
-            task.as_str().to_string(),
-            token,
+            identity.run_id().to_string(),
+            token.clone(),
             HashMap::new(),
             WorkflowRunContext {
                 session_cwd,
@@ -771,8 +1428,52 @@ impl Coordinator {
                 ..WorkflowRunContext::default()
             },
             hub,
-        ));
-        Ok(task)
+            prompt_dispatch,
+            Some(terminal_barrier),
+        );
+        if let Some(context) = context {
+            let workflow_runs = self.workflow_runs.clone();
+            tokio::spawn(async move {
+                let _ = runner.await;
+                // No successor can occupy this context before this removal: the
+                // current entry remains the admission guard for the runner's
+                // entire lifetime.
+                workflow_runs.lock().await.remove(&context);
+            });
+        } else {
+            // Dropping a Tokio JoinHandle detaches the durable runner.
+            drop(runner);
+        }
+
+        Ok(locator)
+    }
+
+    /// Return one exact ledger attempt. This is the recovery/status authority for
+    /// direct unary and MCP attempts that intentionally have no TaskRecord row.
+    pub async fn attempt_status(
+        &self,
+        attempt: &bridge_core::ids::AttemptId,
+    ) -> Result<bridge_core::workflow_history::AttemptRecord, BridgeError> {
+        let history = match &self.workflow_history {
+            Some(Ok(history)) => history,
+            Some(Err(reason)) => {
+                return Err(BridgeError::DurableEvidenceUnavailable {
+                    reason: reason.as_str(),
+                });
+            }
+            None => {
+                return Err(BridgeError::DurableEvidenceUnavailable {
+                    reason: bridge_core::workflow_history::LedgerUnavailableReason::Open.as_str(),
+                });
+            }
+        };
+        history
+            .attempt(attempt)
+            .await
+            .map_err(|error| BridgeError::DurableEvidenceUnavailable {
+                reason: error.reason.as_str(),
+            })?
+            .ok_or(BridgeError::TaskNotFound)
     }
 
     /// Return status for exactly one warm context or detached task.
@@ -828,6 +1529,13 @@ impl Coordinator {
 
     async fn task_status_dto(&self, rec: &TaskRecord) -> Result<TaskStatusDto, BridgeError> {
         let mut dto = TaskStatusDto::from(rec);
+        if let Some(locator) = self.task_store.get_attempt_locator(&rec.id).await? {
+            dto.execution_id = Some(locator.identity.execution_id);
+            dto.attempt_id = Some(locator.identity.attempt_id);
+            dto.attempt_ordinal = Some(locator.identity.ordinal);
+            dto.parent_attempt_id = locator.identity.parent_attempt_id;
+            dto.telemetry_unavailable = locator.telemetry_unavailable;
+        }
 
         if let Some(agg) = self.task_store.turn_log_usage_for_task(&rec.id).await? {
             dto.usage = Some(UsageSnapshot {
@@ -931,11 +1639,64 @@ impl Coordinator {
     }
 
     /// Boot-time detached task resume.
-    pub async fn resume(&self) {
-        match self.batch_deps() {
-            Some(bdeps) => crate::batch::resume_all(&bdeps, self.resume_attempt_cap).await,
-            None => resume_working_tasks(&self.detached_deps(), self.resume_attempt_cap).await,
+    pub async fn resume(&self) -> Result<(), BridgeError> {
+        self.resume_with_cap(self.resume_attempt_cap).await
+    }
+
+    /// Run the same attempt-first boot sequence with an explicit resume cap.
+    /// Kept public for the legacy inbound test/operator adapter; production serve
+    /// uses `resume()` and the configured cap.
+    #[doc(hidden)]
+    pub async fn resume_with_cap(&self, cap: u32) -> Result<(), BridgeError> {
+        // Hidden terminal rows from a prior crash must reconcile before any
+        // checkpoint scan or conservative active-summary interruption.
+        if !reconcile_pending_terminal_projections(&self.detached_deps()).await {
+            tracing::warn!("pending terminal projection reconciliation incomplete; resume refused");
+            return Err(BridgeError::StoreFailure);
         }
+        if !reconcile_terminal_checkpoints(&self.detached_deps()).await {
+            tracing::warn!("terminal-checkpoint attempt reconciliation incomplete; resume refused");
+            return Err(BridgeError::StoreFailure);
+        }
+        if let Some(Ok(history)) = &self.workflow_history {
+            let excluded = match self
+                .task_store
+                .terminal_attempts_with_telemetry_markers()
+                .await
+            {
+                Ok(excluded) => excluded,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "terminal telemetry-marker scan failed; resume refused"
+                    );
+                    return Err(BridgeError::StoreFailure);
+                }
+            };
+            if let Err(error) = history
+                .interrupt_active_excluding(self.clock.now_ms(), &excluded)
+                .await
+            {
+                self.observer.record_workflow(
+                    &bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable {
+                        reason: error.reason,
+                    },
+                );
+                tracing::warn!(
+                    reason = error.reason.as_str(),
+                    "workflow history boot reconciliation unavailable; resume refused"
+                );
+                // Re-running a provider while its prior summary is still active
+                // would create two live attempts. Leave primary tasks Working so
+                // a later healthy boot can reconcile and resume safely.
+                return Err(BridgeError::StoreFailure);
+            }
+        }
+        match self.batch_deps() {
+            Some(bdeps) => crate::batch::resume_all(&bdeps, cap).await,
+            None => resume_working_tasks(&self.detached_deps(), cap).await,
+        }
+        Ok(())
     }
 }
 
@@ -1020,8 +1781,12 @@ mod tests {
         TurnContext, TurnOutcome, Update,
     };
     use bridge_core::task_store::{
-        MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinalized,
-        TurnLogFinished, TurnUsageFinalization,
+        MemoryTaskStore, TaskAttemptLocator, TaskRecord, TaskRecordStatus, TaskStore,
+        TurnLogFinalized, TurnLogFinished, TurnUsageFinalization,
+    };
+    use bridge_core::workflow_history::{
+        AttemptReservation, AttemptTerminal, CompletedAttempt, LedgerError,
+        LedgerUnavailableReason, MemoryWorkflowHistoryStore, TerminalWrite, WorkflowHistoryStore,
     };
     use bridge_workflow::graph::WorkflowNode;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -1034,6 +1799,10 @@ mod tests {
 
     struct FakeBackend {
         prompt_gate: Option<Arc<Notify>>,
+        prompt_calls: AtomicUsize,
+        release_calls: AtomicUsize,
+        fail_release: std::sync::atomic::AtomicBool,
+        release_gate: Option<Arc<Notify>>,
         configured_turns: Arc<StdMutex<Vec<(SessionId, TurnMeta)>>>,
     }
 
@@ -1041,6 +1810,21 @@ mod tests {
         fn new(prompt_gate: Option<Arc<Notify>>) -> Self {
             Self {
                 prompt_gate,
+                prompt_calls: AtomicUsize::new(0),
+                release_calls: AtomicUsize::new(0),
+                fail_release: std::sync::atomic::AtomicBool::new(false),
+                release_gate: None,
+                configured_turns: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
+
+        fn with_blocked_release(release_gate: Arc<Notify>) -> Self {
+            Self {
+                prompt_gate: None,
+                prompt_calls: AtomicUsize::new(0),
+                release_calls: AtomicUsize::new(0),
+                fail_release: std::sync::atomic::AtomicBool::new(false),
+                release_gate: Some(release_gate),
                 configured_turns: Arc::new(StdMutex::new(Vec::new())),
             }
         }
@@ -1053,6 +1837,7 @@ mod tests {
             _session: &SessionId,
             _parts: Vec<Part>,
         ) -> Result<BackendStream, BridgeError> {
+            self.prompt_calls.fetch_add(1, AtomicOrdering::SeqCst);
             if let Some(gate) = &self.prompt_gate {
                 gate.notified().await;
             }
@@ -1064,6 +1849,18 @@ mod tests {
 
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
             Ok(())
+        }
+
+        async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.release_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if let Some(gate) = &self.release_gate {
+                gate.notified().await;
+            }
+            if self.fail_release.load(AtomicOrdering::SeqCst) {
+                Err(BridgeError::StoreFailure)
+            } else {
+                Ok(())
+            }
         }
 
         async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
@@ -1099,6 +1896,12 @@ mod tests {
         fn default_id(&self) -> AgentId {
             self.entry.id.clone()
         }
+        fn configured_effective(
+            &self,
+            id: &AgentId,
+        ) -> Option<bridge_core::domain::EffectiveConfig> {
+            (*id == self.entry.id).then(|| bridge_core::domain::effective_config(&self.entry, None))
+        }
 
         async fn apply(&self, _snapshot: RegistrySnapshot) -> Result<(), BridgeError> {
             Ok(())
@@ -1106,6 +1909,37 @@ mod tests {
 
         fn list(&self) -> Vec<AgentId> {
             vec![self.entry.id.clone()]
+        }
+    }
+
+    struct NoEffectRegistry {
+        default_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AgentRegistry for NoEffectRegistry {
+        async fn resolve(&self, _id: &AgentId) -> Result<Resolved, BridgeError> {
+            panic!("colliding direct admission must not resolve the registry")
+        }
+
+        fn default_id(&self) -> AgentId {
+            self.default_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            AgentId::parse("codex").unwrap()
+        }
+
+        fn configured_effective(
+            &self,
+            _id: &AgentId,
+        ) -> Option<bridge_core::domain::EffectiveConfig> {
+            None
+        }
+
+        async fn apply(&self, _snapshot: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![AgentId::parse("codex").unwrap()]
         }
     }
 
@@ -1360,6 +2194,523 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ReconciliationFailureHistory {
+        inner: MemoryWorkflowHistoryStore,
+    }
+
+    #[async_trait]
+    impl WorkflowHistoryStore for ReconciliationFailureHistory {
+        async fn reserve(&self, row: &AttemptReservation) -> Result<(), LedgerError> {
+            self.inner.reserve(row).await
+        }
+
+        async fn mark_prompt_acceptance(
+            &self,
+            id: &bridge_core::ids::AttemptId,
+            acceptance: &str,
+        ) -> Result<(), LedgerError> {
+            self.inner.mark_prompt_acceptance(id, acceptance).await
+        }
+
+        async fn terminalize(
+            &self,
+            id: &bridge_core::ids::AttemptId,
+            terminal: &AttemptTerminal,
+        ) -> Result<TerminalWrite, LedgerError> {
+            self.inner.terminalize(id, terminal).await
+        }
+        async fn set_pinned(
+            &self,
+            id: &bridge_core::ids::AttemptId,
+            pinned: bool,
+        ) -> Result<bool, LedgerError> {
+            self.inner.set_pinned(id, pinned).await
+        }
+
+        async fn interrupt_active(&self, _completed_ms: i64) -> Result<u64, LedgerError> {
+            Err(LedgerError::new(LedgerUnavailableReason::Io))
+        }
+
+        async fn latest_reservation_for_task(
+            &self,
+            task: &TaskId,
+        ) -> Result<Option<AttemptReservation>, LedgerError> {
+            self.inner.latest_reservation_for_task(task).await
+        }
+
+        async fn completed_between(
+            &self,
+            start_ms: i64,
+            end_ms: i64,
+        ) -> Result<Vec<CompletedAttempt>, LedgerError> {
+            self.inner.completed_between(start_ms, end_ms).await
+        }
+    }
+
+    #[derive(Default)]
+    struct PromptBarrierFailureHistory {
+        inner: MemoryWorkflowHistoryStore,
+        fail_terminal: std::sync::atomic::AtomicBool,
+        conflict_terminal: std::sync::atomic::AtomicBool,
+        commit_then_fail_terminal_once: std::sync::atomic::AtomicBool,
+        mark_calls: AtomicUsize,
+        terminal_calls: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct WorkflowBalanceObserver {
+        started: AtomicUsize,
+        finished: AtomicUsize,
+        stopped: AtomicUsize,
+        unavailable: AtomicUsize,
+    }
+
+    impl Observer for WorkflowBalanceObserver {
+        fn record(&self, _event: &bridge_core::ports::ObsEvent<'_>) {}
+
+        fn record_workflow(&self, event: &bridge_core::ports::WorkflowObsEvent<'_>) {
+            match event {
+                bridge_core::ports::WorkflowObsEvent::Started { .. } => {
+                    self.started.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                bridge_core::ports::WorkflowObsEvent::Finished { .. } => {
+                    self.finished.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                bridge_core::ports::WorkflowObsEvent::Stopped { .. } => {
+                    self.stopped.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+                bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable { .. } => {
+                    self.unavailable.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WorkflowHistoryStore for PromptBarrierFailureHistory {
+        async fn reserve(&self, row: &AttemptReservation) -> Result<(), LedgerError> {
+            self.inner.reserve(row).await
+        }
+
+        async fn mark_prompt_acceptance(
+            &self,
+            _id: &bridge_core::ids::AttemptId,
+            _acceptance: &str,
+        ) -> Result<(), LedgerError> {
+            self.mark_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(LedgerError::new(LedgerUnavailableReason::Io))
+        }
+
+        async fn terminalize(
+            &self,
+            id: &bridge_core::ids::AttemptId,
+            terminal: &AttemptTerminal,
+        ) -> Result<TerminalWrite, LedgerError> {
+            self.terminal_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.conflict_terminal.load(AtomicOrdering::SeqCst) {
+                return Ok(TerminalWrite::Conflict);
+            }
+            if self
+                .commit_then_fail_terminal_once
+                .swap(false, AtomicOrdering::SeqCst)
+            {
+                self.inner.terminalize(id, terminal).await?;
+                return Err(LedgerError::new(LedgerUnavailableReason::Io));
+            }
+            if self.fail_terminal.load(AtomicOrdering::SeqCst) {
+                Err(LedgerError::new(LedgerUnavailableReason::Io))
+            } else {
+                self.inner.terminalize(id, terminal).await
+            }
+        }
+        async fn set_pinned(
+            &self,
+            id: &bridge_core::ids::AttemptId,
+            pinned: bool,
+        ) -> Result<bool, LedgerError> {
+            self.inner.set_pinned(id, pinned).await
+        }
+
+        async fn interrupt_active(&self, completed_ms: i64) -> Result<u64, LedgerError> {
+            self.inner.interrupt_active(completed_ms).await
+        }
+
+        async fn interrupt_active_excluding(
+            &self,
+            completed_ms: i64,
+            excluded: &[bridge_core::ids::AttemptId],
+        ) -> Result<u64, LedgerError> {
+            self.inner
+                .interrupt_active_excluding(completed_ms, excluded)
+                .await
+        }
+
+        async fn latest_reservation_for_task(
+            &self,
+            task: &TaskId,
+        ) -> Result<Option<AttemptReservation>, LedgerError> {
+            self.inner.latest_reservation_for_task(task).await
+        }
+
+        async fn completed_between(
+            &self,
+            start_ms: i64,
+            end_ms: i64,
+        ) -> Result<Vec<CompletedAttempt>, LedgerError> {
+            self.inner.completed_between(start_ms, end_ms).await
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_prompt_barrier_failure_cleans_up_then_terminalizes_once() {
+        for (fail_release, fail_terminal, expected_cleanup) in [
+            (false, false, "complete"),
+            (true, false, "failed"),
+            (false, true, "none"),
+        ] {
+            let history = Arc::new(PromptBarrierFailureHistory::default());
+            history
+                .fail_terminal
+                .store(fail_terminal, AtomicOrdering::SeqCst);
+            let backend = Arc::new(FakeBackend::new(None));
+            backend
+                .fail_release
+                .store(fail_release, AtomicOrdering::SeqCst);
+            let observer = Arc::new(WorkflowBalanceObserver::default());
+            let fixture = coordinator_fixture_with_backend_and_observer(
+                Arc::new(HashMap::new()),
+                backend.clone(),
+                observer.clone(),
+            );
+            let coordinator = fixture
+                .coordinator
+                .with_workflow_history(Ok(history.clone()));
+            let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+
+            let error = match coordinator
+                .prompt_with_identity(prompt_params("hi"), identity)
+                .await
+            {
+                Ok(_) => panic!("prompt barrier failure unexpectedly succeeded"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                BridgeError::DurableEvidenceUnavailable { reason: "io" }
+            ));
+            assert_eq!(backend.prompt_calls.load(AtomicOrdering::SeqCst), 0);
+            assert_eq!(backend.release_calls.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(history.mark_calls.load(AtomicOrdering::SeqCst), 1);
+            let expected_terminal_calls = if fail_terminal { 2 } else { 1 };
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while history.terminal_calls.load(AtomicOrdering::SeqCst) < expected_terminal_calls
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("caller Drop must settle its one asynchronous terminal retry");
+            assert_eq!(
+                history.terminal_calls.load(AtomicOrdering::SeqCst),
+                expected_terminal_calls
+            );
+            assert_eq!(observer.started.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(
+                observer.finished.load(AtomicOrdering::SeqCst)
+                    + observer.stopped.load(AtomicOrdering::SeqCst),
+                1
+            );
+
+            let rows = history.completed_between(0, i64::MAX).await.unwrap();
+            if fail_terminal {
+                assert!(rows.is_empty());
+                assert_eq!(observer.stopped.load(AtomicOrdering::SeqCst), 1);
+            } else {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].terminal.outcome, "failed");
+                assert_eq!(rows[0].terminal.terminal_reason, "prompt_barrier_failed");
+                assert_eq!(rows[0].terminal.prompt_acceptance, "unknown");
+                assert_eq!(rows[0].terminal.cleanup_disposition, expected_cleanup);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_real_mcp_prompt_uses_unknown_cleanup_and_one_drop_terminal() {
+        let history = Arc::new(PromptBarrierFailureHistory::default());
+        let release_gate = Arc::new(Notify::new());
+        let backend = Arc::new(FakeBackend::with_blocked_release(release_gate.clone()));
+        let observer = Arc::new(WorkflowBalanceObserver::default());
+        let fixture = coordinator_fixture_with_backend_and_observer(
+            Arc::new(HashMap::new()),
+            backend.clone(),
+            observer.clone(),
+        );
+        let coordinator = Arc::new(
+            fixture
+                .coordinator
+                .with_workflow_history(Ok(history.clone())),
+        );
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let attempt_id = identity.attempt_id.clone();
+
+        let caller = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                coordinator
+                    .prompt_with_identity(prompt_params("hi"), identity)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backend.release_calls.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the real Coordinator caller must enter cleanup after the barrier failure");
+
+        caller.abort();
+        let join_error = match caller.await {
+            Ok(_) => panic!("aborted Coordinator caller unexpectedly completed"),
+            Err(error) => error,
+        };
+        assert!(join_error.is_cancelled());
+        release_gate.notify_one();
+
+        let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let rows = history.completed_between(0, i64::MAX).await.unwrap();
+                if let Some(row) = rows.into_iter().next() {
+                    break row.terminal;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("DirectAttemptHandle Drop must asynchronously terminalize the canceled caller");
+
+        assert_eq!(backend.prompt_calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(backend.release_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(history.mark_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(history.terminal_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(terminal.terminal_reason, "prompt_barrier_failed");
+        assert_eq!(terminal.prompt_acceptance, "unknown");
+        assert_eq!(terminal.cleanup_disposition, "unknown");
+        assert!(terminal.degraded);
+        assert!(!terminal.telemetry_complete);
+        assert_eq!(observer.started.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(observer.finished.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(observer.stopped.load(AtomicOrdering::SeqCst), 1);
+
+        let exact = history.inner.attempt(&attempt_id).await.unwrap().unwrap();
+        assert_eq!(exact.terminal, Some(terminal));
+    }
+
+    #[tokio::test]
+    async fn real_mcp_caller_drop_replays_ambiguous_terminal_exactly_once() {
+        let history = Arc::new(PromptBarrierFailureHistory::default());
+        history
+            .commit_then_fail_terminal_once
+            .store(true, AtomicOrdering::SeqCst);
+        let backend = Arc::new(FakeBackend::new(None));
+        let observer = Arc::new(WorkflowBalanceObserver::default());
+        let fixture = coordinator_fixture_with_backend_and_observer(
+            Arc::new(HashMap::new()),
+            backend.clone(),
+            observer.clone(),
+        );
+        let coordinator = fixture
+            .coordinator
+            .with_workflow_history(Ok(history.clone()));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let attempt_id = identity.attempt_id.clone();
+
+        let error = match coordinator
+            .prompt_with_identity(prompt_params("hi"), identity)
+            .await
+        {
+            Ok(_) => panic!("prompt barrier failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            BridgeError::DurableEvidenceUnavailable { reason: "io" }
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while history.terminal_calls.load(AtomicOrdering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the real caller's Drop path must retry the prepared terminal");
+
+        let rows = history.completed_between(0, i64::MAX).await.unwrap();
+        assert_eq!(rows.len(), 1, "the replay cannot create a second summary");
+        let terminal = &rows[0].terminal;
+        assert_eq!(terminal.terminal_reason, "prompt_barrier_failed");
+        assert_eq!(terminal.prompt_acceptance, "unknown");
+        assert_eq!(terminal.cleanup_disposition, "complete");
+        assert!(terminal.degraded);
+        assert!(!terminal.telemetry_complete);
+        assert_eq!(backend.prompt_calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(backend.release_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(history.mark_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(history.terminal_calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(observer.started.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(observer.finished.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(observer.stopped.load(AtomicOrdering::SeqCst), 1);
+
+        let exact = history.inner.attempt(&attempt_id).await.unwrap().unwrap();
+        assert_eq!(exact.terminal.as_ref(), Some(terminal));
+    }
+
+    #[tokio::test]
+    async fn terminal_summary_conflict_balances_direct_in_flight_once() {
+        let history = Arc::new(PromptBarrierFailureHistory::default());
+        history
+            .conflict_terminal
+            .store(true, AtomicOrdering::SeqCst);
+        let observer = Arc::new(WorkflowBalanceObserver::default());
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let mut handle = admit_direct_attempt_with_history(
+            Ok(history),
+            observer.clone(),
+            identity,
+            bridge_core::workflow_history::ExecutionSurface::DirectUnary,
+            "direct",
+            "direct",
+            bridge_core::workflow_history::fingerprint_workload_shape(b"conflict"),
+            true,
+            1,
+            "caller_aborted",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            handle
+                .finish("failed", "prompt_failed", true, "not_needed")
+                .await,
+            Err(BridgeError::DurableEvidenceUnavailable {
+                reason: "collision"
+            })
+        ));
+        assert_eq!(observer.started.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(observer.finished.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(observer.stopped.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(observer.unavailable.load(AtomicOrdering::SeqCst), 1);
+
+        drop(handle);
+        assert_eq!(
+            observer.stopped.load(AtomicOrdering::SeqCst),
+            1,
+            "Drop must not emit a second completion event"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_direct_admission_records_explicit_smoke_surface() {
+        let history = Arc::new(MemoryWorkflowHistoryStore::new());
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let attempt_id = identity.attempt_id.clone();
+        let execution_id = identity.execution_id.clone();
+        let mut handle = admit_direct_attempt_with_history(
+            Ok(history.clone()),
+            Arc::new(NoopObserver),
+            identity,
+            bridge_core::workflow_history::ExecutionSurface::Smoke,
+            "smoke",
+            "direct",
+            "fixed_pong".into(),
+            false,
+            1,
+            "smoke_aborted",
+        )
+        .await
+        .unwrap();
+
+        handle.mark_prompt_dispatch().await.unwrap();
+        handle
+            .finish_with_completeness("completed", "completed", false, "complete", false)
+            .await
+            .unwrap();
+
+        let row = history.attempt(&attempt_id).await.unwrap().unwrap();
+        assert_eq!(row.reservation.workflow, "smoke");
+        assert_eq!(
+            row.reservation.surface,
+            bridge_core::workflow_history::ExecutionSurface::Smoke
+        );
+        assert_eq!(
+            row.reservation.task_id.as_ref().map(TaskId::as_str),
+            Some(execution_id.as_str())
+        );
+        let terminal = row.terminal.unwrap();
+        assert_eq!(terminal.prompt_acceptance, "dispatch_uncertain");
+        assert!(!terminal.telemetry_complete);
+    }
+
+    #[tokio::test]
+    async fn direct_collision_refuses_before_default_registry_lookup() {
+        let default_calls = Arc::new(AtomicUsize::new(0));
+        let registry: Arc<dyn AgentRegistry> = Arc::new(NoEffectRegistry {
+            default_calls: default_calls.clone(),
+        });
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+        let history = Arc::new(MemoryWorkflowHistoryStore::new());
+        let coordinator = coordinator_fixture_with_registry(registry, clock)
+            .with_workflow_history(Ok(history.clone()));
+        let baseline_calls = default_calls.load(AtomicOrdering::SeqCst);
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        history
+            .reserve(&AttemptReservation {
+                identity: identity.clone(),
+                task_id: Some(task),
+                workflow: "direct".into(),
+                task_class: "direct".into(),
+                surface: bridge_core::workflow_history::ExecutionSurface::Mcp,
+                policy: "r2f0a".into(),
+                workload_fingerprint: "existing".into(),
+                started_ms: 1,
+                workload_fingerprint_complete: false,
+                prompt_acceptance: "not_dispatched".into(),
+                pinned: false,
+            })
+            .await
+            .unwrap();
+        let params = OpParams {
+            workflow: None,
+            skill: None,
+            input: "hello".into(),
+            context: None,
+            agent: None,
+            model: None,
+            effort: None,
+            mode: None,
+            cwd: Some("/tmp/repo".into()),
+        };
+
+        let error = coordinator
+            .prompt_with_identity(params, identity)
+            .await
+            .err()
+            .expect("the duplicate locator must refuse");
+        assert!(matches!(
+            error,
+            BridgeError::DurableEvidenceUnavailable {
+                reason: "collision"
+            }
+        ));
+        assert_eq!(
+            default_calls.load(AtomicOrdering::SeqCst),
+            baseline_calls,
+            "identity collision must refuse before the registry default is read"
+        );
+    }
+
     struct AllowPolicy;
 
     impl PolicyEngine for AllowPolicy {
@@ -1483,6 +2834,261 @@ mod tests {
         task_store: Arc<MemoryTaskStore>,
     }
 
+    /// Delegating primary store that refuses exactly the first recovered
+    /// terminal projection write. This models a summary commit followed by a
+    /// one-shot primary transaction failure at the boot boundary.
+    struct OneShotPendingTaskStore {
+        inner: MemoryTaskStore,
+        fail_pending_once: std::sync::atomic::AtomicBool,
+        fail_scan_once: std::sync::atomic::AtomicBool,
+    }
+
+    impl OneShotPendingTaskStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryTaskStore::new(),
+                fail_pending_once: std::sync::atomic::AtomicBool::new(true),
+                fail_scan_once: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn fail_next_scan(&self) {
+            self.fail_scan_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl TaskStore for OneShotPendingTaskStore {
+        async fn create(&self, rec: &TaskRecord) -> Result<(), BridgeError> {
+            self.inner.create(rec).await
+        }
+
+        async fn create_with_attempt_locator(
+            &self,
+            rec: &TaskRecord,
+            locator: &TaskAttemptLocator,
+        ) -> Result<(), BridgeError> {
+            self.inner.create_with_attempt_locator(rec, locator).await
+        }
+
+        async fn set_terminal(
+            &self,
+            id: &TaskId,
+            status: TaskRecordStatus,
+            result: Option<&str>,
+            error: Option<&str>,
+            updated_ms: i64,
+        ) -> Result<(), BridgeError> {
+            self.inner
+                .set_terminal(id, status, result, error, updated_ms)
+                .await
+        }
+
+        async fn get(&self, id: &TaskId) -> Result<Option<TaskRecord>, BridgeError> {
+            self.inner.get(id).await
+        }
+
+        async fn mark_attempt_telemetry_unavailable(
+            &self,
+            task: &TaskId,
+            attempt: &bridge_core::ids::AttemptId,
+            reason: LedgerUnavailableReason,
+        ) -> Result<(), BridgeError> {
+            self.inner
+                .mark_attempt_telemetry_unavailable(task, attempt, reason)
+                .await
+        }
+
+        async fn get_attempt_locator(
+            &self,
+            task: &TaskId,
+        ) -> Result<Option<TaskAttemptLocator>, BridgeError> {
+            self.inner.get_attempt_locator(task).await
+        }
+
+        async fn terminal_attempts_with_telemetry_markers(
+            &self,
+        ) -> Result<Vec<bridge_core::ids::AttemptId>, BridgeError> {
+            self.inner.terminal_attempts_with_telemetry_markers().await
+        }
+
+        async fn list(&self, limit: usize) -> Result<Vec<TaskRecord>, BridgeError> {
+            self.inner.list(limit).await
+        }
+
+        async fn sweep_interrupted(&self, updated_ms: i64) -> Result<u64, BridgeError> {
+            self.inner.sweep_interrupted(updated_ms).await
+        }
+
+        async fn cancel_if_working(
+            &self,
+            id: &TaskId,
+            updated_ms: i64,
+        ) -> Result<bool, BridgeError> {
+            self.inner.cancel_if_working(id, updated_ms).await
+        }
+
+        async fn put_node_checkpoint(
+            &self,
+            task: &TaskId,
+            node: &NodeId,
+            output: &str,
+            ok: bool,
+            ts: i64,
+        ) -> Result<(), BridgeError> {
+            self.inner
+                .put_node_checkpoint(task, node, output, ok, ts)
+                .await
+        }
+
+        async fn node_checkpoints(
+            &self,
+            task: &TaskId,
+        ) -> Result<
+            Vec<(
+                NodeId,
+                String,
+                bool,
+                Option<bridge_core::orch::UsageSnapshot>,
+            )>,
+            BridgeError,
+        > {
+            self.inner.node_checkpoints(task).await
+        }
+
+        async fn claim_resume_attempt(
+            &self,
+            task: &TaskId,
+            cap: u32,
+            now_ms: i64,
+        ) -> Result<bridge_core::task_store::ResumeClaim, BridgeError> {
+            self.inner.claim_resume_attempt(task, cap, now_ms).await
+        }
+
+        async fn working_tasks(&self) -> Result<Vec<TaskRecord>, BridgeError> {
+            self.inner.working_tasks().await
+        }
+
+        async fn record_node_started(
+            &self,
+            task: &TaskId,
+            node: &NodeId,
+            operation_id: &bridge_core::ids::OperationId,
+            ts: i64,
+        ) -> Result<i64, BridgeError> {
+            self.inner
+                .record_node_started(task, node, operation_id, ts)
+                .await
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn put_node_checkpoint_sequenced(
+            &self,
+            task: &TaskId,
+            node: &NodeId,
+            operation_id: &bridge_core::ids::OperationId,
+            output: &str,
+            ok: bool,
+            ts: i64,
+            usage: Option<&bridge_core::orch::UsageSnapshot>,
+        ) -> Result<i64, BridgeError> {
+            self.inner
+                .put_node_checkpoint_sequenced(task, node, operation_id, output, ok, ts, usage)
+                .await
+        }
+
+        async fn set_terminal_sequenced(
+            &self,
+            task: &TaskId,
+            operation_id: &bridge_core::ids::OperationId,
+            status: TaskRecordStatus,
+            result: Option<&str>,
+            error: Option<&str>,
+            ts: i64,
+        ) -> Result<i64, BridgeError> {
+            self.inner
+                .set_terminal_sequenced(task, operation_id, status, result, error, ts)
+                .await
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn set_terminal_sequenced_pending(
+            &self,
+            task: &TaskId,
+            operation_id: &bridge_core::ids::OperationId,
+            status: TaskRecordStatus,
+            result: Option<&str>,
+            error: Option<&str>,
+            ts: i64,
+            attempt_id: &bridge_core::ids::AttemptId,
+            terminal: &AttemptTerminal,
+        ) -> Result<i64, BridgeError> {
+            if self
+                .fail_pending_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(BridgeError::StoreFailure);
+            }
+            self.inner
+                .set_terminal_sequenced_pending(
+                    task,
+                    operation_id,
+                    status,
+                    result,
+                    error,
+                    ts,
+                    attempt_id,
+                    terminal,
+                )
+                .await
+        }
+
+        async fn pending_terminal_projection(
+            &self,
+            task: &TaskId,
+        ) -> Result<Option<bridge_core::task_store::PendingTerminalProjection>, BridgeError>
+        {
+            self.inner.pending_terminal_projection(task).await
+        }
+
+        async fn pending_terminal_projections(
+            &self,
+        ) -> Result<Vec<bridge_core::task_store::PendingTerminalProjection>, BridgeError> {
+            if self
+                .fail_scan_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(BridgeError::StoreFailure);
+            }
+            self.inner.pending_terminal_projections().await
+        }
+
+        async fn mark_terminal_projection_ready(
+            &self,
+            task: &TaskId,
+            attempt_id: &bridge_core::ids::AttemptId,
+        ) -> Result<(), BridgeError> {
+            self.inner
+                .mark_terminal_projection_ready(task, attempt_id)
+                .await
+        }
+
+        async fn journal_from(
+            &self,
+            task: &TaskId,
+            after_seq: i64,
+        ) -> Result<Vec<bridge_core::orch::OrchEvent>, BridgeError> {
+            self.inner.journal_from(task, after_seq).await
+        }
+
+        async fn progress_snapshot(
+            &self,
+            task: &TaskId,
+        ) -> Result<bridge_core::task_store::TaskProgressSnapshot, BridgeError> {
+            self.inner.progress_snapshot(task).await
+        }
+    }
     fn coordinator_fixture(workflows: Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>>) -> Fixture {
         coordinator_fixture_with_backend(workflows, Arc::new(FakeBackend::new(None)))
     }
@@ -1490,6 +3096,14 @@ mod tests {
     fn coordinator_fixture_with_backend(
         workflows: Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>>,
         backend: Arc<FakeBackend>,
+    ) -> Fixture {
+        coordinator_fixture_with_backend_and_observer(workflows, backend, Arc::new(NoopObserver))
+    }
+
+    fn coordinator_fixture_with_backend_and_observer(
+        workflows: Arc<HashMap<WorkflowId, Arc<WorkflowGraph>>>,
+        backend: Arc<FakeBackend>,
+        observer: Arc<dyn Observer>,
     ) -> Fixture {
         let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
             entry: entry(),
@@ -1518,7 +3132,7 @@ mod tests {
             clock,
             Some(SessionCwd::parse("/tmp").unwrap()),
             None,
-            Arc::new(NoopObserver),
+            observer,
             3,
         );
         Fixture {
@@ -2825,11 +4439,14 @@ mod tests {
             Arc::new(FakeBackend::new(Some(gate))),
         );
 
-        let id = fixture
+        let locator = fixture
             .coordinator
             .run_workflow(workflow_params())
             .await
             .unwrap();
+        let id = locator.task_id.clone();
+        assert_eq!(id.as_str(), locator.execution_id.as_str());
+        assert_eq!(locator.attempt_ordinal, 0);
         let rec = fixture.task_store.get(&id).await.unwrap().unwrap();
 
         assert_eq!(rec.id, id);
@@ -2842,6 +4459,118 @@ mod tests {
             fixture.task_store.create(&rec).await.is_err(),
             "task creates must be non-clobbering"
         );
+    }
+    #[tokio::test]
+    async fn healthy_workflow_persists_calibration_eligible_measurements() {
+        let mut workflows = HashMap::new();
+        workflows.insert(
+            WorkflowId::parse("code-review").unwrap(),
+            workflow("code-review"),
+        );
+        let Fixture {
+            coordinator,
+            task_store,
+        } = coordinator_fixture(Arc::new(workflows));
+        let history = Arc::new(MemoryWorkflowHistoryStore::new());
+        let coordinator = coordinator.with_workflow_history(Ok(history.clone()));
+
+        let locator = coordinator.run_workflow(workflow_params()).await.unwrap();
+        let rows = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = history.completed_between(0, i64::MAX).await.unwrap();
+                if !rows.is_empty() {
+                    break rows;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("workflow summary terminalizes");
+        assert_eq!(
+            task_store
+                .get(&locator.task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskRecordStatus::Completed
+        );
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert!(row.reservation.workload_fingerprint_complete);
+        assert!(row.terminal.telemetry_complete);
+        assert!(row.terminal.monotonic_clock);
+        assert_eq!(row.terminal.cleanup_disposition, "complete");
+        assert_eq!(row.terminal.node_counts.completed, 1);
+        assert_eq!(
+            row.terminal.finalization_ms,
+            row.terminal
+                .end_to_end_ms
+                .saturating_sub(row.terminal.queue_ms)
+                .saturating_sub(row.terminal.work_ms)
+                .saturating_sub(row.terminal.cleanup_ms)
+        );
+        assert!(row
+            .terminal
+            .phase_durations
+            .iter()
+            .any(|phase| phase.phase == "work"));
+        assert!(row
+            .terminal
+            .phase_durations
+            .iter()
+            .any(|phase| phase.phase == "finalization"));
+
+        let report = bridge_core::workflow_history::report(0, i64::MAX, &rows);
+        assert_eq!(report.calibration_sample_count, 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_optional_history_does_not_block_primary_workflow() {
+        let mut workflows = HashMap::new();
+        workflows.insert(
+            WorkflowId::parse("code-review").unwrap(),
+            workflow("code-review"),
+        );
+        let Fixture {
+            coordinator,
+            task_store,
+        } = coordinator_fixture(Arc::new(workflows));
+        let coordinator = coordinator.with_workflow_history(Err(LedgerUnavailableReason::Open));
+
+        let locator = coordinator.run_workflow(workflow_params()).await.unwrap();
+        assert_eq!(
+            locator.telemetry_unavailable,
+            Some(LedgerUnavailableReason::Open)
+        );
+        let durable_locator = task_store
+            .get_attempt_locator(&locator.task_id)
+            .await
+            .unwrap()
+            .expect("primary task admission persists the locator");
+        assert_eq!(durable_locator.identity.execution_id, locator.execution_id);
+        assert_eq!(durable_locator.identity.attempt_id, locator.attempt_id);
+        assert_eq!(
+            durable_locator.telemetry_unavailable,
+            Some(LedgerUnavailableReason::Open)
+        );
+
+        let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let record = task_store
+                    .get(&locator.task_id)
+                    .await
+                    .unwrap()
+                    .expect("primary task remains queryable");
+                if record.status != TaskRecordStatus::Working {
+                    break record;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("primary workflow completes without optional history");
+        assert_eq!(terminal.status, TaskRecordStatus::Completed);
     }
 
     #[tokio::test]
@@ -2860,6 +4589,402 @@ mod tests {
             Err(other) => panic!("expected TaskSpecInvalid, got {other:?}"),
             Ok(id) => panic!("expected TaskSpecInvalid, got Ok({id:?})"),
         }
+    }
+
+    #[tokio::test]
+    async fn resume_reconciles_detached_and_batch_terminal_checkpoints_before_interrupting() {
+        for (case, batch_id, checkpoint_ok, expected_status, expected_outcome) in [
+            (
+                "detached",
+                None,
+                true,
+                TaskRecordStatus::Completed,
+                "completed",
+            ),
+            (
+                "batch",
+                Some(bridge_core::ids::BatchId::parse("batch-checkpoint").unwrap()),
+                false,
+                TaskRecordStatus::Failed,
+                "failed",
+            ),
+        ] {
+            let graph = workflow("code-review");
+            let mut workflows = HashMap::new();
+            workflows.insert(graph.id.clone(), graph.clone());
+            let backend = Arc::new(FakeBackend::new(None));
+            let Fixture {
+                coordinator,
+                task_store,
+            } = coordinator_fixture_with_backend(Arc::new(workflows), backend.clone());
+            let history = Arc::new(MemoryWorkflowHistoryStore::new());
+            let coordinator = coordinator.with_workflow_history(Ok(history.clone()));
+            let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+            let task = TaskId::parse(identity.execution_id.as_str().to_owned()).unwrap();
+            let locator = TaskAttemptLocator {
+                identity: identity.clone(),
+                telemetry_unavailable: None,
+            };
+            let mut record = working_record(task.clone());
+            record.workflow = graph.id.as_str().to_owned();
+            record.input = typed_code_review_input().to_owned();
+            record.workflow_spec_json = Some(crate::detached::encode_workflow_spec(&graph));
+            record.batch_id = batch_id;
+            record.item_id = (case == "batch").then(|| "item-0".to_owned());
+            task_store
+                .create_with_attempt_locator(&record, &locator)
+                .await
+                .unwrap();
+            history
+                .reserve(&AttemptReservation {
+                    identity: identity.clone(),
+                    task_id: Some(task.clone()),
+                    workflow: graph.id.as_str().to_owned(),
+                    task_class: "workflow".into(),
+                    surface: bridge_core::workflow_history::ExecutionSurface::ServedTask,
+                    policy: "r2f0a".into(),
+                    workload_fingerprint: bridge_core::workflow_history::fingerprint_workload_shape(
+                        b"checkpoint-recovery",
+                    ),
+                    started_ms: 1,
+                    workload_fingerprint_complete: true,
+                    prompt_acceptance: "dispatch_uncertain".into(),
+                    pinned: false,
+                })
+                .await
+                .unwrap();
+            task_store
+                .put_node_checkpoint(
+                    &task,
+                    &NodeId::parse("only").unwrap(),
+                    "checkpoint-output",
+                    checkpoint_ok,
+                    2,
+                )
+                .await
+                .unwrap();
+
+            coordinator.resume().await.unwrap();
+
+            let persisted = task_store.get(&task).await.unwrap().unwrap();
+            assert_eq!(persisted.status, expected_status, "{case}");
+            assert_eq!(
+                persisted.resume_attempts, 0,
+                "{case} must not mint a resume"
+            );
+            assert_eq!(
+                task_store.get_attempt_locator(&task).await.unwrap(),
+                Some(locator),
+                "{case} keeps the original attempt locator"
+            );
+            assert_eq!(
+                backend.prompt_calls.load(AtomicOrdering::SeqCst),
+                0,
+                "{case} checkpoint recovery cannot prompt"
+            );
+            let attempt = history
+                .attempt(&identity.attempt_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let terminal = attempt.terminal.expect("existing attempt terminalized");
+            assert_eq!(terminal.outcome, expected_outcome, "{case}");
+            assert_eq!(terminal.terminal_reason, "terminal_checkpoint_recovered");
+            assert_ne!(terminal.outcome, "interrupted", "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_summary_replays_after_one_shot_primary_failure_on_second_boot() {
+        let graph = workflow("code-review");
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let locator = TaskAttemptLocator {
+            identity: identity.clone(),
+            telemetry_unavailable: None,
+        };
+        let store = Arc::new(OneShotPendingTaskStore::new());
+        let mut record = working_record(task.clone());
+        record.workflow = graph.id.as_str().to_owned();
+        record.input = typed_code_review_input().to_owned();
+        record.workflow_spec_json = Some(crate::detached::encode_workflow_spec(&graph));
+        store
+            .create_with_attempt_locator(&record, &locator)
+            .await
+            .unwrap();
+        store
+            .put_node_checkpoint(
+                &task,
+                &NodeId::parse("only").unwrap(),
+                "stable-checkpoint-output",
+                true,
+                2,
+            )
+            .await
+            .unwrap();
+
+        let history = Arc::new(MemoryWorkflowHistoryStore::new());
+        history
+            .reserve(&AttemptReservation {
+                identity: identity.clone(),
+                task_id: Some(task.clone()),
+                workflow: graph.id.as_str().to_owned(),
+                task_class: "workflow".into(),
+                surface: bridge_core::workflow_history::ExecutionSurface::ServedTask,
+                policy: "r2f0a".into(),
+                workload_fingerprint: bridge_core::workflow_history::fingerprint_workload_shape(
+                    b"checkpoint-primary-one-shot",
+                ),
+                started_ms: 1,
+                workload_fingerprint_complete: true,
+                prompt_acceptance: "dispatch_uncertain".into(),
+                pinned: false,
+            })
+            .await
+            .unwrap();
+        let store_dyn: Arc<dyn TaskStore> = store.clone();
+        let history_dyn: Arc<dyn WorkflowHistoryStore> = history.clone();
+        let deps = crate::detached::DetachedDeps {
+            task_store: store_dyn,
+            executor: None,
+            workflows: Arc::new(HashMap::new()),
+            workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
+            progress_hubs: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(ManualClock::new(10)),
+            observer: Arc::new(NoopObserver),
+            workflow_history: Some(Ok(history_dyn)),
+        };
+
+        assert!(
+            !crate::detached::reconcile_terminal_checkpoints(&deps).await,
+            "the first boot must report the primary write failure"
+        );
+        assert_eq!(
+            store.get(&task).await.unwrap().unwrap().status,
+            TaskRecordStatus::Working
+        );
+        assert!(store
+            .pending_terminal_projection(&task)
+            .await
+            .unwrap()
+            .is_none());
+        let first_terminal = history
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .expect("the first boot committed the recovered summary");
+
+        assert!(crate::detached::reconcile_terminal_checkpoints(&deps).await);
+        assert_eq!(
+            store.get(&task).await.unwrap().unwrap().status,
+            TaskRecordStatus::Completed
+        );
+        let replayed = history
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .expect("the second boot replays the same summary");
+        assert_eq!(replayed, first_terminal);
+        assert_eq!(replayed.terminal_reason, "terminal_checkpoint_recovered");
+        assert_eq!(replayed.completed_ms, first_terminal.completed_ms);
+    }
+    #[tokio::test]
+    async fn failed_checkpoint_summary_publishes_only_with_exact_primary_marker() {
+        let graph = workflow("code-review");
+        let mut workflows = HashMap::new();
+        workflows.insert(graph.id.clone(), graph.clone());
+        let backend = Arc::new(FakeBackend::new(None));
+        let Fixture {
+            coordinator,
+            task_store,
+        } = coordinator_fixture_with_backend(Arc::new(workflows), backend.clone());
+        let history = Arc::new(PromptBarrierFailureHistory::default());
+        history.fail_terminal.store(true, AtomicOrdering::SeqCst);
+        let coordinator = coordinator.with_workflow_history(Ok(history.clone()));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str().to_owned()).unwrap();
+        let locator = TaskAttemptLocator {
+            identity: identity.clone(),
+            telemetry_unavailable: None,
+        };
+        let mut record = working_record(task.clone());
+        record.workflow = graph.id.as_str().to_owned();
+        record.input = typed_code_review_input().to_owned();
+        record.workflow_spec_json = Some(crate::detached::encode_workflow_spec(&graph));
+        task_store
+            .create_with_attempt_locator(&record, &locator)
+            .await
+            .unwrap();
+        history
+            .reserve(&AttemptReservation {
+                identity: identity.clone(),
+                task_id: Some(task.clone()),
+                workflow: graph.id.as_str().to_owned(),
+                task_class: "workflow".into(),
+                surface: bridge_core::workflow_history::ExecutionSurface::ServedTask,
+                policy: "r2f0a".into(),
+                workload_fingerprint: bridge_core::workflow_history::fingerprint_workload_shape(
+                    b"checkpoint-terminalization-failure",
+                ),
+                started_ms: 1,
+                workload_fingerprint_complete: true,
+                prompt_acceptance: "dispatch_uncertain".into(),
+                pinned: false,
+            })
+            .await
+            .unwrap();
+        task_store
+            .put_node_checkpoint(
+                &task,
+                &NodeId::parse("only").unwrap(),
+                "checkpoint-output",
+                true,
+                2,
+            )
+            .await
+            .unwrap();
+
+        coordinator.resume().await.unwrap();
+
+        let persisted = task_store.get(&task).await.unwrap().unwrap();
+        assert_eq!(persisted.status, TaskRecordStatus::Completed);
+        assert_eq!(persisted.resume_attempts, 0);
+        assert_eq!(backend.prompt_calls.load(AtomicOrdering::SeqCst), 0);
+        let marked = task_store
+            .get_attempt_locator(&task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(marked.identity, identity);
+        assert_eq!(
+            marked.telemetry_unavailable,
+            Some(LedgerUnavailableReason::Io)
+        );
+        let attempt = history
+            .inner
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            attempt.terminal.is_none(),
+            "a bounded exact-attempt marker permits terminal projection without inventing a summary"
+        );
+
+        // A later boot does not silently backfill a workflow whose optional
+        // summary failed after its exact primary marker became authoritative.
+        history.fail_terminal.store(false, AtomicOrdering::SeqCst);
+        coordinator.resume().await.unwrap();
+
+        let persisted = task_store.get(&task).await.unwrap().unwrap();
+        assert_eq!(persisted.status, TaskRecordStatus::Completed);
+        assert_eq!(persisted.resume_attempts, 0);
+        assert_eq!(backend.prompt_calls.load(AtomicOrdering::SeqCst), 0);
+        let attempt = history
+            .inner
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(attempt.terminal.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_without_terminal_checkpoint_interrupts_then_mints_one_successor() {
+        let graph = workflow("code-review");
+        let mut workflows = HashMap::new();
+        workflows.insert(graph.id.clone(), graph.clone());
+        let backend = Arc::new(FakeBackend::new(None));
+        let Fixture {
+            coordinator,
+            task_store,
+        } = coordinator_fixture_with_backend(Arc::new(workflows), backend.clone());
+        let history = Arc::new(MemoryWorkflowHistoryStore::new());
+        let coordinator = coordinator.with_workflow_history(Ok(history.clone()));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str().to_owned()).unwrap();
+        let locator = TaskAttemptLocator {
+            identity: identity.clone(),
+            telemetry_unavailable: None,
+        };
+        let mut record = working_record(task.clone());
+        record.workflow = graph.id.as_str().to_owned();
+        record.input = typed_code_review_input().to_owned();
+        record.workflow_spec_json = Some(crate::detached::encode_workflow_spec(&graph));
+        task_store
+            .create_with_attempt_locator(&record, &locator)
+            .await
+            .unwrap();
+        history
+            .reserve(&AttemptReservation {
+                identity: identity.clone(),
+                task_id: Some(task.clone()),
+                workflow: graph.id.as_str().to_owned(),
+                task_class: "workflow".into(),
+                surface: bridge_core::workflow_history::ExecutionSurface::ServedTask,
+                policy: "r2f0a".into(),
+                workload_fingerprint: bridge_core::workflow_history::fingerprint_workload_shape(
+                    b"no-terminal-checkpoint",
+                ),
+                started_ms: 1,
+                workload_fingerprint_complete: true,
+                prompt_acceptance: "dispatch_uncertain".into(),
+                pinned: false,
+            })
+            .await
+            .unwrap();
+
+        coordinator.resume().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if task_store
+                    .get(&task)
+                    .await
+                    .unwrap()
+                    .is_some_and(|record| record.status != TaskRecordStatus::Working)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("resumed provider attempt terminalizes");
+
+        let original = history
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(original.outcome, "interrupted");
+        assert_eq!(original.terminal_reason, "process_restart");
+        let current = task_store
+            .get_attempt_locator(&task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.identity.ordinal, 1);
+        assert_eq!(
+            current.identity.parent_attempt_id,
+            Some(identity.attempt_id.clone())
+        );
+        assert_ne!(current.identity.attempt_id, identity.attempt_id);
+        assert_eq!(
+            task_store
+                .get(&task)
+                .await
+                .unwrap()
+                .unwrap()
+                .resume_attempts,
+            1
+        );
+        assert_eq!(backend.prompt_calls.load(AtomicOrdering::SeqCst), 1);
     }
 
     /// #10 slice 4: `coordinator.resume()` is the serve boot-resume entry point that
@@ -2893,13 +5018,104 @@ mod tests {
             .await
             .unwrap();
 
-        fixture.coordinator.resume().await;
+        fixture.coordinator.resume().await.unwrap();
 
         let rec = fixture.task_store.get(&id).await.unwrap().unwrap();
         assert_eq!(
             rec.status,
             TaskRecordStatus::Interrupted,
             "coordinator.resume() must interrupt an unresumable working task"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_failure_refuses_resume_before_slot_or_prompt() {
+        let graph = workflow("code-review");
+        let mut workflows = HashMap::new();
+        workflows.insert(WorkflowId::parse("code-review").unwrap(), graph.clone());
+        let backend = Arc::new(FakeBackend::new(None));
+        let Fixture {
+            coordinator,
+            task_store,
+        } = coordinator_fixture_with_backend(Arc::new(workflows), backend.clone());
+        let coordinator = coordinator
+            .with_workflow_history(Ok(Arc::new(ReconciliationFailureHistory::default())));
+
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let id = TaskId::parse(identity.execution_id.as_str().to_owned()).unwrap();
+        task_store
+            .create(&TaskRecord {
+                id: id.clone(),
+                workflow: "code-review".into(),
+                status: TaskRecordStatus::Working,
+                result: None,
+                error: None,
+                created_ms: 1,
+                updated_ms: 1,
+                last_artifact_ms: None,
+                input: typed_code_review_input().into(),
+                workflow_spec_json: Some(crate::detached::encode_workflow_spec(&graph)),
+                resume_attempts: 0,
+                session_cwd: Some("/tmp/repo".into()),
+                batch_id: None,
+                item_id: None,
+                artifacts_purged_at: None,
+            })
+            .await
+            .unwrap();
+        let locator = TaskAttemptLocator {
+            identity,
+            telemetry_unavailable: None,
+        };
+        task_store.put_attempt_locator(&id, &locator).await.unwrap();
+
+        assert_eq!(coordinator.resume().await, Err(BridgeError::StoreFailure));
+
+        let record = task_store.get(&id).await.unwrap().unwrap();
+        assert_eq!(record.status, TaskRecordStatus::Working);
+        assert_eq!(record.resume_attempts, 0);
+        assert_eq!(
+            task_store.get_attempt_locator(&id).await.unwrap(),
+            Some(locator)
+        );
+        assert_eq!(backend.prompt_calls.load(AtomicOrdering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn pending_projection_scan_failure_closes_and_retries_serving_gate() {
+        let store = Arc::new(OneShotPendingTaskStore::new());
+        store.fail_next_scan();
+        let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+            entry: entry(),
+            backend: Arc::new(FakeBackend::new(None)),
+            resolved: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+        let session_manager = Arc::new(SessionManager::new_with_clock(
+            registry.clone(),
+            Duration::from_secs(60),
+            clock.clone(),
+        ));
+        let task_store: Arc<dyn TaskStore> = store;
+        let coordinator = Coordinator::new(
+            session_manager,
+            None,
+            Arc::new(HashMap::new()),
+            task_store,
+            Arc::new(FakeSessionStore::default()),
+            Arc::new(AllowPolicy),
+            registry,
+            clock,
+            Some(SessionCwd::parse("/tmp").unwrap()),
+            None,
+            Arc::new(NoopObserver),
+            3,
+        );
+
+        assert_eq!(coordinator.resume().await, Err(BridgeError::StoreFailure));
+        assert_eq!(
+            coordinator.resume().await,
+            Ok(()),
+            "a later healthy boot may retry the serving gate"
         );
     }
 

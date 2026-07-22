@@ -103,6 +103,15 @@ fn effort_to_string(effort: &bridge_core::domain::Effort) -> String {
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type WorkflowHistorySelection = Result<
+    Arc<dyn bridge_core::workflow_history::WorkflowHistoryStore>,
+    bridge_core::workflow_history::LedgerUnavailableReason,
+>;
+type McpStores = (
+    Arc<dyn bridge_core::ports::SessionStore>,
+    Arc<dyn bridge_core::task_store::TaskStore>,
+    WorkflowHistorySelection,
+);
 
 /// Top-level usage, printed by `a2a-bridge help|--help|-h`. The detailed flags live in each subcommand's
 /// `--help`; the copy-paste quickstart lives in `AGENTS.md`.
@@ -115,6 +124,8 @@ USAGE:
 SUBCOMMANDS:
   run-workflow <id>   Run a workflow against a repo (design | code-review | spec-review | plan-review | …).
                       --input <file> --session-cwd <repo> [--config <f>] [--out <f>]
+  workflow-stats      Read workflow history or pin/unpin one incident attempt.
+                      [get|pin|unpin <attempt-id>] [--config <f> | --store <db>] [--json]
   run-batch <workflow> Submit a manifest of independent workflow runs to a running serve.
                       --manifest <file> [--concurrency K] [--detach] [--url <url>]
   batch               Batch store.  status <id> | list | cancel <id>
@@ -227,6 +238,7 @@ task types and `task-spec template <type>` to scaffold one.";
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TopSubcommand {
     RunWorkflow,
+    WorkflowStats,
     RunBatch,
     Batch,
     Models,
@@ -253,6 +265,7 @@ enum TopSubcommand {
 fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
     match raw_args.get(1).map(|s| s.as_str()) {
         Some("run-workflow") => TopSubcommand::RunWorkflow,
+        Some("workflow-stats") => TopSubcommand::WorkflowStats,
         Some("run-batch") => TopSubcommand::RunBatch,
         Some("batch") => TopSubcommand::Batch,
         Some("models") => TopSubcommand::Models,
@@ -858,6 +871,10 @@ fn build_coordinator(
     resume_cap: u32,
     trace_refs_enabled: bool,
     max_task_turns: usize,
+    workflow_history: Result<
+        Arc<dyn bridge_core::workflow_history::WorkflowHistoryStore>,
+        bridge_core::workflow_history::LedgerUnavailableReason,
+    >,
     perm_registry: Arc<PermissionRegistry>,
 ) -> Arc<bridge_coordinator::Coordinator> {
     Arc::new(
@@ -876,6 +893,7 @@ fn build_coordinator(
             resume_cap,
         )
         .with_trace_refs_config(trace_refs_enabled, max_task_turns)
+        .with_workflow_history(workflow_history)
         .with_permission_registry(perm_registry),
     )
 }
@@ -3109,9 +3127,18 @@ async fn run_workflow_serve_client(
     url: &str,
     context: &str,
     session_cwd: Option<&str>,
+    identity: &bridge_core::ids::AttemptIdentity,
 ) -> Result<(), BoxError> {
     let mut metadata = serde_json::Map::new();
     metadata.insert("a2a-bridge.skill".to_string(), workflow_id.into());
+    metadata.insert(
+        "a2a-bridge.execution_id".to_string(),
+        identity.execution_id.as_str().into(),
+    );
+    metadata.insert(
+        "a2a-bridge.attempt_id".to_string(),
+        identity.attempt_id.as_str().into(),
+    );
     if let Some(cwd) = session_cwd {
         metadata.insert("a2a-bridge.cwd".to_string(), cwd.into());
     }
@@ -3121,7 +3148,7 @@ async fn run_workflow_serve_client(
     // `--serve` runs in the durable store.
     let opts = SendOpts {
         context_id: Some(context.to_string()),
-        task_id: TaskIdMode::Mint,
+        task_id: TaskIdMode::Explicit(identity.execution_id.as_str().to_string()),
         metadata: Some(metadata),
     };
     let parts = [bridge_core::domain::Part { text: input.into() }];
@@ -3214,6 +3241,11 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     bridge_observ::init();
     let (workflow_id, input_path, out_path, config_path, session_cwd, serve, url, context) =
         parse_run_workflow_args(args)?;
+    let identity = bridge_core::ids::AttemptIdentity::initial()?;
+    println!("execution_id={}", identity.execution_id.as_str());
+    println!("attempt_id={}", identity.attempt_id.as_str());
+    std::io::Write::flush(&mut std::io::stdout())
+        .map_err(|error| format!("run-workflow: cannot flush attempt locator: {error}"))?;
 
     let input = read_input(&input_path.to_string_lossy())
         .map_err(|e| format!("run-workflow: cannot read input {:?}: {e}", input_path))?;
@@ -3231,6 +3263,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             &url,
             &context,
             session_cwd.as_deref(),
+            &identity,
         )
         .await;
     }
@@ -3258,6 +3291,84 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         .get(&wf_id)
         .cloned()
         .ok_or_else(|| format!("run-workflow: unknown workflow {workflow_id:?}"))?;
+
+    let (workload_fingerprint, workload_fingerprint_complete) =
+        bridge_workflow::graph::workload_fingerprint_with(&graph, |agent| {
+            let entry = cfg.agents.iter().find(|entry| entry.id == agent.as_str())?;
+            let effort = match entry.effort.as_deref() {
+                Some(value) => Some(value.parse::<bridge_core::domain::Effort>().ok()?),
+                None => None,
+            };
+            Some(bridge_core::domain::EffectiveConfig {
+                model: entry.model.clone(),
+                effort,
+                mode: entry.mode.clone(),
+            })
+        });
+
+    // Freeze exactly one history allocation before registry/session/provider effects.
+    let selected_history = match cfg.store.as_ref() {
+        Some(store) => {
+            let path = std::path::Path::new(&store.path);
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                base.join(path)
+            };
+            SqliteStore::open_shared_history(&path).map(Arc::new)
+        }
+        None => bridge_store::sqlite::platform_history_path()
+            .and_then(|path| SqliteStore::open_history(&path).map(Arc::new)),
+    };
+    // Admit the exact offline attempt before registry construction, container
+    // warmup, session creation, executor resolution, or provider work. Ordinary
+    // summary failures remain fail-open; identity collisions are replay refusal.
+    let offline_telemetry = bridge_coordinator::detached::AttemptTelemetryState::default();
+    let history_store = match selected_history {
+        Ok(store) => {
+            let reservation = bridge_core::workflow_history::AttemptReservation {
+                identity: identity.clone(),
+                task_id: None,
+                workflow: workflow_id.clone(),
+                task_class: "workflow".into(),
+                surface: bridge_core::workflow_history::ExecutionSurface::Offline,
+                policy: "r2f0a".into(),
+                workload_fingerprint,
+                started_ms: bridge_core::task_store::system_wall_now_ms(),
+                workload_fingerprint_complete,
+                prompt_acceptance: "not_dispatched".into(),
+                pinned: false,
+            };
+            match bridge_core::workflow_history::WorkflowHistoryStore::reserve(
+                store.as_ref(),
+                &reservation,
+            )
+            .await
+            {
+                Ok(()) => Some(store),
+                Err(error)
+                    if error.reason
+                        == bridge_core::workflow_history::LedgerUnavailableReason::Collision =>
+                {
+                    return Err(format!(
+                        "run-workflow: attempt identity collision ({})",
+                        identity.attempt_id.as_str()
+                    )
+                    .into());
+                }
+                Err(error) => {
+                    offline_telemetry.record(error.reason);
+                    eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            offline_telemetry.record(error.reason);
+            eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
+            None
+        }
+    };
 
     // #1d: warm the in-container LSP dep cache up front for container_rw agents. run-workflow targets ONE
     // repo (the stamped --session-cwd), so the profile + warm are resolved once and applied to every
@@ -3378,15 +3489,8 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
     );
 
-    // Unique run id.
-    let run_id = format!(
-        "cli-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    );
+    // The existing executor run string is the monotonic attempt identity.
+    let run_id = identity.run_id().to_string();
 
     // Per-request session cwd: thread it into the context so EVERY node's agent works in the target
     // dir (a container_rw :rw target, or the repo a reader reads) — not the launch cwd.
@@ -3403,18 +3507,54 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         None => bridge_workflow::executor::WorkflowRunContext::default(),
     };
 
+    let workflow_started = std::time::Instant::now();
+    let diagnostic_ctx = bridge_workflow::executor::WorkflowDiagnosticContext::in_memory(ctx);
+    let diagnostic_ctx = match history_store.as_ref() {
+        Some(store) => {
+            let prompt_store = store.clone();
+            let attempt_id = identity.attempt_id.clone();
+            let prompt_telemetry = offline_telemetry.clone();
+            let barrier: bridge_workflow::executor::PromptDispatchBarrier = Arc::new(move || {
+                let prompt_store = prompt_store.clone();
+                let attempt_id = attempt_id.clone();
+                let prompt_telemetry = prompt_telemetry.clone();
+                Box::pin(async move {
+                    if let Err(error) =
+                        bridge_core::workflow_history::WorkflowHistoryStore::mark_prompt_acceptance(
+                            prompt_store.as_ref(),
+                            &attempt_id,
+                            "dispatch_uncertain",
+                        )
+                        .await
+                    {
+                        prompt_telemetry.record(error.reason);
+                        eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
+                    }
+                })
+            });
+            diagnostic_ctx.with_prompt_dispatch_barrier(barrier)
+        }
+        None => diagnostic_ctx,
+    };
+
     // Run the workflow.
     use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
     use futures::StreamExt;
-    let mut stream = executor.run_with_context(
+    let mut stream = executor.run_with_diagnostic_context(
         graph,
         input,
         run_id,
         tokio_util::sync::CancellationToken::new(),
-        ctx,
+        diagnostic_ctx,
     );
     let mut output = String::new();
     let mut ok = true;
+    let mut terminal_outcome = "failed";
+    let mut completed_nodes = 0_u32;
+    let mut failed_nodes = 0_u32;
+    let mut cleanup_disposition = "unknown";
+    let mut cleanup_ms = 0_u64;
+    let mut terminal_seen = false;
     while let Some(item) = stream.next().await {
         match item {
             Ok(WorkflowEvent::NodeStarted { node }) => {
@@ -3426,15 +3566,33 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                 usage: _,
                 ..
             }) => {
+                if node_ok {
+                    completed_nodes = completed_nodes.saturating_add(1);
+                } else {
+                    failed_nodes = failed_nodes.saturating_add(1);
+                }
                 eprintln!(
                     "[workflow] node {} {}",
                     node.as_str(),
                     if node_ok { "ok" } else { "failed" }
                 );
             }
+            Ok(WorkflowEvent::CleanupObserved {
+                disposition,
+                duration_ms,
+            }) => {
+                cleanup_disposition = disposition.as_str();
+                cleanup_ms = duration_ms;
+            }
             Ok(WorkflowEvent::Terminal { outcome, output: o }) => {
+                terminal_seen = true;
                 output = o;
                 ok = matches!(outcome, WorkflowOutcome::Completed);
+                terminal_outcome = match outcome {
+                    WorkflowOutcome::Completed => "completed",
+                    WorkflowOutcome::Failed => "failed",
+                    WorkflowOutcome::Canceled => "canceled",
+                };
             }
             Err(e) => {
                 eprintln!("[workflow] error: {e:?}");
@@ -3442,20 +3600,385 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             }
         }
     }
+    let prefinal_ms = u64::try_from(workflow_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let cleanup_ms = cleanup_ms.min(prefinal_ms);
+    let work_ms = prefinal_ms.saturating_sub(cleanup_ms);
+    let finalization_started = std::time::Instant::now();
 
     // Write output.
-    if let Some(out) = out_path {
+    let output_error = if let Some(out) = out_path {
         std::fs::write(&out, &output)
-            .map_err(|e| format!("run-workflow: cannot write output {:?}: {e}", out))?;
+            .err()
+            .map(|error| format!("run-workflow: cannot write output {:?}: {error}", out))
     } else {
         print!("{output}");
+        None
+    };
+    if output_error.is_some() {
+        ok = false;
+        terminal_outcome = "failed";
+    }
+    let finalization_ms =
+        u64::try_from(finalization_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    // The primary offline result/output is published first; summary finalization cannot roll it back.
+    if let Some(store) = history_store {
+        let end_to_end_ms =
+            u64::try_from(workflow_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let telemetry_complete = terminal_seen && offline_telemetry.reason().is_none();
+        let terminal = bridge_core::workflow_history::AttemptTerminal {
+            completed_ms: bridge_core::task_store::system_wall_now_ms(),
+            work_ms,
+            end_to_end_ms,
+            queue_ms: 0,
+            cancellation_ms: 0,
+            cleanup_ms,
+            finalization_ms,
+            outcome: terminal_outcome.into(),
+            terminal_reason: if output_error.is_some() {
+                "output_write_failed"
+            } else {
+                terminal_outcome
+            }
+            .into(),
+            producer_terminal: "unknown".into(),
+            final_message: "unknown".into(),
+            process_liveness: "unknown".into(),
+            terminal_evidence_capability: "unsupported".into(),
+            terminal_evidence_version: "none".into(),
+            terminal_evidence_source: "none".into(),
+            terminal_evidence_complete: false,
+            degraded: terminal_outcome != "completed" || !telemetry_complete,
+            prompt_acceptance: "unknown".into(),
+            cleanup_disposition: cleanup_disposition.into(),
+            node_counts: bridge_core::workflow_history::NodeCounts {
+                completed: completed_nodes,
+                failed: failed_nodes,
+                ..bridge_core::workflow_history::NodeCounts::default()
+            },
+            phase_durations: vec![
+                bridge_core::workflow_history::PhaseDuration {
+                    phase: "work".into(),
+                    duration_ms: work_ms,
+                },
+                bridge_core::workflow_history::PhaseDuration {
+                    phase: "cleanup".into(),
+                    duration_ms: cleanup_ms,
+                },
+                bridge_core::workflow_history::PhaseDuration {
+                    phase: "finalization".into(),
+                    duration_ms: finalization_ms,
+                },
+            ],
+            telemetry_complete,
+            monotonic_clock: true,
+        };
+        let unavailable = match bridge_core::workflow_history::WorkflowHistoryStore::terminalize(
+            store.as_ref(),
+            &identity.attempt_id,
+            &terminal,
+        )
+        .await
+        {
+            Ok(bridge_core::workflow_history::TerminalWrite::Applied)
+            | Ok(bridge_core::workflow_history::TerminalWrite::Replayed) => None,
+            Ok(bridge_core::workflow_history::TerminalWrite::Conflict) => {
+                Some(bridge_core::workflow_history::LedgerUnavailableReason::Collision)
+            }
+            Err(error) => Some(error.reason),
+        };
+        if let Some(reason) = unavailable {
+            eprintln!("telemetry_unavailable{{reason={}}}", reason.as_str());
+        }
     }
 
+    if let Some(error) = output_error {
+        return Err(error.into());
+    }
     if ok {
         Ok(())
     } else {
         Err("run-workflow: workflow did not complete successfully".into())
     }
+}
+
+const WORKFLOW_STATS_USAGE: &str = "\
+usage: a2a-bridge workflow-stats [--config <path> | --store <path>]
+                                 [--start-ms <epoch-ms>] [--end-ms <epoch-ms>] [--json]
+       a2a-bridge workflow-stats get <attempt-id>
+                                 [--config <path> | --store <path>] [--json]
+       a2a-bridge workflow-stats pin <attempt-id>
+                                 [--config <path> | --store <path>] [--json]
+       a2a-bridge workflow-stats unpin <attempt-id>
+                                 [--config <path> | --store <path>] [--json]
+
+Read one active or terminal attempt, completed summaries, or explicitly protect/unprotect one incident row.
+An explicit --store path must be absolute; relative [store] paths selected through --config remain
+relative to that config's canonical parent directory.";
+
+#[derive(Debug)]
+enum WorkflowStatsCliError {
+    AttemptIdRequired,
+    InvalidAttemptId,
+    IncompatibleFlags,
+    AttemptNotFound,
+    StorePathNotAbsolute,
+}
+
+impl std::fmt::Display for WorkflowStatsCliError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = match self {
+            Self::AttemptIdRequired => "attempt_id_required",
+            Self::InvalidAttemptId => "invalid_attempt_id",
+            Self::IncompatibleFlags => "incompatible_flags",
+            Self::AttemptNotFound => "attempt_not_found",
+            Self::StorePathNotAbsolute => "store_path_not_absolute",
+        };
+        write!(formatter, "workflow-stats: {code}")
+    }
+}
+
+impl std::error::Error for WorkflowStatsCliError {}
+
+enum WorkflowStatsAction {
+    Report,
+    Get {
+        attempt_id: bridge_core::ids::AttemptId,
+    },
+    SetPinned {
+        attempt_id: bridge_core::ids::AttemptId,
+        pinned: bool,
+    },
+}
+
+struct WorkflowStatsArgs {
+    action: WorkflowStatsAction,
+    config: Option<String>,
+    store: Option<String>,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+    json: bool,
+}
+
+fn parse_workflow_stats_args(args: &[String]) -> Result<WorkflowStatsArgs, BoxError> {
+    let mut index = 0;
+    let action = match args.first().map(String::as_str) {
+        Some(action @ ("get" | "pin" | "unpin")) => {
+            let raw = args
+                .get(1)
+                .filter(|value| !value.starts_with('-'))
+                .ok_or(WorkflowStatsCliError::AttemptIdRequired)?;
+            let attempt_id = bridge_core::ids::AttemptId::parse(raw.clone())
+                .map_err(|_| WorkflowStatsCliError::InvalidAttemptId)?;
+            index = 2;
+            if action == "get" {
+                WorkflowStatsAction::Get { attempt_id }
+            } else {
+                WorkflowStatsAction::SetPinned {
+                    attempt_id,
+                    pinned: action == "pin",
+                }
+            }
+        }
+        _ => WorkflowStatsAction::Report,
+    };
+
+    let mut parsed = WorkflowStatsArgs {
+        action,
+        config: None,
+        store: None,
+        start_ms: None,
+        end_ms: None,
+        json: false,
+    };
+    while index < args.len() {
+        let option = args[index].as_str();
+        if matches!(option, "--start-ms" | "--end-ms")
+            && !matches!(&parsed.action, WorkflowStatsAction::Report)
+        {
+            return Err(WorkflowStatsCliError::IncompatibleFlags.into());
+        }
+        match option {
+            "--config" | "--store" | "--start-ms" | "--end-ms" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("workflow-stats: {option} requires a value"))?
+                    .clone();
+                index += 2;
+                match option {
+                    "--config" if parsed.config.is_none() => parsed.config = Some(value),
+                    "--store" if parsed.store.is_none() => parsed.store = Some(value),
+                    "--start-ms" if parsed.start_ms.is_none() => {
+                        parsed.start_ms = Some(
+                            value
+                                .parse()
+                                .map_err(|_| "workflow-stats: --start-ms must be an integer")?,
+                        );
+                    }
+                    "--end-ms" if parsed.end_ms.is_none() => {
+                        parsed.end_ms = Some(
+                            value
+                                .parse()
+                                .map_err(|_| "workflow-stats: --end-ms must be an integer")?,
+                        );
+                    }
+                    _ => return Err(format!("workflow-stats: duplicate {option}").into()),
+                }
+            }
+            "--json" if !parsed.json => {
+                parsed.json = true;
+                index += 1;
+            }
+            "--json" => return Err("workflow-stats: duplicate --json".into()),
+            other => {
+                return Err(format!(
+                    "workflow-stats: unknown argument {other:?}\n{WORKFLOW_STATS_USAGE}"
+                )
+                .into());
+            }
+        }
+    }
+    if parsed.config.is_some() && parsed.store.is_some() {
+        return Err(WorkflowStatsCliError::IncompatibleFlags.into());
+    }
+    if parsed
+        .store
+        .as_deref()
+        .is_some_and(|path| !std::path::Path::new(path).is_absolute())
+    {
+        return Err(WorkflowStatsCliError::StorePathNotAbsolute.into());
+    }
+    Ok(parsed)
+}
+
+fn workflow_stats_path(args: &WorkflowStatsArgs) -> Result<std::path::PathBuf, BoxError> {
+    if let Some(path) = &args.store {
+        return Ok(std::path::PathBuf::from(path));
+    }
+    if let Some(config_path) = &args.config {
+        // Match the live owner exactly: MCP canonicalizes its config before
+        // resolving a relative store path. Resolving relative to a symlink's
+        // spelling here could otherwise select an unrelated ledger.
+        let config_path = std::fs::canonicalize(config_path)
+            .map_err(|error| format!("workflow-stats: cannot resolve config path: {error}"))?;
+        let raw = std::fs::read_to_string(&config_path)?;
+        let cfg = config::RegistryConfig::parse(&raw)?;
+        return match cfg.store {
+            Some(store) => {
+                let path = std::path::PathBuf::from(store.path);
+                if path.is_absolute() {
+                    Ok(path)
+                } else {
+                    Ok(config_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .join(path))
+                }
+            }
+            None => bridge_store::sqlite::platform_history_path()
+                .map_err(|error| format!("workflow-stats: {error}").into()),
+        };
+    }
+    bridge_store::sqlite::platform_history_path()
+        .map_err(|error| format!("workflow-stats: {error}").into())
+}
+
+async fn workflow_stats_cmd(args: &[String]) -> Result<(), BoxError> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{WORKFLOW_STATS_USAGE}");
+        return Ok(());
+    }
+    let parsed = parse_workflow_stats_args(args)?;
+    let path = workflow_stats_path(&parsed)?;
+
+    match parsed.action {
+        WorkflowStatsAction::Get { attempt_id } => {
+            let store = SqliteStore::open_history_read_only(&path)
+                .map_err(|error| format!("workflow-stats: {error}"))?;
+            let record =
+                bridge_core::workflow_history::WorkflowHistoryStore::attempt(&store, &attempt_id)
+                    .await
+                    .map_err(|error| format!("workflow-stats: {error}"))?
+                    .ok_or(WorkflowStatsCliError::AttemptNotFound)?;
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&record)?);
+            } else {
+                println!("attempt_id: {}", attempt_id.as_str());
+                println!(
+                    "status: {}",
+                    if record.terminal.is_some() {
+                        "terminal"
+                    } else {
+                        "active"
+                    }
+                );
+                println!("record: {}", serde_json::to_string(&record)?);
+            }
+        }
+        WorkflowStatsAction::SetPinned { attempt_id, pinned } => {
+            let store = SqliteStore::open_history_admin(&path)
+                .map_err(|error| format!("workflow-stats: {error}"))?;
+            let changed = bridge_core::workflow_history::WorkflowHistoryStore::set_pinned(
+                &store,
+                &attempt_id,
+                pinned,
+            )
+            .await
+            .map_err(|error| format!("workflow-stats: {error}"))?;
+            if parsed.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "attempt_id": attempt_id,
+                        "pinned": pinned,
+                        "changed": changed,
+                    }))?
+                );
+            } else {
+                println!("attempt_id: {}", attempt_id.as_str());
+                println!("pinned: {pinned}");
+                println!("changed: {changed}");
+            }
+        }
+        WorkflowStatsAction::Report => {
+            let end_ms = parsed
+                .end_ms
+                .unwrap_or_else(bridge_core::task_store::system_wall_now_ms);
+            let start_ms = parsed.start_ms.unwrap_or_else(|| {
+                end_ms.saturating_sub(
+                    bridge_core::workflow_history::RETENTION_DAYS * 24 * 60 * 60 * 1000,
+                )
+            });
+            let store = SqliteStore::open_history_read_only(&path)
+                .map_err(|error| format!("workflow-stats: {error}"))?;
+            let rows = bridge_core::workflow_history::WorkflowHistoryStore::completed_between(
+                &store, start_ms, end_ms,
+            )
+            .await
+            .map_err(|error| format!("workflow-stats: {error}"))?;
+            let report = bridge_core::workflow_history::report(start_ms, end_ms, &rows);
+            if parsed.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("window_ms: {}..{}", report.start_ms, report.end_ms);
+                println!("sample_count: {}", report.sample_count);
+                println!(
+                    "calibration_sample_count: {}",
+                    report.calibration_sample_count
+                );
+                println!("partitions: {}", serde_json::to_string(&report.partitions)?);
+                println!("excluded: {}", serde_json::to_string(&report.excluded)?);
+                println!("work_ms: {}", serde_json::to_string(&report.work_ms)?);
+                println!(
+                    "end_to_end_ms: {}",
+                    serde_json::to_string(&report.end_to_end_ms)?
+                );
+                println!("sufficient: {}", report.sufficient);
+                println!("recommendation: {}", report.recommendation);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3980,10 +4503,23 @@ Send one unary message to a running a2a-bridge serve and print the response text
   --cwd <dir>     override the session cwd for this message";
 
 async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
+    let identity = bridge_core::ids::AttemptIdentity::initial()?;
+    println!("execution_id={}", identity.execution_id.as_str());
+    println!("attempt_id={}", identity.attempt_id.as_str());
+    std::io::Write::flush(&mut std::io::stdout())
+        .map_err(|error| format!("submit: cannot flush attempt locator: {error}"))?;
     let input_path = flag(args, "--input").ok_or("submit: --input <file> required")?;
     let url = flag(args, "--url").unwrap_or("http://127.0.0.1:8080");
     let text = std::fs::read_to_string(input_path)?;
     let mut md = serde_json::Map::new();
+    md.insert(
+        "a2a-bridge.execution_id".into(),
+        identity.execution_id.as_str().into(),
+    );
+    md.insert(
+        "a2a-bridge.attempt_id".into(),
+        identity.attempt_id.as_str().into(),
+    );
     let flagvals: std::collections::HashSet<&str> = [
         "--input",
         "--url",
@@ -4018,6 +4554,7 @@ async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
     let mut message = serde_json::Map::new();
     message.insert("text".into(), text.into());
     message.insert("metadata".into(), serde_json::Value::Object(md));
+    message.insert("taskId".into(), identity.execution_id.as_str().into());
     if let Some(c) = flag(args, "--context") {
         message.insert("contextId".into(), c.into());
     }
@@ -5150,22 +5687,27 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         (None, Some(s)) => Some(resolve_rel(std::path::Path::new(&s.path))),
         (None, None) => None,
     };
-    let (session_store, task_store): (
-        Arc<dyn bridge_core::ports::SessionStore>,
-        Arc<dyn bridge_core::task_store::TaskStore>,
-    ) = match store_path {
+    let (session_store, task_store, workflow_history): McpStores = match store_path {
         Some(path) => {
-            let sqlite = Arc::new(SqliteStore::open(&path).map_err(|e| {
+            let sqlite = Arc::new(SqliteStore::open_shared_history(&path).map_err(|error| {
                 format!(
-                    "a2a-bridge mcp: cannot open task store {path:?} ({e:?}); \
+                    "a2a-bridge mcp: cannot open task/history store {path:?} ({error:?}); \
                      is another a2a-bridge serve/mcp already running on this store?"
                 )
             })?);
-            (sqlite.clone() as _, sqlite as _)
+            (sqlite.clone() as _, sqlite.clone() as _, Ok(sqlite as _))
         }
         None => {
-            let sqlite = Arc::new(SqliteStore::open_in_memory()?);
-            (sqlite.clone() as _, sqlite as _)
+            let path = bridge_store::sqlite::platform_history_path().map_err(|error| {
+                format!(
+                    "a2a-bridge mcp: cannot select owner-private store ({})",
+                    error.reason.as_str()
+                )
+            })?;
+            let sqlite = Arc::new(SqliteStore::open_platform_history(&path).map_err(|error| {
+                format!("a2a-bridge mcp: cannot open owner-private store {path:?} ({error:?})")
+            })?);
+            (sqlite.clone() as _, sqlite.clone() as _, Ok(sqlite as _))
         }
     };
 
@@ -5195,10 +5737,11 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         resume_cap,
         false,
         512,
+        workflow_history,
         Arc::clone(&perm_registry),
     );
 
-    coordinator.resume().await;
+    coordinator.resume().await?;
     bridge_mcp::serve(tokio::io::stdin(), tokio::io::stdout(), coordinator).await?;
     Ok(())
 }
@@ -6232,6 +6775,7 @@ async fn main() -> Result<(), BoxError> {
     }
     match sub {
         TopSubcommand::RunWorkflow => return run_workflow_cmd(&raw_args[2..]).await,
+        TopSubcommand::WorkflowStats => return workflow_stats_cmd(&raw_args[2..]).await,
         TopSubcommand::RunBatch => return run_batch_cmd(&raw_args[2..]).await,
         TopSubcommand::Batch => return batch_cmd(&raw_args[2..]).await,
         TopSubcommand::Models => return models_cmd(&raw_args[2..]).await,
@@ -6262,7 +6806,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         TopSubcommand::Unknown(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | compatibility | smoke | fallback-plan | implement | merge | containers | submit | task | task-spec | prompt | session | init | validate | doctor | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | compatibility | smoke | fallback-plan | implement | merge | containers | workflow-stats | submit | task | task-spec | prompt | session | init | validate | doctor | help)"
             )
             .into());
         }
@@ -6446,9 +6990,9 @@ async fn main() -> Result<(), BoxError> {
         None => Arc::new(StubDelegation),
     };
 
-    // W3b: durable task store. File-backed when [store] path is set (acquires the
-    // single-serve lock via SqliteStore::open); else in-memory (ephemeral).
-    // sweep_interrupted is REPLACED by resume_working_tasks for the file-backed path:
+    // W3b: the task and workflow-history authorities share one durable SQLite store.
+    // An explicit [store] path wins; otherwise the owner-private platform path is selected once.
+    // sweep_interrupted is REPLACED by resume_working_tasks:
     // the resume routine decides per-task whether to re-run or interrupt based on the
     // workflow snapshot + attempt cap, rather than unconditionally sweeping all Working rows.
     let resume_cap = cfg
@@ -6456,28 +7000,42 @@ async fn main() -> Result<(), BoxError> {
         .as_ref()
         .and_then(|s| s.resume_attempt_cap)
         .unwrap_or(3);
-    let task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore> =
-        match cfg.store.as_ref().map(|s| s.path.clone()) {
-            Some(path) => {
-                // Resolve a RELATIVE store path against the config's own directory
-                // (`base`), not the process CWD — so `serve --config /elsewhere/...`
-                // keeps task state beside its config, not wherever serve was launched.
-                let store_path = {
-                    let p = std::path::Path::new(&path);
-                    if p.is_absolute() {
-                        p.to_path_buf()
-                    } else {
-                        base.join(p)
-                    }
-                };
-                let s =
-                    std::sync::Arc::new(SqliteStore::open(&store_path).map_err(|e| {
-                        format!("serve: cannot open task store {store_path:?}: {e:?}")
-                    })?);
-                s as std::sync::Arc<dyn bridge_core::task_store::TaskStore>
-            }
-            None => std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
-        };
+    let (task_store, workflow_history): (
+        std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+        Result<
+            Arc<dyn bridge_core::workflow_history::WorkflowHistoryStore>,
+            bridge_core::workflow_history::LedgerUnavailableReason,
+        >,
+    ) = match cfg.store.as_ref().map(|s| s.path.clone()) {
+        Some(path) => {
+            let store_path = {
+                let p = std::path::Path::new(&path);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    base.join(p)
+                }
+            };
+            let store = std::sync::Arc::new(
+                SqliteStore::open_shared_history(&store_path).map_err(|error| {
+                    format!("serve: cannot open task/history store {store_path:?}: {error:?}")
+                })?,
+            );
+            (store.clone() as _, Ok(store as _))
+        }
+        None => {
+            let path = bridge_store::sqlite::platform_history_path().map_err(|error| {
+                format!(
+                    "serve: cannot select owner-private store ({})",
+                    error.reason.as_str()
+                )
+            })?;
+            let store = std::sync::Arc::new(SqliteStore::open_platform_history(&path).map_err(
+                |error| format!("serve: cannot open owner-private store {path:?} ({error:?})"),
+            )?);
+            (store.clone() as _, Ok(store as _))
+        }
+    };
 
     let metrics_cfg = cfg.metrics_config()?;
     let traces_cfg = cfg.traces_config()?;
@@ -6496,7 +7054,16 @@ async fn main() -> Result<(), BoxError> {
                 .filter_map(|(_, entry)| entry.effort.as_ref().map(effort_to_string))
                 .collect(),
         };
-        Some(Arc::new(bridge_observ::PrometheusObserver::new(vocab)?))
+        let workflow_vocab = bridge_observ::WorkflowLabelVocabulary {
+            workflows: wf_map.keys().map(|id| id.as_str().to_string()).collect(),
+            task_classes: ["workflow".to_string(), "direct".to_string()]
+                .into_iter()
+                .collect(),
+            policies: ["r2f0a".to_string()].into_iter().collect(),
+        };
+        Some(Arc::new(
+            bridge_observ::PrometheusObserver::new_with_workflow_vocabulary(vocab, workflow_vocab)?,
+        ))
     } else {
         None
     };
@@ -6607,6 +7174,7 @@ async fn main() -> Result<(), BoxError> {
     // parsing the config string here would add a new boot-time failure mode
     // (`SessionCwd::parse` rejects empty/relative roots) that serve never had. The
     // real parsed root is wired at the slice that consumes it.
+    let workflow_history_for_metrics = workflow_history.clone();
     let coordinator = build_coordinator(
         session_manager,
         executor,
@@ -6622,6 +7190,7 @@ async fn main() -> Result<(), BoxError> {
         resume_cap,
         traces_cfg.enabled,
         traces_cfg.max_task_turns,
+        workflow_history,
         Arc::clone(&perm_registry),
     );
 
@@ -6678,12 +7247,39 @@ async fn main() -> Result<(), BoxError> {
 
     // 8b. Resume in-flight detached workflows from their checkpoints BEFORE accepting
     //     new requests. Boot order: open store → build server → resume → bind listener.
-    //     For the in-memory/no-path branch the store is always empty so this is a no-op.
+    //     Both configured and owner-private stores may contain work requiring reconciliation.
     //     #10 slice 4: resume via the Coordinator (its resume() dispatches to the SAME
     //     batch::resume_all / detached::resume_non_batch_tasks over the SHARED store +
     //     BatchRuntime as the adapter's resume_working_tasks). This REPLACES the adapter
     //     call — NEVER both, or a working task double-spawns two runners (Fable M4).
-    coordinator.resume().await;
+    coordinator.resume().await?;
+    if let Some(prometheus) = &prometheus_observer {
+        match &workflow_history_for_metrics {
+            Ok(history) => match history.completed_between(0, i64::MAX).await {
+                Ok(rows) => prometheus.rebuild_from_workflow_history(&rows),
+                Err(error) => {
+                    observer.record_workflow(
+                        &bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable {
+                            reason: error.reason,
+                        },
+                    );
+                    tracing::warn!(
+                        reason = error.reason.as_str(),
+                        "workflow metric history rebuild skipped"
+                    );
+                }
+            },
+            Err(reason) => {
+                observer.record_workflow(
+                    &bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable { reason: *reason },
+                );
+                tracing::warn!(
+                    reason = reason.as_str(),
+                    "workflow metric history rebuild skipped"
+                );
+            }
+        }
+    }
 
     // 8c. Build the axum router (consumes one Arc ref; hold a clone above for resume).
     let router = server.router();
@@ -6753,6 +7349,229 @@ mod cli_tests {
         };
 
         assert!(!turn_log_observer_enabled(&metrics, &traces));
+    }
+    #[tokio::test]
+    async fn workflow_stats_get_pin_and_unpin_live_configured_history() {
+        use bridge_core::workflow_history::{
+            AttemptReservation, AttemptTerminal, ExecutionSurface, NodeCounts, WorkflowHistoryStore,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.sqlite");
+        let primary = SqliteStore::open_shared_history(&path).unwrap();
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let reservation = AttemptReservation {
+            identity: identity.clone(),
+            task_id: None,
+            workflow: "code-review".into(),
+            task_class: "review".into(),
+            surface: ExecutionSurface::Offline,
+            policy: "r2f0a".into(),
+            workload_fingerprint: "shape-cli".into(),
+            started_ms: 1_000,
+            workload_fingerprint_complete: true,
+            prompt_acceptance: "not_dispatched".into(),
+            pinned: false,
+        };
+        primary.reserve(&reservation).await.unwrap();
+        primary
+            .mark_prompt_acceptance(&identity.attempt_id, "dispatch_uncertain")
+            .await
+            .unwrap();
+        let reader = SqliteStore::open_history_read_only(&path).unwrap();
+        let active = reader.attempt(&identity.attempt_id).await.unwrap().unwrap();
+        assert!(active.terminal.is_none());
+        assert_eq!(active.reservation.prompt_acceptance, "dispatch_uncertain");
+        drop(reader);
+        primary
+            .terminalize(
+                &identity.attempt_id,
+                &AttemptTerminal {
+                    completed_ms: 2_000,
+                    work_ms: 800,
+                    end_to_end_ms: 1_000,
+                    queue_ms: 0,
+                    cancellation_ms: 0,
+                    cleanup_ms: 0,
+                    finalization_ms: 200,
+                    outcome: "interrupted".into(),
+                    terminal_reason: "owner_recovery".into(),
+                    producer_terminal: "unknown".into(),
+                    final_message: "unknown".into(),
+                    process_liveness: "unknown".into(),
+                    terminal_evidence_capability: "unsupported".into(),
+                    terminal_evidence_version: "none".into(),
+                    terminal_evidence_source: "none".into(),
+                    terminal_evidence_complete: false,
+                    degraded: true,
+                    prompt_acceptance: "dispatch_uncertain".into(),
+                    cleanup_disposition: "complete".into(),
+                    node_counts: NodeCounts {
+                        completed: 1,
+                        ..NodeCounts::default()
+                    },
+                    phase_durations: Vec::new(),
+                    telemetry_complete: false,
+                    monotonic_clock: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        let reader = SqliteStore::open_history_read_only(&path).unwrap();
+        let terminal = reader
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(terminal.outcome, "interrupted");
+        assert!(terminal.degraded);
+        assert!(!terminal.telemetry_complete);
+        drop(reader);
+
+        let command = |action: &str| {
+            vec![
+                action.to_owned(),
+                identity.attempt_id.as_str().to_owned(),
+                "--store".to_owned(),
+                path.to_string_lossy().into_owned(),
+                "--json".to_owned(),
+            ]
+        };
+        workflow_stats_cmd(&command("get")).await.unwrap();
+        workflow_stats_cmd(&command("pin")).await.unwrap();
+        workflow_stats_cmd(&command("pin")).await.unwrap();
+        assert!(
+            primary.completed_between(0, i64::MAX).await.unwrap()[0]
+                .reservation
+                .pinned
+        );
+
+        workflow_stats_cmd(&command("unpin")).await.unwrap();
+        assert!(
+            !primary.completed_between(0, i64::MAX).await.unwrap()[0]
+                .reservation
+                .pinned
+        );
+
+        let invalid = vec![
+            "pin".to_owned(),
+            identity.attempt_id.as_str().to_owned(),
+            "--store".to_owned(),
+            path.to_string_lossy().into_owned(),
+            "--start-ms".to_owned(),
+            "1".to_owned(),
+        ];
+        assert_eq!(
+            parse_workflow_stats_args(&invalid)
+                .err()
+                .unwrap()
+                .to_string(),
+            "workflow-stats: incompatible_flags"
+        );
+
+        let unknown = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let unknown_command = vec![
+            "get".to_owned(),
+            unknown.attempt_id.as_str().to_owned(),
+            "--store".to_owned(),
+            path.to_string_lossy().into_owned(),
+            "--json".to_owned(),
+        ];
+        let error = workflow_stats_cmd(&unknown_command).await.unwrap_err();
+        assert_eq!(error.to_string(), "workflow-stats: attempt_not_found");
+    }
+
+    #[tokio::test]
+    async fn workflow_stats_get_reports_incompatible_schema_as_typed_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("incompatible-history.sqlite");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE workflow_attempt_summaries (
+                     attempt_id TEXT PRIMARY KEY
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let command = vec![
+            "get".to_owned(),
+            identity.attempt_id.as_str().to_owned(),
+            "--store".to_owned(),
+            path.to_string_lossy().into_owned(),
+            "--json".to_owned(),
+        ];
+        let error = workflow_stats_cmd(&command).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "workflow-stats: telemetry_unavailable{reason=Migration}"
+        );
+    }
+
+    #[test]
+    fn workflow_stats_rejects_config_and_store_as_typed_incompatible_flags() {
+        let error = parse_workflow_stats_args(&[
+            "--config".to_owned(),
+            "bridge.toml".to_owned(),
+            "--store".to_owned(),
+            "history.sqlite".to_owned(),
+        ])
+        .err()
+        .expect("mutually exclusive selectors must be rejected");
+        assert_eq!(error.to_string(), "workflow-stats: incompatible_flags");
+    }
+
+    #[test]
+    fn workflow_stats_rejects_relative_store_as_typed_error() {
+        let error = parse_workflow_stats_args(&[
+            "--store".to_owned(),
+            "reader-cwd/history.sqlite".to_owned(),
+        ])
+        .err()
+        .expect("a direct store selector must be absolute");
+        assert_eq!(error.to_string(), "workflow-stats: store_path_not_absolute");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_stats_resolves_relative_store_from_canonical_config_owner() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let owner = directory.path().join("owner");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::create_dir_all(&alias).unwrap();
+        let config = owner.join("bridge.toml");
+        std::fs::write(
+            &config,
+            "default = \"api\"\n\
+             [[agents]]\n\
+             id = \"api\"\n\
+             kind = \"api\"\n\
+             [server]\n\
+             [store]\n\
+             path = \"ledger/history.sqlite\"\n",
+        )
+        .unwrap();
+        let linked_config = alias.join("bridge.toml");
+        symlink(&config, &linked_config).unwrap();
+        let canonical_owner = config.canonicalize().unwrap().parent().unwrap().to_owned();
+        let parsed = parse_workflow_stats_args(&[
+            "--config".to_owned(),
+            linked_config.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            workflow_stats_path(&parsed).unwrap(),
+            canonical_owner.join("ledger/history.sqlite")
+        );
     }
 
     /// B2 (T-B1): `run_blocking` must run its closure OFF the runtime worker. On a current-thread
@@ -9245,9 +10064,18 @@ The command prints schemas, templates, and validates input.
             )
             .mount(&server)
             .await;
-        super::run_workflow_serve_client("wf", "hello", None, &server.uri(), context, session_cwd)
-            .await
-            .unwrap();
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        super::run_workflow_serve_client(
+            "wf",
+            "hello",
+            None,
+            &server.uri(),
+            context,
+            session_cwd,
+            &identity,
+        )
+        .await
+        .unwrap();
         let reqs = server.received_requests().await.unwrap();
         let req = &reqs[0];
         let auth_present = req.headers.get("authorization").is_some();

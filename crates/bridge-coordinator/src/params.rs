@@ -130,6 +130,23 @@ impl PermitParams {
     }
 }
 
+pub fn attempt_identity_from_mcp_args(
+    value: &serde_json::Value,
+) -> Result<bridge_core::ids::AttemptIdentity, BridgeError> {
+    let execution = string_field(value, "execution_id").ok_or(BridgeError::InvalidRequest {
+        field: "execution_id",
+    })?;
+    let attempt = string_field(value, "attempt_id").ok_or(BridgeError::InvalidRequest {
+        field: "attempt_id",
+    })?;
+    Ok(bridge_core::ids::AttemptIdentity {
+        execution_id: bridge_core::ids::ExecutionId::parse(execution)?,
+        attempt_id: bridge_core::ids::AttemptId::parse(attempt)?,
+        ordinal: 0,
+        parent_attempt_id: None,
+    })
+}
+
 impl OpParams {
     /// From an MCP `tools/call` arguments object.
     pub fn from_mcp_args(v: &serde_json::Value) -> Result<Self, BridgeError> {
