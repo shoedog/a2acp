@@ -212,6 +212,7 @@ impl DirectAttemptHandle {
                         surface: self.surface,
                         policy: "r2f0a",
                         outcome: terminal.outcome.as_str(),
+                        telemetry_complete: terminal.telemetry_complete,
                         work_seconds: terminal.work_ms as f64 / 1000.0,
                         end_to_end_seconds: terminal.end_to_end_ms as f64 / 1000.0,
                     });
@@ -1467,13 +1468,14 @@ impl Coordinator {
                 });
             }
         };
-        history
+        let row = history
             .attempt(attempt)
             .await
             .map_err(|error| BridgeError::DurableEvidenceUnavailable {
                 reason: error.reason.as_str(),
             })?
-            .ok_or(BridgeError::TaskNotFound)
+            .ok_or(BridgeError::TaskNotFound)?;
+        Ok(bridge_core::workflow_history::compatibility_project_attempt_record(row))
     }
 
     /// Return status for exactly one warm context or detached task.
@@ -2359,6 +2361,131 @@ mod tests {
             end_ms: i64,
         ) -> Result<Vec<CompletedAttempt>, LedgerError> {
             self.inner.completed_between(start_ms, end_ms).await
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_real_mcp_attempt_row_is_timing_incomplete_and_not_calibration_eligible() {
+        let history = Arc::new(MemoryWorkflowHistoryStore::new());
+        let backend = Arc::new(FakeBackend::new(None));
+        let observer = Arc::new(WorkflowBalanceObserver::default());
+        let fixture = coordinator_fixture_with_backend_and_observer(
+            Arc::new(HashMap::new()),
+            backend,
+            observer,
+        );
+        let coordinator = fixture
+            .coordinator
+            .with_workflow_history(Ok(history.clone()));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let attempt_id = identity.attempt_id.clone();
+
+        coordinator
+            .prompt_with_identity(prompt_params("hi"), identity)
+            .await
+            .unwrap();
+
+        let row = history
+            .attempt(&attempt_id)
+            .await
+            .unwrap()
+            .expect("real MCP attempt row exists");
+        assert_eq!(
+            row.reservation.surface,
+            bridge_core::workflow_history::ExecutionSurface::Mcp
+        );
+        let terminal = row.terminal.expect("real MCP attempt terminalized");
+        assert_eq!(terminal.work_ms, 0);
+        assert!(terminal.phase_durations.is_empty());
+        assert!(!terminal.telemetry_complete);
+
+        let completed = history.completed_between(0, i64::MAX).await.unwrap();
+        let report = bridge_core::workflow_history::report(0, i64::MAX, &completed);
+        assert_eq!(report.sample_count, 1);
+        assert_eq!(report.calibration_sample_count, 0);
+        assert_eq!(report.excluded.get("telemetry_incomplete"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn public_exact_recovery_projects_legacy_rows_from_custom_history_stores() {
+        for surface in [
+            bridge_core::workflow_history::ExecutionSurface::DirectUnary,
+            bridge_core::workflow_history::ExecutionSurface::Mcp,
+        ] {
+            let history = Arc::new(MemoryWorkflowHistoryStore::new());
+            let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+            let reservation = AttemptReservation {
+                identity: identity.clone(),
+                task_id: Some(
+                    bridge_core::ids::TaskId::parse(identity.execution_id.as_str()).unwrap(),
+                ),
+                workflow: "direct".into(),
+                task_class: "direct".into(),
+                surface,
+                policy: "r2f0a".into(),
+                workload_fingerprint: "legacy-direct".into(),
+                started_ms: 1_000,
+                workload_fingerprint_complete: true,
+                prompt_acceptance: "not_dispatched".into(),
+                pinned: false,
+            };
+            history.reserve(&reservation).await.unwrap();
+            let legacy = AttemptTerminal {
+                completed_ms: 2_000,
+                work_ms: 1_000,
+                end_to_end_ms: 1_000,
+                queue_ms: 0,
+                cancellation_ms: 0,
+                cleanup_ms: 0,
+                finalization_ms: 0,
+                outcome: "completed".into(),
+                terminal_reason: "completed".into(),
+                producer_terminal: "unknown".into(),
+                final_message: "unknown".into(),
+                process_liveness: "unknown".into(),
+                terminal_evidence_capability: "unsupported".into(),
+                terminal_evidence_version: "none".into(),
+                terminal_evidence_source: "none".into(),
+                terminal_evidence_complete: false,
+                degraded: false,
+                prompt_acceptance: "not_dispatched".into(),
+                cleanup_disposition: "complete".into(),
+                node_counts: bridge_core::workflow_history::NodeCounts::default(),
+                phase_durations: vec![bridge_core::workflow_history::PhaseDuration {
+                    phase: "work".into(),
+                    duration_ms: 1_000,
+                }],
+                telemetry_complete: true,
+                monotonic_clock: true,
+            };
+            history
+                .terminalize(&identity.attempt_id, &legacy)
+                .await
+                .unwrap();
+            assert!(
+                history
+                    .attempt(&identity.attempt_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .terminal
+                    .unwrap()
+                    .telemetry_complete,
+                "the custom store deliberately returns the unprojected legacy row"
+            );
+
+            let coordinator = coordinator_fixture(Arc::new(HashMap::new()))
+                .coordinator
+                .with_workflow_history(Ok(history));
+            let recovered = coordinator
+                .attempt_status(&identity.attempt_id)
+                .await
+                .unwrap();
+            let terminal = recovered.terminal.unwrap();
+            assert_eq!(terminal.end_to_end_ms, 1_000);
+            assert_eq!(terminal.work_ms, 0);
+            assert!(terminal.phase_durations.is_empty());
+            assert!(!terminal.telemetry_complete);
         }
     }
 

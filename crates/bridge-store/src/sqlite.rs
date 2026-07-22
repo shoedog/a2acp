@@ -4767,6 +4767,13 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                 }
                 _ => return Err(corruption()),
             }
+            let terminal = terminal.map(|terminal| {
+                bridge_core::workflow_history::compatibility_project_terminal(
+                    reservation.surface,
+                    &terminal,
+                )
+                .into_owned()
+            });
 
             Ok(AttemptRecord {
                 reservation,
@@ -4790,28 +4797,140 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
         if start_ms < 0 || end_ms < start_ms {
             return Err(LedgerError::new(R::Schema));
         }
+        struct PersistedCompleted {
+            reservation_json: String,
+            terminal_json: String,
+            surface: String,
+            completed_ms: i64,
+            outcome: String,
+            degraded: i64,
+            prompt_acceptance: String,
+            producer_terminal: String,
+            final_message: String,
+            process_liveness: String,
+            terminal_evidence_capability: String,
+            terminal_evidence_version: String,
+            terminal_evidence_source: String,
+            terminal_evidence_complete: i64,
+            telemetry_complete: i64,
+        }
+
+        let corruption = || LedgerError::new(R::Corruption);
+        let persisted_bool = |value| -> Result<bool, LedgerError> {
+            match value {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(corruption()),
+            }
+        };
         let conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
+        // Keep this statement and its rows alive through validation and
+        // compatibility projection so retention cannot split selection from
+        // decoding across SQLite snapshots.
         let mut stmt = conn
             .prepare(
-                "SELECT reservation_json, terminal_json FROM workflow_attempt_summaries
-             WHERE status='terminal' AND completed_ms>=?1 AND completed_ms<=?2
-             ORDER BY completed_ms, attempt_id",
+                "SELECT reservation_json, terminal_json, surface, completed_ms,
+                        outcome, degraded, prompt_acceptance, producer_terminal,
+                        final_message, process_liveness, terminal_evidence_capability,
+                        terminal_evidence_version, terminal_evidence_source,
+                        terminal_evidence_complete, telemetry_complete
+                 FROM workflow_attempt_summaries
+                 WHERE status='terminal' AND completed_ms>=?1 AND completed_ms<=?2
+                 ORDER BY completed_ms, attempt_id",
             )
-            .map_err(|e| history_error(&e))?;
+            .map_err(|error| history_error(&error))?;
         let rows = stmt
-            .query_map(rusqlite::params![start_ms, end_ms], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            .query_map(rusqlite::params![start_ms, end_ms], |row| {
+                Ok(PersistedCompleted {
+                    reservation_json: row.get(0)?,
+                    terminal_json: row.get(1)?,
+                    surface: row.get(2)?,
+                    completed_ms: row.get(3)?,
+                    outcome: row.get(4)?,
+                    degraded: row.get(5)?,
+                    prompt_acceptance: row.get(6)?,
+                    producer_terminal: row.get(7)?,
+                    final_message: row.get(8)?,
+                    process_liveness: row.get(9)?,
+                    terminal_evidence_capability: row.get(10)?,
+                    terminal_evidence_version: row.get(11)?,
+                    terminal_evidence_source: row.get(12)?,
+                    terminal_evidence_complete: row.get(13)?,
+                    telemetry_complete: row.get(14)?,
+                })
             })
-            .map_err(|e| history_error(&e))?;
+            .map_err(|error| history_error(&error))?;
+
         let mut out = Vec::new();
         for row in rows {
-            let (reservation, terminal) = row.map_err(|e| history_error(&e))?;
-            out.push(CompletedAttempt {
-                reservation: serde_json::from_str(&reservation)
-                    .map_err(|_| LedgerError::new(R::Corruption))?,
-                terminal: serde_json::from_str(&terminal)
-                    .map_err(|_| LedgerError::new(R::Corruption))?,
-            });
+            let row = row.map_err(|error| history_attempt_read_error(&error))?;
+            let mut reservation = serde_json::from_str::<
+                bridge_core::workflow_history::AttemptReservation,
+            >(&row.reservation_json)
+            .map_err(|_| corruption())?;
+            reservation.validate().map_err(|_| corruption())?;
+            let projected_prompt_acceptance =
+                bridge_core::workflow_history::conservative_prompt_acceptance(
+                    &reservation.prompt_acceptance,
+                    &row.prompt_acceptance,
+                )
+                .map_err(|_| corruption())?;
+            if projected_prompt_acceptance != row.prompt_acceptance {
+                return Err(corruption());
+            }
+
+            let terminal = serde_json::from_str::<bridge_core::workflow_history::AttemptTerminal>(
+                &row.terminal_json,
+            )
+            .map_err(|_| corruption())?;
+            terminal.validate().map_err(|_| corruption())?;
+
+            let legacy_conservative_prompt_projection = row.prompt_acceptance == "not_dispatched"
+                && terminal.prompt_acceptance == "unknown"
+                && terminal.terminal_reason == "prompt_barrier_failed"
+                && matches!(terminal.outcome.as_str(), "failed" | "interrupted")
+                && terminal.producer_terminal == "unknown"
+                && terminal.final_message == "unknown"
+                && terminal.process_liveness == "unknown"
+                && terminal.terminal_evidence_capability == "unsupported"
+                && terminal.terminal_evidence_version == "none"
+                && terminal.terminal_evidence_source == "none"
+                && !terminal.terminal_evidence_complete
+                && terminal.degraded
+                && !terminal.telemetry_complete;
+            if row.surface != reservation.surface.as_str()
+                || row.completed_ms != terminal.completed_ms
+                || row.outcome != terminal.outcome
+                || persisted_bool(row.degraded)? != terminal.degraded
+                || row.producer_terminal != terminal.producer_terminal
+                || row.final_message != terminal.final_message
+                || row.process_liveness != terminal.process_liveness
+                || row.terminal_evidence_capability != terminal.terminal_evidence_capability
+                || row.terminal_evidence_version != terminal.terminal_evidence_version
+                || row.terminal_evidence_source != terminal.terminal_evidence_source
+                || persisted_bool(row.terminal_evidence_complete)?
+                    != terminal.terminal_evidence_complete
+                || persisted_bool(row.telemetry_complete)? != terminal.telemetry_complete
+                || (row.prompt_acceptance != terminal.prompt_acceptance
+                    && !legacy_conservative_prompt_projection)
+            {
+                return Err(corruption());
+            }
+            reservation.prompt_acceptance = if legacy_conservative_prompt_projection {
+                "unknown".to_owned()
+            } else {
+                row.prompt_acceptance
+            };
+            reservation.validate().map_err(|_| corruption())?;
+
+            let completed = CompletedAttempt {
+                reservation,
+                terminal,
+            };
+            out.push(
+                bridge_core::workflow_history::compatibility_project_completed(&completed)
+                    .into_owned(),
+            );
         }
         Ok(out)
     }
@@ -8697,6 +8816,177 @@ mod r2f0a_history_tests {
             TerminalWrite::Conflict
         );
     }
+
+    #[tokio::test]
+    async fn legacy_direct_timing_projection_preserves_raw_bytes_and_replay_authority() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut row = reservation();
+        row.surface = ExecutionSurface::DirectUnary;
+        row.task_id =
+            Some(bridge_core::ids::TaskId::parse(row.identity.execution_id.as_str()).unwrap());
+        store.reserve(&row).await.unwrap();
+
+        let mut legacy = terminal();
+        legacy.work_ms = legacy.end_to_end_ms;
+        legacy.queue_ms = 0;
+        legacy.cancellation_ms = 0;
+        legacy.cleanup_ms = 0;
+        legacy.finalization_ms = 0;
+        legacy.phase_durations = vec![bridge_core::workflow_history::PhaseDuration {
+            phase: "work".into(),
+            duration_ms: legacy.work_ms,
+        }];
+        assert_eq!(
+            store
+                .terminalize(&row.identity.attempt_id, &legacy)
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+
+        let raw_before: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT terminal_json FROM workflow_attempt_summaries WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+                |sqlite_row| sqlite_row.get(0),
+            )
+            .unwrap();
+
+        let exact = store
+            .attempt(&row.identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(exact.end_to_end_ms, legacy.end_to_end_ms);
+        assert_eq!(exact.work_ms, 0);
+        assert!(exact.phase_durations.is_empty());
+        assert!(!exact.telemetry_complete);
+
+        let completed = store.completed_between(0, i64::MAX).await.unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].terminal, exact);
+        let report = bridge_core::workflow_history::report(0, i64::MAX, &completed);
+        assert_eq!(report.excluded["telemetry_incomplete"], 1);
+
+        let raw_after: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT terminal_json FROM workflow_attempt_summaries WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+                |sqlite_row| sqlite_row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_after.as_bytes(), raw_before.as_bytes());
+        assert_eq!(
+            store
+                .terminalize(&row.identity.attempt_id, &legacy)
+                .await
+                .unwrap(),
+            TerminalWrite::Replayed
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries SET telemetry_complete=0 WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .attempt(&row.identity.attempt_id)
+                .await
+                .unwrap_err()
+                .reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Corruption
+        );
+        assert_eq!(
+            store
+                .completed_between(0, i64::MAX)
+                .await
+                .unwrap_err()
+                .reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Corruption,
+            "completed recovery must validate raw projections before compatibility projection"
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries SET telemetry_complete='invalid' WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .completed_between(0, i64::MAX)
+                .await
+                .unwrap_err()
+                .reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Corruption,
+            "invalid persisted projection types are row corruption, not transient I/O"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_range_recovery_preserves_prompt_monotonicity() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut row = reservation();
+        row.prompt_acceptance = "dispatch_uncertain".into();
+        store.reserve(&row).await.unwrap();
+
+        let mut value = terminal();
+        value.prompt_acceptance = "dispatch_uncertain".into();
+        store
+            .terminalize(&row.identity.attempt_id, &value)
+            .await
+            .unwrap();
+
+        let completed = store.completed_between(0, i64::MAX).await.unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].reservation.prompt_acceptance,
+            "dispatch_uncertain"
+        );
+        assert_eq!(
+            completed[0].terminal.prompt_acceptance,
+            "dispatch_uncertain"
+        );
+
+        let mut downgraded = value;
+        downgraded.prompt_acceptance = "not_dispatched".into();
+        let downgraded_json = serde_json::to_string(&downgraded).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries
+                 SET prompt_acceptance='not_dispatched', terminal_json=?2
+                 WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str(), downgraded_json],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .completed_between(0, i64::MAX)
+                .await
+                .unwrap_err()
+                .reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Corruption,
+            "range recovery must not erase immutable dispatch-uncertain evidence"
+        );
+    }
+
     #[tokio::test]
     async fn live_admin_pin_unpin_is_durable_idempotent_and_attempt_scoped() {
         let directory = tempfile::tempdir().unwrap();

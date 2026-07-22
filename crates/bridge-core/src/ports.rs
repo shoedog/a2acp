@@ -247,6 +247,16 @@ pub trait SessionStore: Send + Sync {
 
 /// Sync routing decision — no async needed; plain fn.
 pub trait RouteDecision: Send + Sync {
+    /// Resolve every request-derived route that does not require consulting a
+    /// registry default. `None` defers only that default lookup until after a
+    /// direct-unary attempt has passed its mandatory identity admission.
+    ///
+    /// Implementations must make this boundary explicit: this method must not
+    /// consult a registry default or perform any equivalent default-agent
+    /// lookup. Routers with no default-dependent path may return
+    /// `self.route(meta).map(Some)` explicitly.
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError>;
+
     fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError>;
 }
 
@@ -460,6 +470,7 @@ pub enum WorkflowObsEvent<'a> {
         surface: &'a str,
         policy: &'a str,
         outcome: &'a str,
+        telemetry_complete: bool,
         work_seconds: f64,
         end_to_end_seconds: f64,
     },
@@ -707,6 +718,10 @@ mod tests {
 
     struct AlwaysKiro;
     impl RouteDecision for AlwaysKiro {
+        fn route_before_default(&self, t: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+            self.route(t).map(Some)
+        }
+
         fn route(&self, _t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
             Ok(RouteTarget::Local(AgentId::parse("kiro")?))
         }

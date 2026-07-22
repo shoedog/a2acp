@@ -41,6 +41,10 @@ use serde_json::json;
 struct AlwaysKiroRoute;
 
 impl RouteDecision for AlwaysKiroRoute {
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        self.route(meta).map(Some)
+    }
+
     fn route(&self, _meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
         Ok(RouteTarget::Local(AgentId::parse("kiro")?))
     }
@@ -50,6 +54,10 @@ impl RouteDecision for AlwaysKiroRoute {
 struct E2eSkillRoute;
 
 impl RouteDecision for E2eSkillRoute {
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        self.route(meta).map(Some)
+    }
+
     fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
         if meta.skill.as_deref() == Some("delegate") {
             Ok(RouteTarget::Delegate)

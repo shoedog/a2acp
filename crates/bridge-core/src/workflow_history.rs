@@ -312,6 +312,49 @@ impl AttemptTerminal {
         Ok(())
     }
 }
+
+/// Projects the one false-complete timing shape emitted by legacy direct
+/// producers into the evidence those rows actually contain.
+pub fn compatibility_project_terminal(
+    surface: ExecutionSurface,
+    terminal: &AttemptTerminal,
+) -> std::borrow::Cow<'_, AttemptTerminal> {
+    let legacy_direct_timing = matches!(
+        surface,
+        ExecutionSurface::DirectUnary | ExecutionSurface::Mcp
+    ) && terminal.telemetry_complete
+        && terminal.work_ms == terminal.end_to_end_ms
+        && terminal.queue_ms == 0
+        && terminal.cancellation_ms == 0
+        && terminal.cleanup_ms == 0
+        && terminal.finalization_ms == 0
+        && matches!(
+            terminal.phase_durations.as_slice(),
+            [PhaseDuration { phase, duration_ms }]
+                if phase == "work" && *duration_ms == terminal.work_ms
+        );
+    if !legacy_direct_timing {
+        return std::borrow::Cow::Borrowed(terminal);
+    }
+
+    let mut projected = terminal.clone();
+    projected.work_ms = 0;
+    projected.phase_durations.clear();
+    projected.telemetry_complete = false;
+    std::borrow::Cow::Owned(projected)
+}
+
+pub fn compatibility_project_completed(
+    row: &CompletedAttempt,
+) -> std::borrow::Cow<'_, CompletedAttempt> {
+    match compatibility_project_terminal(row.reservation.surface, &row.terminal) {
+        std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(row),
+        std::borrow::Cow::Owned(terminal) => std::borrow::Cow::Owned(CompletedAttempt {
+            reservation: row.reservation.clone(),
+            terminal,
+        }),
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CompletedAttempt {
     pub reservation: AttemptReservation,
@@ -323,6 +366,15 @@ pub struct AttemptRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<AttemptTerminal>,
 }
+
+pub fn compatibility_project_attempt_record(mut row: AttemptRecord) -> AttemptRecord {
+    if let Some(terminal) = row.terminal.take() {
+        row.terminal =
+            Some(compatibility_project_terminal(row.reservation.surface, &terminal).into_owned());
+    }
+    row
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalWrite {
     Applied,
@@ -446,13 +498,16 @@ impl DirectAttemptBarrier {
         reason: &str,
         degraded: bool,
         cleanup_disposition: &str,
-        telemetry_complete: bool,
+        _telemetry_complete: bool,
     ) -> AttemptTerminal {
         let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let telemetry_complete = telemetry_complete && !self.prompt_barrier_failed;
+        // Direct owners currently observe only the admission-to-terminal clock.
+        // It is valid end-to-end evidence, but it cannot be relabeled as provider
+        // work or split into checkout/configure/cleanup/finalization phases. Keep
+        // every such row explicitly incomplete until those clocks have real owners.
         AttemptTerminal {
             completed_ms: crate::task_store::system_wall_now_ms(),
-            work_ms: elapsed,
+            work_ms: 0,
             end_to_end_ms: elapsed,
             queue_ms: 0,
             cancellation_ms: 0,
@@ -475,15 +530,8 @@ impl DirectAttemptBarrier {
             prompt_acceptance: self.prompt_acceptance.into(),
             cleanup_disposition: cleanup_disposition.into(),
             node_counts: NodeCounts::default(),
-            phase_durations: if telemetry_complete {
-                vec![PhaseDuration {
-                    phase: "work".into(),
-                    duration_ms: elapsed,
-                }]
-            } else {
-                Vec::new()
-            },
-            telemetry_complete,
+            phase_durations: Vec::new(),
+            telemetry_complete: false,
             monotonic_clock: true,
         }
     }
@@ -884,11 +932,13 @@ pub struct StatsReport {
     pub recommendation: String,
 }
 pub fn report(start_ms: i64, end_ms: i64, rows: &[CompletedAttempt]) -> StatsReport {
+    let projected_rows: Vec<_> = rows.iter().map(compatibility_project_completed).collect();
     let mut partition_rows: std::collections::BTreeMap<String, Vec<&CompletedAttempt>> =
         std::collections::BTreeMap::new();
     let mut excluded = std::collections::BTreeMap::new();
-    let healthy: Vec<_> = rows
+    let healthy: Vec<_> = projected_rows
         .iter()
+        .map(std::borrow::Cow::as_ref)
         .filter(|row| {
             let ok = row.terminal.outcome == "completed"
                 && !row.terminal.degraded
@@ -1150,6 +1200,76 @@ mod tests {
         assert_eq!(value.calibration_sample_count, 0);
         assert_eq!(value.excluded["workload_fingerprint_incomplete"], 1);
         assert!(value.partitions.is_empty());
+    }
+
+    #[test]
+    fn legacy_direct_timing_shape_is_excluded_after_upgrade() {
+        let mut legacy = completed("legacy-direct", true);
+        legacy.terminal.work_ms = legacy.terminal.end_to_end_ms;
+        legacy.terminal.phase_durations = vec![PhaseDuration {
+            phase: "work".into(),
+            duration_ms: legacy.terminal.work_ms,
+        }];
+
+        for surface in [ExecutionSurface::DirectUnary, ExecutionSurface::Mcp] {
+            legacy.reservation.surface = surface;
+            let projected = compatibility_project_completed(&legacy).into_owned();
+            assert_eq!(
+                projected.terminal.end_to_end_ms,
+                legacy.terminal.end_to_end_ms
+            );
+            assert_eq!(projected.terminal.work_ms, 0);
+            assert!(projected.terminal.phase_durations.is_empty());
+            assert!(!projected.terminal.telemetry_complete);
+            assert_eq!(
+                compatibility_project_completed(&projected).into_owned(),
+                projected,
+                "the compatibility projection must be idempotent"
+            );
+
+            let value = report(0, 3_000, std::slice::from_ref(&legacy));
+            assert_eq!(value.calibration_sample_count, 0);
+            assert_eq!(value.excluded["telemetry_incomplete"], 1);
+            assert!(value.work_ms.is_none());
+            assert!(value.end_to_end_ms.is_none());
+        }
+    }
+
+    #[test]
+    fn timing_compatibility_projection_preserves_distinguishable_evidence() {
+        let mut offline = completed("offline", true);
+        offline.terminal.work_ms = offline.terminal.end_to_end_ms;
+        offline.terminal.phase_durations = vec![PhaseDuration {
+            phase: "work".into(),
+            duration_ms: offline.terminal.work_ms,
+        }];
+        assert_eq!(compatibility_project_completed(&offline).as_ref(), &offline);
+        assert_eq!(report(0, 3_000, &[offline]).calibration_sample_count, 1);
+
+        let mut distinct = completed("distinct-direct", true);
+        distinct.reservation.surface = ExecutionSurface::DirectUnary;
+        distinct.terminal.work_ms = distinct.terminal.end_to_end_ms;
+        distinct.terminal.phase_durations = vec![PhaseDuration {
+            phase: "provider_work".into(),
+            duration_ms: distinct.terminal.work_ms,
+        }];
+        assert_eq!(
+            compatibility_project_completed(&distinct).as_ref(),
+            &distinct
+        );
+
+        let mut incomplete = completed("incomplete-direct", true);
+        incomplete.reservation.surface = ExecutionSurface::DirectUnary;
+        incomplete.terminal.telemetry_complete = false;
+        incomplete.terminal.work_ms = incomplete.terminal.end_to_end_ms;
+        incomplete.terminal.phase_durations = vec![PhaseDuration {
+            phase: "work".into(),
+            duration_ms: incomplete.terminal.work_ms,
+        }];
+        assert_eq!(
+            compatibility_project_completed(&incomplete).as_ref(),
+            &incomplete
+        );
     }
 
     #[test]
@@ -1441,6 +1561,42 @@ mod tests {
                     .cleanup_disposition,
                 disposition
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_barrier_does_not_publish_collapsed_elapsed_as_complete_work_timing() {
+        for surface in [ExecutionSurface::DirectUnary, ExecutionSurface::Mcp] {
+            let store = std::sync::Arc::new(MemoryWorkflowHistoryStore::new());
+            let reservation = served_reservation(AttemptIdentity::initial().unwrap(), surface);
+            let attempt_id = reservation.identity.attempt_id.clone();
+            let mut barrier =
+                DirectAttemptBarrier::admit(store.clone(), reservation, "caller_aborted")
+                    .await
+                    .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            barrier
+                .finish("completed", "completed", false, "complete", true)
+                .await
+                .unwrap();
+
+            let terminal = store
+                .attempt(&attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .terminal
+                .unwrap();
+            assert!(terminal.end_to_end_ms > 0);
+            assert_eq!(terminal.work_ms, 0);
+            assert!(terminal.phase_durations.is_empty());
+            assert!(!terminal.telemetry_complete);
+
+            let completed = store.completed_between(0, i64::MAX).await.unwrap();
+            let report = report(0, i64::MAX, &completed);
+            assert_eq!(report.sample_count, 1);
+            assert_eq!(report.calibration_sample_count, 0);
+            assert_eq!(report.excluded.get("telemetry_incomplete"), Some(&1));
         }
     }
 

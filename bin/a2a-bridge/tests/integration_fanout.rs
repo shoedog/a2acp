@@ -36,6 +36,10 @@ use tower::ServiceExt;
 struct FanoutSkillRoute;
 
 impl RouteDecision for FanoutSkillRoute {
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        self.route(meta).map(Some)
+    }
+
     fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
         if meta.skill.as_deref() == Some("fan-out") {
             Ok(RouteTarget::Fanout)

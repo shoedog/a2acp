@@ -37,6 +37,10 @@ use serde_json::json;
 struct E2eKiroRoute;
 
 impl RouteDecision for E2eKiroRoute {
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        self.route(meta).map(Some)
+    }
+
     fn route(&self, _meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
         Ok(RouteTarget::Local(AgentId::parse("kiro")?))
     }

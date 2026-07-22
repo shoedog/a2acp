@@ -382,11 +382,13 @@ pub trait TaskStore: Send + Sync {
     ) -> Result<(), BridgeError> {
         Err(BridgeError::StoreFailure)
     }
+    /// Read the authoritative current attempt locator. Unsupported safety
+    /// reads fail closed rather than fabricating absence.
     async fn get_attempt_locator(
         &self,
         _task: &TaskId,
     ) -> Result<Option<TaskAttemptLocator>, BridgeError> {
-        Ok(None)
+        Err(BridgeError::StoreFailure)
     }
     /// Return exact attempts whose primary task is durably terminal and whose
     /// locator carries the authoritative bounded telemetry-unavailable marker.
@@ -640,11 +642,13 @@ pub trait TaskStore: Send + Sync {
     /// Return one pending terminal projection, including its exact persisted
     /// terminal evidence. This is an internal recovery read and is intentionally
     /// not subject to the public Working projection.
+    /// Unsupported recovery reads fail closed rather than fabricating an empty
+    /// projection.
     async fn pending_terminal_projection(
         &self,
         _task: &TaskId,
     ) -> Result<Option<PendingTerminalProjection>, BridgeError> {
-        Ok(None)
+        Err(BridgeError::StoreFailure)
     }
 
     /// Return every terminal projection that must be reconciled before serving.
@@ -2602,6 +2606,16 @@ mod tests {
             store.pending_terminal_projections().await,
             Err(BridgeError::StoreFailure),
             "a store without a durable recovery scan must fail the serving gate closed"
+        );
+        assert_eq!(
+            store.get_attempt_locator(&task).await,
+            Err(BridgeError::StoreFailure),
+            "unsupported identity reads must not fabricate an absent locator"
+        );
+        assert_eq!(
+            store.pending_terminal_projection(&task).await,
+            Err(BridgeError::StoreFailure),
+            "unsupported recovery reads must not fabricate an absent projection"
         );
     }
 

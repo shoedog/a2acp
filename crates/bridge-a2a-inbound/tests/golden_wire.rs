@@ -308,6 +308,13 @@ struct AgentOrWorkflowRoute {
     default: AgentId,
 }
 impl RouteDecision for AgentOrWorkflowRoute {
+    fn route_before_default(&self, t: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        if t.skill.as_deref() == Some("review") {
+            return Ok(Some(RouteTarget::Workflow(WorkflowId::parse("review")?)));
+        }
+        Ok(t.agent.clone().map(RouteTarget::Local))
+    }
+
     fn route(&self, t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
         if t.skill.as_deref() == Some("review") {
             return Ok(RouteTarget::Workflow(WorkflowId::parse("review")?));

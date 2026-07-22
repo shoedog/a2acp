@@ -551,6 +551,8 @@ impl PrometheusObserver {
         rows: &[bridge_core::workflow_history::CompletedAttempt],
     ) {
         for row in rows {
+            let projected = bridge_core::workflow_history::compatibility_project_completed(row);
+            let row = projected.as_ref();
             if !self
                 .dedupe
                 .mark_workflow(&row.reservation.identity.attempt_id)
@@ -564,6 +566,7 @@ impl PrometheusObserver {
                     surface: row.reservation.surface.as_str(),
                     policy: &row.reservation.policy,
                     outcome: &row.terminal.outcome,
+                    telemetry_complete: row.terminal.telemetry_complete,
                     work_seconds: row.terminal.work_ms as f64 / 1000.0,
                     end_to_end_seconds: row.terminal.end_to_end_ms as f64 / 1000.0,
                 });
@@ -694,6 +697,7 @@ impl Observer for PrometheusObserver {
                 surface,
                 policy,
                 outcome,
+                telemetry_complete,
                 work_seconds,
                 end_to_end_seconds,
             } => {
@@ -708,6 +712,7 @@ impl Observer for PrometheusObserver {
                         surface,
                         policy,
                         outcome,
+                        telemetry_complete: *telemetry_complete,
                         work_seconds: *work_seconds,
                         end_to_end_seconds: *end_to_end_seconds,
                     });
@@ -1743,6 +1748,7 @@ pub struct WorkflowMetricSample<'a> {
     pub surface: &'a str,
     pub policy: &'a str,
     pub outcome: &'a str,
+    pub telemetry_complete: bool,
     pub work_seconds: f64,
     pub end_to_end_seconds: f64,
 }
@@ -1860,12 +1866,14 @@ impl WorkflowMetrics {
             Self::outcome(sample.outcome),
         ];
         self.total.with_label_values(&labels).inc();
-        self.work_duration
-            .with_label_values(&labels)
-            .observe(sample.work_seconds);
-        self.end_to_end_duration
-            .with_label_values(&labels)
-            .observe(sample.end_to_end_seconds);
+        if sample.telemetry_complete {
+            self.work_duration
+                .with_label_values(&labels)
+                .observe(sample.work_seconds);
+            self.end_to_end_duration
+                .with_label_values(&labels)
+                .observe(sample.end_to_end_seconds);
+        }
     }
     pub fn set_in_flight(&self, task_class: &str, surface: &str, delta: i64) {
         let task_class = Self::norm(&self.vocabulary.task_classes, task_class);
@@ -1911,6 +1919,7 @@ mod r2f0a_workflow_metric_tests {
             surface: "offline",
             policy: "r2f0a",
             outcome: "completed",
+            telemetry_complete: true,
             work_seconds: 8_000.0,
             end_to_end_seconds: 43_200.0,
         });
@@ -2052,6 +2061,7 @@ mod r2f0a_workflow_metric_tests {
             surface: "offline",
             policy: "r2f0a",
             outcome: "completed",
+            telemetry_complete: true,
             work_seconds: 0.7,
             end_to_end_seconds: 1.0,
         });
@@ -2069,9 +2079,65 @@ mod r2f0a_workflow_metric_tests {
             surface: "offline",
             policy: "r2f0a",
             outcome: "completed",
+            telemetry_complete: true,
             work_seconds: 0.7,
             end_to_end_seconds: 1.0,
         });
         assert_eq!(workflow_total(&observer.endpoint().render().unwrap()), 2.0);
+    }
+
+    #[test]
+    fn legacy_and_new_incomplete_timing_is_not_observed_live_or_rebuilt() {
+        let observer = PrometheusObserver::new_with_workflow_vocabulary(
+            LabelVocabulary::default(),
+            WorkflowLabelVocabulary {
+                workflows: HashSet::from(["code-review".into()]),
+                task_classes: HashSet::from(["review".into()]),
+                policies: HashSet::from(["r2f0a".into()]),
+            },
+        )
+        .unwrap();
+        let mut rebuilt = completed_attempt(bridge_core::ids::AttemptIdentity::initial().unwrap());
+        rebuilt.reservation.surface = bridge_core::workflow_history::ExecutionSurface::DirectUnary;
+        rebuilt.terminal.work_ms = rebuilt.terminal.end_to_end_ms;
+        rebuilt.terminal.finalization_ms = 0;
+        rebuilt.terminal.phase_durations = vec![bridge_core::workflow_history::PhaseDuration {
+            phase: "work".into(),
+            duration_ms: rebuilt.terminal.work_ms,
+        }];
+
+        observer.rebuild_from_workflow_history(std::slice::from_ref(&rebuilt));
+
+        let live = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        observer.record_workflow(&WorkflowObsEvent::Started {
+            task_class: "review",
+            surface: "direct_unary",
+        });
+        observer.record_workflow(&WorkflowObsEvent::Finished {
+            attempt_id: &live.attempt_id,
+            workflow: "code-review",
+            task_class: "review",
+            surface: "direct_unary",
+            policy: "r2f0a",
+            outcome: "completed",
+            telemetry_complete: false,
+            work_seconds: 0.0,
+            end_to_end_seconds: 0.0,
+        });
+
+        let text = observer.endpoint().render().unwrap();
+        assert_eq!(workflow_total(&text), 2.0);
+        for metric in [
+            "bridge_workflow_work_duration_seconds",
+            "bridge_workflow_end_to_end_duration_seconds",
+        ] {
+            assert!(
+                !text
+                    .lines()
+                    .any(|line| line.starts_with(metric)
+                        && line.contains("surface=\"direct_unary\"")),
+                "incomplete timing must not create a duration series: {text}"
+            );
+        }
     }
 }

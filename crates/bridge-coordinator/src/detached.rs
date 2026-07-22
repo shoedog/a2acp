@@ -2257,6 +2257,7 @@ impl WorkflowCompletionGuard {
                 surface: "served_task",
                 policy: "r2f0a",
                 outcome: &terminal.outcome,
+                telemetry_complete: terminal.telemetry_complete,
                 work_seconds: terminal.work_ms as f64 / 1000.0,
                 end_to_end_seconds: terminal.end_to_end_ms as f64 / 1000.0,
             });

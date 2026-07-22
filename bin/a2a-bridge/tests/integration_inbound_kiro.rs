@@ -36,6 +36,10 @@ fn sse_data_payloads(body: &str) -> Vec<String> {
 struct IntegKiroRoute;
 
 impl RouteDecision for IntegKiroRoute {
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        self.route(meta).map(Some)
+    }
+
     fn route(&self, _meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
         Ok(RouteTarget::Local(AgentId::parse("kiro")?))
     }

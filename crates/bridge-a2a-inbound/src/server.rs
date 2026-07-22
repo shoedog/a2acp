@@ -326,6 +326,23 @@ impl InboundServer {
     /// the `BridgeError` (the caller maps it to a JSON-RPC error). The backend
     /// is NOT touched here, so a rejecting gate never reaches `prompt`.
     fn gate(&self, headers: &HeaderMap, params: &Value) -> Result<RoutedCall, BridgeError> {
+        self.gate_with_route_mode(headers, params, false)
+    }
+
+    fn gate_before_direct_admission(
+        &self,
+        headers: &HeaderMap,
+        params: &Value,
+    ) -> Result<RoutedCall, BridgeError> {
+        self.gate_with_route_mode(headers, params, true)
+    }
+
+    fn gate_with_route_mode(
+        &self,
+        headers: &HeaderMap,
+        params: &Value,
+        defer_registry_default: bool,
+    ) -> Result<RoutedCall, BridgeError> {
         // 1. Authorize. We derive a minimal InboundRequest from the bearer token.
         let token = bearer_token(headers);
         let inbound = match token {
@@ -358,7 +375,19 @@ impl InboundServer {
         //    the local-backend producer or the delegation producer.
         //    Invalid metadata (bad agent id, unknown effort) returns InvalidRequest → client error.
         let task_meta = task_meta_from_params(params)?;
-        let target = self.route.route(&task_meta)?;
+        let (target, default_route_deferred) = if defer_registry_default {
+            match self.route.route_before_default(&task_meta)? {
+                Some(target) => (target, false),
+                None => (
+                    RouteTarget::Local(
+                        AgentId::parse("unresolved").expect("fixed unresolved agent id is valid"),
+                    ),
+                    true,
+                ),
+            }
+        } else {
+            (self.route.route(&task_meta)?, false)
+        };
 
         if matches!(&target, RouteTarget::Workflow(_)) {
             let text = parts
@@ -402,6 +431,7 @@ impl InboundServer {
             session,
             parts,
             target,
+            default_route_deferred,
             auth,
             // Per-request overrides ride along so LOCAL dispatch can compute the
             // effective config (entry defaults layered with these) before the prompt.
@@ -442,6 +472,7 @@ struct RoutedCall {
     session: SessionId,
     parts: Vec<Part>,
     target: RouteTarget,
+    default_route_deferred: bool,
     auth: AuthContext,
     /// Per-request config overrides parsed from `a2a-bridge.{model,effort,mode}`.
     /// LOCAL dispatch layers these on the resolved entry's defaults via
@@ -3459,7 +3490,7 @@ async fn unary_message(
         Err(error) => return identity_refusal_response(id, &error, &params),
     };
 
-    let routed = match srv.gate(&headers, &params) {
+    let mut routed = match srv.gate_before_direct_admission(&headers, &params) {
         Ok(r) => r,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
@@ -3491,6 +3522,27 @@ async fn unary_message(
     };
 
     let mut direct_history = direct_history;
+    if routed.default_route_deferred {
+        let task_meta = match task_meta_from_params(&params) {
+            Ok(meta) => meta,
+            Err(error) => return bridge_err_to_jsonrpc(id, &error),
+        };
+        let target = match srv.route.route(&task_meta) {
+            Ok(target @ RouteTarget::Local(_)) => target,
+            Ok(_) => {
+                return bridge_err_to_jsonrpc(
+                    id,
+                    &BridgeError::InvalidRequest {
+                        field: "deferred default route",
+                    },
+                )
+            }
+            Err(error) => return bridge_err_to_jsonrpc(id, &error),
+        };
+        routed.target = target;
+        routed.default_route_deferred = false;
+    }
+
     let mut cleanup_disposition = "unknown";
 
     let _ = srv.store.put(&routed.task, &routed.session).await;
@@ -4512,11 +4564,7 @@ async fn get_task(
             return jsonrpc_ok(id, json!({ "task": t }));
         }
         Ok(None) => {} // not a detached task — fall through to the heuristic
-        Err(e) => {
-            // A store read failure degrades to the heuristic; surface it so a
-            // persistent failure isn't silently reported as SUBMITTED.
-            tracing::warn!(task = task.as_str(), error = ?e, "task_store.get failed in get_task");
-        }
+        Err(error) => return bridge_err_to_jsonrpc(id, &error),
     }
     // Fallback: session-mapping heuristic (non-workflow tasks; unchanged).
     let known = matches!(srv.store.session_for(&task).await, Ok(Some(_)));
@@ -5645,14 +5693,50 @@ mod tests {
 
     struct AlwaysKiro;
     impl RouteDecision for AlwaysKiro {
+        fn route_before_default(&self, t: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+            self.route(t).map(Some)
+        }
+
         fn route(&self, _t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
             Ok(RouteTarget::Local(AgentId::parse("kiro")?))
         }
     }
 
+    struct ProductionLikeDefaultRoute {
+        registry: Arc<FakeRegistry>,
+        default_lookups: Arc<AtomicUsize>,
+    }
+
+    impl RouteDecision for ProductionLikeDefaultRoute {
+        fn route_before_default(
+            &self,
+            meta: &TaskMeta,
+        ) -> Result<Option<RouteTarget>, BridgeError> {
+            let target = match meta.skill.as_deref() {
+                Some("delegate") => Some(RouteTarget::Delegate),
+                Some("fan-out") => Some(RouteTarget::Fanout),
+                _ => meta.agent.clone().map(RouteTarget::Local),
+            };
+            Ok(target)
+        }
+
+        fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            Ok(match self.route_before_default(meta)? {
+                Some(target) => target,
+                None => {
+                    self.default_lookups.fetch_add(1, Ordering::SeqCst);
+                    RouteTarget::Local(self.registry.default_id())
+                }
+            })
+        }
+    }
     /// Routes `skill=="delegate"` to `Delegate`, everything else to local kiro.
     struct SkillRoute;
     impl RouteDecision for SkillRoute {
+        fn route_before_default(&self, t: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+            self.route(t).map(Some)
+        }
+
         fn route(&self, t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
             if t.skill.as_deref() == Some("delegate") {
                 Ok(RouteTarget::Delegate)
@@ -7974,6 +8058,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn colliding_unary_refuses_before_production_like_default_lookup() {
+        let backend = FakeBackend::new();
+        let registry = FakeRegistry::single("kiro", backend.clone());
+        let history = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        let default_lookups = Arc::new(AtomicUsize::new(0));
+        let route = Arc::new(ProductionLikeDefaultRoute {
+            registry: registry.clone(),
+            default_lookups: default_lookups.clone(),
+        });
+        let sessions = Arc::new(FakeStore::default());
+        let coordinator = coordinator_over_with_workflow_history(
+            registry.clone(),
+            sessions.clone(),
+            Arc::new(AutoApprove),
+            None,
+            std::collections::HashMap::new(),
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+            Ok(history.clone()),
+        );
+        let server = Arc::new(InboundServer::from_coordinator(
+            coordinator,
+            route,
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "kiro",
+        ));
+
+        let collision = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let collision_task = TaskId::parse(collision.execution_id.as_str()).unwrap();
+        history
+            .reserve(&bridge_core::workflow_history::AttemptReservation {
+                identity: collision.clone(),
+                task_id: Some(collision_task.clone()),
+                workflow: "direct".into(),
+                task_class: "direct".into(),
+                surface: bridge_core::workflow_history::ExecutionSurface::Mcp,
+                policy: "r2f0a".into(),
+                workload_fingerprint: "cross-surface-existing".into(),
+                started_ms: 1,
+                workload_fingerprint_complete: false,
+                prompt_acceptance: "not_dispatched".into(),
+                pinned: false,
+            })
+            .await
+            .unwrap();
+
+        let refusal = router(server.clone())
+            .oneshot(raw_post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": collision.execution_id.as_str(),
+                    "message": {
+                        "taskId": collision.execution_id.as_str(),
+                        "text": "must not route",
+                        "metadata": {
+                            "a2a-bridge.execution_id": collision.execution_id.as_str(),
+                            "a2a-bridge.attempt_id": collision.attempt_id.as_str()
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let refusal: Value = serde_json::from_str(&body_string(refusal).await).unwrap();
+        assert!(refusal.get("error").is_some(), "{refusal}");
+        assert_eq!(default_lookups.load(Ordering::SeqCst), 0);
+        assert!(
+            registry.observed().is_empty(),
+            "collision reached registry resolution"
+        );
+        assert!(!backend.prompted.load(Ordering::SeqCst));
+        assert_eq!(sessions.session_for(&collision_task).await.unwrap(), None);
+
+        let omitted = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let omitted_response = router(server.clone())
+            .oneshot(raw_post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": omitted.execution_id.as_str(),
+                    "message": {
+                        "taskId": omitted.execution_id.as_str(),
+                        "text": "use default",
+                        "metadata": {
+                            "a2a-bridge.execution_id": omitted.execution_id.as_str(),
+                            "a2a-bridge.attempt_id": omitted.attempt_id.as_str()
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let omitted_body: Value =
+            serde_json::from_str(&body_string(omitted_response).await).unwrap();
+        assert!(omitted_body.get("error").is_none(), "{omitted_body}");
+        assert_eq!(default_lookups.load(Ordering::SeqCst), 1);
+        let omitted_row = history
+            .attempt(&omitted.attempt_id)
+            .await
+            .unwrap()
+            .expect("real unary attempt row exists");
+        let omitted_terminal = omitted_row.terminal.expect("real unary row terminalized");
+        assert_eq!(omitted_terminal.work_ms, 0);
+        assert!(omitted_terminal.phase_durations.is_empty());
+        assert!(!omitted_terminal.telemetry_complete);
+        let unary_report = bridge_core::workflow_history::report(
+            0,
+            i64::MAX,
+            &history.completed_between(0, i64::MAX).await.unwrap(),
+        );
+        assert_eq!(unary_report.calibration_sample_count, 0);
+        assert!(
+            unary_report.excluded.contains_key("telemetry_incomplete"),
+            "real direct-unary rows must be excluded from healthy calibration"
+        );
+
+        backend.prompted.store(false, Ordering::SeqCst);
+        let explicit = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let explicit_response = router(server)
+            .oneshot(raw_post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": explicit.execution_id.as_str(),
+                    "message": {
+                        "taskId": explicit.execution_id.as_str(),
+                        "text": "use explicit",
+                        "metadata": {
+                            "a2a-bridge.agent": "kiro",
+                            "a2a-bridge.execution_id": explicit.execution_id.as_str(),
+                            "a2a-bridge.attempt_id": explicit.attempt_id.as_str()
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let explicit_body: Value =
+            serde_json::from_str(&body_string(explicit_response).await).unwrap();
+        assert!(explicit_body.get("error").is_none(), "{explicit_body}");
+        assert_eq!(default_lookups.load(Ordering::SeqCst), 1);
+        assert!(backend.prompted.load(Ordering::SeqCst));
+    }
+    #[tokio::test]
     async fn unary_send_message_returns_artifact() {
         let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
         let resp = router(srv)
@@ -8336,6 +8566,10 @@ mod tests {
 
     struct WorkflowOnlyRoute;
     impl RouteDecision for WorkflowOnlyRoute {
+        fn route_before_default(&self, t: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+            self.route(t).map(Some)
+        }
+
         fn route(&self, _t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
             Ok(RouteTarget::Workflow(bridge_core::ids::WorkflowId::parse(
                 "code-review",
@@ -9246,6 +9480,10 @@ mod tests {
     /// everything else to local kiro. Used only in fan-out tests.
     struct FanoutSkillRoute;
     impl RouteDecision for FanoutSkillRoute {
+        fn route_before_default(&self, t: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+            self.route(t).map(Some)
+        }
+
         fn route(&self, t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
             match t.skill.as_deref() {
                 Some("fan-out") => Ok(RouteTarget::Fanout),
@@ -11273,6 +11511,7 @@ mod tests {
             session: SessionId::parse("session-ready-error-and-close").unwrap(),
             parts: vec![Part { text: "go".into() }],
             target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            default_route_deferred: false,
             auth: AuthContext::new(CallerId::parse("anon").unwrap()),
             overrides: None,
             traceparent: None,
@@ -11378,6 +11617,7 @@ mod tests {
             session: SessionId::parse("session-ready-usage-disconnect").unwrap(),
             parts: vec![Part { text: "go".into() }],
             target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            default_route_deferred: false,
             auth: AuthContext::new(CallerId::parse("anon").unwrap()),
             overrides: None,
             traceparent: None,
@@ -11514,6 +11754,7 @@ mod tests {
             session: SessionId::parse("session-task-streaming-pre-cancel").unwrap(),
             parts: vec![Part { text: "hi".into() }],
             target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            default_route_deferred: false,
             auth: AuthContext::new(CallerId::parse("anon").unwrap()),
             overrides: None,
             traceparent: None,
@@ -11576,6 +11817,7 @@ mod tests {
             session: SessionId::parse("session-task-streaming-disconnect").unwrap(),
             parts: vec![Part { text: "hi".into() }],
             target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            default_route_deferred: false,
             auth: AuthContext::new(CallerId::parse("anon").unwrap()),
             overrides: None,
             traceparent: None,
@@ -11667,6 +11909,7 @@ mod tests {
             session: SessionId::parse("session-task-streaming-no-usage-disconnect").unwrap(),
             parts: vec![Part { text: "hi".into() }],
             target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            default_route_deferred: false,
             auth: AuthContext::new(CallerId::parse("anon").unwrap()),
             overrides: None,
             traceparent: None,
@@ -11786,6 +12029,7 @@ mod tests {
             session: SessionId::parse("session-send-err").unwrap(),
             parts: vec![Part { text: "hi".into() }],
             target: RouteTarget::Local(AgentId::parse("kiro").unwrap()),
+            default_route_deferred: false,
             auth: AuthContext::new(bridge_core::ids::CallerId::parse("anon").unwrap()),
             overrides: None,
             traceparent: None,
@@ -12085,6 +12329,10 @@ mod tests {
         default: AgentId,
     }
     impl RouteDecision for RegistryRoute {
+        fn route_before_default(&self, t: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+            Ok(t.agent.clone().map(RouteTarget::Local))
+        }
+
         fn route(&self, t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
             Ok(RouteTarget::Local(
                 t.agent.clone().unwrap_or_else(|| self.default.clone()),
@@ -13838,9 +14086,16 @@ mod tests {
     fn build_with_task_store(
         task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
     ) -> Arc<InboundServer> {
+        build_with_task_and_session_store(task_store, Arc::new(FakeStore::default()))
+    }
+
+    fn build_with_task_and_session_store(
+        task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+        session_store: std::sync::Arc<dyn SessionStore>,
+    ) -> Arc<InboundServer> {
         let coord = coordinator_over(
             FakeRegistry::single("kiro", FakeBackend::new()),
-            Arc::new(FakeStore::default()),
+            session_store,
             Arc::new(AutoApprove),
             None,
             std::collections::HashMap::new(),
@@ -14344,6 +14599,8 @@ mod tests {
 
     struct LegacyFallbackStore {
         inner: std::sync::Arc<bridge_core::task_store::MemoryTaskStore>,
+        fail_get: bool,
+        fail_locator: bool,
     }
 
     #[async_trait::async_trait]
@@ -14372,7 +14629,29 @@ mod tests {
             &self,
             id: &bridge_core::ids::TaskId,
         ) -> Result<Option<bridge_core::task_store::TaskRecord>, BridgeError> {
-            self.inner.get(id).await
+            if self.fail_get {
+                Err(BridgeError::StoreFailure)
+            } else {
+                self.inner.get(id).await
+            }
+        }
+
+        async fn get_attempt_locator(
+            &self,
+            task: &bridge_core::ids::TaskId,
+        ) -> Result<Option<bridge_core::task_store::TaskAttemptLocator>, BridgeError> {
+            if self.fail_locator {
+                Err(BridgeError::StoreFailure)
+            } else {
+                self.inner.get_attempt_locator(task).await
+            }
+        }
+
+        async fn turn_log_usage_for_task(
+            &self,
+            task: &bridge_core::ids::TaskId,
+        ) -> Result<Option<bridge_core::task_store::TaskUsageAgg>, BridgeError> {
+            self.inner.turn_log_usage_for_task(task).await
         }
 
         async fn list(
@@ -14479,6 +14758,38 @@ mod tests {
                 .await
         }
 
+        #[allow(clippy::too_many_arguments)]
+        async fn set_terminal_sequenced_pending(
+            &self,
+            task: &bridge_core::ids::TaskId,
+            operation_id: &bridge_core::ids::OperationId,
+            status: bridge_core::task_store::TaskRecordStatus,
+            result: Option<&str>,
+            error: Option<&str>,
+            ts: i64,
+            attempt_id: &bridge_core::ids::AttemptId,
+            terminal: &bridge_core::workflow_history::AttemptTerminal,
+        ) -> Result<i64, BridgeError> {
+            self.inner
+                .set_terminal_sequenced_pending(
+                    task,
+                    operation_id,
+                    status,
+                    result,
+                    error,
+                    ts,
+                    attempt_id,
+                    terminal,
+                )
+                .await
+        }
+
+        async fn pending_terminal_projections(
+            &self,
+        ) -> Result<Vec<bridge_core::task_store::PendingTerminalProjection>, BridgeError> {
+            self.inner.pending_terminal_projections().await
+        }
+
         async fn journal_from(
             &self,
             task: &bridge_core::ids::TaskId,
@@ -14493,6 +14804,231 @@ mod tests {
         ) -> Result<bridge_core::task_store::TaskProgressSnapshot, BridgeError> {
             self.inner.progress_snapshot(task).await
         }
+    }
+
+    #[tokio::test]
+    async fn get_task_primary_read_failure_never_falls_back_to_session_heuristic() {
+        for has_session_mapping in [false, true] {
+            let inner = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+            let task_store = std::sync::Arc::new(LegacyFallbackStore {
+                inner,
+                fail_get: true,
+                fail_locator: false,
+            });
+            let sessions = std::sync::Arc::new(FakeStore::default());
+            let task = bridge_core::ids::TaskId::parse(if has_session_mapping {
+                "get-task-fault-mapped"
+            } else {
+                "get-task-fault-unmapped"
+            })
+            .unwrap();
+            if has_session_mapping {
+                sessions
+                    .put(
+                        &task,
+                        &bridge_core::ids::SessionId::parse("session-get-task-fault").unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let server = build_with_task_and_session_store(task_store, sessions);
+            let response = router(server)
+                .oneshot(post_request(
+                    methods::GET_TASK,
+                    json!({ "taskId": task.as_str() }),
+                    "1.0",
+                ))
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(body["error"]["code"], JSONRPC_INTERNAL, "{body}");
+            assert_eq!(
+                body["error"]["message"],
+                BridgeError::StoreFailure.client_message(),
+                "{body}"
+            );
+            assert!(body.get("result").is_none(), "{body}");
+            assert!(
+                body.pointer("/result/task/state").is_none(),
+                "a failed primary read must not fabricate a heuristic state: {body}"
+            );
+        }
+
+        let absent = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let absent_response = router(build_with_task_store(absent))
+            .oneshot(post_request(
+                methods::GET_TASK,
+                json!({ "taskId": "get-task-legitimate-absent" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let absent_body: Value = serde_json::from_str(&body_string(absent_response).await).unwrap();
+        assert_eq!(
+            absent_body["result"]["task"]["state"],
+            "TASK_STATE_SUBMITTED"
+        );
+
+        let real = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        real.create(&working_record("get-task-real-row"))
+            .await
+            .unwrap();
+        let real_response = router(build_with_task_store(real))
+            .oneshot(post_request(
+                methods::GET_TASK,
+                json!({ "taskId": "get-task-real-row" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let real_body: Value = serde_json::from_str(&body_string(real_response).await).unwrap();
+        assert_eq!(
+            real_body["result"]["task"]["status"]["state"],
+            "TASK_STATE_WORKING"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_composition_surfaces_typed_locator_read_failures() {
+        let inner = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        inner
+            .create(&working_record("incomplete-locator-store-task"))
+            .await
+            .unwrap();
+        let store = std::sync::Arc::new(LegacyFallbackStore {
+            inner,
+            fail_get: false,
+            fail_locator: true,
+        });
+        let server = build_with_task_store(store);
+        let task = bridge_core::ids::TaskId::parse("incomplete-locator-store-task").unwrap();
+
+        let status_error = server
+            .coordinator()
+            .status(None, Some(task.clone()))
+            .await
+            .err()
+            .expect("locator read failure must surface");
+        assert_eq!(status_error, BridgeError::StoreFailure);
+        let response = router(server)
+            .oneshot(post_request(
+                methods::GET_TASK,
+                json!({ "taskId": task.as_str() }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], JSONRPC_INTERNAL, "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            BridgeError::StoreFailure.client_message(),
+            "{body}"
+        );
+        assert!(body.get("result").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn public_composition_recovery_fails_singular_projection_read_closed() {
+        use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = bridge_core::ids::TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let terminal_node = bridge_core::ids::NodeId::parse("synth").unwrap();
+        let graph = WorkflowGraph {
+            id: bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: terminal_node.clone(),
+                agent: AgentId::parse("kiro").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: Vec::new(),
+                retry: None,
+            }],
+            panel: None,
+        };
+        let mut record = working_record(task.as_str());
+        record.workflow_spec_json =
+            Some(bridge_coordinator::detached::encode_workflow_spec(&graph));
+        let locator = bridge_core::task_store::TaskAttemptLocator {
+            identity: identity.clone(),
+            telemetry_unavailable: None,
+        };
+        let inner = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        inner
+            .create_with_attempt_locator(&record, &locator)
+            .await
+            .unwrap();
+        inner
+            .put_node_checkpoint(
+                &task,
+                &terminal_node,
+                "recovered output",
+                true,
+                crate::workflow_sink::now_ms(),
+            )
+            .await
+            .unwrap();
+
+        let history =
+            std::sync::Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        history
+            .reserve(&recovery_reservation(identity))
+            .await
+            .unwrap();
+        let store = std::sync::Arc::new(LegacyFallbackStore {
+            inner: inner.clone(),
+            fail_get: false,
+            fail_locator: false,
+        });
+        assert_eq!(
+            store.pending_terminal_projection(&task).await,
+            Err(BridgeError::StoreFailure),
+            "the custom store deliberately inherits the singular fail-closed read"
+        );
+
+        let registry: std::sync::Arc<dyn AgentRegistry> =
+            FakeRegistry::single("kiro", FakeBackend::new());
+        let task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore> = store;
+        let history_store: std::sync::Arc<dyn WorkflowHistoryStore> = history;
+        let coordinator = bridge_coordinator::Coordinator::new(
+            std::sync::Arc::new(crate::session_manager::SessionManager::new(
+                registry.clone(),
+                std::time::Duration::from_secs(60),
+            )),
+            None,
+            std::sync::Arc::new(std::collections::HashMap::new()),
+            task_store,
+            std::sync::Arc::new(FakeStore::default()),
+            std::sync::Arc::new(AutoApprove),
+            registry,
+            std::sync::Arc::new(bridge_coordinator::clock::SystemClock),
+            None,
+            None,
+            std::sync::Arc::new(bridge_observ::NoopObserver),
+            3,
+        )
+        .with_workflow_history(Ok(history_store));
+        let server = std::sync::Arc::new(InboundServer::from_coordinator(
+            std::sync::Arc::new(coordinator),
+            std::sync::Arc::new(AlwaysKiro),
+            std::sync::Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            std::sync::Arc::new(NoDelegation),
+            "kiro",
+        ));
+
+        assert_eq!(
+            server.coordinator().resume().await,
+            Err(BridgeError::StoreFailure)
+        );
+        assert!(
+            inner
+                .pending_terminal_projection(&task)
+                .await
+                .unwrap()
+                .is_some(),
+            "recovery must reach the singular read after durably writing the pending projection"
+        );
     }
 
     #[tokio::test]
@@ -14593,7 +15129,11 @@ mod tests {
     #[tokio::test]
     async fn legacy_task_uses_typed_fallback() {
         let inner = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
-        let store = std::sync::Arc::new(LegacyFallbackStore { inner });
+        let store = std::sync::Arc::new(LegacyFallbackStore {
+            inner,
+            fail_get: false,
+            fail_locator: false,
+        });
         let task_id = bridge_core::ids::TaskId::parse("task-fold-legacy").unwrap();
         store
             .create(&working_record("task-fold-legacy"))

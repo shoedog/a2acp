@@ -189,6 +189,10 @@ impl AuthMiddleware for AlwaysGrant {
 /// Routes `skill="code-review"` to the workflow; everything else to local codex.
 struct WorkflowRoute;
 impl RouteDecision for WorkflowRoute {
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        self.route(meta).map(Some)
+    }
+
     fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
         if meta.skill.as_deref() == Some("code-review") {
             Ok(RouteTarget::Workflow(WorkflowId::parse("code-review")?))
@@ -3292,6 +3296,13 @@ async fn detached_unknown_workflow_rejected_pre_create() {
     /// server (so the runner's graph lookup is `None` → the unknown-workflow reject).
     struct GhostWorkflowRoute;
     impl RouteDecision for GhostWorkflowRoute {
+        fn route_before_default(
+            &self,
+            meta: &TaskMeta,
+        ) -> Result<Option<RouteTarget>, BridgeError> {
+            self.route(meta).map(Some)
+        }
+
         fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
             if meta.skill.as_deref() == Some("code-review") {
                 Ok(RouteTarget::Workflow(WorkflowId::parse("ghost-workflow")?))
