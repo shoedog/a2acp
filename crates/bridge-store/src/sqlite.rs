@@ -873,14 +873,27 @@ impl SqliteStore {
         let lock = history_parent.open_file(".lock", true, R::Open, R::ReadOnlyLock)?;
         lock.try_lock_exclusive()
             .map_err(|error| history_lock_error(&error))?;
-        if history_kind.is_none() {
-            prevalidate_tagged_history_path(path, None, false)?;
-        }
-        let schema_lock = if history_kind.is_some() {
+        let detected_history_kind = if history_kind.is_none() {
+            prevalidate_tagged_history_path(path, None, false)?
+        } else {
+            history_kind
+        };
+        // `open` is also the configured primary-store opener. If that database
+        // already carries the configured history tag, retain the allocation
+        // identity so every later mutation keeps configured accounting and
+        // colocated-locator requirements. A platform allocation is never
+        // adopted implicitly because its opener has additional physical guards.
+        let effective_history_kind = match (history_kind, detected_history_kind) {
+            (None, Some(HistoryAllocationKind::Configured)) => {
+                Some(HistoryAllocationKind::Configured)
+            }
+            _ => history_kind,
+        };
+        let schema_lock = if effective_history_kind.is_some() {
             let file = history_parent.open_file(".schema.lock", true, R::Open, R::ReadOnlyLock)?;
             file.try_lock_exclusive()
                 .map_err(|error| history_lock_error(&error))?;
-            if let Some(expected) = history_kind {
+            if let Some(expected) = effective_history_kind {
                 match prevalidate_tagged_history_path(
                     path,
                     Some(expected),
@@ -955,12 +968,12 @@ impl SqliteStore {
             history_parent: Some(history_parent),
             now_ms: Arc::new(system_wall_now_ms),
             _lock: Some(lock),
-            history_path: history_kind.map(|_| path.to_path_buf()),
-            history_allocation_kind: history_kind,
+            history_path: effective_history_kind.map(|_| path.to_path_buf()),
+            history_allocation_kind: effective_history_kind,
             history_attempt_lock_dir: None,
             history_attempt_locks: Mutex::new(HashMap::new()),
         };
-        let _admission_lease = if history_kind.is_some() {
+        let _admission_lease = if effective_history_kind.is_some() {
             store.acquire_history_admission_lease()?
         } else {
             None
@@ -971,7 +984,7 @@ impl SqliteStore {
             store.configure_history_page_limit()?;
         }
         store
-            .create_schema_sqlite(history_kind)
+            .create_schema_sqlite(effective_history_kind)
             .map_err(|error| schema_migration_error(&error))?;
         if history_kind == Some(HistoryAllocationKind::Platform) {
             store.configure_history_physical_limit()?;
@@ -8125,6 +8138,83 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                     if admitted.is_some() || ordinal_owner.is_some() {
                         return Err(LedgerError::new(R::Collision));
                     }
+                }
+                let retained_served_locator = if served {
+                    let task = row
+                        .task_id
+                        .as_ref()
+                        .ok_or_else(|| LedgerError::new(R::Corruption))?;
+                    let locator_json: Option<String> = tx
+                        .query_row(
+                            "SELECT locator_json FROM task_attempt_locators WHERE task_id=?1",
+                            rusqlite::params![task.as_str()],
+                            |record| record.get(0),
+                        )
+                        .optional()
+                        .map_err(|error| {
+                            if sqlite_persisted_value_is_invalid(&error) {
+                                LedgerError::new(R::Corruption)
+                            } else {
+                                history_error(&error)
+                            }
+                        })?;
+                    match locator_json {
+                        Some(locator_json) => {
+                            let locator: bridge_core::task_store::TaskAttemptLocator =
+                                serde_json::from_str(&locator_json)
+                                    .map_err(|_| LedgerError::new(R::Corruption))?;
+                            let (
+                                admitted_execution,
+                                admitted_ordinal,
+                                admitted_task,
+                                admitted_surface,
+                                admitted_disposition,
+                            ) = admitted
+                                .as_ref()
+                                .ok_or_else(|| LedgerError::new(R::Corruption))?;
+                            if !locator.belongs_to(task)
+                                || locator.identity.attempt_id != row.identity.attempt_id
+                                || locator.identity.execution_id != row.identity.execution_id
+                                || locator.identity.execution_id.as_str() != admitted_execution
+                                || locator.identity.ordinal != row.identity.ordinal
+                                || i64::from(locator.identity.ordinal) != *admitted_ordinal
+                                || admitted_task.as_deref() != Some(task.as_str())
+                                || admitted_surface != "served_task"
+                                || *admitted_disposition != 0
+                                || locator.telemetry_unavailable.is_some()
+                            {
+                                return Err(LedgerError::new(R::Corruption));
+                            }
+                            Some(locator)
+                        }
+                        None if self.history_allocation_kind
+                            == Some(HistoryAllocationKind::Configured) =>
+                        {
+                            return Err(LedgerError::new(R::Corruption));
+                        }
+                        None => {
+                            let colocated_primary_task = tx
+                                .query_row(
+                                    "SELECT 1 FROM tasks WHERE id=?1",
+                                    rusqlite::params![task.as_str()],
+                                    |record| record.get::<_, i64>(0),
+                                )
+                                .optional()
+                                .map_err(|error| history_error(&error))?
+                                .is_some();
+                            if colocated_primary_task {
+                                return Err(LedgerError::new(R::Corruption));
+                            }
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                if retained_served_locator.as_ref().is_some_and(|locator| {
+                    locator.identity.parent_attempt_id != row.identity.parent_attempt_id
+                }) {
+                    return commit_served_reservation_refusal(tx, row, R::Collision);
                 }
                 if let Some(parent) = row.identity.parent_attempt_id.as_ref() {
                     let prior: Option<(String, i64, String, Option<String>)> = tx
@@ -16184,6 +16274,55 @@ mod r2f0a_history_tests {
         row
     }
 
+    async fn served_resume_fixture(
+        path: &std::path::Path,
+        allocation_kind: HistoryAllocationKind,
+    ) -> (
+        SqliteStore,
+        AttemptReservation,
+        bridge_core::task_store::TaskAttemptLocator,
+    ) {
+        use bridge_core::task_store::{TaskAttemptLocator, TaskStore};
+
+        let store = match allocation_kind {
+            HistoryAllocationKind::Configured => SqliteStore::open_shared_history(path).unwrap(),
+            HistoryAllocationKind::Platform => SqliteStore::open_platform_history(path).unwrap(),
+        };
+        let parent = parent_reservation();
+        let child = served_followup(&parent, "attempt-55555555555555555555555555555555");
+        let task = child.task_id.clone().unwrap();
+        let parent_locator = TaskAttemptLocator {
+            identity: parent.identity.clone(),
+            telemetry_unavailable: None,
+        };
+        let child_locator = TaskAttemptLocator {
+            identity: child.identity.clone(),
+            telemetry_unavailable: None,
+        };
+        store
+            .create_with_attempt_locator(&primary_task_record(&task, 1), &parent_locator)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_resume_attempt_with_locator(&task, 3, 2, &parent_locator, &child_locator)
+                .await
+                .unwrap(),
+            bridge_core::task_store::ResumeClaim::Resumable { attempt: 1 }
+        );
+        (store, child, child_locator)
+    }
+
+    async fn configured_served_resume_fixture(
+        path: &std::path::Path,
+    ) -> (
+        SqliteStore,
+        AttemptReservation,
+        bridge_core::task_store::TaskAttemptLocator,
+    ) {
+        served_resume_fixture(path, HistoryAllocationKind::Configured).await
+    }
+
     #[tokio::test]
     async fn pending_terminal_projection_survives_restart_and_stays_hidden_until_evidence() {
         use bridge_core::task_store::{TaskAttemptLocator, TaskRecordStatus, TaskStore};
@@ -16585,12 +16724,432 @@ mod r2f0a_history_tests {
         );
 
         store.reserve(&child).await.unwrap();
+        let retained_parent: Option<String> = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT parent_attempt_id FROM workflow_attempt_summaries WHERE attempt_id=?1",
+                rusqlite::params![child.identity.attempt_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retained_parent.as_deref(),
+            Some(parent.identity.attempt_id.as_str()),
+            "the legitimate one-summary gap must retain its admitted parent"
+        );
+        assert_eq!(
+            store.get_attempt_locator(&task).await.unwrap(),
+            Some(child_locator),
+            "successful summary attachment must not rewrite primary lineage"
+        );
 
         let fork = served_followup(&parent, "attempt-66666666666666666666666666666666");
         assert_eq!(
             store.reserve(&fork).await.unwrap_err().reason,
             bridge_core::workflow_history::LedgerUnavailableReason::Collision,
             "a missing optional summary cannot be used to fork the durable task lineage"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_served_reservation_rejects_false_parent_from_primary_locator() {
+        use bridge_core::task_store::{TaskAttemptLocator, TaskStore};
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-false-parent.sqlite");
+        let (store, child, child_locator) = configured_served_resume_fixture(&path).await;
+        let task = child.task_id.clone().unwrap();
+        let false_parent =
+            bridge_core::ids::AttemptId::parse("attempt-77777777777777777777777777777777").unwrap();
+        let mut forged = child.clone();
+        forged.identity.parent_attempt_id = Some(false_parent.clone());
+
+        assert_eq!(
+            store.reserve(&forged).await.unwrap_err().reason,
+            R::Collision,
+            "the primary child locator must reject a different absent parent"
+        );
+
+        let (child_summaries, false_parent_summaries, disposition) = {
+            let conn = store.conn.lock().unwrap();
+            let child_summaries: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1",
+                    rusqlite::params![child.identity.attempt_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let false_parent_summaries: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_attempt_summaries WHERE parent_attempt_id=?1",
+                    rusqlite::params![false_parent.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let disposition: (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT history_disposition, history_unavailable_reason
+                     FROM attempt_identities WHERE attempt_id=?1",
+                    rusqlite::params![child.identity.attempt_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            (child_summaries, false_parent_summaries, disposition)
+        };
+        assert_eq!(child_summaries, 0);
+        assert_eq!(false_parent_summaries, 0);
+        assert_eq!(disposition, (2, Some(R::Collision.as_str().to_owned())));
+        assert_eq!(
+            store.get_attempt_locator(&task).await.unwrap(),
+            Some(TaskAttemptLocator {
+                identity: child_locator.identity,
+                telemetry_unavailable: Some(R::Collision),
+            }),
+            "the refusal marker must preserve the exact admitted parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn colocated_platform_served_reservation_rejects_false_parent_from_primary_locator() {
+        use bridge_core::task_store::{TaskAttemptLocator, TaskStore};
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("platform-false-parent.sqlite");
+        let (store, child, child_locator) =
+            served_resume_fixture(&path, HistoryAllocationKind::Platform).await;
+        let task = child.task_id.clone().unwrap();
+        let false_parent =
+            bridge_core::ids::AttemptId::parse("attempt-77777777777777777777777777777777").unwrap();
+        let mut forged = child.clone();
+        forged.identity.parent_attempt_id = Some(false_parent.clone());
+
+        assert_eq!(
+            store.reserve(&forged).await.unwrap_err().reason,
+            R::Collision,
+            "the colocated Platform primary locator must reject a different absent parent"
+        );
+
+        let (child_summaries, false_parent_summaries, disposition) = {
+            let conn = store.conn.lock().unwrap();
+            let child_summaries: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1",
+                    rusqlite::params![child.identity.attempt_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let false_parent_summaries: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_attempt_summaries WHERE parent_attempt_id=?1",
+                    rusqlite::params![false_parent.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let disposition: (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT history_disposition, history_unavailable_reason
+                     FROM attempt_identities WHERE attempt_id=?1",
+                    rusqlite::params![child.identity.attempt_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            (child_summaries, false_parent_summaries, disposition)
+        };
+        assert_eq!(child_summaries, 0);
+        assert_eq!(false_parent_summaries, 0);
+        assert_eq!(disposition, (2, Some(R::Collision.as_str().to_owned())));
+        assert_eq!(
+            store.get_attempt_locator(&task).await.unwrap(),
+            Some(TaskAttemptLocator {
+                identity: child_locator.identity,
+                telemetry_unavailable: Some(R::Collision),
+            }),
+            "the refusal marker must preserve the exact admitted Platform parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_reservation_rejects_malformed_or_nontext_primary_locator_as_corruption() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-malformed-locator.sqlite");
+        let (store, child, _) = configured_served_resume_fixture(&path).await;
+        for (label, value) in [
+            (
+                "malformed JSON",
+                rusqlite::types::Value::Text("{".to_owned()),
+            ),
+            ("integer", rusqlite::types::Value::Integer(7)),
+            ("blob", rusqlite::types::Value::Blob(vec![0xff])),
+        ] {
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE task_attempt_locators SET locator_json=?2 WHERE task_id=?1",
+                    rusqlite::params![child.task_id.as_ref().unwrap().as_str(), value],
+                )
+                .unwrap();
+
+            assert_eq!(
+                store.reserve(&child).await.unwrap_err().reason,
+                R::Corruption,
+                "{label} must be classified as persisted corruption"
+            );
+            let summaries: i64 = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1",
+                    rusqlite::params![child.identity.attempt_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(summaries, 0, "{label} must remain atomic");
+        }
+    }
+
+    #[tokio::test]
+    async fn served_reservation_rejects_nonparent_locator_mismatch_as_corruption() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        for field in ["attempt", "execution", "ordinal", "telemetry"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory
+                .path()
+                .join(format!("configured-{field}-mismatch.sqlite"));
+            let (store, child, mut locator) = configured_served_resume_fixture(&path).await;
+            match field {
+                "attempt" => {
+                    locator.identity.attempt_id = bridge_core::ids::AttemptId::parse(
+                        "attempt-88888888888888888888888888888888",
+                    )
+                    .unwrap();
+                }
+                "execution" => {
+                    locator.identity.execution_id = bridge_core::ids::ExecutionId::parse(
+                        "exec-99999999999999999999999999999999",
+                    )
+                    .unwrap();
+                }
+                "ordinal" => locator.identity.ordinal += 1,
+                "telemetry" => locator.telemetry_unavailable = Some(R::Io),
+                _ => unreachable!(),
+            }
+            let locator_json = serde_json::to_string(&locator).unwrap();
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE task_attempt_locators SET locator_json=?2 WHERE task_id=?1",
+                    rusqlite::params![child.task_id.as_ref().unwrap().as_str(), locator_json],
+                )
+                .unwrap();
+
+            assert_eq!(
+                store.reserve(&child).await.unwrap_err().reason,
+                R::Corruption,
+                "{field} disagreement must be a cross-table corruption"
+            );
+            let summaries: i64 = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1",
+                    rusqlite::params![child.identity.attempt_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(summaries, 0, "{field} corruption must remain atomic");
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_served_reservation_requires_colocated_primary_locator() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-missing-locator.sqlite");
+        let (store, child, _) = configured_served_resume_fixture(&path).await;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM task_attempt_locators WHERE task_id=?1",
+                rusqlite::params![child.task_id.as_ref().unwrap().as_str()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.reserve(&child).await.unwrap_err().reason,
+            R::Corruption
+        );
+        let state: (i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT history_disposition,
+                        (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1)
+                 FROM attempt_identities WHERE attempt_id=?1",
+                rusqlite::params![child.identity.attempt_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn colocated_platform_served_reservation_requires_primary_locator() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("platform-missing-locator.sqlite");
+        let (store, child, _) = served_resume_fixture(&path, HistoryAllocationKind::Platform).await;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM task_attempt_locators WHERE task_id=?1",
+                rusqlite::params![child.task_id.as_ref().unwrap().as_str()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.reserve(&child).await.unwrap_err().reason,
+            R::Corruption
+        );
+        let state: (i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT history_disposition,
+                        (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1)
+                 FROM attempt_identities WHERE attempt_id=?1",
+                rusqlite::params![child.identity.attempt_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (0, 0),
+            "missing colocated Platform lineage must remain atomic at disposition 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_open_retains_configured_locator_requirement() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("public-open-configured.sqlite");
+        let (store, child, _) = configured_served_resume_fixture(&path).await;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM task_attempt_locators WHERE task_id=?1",
+                rusqlite::params![child.task_id.as_ref().unwrap().as_str()],
+            )
+            .unwrap();
+        drop(store);
+
+        let store = SqliteStore::open(&path).unwrap();
+        let canonical_path = path.canonicalize().unwrap();
+        assert_eq!(
+            store.history_allocation_kind,
+            Some(HistoryAllocationKind::Configured)
+        );
+        assert_eq!(
+            store.history_path.as_deref(),
+            Some(canonical_path.as_path())
+        );
+        let false_parent =
+            bridge_core::ids::AttemptId::parse("attempt-77777777777777777777777777777777").unwrap();
+        let mut forged = child.clone();
+        forged.identity.parent_attempt_id = Some(false_parent);
+
+        assert_eq!(
+            store.reserve(&forged).await.unwrap_err().reason,
+            R::Corruption,
+            "a public reopen must not fail open when configured lineage is missing"
+        );
+        let state: (i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT history_disposition,
+                        (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1)
+                 FROM attempt_identities WHERE attempt_id=?1",
+                rusqlite::params![child.identity.attempt_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (0, 0),
+            "missing configured lineage must not persist a forged summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_platform_served_reservation_without_primary_locator_remains_fail_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("platform-no-primary-locator.sqlite");
+        let store = SqliteStore::open_platform_history(&path).unwrap();
+        let parent = parent_reservation();
+        let child = served_followup(&parent, "attempt-55555555555555555555555555555555");
+        let task = child.task_id.as_ref().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO attempt_identities(
+                     attempt_id, execution_id, ordinal, task_id,
+                     owner_surface, history_disposition)
+                 VALUES(?1, ?2, ?3, ?4, 'served_task', 0)",
+                rusqlite::params![
+                    child.identity.attempt_id.as_str(),
+                    child.identity.execution_id.as_str(),
+                    i64::from(child.identity.ordinal),
+                    task.as_str()
+                ],
+            )
+            .unwrap();
+
+        store.reserve(&child).await.unwrap();
+        let state: (Option<String>, i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT parent_attempt_id,
+                        (SELECT COUNT(*) FROM task_attempt_locators),
+                        (SELECT history_disposition FROM attempt_identities
+                         WHERE attempt_id=?1)
+                 FROM workflow_attempt_summaries WHERE attempt_id=?1",
+                rusqlite::params![child.identity.attempt_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (Some(parent.identity.attempt_id.as_str().to_owned()), 0, 1)
         );
     }
 
