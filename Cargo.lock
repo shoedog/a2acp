@@ -644,6 +644,7 @@ dependencies = [
  "async-trait",
  "bridge-core",
  "fs2",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

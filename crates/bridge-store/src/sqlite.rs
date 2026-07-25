@@ -11,10 +11,684 @@ use rusqlite::OptionalExtension;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+const HISTORY_PARENT_PROOF_PREFIX: &str = ".a2a-bridge-history-parent-proof-";
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const HISTORY_PARENT_PROOF_ATTEMPTS: usize = 16;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const HISTORY_FILE_OPEN_ATTEMPTS: usize = 16;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryFileOpenState {
+    Existing,
+    ExclusiveCreate,
+}
+
+#[cfg(test)]
+const HISTORY_TEST_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+struct HistoryPrevalidationPauseHook {
+    reached: std::sync::mpsc::Sender<()>,
+    proceed: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+static HISTORY_PREVALIDATION_PAUSE_HOOKS: std::sync::OnceLock<
+    Mutex<HashMap<std::path::PathBuf, HistoryPrevalidationPauseHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn history_prevalidation_pause(
+    path: &std::path::Path,
+) -> Result<(), bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    let hook = HISTORY_PREVALIDATION_PAUSE_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(path);
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    hook.reached.send(()).map_err(|_| LedgerError::new(R::Io))?;
+    hook.proceed
+        .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+        .map_err(|_| LedgerError::new(R::Io))
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryFileOpenPausePoint {
+    AfterInitialExistingNotFound,
+    BeforeExclusiveCreate,
+    BeforeExistingReopen,
+    BeforeFdValidation,
+    AfterFdValidation,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+struct HistoryFileOpenPauseHook {
+    point: HistoryFileOpenPausePoint,
+    reached: std::sync::mpsc::Sender<()>,
+    proceed: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryFileOpenObservedOutcome {
+    Opened,
+    Errno(i32),
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HistoryFileOpenObservation {
+    state: HistoryFileOpenState,
+    ordinal: usize,
+    actual_syscall: bool,
+    outcome: HistoryFileOpenObservedOutcome,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Default)]
+struct HistoryFileOpenTestControl {
+    injections: std::collections::VecDeque<(HistoryFileOpenState, i32)>,
+    pauses: std::collections::VecDeque<HistoryFileOpenPauseHook>,
+    observations: Vec<HistoryFileOpenObservation>,
+    actual_syscalls: usize,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+static HISTORY_FILE_OPEN_TEST_CONTROLS: std::sync::OnceLock<
+    Mutex<HashMap<std::path::PathBuf, HistoryFileOpenTestControl>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn history_file_open_pause(
+    path: &std::path::Path,
+    point: HistoryFileOpenPausePoint,
+) -> Result<(), bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    let hook = {
+        let mut controls = HISTORY_FILE_OPEN_TEST_CONTROLS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        controls.get_mut(path).and_then(|control| {
+            let index = control
+                .pauses
+                .iter()
+                .position(|pause| pause.point == point)?;
+            control.pauses.remove(index)
+        })
+    };
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    hook.reached.send(()).map_err(|_| LedgerError::new(R::Io))?;
+    hook.proceed
+        .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+        .map_err(|_| LedgerError::new(R::Io))
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn history_file_open_injected_errno(
+    path: &std::path::Path,
+    state: HistoryFileOpenState,
+) -> Option<i32> {
+    let mut controls = HISTORY_FILE_OPEN_TEST_CONTROLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let control = controls.get_mut(path)?;
+    let index = control
+        .injections
+        .iter()
+        .position(|(candidate, _)| *candidate == state)?;
+    control.injections.remove(index).map(|(_, errno)| errno)
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn history_file_open_record(path: &std::path::Path, observation: HistoryFileOpenObservation) {
+    let mut controls = HISTORY_FILE_OPEN_TEST_CONTROLS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(control) = controls.get_mut(path) {
+        if observation.actual_syscall {
+            control.actual_syscalls += 1;
+        }
+        control.observations.push(observation);
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryParentProofFailpoint {
+    AfterValidatedCreate,
+    BeforeUnlink,
+    Random,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Default)]
+struct HistoryParentProofTestHooks {
+    failpoint: Option<HistoryParentProofFailpoint>,
+    random_names: std::collections::VecDeque<[u8; 32]>,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+std::thread_local! {
+    static HISTORY_PARENT_PROOF_TEST_HOOKS: std::cell::RefCell<HistoryParentProofTestHooks> =
+        std::cell::RefCell::new(HistoryParentProofTestHooks::default());
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn history_parent_proof_failpoint(kind: HistoryParentProofFailpoint) -> bool {
+    HISTORY_PARENT_PROOF_TEST_HOOKS.with(|slot| {
+        let mut hooks = slot.borrow_mut();
+        let armed = hooks.failpoint == Some(kind);
+        if armed {
+            hooks.failpoint = None;
+        }
+        armed
+    })
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlatformBootstrapFailpoint {
+    HostileEexist,
+    IdentityMismatch,
+    UnexpectedIo,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlatformBootstrapPausePoint {
+    BeforeMkdir(usize),
+    AfterMkdir(usize),
+    AfterBootstrap,
+    BeforeHandoff,
+    BeforeHandoffParentCheck(usize),
+    BeforeHandoffChildLookup(usize),
+    AfterHandoffChildOpen(usize),
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+struct PlatformBootstrapPauseHook {
+    path: std::path::PathBuf,
+    point: PlatformBootstrapPausePoint,
+    reached: std::sync::mpsc::Sender<()>,
+    proceed: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+static PLATFORM_BOOTSTRAP_PAUSE_HOOK: std::sync::OnceLock<
+    Mutex<Option<PlatformBootstrapPauseHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+static PLATFORM_BOOTSTRAP_MKDIR_OUTCOMES: std::sync::OnceLock<
+    Mutex<HashMap<std::path::PathBuf, (usize, usize)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn platform_bootstrap_pause(path: &std::path::Path, point: PlatformBootstrapPausePoint) {
+    let slot = PLATFORM_BOOTSTRAP_PAUSE_HOOK.get_or_init(|| Mutex::new(None));
+    let hook = {
+        let mut slot = slot.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|hook| hook.path == path && hook.point == point)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook.reached.send(()).unwrap();
+        hook.proceed.recv().unwrap();
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn platform_bootstrap_record_mkdir(path: &std::path::Path, created: bool) {
+    let mut outcomes = PLATFORM_BOOTSTRAP_MKDIR_OUTCOMES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    let outcome = outcomes.entry(path.to_path_buf()).or_default();
+    if created {
+        outcome.0 += 1;
+    } else {
+        outcome.1 += 1;
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+std::thread_local! {
+    static PLATFORM_BOOTSTRAP_FAILPOINT: std::cell::Cell<Option<PlatformBootstrapFailpoint>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn platform_bootstrap_failpoint(kind: PlatformBootstrapFailpoint) -> bool {
+    PLATFORM_BOOTSTRAP_FAILPOINT.with(|slot| {
+        if slot.get() == Some(kind) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+static HISTORY_ATTEMPT_ZERO_LINK_PROOFS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+struct PlatformOpenRaceHook {
+    path: std::path::PathBuf,
+    reached: std::sync::mpsc::Sender<()>,
+    proceed: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PlatformOpenTestHooks {
+    after_initial_probe: Option<PlatformOpenRaceHook>,
+    while_untagged_under_schema_lock: Option<PlatformOpenRaceHook>,
+    after_migrating_before_ready: Option<PlatformOpenRaceHook>,
+    would_block: Option<(std::path::PathBuf, std::sync::mpsc::Sender<()>)>,
+    fail_before_migrating_commit: Option<std::path::PathBuf>,
+    fail_after_physical_verification: Option<std::path::PathBuf>,
+}
+
+#[cfg(test)]
+static PLATFORM_OPEN_TEST_HOOKS: std::sync::OnceLock<Mutex<PlatformOpenTestHooks>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static CONFIGURED_MIGRATION_FAIL_BEFORE_COMMIT: std::sync::OnceLock<
+    Mutex<Option<std::path::PathBuf>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn configured_migration_fail_before_commit(
+    path: Option<&std::path::Path>,
+    allocation_kind: Option<HistoryAllocationKind>,
+    allocation_table_preexisting: bool,
+) -> Result<(), SchemaMigrationError> {
+    if allocation_kind != Some(HistoryAllocationKind::Configured) || allocation_table_preexisting {
+        return Ok(());
+    }
+    let mut armed = CONFIGURED_MIGRATION_FAIL_BEFORE_COMMIT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap();
+    if armed.as_deref() != path {
+        return Ok(());
+    }
+    armed.take();
+    Err(SchemaMigrationError::Sqlite(
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+            Some("deterministic configured migration pre-commit failure".into()),
+        ),
+    ))
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryTransactionPausePoint {
+    Reserve,
+    SetPinned,
+}
+
+#[cfg(test)]
+struct HistoryTransactionPauseHook {
+    path: std::path::PathBuf,
+    point: HistoryTransactionPausePoint,
+    reached: std::sync::mpsc::Sender<()>,
+    proceed: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static HISTORY_TRANSACTION_PAUSE_HOOK: std::sync::OnceLock<
+    Mutex<Option<HistoryTransactionPauseHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct HistoryAdmissionContentionHook {
+    path: std::path::PathBuf,
+    reached: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+static HISTORY_ADMISSION_CONTENTION_HOOK: std::sync::OnceLock<
+    Mutex<Option<HistoryAdmissionContentionHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn history_admission_contention_observed(path: Option<&std::path::Path>) {
+    let hook = {
+        let mut slot = HISTORY_ADMISSION_CONTENTION_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|hook| Some(hook.path.as_path()) == path)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook.reached.send(()).unwrap();
+    }
+}
+
+#[cfg(test)]
+fn history_transaction_pause(path: Option<&std::path::Path>, point: HistoryTransactionPausePoint) {
+    let hook = {
+        let mut slot = HISTORY_TRANSACTION_PAUSE_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|hook| Some(hook.path.as_path()) == path && hook.point == point)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook.reached.send(()).unwrap();
+        hook.proceed.recv().unwrap();
+    }
+}
+
+#[cfg(test)]
+fn platform_open_after_initial_probe(
+    path: &std::path::Path,
+) -> Result<(), bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    let hook = {
+        let mut hooks = PLATFORM_OPEN_TEST_HOOKS
+            .get_or_init(|| Mutex::new(PlatformOpenTestHooks::default()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if hooks
+            .after_initial_probe
+            .as_ref()
+            .is_some_and(|hook| hook.path == path)
+        {
+            hooks.after_initial_probe.take()
+        } else {
+            None
+        }
+    };
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    hook.reached.send(()).map_err(|_| LedgerError::new(R::Io))?;
+    hook.proceed
+        .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+        .map_err(|_| LedgerError::new(R::Io))
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum PlatformOpenPausePoint {
+    WhileUntaggedUnderSchemaLock,
+    AfterMigratingBeforeReady,
+}
+
+#[cfg(test)]
+fn platform_open_pause(
+    path: &std::path::Path,
+    point: PlatformOpenPausePoint,
+) -> Result<(), bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    let hook = {
+        let mut hooks = PLATFORM_OPEN_TEST_HOOKS
+            .get_or_init(|| Mutex::new(PlatformOpenTestHooks::default()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = match point {
+            PlatformOpenPausePoint::WhileUntaggedUnderSchemaLock => {
+                &mut hooks.while_untagged_under_schema_lock
+            }
+            PlatformOpenPausePoint::AfterMigratingBeforeReady => {
+                &mut hooks.after_migrating_before_ready
+            }
+        };
+        if slot.as_ref().is_some_and(|hook| hook.path == path) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    hook.reached.send(()).map_err(|_| LedgerError::new(R::Io))?;
+    hook.proceed
+        .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+        .map_err(|_| LedgerError::new(R::Io))
+}
+
+#[cfg(test)]
+fn platform_open_would_block(path: &std::path::Path) {
+    let hook = {
+        let mut hooks = PLATFORM_OPEN_TEST_HOOKS
+            .get_or_init(|| Mutex::new(PlatformOpenTestHooks::default()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if hooks
+            .would_block
+            .as_ref()
+            .is_some_and(|(candidate, _)| candidate == path)
+        {
+            hooks.would_block.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, observed)) = hook {
+        let _ = observed.send(());
+    }
+}
+
+#[cfg(test)]
+fn platform_open_fail_before_migrating_commit(
+    path: &std::path::Path,
+) -> Result<(), bridge_core::workflow_history::LedgerError> {
+    let mut hooks = PLATFORM_OPEN_TEST_HOOKS
+        .get_or_init(|| Mutex::new(PlatformOpenTestHooks::default()))
+        .lock()
+        .unwrap();
+    if hooks.fail_before_migrating_commit.as_deref() == Some(path) {
+        hooks.fail_before_migrating_commit = None;
+        return Err(bridge_core::workflow_history::LedgerError::new(
+            bridge_core::workflow_history::LedgerUnavailableReason::Io,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn platform_open_fail_after_physical_verification(
+    path: &std::path::Path,
+) -> Result<(), bridge_core::workflow_history::LedgerError> {
+    let mut hooks = PLATFORM_OPEN_TEST_HOOKS
+        .get_or_init(|| Mutex::new(PlatformOpenTestHooks::default()))
+        .lock()
+        .unwrap();
+    if hooks.fail_after_physical_verification.as_deref() == Some(path) {
+        hooks.fail_after_physical_verification = None;
+        return Err(bridge_core::workflow_history::LedgerError::new(
+            bridge_core::workflow_history::LedgerUnavailableReason::Io,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+struct TaggedValidationSnapshotHook {
+    reached: std::sync::mpsc::Sender<()>,
+    proceed: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TAGGED_VALIDATION_SNAPSHOT_HOOK: std::cell::RefCell<Option<TaggedValidationSnapshotHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn tagged_validation_after_metadata() {
+    TAGGED_VALIDATION_SNAPSHOT_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook.reached.send(()).unwrap();
+            hook.proceed.recv().unwrap();
+        }
+    });
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryMutationFailpointKind {
+    AdmissionIo,
+    RetentionIo,
+    TerminalSqliteFull,
+    RecoveryIo,
+}
+
+#[cfg(test)]
+struct HistoryMutationFailpoint {
+    path: std::path::PathBuf,
+    attempt_id: String,
+    kind: HistoryMutationFailpointKind,
+}
+
+#[cfg(test)]
+static HISTORY_MUTATION_FAILPOINT: std::sync::OnceLock<Mutex<Option<HistoryMutationFailpoint>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn history_mutation_failpoint(
+    path: Option<&std::path::Path>,
+    attempt_id: &bridge_core::ids::AttemptId,
+    kind: HistoryMutationFailpointKind,
+) -> Result<(), bridge_core::workflow_history::LedgerError> {
+    let mut armed = HISTORY_MUTATION_FAILPOINT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap();
+    let matches = armed.as_ref().is_some_and(|failpoint| {
+        Some(failpoint.path.as_path()) == path
+            && failpoint.attempt_id == attempt_id.as_str()
+            && failpoint.kind == kind
+    });
+    if !matches {
+        return Ok(());
+    }
+    let failpoint = armed.take().unwrap();
+    if failpoint.kind == HistoryMutationFailpointKind::TerminalSqliteFull {
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("deterministic terminal SQLITE_FULL".into()),
+        );
+        return Err(history_error(&error));
+    }
+    Err(bridge_core::workflow_history::LedgerError::new(
+        bridge_core::workflow_history::LedgerUnavailableReason::Io,
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryAllocationKind {
+    Configured,
+    Platform,
+}
+
+/// Opaque proof that the owner-private platform history path was selected from
+/// the process environment rather than supplied by a caller.
+pub struct PlatformHistorySelection {
+    path: std::path::PathBuf,
+}
+
+impl PlatformHistorySelection {
+    /// The purely selected path. Inspecting it performs no filesystem access.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Open the selected owner-private history for concurrent offline/smoke use.
+    pub fn open_concurrent(
+        &self,
+    ) -> Result<SqliteStore, bridge_core::workflow_history::LedgerError> {
+        let bootstrap = bootstrap_selected_platform_history(&self.path)?;
+        SqliteStore::open_selected_history(&self.path, bootstrap)
+    }
+
+    /// Open the selected owner-private task/history store for a process lifetime.
+    pub fn open_lifetime(&self) -> Result<SqliteStore, bridge_core::workflow_history::LedgerError> {
+        let bootstrap = bootstrap_selected_platform_history(&self.path)?;
+        SqliteStore::open_selected_platform_history(&self.path, bootstrap)
+    }
+}
+
+type HistoryAllocationRow = (String, String, i64, i64, i64, i64, i64, i64, i64, i64);
+type AttemptIdentityAuthorityRow = (String, i64, Option<String>, String, i64, Option<String>);
+
+impl HistoryAllocationKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Platform => "platform",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "configured" => Some(Self::Configured),
+            "platform" => Some(Self::Platform),
+            _ => None,
+        }
+    }
+}
+
+fn configured_capacity_available(charged_bytes: u64, slots_used: u64) -> bool {
+    use bridge_core::workflow_history::{
+        CONFIGURED_SLOT_CHARGE, MAX_CHARGED_BYTES, MAX_TERMINAL_ROWS,
+    };
+
+    charged_bytes <= MAX_CHARGED_BYTES.saturating_sub(CONFIGURED_SLOT_CHARGE)
+        && slots_used < MAX_TERMINAL_ROWS
+}
+
 #[derive(Debug)]
 enum MigrationValidationError {
     MalformedLocator,
     ConflictingAuthority,
+    AllocationKind,
+    AllocationSchema,
+    CapacityProtected,
+    Corruption,
 }
 
 #[derive(Debug)]
@@ -29,22 +703,81 @@ impl From<rusqlite::Error> for SchemaMigrationError {
     }
 }
 
+struct HistoryParent {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    directory: std::fs::File,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    canonical_parent: std::path::PathBuf,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    database_name: std::ffi::OsString,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    device: u64,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    inode: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+type PlatformSuffixObservation = (u64, u64, u32, u32, u32);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::unnecessary_cast)]
+const PLATFORM_DIRECTORY_FILE_TYPE: u32 = libc::S_IFDIR as u32;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct GuardedDirectory {
+    file: std::fs::File,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct GuardedSuffix {
+    name: std::ffi::OsString,
+    c_name: std::ffi::CString,
+    directory: GuardedDirectory,
+    require_exact_0700: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct PlatformHistoryBootstrap {
+    canonical_anchor: std::path::PathBuf,
+    expected_root: std::path::PathBuf,
+    anchor: GuardedDirectory,
+    suffix: Vec<GuardedSuffix>,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+struct PlatformHistoryBootstrap;
+
+struct HistoryDirectory {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    directory: std::fs::File,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    device: u64,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    inode: u64,
+}
+
 /// SQLite-backed [`SessionStore`] that persists `task_id ↔ session_id` mappings
 /// and a per-task pending-request that is cleared atomically on first read.
 pub struct SqliteStore {
     conn: Arc<Mutex<rusqlite::Connection>>,
+    // Declared after `conn` so SQLite and its managed sidecars close before the
+    // retained canonical-parent descriptor.
+    history_parent: Option<HistoryParent>,
     now_ms: PersistenceClock,
     // Held for the store's lifetime: an exclusive advisory lock on `<path>.lock`
     // so only one `serve` owns a DB file (makes the boot sweep safe). `None` for
     // in-memory stores.
     _lock: Option<std::fs::File>,
-    /// Present for every file-backed workflow-history allocation so physical
-    /// admission accounts for the database and live sidecars.
+    /// Canonical path for a file-backed workflow-history allocation. Configured mode
+    /// uses it only for safe bridge lock derivation; platform mode also accounts sidecars.
     history_path: Option<std::path::PathBuf>,
+    history_allocation_kind: Option<HistoryAllocationKind>,
     /// Per-attempt process leases are used only by the concurrent platform ledger.
     /// Configured primary stores retain their lifetime-exclusive database lock and
     /// in-memory stores need no cross-process ownership signal.
-    history_attempt_lock_dir: Option<std::path::PathBuf>,
+    history_attempt_lock_dir: Option<HistoryDirectory>,
     history_attempt_locks: Mutex<HashMap<String, std::fs::File>>,
 }
 
@@ -62,9 +795,11 @@ impl SqliteStore {
             .map_err(|_| BridgeError::StoreFailure)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            history_parent: None,
             now_ms,
             _lock: None,
             history_path: None,
+            history_allocation_kind: None,
             history_attempt_lock_dir: None,
             history_attempt_locks: Mutex::new(HashMap::new()),
         };
@@ -78,59 +813,107 @@ impl SqliteStore {
     pub fn open(
         path: &std::path::Path,
     ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
-        Self::open_lifetime_typed(path, false)
+        Self::open_lifetime_typed(path, None)
     }
 
     fn open_lifetime_typed(
         path: &std::path::Path,
-        bounded_history: bool,
+        history_kind: Option<HistoryAllocationKind>,
+    ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        Self::open_lifetime_typed_with_bootstrap(path, history_kind, None)
+    }
+
+    fn open_selected_platform_history(
+        path: &std::path::Path,
+        bootstrap: PlatformHistoryBootstrap,
+    ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        Self::open_lifetime_typed_with_bootstrap(
+            path,
+            Some(HistoryAllocationKind::Platform),
+            Some(bootstrap),
+        )
+    }
+
+    fn open_lifetime_typed_with_bootstrap(
+        path: &std::path::Path,
+        history_kind: Option<HistoryAllocationKind>,
+        bootstrap: Option<PlatformHistoryBootstrap>,
     ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
         use bridge_core::workflow_history::LedgerUnavailableReason as R;
         use fs2::FileExt;
 
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                history_io_error_with_permission(&error, R::Open, R::ReadOnlyParent)
-            })?;
+        ensure_history_write_supported()?;
+        if bootstrap.is_none() {
+            prevalidate_tagged_history_path(
+                path,
+                history_kind,
+                history_kind == Some(HistoryAllocationKind::Platform),
+            )?;
         }
-        let lock_path = history_schema_lock_path(path);
-        let lock_permission = if lock_path.exists() {
-            R::ReadOnlyLock
-        } else {
-            R::ReadOnlyParent
-        };
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|error| history_io_error_with_permission(&error, R::Open, lock_permission))?;
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        if let Some(bootstrap) = bootstrap.as_ref() {
+            platform_bootstrap_pause(
+                &bootstrap.expected_root,
+                PlatformBootstrapPausePoint::AfterBootstrap,
+            );
+        }
+        let canonical_path =
+            canonical_history_write_path_with_namespace_guard(path, bootstrap.is_some())?;
+        let path = canonical_path.as_path();
+
+        prevalidate_tagged_history_path(
+            path,
+            history_kind,
+            history_kind == Some(HistoryAllocationKind::Platform),
+        )?;
+        let history_parent = HistoryParent::prove_with_bootstrap(path, bootstrap)?;
+        let lock = history_parent.open_file(".lock", true, R::Open, R::ReadOnlyLock)?;
         lock.try_lock_exclusive()
             .map_err(|error| history_lock_error(&error))?;
+        if history_kind.is_none() {
+            prevalidate_tagged_history_path(path, None, false)?;
+        }
+        let schema_lock = if history_kind.is_some() {
+            let file = history_parent.open_file(".schema.lock", true, R::Open, R::ReadOnlyLock)?;
+            file.try_lock_exclusive()
+                .map_err(|error| history_lock_error(&error))?;
+            if let Some(expected) = history_kind {
+                match prevalidate_tagged_history_path(
+                    path,
+                    Some(expected),
+                    expected == HistoryAllocationKind::Platform,
+                )? {
+                    Some(_) => {}
+                    None if path.exists() => {
+                        validate_untagged_history_schema_path(path)?;
+                    }
+                    None => {}
+                }
+            }
+            Some(file)
+        } else {
+            None
+        };
+        if history_kind == Some(HistoryAllocationKind::Platform) {
+            preflight_platform_history_physical_limit(path)?;
+            #[cfg(test)]
+            platform_open_fail_before_migrating_commit(path)?;
+        }
         // Resolve database-file permissions before SQLite can collapse an OS
         // EACCES into CANTOPEN. A file that existed before this open owns its
         // permissions; failure to create a missing file belongs to its parent.
-        let database_permission = if path.exists() {
-            R::ReadOnlyDatabase
-        } else {
-            R::ReadOnlyParent
-        };
-        std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|error| {
-                history_io_error_with_permission(&error, R::Open, database_permission)
-            })?;
-        let conn = rusqlite::Connection::open(path).map_err(|error| history_error(&error))?;
+        let _database_file = history_parent.open_file("", true, R::Open, R::ReadOnlyDatabase)?;
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|error| history_error(&error))?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|error| history_error(&error))?;
-        if !bounded_history {
+        if history_kind.is_none() {
             let mode = conn
                 .query_row("PRAGMA journal_mode = WAL", [], |row| {
                     row.get::<_, String>(0)
@@ -143,13 +926,18 @@ impl SqliteStore {
                     "PRAGMA journal_mode=WAL not honored; continuing without WAL"
                 );
             }
+            conn.execute_batch("PRAGMA synchronous = NORMAL;")
+                .map_err(|error| history_error(&error))?;
         }
-        conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;")
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")
             .map_err(|error| history_error(&error))?;
         #[cfg(unix)]
         {
-            set_history_permissions(path, 0o600, R::ReadOnlyDatabase)?;
-            set_history_permissions(&lock_path, 0o600, R::ReadOnlyLock)?;
+            set_history_file_permissions(&_database_file, 0o600, R::ReadOnlyDatabase)?;
+            set_history_file_permissions(&lock, 0o600, R::ReadOnlyLock)?;
+            if let Some(schema_lock) = schema_lock.as_ref() {
+                set_history_file_permissions(schema_lock, 0o600, R::ReadOnlyLock)?;
+            }
             for suffix in ["-wal", "-shm", "-journal"] {
                 let mut sidecar = path.as_os_str().to_os_string();
                 sidecar.push(suffix);
@@ -161,37 +949,44 @@ impl SqliteStore {
         }
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            history_parent: Some(history_parent),
             now_ms: Arc::new(system_wall_now_ms),
             _lock: Some(lock),
-            history_path: bounded_history.then(|| path.to_path_buf()),
+            history_path: history_kind.map(|_| path.to_path_buf()),
+            history_allocation_kind: history_kind,
             history_attempt_lock_dir: None,
             history_attempt_locks: Mutex::new(HashMap::new()),
         };
-        let _admission_lease = if bounded_history {
+        let _admission_lease = if history_kind.is_some() {
             store.acquire_history_admission_lease()?
         } else {
             None
         };
-        if bounded_history {
-            // Bound the allocation before any migration can grow the database.
-            store.configure_history_physical_limit()?;
+        if history_kind == Some(HistoryAllocationKind::Platform) {
+            // Install only the connection-local page ceiling before schema
+            // growth. Journal policy follows the durable migrating marker.
+            store.configure_history_page_limit()?;
         }
         store
-            .create_schema_sqlite()
+            .create_schema_sqlite(history_kind)
             .map_err(|error| schema_migration_error(&error))?;
-        if bounded_history {
-            store.checkpoint_and_verify_history_size()?;
+        if history_kind == Some(HistoryAllocationKind::Platform) {
+            store.configure_history_physical_limit()?;
+            #[cfg(test)]
+            platform_open_fail_after_physical_verification(path)?;
+            store.mark_platform_allocation_ready()?;
         }
+        drop(schema_lock);
         Ok(store)
     }
 
     /// Open the workflow-history allocation inside an explicitly configured shared store.
-    /// The same 128 MiB physical database-plus-sidecar ceiling applies to shared
-    /// and platform allocations.
+    /// Configured stores use persisted history-local logical accounting; unrelated
+    /// primary tables and SQLite sidecars are outside this allocation.
     pub fn open_shared_history(
         path: &std::path::Path,
     ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
-        Self::open_lifetime_typed(path, true)
+        Self::open_lifetime_typed(path, Some(HistoryAllocationKind::Configured))
     }
 
     /// Open the owner-private platform ledger used when no shared store is
@@ -202,7 +997,7 @@ impl SqliteStore {
     pub fn open_platform_history(
         path: &std::path::Path,
     ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
-        Self::open_lifetime_typed(path, true)
+        Self::open_lifetime_typed(path, Some(HistoryAllocationKind::Platform))
     }
 
     /// Open a selected workflow-history ledger and collapse raw filesystem/SQLite text
@@ -210,45 +1005,61 @@ impl SqliteStore {
     pub fn open_history(
         path: &std::path::Path,
     ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
-        Self::open_history_with_schema_lock_timeout(path, std::time::Duration::from_secs(5))
+        Self::open_history_with_schema_lock_timeout_and_bootstrap(
+            path,
+            std::time::Duration::from_secs(5),
+            None,
+        )
     }
 
+    fn open_selected_history(
+        path: &std::path::Path,
+        bootstrap: PlatformHistoryBootstrap,
+    ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        Self::open_history_with_schema_lock_timeout_and_bootstrap(
+            path,
+            std::time::Duration::from_secs(5),
+            Some(bootstrap),
+        )
+    }
+
+    #[cfg(test)]
     fn open_history_with_schema_lock_timeout(
         path: &std::path::Path,
         schema_lock_timeout: std::time::Duration,
     ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        Self::open_history_with_schema_lock_timeout_and_bootstrap(path, schema_lock_timeout, None)
+    }
+
+    fn open_history_with_schema_lock_timeout_and_bootstrap(
+        path: &std::path::Path,
+        schema_lock_timeout: std::time::Duration,
+        bootstrap: Option<PlatformHistoryBootstrap>,
+    ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
         use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
         use fs2::FileExt;
 
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty());
-        if let Some(parent) = parent {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                history_io_error_with_permission(&error, R::Open, R::ReadOnlyParent)
-            })?;
+        ensure_history_write_supported()?;
+        if bootstrap.is_none() {
+            prevalidate_tagged_history_path(path, Some(HistoryAllocationKind::Platform), true)?;
         }
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        if let Some(bootstrap) = bootstrap.as_ref() {
+            platform_bootstrap_pause(
+                &bootstrap.expected_root,
+                PlatformBootstrapPausePoint::AfterBootstrap,
+            );
+        }
+        let canonical_path =
+            canonical_history_write_path_with_namespace_guard(path, bootstrap.is_some())?;
+        let path = canonical_path.as_path();
 
-        let lock_path = history_schema_lock_path(path);
-        let attempt_lock_dir = history_attempt_lock_dir(path);
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file_options = std::fs::OpenOptions::new();
-        file_options
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false);
-        #[cfg(unix)]
-        file_options.mode(0o600);
-        let lock_permission = if lock_path.exists() {
-            R::ReadOnlyLock
-        } else {
-            R::ReadOnlyParent
-        };
-        let schema_lock = file_options
-            .open(&lock_path)
-            .map_err(|error| history_io_error_with_permission(&error, R::Open, lock_permission))?;
+        prevalidate_tagged_history_path(path, Some(HistoryAllocationKind::Platform), true)?;
+        #[cfg(test)]
+        platform_open_after_initial_probe(path)?;
+
+        let history_parent = HistoryParent::prove_with_bootstrap(path, bootstrap)?;
+        let schema_lock = history_parent.open_file(".lock", true, R::Open, R::ReadOnlyLock)?;
 
         let started = std::time::Instant::now();
         loop {
@@ -258,6 +1069,8 @@ impl SqliteStore {
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         && started.elapsed() < schema_lock_timeout =>
                 {
+                    #[cfg(test)]
+                    platform_open_would_block(path);
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -267,48 +1080,61 @@ impl SqliteStore {
             }
         }
 
-        std::fs::create_dir_all(&attempt_lock_dir).map_err(|error| {
-            history_io_error_with_permission(&error, R::Open, R::ReadOnlyParent)
-        })?;
-        let database_permission = if path.exists() {
-            R::ReadOnlyDatabase
-        } else {
-            R::ReadOnlyParent
-        };
-        file_options.open(path).map_err(|error| {
-            history_io_error_with_permission(&error, R::Open, database_permission)
-        })?;
-        #[cfg(unix)]
-        {
-            if let Some(parent) = parent {
-                set_history_permissions(parent, 0o700, R::ReadOnlyParent)?;
+        match prevalidate_tagged_history_path(path, Some(HistoryAllocationKind::Platform), true)? {
+            Some(_) => {}
+            None if path.exists() => {
+                validate_untagged_history_schema_path(path)?;
+                #[cfg(test)]
+                platform_open_pause(path, PlatformOpenPausePoint::WhileUntaggedUnderSchemaLock)?;
             }
-            set_history_permissions(&lock_path, 0o600, R::ReadOnlyLock)?;
-            set_history_permissions(path, 0o600, R::ReadOnlyDatabase)?;
-            set_history_permissions(&attempt_lock_dir, 0o700, R::ReadOnlyParent)?;
+            None => {}
         }
 
-        let conn = rusqlite::Connection::open(path).map_err(|error| history_error(&error))?;
+        preflight_platform_history_physical_limit(path)?;
+        #[cfg(test)]
+        platform_open_fail_before_migrating_commit(path)?;
+
+        let attempt_lock_dir = history_parent.open_directory(".attempt-locks")?;
+        let _database_file = history_parent.open_file("", true, R::Open, R::ReadOnlyDatabase)?;
+        #[cfg(unix)]
+        {
+            set_history_file_permissions(&_database_file, 0o600, R::ReadOnlyDatabase)?;
+            set_history_file_permissions(&schema_lock, 0o600, R::ReadOnlyLock)?;
+        }
+
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|error| history_error(&error))?;
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")
-            .map_err(|error| history_error(&error))?;
-        conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;")
             .map_err(|error| history_error(&error))?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             now_ms: Arc::new(system_wall_now_ms),
             _lock: None,
+            history_parent: Some(history_parent),
             history_path: Some(path.to_path_buf()),
+            history_allocation_kind: Some(HistoryAllocationKind::Platform),
             history_attempt_lock_dir: Some(attempt_lock_dir),
             history_attempt_locks: Mutex::new(HashMap::new()),
         };
         let admission_lease = store.acquire_history_admission_lease()?;
-        // The schema lock serializes migration, while the physical limit must
-        // already be active before migration writes their first page.
-        store.configure_history_physical_limit()?;
+        // The schema lock serializes migration. Only the connection-local page
+        // ceiling is installed before the durable migrating marker.
+        store.configure_history_page_limit()?;
         store
-            .create_schema_sqlite()
+            .create_schema_sqlite(Some(HistoryAllocationKind::Platform))
             .map_err(|error| schema_migration_error(&error))?;
-        store.checkpoint_and_verify_history_size()?;
+        #[cfg(test)]
+        platform_open_pause(path, PlatformOpenPausePoint::AfterMigratingBeforeReady)?;
+        store.configure_history_physical_limit()?;
+        #[cfg(test)]
+        platform_open_fail_after_physical_verification(path)?;
+        store.mark_platform_allocation_ready()?;
         drop(schema_lock);
         drop(admission_lease);
 
@@ -322,9 +1148,19 @@ impl SqliteStore {
     pub fn open_history_read_only(
         path: &std::path::Path,
     ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        prevalidate_tagged_history_path(path, None, false)?;
+        let canonical_path = canonical_history_path(path)?;
+        let path = canonical_path.as_path();
+        let kind = prevalidate_tagged_history_path(path, None, false)?.ok_or_else(|| {
+            bridge_core::workflow_history::LedgerError::new(
+                bridge_core::workflow_history::LedgerUnavailableReason::Migration,
+            )
+        })?;
         let conn = rusqlite::Connection::open_with_flags(
             path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .map_err(|error| history_error(&error))?;
         conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")
@@ -337,13 +1173,74 @@ impl SqliteStore {
         .map_err(|error| history_migration_error(&error))?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            history_parent: None,
             now_ms: Arc::new(system_wall_now_ms),
             _lock: None,
             history_path: Some(path.to_path_buf()),
+            history_allocation_kind: Some(kind),
             history_attempt_lock_dir: None,
             history_attempt_locks: Mutex::new(HashMap::new()),
         })
     }
+    /// Read a configured allocation selected by configuration. A valid untagged
+    /// legacy schema may be inspected without migration or writes.
+    pub fn open_configured_history_read_only(
+        path: &std::path::Path,
+    ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        prevalidate_tagged_history_path(path, Some(HistoryAllocationKind::Configured), false)?;
+        let canonical_path = canonical_history_path(path)?;
+        let path = canonical_path.as_path();
+        if prevalidate_tagged_history_path(path, Some(HistoryAllocationKind::Configured), false)?
+            .is_some()
+        {
+            return Self::open_history_read_only(path);
+        }
+        validate_untagged_history_schema_path(path)?;
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|error| history_error(&error))?;
+        conn.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")
+            .map_err(|error| history_error(&error))?;
+        conn.prepare(
+            "SELECT attempt_id, reservation_json, terminal_json, prompt_acceptance, pinned,
+                    task_id, ordinal, started_ms, status, completed_ms
+             FROM workflow_attempt_summaries LIMIT 0",
+        )
+        .map_err(|error| history_migration_error(&error))?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            history_parent: None,
+            now_ms: Arc::new(system_wall_now_ms),
+            _lock: None,
+            history_path: Some(path.to_path_buf()),
+            history_allocation_kind: Some(HistoryAllocationKind::Configured),
+            history_attempt_lock_dir: None,
+            history_attempt_locks: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn open_platform_history_read_only(
+        path: &std::path::Path,
+    ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        prevalidate_tagged_history_path(path, Some(HistoryAllocationKind::Platform), false)?;
+        if prevalidate_tagged_history_path(
+            &canonical_history_path(path)?,
+            Some(HistoryAllocationKind::Platform),
+            false,
+        )?
+        .is_none()
+        {
+            return Err(bridge_core::workflow_history::LedgerError::new(
+                bridge_core::workflow_history::LedgerUnavailableReason::Migration,
+            ));
+        }
+        Self::open_history_read_only(path)
+    }
+
     /// Open an existing workflow-history allocation for bounded operator mutations.
     /// This does not migrate, reconcile active rows, or take the configured store's
     /// process-lifetime lock; SQLite's immediate transaction is the pin/unpin
@@ -351,9 +1248,24 @@ impl SqliteStore {
     pub fn open_history_admin(
         path: &std::path::Path,
     ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        ensure_history_write_supported()?;
+        prevalidate_tagged_history_path(path, None, false)?;
+        let canonical_path = canonical_history_write_path(path)?;
+        let path = canonical_path.as_path();
+        let kind = prevalidate_tagged_history_path(path, None, false)?.ok_or_else(|| {
+            bridge_core::workflow_history::LedgerError::new(
+                bridge_core::workflow_history::LedgerUnavailableReason::Migration,
+            )
+        })?;
+        let history_parent = HistoryParent::prove(path)?;
+        let _database_file = history_parent.open_file("", false, R::Open, R::ReadOnlyDatabase)?;
         let conn = rusqlite::Connection::open_with_flags(
             path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .map_err(|error| history_error(&error))?;
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")
@@ -365,15 +1277,69 @@ impl SqliteStore {
         .map_err(|error| history_migration_error(&error))?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            history_parent: Some(history_parent),
             now_ms: Arc::new(system_wall_now_ms),
             _lock: None,
             history_path: Some(path.to_path_buf()),
+            history_allocation_kind: Some(kind),
             history_attempt_lock_dir: None,
             history_attempt_locks: Mutex::new(HashMap::new()),
         };
         let _admission_lease = store.acquire_history_admission_lease()?;
+        {
+            let mut conn = store.conn.lock().map_err(|_| {
+                bridge_core::workflow_history::LedgerError::new(
+                    bridge_core::workflow_history::LedgerUnavailableReason::Io,
+                )
+            })?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .map_err(|error| history_error(&error))?;
+            validate_tagged_history_allocation(&tx, kind, false)
+                .map_err(|error| schema_migration_error(&error))?;
+            tx.commit().map_err(|error| history_error(&error))?;
+        }
         store.configure_history_physical_limit()?;
         Ok(store)
+    }
+
+    pub fn open_configured_history_admin(
+        path: &std::path::Path,
+    ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        ensure_history_write_supported()?;
+        prevalidate_tagged_history_path(path, Some(HistoryAllocationKind::Configured), false)?;
+        let canonical_path = canonical_history_write_path(path)?;
+        match prevalidate_tagged_history_path(
+            &canonical_path,
+            Some(HistoryAllocationKind::Configured),
+            false,
+        )? {
+            Some(_) => Self::open_history_admin(&canonical_path),
+            None => {
+                drop(Self::open_shared_history(&canonical_path)?);
+                Self::open_history_admin(&canonical_path)
+            }
+        }
+    }
+
+    pub fn open_platform_history_admin(
+        path: &std::path::Path,
+    ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        ensure_history_write_supported()?;
+        prevalidate_tagged_history_path(path, Some(HistoryAllocationKind::Platform), false)?;
+        let canonical_path = canonical_history_write_path(path)?;
+        if prevalidate_tagged_history_path(
+            &canonical_path,
+            Some(HistoryAllocationKind::Platform),
+            false,
+        )?
+        .is_none()
+        {
+            return Err(bridge_core::workflow_history::LedgerError::new(
+                bridge_core::workflow_history::LedgerUnavailableReason::Migration,
+            ));
+        }
+        Self::open_history_admin(&canonical_path)
     }
 
     fn open_history_attempt_lock(
@@ -386,27 +1352,12 @@ impl SqliteStore {
             .history_attempt_lock_dir
             .as_ref()
             .ok_or_else(|| bridge_core::workflow_history::LedgerError::new(R::Schema))?;
-        let path = directory.join(format!("{}.lock", id.as_str()));
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).read(true).write(true).truncate(false);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let permission = if path.exists() {
-            R::ReadOnlyLock
-        } else {
-            R::ReadOnlyParent
-        };
-        let file = options
-            .open(&path)
-            .map_err(|error| history_io_error_with_permission(&error, R::Io, permission))?;
-        #[cfg(unix)]
-        set_history_permissions(&path, 0o600, R::ReadOnlyLock)?;
-        Ok(file)
+        directory
+            .open_lock(id, true)?
+            .ok_or_else(|| bridge_core::workflow_history::LedgerError::new(R::Io))
     }
 
-    /// Serialize physical admission across primary, platform, and live-admin
+    /// Serialize retention and admission across primary, platform, and live-admin
     /// connections. This dedicated lease is distinct from the configured
     /// primary's lifetime schema lock, so bounded admin pinning remains usable.
     fn acquire_history_admission_lease(
@@ -415,26 +1366,12 @@ impl SqliteStore {
         use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
         use fs2::FileExt;
 
-        let Some(path) = self.history_path.as_ref() else {
+        let Some(parent) = self.history_parent.as_ref() else {
             return Ok(None);
         };
-        let lock_path = history_admission_lock_path(path);
+        let file = parent.open_file(".admission.lock", true, R::AdvisoryLockIo, R::ReadOnlyLock)?;
         #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).read(true).write(true).truncate(false);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let permission = if lock_path.exists() {
-            R::ReadOnlyLock
-        } else {
-            R::ReadOnlyParent
-        };
-        let file = options.open(&lock_path).map_err(|error| {
-            history_io_error_with_permission(&error, R::AdvisoryLockIo, permission)
-        })?;
-        #[cfg(unix)]
-        set_history_permissions(&lock_path, 0o600, R::ReadOnlyLock)?;
+        set_history_file_permissions(&file, 0o600, R::ReadOnlyLock)?;
         let started = std::time::Instant::now();
         loop {
             match file.try_lock_exclusive() {
@@ -443,6 +1380,8 @@ impl SqliteStore {
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         && started.elapsed() < std::time::Duration::from_secs(5) =>
                 {
+                    #[cfg(test)]
+                    history_admission_contention_observed(self.history_path.as_deref());
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -453,25 +1392,260 @@ impl SqliteStore {
         }
     }
 
+    fn mark_platform_allocation_ready(
+        &self,
+    ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+        if self.history_allocation_kind != Some(HistoryAllocationKind::Platform) {
+            return Err(LedgerError::new(R::Migration));
+        }
+        let mut conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| history_error(&error))?;
+        let row: Option<(String, String, i64, i64, i64)> = tx
+            .query_row(
+                "SELECT allocation_kind, allocation_state,
+                        charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| history_migration_error(&error))?;
+        let Some((kind, state, charged_bytes, slots_used, terminal_rows)) = row else {
+            return Err(LedgerError::new(R::Corruption));
+        };
+        if kind != HistoryAllocationKind::Platform.as_str() {
+            return Err(LedgerError::new(R::Migration));
+        }
+        if charged_bytes != 0 || slots_used != 0 || terminal_rows != 0 {
+            return Err(LedgerError::new(R::Corruption));
+        }
+        match state.as_str() {
+            "ready" => {}
+            "migrating" => {
+                let changed = tx
+                    .execute(
+                        "UPDATE workflow_history_allocation
+                         SET allocation_state='ready'
+                         WHERE singleton=1 AND allocation_kind='platform'
+                           AND allocation_state='migrating'
+                           AND charged_bytes=0 AND slots_used=0 AND terminal_rows=0",
+                        [],
+                    )
+                    .map_err(|error| history_error(&error))?;
+                if changed != 1 {
+                    return Err(LedgerError::new(R::Corruption));
+                }
+            }
+            _ => return Err(LedgerError::new(R::Migration)),
+        }
+        tx.commit().map_err(|error| history_error(&error))
+    }
+
+    fn configured_allocation_state(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> Result<Option<(u64, u64, u64)>, bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{
+            LedgerError, LedgerUnavailableReason as R, CONFIGURED_SLOT_CHARGE,
+            HISTORY_ATTACHMENT_CHARGE, MAX_CHARGED_BYTES, MAX_TERMINAL_ROWS,
+            RETAINED_SUMMARY_CHARGE,
+        };
+
+        if self.history_allocation_kind != Some(HistoryAllocationKind::Configured) {
+            return Ok(None);
+        }
+        let row: Option<HistoryAllocationRow> = conn
+            .query_row(
+                "SELECT allocation_kind, allocation_state, accounting_version,
+                        byte_limit, slot_limit, summary_charge, attachment_charge,
+                        charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| history_error(&error))?;
+        let Some((
+            kind,
+            state,
+            version,
+            byte_limit,
+            slot_limit,
+            summary_charge,
+            attachment_charge,
+            charged_bytes,
+            slots_used,
+            terminal_rows,
+        )) = row
+        else {
+            return Err(LedgerError::new(R::Migration));
+        };
+        if kind != HistoryAllocationKind::Configured.as_str()
+            || state != "ready"
+            || version != 1
+            || byte_limit != i64::try_from(MAX_CHARGED_BYTES).unwrap_or(i64::MAX)
+            || slot_limit != i64::try_from(MAX_TERMINAL_ROWS).unwrap_or(i64::MAX)
+            || summary_charge != i64::try_from(RETAINED_SUMMARY_CHARGE).unwrap_or(i64::MAX)
+            || attachment_charge != i64::try_from(HISTORY_ATTACHMENT_CHARGE).unwrap_or(i64::MAX)
+        {
+            return Err(LedgerError::new(R::Migration));
+        }
+        let charged_bytes =
+            u64::try_from(charged_bytes).map_err(|_| LedgerError::new(R::Corruption))?;
+        let slots_used = u64::try_from(slots_used).map_err(|_| LedgerError::new(R::Corruption))?;
+        let terminal_rows =
+            u64::try_from(terminal_rows).map_err(|_| LedgerError::new(R::Corruption))?;
+        if charged_bytes != slots_used.saturating_mul(CONFIGURED_SLOT_CHARGE)
+            || charged_bytes > MAX_CHARGED_BYTES
+            || slots_used > MAX_TERMINAL_ROWS
+            || terminal_rows > slots_used
+        {
+            return Err(LedgerError::new(R::Corruption));
+        }
+        Ok(Some((charged_bytes, slots_used, terminal_rows)))
+    }
+
+    fn configured_allocation_has_capacity(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> Result<bool, bridge_core::workflow_history::LedgerError> {
+        Ok(self
+            .configured_allocation_state(conn)?
+            .is_none_or(|(charged, slots, _)| configured_capacity_available(charged, slots)))
+    }
+
+    fn debit_configured_slot(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{
+            LedgerError, LedgerUnavailableReason as R, CONFIGURED_SLOT_CHARGE,
+        };
+
+        if self.history_allocation_kind != Some(HistoryAllocationKind::Configured) {
+            return Ok(());
+        }
+        let changed = tx
+            .execute(
+                "UPDATE workflow_history_allocation
+                 SET charged_bytes=charged_bytes+17408, slots_used=slots_used+1
+                 WHERE singleton=1 AND allocation_kind='configured'
+                   AND allocation_state='ready' AND accounting_version=1
+                   AND byte_limit=134217728 AND slot_limit=100000
+                   AND summary_charge=16384 AND attachment_charge=1024
+                   AND charged_bytes<=byte_limit-17408 AND slots_used<slot_limit",
+                [],
+            )
+            .map_err(|error| history_error(&error))?;
+        if changed == 1 {
+            return Ok(());
+        }
+        match self.configured_allocation_state(tx)? {
+            Some((charged, slots, _))
+                if charged > 134_217_728u64.saturating_sub(CONFIGURED_SLOT_CHARGE)
+                    || slots >= 100_000 =>
+            {
+                Err(LedgerError::new(R::CapacityProtected))
+            }
+            Some(_) => Err(LedgerError::new(R::Corruption)),
+            None => Err(LedgerError::new(R::Migration)),
+        }
+    }
+
+    fn credit_configured_slot(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        terminal: bool,
+    ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+        if self.history_allocation_kind != Some(HistoryAllocationKind::Configured) {
+            return Ok(());
+        }
+        let changed = tx
+            .execute(
+                "UPDATE workflow_history_allocation
+                 SET charged_bytes=charged_bytes-17408, slots_used=slots_used-1,
+                     terminal_rows=terminal_rows-?1
+                 WHERE singleton=1 AND allocation_kind='configured'
+                   AND allocation_state='ready' AND accounting_version=1
+                   AND byte_limit=134217728 AND slot_limit=100000
+                   AND summary_charge=16384 AND attachment_charge=1024
+                   AND charged_bytes>=17408 AND slots_used>=1
+                   AND terminal_rows>=?1",
+                rusqlite::params![i64::from(terminal)],
+            )
+            .map_err(|error| history_error(&error))?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            self.configured_allocation_state(tx)?;
+            Err(LedgerError::new(R::Corruption))
+        }
+    }
+
+    fn increment_configured_terminal_rows(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+        if self.history_allocation_kind != Some(HistoryAllocationKind::Configured) {
+            return Ok(());
+        }
+        let changed = tx
+            .execute(
+                "UPDATE workflow_history_allocation
+                 SET terminal_rows=terminal_rows+1
+                 WHERE singleton=1 AND allocation_kind='configured'
+                   AND allocation_state='ready' AND accounting_version=1
+                   AND byte_limit=134217728 AND slot_limit=100000
+                   AND summary_charge=16384 AND attachment_charge=1024
+                   AND terminal_rows<slots_used",
+                [],
+            )
+            .map_err(|error| history_error(&error))?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            self.configured_allocation_state(tx)?;
+            Err(LedgerError::new(R::Corruption))
+        }
+    }
+
     fn remove_history_attempt_lock_file(
         &self,
         id: &bridge_core::ids::AttemptId,
     ) -> Result<(), bridge_core::workflow_history::LedgerError> {
-        use bridge_core::workflow_history::LedgerUnavailableReason as R;
-
         let Some(directory) = self.history_attempt_lock_dir.as_ref() else {
             return Ok(());
         };
-        let path = directory.join(format!("{}.lock", id.as_str()));
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(history_io_error_with_permission(
-                &error,
-                R::Io,
-                R::ReadOnlyParent,
-            )),
-        }
+        directory.unlink_stale(id)
     }
 
     /// Acquire a process-lifetime lease before exposing an active platform row.
@@ -519,8 +1693,14 @@ impl SqliteStore {
             .lock()
             .map_err(|_| LedgerError::new(R::Io))?
             .remove(id.as_str());
-        drop(lease);
-        self.remove_history_attempt_lock_file(id)
+        let Some(directory) = self.history_attempt_lock_dir.as_ref() else {
+            return Ok(());
+        };
+        if let Some(lease) = lease.as_ref() {
+            directory.unlink_exact(id, lease)
+        } else {
+            directory.unlink_stale(id)
+        }
     }
 
     /// Probe whether an active platform row's owning process is gone. A held
@@ -558,6 +1738,7 @@ impl SqliteStore {
         use bridge_core::workflow_history::{
             AttemptTerminal, LedgerError, LedgerUnavailableReason as R, NodeCounts,
         };
+
         if completed_ms <= 0 {
             return Err(LedgerError::new(R::Schema));
         }
@@ -567,47 +1748,56 @@ impl SqliteStore {
             .iter()
             .map(bridge_core::ids::AttemptId::as_str)
             .collect::<HashSet<_>>();
-        let mut conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|error| history_error(&error))?;
-        let active = {
-            let mut statement = tx
-                .prepare(
-                    "SELECT attempt_id, prompt_acceptance, length(terminal_reserve)
-                     FROM workflow_attempt_summaries \
-                     WHERE status='active' ORDER BY attempt_id",
-                )
-                .map_err(|error| history_error(&error))?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                    ))
-                })
-                .map_err(|error| history_error(&error))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|error| history_error(&error))?
-        };
         let concurrent_platform = self.history_attempt_lock_dir.is_some();
-        let mut candidates = Vec::with_capacity(active.len());
-        for (attempt_id, prompt_acceptance, terminal_reserve) in active {
-            let parsed = bridge_core::ids::AttemptId::parse(attempt_id)
-                .map_err(|_| LedgerError::new(R::Corruption))?;
-            if excluded.contains(parsed.as_str()) {
-                continue;
+        let mut reconciled = 0u64;
+
+        loop {
+            let mut conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| history_error(&error))?;
+            let active = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT attempt_id, prompt_acceptance, length(terminal_reserve)
+                         FROM workflow_attempt_summaries
+                         WHERE status='active' ORDER BY attempt_id",
+                    )
+                    .map_err(|error| history_error(&error))?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                        ))
+                    })
+                    .map_err(|error| history_error(&error))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| history_error(&error))?
+            };
+
+            let mut candidate = None;
+            for (attempt_id, prompt_acceptance, terminal_reserve) in active {
+                let parsed = bridge_core::ids::AttemptId::parse(attempt_id)
+                    .map_err(|_| LedgerError::new(R::Corruption))?;
+                if excluded.contains(parsed.as_str()) {
+                    continue;
+                }
+                if !concurrent_platform {
+                    candidate = Some((parsed, prompt_acceptance, terminal_reserve, None));
+                    break;
+                }
+                if let Some(lease) = self.acquire_reconciliation_lease(&parsed)? {
+                    candidate = Some((parsed, prompt_acceptance, terminal_reserve, Some(lease)));
+                    break;
+                }
             }
-            if !concurrent_platform {
-                candidates.push((parsed, prompt_acceptance, terminal_reserve, None));
-                continue;
-            }
-            if let Some(lease) = self.acquire_reconciliation_lease(&parsed)? {
-                candidates.push((parsed, prompt_acceptance, terminal_reserve, Some(lease)));
-            }
-        }
-        for (attempt_id, prompt_acceptance, terminal_reserve, _lease) in &candidates {
+
+            let Some((attempt_id, prompt_acceptance, terminal_reserve, lease)) = candidate else {
+                tx.commit().map_err(|error| history_error(&error))?;
+                break;
+            };
             let terminal = AttemptTerminal {
                 completed_ms,
                 work_ms: 0,
@@ -626,7 +1816,7 @@ impl SqliteStore {
                 terminal_evidence_source: "none".into(),
                 terminal_evidence_complete: false,
                 degraded: true,
-                prompt_acceptance: prompt_acceptance.clone(),
+                prompt_acceptance,
                 cleanup_disposition: "unknown".into(),
                 node_counts: NodeCounts::default(),
                 phase_durations: Vec::new(),
@@ -662,26 +1852,34 @@ impl SqliteStore {
             if changed != 1 {
                 return Err(LedgerError::new(R::Io));
             }
+            self.increment_configured_terminal_rows(&tx)?;
             self.ensure_terminal_rewrite_headroom(&tx)?;
-        }
-        tx.commit().map_err(|error| history_error(&error))?;
-        drop(conn);
-        let reconciled = candidates.len() as u64;
-        let ids = candidates
-            .iter()
-            .map(|(attempt_id, _, _, _)| attempt_id.clone())
-            .collect::<Vec<_>>();
-        drop(candidates);
-        for attempt_id in ids {
-            if let Err(error) = self.remove_history_attempt_lock_file(&attempt_id) {
+            #[cfg(test)]
+            history_mutation_failpoint(
+                self.history_path.as_deref(),
+                &attempt_id,
+                HistoryMutationFailpointKind::RecoveryIo,
+            )?;
+            tx.commit().map_err(|error| history_error(&error))?;
+            drop(conn);
+            let cleanup = if let (Some(directory), Some(lease)) =
+                (self.history_attempt_lock_dir.as_ref(), lease.as_ref())
+            {
+                directory.unlink_exact(&attempt_id, lease)
+            } else {
+                Ok(())
+            };
+            if let Err(error) = cleanup {
                 tracing::warn!(
                     attempt = attempt_id.as_str(),
                     reason = error.reason.as_str(),
                     "active-attempt reconciliation committed; stale lease-file cleanup deferred"
                 );
             }
+            reconciled = reconciled.saturating_add(1);
+            self.checkpoint_after_committed_history_mutation("interrupt_active");
         }
-        self.checkpoint_after_committed_history_mutation("interrupt_active");
+
         Ok(reconciled)
     }
 
@@ -723,7 +1921,7 @@ impl SqliteStore {
             LedgerError, LedgerUnavailableReason as R, MAX_CHARGED_BYTES,
         };
 
-        if self.history_path.is_none() {
+        if self.history_allocation_kind != Some(HistoryAllocationKind::Platform) {
             return Ok(true);
         }
         let physical_bytes = self.checked_history_file_bytes()?;
@@ -776,7 +1974,7 @@ impl SqliteStore {
             LedgerError, LedgerUnavailableReason as R, MAX_TERMINAL_JSON_BYTES,
         };
 
-        if self.history_path.is_none() {
+        if self.history_allocation_kind != Some(HistoryAllocationKind::Platform) {
             return Ok(());
         }
         let page_size: i64 = conn
@@ -870,15 +2068,28 @@ impl SqliteStore {
     }
 
     fn create_schema(&self) -> Result<(), BridgeError> {
-        self.create_schema_sqlite()
+        self.create_schema_sqlite(None)
             .map_err(|_| BridgeError::StoreFailure)
     }
 
-    fn create_schema_sqlite(&self) -> Result<(), SchemaMigrationError> {
+    fn create_schema_sqlite(
+        &self,
+        allocation_kind: Option<HistoryAllocationKind>,
+    ) -> Result<(), SchemaMigrationError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(SchemaMigrationError::Sqlite)?;
+        let allocation_table_preexisting = history_allocation_table_exists(&tx)?;
+        if let Some(kind) = allocation_kind {
+            if allocation_table_preexisting {
+                validate_tagged_history_allocation(
+                    &tx,
+                    kind,
+                    kind == HistoryAllocationKind::Platform,
+                )?;
+            }
+        }
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                 task_id TEXT PRIMARY KEY,
@@ -913,8 +2124,12 @@ impl SqliteStore {
                 ordinal INTEGER NOT NULL,
                 task_id TEXT,
                 owner_surface TEXT NOT NULL,
-                summary_attached INTEGER NOT NULL DEFAULT 0
-                    CHECK(summary_attached IN (0, 1)),
+                history_disposition INTEGER NOT NULL DEFAULT 0
+                    CHECK(history_disposition IN (0, 1, 2)),
+                history_unavailable_reason TEXT,
+                CHECK((history_disposition=2 AND history_unavailable_reason IS NOT NULL
+                       AND length(history_unavailable_reason) BETWEEN 1 AND 64)
+                   OR (history_disposition IN (0, 1) AND history_unavailable_reason IS NULL)),
                 UNIQUE(execution_id, ordinal)
             );
             CREATE INDEX IF NOT EXISTS idx_attempt_identities_task
@@ -1008,6 +2223,35 @@ impl SqliteStore {
                 terminal_json TEXT,
                 terminal_reserve BLOB
             );
+            CREATE TABLE IF NOT EXISTS workflow_history_attachment (
+                attempt_id TEXT PRIMARY KEY,
+                charged_bytes INTEGER NOT NULL CHECK(charged_bytes=1024),
+                FOREIGN KEY (attempt_id) REFERENCES workflow_attempt_summaries(attempt_id)
+                    ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS workflow_history_allocation (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                allocation_kind TEXT NOT NULL
+                    CHECK(allocation_kind IN ('configured','platform')),
+                allocation_state TEXT NOT NULL
+                    CHECK(allocation_state IN ('migrating','ready')),
+                accounting_version INTEGER NOT NULL CHECK(accounting_version=1),
+                byte_limit INTEGER NOT NULL CHECK(byte_limit=134217728),
+                slot_limit INTEGER NOT NULL CHECK(slot_limit=100000),
+                summary_charge INTEGER NOT NULL CHECK(summary_charge=16384),
+                attachment_charge INTEGER NOT NULL CHECK(attachment_charge=1024),
+                charged_bytes INTEGER NOT NULL CHECK(charged_bytes>=0 AND charged_bytes<=byte_limit),
+                slots_used INTEGER NOT NULL CHECK(slots_used>=0 AND slots_used<=slot_limit),
+                terminal_rows INTEGER NOT NULL
+                    CHECK(terminal_rows>=0 AND terminal_rows<=slots_used),
+                CHECK(
+                    (allocation_kind='configured'
+                     AND charged_bytes=slots_used*(summary_charge+attachment_charge))
+                    OR
+                    (allocation_kind='platform' AND charged_bytes=0
+                     AND slots_used=0 AND terminal_rows=0)
+                )
+            );
             CREATE TABLE IF NOT EXISTS workflow_history_rewrite_reserve (
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 reserve BLOB NOT NULL
@@ -1022,10 +2266,75 @@ impl SqliteStore {
         )?;
         migrate_tasks_columns(&tx)?;
         migrate_workflow_history_columns(&tx)?;
+        migrate_attempt_identity_disposition(&tx)?;
         migrate_attempt_identity_authority(&tx)?;
+        migrate_history_allocation(&tx, allocation_kind)?;
+        if let Some(kind) = allocation_kind {
+            validate_tagged_history_allocation(&tx, kind, kind == HistoryAllocationKind::Platform)?;
+        }
+        if allocation_kind.is_none() && !allocation_table_preexisting {
+            tx.execute_batch("DROP TABLE workflow_history_allocation;")?;
+        }
+        #[cfg(test)]
+        configured_migration_fail_before_commit(
+            self.history_path.as_deref(),
+            allocation_kind,
+            allocation_table_preexisting,
+        )?;
         tx.commit()?;
         Ok(())
     }
+}
+
+fn migrate_attempt_identity_disposition(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<(), SchemaMigrationError> {
+    let mut statement = tx.prepare("PRAGMA table_info(attempt_identities)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
+    drop(statement);
+
+    if columns.contains("summary_attached") {
+        tx.execute_batch(
+            "DROP INDEX IF EXISTS idx_attempt_identities_task;
+             ALTER TABLE attempt_identities RENAME TO attempt_identities_legacy_disposition;
+             CREATE TABLE attempt_identities (
+                 attempt_id TEXT PRIMARY KEY,
+                 execution_id TEXT NOT NULL,
+                 ordinal INTEGER NOT NULL,
+                 task_id TEXT,
+                 owner_surface TEXT NOT NULL,
+                 history_disposition INTEGER NOT NULL DEFAULT 0
+                     CHECK(history_disposition IN (0, 1, 2)),
+                 history_unavailable_reason TEXT,
+                 CHECK((history_disposition=2 AND history_unavailable_reason IS NOT NULL
+                        AND length(history_unavailable_reason) BETWEEN 1 AND 64)
+                    OR (history_disposition IN (0, 1)
+                        AND history_unavailable_reason IS NULL)),
+                 UNIQUE(execution_id, ordinal)
+             );
+             INSERT INTO attempt_identities(
+                 attempt_id, execution_id, ordinal, task_id, owner_surface,
+                 history_disposition, history_unavailable_reason)
+             SELECT attempt_id, execution_id, ordinal, task_id, owner_surface,
+                    summary_attached, NULL
+             FROM attempt_identities_legacy_disposition;
+             DROP TABLE attempt_identities_legacy_disposition;
+             CREATE INDEX idx_attempt_identities_task
+                 ON attempt_identities(task_id, ordinal);",
+        )?;
+    } else if !columns.contains("history_disposition") {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::ConflictingAuthority,
+        ));
+    } else if !columns.contains("history_unavailable_reason") {
+        tx.execute_batch(
+            "ALTER TABLE attempt_identities
+                 ADD COLUMN history_unavailable_reason TEXT;",
+        )?;
+    }
+    Ok(())
 }
 
 fn migrate_attempt_identity_authority(
@@ -1040,7 +2349,7 @@ fn migrate_attempt_identity_authority(
     if legacy_exists != 0 {
         tx.execute_batch(
             "INSERT INTO attempt_identities(
-                 attempt_id, execution_id, ordinal, task_id, owner_surface, summary_attached)
+                 attempt_id, execution_id, ordinal, task_id, owner_surface, history_disposition)
              SELECT legacy.attempt_id, legacy.execution_id, legacy.ordinal, legacy.task_id,
                     'served_task',
                     CASE WHEN EXISTS(
@@ -1094,7 +2403,7 @@ fn migrate_attempt_identity_authority(
         }
         tx.execute(
             "INSERT INTO attempt_identities(
-                 attempt_id, execution_id, ordinal, task_id, owner_surface, summary_attached)
+                 attempt_id, execution_id, ordinal, task_id, owner_surface, history_disposition)
              VALUES(
                  ?1, ?2, ?3, ?4, 'served_task',
                  CASE WHEN EXISTS(
@@ -1110,6 +2419,14 @@ fn migrate_attempt_identity_authority(
                 task_id
             ],
         )?;
+        if let Some(reason) = locator.telemetry_unavailable {
+            tx.execute(
+                "UPDATE attempt_identities
+                 SET history_disposition=2, history_unavailable_reason=?2
+                 WHERE attempt_id=?1 AND history_disposition=0",
+                rusqlite::params![locator.identity.attempt_id.as_str(), reason.as_str()],
+            )?;
+        }
         let admitted: Option<(String, i64, Option<String>, String)> = tx
             .query_row(
                 "SELECT execution_id, ordinal, task_id, owner_surface
@@ -1151,7 +2468,7 @@ fn migrate_attempt_identity_authority(
     for (attempt_id, execution_id, ordinal, task_id, surface) in summaries {
         tx.execute(
             "INSERT INTO attempt_identities(
-                 attempt_id, execution_id, ordinal, task_id, owner_surface, summary_attached)
+                 attempt_id, execution_id, ordinal, task_id, owner_surface, history_disposition)
              VALUES(?1, ?2, ?3, ?4, ?5, 1)
              ON CONFLICT(attempt_id) DO NOTHING",
             rusqlite::params![attempt_id, execution_id, ordinal, task_id, surface],
@@ -1177,7 +2494,7 @@ fn migrate_attempt_identity_authority(
             ));
         }
         let changed = tx.execute(
-            "UPDATE attempt_identities SET summary_attached=1 WHERE attempt_id=?1",
+            "UPDATE attempt_identities SET history_disposition=1 WHERE attempt_id=?1",
             rusqlite::params![attempt_id],
         )?;
         if changed != 1 {
@@ -1188,6 +2505,255 @@ fn migrate_attempt_identity_authority(
     }
     if legacy_exists != 0 {
         tx.execute_batch("DROP TABLE task_attempt_identities;")?;
+    }
+    Ok(())
+}
+
+fn migrate_history_allocation(
+    tx: &rusqlite::Transaction<'_>,
+    requested_kind: Option<HistoryAllocationKind>,
+) -> Result<(), SchemaMigrationError> {
+    use bridge_core::workflow_history::{
+        HISTORY_ATTACHMENT_CHARGE, MAX_CHARGED_BYTES, MAX_TERMINAL_ROWS, RETAINED_SUMMARY_CHARGE,
+    };
+
+    let Some(requested_kind) = requested_kind else {
+        return Ok(());
+    };
+    let slot_charge = RETAINED_SUMMARY_CHARGE + HISTORY_ATTACHMENT_CHARGE;
+    let persisted: Option<HistoryAllocationRow> = tx
+        .query_row(
+            "SELECT allocation_kind, allocation_state, accounting_version,
+                    byte_limit, slot_limit, summary_charge, attachment_charge,
+                    charged_bytes, slots_used, terminal_rows
+             FROM workflow_history_allocation WHERE singleton=1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let counts = || -> Result<(i64, i64, i64, i64, i64, i64), rusqlite::Error> {
+        let summaries = tx.query_row(
+            "SELECT COUNT(*) FROM workflow_attempt_summaries",
+            [],
+            |row| row.get(0),
+        )?;
+        let attachments = tx.query_row(
+            "SELECT COUNT(*) FROM workflow_history_attachment",
+            [],
+            |row| row.get(0),
+        )?;
+        let terminals = tx.query_row(
+            "SELECT COUNT(*) FROM workflow_attempt_summaries WHERE status='terminal'",
+            [],
+            |row| row.get(0),
+        )?;
+        let bad_summaries = tx.query_row(
+            "SELECT COUNT(*) FROM workflow_attempt_summaries WHERE charged_bytes<>16384",
+            [],
+            |row| row.get(0),
+        )?;
+        let bad_attachments = tx.query_row(
+            "SELECT COUNT(*) FROM workflow_history_attachment WHERE charged_bytes<>1024",
+            [],
+            |row| row.get(0),
+        )?;
+        let bad_identities = tx.query_row(
+            "SELECT COUNT(*)
+             FROM workflow_attempt_summaries summary
+             LEFT JOIN attempt_identities identity ON identity.attempt_id=summary.attempt_id
+             WHERE identity.attempt_id IS NULL OR identity.history_disposition<>1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((
+            summaries,
+            attachments,
+            terminals,
+            bad_summaries,
+            bad_attachments,
+            bad_identities,
+        ))
+    };
+
+    if let Some((
+        kind,
+        state,
+        version,
+        byte_limit,
+        slot_limit,
+        summary_charge,
+        attachment_charge,
+        charged_bytes,
+        slots_used,
+        terminal_rows,
+    )) = persisted
+    {
+        let resuming_platform = requested_kind == HistoryAllocationKind::Platform
+            && HistoryAllocationKind::parse(&kind) == Some(HistoryAllocationKind::Platform)
+            && state == "migrating";
+        if HistoryAllocationKind::parse(&kind) != Some(requested_kind)
+            || (state != "ready" && !resuming_platform)
+            || version != 1
+            || byte_limit != i64::try_from(MAX_CHARGED_BYTES).unwrap_or(i64::MAX)
+            || slot_limit != i64::try_from(MAX_TERMINAL_ROWS).unwrap_or(i64::MAX)
+            || summary_charge != i64::try_from(RETAINED_SUMMARY_CHARGE).unwrap_or(i64::MAX)
+            || attachment_charge != i64::try_from(HISTORY_ATTACHMENT_CHARGE).unwrap_or(i64::MAX)
+        {
+            return Err(SchemaMigrationError::Validation(
+                MigrationValidationError::AllocationKind,
+            ));
+        }
+        if requested_kind == HistoryAllocationKind::Platform {
+            tx.execute(
+                "UPDATE workflow_attempt_summaries SET charged_bytes=16384
+                 WHERE charged_bytes<>16384",
+                [],
+            )?;
+        }
+        if requested_kind == HistoryAllocationKind::Configured {
+            let (summaries, attachments, terminals, bad_summaries, bad_attachments, bad_identities) =
+                counts()?;
+            let expected_charge =
+                summaries.checked_mul(i64::try_from(slot_charge).unwrap_or(i64::MAX));
+            if summaries < 0
+                || attachments != summaries
+                || terminals < 0
+                || terminals > summaries
+                || slots_used != summaries
+                || terminal_rows != terminals
+                || expected_charge != Some(charged_bytes)
+                || bad_summaries != 0
+                || bad_attachments != 0
+                || bad_identities != 0
+            {
+                return Err(SchemaMigrationError::Validation(
+                    MigrationValidationError::Corruption,
+                ));
+            }
+        } else if charged_bytes != 0 || slots_used != 0 || terminal_rows != 0 {
+            return Err(SchemaMigrationError::Validation(
+                MigrationValidationError::Corruption,
+            ));
+        }
+        return Ok(());
+    }
+
+    tx.execute(
+        "UPDATE attempt_identities SET history_disposition=1,
+             history_unavailable_reason=NULL
+         WHERE history_disposition=0 AND EXISTS(
+             SELECT 1 FROM workflow_attempt_summaries summary
+             WHERE summary.attempt_id=attempt_identities.attempt_id)",
+        [],
+    )?;
+    let invalid_identity: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM workflow_attempt_summaries summary
+         LEFT JOIN attempt_identities identity ON identity.attempt_id=summary.attempt_id
+         WHERE identity.attempt_id IS NULL OR identity.history_disposition<>1",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_identity != 0 {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::Corruption,
+        ));
+    }
+    tx.execute("DELETE FROM workflow_history_attachment", [])?;
+    tx.execute(
+        "INSERT INTO workflow_history_attachment(attempt_id, charged_bytes)
+         SELECT attempt_id, 1024 FROM workflow_attempt_summaries",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE workflow_attempt_summaries SET charged_bytes=16384",
+        [],
+    )?;
+
+    if requested_kind == HistoryAllocationKind::Configured {
+        let maximum_slots = MAX_TERMINAL_ROWS.min(MAX_CHARGED_BYTES / slot_charge);
+        loop {
+            let summaries: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM workflow_attempt_summaries",
+                [],
+                |row| row.get(0),
+            )?;
+            if u64::try_from(summaries).unwrap_or(u64::MAX) <= maximum_slots {
+                break;
+            }
+            let victim: Option<String> = tx
+                .query_row(
+                    "SELECT attempt_id FROM workflow_attempt_summaries
+                     WHERE status='terminal' AND pinned=0
+                     ORDER BY completed_ms, attempt_id LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(victim) = victim else {
+                return Err(SchemaMigrationError::Validation(
+                    MigrationValidationError::CapacityProtected,
+                ));
+            };
+            if tx.execute(
+                "DELETE FROM workflow_attempt_summaries
+                 WHERE attempt_id=?1 AND status='terminal' AND pinned=0",
+                rusqlite::params![victim],
+            )? != 1
+            {
+                return Err(SchemaMigrationError::Validation(
+                    MigrationValidationError::Corruption,
+                ));
+            }
+        }
+        let (summaries, attachments, terminals, bad_summaries, bad_attachments, bad_identities) =
+            counts()?;
+        if summaries != attachments
+            || bad_summaries != 0
+            || bad_attachments != 0
+            || bad_identities != 0
+        {
+            return Err(SchemaMigrationError::Validation(
+                MigrationValidationError::Corruption,
+            ));
+        }
+        let charged_bytes = summaries
+            .checked_mul(i64::try_from(slot_charge).unwrap_or(i64::MAX))
+            .ok_or(SchemaMigrationError::Validation(
+                MigrationValidationError::Corruption,
+            ))?;
+        tx.execute(
+            "INSERT INTO workflow_history_allocation(
+                 singleton, allocation_kind, allocation_state, accounting_version,
+                 byte_limit, slot_limit, summary_charge, attachment_charge,
+                 charged_bytes, slots_used, terminal_rows)
+             VALUES(1, 'configured', 'ready', 1, 134217728, 100000,
+                    16384, 1024, ?1, ?2, ?3)",
+            rusqlite::params![charged_bytes, summaries, terminals],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO workflow_history_allocation(
+                 singleton, allocation_kind, allocation_state, accounting_version,
+                 byte_limit, slot_limit, summary_charge, attachment_charge,
+                 charged_bytes, slots_used, terminal_rows)
+             VALUES(1, 'platform', 'migrating', 1, 134217728, 100000,
+                    16384, 1024, 0, 0, 0)",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -1690,7 +3256,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         .map_err(|_| BridgeError::StoreFailure)?;
         tx.execute(
             "INSERT INTO attempt_identities(
-                 attempt_id, execution_id, ordinal, task_id, owner_surface, summary_attached)
+                 attempt_id, execution_id, ordinal, task_id, owner_surface, history_disposition)
              VALUES(?1, ?2, ?3, ?4, 'served_task', 0)",
             rusqlite::params![
                 locator.identity.attempt_id.as_str(),
@@ -1750,7 +3316,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let tx = immediate_transaction(&conn)?;
         tx.execute(
             "INSERT INTO attempt_identities(
-                 attempt_id, execution_id, ordinal, task_id, owner_surface, summary_attached)
+                 attempt_id, execution_id, ordinal, task_id, owner_surface, history_disposition)
              VALUES(?1, ?2, ?3, ?4, 'served_task', 0)",
             rusqlite::params![
                 locator.identity.attempt_id.as_str(),
@@ -1780,31 +3346,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
     ) -> Result<(), BridgeError> {
         let conn = self.conn.lock().map_err(|_| BridgeError::StoreFailure)?;
         let tx = immediate_transaction(&conn)?;
-        let prior: Option<String> = tx
-            .query_row(
-                "SELECT locator_json FROM task_attempt_locators WHERE task_id=?1",
-                rusqlite::params![task.as_str()],
-                |row| row.get(0),
-            )
-            .optional()
+        settle_served_attempt_unavailable(&tx, task, attempt, reason)
             .map_err(|_| BridgeError::StoreFailure)?;
-        let mut locator: bridge_core::task_store::TaskAttemptLocator =
-            serde_json::from_str(&prior.ok_or(BridgeError::StoreFailure)?)
-                .map_err(|_| BridgeError::StoreFailure)?;
-        if &locator.identity.attempt_id != attempt {
-            return Err(BridgeError::StoreFailure);
-        }
-        locator.telemetry_unavailable = Some(reason);
-        let json = serde_json::to_string(&locator).map_err(|_| BridgeError::StoreFailure)?;
-        let changed = tx
-            .execute(
-                "UPDATE task_attempt_locators SET locator_json=?2 WHERE task_id=?1",
-                rusqlite::params![task.as_str(), json],
-            )
-            .map_err(|_| BridgeError::StoreFailure)?;
-        if changed != 1 {
-            return Err(BridgeError::StoreFailure);
-        }
         tx.commit().map_err(|_| BridgeError::StoreFailure)
     }
 
@@ -2071,7 +3614,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         let next_json = serde_json::to_string(next).map_err(|_| BridgeError::StoreFailure)?;
         tx.execute(
             "INSERT INTO attempt_identities(
-                 attempt_id, execution_id, ordinal, task_id, owner_surface, summary_attached)
+                 attempt_id, execution_id, ordinal, task_id, owner_surface, history_disposition)
              VALUES(?1, ?2, ?3, ?4, 'served_task', 0)",
             rusqlite::params![
                 next.identity.attempt_id.as_str(),
@@ -2674,7 +4217,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         .map_err(|_| BridgeError::StoreFailure)?;
         tx.execute(
             "INSERT INTO attempt_identities(
-                 attempt_id, execution_id, ordinal, task_id, owner_surface, summary_attached)
+                 attempt_id, execution_id, ordinal, task_id, owner_surface, history_disposition)
              VALUES(?1, ?2, ?3, ?4, 'served_task', 0)",
             rusqlite::params![
                 locator.identity.attempt_id.as_str(),
@@ -3714,12 +5257,711 @@ fn row_to_batch(row: &rusqlite::Row) -> Result<bridge_core::task_store::BatchRec
     })
 }
 
+fn history_allocation_table_exists(
+    conn: &rusqlite::Connection,
+) -> Result<bool, SchemaMigrationError> {
+    let objects = {
+        let mut statement = conn.prepare(
+            "SELECT type, name FROM sqlite_master
+             WHERE type IN ('table','view')
+               AND name COLLATE NOCASE='workflow_history_allocation'
+             ORDER BY type, name",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    match objects.as_slice() {
+        [] => Ok(false),
+        [(object_type, name)]
+            if object_type == "table" && name == "workflow_history_allocation" =>
+        {
+            Ok(true)
+        }
+        _ => Err(SchemaMigrationError::Validation(
+            MigrationValidationError::AllocationSchema,
+        )),
+    }
+}
+
+fn sqlite_persisted_value_is_invalid(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::FromSqlConversionFailure(_, _, _)
+            | rusqlite::Error::IntegralValueOutOfRange(_, _)
+            | rusqlite::Error::InvalidColumnType(_, _, _)
+    )
+}
+
+fn tagged_allocation_row_error(error: rusqlite::Error) -> SchemaMigrationError {
+    if sqlite_persisted_value_is_invalid(&error) {
+        SchemaMigrationError::Validation(MigrationValidationError::Corruption)
+    } else {
+        SchemaMigrationError::Sqlite(error)
+    }
+}
+
+const CANONICAL_HISTORY_ALLOCATION_DDL: &str = "
+    CREATE TABLE workflow_history_allocation (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+        allocation_kind TEXT NOT NULL
+            CHECK(allocation_kind IN ('configured','platform')),
+        allocation_state TEXT NOT NULL
+            CHECK(allocation_state IN ('migrating','ready')),
+        accounting_version INTEGER NOT NULL CHECK(accounting_version=1),
+        byte_limit INTEGER NOT NULL CHECK(byte_limit=134217728),
+        slot_limit INTEGER NOT NULL CHECK(slot_limit=100000),
+        summary_charge INTEGER NOT NULL CHECK(summary_charge=16384),
+        attachment_charge INTEGER NOT NULL CHECK(attachment_charge=1024),
+        charged_bytes INTEGER NOT NULL CHECK(charged_bytes>=0 AND charged_bytes<=byte_limit),
+        slots_used INTEGER NOT NULL CHECK(slots_used>=0 AND slots_used<=slot_limit),
+        terminal_rows INTEGER NOT NULL
+            CHECK(terminal_rows>=0 AND terminal_rows<=slots_used),
+        CHECK(
+            (allocation_kind='configured'
+             AND charged_bytes=slots_used*(summary_charge+attachment_charge))
+            OR
+            (allocation_kind='platform' AND charged_bytes=0
+             AND slots_used=0 AND terminal_rows=0)
+        )
+    )";
+
+#[derive(Debug, PartialEq, Eq)]
+enum SchemaSqlToken {
+    Word(String),
+    Number(String),
+    Quoted(String),
+    Symbol(String),
+}
+
+fn schema_sql_tokens(sql: &str) -> Option<Vec<SchemaSqlToken>> {
+    let mut tokens = Vec::new();
+    let mut characters = sql.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character.is_ascii_whitespace() {
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            let delimiter = character;
+            let mut quoted = String::from(character);
+            let mut closed = false;
+            while let Some(character) = characters.next() {
+                quoted.push(character);
+                if character == delimiter {
+                    if characters.peek() == Some(&delimiter) {
+                        quoted.push(characters.next()?);
+                    } else {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+            if !closed {
+                return None;
+            }
+            tokens.push(SchemaSqlToken::Quoted(quoted));
+            continue;
+        }
+        if character.is_ascii_alphabetic() || character == '_' {
+            let mut word = String::from(character.to_ascii_lowercase());
+            while let Some(next) = characters.peek() {
+                if next.is_ascii_alphanumeric() || *next == '_' {
+                    word.push(characters.next()?.to_ascii_lowercase());
+                } else {
+                    break;
+                }
+            }
+            tokens.push(SchemaSqlToken::Word(word));
+            continue;
+        }
+        if character.is_ascii_digit() {
+            let mut number = String::from(character);
+            while characters.peek().is_some_and(char::is_ascii_digit) {
+                number.push(characters.next()?);
+            }
+            tokens.push(SchemaSqlToken::Number(number));
+            continue;
+        }
+
+        let symbol = match character {
+            '-' if characters.peek() == Some(&'-') => return None,
+            '/' if characters.peek() == Some(&'*') => return None,
+            '<' if characters.peek() == Some(&'=') || characters.peek() == Some(&'>') => {
+                format!("{character}{}", characters.next()?)
+            }
+            '>' if characters.peek() == Some(&'=') => {
+                format!("{character}{}", characters.next()?)
+            }
+            '!' if characters.peek() == Some(&'=') => {
+                format!("{character}{}", characters.next()?)
+            }
+            '!' => return None,
+            '=' if characters.peek() == Some(&'=') => {
+                format!("{character}{}", characters.next()?)
+            }
+            '|' if characters.peek() == Some(&'|') => {
+                format!("{character}{}", characters.next()?)
+            }
+            '|' => return None,
+            '-' if characters.peek() == Some(&'>') => {
+                let mut operator = format!("{character}{}", characters.next()?);
+                if characters.peek() == Some(&'>') {
+                    operator.push(characters.next()?);
+                }
+                operator
+            }
+            '(' | ')' | ',' | '.' | ';' | '=' | '<' | '>' | '+' | '-' | '*' | '/' | '%' => {
+                String::from(character)
+            }
+            _ => return None,
+        };
+        tokens.push(SchemaSqlToken::Symbol(symbol));
+    }
+    Some(tokens)
+}
+
+fn validate_history_allocation_schema(
+    conn: &rusqlite::Connection,
+) -> Result<(), SchemaMigrationError> {
+    let persisted: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type='table' AND name='workflow_history_allocation'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if persisted.as_deref().and_then(schema_sql_tokens)
+        != schema_sql_tokens(CANONICAL_HISTORY_ALLOCATION_DDL)
+    {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::AllocationSchema,
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryIdentityDispositionColumn {
+    LegacySummaryAttached,
+    HistoryDisposition,
+}
+
+fn history_identity_disposition_column(
+    conn: &rusqlite::Connection,
+) -> Result<HistoryIdentityDispositionColumn, SchemaMigrationError> {
+    let mut statement = conn.prepare("PRAGMA table_info(attempt_identities)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<HashSet<_>, _>>()?;
+    match (
+        columns.contains("history_disposition"),
+        columns.contains("summary_attached"),
+    ) {
+        (true, false) => Ok(HistoryIdentityDispositionColumn::HistoryDisposition),
+        (false, true) => Ok(HistoryIdentityDispositionColumn::LegacySummaryAttached),
+        _ => Err(SchemaMigrationError::Validation(
+            MigrationValidationError::Corruption,
+        )),
+    }
+}
+
+fn validate_untagged_history_schema(
+    conn: &rusqlite::Connection,
+) -> Result<HistoryIdentityDispositionColumn, SchemaMigrationError> {
+    if history_allocation_table_exists(conn)? {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::AllocationKind,
+        ));
+    }
+    let required_tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='table' AND name IN (
+             'sessions', 'tasks', 'task_attempt_locators', 'attempt_identities',
+             'task_node_checkpoints', 'task_node_starts', 'task_journal', 'turn_log',
+             'workflow_attempt_summaries', 'workflow_history_rewrite_reserve'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if required_tables != 10 {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::Corruption,
+        ));
+    }
+    for projection in [
+        "SELECT task_id, session_id FROM sessions LIMIT 0",
+        "SELECT id, workflow, status, result, error, created_ms, updated_ms FROM tasks LIMIT 0",
+        "SELECT task_id, locator_json FROM task_attempt_locators LIMIT 0",
+        "SELECT attempt_id, execution_id, ordinal, task_id, owner_surface
+         FROM attempt_identities LIMIT 0",
+        "SELECT task_id, node_id, output, ok, ts FROM task_node_checkpoints LIMIT 0",
+        "SELECT task_id, node_id, seq, ts FROM task_node_starts LIMIT 0",
+        "SELECT task_id, seq, event_json FROM task_journal LIMIT 0",
+        "SELECT turn_id, session_id, attempt, agent FROM turn_log LIMIT 0",
+        "SELECT attempt_id, execution_id, parent_attempt_id, ordinal, task_id,
+                workflow, task_class, surface, policy, workload_fingerprint,
+                started_ms, completed_ms, status, outcome, degraded, pinned,
+                charged_bytes, reservation_json, terminal_json
+         FROM workflow_attempt_summaries LIMIT 0",
+        "SELECT singleton, reserve FROM workflow_history_rewrite_reserve LIMIT 0",
+    ] {
+        conn.prepare(projection)?;
+    }
+    let disposition = history_identity_disposition_column(conn)?;
+    let attachments: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='table' AND name='workflow_history_attachment'",
+        [],
+        |row| row.get(0),
+    )?;
+    if attachments == 1 {
+        conn.prepare("SELECT attempt_id, charged_bytes FROM workflow_history_attachment LIMIT 0")?;
+    }
+    Ok(disposition)
+}
+
+fn validate_untagged_history_schema_path(
+    path: &std::path::Path,
+) -> Result<HistoryIdentityDispositionColumn, bridge_core::workflow_history::LedgerError> {
+    let mut connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| history_error(&error))?;
+    connection
+        .execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=5000;")
+        .map_err(|error| history_error(&error))?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+        .map_err(|error| history_error(&error))?;
+    let disposition =
+        validate_untagged_history_schema(&tx).map_err(|error| schema_migration_error(&error))?;
+    tx.commit().map_err(|error| history_error(&error))?;
+    Ok(disposition)
+}
+
+fn validate_tagged_history_allocation(
+    conn: &rusqlite::Connection,
+    expected_kind: HistoryAllocationKind,
+    allow_platform_migrating: bool,
+) -> Result<(), SchemaMigrationError> {
+    use bridge_core::workflow_history::{
+        CONFIGURED_SLOT_CHARGE, HISTORY_ATTACHMENT_CHARGE, MAX_CHARGED_BYTES, MAX_TERMINAL_ROWS,
+        RETAINED_SUMMARY_CHARGE,
+    };
+
+    if !history_allocation_table_exists(conn)? {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::Corruption,
+        ));
+    }
+    validate_history_allocation_schema(conn)?;
+    let allocation_rows: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM workflow_history_allocation",
+        [],
+        |row| row.get(0),
+    )?;
+    if allocation_rows != 1 {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::Corruption,
+        ));
+    }
+    let row: Option<HistoryAllocationRow> = conn
+        .query_row(
+            "SELECT allocation_kind, allocation_state, accounting_version,
+                    byte_limit, slot_limit, summary_charge, attachment_charge,
+                    charged_bytes, slots_used, terminal_rows
+             FROM workflow_history_allocation WHERE singleton=1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(tagged_allocation_row_error)?;
+    let Some((
+        kind,
+        state,
+        version,
+        byte_limit,
+        slot_limit,
+        summary_charge,
+        attachment_charge,
+        charged_bytes,
+        slots_used,
+        terminal_rows,
+    )) = row
+    else {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::Corruption,
+        ));
+    };
+    let actual_kind = HistoryAllocationKind::parse(&kind).ok_or(
+        SchemaMigrationError::Validation(MigrationValidationError::Corruption),
+    )?;
+    if !matches!(state.as_str(), "migrating" | "ready") {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::Corruption,
+        ));
+    }
+    if version != 1
+        || byte_limit != i64::try_from(MAX_CHARGED_BYTES).unwrap_or(i64::MAX)
+        || slot_limit != i64::try_from(MAX_TERMINAL_ROWS).unwrap_or(i64::MAX)
+        || summary_charge != i64::try_from(RETAINED_SUMMARY_CHARGE).unwrap_or(i64::MAX)
+        || attachment_charge != i64::try_from(HISTORY_ATTACHMENT_CHARGE).unwrap_or(i64::MAX)
+    {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::Corruption,
+        ));
+    }
+    if charged_bytes < 0
+        || charged_bytes > i64::try_from(MAX_CHARGED_BYTES).unwrap_or(i64::MAX)
+        || slots_used < 0
+        || slots_used > i64::try_from(MAX_TERMINAL_ROWS).unwrap_or(i64::MAX)
+        || terminal_rows < 0
+        || terminal_rows > slots_used
+    {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::Corruption,
+        ));
+    }
+
+    #[cfg(test)]
+    tagged_validation_after_metadata();
+
+    let required_tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='table' AND name IN (
+             'workflow_attempt_summaries',
+             'workflow_history_attachment',
+             'attempt_identities',
+             'task_attempt_locators'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if required_tables != 4 {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::Corruption,
+        ));
+    }
+    let locators = {
+        let mut statement = conn
+            .prepare("SELECT task_id, locator_json FROM task_attempt_locators ORDER BY task_id")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (task_id, json) in locators {
+        let locator: bridge_core::task_store::TaskAttemptLocator = serde_json::from_str(&json)
+            .map_err(|_| SchemaMigrationError::Validation(MigrationValidationError::Corruption))?;
+        if locator.identity.execution_id.as_str() != task_id {
+            return Err(SchemaMigrationError::Validation(
+                MigrationValidationError::Corruption,
+            ));
+        }
+        let identity: Option<AttemptIdentityAuthorityRow> = conn
+            .query_row(
+                "SELECT execution_id, ordinal, task_id, owner_surface,
+                        history_disposition, history_unavailable_reason
+                 FROM attempt_identities WHERE attempt_id=?1",
+                rusqlite::params![locator.identity.attempt_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((execution, ordinal, identity_task, surface, disposition, reason)) = identity
+        else {
+            return Err(SchemaMigrationError::Validation(
+                MigrationValidationError::Corruption,
+            ));
+        };
+        let marker = locator
+            .telemetry_unavailable
+            .map(|unavailable| unavailable.as_str());
+        let disposition_coherent = match disposition {
+            0 => reason.is_none() && marker.is_none(),
+            1 => reason.is_none(),
+            2 => reason.as_deref() == marker && marker.is_some(),
+            _ => false,
+        };
+        if execution != locator.identity.execution_id.as_str()
+            || ordinal != i64::from(locator.identity.ordinal)
+            || identity_task.as_deref() != Some(task_id.as_str())
+            || surface != "served_task"
+            || !disposition_coherent
+        {
+            return Err(SchemaMigrationError::Validation(
+                MigrationValidationError::Corruption,
+            ));
+        }
+    }
+    let structural_corruption: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM workflow_attempt_summaries summary
+         LEFT JOIN workflow_history_attachment attachment
+           ON attachment.attempt_id=summary.attempt_id
+         LEFT JOIN attempt_identities identity
+           ON identity.attempt_id=summary.attempt_id
+         WHERE summary.status NOT IN ('active','terminal')
+            OR attachment.attempt_id IS NULL
+            OR attachment.charged_bytes<>1024
+            OR identity.attempt_id IS NULL
+            OR identity.history_disposition<>1",
+        [],
+        |row| row.get(0),
+    )?;
+    let orphan_attachments: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM workflow_history_attachment attachment
+         LEFT JOIN workflow_attempt_summaries summary
+           ON summary.attempt_id=attachment.attempt_id
+         WHERE summary.attempt_id IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if structural_corruption != 0 || orphan_attachments != 0 {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::Corruption,
+        ));
+    }
+
+    if actual_kind == HistoryAllocationKind::Platform {
+        if charged_bytes != 0 || slots_used != 0 || terminal_rows != 0 {
+            return Err(SchemaMigrationError::Validation(
+                MigrationValidationError::Corruption,
+            ));
+        }
+    } else {
+        let (summaries, attachments, terminals, invalid_statuses): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                 (SELECT COUNT(*) FROM workflow_attempt_summaries),
+                 (SELECT COUNT(*) FROM workflow_history_attachment),
+                 (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE status='terminal'),
+                 (SELECT COUNT(*) FROM workflow_attempt_summaries
+                  WHERE status NOT IN ('active','terminal'))",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let bad_summaries: i64 = conn.query_row(
+            "SELECT COUNT(*)
+         FROM workflow_attempt_summaries summary
+         LEFT JOIN workflow_history_attachment attachment
+           ON attachment.attempt_id=summary.attempt_id
+         LEFT JOIN attempt_identities identity
+           ON identity.attempt_id=summary.attempt_id
+         WHERE summary.charged_bytes<>16384
+            OR attachment.attempt_id IS NULL
+            OR attachment.charged_bytes<>1024
+            OR identity.attempt_id IS NULL
+            OR identity.history_disposition<>1",
+            [],
+            |row| row.get(0),
+        )?;
+        let orphan_attachments: i64 = conn.query_row(
+            "SELECT COUNT(*)
+         FROM workflow_history_attachment attachment
+         LEFT JOIN workflow_attempt_summaries summary
+           ON summary.attempt_id=attachment.attempt_id
+         WHERE summary.attempt_id IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let expected_charge =
+            summaries.checked_mul(i64::try_from(CONFIGURED_SLOT_CHARGE).unwrap_or(i64::MAX));
+        if summaries < 0
+            || attachments != summaries
+            || terminals < 0
+            || terminals > summaries
+            || invalid_statuses != 0
+            || bad_summaries != 0
+            || orphan_attachments != 0
+            || slots_used != summaries
+            || terminal_rows != terminals
+            || expected_charge != Some(charged_bytes)
+        {
+            return Err(SchemaMigrationError::Validation(
+                MigrationValidationError::Corruption,
+            ));
+        }
+    }
+
+    let valid_state = state == "ready"
+        || (actual_kind == HistoryAllocationKind::Platform
+            && allow_platform_migrating
+            && state == "migrating");
+    if actual_kind != expected_kind || !valid_state {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::AllocationKind,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_history_allocation_path(
+    path: &std::path::Path,
+    expected_kind: HistoryAllocationKind,
+    allow_platform_migrating: bool,
+) -> Result<(), bridge_core::workflow_history::LedgerError> {
+    let mut connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| history_error(&error))?;
+    connection
+        .execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=5000;")
+        .map_err(|error| history_error(&error))?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+        .map_err(|error| history_error(&error))?;
+    validate_tagged_history_allocation(&tx, expected_kind, allow_platform_migrating)
+        .map_err(|error| schema_migration_error(&error))?;
+    tx.commit().map_err(|error| history_error(&error))?;
+    Ok(())
+}
+
+fn prevalidate_tagged_history_path(
+    path: &std::path::Path,
+    expected_kind: Option<HistoryAllocationKind>,
+    allow_platform_migrating: bool,
+) -> Result<Option<HistoryAllocationKind>, bridge_core::workflow_history::LedgerError> {
+    let database_exists = preflight_history_path(path)?;
+    if !database_exists {
+        return Ok(None);
+    }
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    history_prevalidation_pause(path)?;
+    let canonical_path = canonical_history_path(path)?;
+    let Some(actual_kind) = probe_history_allocation_kind(&canonical_path)? else {
+        return Ok(None);
+    };
+    validate_history_allocation_path(
+        &canonical_path,
+        actual_kind,
+        allow_platform_migrating && actual_kind == HistoryAllocationKind::Platform,
+    )?;
+    if expected_kind.is_some_and(|expected| expected != actual_kind) {
+        return Err(bridge_core::workflow_history::LedgerError::new(
+            bridge_core::workflow_history::LedgerUnavailableReason::Migration,
+        ));
+    }
+    Ok(Some(actual_kind))
+}
+
+fn probe_history_allocation_kind_snapshot(
+    connection: &rusqlite::Connection,
+) -> Result<Option<HistoryAllocationKind>, bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    let table_exists = history_allocation_table_exists(connection)
+        .map_err(|error| schema_migration_error(&error))?;
+    if !table_exists {
+        return Ok(None);
+    }
+    validate_history_allocation_schema(connection)
+        .map_err(|error| schema_migration_error(&error))?;
+    let allocation_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM workflow_history_allocation",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| history_migration_error(&error))?;
+    if allocation_rows != 1 {
+        return Err(LedgerError::new(R::Corruption));
+    }
+    let persisted: Option<(String, String)> = connection
+        .query_row(
+            "SELECT allocation_kind, allocation_state
+             FROM workflow_history_allocation WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            if sqlite_persisted_value_is_invalid(&error) {
+                LedgerError::new(R::Corruption)
+            } else {
+                history_migration_error(&error)
+            }
+        })?;
+    let Some((kind, state)) = persisted else {
+        return Err(LedgerError::new(R::Corruption));
+    };
+    if !matches!(state.as_str(), "migrating" | "ready") {
+        return Err(LedgerError::new(R::Corruption));
+    }
+    HistoryAllocationKind::parse(&kind)
+        .map(Some)
+        .ok_or_else(|| LedgerError::new(R::Corruption))
+}
+
+fn probe_history_allocation_kind(
+    path: &std::path::Path,
+) -> Result<Option<HistoryAllocationKind>, bridge_core::workflow_history::LedgerError> {
+    let database_exists = preflight_history_path(path)?;
+    if !database_exists {
+        return Ok(None);
+    }
+    let mut connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| history_error(&error))?;
+    connection
+        .execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=5000;")
+        .map_err(|error| history_error(&error))?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+        .map_err(|error| history_error(&error))?;
+    let kind = probe_history_allocation_kind_snapshot(&tx)?;
+    tx.commit().map_err(|error| history_error(&error))?;
+    Ok(kind)
+}
+
+#[cfg(test)]
 fn history_schema_lock_path(path: &std::path::Path) -> std::path::PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".lock");
     std::path::PathBuf::from(name)
 }
 
+#[cfg(test)]
+fn history_kind_lock_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".schema.lock");
+    std::path::PathBuf::from(name)
+}
+
+#[cfg(test)]
 fn history_admission_lock_path(path: &std::path::Path) -> std::path::PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".admission.lock");
@@ -3732,14 +5974,1733 @@ fn history_attempt_lock_dir(path: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(name)
 }
 
+fn ensure_history_write_supported() -> Result<(), bridge_core::workflow_history::LedgerError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(bridge_core::workflow_history::LedgerError::new(
+            bridge_core::workflow_history::LedgerUnavailableReason::Open,
+        ))
+    }
+}
+
+fn bootstrap_selected_platform_history(
+    path: &std::path::Path,
+) -> Result<PlatformHistoryBootstrap, bridge_core::workflow_history::LedgerError> {
+    ensure_history_write_supported()?;
+    // This complete read-only validation is deliberately before the first
+    // namespace mutation. An absent database and parent return None.
+    prevalidate_tagged_history_path(path, Some(HistoryAllocationKind::Platform), true).map_err(
+        |error| {
+            if error.reason == bridge_core::workflow_history::LedgerUnavailableReason::Permission
+                && error.sqlite_primary_code.is_none()
+                && error.sqlite_extended_code.is_none()
+            {
+                bridge_core::workflow_history::LedgerError::new(
+                    bridge_core::workflow_history::LedgerUnavailableReason::ReadOnlyParent,
+                )
+            } else {
+                error
+            }
+        },
+    )?;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        bootstrap_platform_history_root(path)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = path;
+        Err(bridge_core::workflow_history::LedgerError::new(
+            bridge_core::workflow_history::LedgerUnavailableReason::Open,
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn platform_bootstrap_error(
+    error: &std::io::Error,
+    namespace_error: bool,
+) -> bridge_core::workflow_history::LedgerError {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    if error.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(error.raw_os_error(), Some(libc::EPERM | libc::EROFS))
+    {
+        LedgerError::new(R::ReadOnlyParent)
+    } else if namespace_error
+        && matches!(
+            error.raw_os_error(),
+            Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
+        )
+    {
+        LedgerError::new(R::Open)
+    } else {
+        LedgerError::new(R::Io)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn platform_directory_identity(
+    directory: &std::fs::File,
+) -> Result<(u64, u64, u32), bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = directory
+        .metadata()
+        .map_err(|error| platform_bootstrap_error(&error, false))?;
+    if !metadata.is_dir() {
+        return Err(LedgerError::new(R::Open));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(LedgerError::new(R::ReadOnlyParent));
+    }
+    Ok((metadata.dev(), metadata.ino(), metadata.mode() & 0o777))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_platform_directory(
+    path: &std::path::Path,
+) -> Result<std::fs::File, bridge_core::workflow_history::LedgerError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    options
+        .open(path)
+        .map_err(|error| platform_bootstrap_error(&error, true))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::unnecessary_cast)]
+fn platform_suffix_observation(
+    directory: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> Result<PlatformSuffixObservation, bridge_core::workflow_history::LedgerError> {
+    use std::os::fd::AsRawFd as _;
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(platform_bootstrap_error(
+            &std::io::Error::last_os_error(),
+            true,
+        ));
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok((
+        stat.st_dev as u64,
+        stat.st_ino as u64,
+        stat.st_uid as u32,
+        stat.st_mode as u32 & libc::S_IFMT as u32,
+        stat.st_mode as u32 & 0o777,
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn platform_suffix_entry(
+    directory: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> Result<(u64, u64, u32, u32), bridge_core::workflow_history::LedgerError> {
+    let (device, inode, uid, file_type, mode) = platform_suffix_observation(directory, name)?;
+    if file_type != PLATFORM_DIRECTORY_FILE_TYPE {
+        return Err(bridge_core::workflow_history::LedgerError::new(
+            bridge_core::workflow_history::LedgerUnavailableReason::Open,
+        ));
+    }
+    if uid != unsafe { libc::geteuid() } {
+        return Err(bridge_core::workflow_history::LedgerError::new(
+            bridge_core::workflow_history::LedgerUnavailableReason::ReadOnlyParent,
+        ));
+    }
+    Ok((device, inode, uid, mode))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::unnecessary_cast)]
+fn platform_retained_suffix_observation(
+    directory: &std::fs::File,
+) -> Result<PlatformSuffixObservation, bridge_core::workflow_history::LedgerError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = directory
+        .metadata()
+        .map_err(|error| platform_bootstrap_error(&error, false))?;
+    Ok((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+        metadata.mode() & libc::S_IFMT as u32,
+        metadata.mode() & 0o777,
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn platform_handoff_observation_matches(
+    observation: PlatformSuffixObservation,
+    expected_identity: (u64, u64),
+    require_exact_0700: bool,
+) -> bool {
+    let (device, inode, uid, file_type, mode) = observation;
+    file_type == PLATFORM_DIRECTORY_FILE_TYPE
+        && uid == unsafe { libc::geteuid() }
+        && (device, inode) == expected_identity
+        && (!require_exact_0700 || mode == 0o700)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn platform_handoff_retained_directory_observation(
+    directory: &std::fs::File,
+    expected_identity: (u64, u64),
+    require_exact_0700: bool,
+) -> Result<PlatformSuffixObservation, bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    let observation = platform_retained_suffix_observation(directory)?;
+    if !platform_handoff_observation_matches(observation, expected_identity, require_exact_0700) {
+        return Err(LedgerError::new(R::Open));
+    }
+    Ok(observation)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn platform_handoff_child_observation_error(
+    child_error: bridge_core::workflow_history::LedgerError,
+    current_observation: Result<
+        PlatformSuffixObservation,
+        bridge_core::workflow_history::LedgerError,
+    >,
+    current_identity: (u64, u64),
+    current_requires_exact_0700: bool,
+) -> bridge_core::workflow_history::LedgerError {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    match current_observation {
+        Ok(observation)
+            if platform_handoff_observation_matches(
+                observation,
+                current_identity,
+                current_requires_exact_0700,
+            ) =>
+        {
+            child_error
+        }
+        Ok(_) => LedgerError::new(R::Open),
+        Err(error) => error,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn platform_handoff_child_observation(
+    directory: &std::fs::File,
+    name: &std::ffi::CStr,
+    current_identity: (u64, u64),
+    current_requires_exact_0700: bool,
+    child_identity: (u64, u64),
+    child_requires_exact_0700: bool,
+) -> Result<PlatformSuffixObservation, bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    match platform_suffix_observation(directory, name) {
+        Ok(observation)
+            if platform_handoff_observation_matches(
+                observation,
+                child_identity,
+                child_requires_exact_0700,
+            ) =>
+        {
+            Ok(observation)
+        }
+        Ok(_) => Err(LedgerError::new(R::Open)),
+        Err(error) => Err(platform_handoff_child_observation_error(
+            error,
+            platform_retained_suffix_observation(directory),
+            current_identity,
+            current_requires_exact_0700,
+        )),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn platform_handoff_open_error(
+    error: &std::io::Error,
+    observation: Result<PlatformSuffixObservation, bridge_core::workflow_history::LedgerError>,
+    expected_identity: (u64, u64),
+    require_exact_0700: bool,
+) -> bridge_core::workflow_history::LedgerError {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    match observation {
+        Ok(observation)
+            if platform_handoff_observation_matches(
+                observation,
+                expected_identity,
+                require_exact_0700,
+            ) =>
+        {
+            platform_bootstrap_error(error, true)
+        }
+        Ok(_) => LedgerError::new(R::Open),
+        Err(error) => error,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn platform_handoff_reopen_directory(
+    path: &std::path::Path,
+    retained_directory: &std::fs::File,
+    expected_identity: (u64, u64),
+    require_exact_0700: bool,
+) -> Result<GuardedDirectory, bridge_core::workflow_history::LedgerError> {
+    match open_platform_directory(path) {
+        Ok(file) => {
+            let (device, inode, _, _, _) = platform_handoff_retained_directory_observation(
+                &file,
+                expected_identity,
+                require_exact_0700,
+            )?;
+            Ok(GuardedDirectory {
+                file,
+                device,
+                inode,
+            })
+        }
+        Err(error) => {
+            platform_handoff_retained_directory_observation(
+                retained_directory,
+                expected_identity,
+                require_exact_0700,
+            )?;
+            Err(error)
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn guarded_platform_directory(
+    file: std::fs::File,
+) -> Result<GuardedDirectory, bridge_core::workflow_history::LedgerError> {
+    let (device, inode, _) = platform_directory_identity(&file)?;
+    Ok(GuardedDirectory {
+        file,
+        device,
+        inode,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bootstrap_existing_platform_root(
+    selected_root: &std::path::Path,
+    canonical_anchor: std::path::PathBuf,
+    directory: std::fs::File,
+) -> Result<PlatformHistoryBootstrap, bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let anchor = guarded_platform_directory(directory)?;
+    let selected = std::fs::symlink_metadata(selected_root)
+        .map_err(|error| platform_bootstrap_error(&error, true))?;
+    if !selected.file_type().is_dir() {
+        return Err(LedgerError::new(R::Open));
+    }
+    if selected.uid() != unsafe { libc::geteuid() } {
+        return Err(LedgerError::new(R::ReadOnlyParent));
+    }
+    if (selected.dev(), selected.ino()) != (anchor.device, anchor.inode) {
+        return Err(LedgerError::new(R::Open));
+    }
+    Ok(PlatformHistoryBootstrap {
+        expected_root: canonical_anchor.clone(),
+        canonical_anchor,
+        anchor,
+        suffix: Vec::new(),
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bootstrap_platform_history_root(
+    path: &std::path::Path,
+) -> Result<PlatformHistoryBootstrap, bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let database_name = path
+        .file_name()
+        .filter(|name| *name == std::ffi::OsStr::new("workflow-history.sqlite"))
+        .ok_or_else(|| LedgerError::new(R::Open))?;
+    if database_name.as_bytes().contains(&0) {
+        return Err(LedgerError::new(R::Open));
+    }
+    let state_root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| LedgerError::new(R::Open))?;
+    if state_root
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(LedgerError::new(R::Open));
+    }
+
+    match std::fs::symlink_metadata(state_root) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() {
+                return Err(LedgerError::new(R::Open));
+            }
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(LedgerError::new(R::ReadOnlyParent));
+            }
+            let canonical = std::fs::canonicalize(state_root)
+                .map_err(|error| platform_bootstrap_error(&error, true))?;
+            let directory = open_platform_directory(&canonical)?;
+            return bootstrap_existing_platform_root(state_root, canonical, directory);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(platform_bootstrap_error(&error, true)),
+    }
+
+    let mut anchor = state_root.to_path_buf();
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&anchor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = match anchor.components().next_back() {
+                    Some(std::path::Component::Normal(component)) => component.to_os_string(),
+                    _ => return Err(LedgerError::new(R::Open)),
+                };
+                std::ffi::CString::new(component.as_bytes())
+                    .map_err(|_| LedgerError::new(R::Open))?;
+                suffix.push(component);
+                anchor = anchor
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf();
+            }
+            Err(error) => return Err(platform_bootstrap_error(&error, true)),
+        }
+    }
+
+    let canonical_anchor =
+        std::fs::canonicalize(&anchor).map_err(|error| platform_bootstrap_error(&error, true))?;
+    let anchor_directory = guarded_platform_directory(open_platform_directory(&canonical_anchor)?)?;
+    let mut directory = anchor_directory
+        .file
+        .try_clone()
+        .map_err(|error| platform_bootstrap_error(&error, false))?;
+    let mut expected_root = canonical_anchor.clone();
+    let mut guarded_suffix = Vec::with_capacity(suffix.len());
+
+    for component in suffix.iter().rev() {
+        #[cfg(test)]
+        let index = guarded_suffix.len();
+        expected_root.push(component);
+        let name =
+            std::ffi::CString::new(component.as_bytes()).map_err(|_| LedgerError::new(R::Open))?;
+        #[cfg(test)]
+        platform_bootstrap_pause(state_root, PlatformBootstrapPausePoint::BeforeMkdir(index));
+        #[cfg(test)]
+        if platform_bootstrap_failpoint(PlatformBootstrapFailpoint::UnexpectedIo) {
+            return Err(LedgerError::new(R::Io));
+        }
+        #[cfg(test)]
+        if platform_bootstrap_failpoint(PlatformBootstrapFailpoint::HostileEexist) {
+            let target = c".";
+            let result =
+                unsafe { libc::symlinkat(target.as_ptr(), directory.as_raw_fd(), name.as_ptr()) };
+            if result != 0 {
+                return Err(platform_bootstrap_error(
+                    &std::io::Error::last_os_error(),
+                    false,
+                ));
+            }
+        }
+        let created = loop {
+            let result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+            if result == 0 {
+                break true;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                break false;
+            }
+            return Err(platform_bootstrap_error(&error, true));
+        };
+        #[cfg(test)]
+        platform_bootstrap_record_mkdir(state_root, created);
+        #[cfg(test)]
+        if created {
+            platform_bootstrap_pause(state_root, PlatformBootstrapPausePoint::AfterMkdir(index));
+        }
+
+        let (entry_device, entry_inode, _, entry_mode) = platform_suffix_entry(&directory, &name)?;
+        if created && entry_mode != 0o700 {
+            // Owner-bit-masking umasks can leave only the empty entry observed from
+            // this mkdirat success. That is residue accounting, not attribution:
+            // a same-euid writer may already have substituted this pathname.
+            return if entry_mode & !0o700 == 0 {
+                Err(LedgerError::new(R::ReadOnlyParent))
+            } else {
+                Err(LedgerError::new(R::Open))
+            };
+        }
+        #[cfg(test)]
+        if platform_bootstrap_failpoint(PlatformBootstrapFailpoint::IdentityMismatch) {
+            let raced_away = c".a2a-bridge-bootstrap-raced-away";
+            if unsafe {
+                libc::renameat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    directory.as_raw_fd(),
+                    raced_away.as_ptr(),
+                )
+            } != 0
+                || unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) } != 0
+            {
+                return Err(platform_bootstrap_error(
+                    &std::io::Error::last_os_error(),
+                    false,
+                ));
+            }
+        }
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(platform_bootstrap_error(
+                &std::io::Error::last_os_error(),
+                true,
+            ));
+        }
+        let next = guarded_platform_directory(unsafe { std::fs::File::from_raw_fd(descriptor) })?;
+        let (_, _, next_mode) = platform_directory_identity(&next.file)?;
+        let (live_device, live_inode, _, live_mode) = platform_suffix_entry(&directory, &name)?;
+        if (next.device, next.inode) != (entry_device, entry_inode)
+            || (live_device, live_inode) != (entry_device, entry_inode)
+            || (created && (next_mode != 0o700 || live_mode != 0o700))
+        {
+            return Err(LedgerError::new(R::Open));
+        }
+        directory = next
+            .file
+            .try_clone()
+            .map_err(|error| platform_bootstrap_error(&error, false))?;
+        guarded_suffix.push(GuardedSuffix {
+            name: component.clone(),
+            c_name: name,
+            directory: next,
+            require_exact_0700: created,
+        });
+    }
+
+    // mkdirat success is not an inode capability. A same-euid writer can swap in
+    // another already-valid owned 0700 directory before the first observation;
+    // Linux/macOS primitives used here cannot distinguish that live directory.
+    // The guard therefore never mutates or cleans up a suffix inode based on
+    // alleged creation provenance.
+    Ok(PlatformHistoryBootstrap {
+        canonical_anchor,
+        expected_root,
+        anchor: anchor_directory,
+        suffix: guarded_suffix,
+    })
+}
+
+fn canonical_history_write_path(
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, bridge_core::workflow_history::LedgerError> {
+    canonical_history_write_path_with_namespace_guard(path, false)
+}
+
+fn canonical_history_write_path_with_namespace_guard(
+    path: &std::path::Path,
+    namespace_guarded: bool,
+) -> Result<std::path::PathBuf, bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    let file_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| LedgerError::new(R::Open))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+        if namespace_guarded {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                platform_bootstrap_error(&error, true)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                LedgerError::new(R::Open)
+            }
+        } else if error.kind() == std::io::ErrorKind::NotFound {
+            LedgerError::new(R::ReadOnlyParent)
+        } else {
+            history_io_error_with_permission(&error, R::Open, R::ReadOnlyParent)
+        }
+    })?;
+    let canonical = canonical_parent.join(file_name);
+    preflight_history_path(&canonical)?;
+    Ok(canonical)
+}
+
+fn canonical_history_path(
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    let file_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| LedgerError::new(R::Open))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let canonical_parent = std::fs::canonicalize(parent)
+        .map_err(|error| history_io_error_with_permission(&error, R::Open, R::ReadOnlyParent))?;
+    let canonical = canonical_parent.join(file_name);
+    preflight_history_path(&canonical)?;
+    Ok(canonical)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn history_parent_permission_error(
+    error: &std::io::Error,
+    fallback: bridge_core::workflow_history::LedgerUnavailableReason,
+) -> bridge_core::workflow_history::LedgerError {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    if error.kind() == std::io::ErrorKind::PermissionDenied
+        || error.raw_os_error() == Some(libc::EROFS)
+    {
+        LedgerError::new(R::ReadOnlyParent)
+    } else {
+        LedgerError::new(fallback)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn history_parent_open_error(error: &std::io::Error) -> bridge_core::workflow_history::LedgerError {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    if error.kind() == std::io::ErrorKind::PermissionDenied
+        || error.raw_os_error() == Some(libc::EROFS)
+    {
+        LedgerError::new(R::ReadOnlyParent)
+    } else if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
+    ) {
+        LedgerError::new(R::Open)
+    } else {
+        LedgerError::new(R::Io)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn history_child_name(
+    database_name: &std::ffi::OsStr,
+    suffix: &str,
+) -> Result<std::ffi::CString, bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut name = database_name.to_os_string();
+    name.push(suffix);
+    let bytes = name.as_os_str().as_bytes();
+    if bytes.is_empty() || bytes.contains(&b'/') {
+        return Err(LedgerError::new(R::Open));
+    }
+    std::ffi::CString::new(bytes).map_err(|_| LedgerError::new(R::Open))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn history_file_identity(
+    file: &std::fs::File,
+    require_zero: bool,
+    require_mode: Option<u32>,
+    require_linked: bool,
+) -> Result<(u64, u64), bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| history_parent_permission_error(&error, R::Io))?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || (require_linked && metadata.nlink() != 1)
+        || (!require_linked && metadata.nlink() != 0)
+        || (require_zero && metadata.len() != 0)
+        || require_mode.is_some_and(|mode| metadata.mode() & 0o777 != mode)
+    {
+        return Err(LedgerError::new(R::Open));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::unnecessary_cast)]
+fn history_entry_identity(
+    directory: &std::fs::File,
+    name: &std::ffi::CStr,
+    require_directory: bool,
+    missing: bridge_core::workflow_history::LedgerUnavailableReason,
+) -> Result<(u64, u64, u64, u32), bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+    use std::os::fd::AsRawFd as _;
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Err(LedgerError::new(missing));
+        }
+        return Err(history_parent_permission_error(&error, R::Io));
+    }
+    let stat = unsafe { stat.assume_init() };
+    let file_type = stat.st_mode & libc::S_IFMT;
+    let expected = if require_directory {
+        libc::S_IFDIR
+    } else {
+        libc::S_IFREG
+    };
+    if file_type != expected || stat.st_uid != unsafe { libc::geteuid() } {
+        return Err(LedgerError::new(R::Open));
+    }
+    Ok((
+        stat.st_dev as u64,
+        stat.st_ino as u64,
+        stat.st_nlink as u64,
+        stat.st_mode as u32 & 0o777,
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn history_random_bytes() -> Result<[u8; 32], bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    #[cfg(test)]
+    {
+        let injected = HISTORY_PARENT_PROOF_TEST_HOOKS.with(|slot| {
+            let mut hooks = slot.borrow_mut();
+            if hooks.failpoint == Some(HistoryParentProofFailpoint::Random) {
+                hooks.failpoint = None;
+                return Err(LedgerError::new(R::Io));
+            }
+            Ok(hooks.random_names.pop_front())
+        })?;
+        if let Some(bytes) = injected {
+            return Ok(bytes);
+        }
+    }
+
+    let mut bytes = [0_u8; 32];
+    #[cfg(target_os = "linux")]
+    {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let result = unsafe {
+                libc::getrandom(bytes[offset..].as_mut_ptr().cast(), bytes.len() - offset, 0)
+            };
+            if result < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(LedgerError::new(R::Io));
+            }
+            if result == 0 {
+                return Err(LedgerError::new(R::Io));
+            }
+            offset += result as usize;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    loop {
+        let result = unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) };
+        if result == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(LedgerError::new(R::Io));
+        }
+    }
+    Ok(bytes)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+// Ordinary returned errors explicitly run the identity-checked cleanup path,
+// with Drop making one backstop attempt. SIGKILL, persistent kernel failure, or
+// a concurrently mutated trusted-parent namespace can still leave the empty
+// owner-only proof entry; this guard does not close that residual race.
+struct HistoryProofCleanup<'a> {
+    directory: &'a std::fs::File,
+    file: std::fs::File,
+    name: std::ffi::CString,
+    linked: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl HistoryProofCleanup<'_> {
+    fn cleanup(&mut self) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        use std::os::fd::AsRawFd as _;
+
+        if !self.linked {
+            return Ok(());
+        }
+        if unsafe { libc::fchmod(self.file.as_raw_fd(), 0o600) } != 0 {
+            return Err(history_parent_permission_error(
+                &std::io::Error::last_os_error(),
+                R::Io,
+            ));
+        }
+        let fd_identity = history_file_identity(&self.file, true, Some(0o600), true)?;
+        let (entry_device, entry_inode, links, mode) =
+            history_entry_identity(self.directory, &self.name, false, R::Io)?;
+        if links != 1 || mode != 0o600 || fd_identity != (entry_device, entry_inode) {
+            return Err(LedgerError::new(R::Open));
+        }
+        #[cfg(test)]
+        if history_parent_proof_failpoint(HistoryParentProofFailpoint::BeforeUnlink) {
+            return Err(LedgerError::new(R::Io));
+        }
+        let result = unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) };
+        if result != 0 {
+            return Err(history_parent_permission_error(
+                &std::io::Error::last_os_error(),
+                R::Io,
+            ));
+        }
+        self.linked = false;
+        history_file_identity(&self.file, true, Some(0o600), false)?;
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for HistoryProofCleanup<'_> {
+    fn drop(&mut self) {
+        if self.linked {
+            let _ = self.cleanup();
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl PlatformHistoryBootstrap {
+    fn final_directory(&self) -> &GuardedDirectory {
+        self.suffix
+            .last()
+            .map(|suffix| &suffix.directory)
+            .unwrap_or(&self.anchor)
+    }
+
+    fn revalidate_for_handoff(
+        &self,
+        parent: &HistoryParent,
+    ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        if parent.canonical_parent != self.expected_root {
+            return Err(LedgerError::new(R::Open));
+        }
+
+        platform_handoff_retained_directory_observation(
+            &self.anchor.file,
+            (self.anchor.device, self.anchor.inode),
+            false,
+        )?;
+        let reopened_anchor = platform_handoff_reopen_directory(
+            &self.canonical_anchor,
+            &self.anchor.file,
+            (self.anchor.device, self.anchor.inode),
+            false,
+        )?;
+
+        let mut walked_root = self.canonical_anchor.clone();
+        let mut current = reopened_anchor.file;
+        let mut current_identity = (self.anchor.device, self.anchor.inode);
+        let mut current_requires_exact_0700 = false;
+        for suffix in &self.suffix {
+            walked_root.push(&suffix.name);
+            #[cfg(test)]
+            let index = self
+                .suffix
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, suffix))
+                .expect("the handoff suffix comes from the retained suffix list");
+            #[cfg(test)]
+            platform_bootstrap_pause(
+                &self.expected_root,
+                PlatformBootstrapPausePoint::BeforeHandoffParentCheck(index),
+            );
+            platform_handoff_retained_directory_observation(
+                &current,
+                current_identity,
+                current_requires_exact_0700,
+            )?;
+            #[cfg(test)]
+            platform_bootstrap_pause(
+                &self.expected_root,
+                PlatformBootstrapPausePoint::BeforeHandoffChildLookup(index),
+            );
+            let (entry_device, entry_inode, _, _, entry_mode) = platform_handoff_child_observation(
+                &current,
+                &suffix.c_name,
+                current_identity,
+                current_requires_exact_0700,
+                (suffix.directory.device, suffix.directory.inode),
+                suffix.require_exact_0700,
+            )?;
+            platform_handoff_retained_directory_observation(
+                &suffix.directory.file,
+                (suffix.directory.device, suffix.directory.inode),
+                suffix.require_exact_0700,
+            )?;
+            let descriptor = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    suffix.c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if descriptor < 0 {
+                let open_error = std::io::Error::last_os_error();
+                return Err(platform_handoff_open_error(
+                    &open_error,
+                    platform_handoff_child_observation(
+                        &current,
+                        &suffix.c_name,
+                        current_identity,
+                        current_requires_exact_0700,
+                        (suffix.directory.device, suffix.directory.inode),
+                        suffix.require_exact_0700,
+                    ),
+                    (suffix.directory.device, suffix.directory.inode),
+                    suffix.require_exact_0700,
+                ));
+            }
+            let next_file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+            let (next_device, next_inode, _, _, next_mode) =
+                platform_handoff_retained_directory_observation(
+                    &next_file,
+                    (suffix.directory.device, suffix.directory.inode),
+                    suffix.require_exact_0700,
+                )?;
+            let next = GuardedDirectory {
+                file: next_file,
+                device: next_device,
+                inode: next_inode,
+            };
+            #[cfg(test)]
+            platform_bootstrap_pause(
+                &self.expected_root,
+                PlatformBootstrapPausePoint::AfterHandoffChildOpen(index),
+            );
+            let (live_device, live_inode, _, _, live_mode) = platform_handoff_child_observation(
+                &current,
+                &suffix.c_name,
+                current_identity,
+                current_requires_exact_0700,
+                (suffix.directory.device, suffix.directory.inode),
+                suffix.require_exact_0700,
+            )?;
+            let (retained_device, retained_inode, retained_uid, retained_type, retained_mode) =
+                platform_handoff_retained_directory_observation(
+                    &suffix.directory.file,
+                    (suffix.directory.device, suffix.directory.inode),
+                    suffix.require_exact_0700,
+                )?;
+            if (entry_device, entry_inode) != (suffix.directory.device, suffix.directory.inode)
+                || (next.device, next.inode) != (suffix.directory.device, suffix.directory.inode)
+                || (live_device, live_inode) != (suffix.directory.device, suffix.directory.inode)
+                || retained_type != PLATFORM_DIRECTORY_FILE_TYPE
+                || retained_uid != unsafe { libc::geteuid() }
+                || (retained_device, retained_inode)
+                    != (suffix.directory.device, suffix.directory.inode)
+                || (suffix.require_exact_0700
+                    && (entry_mode != 0o700
+                        || next_mode != 0o700
+                        || live_mode != 0o700
+                        || retained_mode != 0o700))
+            {
+                return Err(LedgerError::new(R::Open));
+            }
+            current = next.file;
+            current_identity = (suffix.directory.device, suffix.directory.inode);
+            current_requires_exact_0700 = suffix.require_exact_0700;
+        }
+        if walked_root != self.expected_root {
+            return Err(LedgerError::new(R::Open));
+        }
+
+        let final_directory = self.final_directory();
+        let final_requires_exact_0700 = self
+            .suffix
+            .last()
+            .is_some_and(|suffix| suffix.require_exact_0700);
+        let (final_device, final_inode, _, _, _) = platform_handoff_retained_directory_observation(
+            &current,
+            (final_directory.device, final_directory.inode),
+            final_requires_exact_0700,
+        )?;
+        if (final_device, final_inode) != (final_directory.device, final_directory.inode)
+            || (parent.device, parent.inode) != (final_directory.device, final_directory.inode)
+        {
+            return Err(LedgerError::new(R::Open));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl HistoryParent {
+    fn open(path: &std::path::Path) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        let canonical_parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| LedgerError::new(R::Open))?
+            .to_path_buf();
+        let database_name = path
+            .file_name()
+            .filter(|name| !name.is_empty() && !name.as_bytes().contains(&b'/'))
+            .ok_or_else(|| LedgerError::new(R::Open))?
+            .to_os_string();
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let directory = options
+            .open(&canonical_parent)
+            .map_err(|error| history_parent_open_error(&error))?;
+        let metadata = directory
+            .metadata()
+            .map_err(|error| history_parent_permission_error(&error, R::Io))?;
+        if !metadata.is_dir() {
+            return Err(LedgerError::new(R::Open));
+        }
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(LedgerError::new(R::ReadOnlyParent));
+        }
+        Ok(Self {
+            directory,
+            canonical_parent,
+            database_name,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn prove(path: &std::path::Path) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        Self::prove_with_bootstrap(path, None)
+    }
+
+    fn prove_with_bootstrap(
+        path: &std::path::Path,
+        bootstrap: Option<PlatformHistoryBootstrap>,
+    ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        use std::fmt::Write as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let parent = Self::open(path)?;
+        if let Some(bootstrap) = bootstrap.as_ref() {
+            #[cfg(test)]
+            platform_bootstrap_pause(
+                &bootstrap.expected_root,
+                PlatformBootstrapPausePoint::BeforeHandoff,
+            );
+            bootstrap.revalidate_for_handoff(&parent)?;
+        }
+        for _ in 0..HISTORY_PARENT_PROOF_ATTEMPTS {
+            let random = history_random_bytes()?;
+            let mut encoded = String::with_capacity(64);
+            for byte in random {
+                write!(&mut encoded, "{byte:02x}").map_err(|_| LedgerError::new(R::Io))?;
+            }
+            let name = std::ffi::CString::new(format!("{HISTORY_PARENT_PROOF_PREFIX}{encoded}"))
+                .map_err(|_| LedgerError::new(R::Open))?;
+            let descriptor = unsafe {
+                libc::openat(
+                    parent.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if descriptor < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(history_parent_permission_error(&error, R::Io));
+            }
+            let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+            let mut cleanup = HistoryProofCleanup {
+                directory: &parent.directory,
+                file,
+                name,
+                linked: true,
+            };
+            let validation = (|| {
+                if unsafe { libc::fchmod(cleanup.file.as_raw_fd(), 0o600) } != 0 {
+                    return Err(history_parent_permission_error(
+                        &std::io::Error::last_os_error(),
+                        R::Io,
+                    ));
+                }
+                let fd_identity = history_file_identity(&cleanup.file, true, Some(0o600), true)?;
+                let (entry_device, entry_inode, links, mode) =
+                    history_entry_identity(&parent.directory, &cleanup.name, false, R::Io)?;
+                if links != 1 || mode != 0o600 || fd_identity != (entry_device, entry_inode) {
+                    return Err(LedgerError::new(R::Open));
+                }
+                #[cfg(test)]
+                if history_parent_proof_failpoint(HistoryParentProofFailpoint::AfterValidatedCreate)
+                {
+                    return Err(LedgerError::new(R::Io));
+                }
+                Ok(())
+            })();
+            if let Err(error) = validation {
+                let cleanup_result = cleanup.cleanup();
+                return Err(cleanup_result.err().unwrap_or(error));
+            }
+            cleanup.cleanup()?;
+            drop(cleanup);
+            parent.revalidate()?;
+            return Ok(parent);
+        }
+        Err(LedgerError::new(R::Collision))
+    }
+
+    fn revalidate(&self) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let reopened = options
+            .open(&self.canonical_parent)
+            .map_err(|error| history_parent_open_error(&error))?;
+        let metadata = reopened
+            .metadata()
+            .map_err(|error| history_parent_permission_error(&error, R::Io))?;
+        if !metadata.is_dir() || metadata.dev() != self.device || metadata.ino() != self.inode {
+            return Err(LedgerError::new(R::Open));
+        }
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(LedgerError::new(R::ReadOnlyParent));
+        }
+        Ok(())
+    }
+
+    fn open_file(
+        &self,
+        suffix: &str,
+        create: bool,
+        fallback: bridge_core::workflow_history::LedgerUnavailableReason,
+        permission: bridge_core::workflow_history::LedgerUnavailableReason,
+    ) -> Result<std::fs::File, bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let name = history_child_name(&self.database_name, suffix)?;
+        #[cfg(test)]
+        use std::os::unix::ffi::OsStrExt as _;
+        #[cfg(test)]
+        let test_path = self
+            .canonical_parent
+            .join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        let mut state = HistoryFileOpenState::Existing;
+        #[cfg(test)]
+        let mut reopening = false;
+        #[cfg(test)]
+        let mut paused_after_actual_existing_not_found = false;
+        let descriptor = 'open: {
+            for _ordinal in 1..=HISTORY_FILE_OPEN_ATTEMPTS {
+                #[cfg(test)]
+                match state {
+                    HistoryFileOpenState::Existing if reopening => history_file_open_pause(
+                        &test_path,
+                        HistoryFileOpenPausePoint::BeforeExistingReopen,
+                    )?,
+                    HistoryFileOpenState::ExclusiveCreate => history_file_open_pause(
+                        &test_path,
+                        HistoryFileOpenPausePoint::BeforeExclusiveCreate,
+                    )?,
+                    HistoryFileOpenState::Existing => {}
+                }
+
+                #[cfg(test)]
+                let injected = history_file_open_injected_errno(&test_path, state);
+                #[cfg(not(test))]
+                let injected: Option<i32> = None;
+                let (descriptor, error, _actual_syscall) = if let Some(errno) = injected {
+                    (-1, Some(std::io::Error::from_raw_os_error(errno)), false)
+                } else {
+                    let flags = match state {
+                        HistoryFileOpenState::Existing => {
+                            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC
+                        }
+                        HistoryFileOpenState::ExclusiveCreate => {
+                            libc::O_RDWR
+                                | libc::O_CREAT
+                                | libc::O_EXCL
+                                | libc::O_NOFOLLOW
+                                | libc::O_CLOEXEC
+                        }
+                    };
+                    let descriptor = unsafe {
+                        libc::openat(self.directory.as_raw_fd(), name.as_ptr(), flags, 0o600)
+                    };
+                    let error = (descriptor < 0).then(std::io::Error::last_os_error);
+                    (descriptor, error, true)
+                };
+                #[cfg(test)]
+                history_file_open_record(
+                    &test_path,
+                    HistoryFileOpenObservation {
+                        state,
+                        ordinal: _ordinal,
+                        actual_syscall: _actual_syscall,
+                        outcome: error.as_ref().map_or(
+                            HistoryFileOpenObservedOutcome::Opened,
+                            |error| {
+                                HistoryFileOpenObservedOutcome::Errno(
+                                    error.raw_os_error().unwrap_or(libc::EIO),
+                                )
+                            },
+                        ),
+                    },
+                );
+                if descriptor >= 0 {
+                    break 'open descriptor;
+                }
+                let error = error.expect("a failed open must retain its OS error");
+                match state {
+                    HistoryFileOpenState::Existing => {
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        if error.kind() == std::io::ErrorKind::NotFound {
+                            #[cfg(test)]
+                            if _actual_syscall && !paused_after_actual_existing_not_found {
+                                paused_after_actual_existing_not_found = true;
+                                history_file_open_pause(
+                                    &test_path,
+                                    HistoryFileOpenPausePoint::AfterInitialExistingNotFound,
+                                )?;
+                            }
+                            if !create {
+                                return Err(history_io_error_with_permission(
+                                    &error, fallback, permission,
+                                ));
+                            }
+                            state = HistoryFileOpenState::ExclusiveCreate;
+                            #[cfg(test)]
+                            {
+                                reopening = false;
+                            }
+                            continue;
+                        }
+                        return Err(history_io_error_with_permission(
+                            &error, fallback, permission,
+                        ));
+                    }
+                    HistoryFileOpenState::ExclusiveCreate => {
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotFound
+                        ) {
+                            state = HistoryFileOpenState::Existing;
+                            #[cfg(test)]
+                            {
+                                reopening = true;
+                            }
+                            continue;
+                        }
+                        return Err(history_parent_permission_error(&error, fallback));
+                    }
+                }
+            }
+            return Err(LedgerError::new(fallback));
+        };
+        let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        #[cfg(test)]
+        history_file_open_pause(&test_path, HistoryFileOpenPausePoint::BeforeFdValidation)?;
+        let fd_identity = history_file_identity(&file, false, None, true)?;
+        #[cfg(test)]
+        history_file_open_pause(&test_path, HistoryFileOpenPausePoint::AfterFdValidation)?;
+        let (entry_device, entry_inode, links, _) =
+            history_entry_identity(&self.directory, &name, false, R::Open)?;
+        if links != 1 || fd_identity != (entry_device, entry_inode) {
+            return Err(LedgerError::new(R::Open));
+        }
+        Ok(file)
+    }
+
+    fn open_directory(
+        &self,
+        suffix: &str,
+    ) -> Result<HistoryDirectory, bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::fs::MetadataExt as _;
+
+        let name = history_child_name(&self.database_name, suffix)?;
+        let created = unsafe { libc::mkdirat(self.directory.as_raw_fd(), name.as_ptr(), 0o700) };
+        if created != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(history_parent_permission_error(&error, R::Io));
+            }
+        }
+        let descriptor = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(history_parent_permission_error(
+                &std::io::Error::last_os_error(),
+                R::Open,
+            ));
+        }
+        let directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        let metadata = directory
+            .metadata()
+            .map_err(|error| history_parent_permission_error(&error, R::Io))?;
+        let (entry_device, entry_inode, _, _) =
+            history_entry_identity(&self.directory, &name, true, R::Io)?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || (metadata.dev(), metadata.ino()) != (entry_device, entry_inode)
+        {
+            return Err(LedgerError::new(R::Open));
+        }
+        if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+            return Err(history_parent_permission_error(
+                &std::io::Error::last_os_error(),
+                R::Io,
+            ));
+        }
+        let current = directory
+            .metadata()
+            .map_err(|error| history_parent_permission_error(&error, R::Io))?;
+        let (current_device, current_inode, _, mode) =
+            history_entry_identity(&self.directory, &name, true, R::Io)?;
+        if !current.is_dir()
+            || current.uid() != unsafe { libc::geteuid() }
+            || current.mode() & 0o777 != 0o700
+            || mode != 0o700
+            || (current.dev(), current.ino()) != (current_device, current_inode)
+            || (current_device, current_inode) != (entry_device, entry_inode)
+        {
+            return Err(LedgerError::new(R::Open));
+        }
+        Ok(HistoryDirectory {
+            directory,
+            device: entry_device,
+            inode: entry_inode,
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl HistoryDirectory {
+    fn revalidate(&self) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = self
+            .directory
+            .metadata()
+            .map_err(|error| history_parent_permission_error(&error, R::Io))?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o700
+            || metadata.dev() != self.device
+            || metadata.ino() != self.inode
+        {
+            return Err(LedgerError::new(R::Open));
+        }
+        Ok(())
+    }
+
+    fn lock_name(
+        id: &bridge_core::ids::AttemptId,
+    ) -> Result<std::ffi::CString, bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        let value = format!("{}.lock", id.as_str());
+        if value.as_bytes().contains(&b'/') {
+            return Err(LedgerError::new(R::Open));
+        }
+        std::ffi::CString::new(value).map_err(|_| LedgerError::new(R::Open))
+    }
+
+    fn open_lock(
+        &self,
+        id: &bridge_core::ids::AttemptId,
+        create: bool,
+    ) -> Result<Option<std::fs::File>, bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        self.revalidate()?;
+        let name = Self::lock_name(id)?;
+        let mut descriptor = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            let first = std::io::Error::last_os_error();
+            if first.kind() != std::io::ErrorKind::NotFound {
+                return Err(history_io_error_with_permission(
+                    &first,
+                    R::Io,
+                    R::ReadOnlyLock,
+                ));
+            }
+            if !create {
+                return Ok(None);
+            }
+            descriptor = unsafe {
+                libc::openat(
+                    self.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if descriptor < 0 {
+                return Err(history_parent_permission_error(
+                    &std::io::Error::last_os_error(),
+                    R::Io,
+                ));
+            }
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+        let fd_identity = history_file_identity(&file, false, None, true)?;
+        let (entry_device, entry_inode, links, _) =
+            history_entry_identity(&self.directory, &name, false, R::Io)?;
+        if links != 1 || fd_identity != (entry_device, entry_inode) {
+            return Err(LedgerError::new(R::Open));
+        }
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+            return Err(history_io_error_with_permission(
+                &std::io::Error::last_os_error(),
+                R::Io,
+                R::ReadOnlyLock,
+            ));
+        }
+        let fd_identity = history_file_identity(&file, false, Some(0o600), true)?;
+        let (current_device, current_inode, links, mode) =
+            history_entry_identity(&self.directory, &name, false, R::Io)?;
+        if links != 1
+            || mode != 0o600
+            || fd_identity != (current_device, current_inode)
+            || (current_device, current_inode) != (entry_device, entry_inode)
+        {
+            return Err(LedgerError::new(R::Open));
+        }
+        Ok(Some(file))
+    }
+
+    fn unlink_exact(
+        &self,
+        id: &bridge_core::ids::AttemptId,
+        file: &std::fs::File,
+    ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        use std::os::fd::AsRawFd as _;
+
+        self.revalidate()?;
+        let name = Self::lock_name(id)?;
+        let fd_identity = history_file_identity(file, false, Some(0o600), true)?;
+        let (entry_device, entry_inode, links, mode) =
+            history_entry_identity(&self.directory, &name, false, R::Io)?;
+        if links != 1 || mode != 0o600 || fd_identity != (entry_device, entry_inode) {
+            return Err(LedgerError::new(R::Open));
+        }
+        let result = unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(history_io_error_with_permission(
+                &error,
+                R::Io,
+                R::ReadOnlyParent,
+            ));
+        }
+        history_file_identity(file, false, Some(0o600), false)?;
+        #[cfg(test)]
+        HISTORY_ATTEMPT_ZERO_LINK_PROOFS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn unlink_stale(
+        &self,
+        id: &bridge_core::ids::AttemptId,
+    ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        use fs2::FileExt as _;
+
+        let Some(file) = self.open_lock(id, false)? else {
+            return Ok(());
+        };
+        match file.try_lock_exclusive() {
+            Ok(()) => self.unlink_exact(id, &file),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(LedgerError::new(R::Locked))
+            }
+            Err(error) => Err(history_lock_error(&error)),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl HistoryDirectory {
+    fn open_lock(
+        &self,
+        _id: &bridge_core::ids::AttemptId,
+        _create: bool,
+    ) -> Result<Option<std::fs::File>, bridge_core::workflow_history::LedgerError> {
+        Err(bridge_core::workflow_history::LedgerError::new(
+            bridge_core::workflow_history::LedgerUnavailableReason::Open,
+        ))
+    }
+
+    fn unlink_exact(
+        &self,
+        _id: &bridge_core::ids::AttemptId,
+        _file: &std::fs::File,
+    ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        Err(bridge_core::workflow_history::LedgerError::new(
+            bridge_core::workflow_history::LedgerUnavailableReason::Open,
+        ))
+    }
+
+    fn unlink_stale(
+        &self,
+        _id: &bridge_core::ids::AttemptId,
+    ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        Err(bridge_core::workflow_history::LedgerError::new(
+            bridge_core::workflow_history::LedgerUnavailableReason::Open,
+        ))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl HistoryParent {
+    fn prove(_path: &std::path::Path) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        Err(bridge_core::workflow_history::LedgerError::new(
+            bridge_core::workflow_history::LedgerUnavailableReason::Open,
+        ))
+    }
+
+    fn prove_with_bootstrap(
+        _path: &std::path::Path,
+        _bootstrap: Option<PlatformHistoryBootstrap>,
+    ) -> Result<Self, bridge_core::workflow_history::LedgerError> {
+        Self::prove(_path)
+    }
+
+    fn open_file(
+        &self,
+        _suffix: &str,
+        _create: bool,
+        _fallback: bridge_core::workflow_history::LedgerUnavailableReason,
+        _permission: bridge_core::workflow_history::LedgerUnavailableReason,
+    ) -> Result<std::fs::File, bridge_core::workflow_history::LedgerError> {
+        Err(bridge_core::workflow_history::LedgerError::new(
+            bridge_core::workflow_history::LedgerUnavailableReason::Open,
+        ))
+    }
+
+    fn open_directory(
+        &self,
+        _suffix: &str,
+    ) -> Result<HistoryDirectory, bridge_core::workflow_history::LedgerError> {
+        Err(bridge_core::workflow_history::LedgerError::new(
+            bridge_core::workflow_history::LedgerUnavailableReason::Open,
+        ))
+    }
+}
+
+fn preflight_history_path(
+    path: &std::path::Path,
+) -> Result<bool, bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    fn regular_single_link(
+        path: &std::path::Path,
+        require_effective_owner: bool,
+    ) -> Result<bool, LedgerError> {
+        #[cfg(not(unix))]
+        let _ = require_effective_owner;
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(LedgerError::new(R::Open));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.nlink() != 1
+                        || (require_effective_owner && metadata.uid() != unsafe { libc::geteuid() })
+                    {
+                        return Err(LedgerError::new(R::Open));
+                    }
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(history_io_error_with_permission(
+                &error,
+                R::Open,
+                R::Permission,
+            )),
+        }
+    }
+
+    // The canonical parent is the trust boundary: these no-follow probes reject
+    // existing aliases, but cannot pin SQLite-managed sidecars against a
+    // concurrently hostile writer that can replace entries in that directory.
+    let database_exists = regular_single_link(path, false)?;
+    for (suffix, require_effective_owner) in [
+        ("-wal", true),
+        ("-shm", true),
+        ("-journal", false),
+        (".lock", false),
+        (".schema.lock", false),
+        (".admission.lock", false),
+    ] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        regular_single_link(std::path::Path::new(&sidecar), require_effective_owner)?;
+    }
+    let attempt_locks = history_attempt_lock_dir(path);
+    match std::fs::symlink_metadata(&attempt_locks) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err(LedgerError::new(R::Open)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(history_io_error_with_permission(
+                &error,
+                R::Open,
+                R::Permission,
+            ));
+        }
+    }
+    Ok(database_exists)
+}
+
+#[cfg(all(test, unix))]
+fn open_history_owned_file(
+    path: &std::path::Path,
+    fallback: bridge_core::workflow_history::LedgerUnavailableReason,
+    permission: bridge_core::workflow_history::LedgerUnavailableReason,
+) -> Result<std::fs::File, bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| history_io_error_with_permission(&error, fallback, permission))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| history_io_error_with_permission(&error, fallback, permission))?;
+    if !metadata.is_file() {
+        return Err(LedgerError::new(R::Open));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(LedgerError::new(R::Open));
+        }
+    }
+    Ok(file)
+}
+
 fn history_io_error_with_permission(
     error: &std::io::Error,
     fallback: bridge_core::workflow_history::LedgerUnavailableReason,
     permission: bridge_core::workflow_history::LedgerUnavailableReason,
 ) -> bridge_core::workflow_history::LedgerError {
     use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+    #[cfg(unix)]
+    let permission_denied = error.kind() == std::io::ErrorKind::PermissionDenied
+        || error.raw_os_error() == Some(libc::EROFS);
+    #[cfg(not(unix))]
+    let permission_denied = error.kind() == std::io::ErrorKind::PermissionDenied;
     let reason = match error.kind() {
-        std::io::ErrorKind::PermissionDenied => permission,
+        _ if permission_denied => permission,
         std::io::ErrorKind::WouldBlock => R::Locked,
         _ => fallback,
     };
@@ -3755,6 +7716,19 @@ fn history_lock_error(error: &std::io::Error) -> bridge_core::workflow_history::
         _ => R::AdvisoryLockIo,
     };
     LedgerError::new(reason)
+}
+
+#[cfg(unix)]
+fn set_history_file_permissions(
+    file: &std::fs::File,
+    mode: u32,
+    permission: bridge_core::workflow_history::LedgerUnavailableReason,
+) -> Result<(), bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::LedgerUnavailableReason as R;
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(|error| history_io_error_with_permission(&error, R::Io, permission))
 }
 
 #[cfg(unix)]
@@ -3776,13 +7750,6 @@ fn set_history_sidecar_permissions(
 ) -> Result<(), bridge_core::workflow_history::LedgerError> {
     use bridge_core::workflow_history::LedgerUnavailableReason as R;
 
-    set_history_permissions(path, 0o600, R::ReadOnlyDatabase)?;
-    set_history_permissions(&history_schema_lock_path(path), 0o600, R::ReadOnlyLock)?;
-    let admission_lock = history_admission_lock_path(path);
-    if admission_lock.exists() {
-        set_history_permissions(&admission_lock, 0o600, R::ReadOnlyLock)?;
-    }
-    set_history_permissions(&history_attempt_lock_dir(path), 0o700, R::ReadOnlyParent)?;
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = path.as_os_str().to_os_string();
         sidecar.push(suffix);
@@ -3810,7 +7777,7 @@ fn history_error(error: &rusqlite::Error) -> bridge_core::workflow_history::Ledg
             rusqlite::ErrorCode::FileLockingProtocolFailed
             | rusqlite::ErrorCode::NoLargeFileSupport => R::AdvisoryLockUnsupported,
             rusqlite::ErrorCode::SystemIoFailure => R::Io,
-            rusqlite::ErrorCode::DiskFull => R::CapacityProtected,
+            rusqlite::ErrorCode::DiskFull => R::Io,
             _ => R::Io,
         };
         let extended = sqlite.extended_code;
@@ -3886,11 +7853,180 @@ fn schema_migration_error(
         SchemaMigrationError::Sqlite(error) => history_migration_error(error),
         SchemaMigrationError::Validation(
             MigrationValidationError::MalformedLocator
-            | MigrationValidationError::ConflictingAuthority,
+            | MigrationValidationError::ConflictingAuthority
+            | MigrationValidationError::AllocationKind
+            | MigrationValidationError::AllocationSchema,
         ) => bridge_core::workflow_history::LedgerError::new(
             bridge_core::workflow_history::LedgerUnavailableReason::Migration,
         ),
+        SchemaMigrationError::Validation(MigrationValidationError::CapacityProtected) => {
+            bridge_core::workflow_history::LedgerError::new(
+                bridge_core::workflow_history::LedgerUnavailableReason::CapacityProtected,
+            )
+        }
+        SchemaMigrationError::Validation(MigrationValidationError::Corruption) => {
+            bridge_core::workflow_history::LedgerError::new(
+                bridge_core::workflow_history::LedgerUnavailableReason::Corruption,
+            )
+        }
     }
+}
+
+fn settle_served_attempt_unavailable(
+    conn: &rusqlite::Connection,
+    task: &TaskId,
+    attempt: &bridge_core::ids::AttemptId,
+    reason: bridge_core::workflow_history::LedgerUnavailableReason,
+) -> Result<(), bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    let prior: Option<String> = conn
+        .query_row(
+            "SELECT locator_json FROM task_attempt_locators WHERE task_id=?1",
+            rusqlite::params![task.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| history_error(&error))?;
+    let mut locator: bridge_core::task_store::TaskAttemptLocator =
+        serde_json::from_str(&prior.ok_or_else(|| LedgerError::new(R::Corruption))?)
+            .map_err(|_| LedgerError::new(R::Corruption))?;
+    if &locator.identity.attempt_id != attempt {
+        return Err(LedgerError::new(R::Corruption));
+    }
+    locator.telemetry_unavailable = Some(reason);
+    let json = serde_json::to_string(&locator).map_err(|_| LedgerError::new(R::Schema))?;
+    let identity_changed = conn
+        .execute(
+            "UPDATE attempt_identities
+             SET history_disposition=CASE WHEN history_disposition=0 THEN 2
+                                          ELSE history_disposition END,
+                 history_unavailable_reason=CASE WHEN history_disposition=0 THEN ?3
+                                                 ELSE history_unavailable_reason END
+             WHERE attempt_id=?1 AND task_id=?2 AND owner_surface='served_task'
+               AND (history_disposition IN (0, 1)
+                    OR (history_disposition=2 AND history_unavailable_reason=?3))",
+            rusqlite::params![attempt.as_str(), task.as_str(), reason.as_str()],
+        )
+        .map_err(|error| history_error(&error))?;
+    if identity_changed != 1 {
+        return Err(LedgerError::new(R::Corruption));
+    }
+    let locator_changed = conn
+        .execute(
+            "UPDATE task_attempt_locators SET locator_json=?2 WHERE task_id=?1",
+            rusqlite::params![task.as_str(), json],
+        )
+        .map_err(|error| history_error(&error))?;
+    if locator_changed != 1 {
+        return Err(LedgerError::new(R::Corruption));
+    }
+    Ok(())
+}
+
+fn commit_served_reservation_refusal<T>(
+    tx: rusqlite::Transaction<'_>,
+    row: &bridge_core::workflow_history::AttemptReservation,
+    reason: bridge_core::workflow_history::LedgerUnavailableReason,
+) -> Result<T, bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    let task = row
+        .task_id
+        .as_ref()
+        .ok_or_else(|| LedgerError::new(R::Schema))?;
+    settle_served_attempt_unavailable(&tx, task, &row.identity.attempt_id, reason)?;
+    tx.commit().map_err(|error| history_error(&error))?;
+    Err(LedgerError::new(reason))
+}
+
+struct PersistedReservationProjection<'a> {
+    attempt_id: &'a str,
+    execution_id: &'a str,
+    parent_attempt_id: Option<&'a str>,
+    ordinal: i64,
+    task_id: Option<&'a str>,
+    workflow: &'a str,
+    task_class: &'a str,
+    surface: &'a str,
+    policy: &'a str,
+    workload_fingerprint: &'a str,
+    workload_fingerprint_complete: i64,
+    started_ms: i64,
+    pinned: i64,
+    reservation_json: &'a str,
+    authority_attempt_id: Option<&'a str>,
+    authority_execution_id: Option<&'a str>,
+    authority_ordinal: Option<i64>,
+    authority_task_id: Option<&'a str>,
+    authority_surface: Option<&'a str>,
+    authority_history_disposition: Option<i64>,
+}
+
+fn history_persisted_bool(value: i64) -> Result<bool, bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(LedgerError::new(R::Corruption)),
+    }
+}
+
+fn validate_persisted_reservation(
+    row: PersistedReservationProjection<'_>,
+    expected_attempt: Option<&bridge_core::ids::AttemptId>,
+    expected_task: Option<&bridge_core::ids::TaskId>,
+) -> Result<
+    bridge_core::workflow_history::AttemptReservation,
+    bridge_core::workflow_history::LedgerError,
+> {
+    use bridge_core::workflow_history::{
+        AttemptReservation, LedgerError, LedgerUnavailableReason as R,
+    };
+
+    let corruption = || LedgerError::new(R::Corruption);
+    let reservation = serde_json::from_str::<AttemptReservation>(row.reservation_json)
+        .map_err(|_| corruption())?;
+    reservation.validate().map_err(|_| corruption())?;
+
+    let projected_fingerprint_complete = history_persisted_bool(row.workload_fingerprint_complete)?;
+    let projected_pinned = history_persisted_bool(row.pinned)?;
+    let reservation_task_id = reservation.task_id.as_ref().map(|value| value.as_str());
+    let reservation_parent = reservation
+        .identity
+        .parent_attempt_id
+        .as_ref()
+        .map(|value| value.as_str());
+    if expected_attempt.is_some_and(|expected| row.attempt_id != expected.as_str())
+        || expected_task.is_some_and(|expected| row.task_id != Some(expected.as_str()))
+        || reservation.identity.attempt_id.as_str() != row.attempt_id
+        || reservation.identity.execution_id.as_str() != row.execution_id
+        || reservation_parent != row.parent_attempt_id
+        || i64::from(reservation.identity.ordinal) != row.ordinal
+        || reservation_task_id != row.task_id
+        || reservation.workflow != row.workflow
+        || reservation.task_class != row.task_class
+        || reservation.surface.as_str() != row.surface
+        || reservation.policy != row.policy
+        || reservation.workload_fingerprint != row.workload_fingerprint
+        || reservation.workload_fingerprint_complete != projected_fingerprint_complete
+        || reservation.started_ms != row.started_ms
+        || reservation.pinned != projected_pinned
+    {
+        return Err(corruption());
+    }
+
+    if row.authority_attempt_id != Some(row.attempt_id)
+        || row.authority_execution_id != Some(row.execution_id)
+        || row.authority_ordinal != Some(row.ordinal)
+        || row.authority_task_id != row.task_id
+        || row.authority_surface != Some(row.surface)
+        || row.authority_history_disposition != Some(1)
+    {
+        return Err(corruption());
+    }
+
+    Ok(reservation)
 }
 
 #[async_trait::async_trait]
@@ -3900,165 +8036,231 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
         row: &bridge_core::workflow_history::AttemptReservation,
     ) -> Result<(), bridge_core::workflow_history::LedgerError> {
         use bridge_core::workflow_history::{
-            LedgerError, LedgerUnavailableReason as R, MAX_CHARGED_BYTES, MAX_TERMINAL_JSON_BYTES,
-            MAX_TERMINAL_ROWS, PERMANENT_IDENTITY_CHARGE, RESERVED_ROW_CHARGE, RETENTION_DAYS,
+            LedgerError, LedgerUnavailableReason as R, HISTORY_ATTACHMENT_CHARGE,
+            MAX_CHARGED_BYTES, MAX_TERMINAL_JSON_BYTES, MAX_TERMINAL_ROWS,
+            PERMANENT_IDENTITY_CHARGE, RESERVED_ROW_CHARGE, RETAINED_SUMMARY_CHARGE,
+            RETENTION_DAYS,
         };
         row.validate()?;
         let reservation_json =
             serde_json::to_string(row).map_err(|_| LedgerError::new(R::Schema))?;
         let _admission_lease = self.acquire_history_admission_lease()?;
+        #[cfg(test)]
+        history_transaction_pause(
+            self.history_path.as_deref(),
+            HistoryTransactionPausePoint::Reserve,
+        );
         self.checkpoint_and_verify_history_size()?;
         let lease_acquired = self.acquire_history_attempt_lease(&row.identity.attempt_id)?;
-        let result = (|| {
-            let mut conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
-            let tx = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| history_error(&e))?;
-            if matches!(
-                row.surface,
-                bridge_core::workflow_history::ExecutionSurface::ServedTask
-                    | bridge_core::workflow_history::ExecutionSurface::DirectUnary
-                    | bridge_core::workflow_history::ExecutionSurface::Mcp
-                    | bridge_core::workflow_history::ExecutionSurface::Smoke
-            ) && row.task_id.as_ref().map(|task| task.as_str())
-                != Some(row.identity.execution_id.as_str())
-            {
-                return Err(LedgerError::new(R::Schema));
-            }
-            let served = row.surface == bridge_core::workflow_history::ExecutionSurface::ServedTask;
-            let admitted: Option<(String, i64, Option<String>, String, i64)> = tx
-                .query_row(
-                    "SELECT execution_id, ordinal, task_id, owner_surface, summary_attached
+        enum ReservationTransaction {
+            Admitted,
+            Collected(bridge_core::ids::AttemptId),
+        }
+        let result = loop {
+            let transaction_result = (|| -> Result<ReservationTransaction, LedgerError> {
+                let mut conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|e| history_error(&e))?;
+                if matches!(
+                    row.surface,
+                    bridge_core::workflow_history::ExecutionSurface::ServedTask
+                        | bridge_core::workflow_history::ExecutionSurface::DirectUnary
+                        | bridge_core::workflow_history::ExecutionSurface::Mcp
+                        | bridge_core::workflow_history::ExecutionSurface::Smoke
+                ) && row.task_id.as_ref().map(|task| task.as_str())
+                    != Some(row.identity.execution_id.as_str())
+                {
+                    return Err(LedgerError::new(R::Schema));
+                }
+                let served =
+                    row.surface == bridge_core::workflow_history::ExecutionSurface::ServedTask;
+                let admitted: Option<(String, i64, Option<String>, String, i64)> = tx
+                    .query_row(
+                        "SELECT execution_id, ordinal, task_id, owner_surface, history_disposition
                      FROM attempt_identities WHERE attempt_id=?1",
-                    rusqlite::params![row.identity.attempt_id.as_str()],
-                    |record| {
-                        Ok((
-                            record.get(0)?,
-                            record.get(1)?,
-                            record.get(2)?,
-                            record.get(3)?,
-                            record.get(4)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|error| history_error(&error))?;
-            if served {
-                let exact = admitted.as_ref().is_some_and(
-                    |(execution, ordinal, task_id, owner_surface, summary_attached)| {
-                        execution == row.identity.execution_id.as_str()
-                            && *ordinal == i64::from(row.identity.ordinal)
-                            && task_id.as_deref() == row.task_id.as_ref().map(|task| task.as_str())
-                            && owner_surface == "served_task"
-                            && *summary_attached == 0
-                    },
-                );
-                if !exact {
-                    return Err(LedgerError::new(R::Collision));
-                }
-            } else {
-                let ordinal_owner: Option<String> = tx
-                    .query_row(
-                        "SELECT attempt_id FROM attempt_identities
-                         WHERE execution_id=?1 AND ordinal=?2",
-                        rusqlite::params![
-                            row.identity.execution_id.as_str(),
-                            i64::from(row.identity.ordinal)
-                        ],
-                        |record| record.get(0),
-                    )
-                    .optional()
-                    .map_err(|error| history_error(&error))?;
-                if admitted.is_some() || ordinal_owner.is_some() {
-                    return Err(LedgerError::new(R::Collision));
-                }
-            }
-            if let Some(parent) = row.identity.parent_attempt_id.as_ref() {
-                let prior: Option<(String, i64, String, Option<String>)> = tx
-                    .query_row(
-                        "SELECT execution_id, ordinal, status, task_id
-                         FROM workflow_attempt_summaries WHERE attempt_id=?1",
-                        rusqlite::params![parent.as_str()],
+                        rusqlite::params![row.identity.attempt_id.as_str()],
                         |record| {
                             Ok((
                                 record.get(0)?,
                                 record.get(1)?,
                                 record.get(2)?,
                                 record.get(3)?,
+                                record.get(4)?,
                             ))
                         },
                     )
                     .optional()
                     .map_err(|error| history_error(&error))?;
-                match prior {
-                    Some((execution, ordinal, status, task_id)) => {
-                        let expected_ordinal = ordinal.checked_add(1);
-                        if execution != row.identity.execution_id.as_str()
-                            || expected_ordinal != Some(i64::from(row.identity.ordinal))
-                            || status != "terminal"
-                            || task_id.as_deref() != row.task_id.as_ref().map(|task| task.as_str())
-                        {
-                            return Err(LedgerError::new(R::Collision));
-                        }
-                    }
-                    None if row.surface
-                        != bridge_core::workflow_history::ExecutionSurface::ServedTask =>
-                    {
+                if served {
+                    let exact = admitted.as_ref().is_some_and(
+                        |(execution, ordinal, task_id, owner_surface, history_disposition)| {
+                            execution == row.identity.execution_id.as_str()
+                                && *ordinal == i64::from(row.identity.ordinal)
+                                && task_id.as_deref()
+                                    == row.task_id.as_ref().map(|task| task.as_str())
+                                && owner_surface == "served_task"
+                                && *history_disposition == 0
+                        },
+                    );
+                    if !exact {
                         return Err(LedgerError::new(R::Collision));
                     }
-                    None => {}
+                } else {
+                    let ordinal_owner: Option<String> = tx
+                        .query_row(
+                            "SELECT attempt_id FROM attempt_identities
+                         WHERE execution_id=?1 AND ordinal=?2",
+                            rusqlite::params![
+                                row.identity.execution_id.as_str(),
+                                i64::from(row.identity.ordinal)
+                            ],
+                            |record| record.get(0),
+                        )
+                        .optional()
+                        .map_err(|error| history_error(&error))?;
+                    if admitted.is_some() || ordinal_owner.is_some() {
+                        return Err(LedgerError::new(R::Collision));
+                    }
                 }
-            } else {
-                let existing: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM workflow_attempt_summaries WHERE execution_id=?1",
-                        rusqlite::params![row.identity.execution_id.as_str()],
-                        |record| record.get(0),
-                    )
-                    .map_err(|error| history_error(&error))?;
-                if existing != 0 {
-                    return Err(LedgerError::new(R::Collision));
+                if let Some(parent) = row.identity.parent_attempt_id.as_ref() {
+                    let prior: Option<(String, i64, String, Option<String>)> = tx
+                        .query_row(
+                            "SELECT execution_id, ordinal, status, task_id
+                         FROM workflow_attempt_summaries WHERE attempt_id=?1",
+                            rusqlite::params![parent.as_str()],
+                            |record| {
+                                Ok((
+                                    record.get(0)?,
+                                    record.get(1)?,
+                                    record.get(2)?,
+                                    record.get(3)?,
+                                ))
+                            },
+                        )
+                        .optional()
+                        .map_err(|error| history_error(&error))?;
+                    match prior {
+                        Some((execution, ordinal, status, task_id)) => {
+                            let expected_ordinal = ordinal.checked_add(1);
+                            if execution != row.identity.execution_id.as_str()
+                                || expected_ordinal != Some(i64::from(row.identity.ordinal))
+                                || status != "terminal"
+                                || task_id.as_deref()
+                                    != row.task_id.as_ref().map(|task| task.as_str())
+                            {
+                                if served {
+                                    return commit_served_reservation_refusal(
+                                        tx,
+                                        row,
+                                        R::Collision,
+                                    );
+                                }
+                                return Err(LedgerError::new(R::Collision));
+                            }
+                        }
+                        None => {
+                            let retained_parent: Option<(String, i64, Option<String>, i64)> = tx
+                                .query_row(
+                                    "SELECT execution_id, ordinal, task_id, history_disposition
+                                     FROM attempt_identities WHERE attempt_id=?1",
+                                    rusqlite::params![parent.as_str()],
+                                    |record| {
+                                        Ok((
+                                            record.get(0)?,
+                                            record.get(1)?,
+                                            record.get(2)?,
+                                            record.get(3)?,
+                                        ))
+                                    },
+                                )
+                                .optional()
+                                .map_err(|error| history_error(&error))?;
+                            let retained_parent_is_exact = served
+                                || retained_parent.as_ref().is_some_and(
+                                    |(execution, ordinal, task_id, disposition)| {
+                                        execution == row.identity.execution_id.as_str()
+                                            && ordinal.checked_add(1)
+                                                == Some(i64::from(row.identity.ordinal))
+                                            && task_id.as_deref()
+                                                == row.task_id.as_ref().map(|task| task.as_str())
+                                            && *disposition == 1
+                                    },
+                                );
+                            if !retained_parent_is_exact {
+                                if served {
+                                    return commit_served_reservation_refusal(
+                                        tx,
+                                        row,
+                                        R::Collision,
+                                    );
+                                }
+                                return Err(LedgerError::new(R::Collision));
+                            }
+                        }
+                    }
+                } else {
+                    let existing: i64 = tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM workflow_attempt_summaries WHERE execution_id=?1",
+                            rusqlite::params![row.identity.execution_id.as_str()],
+                            |record| record.get(0),
+                        )
+                        .map_err(|error| history_error(&error))?;
+                    if existing != 0 {
+                        if served {
+                            return commit_served_reservation_refusal(tx, row, R::Collision);
+                        }
+                        return Err(LedgerError::new(R::Collision));
+                    }
                 }
-            }
-            let cutoff = row
-                .started_ms
-                .saturating_sub(RETENTION_DAYS * 24 * 60 * 60 * 1000);
-            let expired = {
-                let mut statement = tx
-                    .prepare(
-                        "SELECT attempt_id, charged_bytes FROM workflow_attempt_summaries
+                let cutoff = row
+                    .started_ms
+                    .saturating_sub(RETENTION_DAYS * 24 * 60 * 60 * 1000);
+                let expired = {
+                    let mut statement = tx
+                        .prepare(
+                            "SELECT attempt_id, charged_bytes FROM workflow_attempt_summaries
                          WHERE status='terminal' AND pinned=0 AND completed_ms < ?1
                          ORDER BY completed_ms, attempt_id LIMIT 1",
-                    )
-                    .map_err(|error| history_error(&error))?;
-                let rows = statement
-                    .query_map(rusqlite::params![cutoff], |record| {
-                        Ok((record.get::<_, String>(0)?, record.get::<_, i64>(1)?))
-                    })
-                    .map_err(|error| history_error(&error))?;
-                rows.collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| history_error(&error))?
-            };
-            for (attempt_id, charged_bytes) in expired {
-                let attempt_id = bridge_core::ids::AttemptId::parse(attempt_id)
-                    .map_err(|_| LedgerError::new(R::Corruption))?;
-                let charged_bytes =
-                    u64::try_from(charged_bytes).map_err(|_| LedgerError::new(R::Corruption))?;
-                let changed = tx
-                    .execute(
-                        "DELETE FROM workflow_attempt_summaries
+                        )
+                        .map_err(|error| history_error(&error))?;
+                    let rows = statement
+                        .query_map(rusqlite::params![cutoff], |record| {
+                            Ok((record.get::<_, String>(0)?, record.get::<_, i64>(1)?))
+                        })
+                        .map_err(|error| history_error(&error))?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| history_error(&error))?
+                };
+                if let Some((attempt_id, charged_bytes)) = expired.into_iter().next() {
+                    let attempt_id = bridge_core::ids::AttemptId::parse(attempt_id)
+                        .map_err(|_| LedgerError::new(R::Corruption))?;
+                    let charged_bytes = u64::try_from(charged_bytes)
+                        .map_err(|_| LedgerError::new(R::Corruption))?;
+                    self.credit_configured_slot(&tx, true)?;
+                    let changed = tx
+                        .execute(
+                            "DELETE FROM workflow_attempt_summaries
                          WHERE attempt_id=?1 AND status='terminal' AND pinned=0",
-                        rusqlite::params![attempt_id.as_str()],
-                    )
-                    .map_err(|error| history_error(&error))?;
-                if changed != 1 {
-                    return Err(LedgerError::new(R::Corruption));
+                            rusqlite::params![attempt_id.as_str()],
+                        )
+                        .map_err(|error| history_error(&error))?;
+                    if changed != 1 {
+                        return Err(LedgerError::new(R::Corruption));
+                    }
+                    let _ = charged_bytes;
+                    #[cfg(test)]
+                    history_mutation_failpoint(
+                        self.history_path.as_deref(),
+                        &attempt_id,
+                        HistoryMutationFailpointKind::RetentionIo,
+                    )?;
+                    tx.commit().map_err(|error| history_error(&error))?;
+                    return Ok(ReservationTransaction::Collected(attempt_id));
                 }
-                let _ = charged_bytes;
-                self.remove_history_attempt_lock_file(&attempt_id)?;
-            }
 
-            loop {
+                let configured_fits = self.configured_allocation_has_capacity(&tx)?;
                 let allocated_rows: i64 = tx
                     .query_row("SELECT COUNT(*) FROM workflow_attempt_summaries", [], |r| {
                         r.get(0)
@@ -4086,10 +8288,15 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                 let authority_charge = identity_rows
                     .saturating_add(incoming_identities)
                     .saturating_mul(PERMANENT_IDENTITY_CHARGE);
-                let logical_fits = charged
-                    .saturating_add(RESERVED_ROW_CHARGE)
-                    .saturating_add(authority_charge)
-                    <= MAX_CHARGED_BYTES;
+                let logical_fits =
+                    if self.history_allocation_kind == Some(HistoryAllocationKind::Configured) {
+                        configured_fits
+                    } else {
+                        charged
+                            .saturating_add(RESERVED_ROW_CHARGE)
+                            .saturating_add(authority_charge)
+                            <= MAX_CHARGED_BYTES
+                    };
                 let physical_charge = RESERVED_ROW_CHARGE
                     .saturating_add(incoming_identities.saturating_mul(PERMANENT_IDENTITY_CHARGE));
                 let page_size: i64 = tx
@@ -4102,136 +8309,180 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                     .saturating_add(page_size.saturating_mul(4));
                 let physical_fits = self
                     .history_growth_fits(&tx, physical_charge.saturating_add(rewrite_provision))?;
-                if allocated_rows < MAX_TERMINAL_ROWS && logical_fits && physical_fits {
-                    break;
-                }
-                let victim: Option<(String, i64)> = tx
-                    .query_row(
-                        "SELECT attempt_id, charged_bytes FROM workflow_attempt_summaries
+                if !(allocated_rows < MAX_TERMINAL_ROWS && logical_fits && physical_fits) {
+                    let victim: Option<(String, i64)> = tx
+                        .query_row(
+                            "SELECT attempt_id, charged_bytes FROM workflow_attempt_summaries
                          WHERE status='terminal' AND pinned=0
                          ORDER BY completed_ms, attempt_id LIMIT 1",
-                        [],
-                        |record| Ok((record.get(0)?, record.get(1)?)),
-                    )
-                    .optional()
-                    .map_err(|e| history_error(&e))?;
-                let Some((victim, victim_charge)) = victim else {
-                    return Err(LedgerError::new(R::CapacityProtected));
-                };
-                let victim = bridge_core::ids::AttemptId::parse(victim)
-                    .map_err(|_| LedgerError::new(R::Corruption))?;
-                let victim_charge =
-                    u64::try_from(victim_charge).map_err(|_| LedgerError::new(R::Corruption))?;
-                let changed = tx
-                    .execute(
-                        "DELETE FROM workflow_attempt_summaries
+                            [],
+                            |record| Ok((record.get(0)?, record.get(1)?)),
+                        )
+                        .optional()
+                        .map_err(|e| history_error(&e))?;
+                    let Some((victim, victim_charge)) = victim else {
+                        if served {
+                            return commit_served_reservation_refusal(
+                                tx,
+                                row,
+                                R::CapacityProtected,
+                            );
+                        }
+                        return Err(LedgerError::new(R::CapacityProtected));
+                    };
+                    let victim = bridge_core::ids::AttemptId::parse(victim)
+                        .map_err(|_| LedgerError::new(R::Corruption))?;
+                    let victim_charge = u64::try_from(victim_charge)
+                        .map_err(|_| LedgerError::new(R::Corruption))?;
+                    self.credit_configured_slot(&tx, true)?;
+                    let changed = tx
+                        .execute(
+                            "DELETE FROM workflow_attempt_summaries
                          WHERE attempt_id=?1 AND status='terminal' AND pinned=0",
-                        rusqlite::params![victim.as_str()],
-                    )
-                    .map_err(|e| history_error(&e))?;
-                if changed != 1 {
-                    return Err(LedgerError::new(R::Corruption));
+                            rusqlite::params![victim.as_str()],
+                        )
+                        .map_err(|e| history_error(&e))?;
+                    if changed != 1 {
+                        return Err(LedgerError::new(R::Corruption));
+                    }
+                    let _ = victim_charge;
+                    #[cfg(test)]
+                    history_mutation_failpoint(
+                        self.history_path.as_deref(),
+                        &victim,
+                        HistoryMutationFailpointKind::RetentionIo,
+                    )?;
+                    tx.commit().map_err(|error| history_error(&error))?;
+                    return Ok(ReservationTransaction::Collected(victim));
                 }
-                let _ = victim_charge;
-                self.remove_history_attempt_lock_file(&victim)?;
-                // Re-evaluate logical charge and proven reusable pages after
-                // every eviction; permanent identity authority remains charged.
-            }
 
-            if served {
-                let changed = tx
-                    .execute(
-                        "UPDATE attempt_identities SET summary_attached=1
+                if served {
+                    let changed = tx
+                        .execute(
+                            "UPDATE attempt_identities SET history_disposition=1
                          WHERE attempt_id=?1 AND execution_id=?2 AND ordinal=?3
                            AND task_id=?4 AND owner_surface='served_task'
-                           AND summary_attached=0",
+                           AND history_disposition=0",
+                            rusqlite::params![
+                                row.identity.attempt_id.as_str(),
+                                row.identity.execution_id.as_str(),
+                                i64::from(row.identity.ordinal),
+                                row.task_id.as_ref().map(|task| task.as_str())
+                            ],
+                        )
+                        .map_err(|error| history_error(&error))?;
+                    if changed != 1 {
+                        return Err(LedgerError::new(R::Collision));
+                    }
+                } else {
+                    tx.execute(
+                        "INSERT INTO attempt_identities(
+                         attempt_id, execution_id, ordinal, task_id,
+                         owner_surface, history_disposition)
+                     VALUES(?1, ?2, ?3, ?4, ?5, 1)",
                         rusqlite::params![
                             row.identity.attempt_id.as_str(),
                             row.identity.execution_id.as_str(),
                             i64::from(row.identity.ordinal),
-                            row.task_id.as_ref().map(|task| task.as_str())
+                            row.task_id.as_ref().map(|task| task.as_str()),
+                            row.surface.as_str()
                         ],
                     )
-                    .map_err(|error| history_error(&error))?;
-                if changed != 1 {
-                    return Err(LedgerError::new(R::Collision));
+                    .map_err(|error| {
+                        if matches!(
+                            error,
+                            rusqlite::Error::SqliteFailure(
+                                rusqlite::ffi::Error {
+                                    code: rusqlite::ErrorCode::ConstraintViolation,
+                                    ..
+                                },
+                                _
+                            )
+                        ) {
+                            LedgerError::new(R::Collision)
+                        } else {
+                            history_error(&error)
+                        }
+                    })?;
                 }
-            } else {
-                tx.execute(
-                    "INSERT INTO attempt_identities(
-                         attempt_id, execution_id, ordinal, task_id,
-                         owner_surface, summary_attached)
-                     VALUES(?1, ?2, ?3, ?4, ?5, 1)",
-                    rusqlite::params![
-                        row.identity.attempt_id.as_str(),
-                        row.identity.execution_id.as_str(),
-                        i64::from(row.identity.ordinal),
-                        row.task_id.as_ref().map(|task| task.as_str()),
-                        row.surface.as_str()
-                    ],
-                )
-                .map_err(|error| {
-                    if matches!(
-                        error,
-                        rusqlite::Error::SqliteFailure(
-                            rusqlite::ffi::Error {
-                                code: rusqlite::ErrorCode::ConstraintViolation,
-                                ..
-                            },
-                            _
-                        )
-                    ) {
-                        LedgerError::new(R::Collision)
-                    } else {
-                        history_error(&error)
-                    }
-                })?;
-            }
-            let result = tx.execute(
-                "INSERT INTO workflow_attempt_summaries(
+                let result = tx.execute(
+                    "INSERT INTO workflow_attempt_summaries(
                 attempt_id, execution_id, parent_attempt_id, ordinal, task_id,
                 workflow, task_class, surface, policy, workload_fingerprint,
                 workload_fingerprint_complete, started_ms, status, prompt_acceptance,
                 pinned, charged_bytes, reservation_json, terminal_reserve)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'active',?13,?14,?15,?16,zeroblob(?17))",
-                rusqlite::params![
-                    row.identity.attempt_id.as_str(),
-                    row.identity.execution_id.as_str(),
-                    row.identity.parent_attempt_id.as_ref().map(|v| v.as_str()),
-                    i64::from(row.identity.ordinal),
-                    row.task_id.as_ref().map(|v| v.as_str()),
-                    row.workflow,
-                    row.task_class,
-                    row.surface.as_str(),
-                    row.policy,
-                    row.workload_fingerprint,
-                    row.workload_fingerprint_complete,
-                    row.started_ms,
-                    row.prompt_acceptance,
-                    row.pinned,
-                    RESERVED_ROW_CHARGE as i64,
-                    reservation_json,
-                    i64::try_from(MAX_TERMINAL_JSON_BYTES)
-                        .map_err(|_| LedgerError::new(R::Schema))?,
-                ],
-            );
-            match result {
-                Ok(_) => {
-                    self.ensure_terminal_rewrite_headroom(&tx)?;
-                    tx.commit().map_err(|e| history_error(&e))
+                    rusqlite::params![
+                        row.identity.attempt_id.as_str(),
+                        row.identity.execution_id.as_str(),
+                        row.identity.parent_attempt_id.as_ref().map(|v| v.as_str()),
+                        i64::from(row.identity.ordinal),
+                        row.task_id.as_ref().map(|v| v.as_str()),
+                        row.workflow,
+                        row.task_class,
+                        row.surface.as_str(),
+                        row.policy,
+                        row.workload_fingerprint,
+                        row.workload_fingerprint_complete,
+                        row.started_ms,
+                        row.prompt_acceptance,
+                        row.pinned,
+                        RETAINED_SUMMARY_CHARGE as i64,
+                        reservation_json,
+                        i64::try_from(MAX_TERMINAL_JSON_BYTES)
+                            .map_err(|_| LedgerError::new(R::Schema))?,
+                    ],
+                );
+                match result {
+                    Ok(_) => {
+                        tx.execute(
+                            "INSERT INTO workflow_history_attachment(attempt_id, charged_bytes)
+                         VALUES(?1, ?2)",
+                            rusqlite::params![
+                                row.identity.attempt_id.as_str(),
+                                i64::try_from(HISTORY_ATTACHMENT_CHARGE)
+                                    .map_err(|_| LedgerError::new(R::Schema))?
+                            ],
+                        )
+                        .map_err(|error| history_error(&error))?;
+                        self.debit_configured_slot(&tx)?;
+                        self.ensure_terminal_rewrite_headroom(&tx)?;
+                        #[cfg(test)]
+                        history_mutation_failpoint(
+                            self.history_path.as_deref(),
+                            &row.identity.attempt_id,
+                            HistoryMutationFailpointKind::AdmissionIo,
+                        )?;
+                        tx.commit().map_err(|e| history_error(&e))?;
+                        Ok(ReservationTransaction::Admitted)
+                    }
+                    Err(rusqlite::Error::SqliteFailure(err, _))
+                        if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        Err(LedgerError::new(R::Collision))
+                    }
+                    Err(error) => Err(history_error(&error)),
                 }
-                Err(rusqlite::Error::SqliteFailure(err, _))
-                    if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-                {
-                    Err(LedgerError::new(R::Collision))
+            })();
+            match transaction_result {
+                Ok(ReservationTransaction::Collected(victim)) => {
+                    if let Err(error) = self.remove_history_attempt_lock_file(&victim) {
+                        break Err(error);
+                    }
+                    if let Err(error) = self.checkpoint_and_verify_history_size() {
+                        break Err(error);
+                    }
                 }
-                Err(error) => Err(history_error(&error)),
+                outcome => break outcome,
             }
-        })();
+        };
         match result {
-            Ok(()) => {
+            Ok(ReservationTransaction::Admitted) => {
                 self.checkpoint_after_committed_history_mutation("reserve");
                 Ok(())
+            }
+            Ok(ReservationTransaction::Collected(_)) => {
+                unreachable!("a committed retention victim always restarts admission")
             }
             Err(error) => {
                 if lease_acquired {
@@ -4379,7 +8630,14 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                 )
                 .map_err(|error| history_error(&error))?;
             if changed == 1 {
+                self.increment_configured_terminal_rows(&tx)?;
                 self.ensure_terminal_rewrite_headroom(&tx)?;
+                #[cfg(test)]
+                history_mutation_failpoint(
+                    self.history_path.as_deref(),
+                    id,
+                    HistoryMutationFailpointKind::TerminalSqliteFull,
+                )?;
                 tx.commit().map_err(|error| history_error(&error))?;
                 return Ok(TerminalWrite::Applied);
             }
@@ -4411,6 +8669,11 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
         };
 
         let _admission_lease = self.acquire_history_admission_lease()?;
+        #[cfg(test)]
+        history_transaction_pause(
+            self.history_path.as_deref(),
+            HistoryTransactionPausePoint::SetPinned,
+        );
         self.checkpoint_and_verify_history_size()?;
         let mut conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
         let tx = conn
@@ -4490,22 +8753,106 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
         Option<bridge_core::workflow_history::AttemptReservation>,
         bridge_core::workflow_history::LedgerError,
     > {
-        use bridge_core::workflow_history::{
-            AttemptReservation, LedgerError, LedgerUnavailableReason as R,
-        };
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+        struct PersistedLatestReservation {
+            attempt_id: String,
+            execution_id: String,
+            parent_attempt_id: Option<String>,
+            ordinal: i64,
+            task_id: Option<String>,
+            workflow: String,
+            task_class: String,
+            surface: String,
+            policy: String,
+            workload_fingerprint: String,
+            workload_fingerprint_complete: i64,
+            started_ms: i64,
+            pinned: i64,
+            reservation_json: String,
+            authority_attempt_id: Option<String>,
+            authority_execution_id: Option<String>,
+            authority_ordinal: Option<i64>,
+            authority_task_id: Option<String>,
+            authority_surface: Option<String>,
+            authority_history_disposition: Option<i64>,
+        }
+
         let conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
-        let json: Option<String> = conn
-            .query_row(
-                "SELECT reservation_json FROM workflow_attempt_summaries
-                 WHERE task_id=?1 ORDER BY ordinal DESC, started_ms DESC LIMIT 1",
-                rusqlite::params![task.as_str()],
-                |row| row.get(0),
-            )
+        let disposition_projection = match history_identity_disposition_column(&conn)
+            .map_err(|error| schema_migration_error(&error))?
+        {
+            HistoryIdentityDispositionColumn::LegacySummaryAttached => "authority.summary_attached",
+            HistoryIdentityDispositionColumn::HistoryDisposition => "authority.history_disposition",
+        };
+        let query = format!(
+            "SELECT summary.attempt_id, summary.execution_id,
+                    summary.parent_attempt_id, summary.ordinal, summary.task_id,
+                    summary.workflow, summary.task_class, summary.surface, summary.policy,
+                    summary.workload_fingerprint, summary.workload_fingerprint_complete,
+                    summary.started_ms, summary.pinned, summary.reservation_json,
+                    authority.attempt_id, authority.execution_id, authority.ordinal,
+                    authority.task_id, authority.owner_surface, {disposition_projection}
+             FROM workflow_attempt_summaries summary
+             LEFT JOIN attempt_identities authority
+               ON authority.attempt_id=summary.attempt_id
+             WHERE summary.task_id=?1
+             ORDER BY summary.ordinal DESC, summary.started_ms DESC LIMIT 1"
+        );
+        let row: Option<PersistedLatestReservation> = conn
+            .query_row(&query, rusqlite::params![task.as_str()], |row| {
+                Ok(PersistedLatestReservation {
+                    attempt_id: row.get(0)?,
+                    execution_id: row.get(1)?,
+                    parent_attempt_id: row.get(2)?,
+                    ordinal: row.get(3)?,
+                    task_id: row.get(4)?,
+                    workflow: row.get(5)?,
+                    task_class: row.get(6)?,
+                    surface: row.get(7)?,
+                    policy: row.get(8)?,
+                    workload_fingerprint: row.get(9)?,
+                    workload_fingerprint_complete: row.get(10)?,
+                    started_ms: row.get(11)?,
+                    pinned: row.get(12)?,
+                    reservation_json: row.get(13)?,
+                    authority_attempt_id: row.get(14)?,
+                    authority_execution_id: row.get(15)?,
+                    authority_ordinal: row.get(16)?,
+                    authority_task_id: row.get(17)?,
+                    authority_surface: row.get(18)?,
+                    authority_history_disposition: row.get(19)?,
+                })
+            })
             .optional()
-            .map_err(|error| history_error(&error))?;
-        json.map(|value| {
-            serde_json::from_str::<AttemptReservation>(&value)
-                .map_err(|_| LedgerError::new(R::Corruption))
+            .map_err(|error| history_attempt_read_error(&error))?;
+        row.map(|row| {
+            validate_persisted_reservation(
+                PersistedReservationProjection {
+                    attempt_id: &row.attempt_id,
+                    execution_id: &row.execution_id,
+                    parent_attempt_id: row.parent_attempt_id.as_deref(),
+                    ordinal: row.ordinal,
+                    task_id: row.task_id.as_deref(),
+                    workflow: &row.workflow,
+                    task_class: &row.task_class,
+                    surface: &row.surface,
+                    policy: &row.policy,
+                    workload_fingerprint: &row.workload_fingerprint,
+                    workload_fingerprint_complete: row.workload_fingerprint_complete,
+                    started_ms: row.started_ms,
+                    pinned: row.pinned,
+                    reservation_json: &row.reservation_json,
+                    authority_attempt_id: row.authority_attempt_id.as_deref(),
+                    authority_execution_id: row.authority_execution_id.as_deref(),
+                    authority_ordinal: row.authority_ordinal,
+                    authority_task_id: row.authority_task_id.as_deref(),
+                    authority_surface: row.authority_surface.as_deref(),
+                    authority_history_disposition: row.authority_history_disposition,
+                },
+                None,
+                Some(task),
+            )
         })
         .transpose()
     }
@@ -4518,8 +8865,7 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
         bridge_core::workflow_history::LedgerError,
     > {
         use bridge_core::workflow_history::{
-            AttemptRecord, AttemptReservation, AttemptTerminal, LedgerError,
-            LedgerUnavailableReason as R,
+            AttemptRecord, AttemptTerminal, LedgerError, LedgerUnavailableReason as R,
         };
 
         struct PersistedAttempt {
@@ -4556,120 +8902,107 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
             authority_ordinal: Option<i64>,
             authority_task_id: Option<String>,
             authority_surface: Option<String>,
-            authority_summary_attached: Option<i64>,
+            authority_history_disposition: Option<i64>,
         }
 
         let corruption = || LedgerError::new(R::Corruption);
-        let persisted_bool = |value| -> Result<bool, LedgerError> {
-            match value {
-                0 => Ok(false),
-                1 => Ok(true),
-                _ => Err(corruption()),
-            }
-        };
+        let persisted_bool = history_persisted_bool;
         let conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
+        let disposition_projection = match history_identity_disposition_column(&conn)
+            .map_err(|error| schema_migration_error(&error))?
+        {
+            HistoryIdentityDispositionColumn::LegacySummaryAttached => "authority.summary_attached",
+            HistoryIdentityDispositionColumn::HistoryDisposition => "authority.history_disposition",
+        };
+        let query = format!(
+            "SELECT summary.attempt_id, summary.execution_id,
+                    summary.parent_attempt_id, summary.ordinal, summary.task_id,
+                    summary.workflow, summary.task_class, summary.surface, summary.policy,
+                    summary.workload_fingerprint, summary.workload_fingerprint_complete,
+                    summary.started_ms, summary.completed_ms, summary.status,
+                    summary.prompt_acceptance, summary.producer_terminal,
+                    summary.final_message, summary.process_liveness,
+                    summary.terminal_evidence_capability,
+                    summary.terminal_evidence_version, summary.terminal_evidence_source,
+                    summary.terminal_evidence_complete, summary.telemetry_complete,
+                    summary.outcome, summary.degraded, summary.pinned,
+                    summary.reservation_json, summary.terminal_json,
+                    authority.attempt_id, authority.execution_id, authority.ordinal,
+                    authority.task_id, authority.owner_surface, {disposition_projection}
+             FROM workflow_attempt_summaries summary
+             LEFT JOIN attempt_identities authority
+               ON authority.attempt_id=summary.attempt_id
+             WHERE summary.attempt_id=?1"
+        );
         let row: Option<PersistedAttempt> = conn
-            .query_row(
-                "SELECT summary.attempt_id, summary.execution_id,
-                        summary.parent_attempt_id, summary.ordinal, summary.task_id,
-                        summary.workflow, summary.task_class, summary.surface, summary.policy,
-                        summary.workload_fingerprint, summary.workload_fingerprint_complete,
-                        summary.started_ms, summary.completed_ms, summary.status,
-                        summary.prompt_acceptance, summary.producer_terminal,
-                        summary.final_message, summary.process_liveness,
-                        summary.terminal_evidence_capability,
-                        summary.terminal_evidence_version, summary.terminal_evidence_source,
-                        summary.terminal_evidence_complete, summary.telemetry_complete,
-                        summary.outcome, summary.degraded, summary.pinned,
-                        summary.reservation_json, summary.terminal_json,
-                        authority.attempt_id, authority.execution_id, authority.ordinal,
-                        authority.task_id, authority.owner_surface, authority.summary_attached
-                 FROM workflow_attempt_summaries summary
-                 LEFT JOIN attempt_identities authority
-                   ON authority.attempt_id=summary.attempt_id
-                 WHERE summary.attempt_id=?1",
-                rusqlite::params![id.as_str()],
-                |row| {
-                    Ok(PersistedAttempt {
-                        attempt_id: row.get(0)?,
-                        execution_id: row.get(1)?,
-                        parent_attempt_id: row.get(2)?,
-                        ordinal: row.get(3)?,
-                        task_id: row.get(4)?,
-                        workflow: row.get(5)?,
-                        task_class: row.get(6)?,
-                        surface: row.get(7)?,
-                        policy: row.get(8)?,
-                        workload_fingerprint: row.get(9)?,
-                        workload_fingerprint_complete: row.get(10)?,
-                        started_ms: row.get(11)?,
-                        completed_ms: row.get(12)?,
-                        status: row.get(13)?,
-                        prompt_acceptance: row.get(14)?,
-                        producer_terminal: row.get(15)?,
-                        final_message: row.get(16)?,
-                        process_liveness: row.get(17)?,
-                        terminal_evidence_capability: row.get(18)?,
-                        terminal_evidence_version: row.get(19)?,
-                        terminal_evidence_source: row.get(20)?,
-                        terminal_evidence_complete: row.get(21)?,
-                        telemetry_complete: row.get(22)?,
-                        outcome: row.get(23)?,
-                        degraded: row.get(24)?,
-                        pinned: row.get(25)?,
-                        reservation_json: row.get(26)?,
-                        terminal_json: row.get(27)?,
-                        authority_attempt_id: row.get(28)?,
-                        authority_execution_id: row.get(29)?,
-                        authority_ordinal: row.get(30)?,
-                        authority_task_id: row.get(31)?,
-                        authority_surface: row.get(32)?,
-                        authority_summary_attached: row.get(33)?,
-                    })
-                },
-            )
+            .query_row(&query, rusqlite::params![id.as_str()], |row| {
+                Ok(PersistedAttempt {
+                    attempt_id: row.get(0)?,
+                    execution_id: row.get(1)?,
+                    parent_attempt_id: row.get(2)?,
+                    ordinal: row.get(3)?,
+                    task_id: row.get(4)?,
+                    workflow: row.get(5)?,
+                    task_class: row.get(6)?,
+                    surface: row.get(7)?,
+                    policy: row.get(8)?,
+                    workload_fingerprint: row.get(9)?,
+                    workload_fingerprint_complete: row.get(10)?,
+                    started_ms: row.get(11)?,
+                    completed_ms: row.get(12)?,
+                    status: row.get(13)?,
+                    prompt_acceptance: row.get(14)?,
+                    producer_terminal: row.get(15)?,
+                    final_message: row.get(16)?,
+                    process_liveness: row.get(17)?,
+                    terminal_evidence_capability: row.get(18)?,
+                    terminal_evidence_version: row.get(19)?,
+                    terminal_evidence_source: row.get(20)?,
+                    terminal_evidence_complete: row.get(21)?,
+                    telemetry_complete: row.get(22)?,
+                    outcome: row.get(23)?,
+                    degraded: row.get(24)?,
+                    pinned: row.get(25)?,
+                    reservation_json: row.get(26)?,
+                    terminal_json: row.get(27)?,
+                    authority_attempt_id: row.get(28)?,
+                    authority_execution_id: row.get(29)?,
+                    authority_ordinal: row.get(30)?,
+                    authority_task_id: row.get(31)?,
+                    authority_surface: row.get(32)?,
+                    authority_history_disposition: row.get(33)?,
+                })
+            })
             .optional()
             .map_err(|error| history_attempt_read_error(&error))?;
         row.map(|row| {
-            let mut reservation = serde_json::from_str::<AttemptReservation>(&row.reservation_json)
-                .map_err(|_| corruption())?;
-            reservation.validate().map_err(|_| corruption())?;
-
-            let projected_fingerprint_complete = persisted_bool(row.workload_fingerprint_complete)?;
             let projected_pinned = persisted_bool(row.pinned)?;
-            let reservation_task_id = reservation.task_id.as_ref().map(|value| value.as_str());
-            let reservation_parent = reservation
-                .identity
-                .parent_attempt_id
-                .as_ref()
-                .map(|value| value.as_str());
-            if row.attempt_id != id.as_str()
-                || reservation.identity.attempt_id != *id
-                || row.execution_id != reservation.identity.execution_id.as_str()
-                || row.parent_attempt_id.as_deref() != reservation_parent
-                || row.ordinal != i64::from(reservation.identity.ordinal)
-                || row.task_id.as_deref() != reservation_task_id
-                || row.workflow != reservation.workflow
-                || row.task_class != reservation.task_class
-                || row.surface != reservation.surface.as_str()
-                || row.policy != reservation.policy
-                || row.workload_fingerprint != reservation.workload_fingerprint
-                || projected_fingerprint_complete != reservation.workload_fingerprint_complete
-                || row.started_ms != reservation.started_ms
-                || projected_pinned != reservation.pinned
-            {
-                return Err(corruption());
-            }
-
-            if row.authority_attempt_id.as_deref() != Some(row.attempt_id.as_str())
-                || row.authority_execution_id.as_deref() != Some(row.execution_id.as_str())
-                || row.authority_ordinal != Some(row.ordinal)
-                || row.authority_task_id.as_deref() != row.task_id.as_deref()
-                || row.authority_surface.as_deref() != Some(row.surface.as_str())
-                || row.authority_summary_attached != Some(1)
-            {
-                return Err(corruption());
-            }
+            let mut reservation = validate_persisted_reservation(
+                PersistedReservationProjection {
+                    attempt_id: &row.attempt_id,
+                    execution_id: &row.execution_id,
+                    parent_attempt_id: row.parent_attempt_id.as_deref(),
+                    ordinal: row.ordinal,
+                    task_id: row.task_id.as_deref(),
+                    workflow: &row.workflow,
+                    task_class: &row.task_class,
+                    surface: &row.surface,
+                    policy: &row.policy,
+                    workload_fingerprint: &row.workload_fingerprint,
+                    workload_fingerprint_complete: row.workload_fingerprint_complete,
+                    started_ms: row.started_ms,
+                    pinned: row.pinned,
+                    reservation_json: &row.reservation_json,
+                    authority_attempt_id: row.authority_attempt_id.as_deref(),
+                    authority_execution_id: row.authority_execution_id.as_deref(),
+                    authority_ordinal: row.authority_ordinal,
+                    authority_task_id: row.authority_task_id.as_deref(),
+                    authority_surface: row.authority_surface.as_deref(),
+                    authority_history_disposition: row.authority_history_disposition,
+                },
+                Some(id),
+                None,
+            )?;
 
             if !matches!(
                 row.prompt_acceptance.as_str(),
@@ -4798,9 +9131,21 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
             return Err(LedgerError::new(R::Schema));
         }
         struct PersistedCompleted {
+            attempt_id: String,
+            execution_id: String,
+            parent_attempt_id: Option<String>,
+            ordinal: i64,
+            task_id: Option<String>,
+            workflow: String,
+            task_class: String,
+            surface: String,
+            policy: String,
+            workload_fingerprint: String,
+            workload_fingerprint_complete: i64,
+            started_ms: i64,
+            pinned: i64,
             reservation_json: String,
             terminal_json: String,
-            surface: String,
             completed_ms: i64,
             outcome: String,
             degraded: i64,
@@ -4813,6 +9158,12 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
             terminal_evidence_source: String,
             terminal_evidence_complete: i64,
             telemetry_complete: i64,
+            authority_attempt_id: Option<String>,
+            authority_execution_id: Option<String>,
+            authority_ordinal: Option<i64>,
+            authority_task_id: Option<String>,
+            authority_surface: Option<String>,
+            authority_history_disposition: Option<i64>,
         }
 
         let corruption = || LedgerError::new(R::Corruption);
@@ -4824,51 +9175,108 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
             }
         };
         let conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
+        let disposition_projection = match history_identity_disposition_column(&conn)
+            .map_err(|error| schema_migration_error(&error))?
+        {
+            HistoryIdentityDispositionColumn::LegacySummaryAttached => "authority.summary_attached",
+            HistoryIdentityDispositionColumn::HistoryDisposition => "authority.history_disposition",
+        };
         // Keep this statement and its rows alive through validation and
         // compatibility projection so retention cannot split selection from
         // decoding across SQLite snapshots.
+        let query = format!(
+            "SELECT summary.attempt_id, summary.execution_id,
+                    summary.parent_attempt_id, summary.ordinal, summary.task_id,
+                    summary.workflow, summary.task_class, summary.surface, summary.policy,
+                    summary.workload_fingerprint, summary.workload_fingerprint_complete,
+                    summary.started_ms, summary.pinned, summary.reservation_json,
+                    summary.terminal_json, summary.completed_ms, summary.outcome,
+                    summary.degraded, summary.prompt_acceptance, summary.producer_terminal,
+                    summary.final_message, summary.process_liveness,
+                    summary.terminal_evidence_capability,
+                    summary.terminal_evidence_version, summary.terminal_evidence_source,
+                    summary.terminal_evidence_complete, summary.telemetry_complete,
+                    authority.attempt_id, authority.execution_id, authority.ordinal,
+                    authority.task_id, authority.owner_surface, {disposition_projection}
+             FROM workflow_attempt_summaries summary
+             LEFT JOIN attempt_identities authority
+               ON authority.attempt_id=summary.attempt_id
+             WHERE summary.status='terminal'
+               AND summary.completed_ms>=?1 AND summary.completed_ms<=?2
+             ORDER BY summary.completed_ms, summary.attempt_id"
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT reservation_json, terminal_json, surface, completed_ms,
-                        outcome, degraded, prompt_acceptance, producer_terminal,
-                        final_message, process_liveness, terminal_evidence_capability,
-                        terminal_evidence_version, terminal_evidence_source,
-                        terminal_evidence_complete, telemetry_complete
-                 FROM workflow_attempt_summaries
-                 WHERE status='terminal' AND completed_ms>=?1 AND completed_ms<=?2
-                 ORDER BY completed_ms, attempt_id",
-            )
-            .map_err(|error| history_error(&error))?;
+            .prepare(&query)
+            .map_err(|error| history_migration_error(&error))?;
         let rows = stmt
             .query_map(rusqlite::params![start_ms, end_ms], |row| {
                 Ok(PersistedCompleted {
-                    reservation_json: row.get(0)?,
-                    terminal_json: row.get(1)?,
-                    surface: row.get(2)?,
-                    completed_ms: row.get(3)?,
-                    outcome: row.get(4)?,
-                    degraded: row.get(5)?,
-                    prompt_acceptance: row.get(6)?,
-                    producer_terminal: row.get(7)?,
-                    final_message: row.get(8)?,
-                    process_liveness: row.get(9)?,
-                    terminal_evidence_capability: row.get(10)?,
-                    terminal_evidence_version: row.get(11)?,
-                    terminal_evidence_source: row.get(12)?,
-                    terminal_evidence_complete: row.get(13)?,
-                    telemetry_complete: row.get(14)?,
+                    attempt_id: row.get(0)?,
+                    execution_id: row.get(1)?,
+                    parent_attempt_id: row.get(2)?,
+                    ordinal: row.get(3)?,
+                    task_id: row.get(4)?,
+                    workflow: row.get(5)?,
+                    task_class: row.get(6)?,
+                    surface: row.get(7)?,
+                    policy: row.get(8)?,
+                    workload_fingerprint: row.get(9)?,
+                    workload_fingerprint_complete: row.get(10)?,
+                    started_ms: row.get(11)?,
+                    pinned: row.get(12)?,
+                    reservation_json: row.get(13)?,
+                    terminal_json: row.get(14)?,
+                    completed_ms: row.get(15)?,
+                    outcome: row.get(16)?,
+                    degraded: row.get(17)?,
+                    prompt_acceptance: row.get(18)?,
+                    producer_terminal: row.get(19)?,
+                    final_message: row.get(20)?,
+                    process_liveness: row.get(21)?,
+                    terminal_evidence_capability: row.get(22)?,
+                    terminal_evidence_version: row.get(23)?,
+                    terminal_evidence_source: row.get(24)?,
+                    terminal_evidence_complete: row.get(25)?,
+                    telemetry_complete: row.get(26)?,
+                    authority_attempt_id: row.get(27)?,
+                    authority_execution_id: row.get(28)?,
+                    authority_ordinal: row.get(29)?,
+                    authority_task_id: row.get(30)?,
+                    authority_surface: row.get(31)?,
+                    authority_history_disposition: row.get(32)?,
                 })
             })
-            .map_err(|error| history_error(&error))?;
+            .map_err(|error| history_migration_error(&error))?;
 
         let mut out = Vec::new();
         for row in rows {
             let row = row.map_err(|error| history_attempt_read_error(&error))?;
-            let mut reservation = serde_json::from_str::<
-                bridge_core::workflow_history::AttemptReservation,
-            >(&row.reservation_json)
-            .map_err(|_| corruption())?;
-            reservation.validate().map_err(|_| corruption())?;
+            let mut reservation = validate_persisted_reservation(
+                PersistedReservationProjection {
+                    attempt_id: &row.attempt_id,
+                    execution_id: &row.execution_id,
+                    parent_attempt_id: row.parent_attempt_id.as_deref(),
+                    ordinal: row.ordinal,
+                    task_id: row.task_id.as_deref(),
+                    workflow: &row.workflow,
+                    task_class: &row.task_class,
+                    surface: &row.surface,
+                    policy: &row.policy,
+                    workload_fingerprint: &row.workload_fingerprint,
+                    workload_fingerprint_complete: row.workload_fingerprint_complete,
+                    started_ms: row.started_ms,
+                    pinned: row.pinned,
+                    reservation_json: &row.reservation_json,
+                    authority_attempt_id: row.authority_attempt_id.as_deref(),
+                    authority_execution_id: row.authority_execution_id.as_deref(),
+                    authority_ordinal: row.authority_ordinal,
+                    authority_task_id: row.authority_task_id.as_deref(),
+                    authority_surface: row.authority_surface.as_deref(),
+                    authority_history_disposition: row.authority_history_disposition,
+                },
+                None,
+                None,
+            )?;
             let projected_prompt_acceptance =
                 bridge_core::workflow_history::conservative_prompt_acceptance(
                     &reservation.prompt_acceptance,
@@ -4936,29 +9344,145 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
     }
 }
 
-/// Owner-private history path used only when no configured durable store exists.
-pub fn platform_history_path(
-) -> Result<std::path::PathBuf, bridge_core::workflow_history::LedgerError> {
+/// Purely select the owner-private history path used when no configured store exists.
+pub fn select_platform_history(
+) -> Result<PlatformHistorySelection, bridge_core::workflow_history::LedgerError> {
     use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
     if let Some(path) = std::env::var_os("A2A_BRIDGE_STATE_DIR") {
         if path.is_empty() {
             return Err(LedgerError::new(R::Open));
         }
-        return Ok(std::path::PathBuf::from(path).join("workflow-history.sqlite"));
+        let path = std::path::PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(LedgerError::new(R::Open));
+        }
+        return Ok(PlatformHistorySelection {
+            path: path.join("workflow-history.sqlite"),
+        });
     }
-    let home = std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| LedgerError::new(R::Open))?;
-    let base = if cfg!(target_os = "macos") {
-        std::path::PathBuf::from(home).join("Library/Application Support/a2a-bridge")
-    } else {
-        std::env::var_os("XDG_STATE_HOME")
+
+    #[cfg(target_os = "macos")]
+    let base = {
+        let home = std::env::var_os("HOME")
             .filter(|v| !v.is_empty())
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(home).join(".local/state"))
-            .join("a2a-bridge")
+            .ok_or_else(|| LedgerError::new(R::Open))?;
+        let home = std::path::PathBuf::from(home);
+        if !home.is_absolute() {
+            return Err(LedgerError::new(R::Open));
+        }
+        home.join("Library/Application Support/a2a-bridge")
     };
-    Ok(base.join("workflow-history.sqlite"))
+    #[cfg(not(target_os = "macos"))]
+    let base = {
+        let absolute_xdg = std::env::var_os("XDG_STATE_HOME")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute());
+        if let Some(xdg) = absolute_xdg {
+            xdg.join("a2a-bridge")
+        } else {
+            let home = std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| LedgerError::new(R::Open))?;
+            let home = std::path::PathBuf::from(home);
+            if !home.is_absolute() {
+                return Err(LedgerError::new(R::Open));
+            }
+            home.join(".local/state").join("a2a-bridge")
+        }
+    };
+    Ok(PlatformHistorySelection {
+        path: base.join("workflow-history.sqlite"),
+    })
+}
+
+/// Compatibility/read-only path API. Selection alone never bootstraps.
+pub fn platform_history_path(
+) -> Result<std::path::PathBuf, bridge_core::workflow_history::LedgerError> {
+    select_platform_history().map(|selection| selection.path)
+}
+
+fn preflight_platform_history_physical_limit(
+    path: &std::path::Path,
+) -> Result<(), bridge_core::workflow_history::LedgerError> {
+    use bridge_core::workflow_history::{
+        LedgerError, LedgerUnavailableReason as R, MAX_CHARGED_BYTES,
+    };
+
+    fn regular_file_len(
+        path: &std::path::Path,
+    ) -> Result<u64, bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(LedgerError::new(R::Open));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.nlink() != 1 {
+                        return Err(LedgerError::new(R::Open));
+                    }
+                }
+                Ok(metadata.len())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(history_io_error_with_permission(
+                &error,
+                R::Io,
+                R::Permission,
+            )),
+        }
+    }
+
+    let main_bytes = regular_file_len(path)?;
+    let mut aggregate_bytes = main_bytes;
+    for suffix in ["-wal", "-journal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        aggregate_bytes =
+            aggregate_bytes.saturating_add(regular_file_len(std::path::Path::new(&sidecar))?);
+    }
+    let main_budget = MAX_CHARGED_BYTES
+        .checked_sub(HISTORY_SIDECAR_HEADROOM_BYTES)
+        .ok_or_else(|| LedgerError::new(R::CapacityProtected))?;
+    if main_bytes > main_budget
+        || aggregate_bytes.saturating_add(HISTORY_DISK_TRANSACTION_HEADROOM_BYTES)
+            > MAX_CHARGED_BYTES
+    {
+        return Err(LedgerError::new(R::CapacityProtected));
+    }
+    if main_bytes == 0 {
+        return Ok(());
+    }
+
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| history_error(&error))?;
+    connection
+        .execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=5000;")
+        .map_err(|error| history_error(&error))?;
+    let page_size: i64 = connection
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .map_err(|error| history_error(&error))?;
+    let page_count: i64 = connection
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .map_err(|error| history_error(&error))?;
+    let page_size = u64::try_from(page_size).map_err(|_| LedgerError::new(R::Corruption))?;
+    let page_count = u64::try_from(page_count).map_err(|_| LedgerError::new(R::Corruption))?;
+    if page_size == 0 {
+        return Err(LedgerError::new(R::Corruption));
+    }
+    if page_count > main_budget / page_size {
+        return Err(LedgerError::new(R::CapacityProtected));
+    }
+    Ok(())
 }
 
 // A disk-backed SQLite transaction can copy every main-database page into its
@@ -4972,13 +9496,13 @@ impl SqliteStore {
     /// Apply the main-database page ceiling before schema migration or any
     /// history mutation. Aggregate filesystem admission additionally accounts
     /// for every live WAL/journal/SHM sidecar.
-    fn configure_history_physical_limit(
+    fn configure_history_page_limit(
         &self,
     ) -> Result<(), bridge_core::workflow_history::LedgerError> {
         use bridge_core::workflow_history::{
             LedgerError, LedgerUnavailableReason as R, MAX_CHARGED_BYTES,
         };
-        if self.history_path.is_none() {
+        if self.history_allocation_kind != Some(HistoryAllocationKind::Platform) {
             return Ok(());
         }
         let conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
@@ -5014,6 +9538,20 @@ impl SqliteStore {
         if applied > max_pages {
             return Err(LedgerError::new(R::CapacityProtected));
         }
+        Ok(())
+    }
+
+    /// Apply platform-only rollback-journal policy only after the durable
+    /// platform/migrating marker and schema transaction have committed.
+    fn configure_history_physical_limit(
+        &self,
+    ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        if self.history_allocation_kind != Some(HistoryAllocationKind::Platform) {
+            return Ok(());
+        }
+        self.configure_history_page_limit()?;
+        let conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
         // A live reader can prevent WAL checkpointing while later writers keep
         // appending frames, so WAL plus max_page_count is not a hard physical
         // bound. Rollback journals serialize writers and contain at most one
@@ -5026,7 +9564,8 @@ impl SqliteStore {
             return Err(LedgerError::new(R::CapacityProtected));
         }
         conn.execute_batch(
-            "PRAGMA cache_spill = OFF;
+            "PRAGMA synchronous = NORMAL;
+             PRAGMA cache_spill = OFF;
              PRAGMA journal_size_limit = 0;",
         )
         .map_err(|error| history_error(&error))?;
@@ -5045,7 +9584,7 @@ impl SqliteStore {
         use bridge_core::workflow_history::{
             LedgerError, LedgerUnavailableReason as R, MAX_CHARGED_BYTES,
         };
-        if self.history_path.is_none() {
+        if self.history_allocation_kind != Some(HistoryAllocationKind::Platform) {
             return Ok(());
         }
         let conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
@@ -6119,17 +10658,17 @@ mod tests {
     }
 
     #[test]
-    fn open_creates_missing_parent_dir() {
-        // A `[store] path` may name a not-yet-existing subdir (e.g. `<config-dir>/.a2a-bridge/...`).
-        // `open` must `mkdir -p` the parent rather than fail with StoreFailure.
+    fn open_refuses_missing_parent_without_namespace_effect() {
         let base = std::env::temp_dir().join(format!("a2a-store-mkdir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let path = base.join("nested").join("tasks.sqlite");
         assert!(!base.exists(), "parent dir must not pre-exist");
-        let store = SqliteStore::open(&path).expect("open creates the missing parent dir");
-        assert!(path.exists(), "db file created under the freshly-made dir");
-        drop(store);
-        let _ = std::fs::remove_dir_all(&base);
+        let error = SqliteStore::open(&path).err().unwrap();
+        assert_eq!(
+            error.reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::ReadOnlyParent
+        );
+        assert!(!base.exists(), "refusal must not create the missing parent");
     }
 
     #[tokio::test]
@@ -7317,6 +11856,2990 @@ mod r2f0a_history_tests {
         TerminalWrite, WorkflowHistoryStore,
     };
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn selected_history(path: std::path::PathBuf) -> PlatformHistorySelection {
+        PlatformHistorySelection { path }
+    }
+
+    fn assert_plain_error(
+        error: bridge_core::workflow_history::LedgerError,
+        reason: bridge_core::workflow_history::LedgerUnavailableReason,
+    ) {
+        assert_eq!(error.reason, reason);
+        assert_eq!(error.sqlite_primary_code, None);
+        assert_eq!(error.sqlite_extended_code, None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_canonical_history_path(store: SqliteStore, expected: &std::path::Path) {
+        assert_eq!(
+            store.history_path.as_deref(),
+            Some(expected),
+            "a file-backed history opener must retain the canonical parent spelling"
+        );
+        drop(store);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    static PLATFORM_BOOTSTRAP_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct PlatformPauseGuard {
+        path: std::path::PathBuf,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for PlatformPauseGuard {
+        fn drop(&mut self) {
+            if let Some(slot) = PLATFORM_BOOTSTRAP_PAUSE_HOOK.get() {
+                let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if slot.as_ref().is_some_and(|hook| hook.path == self.path) {
+                    *slot = None;
+                }
+            }
+            if let Some(outcomes) = PLATFORM_BOOTSTRAP_MKDIR_OUTCOMES.get() {
+                outcomes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&self.path);
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct HistoryPrevalidationPauseGuard {
+        path: std::path::PathBuf,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for HistoryPrevalidationPauseGuard {
+        fn drop(&mut self) {
+            if let Some(hooks) = HISTORY_PREVALIDATION_PAUSE_HOOKS.get() {
+                hooks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&self.path);
+            }
+            let _ = self.release.send(());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn arm_history_prevalidation_pause(
+        path: &std::path::Path,
+    ) -> (
+        HistoryPrevalidationPauseGuard,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        let mut hooks = HISTORY_PREVALIDATION_PAUSE_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !hooks.contains_key(path),
+            "a same-path prevalidation pause is already armed"
+        );
+        hooks.insert(
+            path.to_path_buf(),
+            HistoryPrevalidationPauseHook {
+                reached: reached_tx,
+                proceed: proceed_rx,
+            },
+        );
+        drop(hooks);
+        (
+            HistoryPrevalidationPauseGuard {
+                path: path.to_path_buf(),
+                release: proceed_tx.clone(),
+            },
+            reached_rx,
+            proceed_tx,
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct HistoryFileOpenControlGuard {
+        path: std::path::PathBuf,
+        releases: Vec<std::sync::mpsc::Sender<()>>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for HistoryFileOpenControlGuard {
+        fn drop(&mut self) {
+            if let Some(controls) = HISTORY_FILE_OPEN_TEST_CONTROLS.get() {
+                controls
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&self.path);
+            }
+            for release in &self.releases {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    type HistoryFileOpenPauseHandles = (
+        Vec<std::sync::mpsc::Receiver<()>>,
+        Vec<std::sync::mpsc::Sender<()>>,
+    );
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn arm_history_file_open_control(
+        path: &std::path::Path,
+        injections: &[(HistoryFileOpenState, i32)],
+        pauses: &[HistoryFileOpenPausePoint],
+    ) -> (HistoryFileOpenControlGuard, HistoryFileOpenPauseHandles) {
+        let mut pause_hooks = std::collections::VecDeque::new();
+        let mut reached = Vec::new();
+        let mut proceed = Vec::new();
+        for point in pauses {
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+            let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+            pause_hooks.push_back(HistoryFileOpenPauseHook {
+                point: *point,
+                reached: reached_tx,
+                proceed: proceed_rx,
+            });
+            reached.push(reached_rx);
+            proceed.push(proceed_tx);
+        }
+        let control = HistoryFileOpenTestControl {
+            injections: injections.iter().copied().collect(),
+            pauses: pause_hooks,
+            observations: Vec::new(),
+            actual_syscalls: 0,
+        };
+        let mut controls = HISTORY_FILE_OPEN_TEST_CONTROLS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !controls.contains_key(path),
+            "a same-path history-file-open control is already armed"
+        );
+        controls.insert(path.to_path_buf(), control);
+        drop(controls);
+        (
+            HistoryFileOpenControlGuard {
+                path: path.to_path_buf(),
+                releases: proceed.clone(),
+            },
+            (reached, proceed),
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn history_file_open_observations(
+        path: &std::path::Path,
+    ) -> (Vec<HistoryFileOpenObservation>, usize) {
+        let controls = HISTORY_FILE_OPEN_TEST_CONTROLS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let control = controls
+            .get(path)
+            .expect("history-file-open control must remain armed");
+        (control.observations.clone(), control.actual_syscalls)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct PlatformOpenControlGuard {
+        path: std::path::PathBuf,
+        releases: Vec<std::sync::mpsc::Sender<()>>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for PlatformOpenControlGuard {
+        fn drop(&mut self) {
+            if let Some(hooks) = PLATFORM_OPEN_TEST_HOOKS.get() {
+                let mut hooks = hooks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if hooks
+                    .after_initial_probe
+                    .as_ref()
+                    .is_some_and(|hook| hook.path == self.path)
+                {
+                    hooks.after_initial_probe = None;
+                }
+                if hooks
+                    .while_untagged_under_schema_lock
+                    .as_ref()
+                    .is_some_and(|hook| hook.path == self.path)
+                {
+                    hooks.while_untagged_under_schema_lock = None;
+                }
+                if hooks
+                    .after_migrating_before_ready
+                    .as_ref()
+                    .is_some_and(|hook| hook.path == self.path)
+                {
+                    hooks.after_migrating_before_ready = None;
+                }
+                if hooks
+                    .would_block
+                    .as_ref()
+                    .is_some_and(|(path, _)| path == &self.path)
+                {
+                    hooks.would_block = None;
+                }
+            }
+            for release in &self.releases {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn arm_platform_open_after_initial_probe(
+        path: &std::path::Path,
+    ) -> (
+        PlatformOpenControlGuard,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        let mut hooks = PLATFORM_OPEN_TEST_HOOKS
+            .get_or_init(|| Mutex::new(PlatformOpenTestHooks::default()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            hooks.after_initial_probe.is_none(),
+            "an after-initial-probe hook leaked"
+        );
+        hooks.after_initial_probe = Some(PlatformOpenRaceHook {
+            path: path.to_path_buf(),
+            reached: reached_tx,
+            proceed: proceed_rx,
+        });
+        drop(hooks);
+        (
+            PlatformOpenControlGuard {
+                path: path.to_path_buf(),
+                releases: vec![proceed_tx.clone()],
+            },
+            reached_rx,
+            proceed_tx,
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    type PlatformOpenControlHandles = (
+        PlatformOpenControlGuard,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn arm_platform_open_control(
+        path: &std::path::Path,
+        pause: PlatformOpenPausePoint,
+    ) -> PlatformOpenControlHandles {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let hook = PlatformOpenRaceHook {
+            path: path.to_path_buf(),
+            reached: reached_tx,
+            proceed: proceed_rx,
+        };
+        let mut hooks = PLATFORM_OPEN_TEST_HOOKS
+            .get_or_init(|| Mutex::new(PlatformOpenTestHooks::default()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = match pause {
+            PlatformOpenPausePoint::WhileUntaggedUnderSchemaLock => {
+                &mut hooks.while_untagged_under_schema_lock
+            }
+            PlatformOpenPausePoint::AfterMigratingBeforeReady => {
+                &mut hooks.after_migrating_before_ready
+            }
+        };
+        assert!(slot.is_none(), "a platform-open pause hook leaked");
+        *slot = Some(hook);
+        assert!(hooks.would_block.is_none(), "a would-block hook leaked");
+        hooks.would_block = Some((path.to_path_buf(), blocked_tx));
+        drop(hooks);
+        (
+            PlatformOpenControlGuard {
+                path: path.to_path_buf(),
+                releases: vec![proceed_tx.clone()],
+            },
+            reached_rx,
+            proceed_tx,
+            blocked_rx,
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn arm_platform_pause(
+        path: &std::path::Path,
+        point: PlatformBootstrapPausePoint,
+    ) -> (
+        PlatformPauseGuard,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        let mut slot = PLATFORM_BOOTSTRAP_PAUSE_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap();
+        assert!(slot.is_none(), "a platform bootstrap pause hook leaked");
+        *slot = Some(PlatformBootstrapPauseHook {
+            path: path.to_path_buf(),
+            point,
+            reached: reached_tx,
+            proceed: proceed_rx,
+        });
+        drop(slot);
+        (
+            PlatformPauseGuard {
+                path: path.to_path_buf(),
+            },
+            reached_rx,
+            proceed_tx,
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn canonical_late_hook_path(
+        existing_anchor: &std::path::Path,
+        state_root: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let suffix = state_root
+            .strip_prefix(existing_anchor)
+            .expect("the state root must be below its caller-owned anchor");
+        std::fs::canonicalize(existing_anchor)
+            .expect("the caller-owned anchor must exist")
+            .join(suffix)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_no_history_artifacts(root: &std::path::Path) {
+        fn visit(directory: &std::path::Path) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                assert!(
+                    !name.contains("workflow-history.sqlite"),
+                    "store artifact: {name}"
+                );
+                assert!(
+                    !name.starts_with(HISTORY_PARENT_PROOF_PREFIX),
+                    "proof artifact: {name}"
+                );
+                assert!(
+                    !name.ends_with(".attempt-locks"),
+                    "attempt artifact: {name}"
+                );
+                if metadata.is_dir() {
+                    visit(&entry.path());
+                }
+            }
+        }
+        visit(root);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const REFUSAL_SNAPSHOT_CONTENT_LIMIT: u64 = 1024 * 1024;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[derive(Debug, PartialEq, Eq)]
+    struct RefusalEntrySnapshot {
+        relative_path: std::path::PathBuf,
+        file_type: &'static str,
+        mode: u32,
+        owner: u32,
+        links: u64,
+        length: u64,
+        device: u64,
+        inode: u64,
+        bytes: Option<Vec<u8>>,
+        symlink_target: Option<std::path::PathBuf>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[derive(Debug, PartialEq, Eq)]
+    struct RefusalDirectorySnapshot {
+        root: std::path::PathBuf,
+        entries: Vec<RefusalEntrySnapshot>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[derive(Debug, PartialEq, Eq)]
+    struct RefusalAttemptLocksSnapshot {
+        path: RefusalEntrySnapshot,
+        entries: Vec<RefusalEntrySnapshot>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[derive(Debug, PartialEq, Eq)]
+    struct RefusalStateSnapshot {
+        directories: Vec<RefusalDirectorySnapshot>,
+        database_artifacts: Vec<(String, Option<RefusalEntrySnapshot>)>,
+        attempt_locks: Option<RefusalAttemptLocksSnapshot>,
+        parent_proof_residue: Vec<std::path::PathBuf>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn refusal_entry_snapshot(
+        root: &std::path::Path,
+        path: &std::path::Path,
+    ) -> Option<RefusalEntrySnapshot> {
+        use std::io::Read as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => panic!("snapshot metadata for {}: {error}", path.display()),
+        };
+        let file_type = metadata.file_type();
+        let relative_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+        let bytes = if file_type.is_file() && metadata.len() <= REFUSAL_SNAPSHOT_CONTENT_LIMIT {
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let mut file = options.open(path).unwrap();
+            let descriptor_metadata = file.metadata().unwrap();
+            assert_eq!(
+                (descriptor_metadata.dev(), descriptor_metadata.ino()),
+                (metadata.dev(), metadata.ino()),
+                "snapshot regular-file identity changed for {}",
+                path.display()
+            );
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes.len() as u64, metadata.len());
+            Some(bytes)
+        } else {
+            None
+        };
+        let symlink_target = file_type
+            .is_symlink()
+            .then(|| std::fs::read_link(path).unwrap());
+        Some(RefusalEntrySnapshot {
+            relative_path,
+            file_type: if file_type.is_file() {
+                "regular"
+            } else if file_type.is_dir() {
+                "directory"
+            } else if file_type.is_symlink() {
+                "symlink"
+            } else {
+                "other"
+            },
+            mode: metadata.mode(),
+            owner: metadata.uid(),
+            links: metadata.nlink(),
+            length: metadata.len(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes,
+            symlink_target,
+        })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn refusal_directory_snapshot(root: &std::path::Path) -> RefusalDirectorySnapshot {
+        fn visit(
+            root: &std::path::Path,
+            directory: &std::path::Path,
+            entries: &mut Vec<RefusalEntrySnapshot>,
+        ) {
+            let mut children = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            children.sort();
+            for child in children {
+                let entry = refusal_entry_snapshot(root, &child).unwrap();
+                let recurse = entry.file_type == "directory";
+                entries.push(entry);
+                if recurse {
+                    visit(root, &child, entries);
+                }
+            }
+        }
+
+        let metadata = std::fs::symlink_metadata(root).unwrap();
+        assert!(metadata.is_dir(), "protected root must be a directory");
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        RefusalDirectorySnapshot {
+            root: root.to_path_buf(),
+            entries,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn refusal_state_snapshot(
+        database: &std::path::Path,
+        protected_directories: &[&std::path::Path],
+    ) -> RefusalStateSnapshot {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+            let mut value = path.as_os_str().to_os_string();
+            value.push(suffix);
+            value.into()
+        }
+
+        let mut directories = protected_directories
+            .iter()
+            .map(|root| refusal_directory_snapshot(root))
+            .collect::<Vec<_>>();
+        directories.sort_by(|left, right| left.root.cmp(&right.root));
+
+        let artifact_root = database.parent().unwrap();
+        let database_artifacts = [
+            "",
+            "-wal",
+            "-shm",
+            "-journal",
+            ".lock",
+            ".schema.lock",
+            ".admission.lock",
+        ]
+        .into_iter()
+        .map(|suffix| {
+            let path = with_suffix(database, suffix);
+            (
+                suffix.to_owned(),
+                refusal_entry_snapshot(artifact_root, &path),
+            )
+        })
+        .collect::<Vec<_>>();
+        assert!(
+            database_artifacts[0].1.as_ref().is_none_or(|database| {
+                database.file_type != "regular" || database.bytes.is_some()
+            }),
+            "refusal fixture database exceeds the exact-content snapshot limit"
+        );
+
+        let attempt_path = history_attempt_lock_dir(database);
+        let attempt_locks = refusal_entry_snapshot(artifact_root, &attempt_path).map(|path| {
+            let entries = if path.file_type == "directory" {
+                refusal_directory_snapshot(&attempt_path).entries
+            } else {
+                Vec::new()
+            };
+            RefusalAttemptLocksSnapshot { path, entries }
+        });
+
+        let prefix = HISTORY_PARENT_PROOF_PREFIX.as_bytes();
+        let mut parent_proof_residue = directories
+            .iter()
+            .flat_map(|directory| &directory.entries)
+            .filter(|entry| {
+                entry
+                    .relative_path
+                    .file_name()
+                    .is_some_and(|name| name.as_bytes().starts_with(prefix))
+            })
+            .map(|entry| entry.relative_path.clone())
+            .collect::<Vec<_>>();
+        parent_proof_residue.sort();
+
+        RefusalStateSnapshot {
+            directories,
+            database_artifacts,
+            attempt_locks,
+            parent_proof_residue,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_refusal_state_unchanged(
+        before: &RefusalStateSnapshot,
+        database: &std::path::Path,
+        protected_directories: &[&std::path::Path],
+    ) {
+        let after = refusal_state_snapshot(database, protected_directories);
+        assert_eq!(&after, before, "refusal changed protected filesystem state");
+        assert!(
+            after.parent_proof_residue.is_empty(),
+            "history parent proof residue survived refusal: {:?}",
+            after.parent_proof_residue
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_safe_sqlite_sidecar_observation(entry: &RefusalEntrySnapshot) {
+        assert_eq!(
+            entry.file_type, "regular",
+            "SQLite sidecar changed to an unsafe type"
+        );
+        assert_eq!(
+            entry.owner,
+            unsafe { libc::geteuid() },
+            "SQLite sidecar is not owned by the effective uid"
+        );
+        assert_eq!(entry.links, 1, "SQLite sidecar has multiple links");
+        assert!(
+            entry.symlink_target.is_none(),
+            "SQLite sidecar has a symlink target"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn sqlite_inspection_allowed_relative_paths(
+        database: &std::path::Path,
+        protected_root: &std::path::Path,
+    ) -> Vec<std::path::PathBuf> {
+        fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+            let mut value = path.as_os_str().to_os_string();
+            value.push(suffix);
+            value.into()
+        }
+
+        fn add_sidecars(
+            allowed: &mut Vec<std::path::PathBuf>,
+            database: &std::path::Path,
+            protected_root: &std::path::Path,
+        ) {
+            for suffix in ["-wal", "-shm"] {
+                if let Ok(relative) = with_suffix(database, suffix).strip_prefix(protected_root) {
+                    let relative = relative.to_path_buf();
+                    if !allowed.contains(&relative) {
+                        allowed.push(relative);
+                    }
+                }
+            }
+        }
+
+        let mut allowed = Vec::new();
+        add_sidecars(&mut allowed, database, protected_root);
+
+        if let (Some(database_parent), Some(database_name)) =
+            (database.parent(), database.file_name())
+        {
+            if let (Ok(canonical_database_parent), Ok(canonical_protected_root)) = (
+                std::fs::canonicalize(database_parent),
+                std::fs::canonicalize(protected_root),
+            ) {
+                let canonical_database = canonical_database_parent.join(database_name);
+                add_sidecars(&mut allowed, &canonical_database, &canonical_protected_root);
+            }
+        }
+        allowed
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_sqlite_inspection_effects_only(
+        before: &RefusalStateSnapshot,
+        database: &std::path::Path,
+        protected_directories: &[&std::path::Path],
+    ) {
+        let after = refusal_state_snapshot(database, protected_directories);
+        assert_eq!(
+            after.directories.len(),
+            before.directories.len(),
+            "SQLite inspection changed the protected-root set"
+        );
+        for (before_directory, after_directory) in before.directories.iter().zip(&after.directories)
+        {
+            assert_eq!(after_directory.root, before_directory.root);
+            let allowed =
+                sqlite_inspection_allowed_relative_paths(database, &before_directory.root);
+            for entry in before_directory
+                .entries
+                .iter()
+                .chain(&after_directory.entries)
+            {
+                if allowed
+                    .iter()
+                    .any(|relative| relative == &entry.relative_path)
+                {
+                    assert_safe_sqlite_sidecar_observation(entry);
+                }
+            }
+            let protected_before = before_directory
+                .entries
+                .iter()
+                .filter(|entry| {
+                    !allowed
+                        .iter()
+                        .any(|relative| relative == &entry.relative_path)
+                })
+                .collect::<Vec<_>>();
+            let protected_after = after_directory
+                .entries
+                .iter()
+                .filter(|entry| {
+                    !allowed
+                        .iter()
+                        .any(|relative| relative == &entry.relative_path)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                protected_after, protected_before,
+                "SQLite inspection changed protected filesystem state outside canonical WAL/SHM"
+            );
+        }
+
+        assert_eq!(
+            after.database_artifacts.len(),
+            before.database_artifacts.len()
+        );
+        for ((before_suffix, before_entry), (after_suffix, after_entry)) in before
+            .database_artifacts
+            .iter()
+            .zip(&after.database_artifacts)
+        {
+            assert_eq!(after_suffix, before_suffix);
+            if matches!(before_suffix.as_str(), "-wal" | "-shm") {
+                for entry in before_entry.iter().chain(after_entry) {
+                    assert_safe_sqlite_sidecar_observation(entry);
+                }
+            } else {
+                assert_eq!(
+                    after_entry, before_entry,
+                    "SQLite inspection changed protected database artifact {before_suffix}"
+                );
+            }
+        }
+        assert_eq!(after.attempt_locks, before.attempt_locks);
+        assert_eq!(after.parent_proof_residue, before.parent_proof_residue);
+        assert!(
+            after.parent_proof_residue.is_empty(),
+            "history parent proof residue survived SQLite inspection: {:?}",
+            after.parent_proof_residue
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sqlite_inspection_comparator_allows_only_safe_canonical_wal_and_shm() {
+        fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+            let mut value = path.as_os_str().to_os_string();
+            value.push(suffix);
+            value.into()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("history.sqlite");
+        std::fs::write(&database, b"main").unwrap();
+        let absent = refusal_state_snapshot(&database, &[directory.path()]);
+        let wal = with_suffix(&database, "-wal");
+        let shm = with_suffix(&database, "-shm");
+        std::fs::write(&wal, b"wal-one").unwrap();
+        std::fs::write(&shm, b"shm-one").unwrap();
+        assert_sqlite_inspection_effects_only(&absent, &database, &[directory.path()]);
+
+        let present = refusal_state_snapshot(&database, &[directory.path()]);
+        std::fs::write(&wal, b"wal-two-longer").unwrap();
+        std::fs::write(&shm, b"shm-two-longer").unwrap();
+        assert_sqlite_inspection_effects_only(&present, &database, &[directory.path()]);
+
+        let changed = refusal_state_snapshot(&database, &[directory.path()]);
+        std::fs::remove_file(&wal).unwrap();
+        std::fs::remove_file(&shm).unwrap();
+        assert_sqlite_inspection_effects_only(&changed, &database, &[directory.path()]);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sqlite_inspection_comparator_normalizes_protected_root_alias_without_broadening() {
+        use std::os::unix::fs::symlink;
+
+        fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+            let mut value = path.as_os_str().to_os_string();
+            value.push(suffix);
+            value.into()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let canonical_ancestor = directory.path().join("canonical");
+        let canonical_root = canonical_ancestor.join("protected");
+        std::fs::create_dir_all(&canonical_root).unwrap();
+        let alias_ancestor = directory.path().join("alias");
+        symlink(&canonical_ancestor, &alias_ancestor).unwrap();
+        let protected_root = alias_ancestor.join("protected");
+        assert!(
+            std::fs::symlink_metadata(&protected_root).unwrap().is_dir(),
+            "the protected root itself must remain a directory"
+        );
+
+        let database = canonical_root.join("history.sqlite");
+        std::fs::write(&database, b"main").unwrap();
+        let database = std::fs::canonicalize(database).unwrap();
+        assert_ne!(
+            database.parent().unwrap(),
+            protected_root,
+            "the fixture needs distinct lexical root spellings"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&protected_root).unwrap(),
+            database.parent().unwrap()
+        );
+        let wal = with_suffix(&database, "-wal");
+        let shm = with_suffix(&database, "-shm");
+
+        let absent = refusal_state_snapshot(&database, &[&protected_root]);
+        std::fs::write(&wal, b"wal-one").unwrap();
+        std::fs::write(&shm, b"shm-one").unwrap();
+        assert_sqlite_inspection_effects_only(&absent, &database, &[&protected_root]);
+
+        let present = refusal_state_snapshot(&database, &[&protected_root]);
+        std::fs::write(&wal, b"wal-two-longer").unwrap();
+        std::fs::write(&shm, b"shm-two-longer").unwrap();
+        assert_sqlite_inspection_effects_only(&present, &database, &[&protected_root]);
+
+        let before_unrelated = refusal_state_snapshot(&database, &[&protected_root]);
+        std::fs::write(protected_root.join("unrelated-wal"), b"other").unwrap();
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_sqlite_inspection_effects_only(&before_unrelated, &database, &[&protected_root]);
+        }));
+        assert!(
+            rejected.is_err(),
+            "comparator accepted an unrelated WAL-suffixed entry"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sqlite_inspection_comparator_rejects_every_non_sqlite_or_unsafe_effect() {
+        fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+            let mut value = path.as_os_str().to_os_string();
+            value.push(suffix);
+            value.into()
+        }
+
+        fn assert_rejected(case: &str, mutate: impl FnOnce(&std::path::Path)) {
+            let directory = tempfile::tempdir().unwrap();
+            let database = directory.path().join("history.sqlite");
+            std::fs::write(&database, b"main").unwrap();
+            let before = refusal_state_snapshot(&database, &[directory.path()]);
+            mutate(&database);
+            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_sqlite_inspection_effects_only(&before, &database, &[directory.path()]);
+            }));
+            assert!(rejected.is_err(), "comparator accepted {case}");
+        }
+
+        assert_rejected("main-database change", |database| {
+            std::fs::write(database, b"changed-main").unwrap();
+        });
+        assert_rejected("schema-lock creation", |database| {
+            std::fs::write(with_suffix(database, ".schema.lock"), b"lock").unwrap();
+        });
+        assert_rejected("attempt-lock creation", |database| {
+            std::fs::create_dir(history_attempt_lock_dir(database)).unwrap();
+        });
+        assert_rejected("unrelated WAL-suffixed entry", |database| {
+            std::fs::write(with_suffix(database, "-unrelated-wal"), b"other").unwrap();
+        });
+        assert_rejected("unsafe canonical WAL type", |database| {
+            std::fs::create_dir(with_suffix(database, "-wal")).unwrap();
+        });
+        assert_rejected("multi-link canonical SHM", |database| {
+            let shm = with_suffix(database, "-shm");
+            std::fs::write(&shm, b"shm").unwrap();
+            std::fs::hard_link(&shm, with_suffix(database, "-linked-shm")).unwrap();
+        });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn canonical_sidecar_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        value.into()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn prepare_owner_gate_live_wal_fixture(
+        path: &std::path::Path,
+        kind: HistoryAllocationKind,
+    ) -> (
+        std::path::PathBuf,
+        rusqlite::Connection,
+        rusqlite::Connection,
+    ) {
+        use std::os::unix::fs::MetadataExt as _;
+        match kind {
+            HistoryAllocationKind::Configured => {
+                drop(SqliteStore::open_shared_history(path).unwrap());
+            }
+            HistoryAllocationKind::Platform => {
+                drop(SqliteStore::open_platform_history(path).unwrap());
+            }
+        }
+        let canonical = canonical_fixture_path(path);
+        let writer = rusqlite::Connection::open(&canonical).unwrap();
+        let mode: String = writer
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE IF NOT EXISTS owner_gate_wal_fixture(value INTEGER NOT NULL);
+                 INSERT INTO owner_gate_wal_fixture VALUES(1);",
+            )
+            .unwrap();
+        let reader = rusqlite::Connection::open(&canonical).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row(
+                "SELECT charged_bytes FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        writer
+            .execute("INSERT INTO owner_gate_wal_fixture VALUES(2)", [])
+            .unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = canonical_sidecar_path(&canonical, suffix);
+            let metadata = std::fs::symlink_metadata(&sidecar).unwrap();
+            assert!(metadata.file_type().is_file());
+            assert_eq!(metadata.nlink(), 1);
+        }
+        (canonical, reader, writer)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn owner_gate_public_opener(
+        route: &str,
+        path: &std::path::Path,
+    ) -> Result<SqliteStore, bridge_core::workflow_history::LedgerError> {
+        match route {
+            "untyped-lifetime" => SqliteStore::open(path),
+            "configured-lifetime" => SqliteStore::open_shared_history(path),
+            "platform-lifetime" => SqliteStore::open_platform_history(path),
+            "concurrent-platform" => SqliteStore::open_history(path),
+            "generic-read-only" => SqliteStore::open_history_read_only(path),
+            "configured-read-only" => SqliteStore::open_configured_history_read_only(path),
+            "platform-read-only" => SqliteStore::open_platform_history_read_only(path),
+            "generic-admin" => SqliteStore::open_history_admin(path),
+            "configured-admin" => SqliteStore::open_configured_history_admin(path),
+            "platform-admin" => SqliteStore::open_platform_history_admin(path),
+            other => panic!("unknown owner-gate public route: {other}"),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[derive(Debug)]
+    struct BoundedCrashFixtureTimeout {
+        pid: u32,
+        kill: std::io::Result<()>,
+        output: std::process::Output,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_bounded_crash_fixture_with_timeout(
+        helper: &str,
+        path_environment: &str,
+        path: &std::path::Path,
+        case: &str,
+        readiness_path: Option<&std::path::Path>,
+        timeout: std::time::Duration,
+    ) -> Option<BoundedCrashFixtureTimeout> {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(helper)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(path_environment, path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        if let Some(readiness_path) = readiness_path {
+            let expected_pid = pid.to_string();
+            let readiness_deadline = std::time::Instant::now() + HISTORY_TEST_HOOK_TIMEOUT;
+            let readiness = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break Err(format!("exited before readiness: {status}")),
+                    Ok(None) => {}
+                    Err(error) => break Err(format!("wait failed: {error}")),
+                }
+                match std::fs::read_to_string(readiness_path) {
+                    Ok(observed_pid) if observed_pid == expected_pid => match child.try_wait() {
+                        Ok(None) => break Ok(()),
+                        Ok(Some(status)) => {
+                            break Err(format!("exited while confirming readiness: {status}"));
+                        }
+                        Err(error) => break Err(format!("confirmation failed: {error}")),
+                    },
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => break Err(format!("probe failed: {error}")),
+                }
+                if std::time::Instant::now() >= readiness_deadline {
+                    break Err("timed out".to_owned());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            if let Err(error) = readiness {
+                let kill = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "{case} readiness failed ({error}); kill={kill:?} status={:?}: stdout={} stderr={}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    let output = child.wait_with_output().unwrap();
+                    assert_eq!(
+                        output.status.code(),
+                        Some(17),
+                        "{case} failed unexpectedly: stdout={} stderr={}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    return None;
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let kill = child.kill();
+                    let output = child.wait_with_output().unwrap();
+                    return Some(BoundedCrashFixtureTimeout { pid, kill, output });
+                }
+                Err(error) => {
+                    let kill = child.kill();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "{case} wait failed ({error}); kill={kill:?} status={:?}: stdout={} stderr={}",
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_bounded_crash_fixture(
+        helper: &str,
+        path_environment: &str,
+        path: &std::path::Path,
+        case: &str,
+    ) {
+        if let Some(BoundedCrashFixtureTimeout {
+            pid: _,
+            kill,
+            output,
+        }) = run_bounded_crash_fixture_with_timeout(
+            helper,
+            path_environment,
+            path,
+            case,
+            None,
+            std::time::Duration::from_secs(10),
+        ) {
+            panic!(
+                "{case} timed out; kill={kill:?} status={:?}: stdout={} stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn bounded_crash_fixture_timeout_process_helper() {
+        use std::io::Write as _;
+
+        let Some(started_path) =
+            std::env::var_os("A2A_BRIDGE_TEST_BOUNDED_CRASH_FIXTURE_STARTED_PATH")
+        else {
+            return;
+        };
+        let mut started = std::fs::File::create(started_path).unwrap();
+        write!(started, "{}", std::process::id()).unwrap();
+        started.sync_all().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        unsafe { libc::_exit(19) };
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn bounded_crash_fixture_timeout_kills_and_reaps() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let started_path = directory.path().join("started");
+        let outcome = run_bounded_crash_fixture_with_timeout(
+            "sqlite::r2f0a_history_tests::bounded_crash_fixture_timeout_process_helper",
+            "A2A_BRIDGE_TEST_BOUNDED_CRASH_FIXTURE_STARTED_PATH",
+            &started_path,
+            "bounded crash fixture timeout oracle",
+            Some(&started_path),
+            std::time::Duration::from_millis(500),
+        )
+        .expect("bounded crash fixture returned before its timeout");
+        let BoundedCrashFixtureTimeout { pid, kill, output } = outcome;
+        assert_eq!(
+            std::fs::read_to_string(&started_path).unwrap(),
+            pid.to_string(),
+            "the timed-out PID was not the helper that proved it started"
+        );
+        assert!(
+            kill.is_ok(),
+            "the exact timed-out child was not killed: {kill:?}"
+        );
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGKILL),
+            "the timed-out child did not terminate from the runner's kill"
+        );
+
+        let mut status = 0;
+        let wait = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert_eq!(wait, -1, "the timed-out child remained waitable: {wait}");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "the timed-out child was not reaped"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_owner_gate_safe_sidecars(path: &std::path::Path) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = canonical_sidecar_path(path, suffix);
+            let metadata = std::fs::symlink_metadata(&sidecar).unwrap();
+            assert!(metadata.file_type().is_file());
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            assert_eq!(metadata.nlink(), 1);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_platform_transition_artifacts(
+        before: &RefusalStateSnapshot,
+        database: &std::path::Path,
+        protected_root: &std::path::Path,
+    ) {
+        fn transition_owned_path(
+            entry: &RefusalEntrySnapshot,
+            database: &std::path::Path,
+            protected_root: &std::path::Path,
+        ) -> bool {
+            let mut paths = ["", "-wal", "-shm", "-journal"]
+                .into_iter()
+                .filter_map(|suffix| {
+                    canonical_sidecar_path(database, suffix)
+                        .strip_prefix(protected_root)
+                        .ok()
+                        .map(std::path::Path::to_path_buf)
+                })
+                .collect::<Vec<_>>();
+            if let Ok(attempt_locks) =
+                history_attempt_lock_dir(database).strip_prefix(protected_root)
+            {
+                paths.push(attempt_locks.to_path_buf());
+            }
+            paths.iter().any(|path| {
+                entry.relative_path == path.as_path() || entry.relative_path.starts_with(path)
+            })
+        }
+
+        let after = refusal_state_snapshot(database, &[protected_root]);
+        let matching_root = std::fs::canonicalize(protected_root).unwrap_or_else(|error| {
+            panic!(
+                "canonicalize platform-transition protected root {}: {error}",
+                protected_root.display()
+            )
+        });
+        assert_eq!(before.directories.len(), 1);
+        assert_eq!(after.directories.len(), 1);
+        assert_eq!(before.directories[0].root, after.directories[0].root);
+        let protected_before = before.directories[0]
+            .entries
+            .iter()
+            .filter(|entry| !transition_owned_path(entry, database, &matching_root))
+            .collect::<Vec<_>>();
+        let protected_after = after.directories[0]
+            .entries
+            .iter()
+            .filter(|entry| !transition_owned_path(entry, database, &matching_root))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            protected_after, protected_before,
+            "platform transition changed unrelated, bridge-lock, or namespace artifacts"
+        );
+
+        for ((before_suffix, before_entry), (after_suffix, after_entry)) in before
+            .database_artifacts
+            .iter()
+            .zip(&after.database_artifacts)
+        {
+            assert_eq!(after_suffix, before_suffix);
+            if !matches!(before_suffix.as_str(), "" | "-wal" | "-shm" | "-journal") {
+                assert_eq!(
+                    after_entry, before_entry,
+                    "platform transition changed bridge artifact {before_suffix}"
+                );
+            }
+        }
+        let attempt_locks = after
+            .attempt_locks
+            .as_ref()
+            .expect("platform transition did not establish its attempt-lock namespace");
+        assert_eq!(attempt_locks.path.file_type, "directory");
+        assert_eq!(attempt_locks.path.mode & 0o777, 0o700);
+        assert_eq!(attempt_locks.path.owner, unsafe { libc::geteuid() });
+        assert!(attempt_locks.entries.is_empty());
+        assert!(
+            after.parent_proof_residue.is_empty(),
+            "parent-proof residue survived platform transition: {:?}",
+            after.parent_proof_residue
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tagged_platform_wal_crash_process_helper() {
+        let Some(path) = std::env::var_os("A2A_BRIDGE_TEST_TAGGED_PLATFORM_WAL_CRASH_PATH") else {
+            return;
+        };
+        let store = SqliteStore::open_platform_history(std::path::Path::new(&path)).unwrap();
+        let connection = store.conn.lock().unwrap();
+        let mode: String = connection
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        connection
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE owner_gate_crash_marker(value INTEGER NOT NULL);
+                 INSERT INTO owner_gate_crash_marker VALUES(1);",
+            )
+            .unwrap();
+        unsafe { libc::_exit(17) };
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_owner_owned_platform_writable_control() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let alias_child = directory.path().join("lexical-alias");
+        std::fs::create_dir(&alias_child).unwrap();
+        let protected_root = alias_child.join("..");
+        let path = protected_root.join("platform-writable.sqlite");
+        run_bounded_crash_fixture(
+            "sqlite::r2f0a_history_tests::tagged_platform_wal_crash_process_helper",
+            "A2A_BRIDGE_TEST_TAGGED_PLATFORM_WAL_CRASH_PATH",
+            &path,
+            "tagged platform WAL crash fixture",
+        );
+        let canonical = canonical_fixture_path(&path);
+        assert_ne!(
+            canonical.parent().unwrap(),
+            protected_root,
+            "the fixture requires a caller-spelled root that does not prefix the canonical database"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&protected_root).unwrap(),
+            canonical.parent().unwrap(),
+            "the lexical alias must resolve to the canonical database parent"
+        );
+        assert_owner_gate_safe_sidecars(&canonical);
+        assert!(
+            std::fs::metadata(canonical_sidecar_path(&canonical, "-wal"))
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false),
+            "tagged platform crash fixture did not retain committed WAL state"
+        );
+        let stale_directory = tempfile::tempdir().unwrap();
+        let stale_main = stale_directory.path().join("stale-main.sqlite");
+        std::fs::copy(&canonical, &stale_main).unwrap();
+        let stale_marker = rusqlite::Connection::open(&stale_main)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM owner_gate_crash_marker", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .ok();
+        assert_ne!(
+            stale_marker,
+            Some(1),
+            "the control requires its committed marker to remain in crash-residue WAL"
+        );
+
+        let unrelated = protected_root.join("owner-control-unrelated");
+        std::fs::write(&unrelated, b"unrelated-owner-control").unwrap();
+        let namespace = std::fs::symlink_metadata(&protected_root).unwrap();
+        let namespace_identity = (
+            namespace.dev(),
+            namespace.ino(),
+            namespace.mode(),
+            namespace.uid(),
+            namespace.gid(),
+        );
+        assert_owner_gate_safe_sidecars(&canonical);
+        let before = refusal_state_snapshot(&canonical, &[&protected_root]);
+        let (_control, reached, proceed) = arm_platform_open_after_initial_probe(&canonical);
+        let opener_path = canonical.clone();
+        let opener = std::thread::spawn(move || SqliteStore::open_history(&opener_path));
+        reached
+            .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+            .expect("owner-owned platform opener did not inspect crash-residue WAL");
+        assert_sqlite_inspection_effects_only(&before, &canonical, &[&protected_root]);
+        proceed.send(()).unwrap();
+        let store = opener
+            .join()
+            .unwrap()
+            .expect("owner-owned platform writable crash-residue fixture was rejected");
+
+        {
+            let connection = store.conn.lock().unwrap();
+            let marker: i64 = connection
+                .query_row("SELECT COUNT(*) FROM owner_gate_crash_marker", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(marker, 1, "platform transition lost the WAL-only marker");
+            let allocation: (i64, String, String, i64, i64, i64) = connection
+                .query_row(
+                    "SELECT COUNT(*), allocation_kind, allocation_state,
+                            charged_bytes, slots_used, terminal_rows
+                     FROM workflow_history_allocation WHERE singleton=1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(allocation, (1, "platform".into(), "ready".into(), 0, 0, 0));
+            let journal_mode: String = connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert!(matches!(
+                journal_mode.as_str(),
+                "delete" | "truncate" | "persist"
+            ));
+        }
+        drop(store);
+        drop(SqliteStore::open_platform_history_read_only(&canonical).unwrap());
+
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = canonical_sidecar_path(&canonical, suffix);
+            if sidecar.exists() {
+                let metadata = std::fs::symlink_metadata(&sidecar).unwrap();
+                assert!(metadata.file_type().is_file());
+                assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+                assert_eq!(metadata.nlink(), 1);
+            }
+        }
+        assert_eq!(
+            std::fs::read(&unrelated).unwrap(),
+            b"unrelated-owner-control"
+        );
+        let namespace = std::fs::symlink_metadata(&protected_root).unwrap();
+        assert_eq!(
+            (
+                namespace.dev(),
+                namespace.ino(),
+                namespace.mode(),
+                namespace.uid(),
+                namespace.gid(),
+            ),
+            namespace_identity,
+            "platform transition changed the protected namespace identity"
+        );
+        assert_platform_transition_artifacts(&before, &canonical, &protected_root);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_owner_owned_sidecar_controls() {
+        for (case, kind, route) in [
+            (
+                "configured-read-only",
+                HistoryAllocationKind::Configured,
+                "configured-read-only",
+            ),
+            (
+                "platform-read-only",
+                HistoryAllocationKind::Platform,
+                "platform-read-only",
+            ),
+            (
+                "configured-writable",
+                HistoryAllocationKind::Configured,
+                "configured-lifetime",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(format!("{case}.sqlite"));
+            let (canonical, _reader, _writer) = prepare_owner_gate_live_wal_fixture(&path, kind);
+            assert_owner_gate_safe_sidecars(&canonical);
+            let before = refusal_state_snapshot(&canonical, &[directory.path()]);
+            drop(
+                owner_gate_public_opener(route, &canonical).unwrap_or_else(|error| {
+                    panic!("owner-owned {case} route {route} was rejected: {error:?}")
+                }),
+            );
+            assert_sqlite_inspection_effects_only(&before, &canonical, &[directory.path()]);
+        }
+        run_owner_owned_platform_writable_control();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn canonical_sidecar_owner_process_helper() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let Some(path) = std::env::var_os("A2A_BRIDGE_TEST_OWNER_GATE_PATH") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        assert_eq!(unsafe { libc::geteuid() }, 65_534);
+        assert_eq!(unsafe { libc::getegid() }, 65_534);
+        let foreign_suffix =
+            std::env::var("A2A_BRIDGE_TEST_OWNER_GATE_SUFFIX").expect("foreign suffix");
+        let foreign = canonical_sidecar_path(&path, &foreign_suffix);
+        let metadata = std::fs::symlink_metadata(&foreign).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.nlink(), 1);
+        assert_ne!(metadata.uid(), unsafe { libc::geteuid() });
+
+        let routes = std::env::var("A2A_BRIDGE_TEST_OWNER_GATE_ROUTES").expect("public routes");
+        for route in routes.split(',') {
+            let parent = path.parent().unwrap();
+            let parent_before = refusal_entry_snapshot(parent, parent).unwrap();
+            let before = refusal_state_snapshot(&path, &[parent]);
+            let error = match owner_gate_public_opener(route, &path) {
+                Ok(store) => {
+                    drop(store);
+                    panic!("foreign-owned canonical {foreign_suffix} was accepted by {route}");
+                }
+                Err(error) => error,
+            };
+            assert_plain_error(error, R::Open);
+            assert_refusal_state_unchanged(&before, &path, &[parent]);
+            assert_eq!(
+                refusal_entry_snapshot(parent, parent).unwrap(),
+                parent_before
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn foreign_owned_canonical_wal_and_shm_are_refused_before_sqlite_inspection() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        use std::os::unix::process::CommandExt as _;
+
+        fn chown(path: &std::path::Path, uid: u32, gid: u32) {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(path.as_ptr(), uid, gid) }, 0);
+        }
+
+        fn chown_tree(path: &std::path::Path, uid: u32, gid: u32) {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    chown_tree(&entry.unwrap().path(), uid, gid);
+                }
+            }
+            chown(path, uid, gid);
+        }
+
+        fn run_child(path: &std::path::Path, suffix: &str, routes: &[&str], case: &str) {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("sqlite::r2f0a_history_tests::canonical_sidecar_owner_process_helper")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env("A2A_BRIDGE_TEST_OWNER_GATE_PATH", path)
+                .env("A2A_BRIDGE_TEST_OWNER_GATE_SUFFIX", suffix)
+                .env("A2A_BRIDGE_TEST_OWNER_GATE_ROUTES", routes.join(","))
+                .uid(65_534)
+                .gid(65_534)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "{case} timed out: stdout={} stderr={}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{case} failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping only the foreign-UID arm: constructing it requires effective root");
+            run_owner_owned_sidecar_controls();
+            return;
+        }
+
+        let configured_routes = [
+            "configured-read-only",
+            "generic-read-only",
+            "untyped-lifetime",
+            "configured-lifetime",
+            "generic-admin",
+            "configured-admin",
+        ];
+        let platform_routes = [
+            "platform-read-only",
+            "platform-lifetime",
+            "concurrent-platform",
+            "platform-admin",
+        ];
+        for suffix in ["-wal", "-shm"] {
+            for (kind, routes) in [
+                (
+                    HistoryAllocationKind::Configured,
+                    configured_routes.as_slice(),
+                ),
+                (HistoryAllocationKind::Platform, platform_routes.as_slice()),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join(format!(
+                    "{}{}.sqlite",
+                    kind.as_str(),
+                    suffix.trim_start_matches('-')
+                ));
+                let (canonical, _reader, _writer) =
+                    prepare_owner_gate_live_wal_fixture(&path, kind);
+                chown_tree(directory.path(), 65_534, 65_534);
+                let foreign = canonical_sidecar_path(&canonical, suffix);
+                chown(&foreign, 0, 0);
+                std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+                let foreign_metadata = std::fs::symlink_metadata(&foreign).unwrap();
+                assert!(foreign_metadata.file_type().is_file());
+                assert_eq!(foreign_metadata.nlink(), 1);
+                assert_ne!(foreign_metadata.uid(), 65_534);
+                let other_suffix = if suffix == "-wal" { "-shm" } else { "-wal" };
+                let other_metadata =
+                    std::fs::symlink_metadata(canonical_sidecar_path(&canonical, other_suffix))
+                        .unwrap();
+                assert!(other_metadata.file_type().is_file());
+                assert_eq!(other_metadata.nlink(), 1);
+                assert_eq!(other_metadata.uid(), 65_534);
+                assert_eq!(std::fs::metadata(directory.path()).unwrap().uid(), 65_534);
+                assert_eq!(std::fs::metadata(&canonical).unwrap().uid(), 65_534);
+                let fixture_snapshot = refusal_directory_snapshot(directory.path());
+                let foreign_relative = foreign.strip_prefix(directory.path()).unwrap();
+                for entry in &fixture_snapshot.entries {
+                    if entry.relative_path == foreign_relative {
+                        assert_ne!(entry.owner, 65_534);
+                    } else {
+                        assert_eq!(entry.owner, 65_534);
+                    }
+                }
+
+                run_child(
+                    &canonical,
+                    suffix,
+                    routes,
+                    &format!("{} {suffix}", kind.as_str()),
+                );
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn owner_owned_canonical_wal_and_shm_remain_accepted() {
+        run_owner_owned_sidecar_controls();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn selected_platform_fresh_root_bootstraps_exact_modes_and_durable_history() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let anchor = directory.path().join("owned-anchor");
+        std::fs::create_dir(&anchor).unwrap();
+        std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state_parent = anchor.join("state");
+        let state_root = state_parent.join("a2a-bridge");
+        let selection = selected_history(state_root.join("workflow-history.sqlite"));
+
+        let store = selection.open_concurrent().unwrap();
+        let row = reservation();
+        store.reserve(&row).await.unwrap();
+        assert_eq!(
+            store
+                .terminalize(&row.identity.attempt_id, &terminal())
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+        drop(store);
+
+        for created in [&state_parent, &state_root] {
+            let metadata = std::fs::metadata(created).unwrap();
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+        let reopened = selection.open_concurrent().unwrap();
+        assert!(reopened
+            .attempt(&row.identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .is_some());
+        drop(reopened);
+        drop(
+            selection
+                .open_lifetime()
+                .expect("the selected lifetime writer reuses the same bootstrap"),
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn selection_and_path_taking_openers_do_not_bootstrap() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("pure").join("a2a-bridge");
+        let selection = selected_history(state_root.join("workflow-history.sqlite"));
+        assert_eq!(selection.path(), state_root.join("workflow-history.sqlite"));
+        assert!(
+            !state_root.exists(),
+            "pure path inspection created the root"
+        );
+
+        let configured_parent = directory.path().join("configured-missing");
+        let configured_path = configured_parent.join("history.sqlite");
+        for error in [
+            SqliteStore::open(&configured_path).err().unwrap(),
+            SqliteStore::open_shared_history(&configured_path)
+                .err()
+                .unwrap(),
+            SqliteStore::open_platform_history(&configured_path)
+                .err()
+                .unwrap(),
+            SqliteStore::open_history(&configured_path).err().unwrap(),
+            SqliteStore::open_history_admin(&configured_path)
+                .err()
+                .unwrap(),
+        ] {
+            assert_plain_error(error, R::ReadOnlyParent);
+        }
+        assert!(
+            !configured_parent.exists(),
+            "a caller-path opener bootstrapped its missing parent"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn selected_platform_preserves_existing_permissive_directory_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_root = directory.path().join("existing-state");
+        std::fs::create_dir(&state_root).unwrap();
+        std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let selection = selected_history(state_root.join("workflow-history.sqlite"));
+        drop(selection.open_concurrent().unwrap());
+        assert_eq!(
+            std::fs::metadata(&state_root).unwrap().permissions().mode() & 0o777,
+            0o777,
+            "bootstrap must not chmod an accepted existing directory"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn selected_platform_rejects_final_symlink_and_wrong_type_without_artifacts() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let victim = directory.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("sentinel"), b"victim-bytes").unwrap();
+
+        let final_alias = directory.path().join("state-alias");
+        symlink(&victim, &final_alias).unwrap();
+        let error = selected_history(final_alias.join("workflow-history.sqlite"))
+            .open_concurrent()
+            .err()
+            .unwrap();
+        assert_plain_error(error, R::Open);
+        assert_eq!(
+            std::fs::read(victim.join("sentinel")).unwrap(),
+            b"victim-bytes"
+        );
+
+        let regular = directory.path().join("state-file");
+        std::fs::write(&regular, b"regular-bytes").unwrap();
+        let error = selected_history(regular.join("workflow-history.sqlite"))
+            .open_lifetime()
+            .err()
+            .unwrap();
+        assert_plain_error(error, R::Open);
+        assert_eq!(std::fs::read(&regular).unwrap(), b"regular-bytes");
+
+        let intermediate = directory.path().join("intermediate-file");
+        std::fs::write(&intermediate, b"intermediate-bytes").unwrap();
+        let error = selected_history(intermediate.join("state").join("workflow-history.sqlite"))
+            .open_concurrent()
+            .err()
+            .unwrap();
+        assert_plain_error(error, R::Open);
+        assert_eq!(std::fs::read(&intermediate).unwrap(), b"intermediate-bytes");
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn post_mkdir_swap_refuses_without_mutating_victim_or_creating_store_artifacts() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _serial = PLATFORM_BOOTSTRAP_TEST_SERIAL.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let anchor = directory.path().join("anchor");
+        std::fs::create_dir(&anchor).unwrap();
+        let state_root = anchor.join("state");
+        let selection = selected_history(state_root.join("workflow-history.sqlite"));
+        let (_hook, reached, proceed) =
+            arm_platform_pause(&state_root, PlatformBootstrapPausePoint::AfterMkdir(0));
+
+        let opener = std::thread::spawn(move || selection.open_concurrent());
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opener did not reach the post-mkdir barrier");
+        let filtered = anchor.join("filtered-entry");
+        std::fs::rename(&state_root, &filtered).unwrap();
+        std::fs::create_dir(&state_root).unwrap();
+        std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::write(state_root.join("sentinel"), b"victim-bytes").unwrap();
+        proceed.send(()).unwrap();
+
+        let error = opener
+            .join()
+            .unwrap()
+            .err()
+            .expect("victim swap must refuse");
+        assert_plain_error(error, R::Open);
+        assert_eq!(
+            std::fs::metadata(&state_root).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert_eq!(
+            std::fs::read(state_root.join("sentinel")).unwrap(),
+            b"victim-bytes"
+        );
+        assert!(std::fs::read_dir(filtered).unwrap().next().is_none());
+        assert_no_history_artifacts(directory.path());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_selected_post_bootstrap_topology_loss(open_lifetime: bool) {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let _serial = PLATFORM_BOOTSTRAP_TEST_SERIAL.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let anchor = directory.path().join("anchor");
+        std::fs::create_dir(&anchor).unwrap();
+        let state_root = anchor.join("state");
+        let selection = selected_history(state_root.join("workflow-history.sqlite"));
+        let (_hook, reached, proceed) = arm_platform_pause(
+            &canonical_late_hook_path(&anchor, &state_root),
+            PlatformBootstrapPausePoint::AfterBootstrap,
+        );
+
+        let opener = std::thread::spawn(move || {
+            if open_lifetime {
+                selection.open_lifetime()
+            } else {
+                selection.open_concurrent()
+            }
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opener did not pause after selected bootstrap");
+        let held = anchor.join("held-state");
+        std::fs::rename(&state_root, &held).unwrap();
+        proceed.send(()).unwrap();
+
+        let error = opener
+            .join()
+            .unwrap()
+            .err()
+            .expect("post-bootstrap topology loss must refuse");
+        assert_plain_error(error, R::Open);
+        assert!(!state_root.exists());
+        let metadata = std::fs::metadata(&held).unwrap();
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert!(std::fs::read_dir(&held).unwrap().next().is_none());
+        assert_no_history_artifacts(directory.path());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn selected_concurrent_topology_loss_after_bootstrap_maps_to_open() {
+        assert_selected_post_bootstrap_topology_loss(false);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn selected_lifetime_topology_loss_after_bootstrap_maps_to_open() {
+        assert_selected_post_bootstrap_topology_loss(true);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn intermediate_same_object_alias_refuses_before_handoff_or_store_effects() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::fs::symlink;
+
+        let _serial = PLATFORM_BOOTSTRAP_TEST_SERIAL.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let anchor = directory.path().join("anchor");
+        std::fs::create_dir(&anchor).unwrap();
+        let state_root = anchor.join("a").join("b");
+        let selection = selected_history(state_root.join("workflow-history.sqlite"));
+        let (_hook, reached, proceed) = arm_platform_pause(
+            &canonical_late_hook_path(&anchor, &state_root),
+            PlatformBootstrapPausePoint::BeforeHandoff,
+        );
+
+        let opener = std::thread::spawn(move || selection.open_concurrent());
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opener did not reach the handoff barrier");
+        let held = anchor.join("held");
+        std::fs::rename(anchor.join("a"), &held).unwrap();
+        std::fs::write(held.join("b/sentinel"), b"alias-bytes").unwrap();
+        symlink("held", anchor.join("a")).unwrap();
+        proceed.send(()).unwrap();
+
+        let error = opener
+            .join()
+            .unwrap()
+            .err()
+            .expect("intermediate alias must refuse");
+        assert_plain_error(error, R::Open);
+        assert_eq!(
+            std::fs::read(held.join("b/sentinel")).unwrap(),
+            b"alias-bytes"
+        );
+        assert_no_history_artifacts(directory.path());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn removed_retained_anchor_maps_mkdirat_enoent_to_open() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let _serial = PLATFORM_BOOTSTRAP_TEST_SERIAL.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let anchor = directory.path().join("anchor");
+        std::fs::create_dir(&anchor).unwrap();
+        let state_root = anchor.join("state");
+        let selection = selected_history(state_root.join("workflow-history.sqlite"));
+        let (_hook, reached, proceed) =
+            arm_platform_pause(&state_root, PlatformBootstrapPausePoint::BeforeMkdir(0));
+
+        let opener = std::thread::spawn(move || selection.open_concurrent());
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opener did not retain the anchor before mkdirat");
+        std::fs::remove_dir(&anchor).unwrap();
+        proceed.send(()).unwrap();
+
+        let error = opener
+            .join()
+            .unwrap()
+            .err()
+            .expect("removed anchor must refuse");
+        assert_plain_error(error, R::Open);
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn forced_benign_eexist_records_one_creator_and_one_existing_open() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        fn assert_no_parent_proof_residue(directory: &std::path::Path) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+                assert!(!entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(HISTORY_PARENT_PROOF_PREFIX));
+                if metadata.is_dir() {
+                    assert_no_parent_proof_residue(&entry.path());
+                }
+            }
+        }
+
+        let _serial = PLATFORM_BOOTSTRAP_TEST_SERIAL.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let anchor = directory.path().join("anchor");
+        std::fs::create_dir(&anchor).unwrap();
+        let state_root = anchor.join("state");
+        let selection_a = selected_history(state_root.join("workflow-history.sqlite"));
+        let selection_b = selected_history(state_root.join("workflow-history.sqlite"));
+        PLATFORM_BOOTSTRAP_MKDIR_OUTCOMES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(&state_root);
+        let (_hook, reached, proceed) =
+            arm_platform_pause(&state_root, PlatformBootstrapPausePoint::BeforeMkdir(0));
+
+        let opener_a = std::thread::spawn(move || selection_a.open_concurrent());
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opener A did not classify the root missing");
+        drop(
+            selection_b
+                .open_concurrent()
+                .expect("opener B creates the suffix"),
+        );
+        proceed.send(()).unwrap();
+        drop(
+            opener_a
+                .join()
+                .unwrap()
+                .expect("opener A accepts benign EEXIST"),
+        );
+
+        let outcomes = PLATFORM_BOOTSTRAP_MKDIR_OUTCOMES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get(&state_root)
+            .copied()
+            .unwrap_or_default();
+        assert_eq!(outcomes, (1, 1));
+        let database = state_root.join("workflow-history.sqlite");
+        assert!(database.is_file());
+        let attempt_locks = history_attempt_lock_dir(&database);
+        let metadata = std::fs::metadata(&attempt_locks).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert!(std::fs::read_dir(&attempt_locks).unwrap().next().is_none());
+        assert_no_parent_proof_residue(directory.path());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn synchronized_selected_platform_creators_converge() {
+        let directory = tempfile::tempdir().unwrap();
+        let anchor = directory.path().join("owned");
+        std::fs::create_dir(&anchor).unwrap();
+        let selection = std::sync::Arc::new(selected_history(
+            anchor
+                .join("missing")
+                .join("a2a-bridge")
+                .join("workflow-history.sqlite"),
+        ));
+        let canonical_database = canonical_late_hook_path(&anchor, selection.path());
+        let mut lock_path = canonical_database.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let lock_path = std::path::PathBuf::from(lock_path);
+        let (_control, (mut reached, proceed)) = arm_history_file_open_control(
+            &lock_path,
+            &[],
+            &[
+                HistoryFileOpenPausePoint::AfterInitialExistingNotFound,
+                HistoryFileOpenPausePoint::AfterInitialExistingNotFound,
+            ],
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let selection = selection.clone();
+            let barrier = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                selection.open_concurrent()
+            }));
+        }
+        for pause in reached.drain(..) {
+            pause
+                .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+                .expect("both creators must pass actual initial Existing/ENOENT");
+        }
+        for release in &proceed {
+            release.send(()).unwrap();
+        }
+        let stores = joins
+            .into_iter()
+            .map(|join| join.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(stores.len(), 2);
+        for store in &stores {
+            assert_eq!(
+                store.history_path.as_deref(),
+                Some(canonical_database.as_path())
+            );
+        }
+        let (observations, actual_syscalls) = history_file_open_observations(&lock_path);
+        assert_eq!(actual_syscalls, 5);
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| {
+                    observation.state == HistoryFileOpenState::ExclusiveCreate
+                        && observation.outcome == HistoryFileOpenObservedOutcome::Opened
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| {
+                    observation.state == HistoryFileOpenState::ExclusiveCreate
+                        && observation.outcome
+                            == HistoryFileOpenObservedOutcome::Errno(libc::EEXIST)
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| {
+                    observation.state == HistoryFileOpenState::Existing
+                        && observation.outcome == HistoryFileOpenObservedOutcome::Opened
+                })
+                .count(),
+            1
+        );
+        drop(stores);
+        assert!(selection.path().exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn selected_platform_creators_wait_and_reprobe_untagged_and_migrating_winners() {
+        for point in [
+            PlatformOpenPausePoint::WhileUntaggedUnderSchemaLock,
+            PlatformOpenPausePoint::AfterMigratingBeforeReady,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("workflow-history.sqlite");
+            drop(SqliteStore::open(&path).unwrap());
+            let canonical = canonical_fixture_path(&path);
+            let (control, reached, proceed, blocked) = arm_platform_open_control(&canonical, point);
+            let winner_selection = selected_history(path.clone());
+            let winner = std::thread::spawn(move || winner_selection.open_concurrent());
+            reached
+                .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+                .expect("winner did not pause under the schema lock");
+
+            let loser_selection = selected_history(path.clone());
+            let loser = std::thread::spawn(move || loser_selection.open_concurrent());
+            blocked
+                .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+                .expect("loser did not observe the real WouldBlock");
+            proceed.send(()).unwrap();
+
+            let winner_store = winner
+                .join()
+                .unwrap()
+                .expect("winner must finish the platform migration");
+            let loser_store = loser
+                .join()
+                .unwrap()
+                .expect("loser must wait, reprobe, and converge");
+            assert_eq!(
+                winner_store.history_path.as_deref(),
+                Some(canonical.as_path())
+            );
+            assert_eq!(
+                loser_store.history_path.as_deref(),
+                Some(canonical.as_path())
+            );
+            drop(winner_store);
+            drop(loser_store);
+            assert_eq!(
+                probe_history_allocation_kind(&canonical).unwrap(),
+                Some(HistoryAllocationKind::Platform)
+            );
+            let state: String = rusqlite::Connection::open(&canonical)
+                .unwrap()
+                .query_row(
+                    "SELECT allocation_state FROM workflow_history_allocation WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "ready");
+            drop(control);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn selected_platform_hostile_eexist_identity_race_and_unexpected_io_are_typed() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        fn arm(failpoint: PlatformBootstrapFailpoint) {
+            PLATFORM_BOOTSTRAP_FAILPOINT.with(|slot| slot.set(Some(failpoint)));
+        }
+
+        fn fixture() -> (
+            tempfile::TempDir,
+            std::path::PathBuf,
+            PlatformHistorySelection,
+        ) {
+            let directory = tempfile::tempdir().unwrap();
+            let anchor = directory.path().join("owned-anchor");
+            std::fs::create_dir(&anchor).unwrap();
+            let selection = selected_history(
+                anchor
+                    .join("first")
+                    .join("second")
+                    .join("workflow-history.sqlite"),
+            );
+            (directory, anchor, selection)
+        }
+
+        let (_directory, anchor, selection) = fixture();
+        arm(PlatformBootstrapFailpoint::HostileEexist);
+        assert_plain_error(selection.open_concurrent().err().unwrap(), R::Open);
+        assert_eq!(
+            std::fs::read_link(anchor.join("first")).unwrap(),
+            std::path::PathBuf::from(".")
+        );
+        assert!(!selection.path().exists());
+
+        let (_directory, anchor, selection) = fixture();
+        arm(PlatformBootstrapFailpoint::IdentityMismatch);
+        assert_plain_error(selection.open_lifetime().err().unwrap(), R::Open);
+        assert!(anchor.join("first").is_dir());
+        assert!(anchor.join(".a2a-bridge-bootstrap-raced-away").is_dir());
+        assert!(!selection.path().exists());
+
+        let (_directory, anchor, selection) = fixture();
+        arm(PlatformBootstrapFailpoint::UnexpectedIo);
+        assert_plain_error(selection.open_concurrent().err().unwrap(), R::Io);
+        assert!(
+            std::fs::read_dir(&anchor).unwrap().next().is_none(),
+            "unexpected I/O must precede the namespace mutation"
+        );
+        assert!(!selection.path().exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn platform_selection_environment_process_helper() {
+        let Some(case) = std::env::var_os("A2A_BRIDGE_TEST_PLATFORM_SELECTION_CASE") else {
+            return;
+        };
+        let anchor = std::path::PathBuf::from(
+            std::env::var_os("A2A_BRIDGE_TEST_PLATFORM_SELECTION_ANCHOR").unwrap(),
+        );
+        std::env::remove_var("A2A_BRIDGE_STATE_DIR");
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::remove_var("HOME");
+
+        match case.to_str().unwrap() {
+            "relative-override" => {
+                std::env::set_var("A2A_BRIDGE_STATE_DIR", "relative-state");
+                std::env::set_var("HOME", anchor.join("unused-home"));
+                match select_platform_history() {
+                    Err(error) => assert_plain_error(
+                        error,
+                        bridge_core::workflow_history::LedgerUnavailableReason::Open,
+                    ),
+                    Ok(selection) => {
+                        let selected = selection.path().to_path_buf();
+                        drop(selection.open_concurrent());
+                        panic!(
+                            "relative explicit state root selected and opened as {}",
+                            selected.display()
+                        );
+                    }
+                }
+            }
+            "relative-home" => {
+                std::env::set_var("HOME", "relative-home");
+                match select_platform_history() {
+                    Err(error) => assert_plain_error(
+                        error,
+                        bridge_core::workflow_history::LedgerUnavailableReason::Open,
+                    ),
+                    Ok(selection) => {
+                        let selected = selection.path().to_path_buf();
+                        drop(selection.open_concurrent());
+                        panic!(
+                            "relative HOME selected and opened as {}",
+                            selected.display()
+                        );
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            "relative-xdg-absolute-home" => {
+                let home = anchor.join("absolute-home");
+                std::fs::create_dir_all(&home).unwrap();
+                std::env::set_var("XDG_STATE_HOME", "relative-xdg");
+                std::env::set_var("HOME", &home);
+                let selection = select_platform_history().unwrap();
+                let selected = selection.path().to_path_buf();
+                drop(selection.open_concurrent().unwrap());
+                assert_eq!(
+                    selected,
+                    home.join(".local/state/a2a-bridge/workflow-history.sqlite")
+                );
+            }
+            #[cfg(not(target_os = "macos"))]
+            "relative-xdg-missing-home"
+            | "relative-xdg-empty-home"
+            | "relative-xdg-relative-home" => {
+                std::env::set_var("XDG_STATE_HOME", "relative-xdg");
+                if case == "relative-xdg-empty-home" {
+                    std::env::set_var("HOME", "");
+                } else if case == "relative-xdg-relative-home" {
+                    std::env::set_var("HOME", "relative-home");
+                }
+                match select_platform_history() {
+                    Err(error) => assert_plain_error(
+                        error,
+                        bridge_core::workflow_history::LedgerUnavailableReason::Open,
+                    ),
+                    Ok(selection) => {
+                        let selected = selection.path().to_path_buf();
+                        drop(selection.open_concurrent());
+                        panic!("relative XDG selected and opened as {}", selected.display());
+                    }
+                }
+            }
+            "xdg-without-home" => {
+                let xdg = anchor.join("xdg");
+                std::env::set_var("XDG_STATE_HOME", &xdg);
+                let selection = select_platform_history().unwrap();
+                assert_eq!(
+                    selection.path(),
+                    xdg.join("a2a-bridge/workflow-history.sqlite")
+                );
+                drop(selection.open_concurrent().unwrap());
+            }
+            "empty-xdg-falls-back" => {
+                let home = anchor.join("home");
+                std::fs::create_dir(&home).unwrap();
+                std::env::set_var("XDG_STATE_HOME", "");
+                std::env::set_var("HOME", &home);
+                let selection = select_platform_history().unwrap();
+                assert_eq!(
+                    selection.path(),
+                    home.join(".local/state/a2a-bridge/workflow-history.sqlite")
+                );
+                drop(selection.open_concurrent().unwrap());
+            }
+            "missing-home" => {
+                assert_plain_error(
+                    select_platform_history().err().unwrap(),
+                    bridge_core::workflow_history::LedgerUnavailableReason::Open,
+                );
+                assert!(std::fs::read_dir(&anchor).unwrap().next().is_none());
+            }
+            "empty-home" => {
+                std::env::set_var("HOME", "");
+                assert_plain_error(
+                    select_platform_history().err().unwrap(),
+                    bridge_core::workflow_history::LedgerUnavailableReason::Open,
+                );
+                assert!(std::fs::read_dir(&anchor).unwrap().next().is_none());
+            }
+            "default-home" => {
+                let home = anchor.join("home");
+                std::fs::create_dir(&home).unwrap();
+                std::env::set_var("HOME", &home);
+                let selection = select_platform_history().unwrap();
+                #[cfg(target_os = "macos")]
+                assert_eq!(
+                    selection.path(),
+                    home.join("Library/Application Support/a2a-bridge/workflow-history.sqlite")
+                );
+                #[cfg(not(target_os = "macos"))]
+                assert_eq!(
+                    selection.path(),
+                    home.join(".local/state/a2a-bridge/workflow-history.sqlite")
+                );
+                drop(selection.open_concurrent().unwrap());
+                assert!(selection.path().is_file());
+            }
+            "empty-override" => {
+                std::env::set_var("A2A_BRIDGE_STATE_DIR", "");
+                std::env::set_var("HOME", anchor.join("unused-home"));
+                assert_plain_error(
+                    select_platform_history().err().unwrap(),
+                    bridge_core::workflow_history::LedgerUnavailableReason::Open,
+                );
+                assert!(std::fs::read_dir(&anchor).unwrap().next().is_none());
+            }
+            "explicit-no-fallback" => {
+                let explicit = anchor.join("explicit").join("deep");
+                std::env::set_var("A2A_BRIDGE_STATE_DIR", &explicit);
+                std::env::set_var("HOME", anchor.join("unused-home"));
+                let selection = select_platform_history().unwrap();
+                assert_eq!(selection.path(), explicit.join("workflow-history.sqlite"));
+                drop(selection.open_concurrent().unwrap());
+                assert!(selection.path().exists());
+                assert!(!anchor.join("unused-home").exists());
+            }
+            "selection-only" => {
+                let pure = anchor.join("pure");
+                std::env::set_var("A2A_BRIDGE_STATE_DIR", &pure);
+                assert_eq!(
+                    platform_history_path().unwrap(),
+                    pure.join("workflow-history.sqlite")
+                );
+                assert!(!pure.exists());
+            }
+            other => panic!("unknown platform selection case {other}"),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn platform_selection_rejects_relative_roots_without_cwd_effects() {
+        #[cfg(target_os = "macos")]
+        let cases = vec!["relative-override", "relative-home"];
+        #[cfg(not(target_os = "macos"))]
+        let cases = vec![
+            "relative-override",
+            "relative-home",
+            "relative-xdg-absolute-home",
+            "relative-xdg-missing-home",
+            "relative-xdg-empty-home",
+            "relative-xdg-relative-home",
+        ];
+
+        for case in cases {
+            let directory = tempfile::tempdir().unwrap();
+            for cwd_name in ["cwd-one", "cwd-two"] {
+                let cwd = directory.path().join(cwd_name);
+                std::fs::create_dir(&cwd).unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg(
+                        "sqlite::r2f0a_history_tests::platform_selection_environment_process_helper",
+                    )
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .current_dir(&cwd)
+                    .env_remove("A2A_BRIDGE_STATE_DIR")
+                    .env_remove("XDG_STATE_HOME")
+                    .env_remove("HOME")
+                    .env("A2A_BRIDGE_TEST_PLATFORM_SELECTION_CASE", case)
+                    .env(
+                        "A2A_BRIDGE_TEST_PLATFORM_SELECTION_ANCHOR",
+                        directory.path(),
+                    )
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "stable-root subprocess {case} in {cwd_name} failed:\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                for relative in ["relative-state", "relative-home", "relative-xdg"] {
+                    assert!(
+                        !cwd.join(relative).exists(),
+                        "{case} created cwd-relative state below {cwd_name}/{relative}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn platform_selection_environment_is_subprocess_isolated_and_pure() {
+        #[cfg(target_os = "macos")]
+        let cases = vec![
+            "missing-home",
+            "empty-home",
+            "default-home",
+            "empty-override",
+            "explicit-no-fallback",
+            "selection-only",
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let cases = vec![
+            "missing-home",
+            "empty-home",
+            "default-home",
+            "empty-override",
+            "explicit-no-fallback",
+            "selection-only",
+            "xdg-without-home",
+            "empty-xdg-falls-back",
+        ];
+
+        for case in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("sqlite::r2f0a_history_tests::platform_selection_environment_process_helper")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env_remove("A2A_BRIDGE_STATE_DIR")
+                .env_remove("XDG_STATE_HOME")
+                .env_remove("HOME")
+                .env("A2A_BRIDGE_TEST_PLATFORM_SELECTION_CASE", case)
+                .env(
+                    "A2A_BRIDGE_TEST_PLATFORM_SELECTION_ANCHOR",
+                    directory.path(),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "platform selection subprocess {case} failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn selected_platform_privilege_process_helper() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let Some(case) = std::env::var_os("A2A_BRIDGE_TEST_PLATFORM_PRIVILEGE_CASE") else {
+            return;
+        };
+        let anchor = std::path::PathBuf::from(
+            std::env::var_os("A2A_BRIDGE_TEST_PLATFORM_PRIVILEGE_ANCHOR").unwrap(),
+        );
+        let selection = selected_history(
+            anchor
+                .join("first")
+                .join("second")
+                .join("workflow-history.sqlite"),
+        );
+        if case == "preserving-umask" {
+            drop(selection.open_concurrent().unwrap());
+            for created in [anchor.join("first"), anchor.join("first/second")] {
+                let metadata = std::fs::metadata(created).unwrap();
+                assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            }
+            assert!(selection.path().is_file());
+            return;
+        }
+        if case == "owner-masking-swap" {
+            let _serial = PLATFORM_BOOTSTRAP_TEST_SERIAL.lock().unwrap();
+            let state_root = anchor.join("first").join("second");
+            let replacement = anchor.join("replacement");
+            std::fs::create_dir(&replacement).unwrap();
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let sentinel = replacement.join("sentinel");
+            std::fs::write(&sentinel, b"replacement-bytes").unwrap();
+            std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o400)).unwrap();
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let database = selection.path().to_path_buf();
+            let (_hook, reached, proceed) =
+                arm_platform_pause(&state_root, PlatformBootstrapPausePoint::AfterMkdir(0));
+            let opener = std::thread::spawn(move || selection.open_concurrent());
+            reached
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("opener did not reach the owner-masking swap barrier");
+            let filtered = anchor.join("filtered-entry");
+            std::fs::rename(anchor.join("first"), &filtered).unwrap();
+            std::fs::rename(&replacement, anchor.join("first")).unwrap();
+            proceed.send(()).unwrap();
+
+            let error = opener
+                .join()
+                .unwrap()
+                .err()
+                .expect("an owner-masked replacement must refuse");
+            assert_plain_error(error, R::ReadOnlyParent);
+            let installed = anchor.join("first");
+            assert_eq!(
+                std::fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
+                0o500
+            );
+            assert_eq!(
+                std::fs::read(installed.join("sentinel")).unwrap(),
+                b"replacement-bytes"
+            );
+            assert!(
+                !installed.join("second").exists(),
+                "the installed replacement must not gain the later suffix"
+            );
+            assert_eq!(
+                std::fs::metadata(installed.join("sentinel"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o400
+            );
+            assert_eq!(
+                std::fs::metadata(&filtered).unwrap().permissions().mode() & 0o777,
+                0o500
+            );
+            assert!(std::fs::read_dir(&filtered).unwrap().next().is_none());
+            assert!(!database.exists());
+            assert_eq!(std::fs::read_dir(&anchor).unwrap().count(), 2);
+            assert_no_history_artifacts(&anchor);
+            return;
+        }
+        if case == "anchor-reopen-permission" {
+            let _serial = PLATFORM_BOOTSTRAP_TEST_SERIAL.lock().unwrap();
+            let state_root = anchor.join("first").join("second");
+            let selection_path = selection.path().to_path_buf();
+            let (_hook, reached, proceed) = arm_platform_pause(
+                &canonical_late_hook_path(&anchor, &state_root),
+                PlatformBootstrapPausePoint::BeforeHandoff,
+            );
+            let opener = std::thread::spawn(move || selection.open_concurrent());
+            reached
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("opener did not reach the canonical-anchor reopen barrier");
+
+            let original_anchor_mode =
+                std::fs::metadata(&anchor).unwrap().permissions().mode() & 0o777;
+            assert_ne!(
+                original_anchor_mode, 0o700,
+                "the caller-owned anchor must not gain the exact suffix policy"
+            );
+            for created in [anchor.join("first"), state_root.clone()] {
+                let metadata = std::fs::metadata(created).unwrap();
+                assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            }
+            std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o000)).unwrap();
+            proceed.send(()).unwrap();
+
+            let opened = opener.join().unwrap();
+            std::fs::set_permissions(
+                &anchor,
+                std::fs::Permissions::from_mode(original_anchor_mode),
+            )
+            .unwrap();
+            let error = opened
+                .err()
+                .expect("the inaccessible canonical-anchor reopen must refuse");
+            assert_plain_error(error, R::ReadOnlyParent);
+            assert_eq!(
+                std::fs::metadata(&anchor).unwrap().permissions().mode() & 0o777,
+                original_anchor_mode
+            );
+            for created in [anchor.join("first"), state_root.clone()] {
+                let metadata = std::fs::metadata(created).unwrap();
+                assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            }
+            assert_eq!(std::fs::read_dir(&anchor).unwrap().count(), 1);
+            assert_eq!(std::fs::read_dir(anchor.join("first")).unwrap().count(), 1);
+            assert!(std::fs::read_dir(&state_root).unwrap().next().is_none());
+            assert!(!selection_path.exists());
+            assert_no_history_artifacts(&anchor);
+            return;
+        }
+        if case == "handoff-mode-drift" {
+            let _serial = PLATFORM_BOOTSTRAP_TEST_SERIAL.lock().unwrap();
+            let state_root = anchor.join("first").join("second");
+            let selection_path = selection.path().to_path_buf();
+            let (_hook, reached, proceed) = arm_platform_pause(
+                &canonical_late_hook_path(&anchor, &state_root),
+                PlatformBootstrapPausePoint::BeforeHandoff,
+            );
+            let opener = std::thread::spawn(move || selection.open_concurrent());
+            reached
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("opener did not reach the handoff mode-drift barrier");
+            let first = anchor.join("first");
+            std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o000)).unwrap();
+            proceed.send(()).unwrap();
+
+            let error = opener
+                .join()
+                .unwrap()
+                .err()
+                .expect("later exact-mode drift must refuse");
+            assert_plain_error(error, R::Open);
+            std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!selection_path.exists());
+            assert_no_history_artifacts(&anchor);
+            return;
+        }
+        if matches!(
+            case.to_str(),
+            Some(
+                "inter-iteration-parent-mode-drift"
+                    | "inter-iteration-child-observation-mode-drift"
+                    | "post-open-child-observation-mode-drift"
+            )
+        ) {
+            let _serial = PLATFORM_BOOTSTRAP_TEST_SERIAL.lock().unwrap();
+            let state_root = anchor.join("first").join("second");
+            let selection_path = selection.path().to_path_buf();
+            let point = match case.to_str().unwrap() {
+                "inter-iteration-parent-mode-drift" => {
+                    PlatformBootstrapPausePoint::BeforeHandoffParentCheck(1)
+                }
+                "inter-iteration-child-observation-mode-drift" => {
+                    PlatformBootstrapPausePoint::BeforeHandoffChildLookup(1)
+                }
+                "post-open-child-observation-mode-drift" => {
+                    PlatformBootstrapPausePoint::AfterHandoffChildOpen(1)
+                }
+                _ => unreachable!(),
+            };
+            let (_hook, reached, proceed) =
+                arm_platform_pause(&canonical_late_hook_path(&anchor, &state_root), point);
+            let opener = std::thread::spawn(move || selection.open_concurrent());
+            reached
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("opener did not reach the inter-iteration handoff barrier");
+            let first = anchor.join("first");
+            std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o000)).unwrap();
+            proceed.send(()).unwrap();
+
+            let error = opener
+                .join()
+                .unwrap()
+                .err()
+                .expect("inter-iteration exact-mode drift must refuse");
+            assert_plain_error(error, R::Open);
+            std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!selection_path.exists());
+            assert_no_history_artifacts(&anchor);
+            return;
+        }
+        let error = selection.open_concurrent().err().unwrap();
+        assert_plain_error(error, R::ReadOnlyParent);
+        match case.to_str().unwrap() {
+            "owner-masking-umask" => {
+                let first = anchor.join("first");
+                let metadata = std::fs::metadata(&first).unwrap();
+                assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+                assert_eq!(metadata.permissions().mode() & 0o777, 0);
+                assert!(!anchor.join("first/second").exists());
+            }
+            "wrong-owner-anchor" | "read-only-anchor" => {
+                assert!(std::fs::read_dir(&anchor).unwrap().next().is_none());
+            }
+            "inaccessible-anchor" => {
+                assert!(!selection.path().exists());
+            }
+            other => panic!("unknown platform privilege case {other}"),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn selected_platform_privilege_failures_are_typed_and_leave_no_store_artifacts() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::process::CommandExt as _;
+
+        fn chown(path: &std::path::Path, uid: u32, gid: u32) {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(path.as_ptr(), uid, gid) }, 0);
+        }
+
+        fn run(
+            case: &str,
+            directory: &tempfile::TempDir,
+            anchor: &std::path::Path,
+            drop_ids: bool,
+            umask: Option<libc::mode_t>,
+        ) {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("sqlite::r2f0a_history_tests::selected_platform_privilege_process_helper")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env("A2A_BRIDGE_TEST_PLATFORM_PRIVILEGE_CASE", case)
+                .env("A2A_BRIDGE_TEST_PLATFORM_PRIVILEGE_ANCHOR", anchor)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            if drop_ids {
+                command.uid(65_534).gid(65_534);
+            }
+            if let Some(mask) = umask {
+                unsafe {
+                    command.pre_exec(move || {
+                        libc::umask(mask);
+                        Ok(())
+                    });
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "platform privilege subprocess {case} failed in {}:\nstdout:\n{}\nstderr:\n{}",
+                directory.path().display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let running_as_root = unsafe { libc::geteuid() } == 0;
+        let ids = if running_as_root {
+            (65_534, 65_534)
+        } else {
+            (unsafe { libc::geteuid() }, unsafe { libc::getegid() })
+        };
+
+        for mask in [0o022, 0o077] {
+            let preserving_dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(
+                preserving_dir.path(),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            let preserving_anchor = preserving_dir.path().join("anchor");
+            std::fs::create_dir(&preserving_anchor).unwrap();
+            if running_as_root {
+                chown(&preserving_anchor, ids.0, ids.1);
+            }
+            run(
+                "preserving-umask",
+                &preserving_dir,
+                &preserving_anchor,
+                running_as_root,
+                Some(mask),
+            );
+        }
+
+        let umask_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(umask_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let umask_anchor = umask_dir.path().join("anchor");
+        std::fs::create_dir(&umask_anchor).unwrap();
+        if running_as_root {
+            chown(&umask_anchor, ids.0, ids.1);
+        }
+        run(
+            "owner-masking-umask",
+            &umask_dir,
+            &umask_anchor,
+            running_as_root,
+            Some(0o777),
+        );
+
+        let swap_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(swap_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let swap_anchor = swap_dir.path().join("anchor");
+        std::fs::create_dir(&swap_anchor).unwrap();
+        if running_as_root {
+            chown(&swap_anchor, ids.0, ids.1);
+        }
+        run(
+            "owner-masking-swap",
+            &swap_dir,
+            &swap_anchor,
+            running_as_root,
+            Some(0o277),
+        );
+
+        let anchor_reopen_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            anchor_reopen_dir.path(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let anchor_reopen_anchor = anchor_reopen_dir.path().join("anchor");
+        std::fs::create_dir(&anchor_reopen_anchor).unwrap();
+        std::fs::set_permissions(
+            &anchor_reopen_anchor,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        if running_as_root {
+            chown(&anchor_reopen_anchor, ids.0, ids.1);
+        }
+        run(
+            "anchor-reopen-permission",
+            &anchor_reopen_dir,
+            &anchor_reopen_anchor,
+            running_as_root,
+            Some(0o022),
+        );
+
+        let handoff_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(handoff_dir.path(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let handoff_anchor = handoff_dir.path().join("anchor");
+        std::fs::create_dir(&handoff_anchor).unwrap();
+        if running_as_root {
+            chown(&handoff_anchor, ids.0, ids.1);
+        }
+        run(
+            "handoff-mode-drift",
+            &handoff_dir,
+            &handoff_anchor,
+            running_as_root,
+            Some(0o022),
+        );
+
+        let inter_iteration_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            inter_iteration_dir.path(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let inter_iteration_anchor = inter_iteration_dir.path().join("anchor");
+        std::fs::create_dir(&inter_iteration_anchor).unwrap();
+        if running_as_root {
+            chown(&inter_iteration_anchor, ids.0, ids.1);
+        }
+        run(
+            "inter-iteration-parent-mode-drift",
+            &inter_iteration_dir,
+            &inter_iteration_anchor,
+            running_as_root,
+            Some(0o022),
+        );
+
+        let child_observation_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            child_observation_dir.path(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let child_observation_anchor = child_observation_dir.path().join("anchor");
+        std::fs::create_dir(&child_observation_anchor).unwrap();
+        if running_as_root {
+            chown(&child_observation_anchor, ids.0, ids.1);
+        }
+        run(
+            "inter-iteration-child-observation-mode-drift",
+            &child_observation_dir,
+            &child_observation_anchor,
+            running_as_root,
+            Some(0o022),
+        );
+
+        let post_open_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(post_open_dir.path(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let post_open_anchor = post_open_dir.path().join("anchor");
+        std::fs::create_dir(&post_open_anchor).unwrap();
+        if running_as_root {
+            chown(&post_open_anchor, ids.0, ids.1);
+        }
+        run(
+            "post-open-child-observation-mode-drift",
+            &post_open_dir,
+            &post_open_anchor,
+            running_as_root,
+            Some(0o022),
+        );
+
+        let inaccessible_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            inaccessible_dir.path(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let inaccessible_anchor = inaccessible_dir.path().join("anchor");
+        std::fs::create_dir(&inaccessible_anchor).unwrap();
+        if running_as_root {
+            chown(&inaccessible_anchor, ids.0, ids.1);
+        }
+        std::fs::set_permissions(&inaccessible_anchor, std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        run(
+            "inaccessible-anchor",
+            &inaccessible_dir,
+            &inaccessible_anchor,
+            running_as_root,
+            None,
+        );
+        std::fs::set_permissions(&inaccessible_anchor, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert!(std::fs::read_dir(&inaccessible_anchor)
+            .unwrap()
+            .next()
+            .is_none());
+
+        if running_as_root {
+            let wrong_dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(wrong_dir.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            let wrong_anchor = wrong_dir.path().join("anchor");
+            std::fs::create_dir(&wrong_anchor).unwrap();
+            run("wrong-owner-anchor", &wrong_dir, &wrong_anchor, true, None);
+
+            let readonly_dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(readonly_dir.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            let readonly_anchor = readonly_dir.path().join("anchor");
+            std::fs::create_dir(&readonly_anchor).unwrap();
+            chown(&readonly_anchor, ids.0, ids.1);
+            std::fs::set_permissions(&readonly_anchor, std::fs::Permissions::from_mode(0o500))
+                .unwrap();
+            run(
+                "read-only-anchor",
+                &readonly_dir,
+                &readonly_anchor,
+                true,
+                None,
+            );
+        }
+    }
+
     fn reservation() -> AttemptReservation {
         AttemptReservation {
             identity: bridge_core::ids::AttemptIdentity::initial().unwrap(),
@@ -7383,6 +14906,1210 @@ mod r2f0a_history_tests {
 
     fn attempt_lock_path(path: &std::path::Path, row: &AttemptReservation) -> std::path::PathBuf {
         history_attempt_lock_dir(path).join(format!("{}.lock", row.identity.attempt_id.as_str()))
+    }
+
+    fn arm_history_mutation_failpoint(
+        store: &SqliteStore,
+        attempt_id: &bridge_core::ids::AttemptId,
+        kind: HistoryMutationFailpointKind,
+    ) {
+        *HISTORY_MUTATION_FAILPOINT
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = Some(HistoryMutationFailpoint {
+            path: store.history_path.clone().unwrap(),
+            attempt_id: attempt_id.as_str().to_owned(),
+            kind,
+        });
+    }
+
+    fn insert_configured_fixture_rows(conn: &rusqlite::Connection, slots: u64) {
+        let slots = i64::try_from(slots).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        conn.execute(
+            "WITH RECURSIVE fill(n) AS (
+                 VALUES(1) UNION ALL SELECT n+1 FROM fill WHERE n<?1
+             )
+             INSERT INTO attempt_identities(
+                 attempt_id, execution_id, ordinal, task_id, owner_surface,
+                 history_disposition)
+             SELECT printf('attempt-b1-fill-%017d', n),
+                    printf('exec-b1-fill-%020d', n), 0, NULL, 'offline', 1
+             FROM fill",
+            rusqlite::params![slots],
+        )
+        .unwrap();
+        conn.execute(
+            "WITH RECURSIVE fill(n) AS (
+                 VALUES(1) UNION ALL SELECT n+1 FROM fill WHERE n<?1
+             )
+             INSERT INTO workflow_attempt_summaries(
+                 attempt_id, execution_id, ordinal, workflow, task_class, surface,
+                 policy, workload_fingerprint, started_ms, status, prompt_acceptance,
+                 pinned, charged_bytes, reservation_json)
+             SELECT printf('attempt-b1-fill-%017d', n),
+                    printf('exec-b1-fill-%020d', n), 0, 'fixture', 'fixture',
+                    'offline', 'r2f0a', 'shape-fixture', 1, 'active',
+                    'not_dispatched', 0, 16384, '{}'
+             FROM fill",
+            rusqlite::params![slots],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workflow_history_attachment(attempt_id, charged_bytes)
+             SELECT attempt_id, 1024 FROM workflow_attempt_summaries",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE workflow_history_allocation
+             SET charged_bytes=?1, slots_used=?2, terminal_rows=0
+             WHERE singleton=1",
+            rusqlite::params![slots * 17_408, slots],
+        )
+        .unwrap();
+        conn.execute_batch("COMMIT;").unwrap();
+    }
+
+    struct PlatformFixtureRow {
+        reservation: AttemptReservation,
+        terminal: AttemptTerminal,
+        reservation_json: String,
+        terminal_json: String,
+    }
+
+    fn platform_fixture_row(index: u64) -> PlatformFixtureRow {
+        assert!(
+            (1..=bridge_core::workflow_history::MAX_TERMINAL_ROWS).contains(&index),
+            "platform fixture index must stay within the canonical ledger bound"
+        );
+        let reservation = AttemptReservation {
+            identity: bridge_core::ids::AttemptIdentity {
+                execution_id: bridge_core::ids::ExecutionId::parse(format!("exec-{index:032x}"))
+                    .unwrap(),
+                attempt_id: bridge_core::ids::AttemptId::parse(format!("attempt-{index:032x}"))
+                    .unwrap(),
+                ordinal: 0,
+                parent_attempt_id: None,
+            },
+            task_id: None,
+            workflow: "fixture".into(),
+            task_class: "fixture".into(),
+            surface: ExecutionSurface::Offline,
+            policy: "r2f0a-capacity-fixture".into(),
+            workload_fingerprint: "shape-fixture".into(),
+            started_ms: 1,
+            workload_fingerprint_complete: true,
+            prompt_acceptance: "unknown".into(),
+            pinned: true,
+        };
+        let terminal = AttemptTerminal {
+            completed_ms: 2,
+            work_ms: 1,
+            end_to_end_ms: 1,
+            queue_ms: 0,
+            cancellation_ms: 0,
+            cleanup_ms: 0,
+            finalization_ms: 0,
+            outcome: "completed".into(),
+            terminal_reason: "completed".into(),
+            producer_terminal: "completed".into(),
+            final_message: "nonempty".into(),
+            process_liveness: "exited".into(),
+            terminal_evidence_capability: "not_applicable".into(),
+            terminal_evidence_version: "none".into(),
+            terminal_evidence_source: "none".into(),
+            terminal_evidence_complete: true,
+            degraded: false,
+            prompt_acceptance: "unknown".into(),
+            cleanup_disposition: "complete".into(),
+            node_counts: NodeCounts {
+                completed: 1,
+                ..NodeCounts::default()
+            },
+            phase_durations: vec![],
+            telemetry_complete: true,
+            monotonic_clock: true,
+        };
+        reservation.validate().unwrap();
+        terminal.validate().unwrap();
+        let reservation_json = serde_json::to_string(&reservation).unwrap();
+        let terminal_json = serde_json::to_string(&terminal).unwrap();
+        PlatformFixtureRow {
+            reservation,
+            terminal,
+            reservation_json,
+            terminal_json,
+        }
+    }
+
+    fn insert_platform_fixture_rows(conn: &rusqlite::Connection, rows: u64) {
+        assert!(
+            (1..=bridge_core::workflow_history::MAX_TERMINAL_ROWS).contains(&rows),
+            "platform fixture row count must stay within the canonical ledger bound"
+        );
+        let transaction = conn.unchecked_transaction().unwrap();
+        {
+            let mut insert_identity = transaction
+                .prepare(
+                    "INSERT INTO attempt_identities(
+                         attempt_id, execution_id, ordinal, task_id, owner_surface,
+                         history_disposition)
+                     VALUES(?1, ?2, ?3, ?4, ?5, 1)",
+                )
+                .unwrap();
+            let mut insert_summary = transaction
+                .prepare(
+                    "INSERT INTO workflow_attempt_summaries(
+                         attempt_id, execution_id, parent_attempt_id, ordinal, task_id,
+                         workflow, task_class, surface, policy, workload_fingerprint,
+                         workload_fingerprint_complete, started_ms, completed_ms, status,
+                         prompt_acceptance, producer_terminal, final_message, process_liveness,
+                         terminal_evidence_capability, terminal_evidence_version,
+                         terminal_evidence_source, terminal_evidence_complete,
+                         telemetry_complete, outcome, degraded, pinned, charged_bytes,
+                         reservation_json, terminal_json, terminal_reserve)
+                     VALUES(
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                         'terminal', ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
+                         ?24, ?25, ?26, ?27, ?28, NULL)",
+                )
+                .unwrap();
+            let mut insert_attachment = transaction
+                .prepare(
+                    "INSERT INTO workflow_history_attachment(attempt_id, charged_bytes)
+                     VALUES(?1, ?2)",
+                )
+                .unwrap();
+            for index in 1..=rows {
+                let row = platform_fixture_row(index);
+                let reservation = &row.reservation;
+                let terminal = &row.terminal;
+                insert_identity
+                    .execute(rusqlite::params![
+                        reservation.identity.attempt_id.as_str(),
+                        reservation.identity.execution_id.as_str(),
+                        i64::from(reservation.identity.ordinal),
+                        reservation.task_id.as_ref().map(|value| value.as_str()),
+                        reservation.surface.as_str(),
+                    ])
+                    .unwrap();
+                insert_summary
+                    .execute(rusqlite::params![
+                        reservation.identity.attempt_id.as_str(),
+                        reservation.identity.execution_id.as_str(),
+                        reservation
+                            .identity
+                            .parent_attempt_id
+                            .as_ref()
+                            .map(|value| value.as_str()),
+                        i64::from(reservation.identity.ordinal),
+                        reservation.task_id.as_ref().map(|value| value.as_str()),
+                        reservation.workflow.as_str(),
+                        reservation.task_class.as_str(),
+                        reservation.surface.as_str(),
+                        reservation.policy.as_str(),
+                        reservation.workload_fingerprint.as_str(),
+                        reservation.workload_fingerprint_complete,
+                        reservation.started_ms,
+                        terminal.completed_ms,
+                        terminal.prompt_acceptance.as_str(),
+                        terminal.producer_terminal.as_str(),
+                        terminal.final_message.as_str(),
+                        terminal.process_liveness.as_str(),
+                        terminal.terminal_evidence_capability.as_str(),
+                        terminal.terminal_evidence_version.as_str(),
+                        terminal.terminal_evidence_source.as_str(),
+                        terminal.terminal_evidence_complete,
+                        terminal.telemetry_complete,
+                        terminal.outcome.as_str(),
+                        terminal.degraded,
+                        reservation.pinned,
+                        bridge_core::workflow_history::RETAINED_SUMMARY_CHARGE as i64,
+                        row.reservation_json,
+                        row.terminal_json,
+                    ])
+                    .unwrap();
+                insert_attachment
+                    .execute(rusqlite::params![
+                        reservation.identity.attempt_id.as_str(),
+                        bridge_core::workflow_history::HISTORY_ATTACHMENT_CHARGE as i64,
+                    ])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+    }
+
+    struct PlatformFixtureSnapshot {
+        summaries: i64,
+        attachments: i64,
+        identities: i64,
+        noncanonical_summaries: i64,
+        noncanonical_attachments: i64,
+        unstable_identities: i64,
+        unstable_fixture_rows: i64,
+        allocation: (i64, i64, i64),
+    }
+
+    fn platform_fixture_snapshot(conn: &rusqlite::Connection) -> PlatformFixtureSnapshot {
+        PlatformFixtureSnapshot {
+            summaries: conn
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_attempt_summaries",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            attachments: conn
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_history_attachment",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            identities: conn
+                .query_row("SELECT COUNT(*) FROM attempt_identities", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            noncanonical_summaries: conn
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_attempt_summaries
+                     WHERE charged_bytes<>16384",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            noncanonical_attachments: conn
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_history_attachment
+                     WHERE charged_bytes<>1024",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            unstable_identities: conn
+                .query_row(
+                    "SELECT COUNT(*) FROM attempt_identities
+                     WHERE ordinal<>0 OR task_id IS NOT NULL OR owner_surface<>'offline'
+                        OR history_disposition<>1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            unstable_fixture_rows: conn
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_attempt_summaries
+                     WHERE policy='r2f0a-capacity-fixture'
+                       AND (status<>'terminal' OR pinned<>1 OR completed_ms IS NULL
+                            OR reservation_json='{}' OR terminal_json IS NULL
+                            OR terminal_reserve IS NOT NULL)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            allocation: conn
+                .query_row(
+                    "SELECT charged_bytes, slots_used, terminal_rows
+                     FROM workflow_history_allocation WHERE singleton=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap(),
+        }
+    }
+
+    async fn assert_platform_fixture_readable(
+        store: &SqliteStore,
+        pinned_fixture_rows: u64,
+        total_completed_rows: u64,
+    ) {
+        let completed = store.completed_between(0, i64::MAX).await.unwrap();
+        assert_eq!(
+            completed.len(),
+            usize::try_from(total_completed_rows).unwrap()
+        );
+        for index in [1, pinned_fixture_rows] {
+            let expected = platform_fixture_row(index);
+            let actual = store
+                .attempt(&expected.reservation.identity.attempt_id)
+                .await
+                .unwrap()
+                .expect("representative fixture attempt must remain readable");
+            assert_eq!(actual.reservation, expected.reservation);
+            assert_eq!(actual.terminal, Some(expected.terminal));
+        }
+    }
+
+    fn remove_configured_fixture_locks(path: &std::path::Path) {
+        for lock in [
+            history_schema_lock_path(path),
+            history_kind_lock_path(path),
+            history_admission_lock_path(path),
+        ] {
+            if lock.exists() {
+                std::fs::remove_file(lock).unwrap();
+            }
+        }
+    }
+
+    fn allocation_fixture_snapshot(path: &std::path::Path) -> (Vec<u8>, Vec<std::ffi::OsString>) {
+        let mut entries = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        (std::fs::read(path).unwrap(), entries)
+    }
+
+    fn canonical_fixture_path(path: &std::path::Path) -> std::path::PathBuf {
+        std::fs::canonicalize(path.parent().unwrap())
+            .unwrap()
+            .join(path.file_name().unwrap())
+    }
+
+    fn arm_configured_migration_failpoint(path: &std::path::Path) {
+        let mut slot = CONFIGURED_MIGRATION_FAIL_BEFORE_COMMIT
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap();
+        assert!(slot.is_none(), "a configured migration failpoint leaked");
+        *slot = Some(canonical_fixture_path(path));
+    }
+
+    fn configured_migration_failpoint_is_armed(path: &std::path::Path) -> bool {
+        CONFIGURED_MIGRATION_FAIL_BEFORE_COMMIT
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap()
+            .as_deref()
+            == Some(canonical_fixture_path(path).as_path())
+    }
+
+    fn clear_configured_migration_failpoint() {
+        CONFIGURED_MIGRATION_FAIL_BEFORE_COMMIT
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap()
+            .take();
+    }
+
+    fn arm_history_transaction_pause(
+        path: &std::path::Path,
+        point: HistoryTransactionPausePoint,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        let mut slot = HISTORY_TRANSACTION_PAUSE_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap();
+        assert!(slot.is_none(), "a history transaction pause hook leaked");
+        *slot = Some(HistoryTransactionPauseHook {
+            path: canonical_fixture_path(path),
+            point,
+            reached: reached_tx,
+            proceed: proceed_rx,
+        });
+        (reached_rx, proceed_tx)
+    }
+
+    fn history_transaction_pause_is_armed(
+        path: &std::path::Path,
+        point: HistoryTransactionPausePoint,
+    ) -> bool {
+        HISTORY_TRANSACTION_PAUSE_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|hook| hook.path == canonical_fixture_path(path) && hook.point == point)
+    }
+
+    fn arm_history_admission_contention(path: &std::path::Path) -> std::sync::mpsc::Receiver<()> {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let mut slot = HISTORY_ADMISSION_CONTENTION_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap();
+        assert!(slot.is_none(), "a history contention hook leaked");
+        *slot = Some(HistoryAdmissionContentionHook {
+            path: canonical_fixture_path(path),
+            reached: reached_tx,
+        });
+        reached_rx
+    }
+
+    fn history_admission_contention_is_armed(path: &std::path::Path) -> bool {
+        HISTORY_ADMISSION_CONTENTION_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|hook| hook.path == canonical_fixture_path(path))
+    }
+
+    #[derive(Debug)]
+    struct LogicalTableSnapshot {
+        name: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<rusqlite::types::Value>>,
+    }
+
+    impl PartialEq for LogicalTableSnapshot {
+        fn eq(&self, other: &Self) -> bool {
+            self.name == other.name
+                && self.columns == other.columns
+                && self.rows.len() == other.rows.len()
+                && self.rows.iter().zip(&other.rows).all(|(left, right)| {
+                    left.len() == right.len()
+                        && left
+                            .iter()
+                            .zip(right)
+                            .all(|(left, right)| sqlite_value_eq(left, right))
+                })
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct LegacyConfiguredSnapshot {
+        schema_version: i64,
+        application_id: i64,
+        user_version: i64,
+        schema: Vec<(String, String, String, String)>,
+        tables: Vec<LogicalTableSnapshot>,
+    }
+
+    fn quote_sqlite_identifier(identifier: &str) -> String {
+        format!("\"{}\"", identifier.replace('"', "\"\""))
+    }
+
+    fn sqlite_value_eq(left: &rusqlite::types::Value, right: &rusqlite::types::Value) -> bool {
+        use rusqlite::types::Value;
+
+        match (left, right) {
+            (Value::Real(left), Value::Real(right)) => left.to_bits() == right.to_bits(),
+            _ => left == right,
+        }
+    }
+
+    fn sqlite_value_cmp(
+        left: &rusqlite::types::Value,
+        right: &rusqlite::types::Value,
+    ) -> std::cmp::Ordering {
+        use rusqlite::types::Value;
+
+        let rank = |value: &Value| match value {
+            Value::Null => 0,
+            Value::Integer(_) => 1,
+            Value::Real(_) => 2,
+            Value::Text(_) => 3,
+            Value::Blob(_) => 4,
+        };
+        match (left, right) {
+            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+            (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
+            (Value::Real(left), Value::Real(right)) => left.total_cmp(right),
+            (Value::Text(left), Value::Text(right)) => left.cmp(right),
+            (Value::Blob(left), Value::Blob(right)) => left.cmp(right),
+            _ => rank(left).cmp(&rank(right)),
+        }
+    }
+
+    fn sqlite_row_cmp(
+        left: &[rusqlite::types::Value],
+        right: &[rusqlite::types::Value],
+    ) -> std::cmp::Ordering {
+        left.iter()
+            .zip(right)
+            .map(|(left, right)| sqlite_value_cmp(left, right))
+            .find(|ordering| *ordering != std::cmp::Ordering::Equal)
+            .unwrap_or_else(|| left.len().cmp(&right.len()))
+    }
+
+    fn legacy_configured_snapshot(path: &std::path::Path) -> LegacyConfiguredSnapshot {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let pragma = |name: &str| {
+            conn.query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+                .unwrap()
+        };
+        let schema = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT type, name, tbl_name, COALESCE(sql, '')
+                     FROM sqlite_master
+                     WHERE name NOT GLOB 'sqlite_*'
+                     ORDER BY type COLLATE BINARY, name COLLATE BINARY",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let table_names = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type='table' AND name NOT GLOB 'sqlite_*'
+                     ORDER BY name COLLATE BINARY",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let mut tables = Vec::new();
+        for name in table_names {
+            let quoted_name = quote_sqlite_identifier(&name);
+            let columns = {
+                let mut statement = conn
+                    .prepare(&format!("PRAGMA table_xinfo({quoted_name})"))
+                    .unwrap();
+                let mut columns = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                columns.sort_by_key(|(cid, _)| *cid);
+                columns
+                    .into_iter()
+                    .map(|(_, column)| column)
+                    .collect::<Vec<_>>()
+            };
+            let mut rows = {
+                let projection = columns
+                    .iter()
+                    .map(|column| quote_sqlite_identifier(column))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut statement = conn
+                    .prepare(&format!("SELECT {projection} FROM {quoted_name}"))
+                    .unwrap();
+                statement
+                    .query_map([], |row| {
+                        (0..columns.len())
+                            .map(|index| row.get(index))
+                            .collect::<Result<Vec<rusqlite::types::Value>, _>>()
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            rows.sort_by(|left, right| sqlite_row_cmp(left, right));
+            tables.push(LogicalTableSnapshot {
+                name,
+                columns,
+                rows,
+            });
+        }
+        LegacyConfiguredSnapshot {
+            schema_version: pragma("schema_version"),
+            application_id: pragma("application_id"),
+            user_version: pragma("user_version"),
+            schema,
+            tables,
+        }
+    }
+
+    fn legacy_configured_fixture_identity(index: u64) -> bridge_core::ids::AttemptIdentity {
+        assert_ne!(
+            index, 0,
+            "configured fixture IDs must not use the forbidden all-zero suffix"
+        );
+        bridge_core::ids::AttemptIdentity {
+            execution_id: bridge_core::ids::ExecutionId::parse(format!("exec-{index:032x}"))
+                .unwrap(),
+            attempt_id: bridge_core::ids::AttemptId::parse(format!("attempt-{index:032x}"))
+                .unwrap(),
+            ordinal: 0,
+            parent_attempt_id: None,
+        }
+    }
+
+    fn legacy_configured_fixture_record(
+        index: u64,
+        eligible_terminals: bool,
+    ) -> bridge_core::workflow_history::AttemptRecord {
+        let pinned = index <= 3 && (!eligible_terminals || index > 2);
+        let reservation = AttemptReservation {
+            identity: legacy_configured_fixture_identity(index),
+            task_id: None,
+            workflow: "fixture".into(),
+            task_class: "fixture".into(),
+            surface: ExecutionSurface::Offline,
+            policy: "r2f0a-b3".into(),
+            workload_fingerprint: "shape-fixture".into(),
+            started_ms: i64::try_from(index).unwrap(),
+            workload_fingerprint_complete: true,
+            prompt_acceptance: "not_dispatched".into(),
+            pinned,
+        };
+        reservation.validate().unwrap();
+        let terminal = if index <= 3 {
+            let mut terminal = terminal();
+            terminal.completed_ms = i64::try_from(index).unwrap();
+            terminal.prompt_acceptance = "not_dispatched".into();
+            terminal.validate().unwrap();
+            Some(terminal)
+        } else {
+            None
+        };
+        bridge_core::workflow_history::AttemptRecord {
+            reservation,
+            terminal,
+        }
+    }
+
+    const LEGACY_REWRITE_RESERVE: &[u8] = b"rewrite-reserve";
+    const LEGACY_TERMINAL_RESERVE: &[u8] = b"terminal-reserve";
+    const LEGACY_SQLITE_AUDIT_BLOB: &[u8] = b"\x00sqlite-audit\xff";
+    const LEGACY_TASK_EXECUTION_ID: &str = "exec-b3a11111111111111111111111111111";
+    const LEGACY_TASK_ATTEMPT_ID: &str = "attempt-b3a11111111111111111111111111111";
+    const LEGACY_TASK_ORDINAL: i64 = 7;
+
+    fn create_legacy_configured_capacity_fixture(
+        path: &std::path::Path,
+        eligible_terminals: bool,
+        legacy_disposition: bool,
+    ) -> u64 {
+        use bridge_core::workflow_history::{
+            CONFIGURED_SLOT_CHARGE, MAX_CHARGED_BYTES, MAX_TERMINAL_ROWS,
+        };
+
+        drop(SqliteStore::open(path).unwrap());
+        let maximum_slots = MAX_TERMINAL_ROWS.min(MAX_CHARGED_BYTES / CONFIGURED_SLOT_CHARGE);
+        let rows = maximum_slots + 1;
+        let largest_identity = legacy_configured_fixture_identity(rows);
+        let first_identity = legacy_configured_fixture_identity(1);
+        let orphan_attempt_id =
+            bridge_core::ids::AttemptId::parse("attempt-ffffffffffffffffffffffffffffffff").unwrap();
+        assert_ne!(orphan_attempt_id, largest_identity.attempt_id);
+        let mut conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "WITH RECURSIVE fill(n) AS (
+                 VALUES(1) UNION ALL SELECT n+1 FROM fill WHERE n<?1
+             )
+             INSERT INTO attempt_identities(
+                 attempt_id, execution_id, ordinal, task_id, owner_surface,
+                 history_disposition)
+             SELECT printf('attempt-%032x', n),
+                    printf('exec-%032x', n), 0, NULL, 'offline', ?2
+             FROM fill",
+            rusqlite::params![
+                i64::try_from(rows).unwrap(),
+                if legacy_disposition { 0 } else { 1 }
+            ],
+        )
+        .unwrap();
+        tx.execute(
+            "WITH RECURSIVE fill(n) AS (
+                 VALUES(1) UNION ALL SELECT n+1 FROM fill WHERE n<?1
+             )
+             INSERT INTO workflow_attempt_summaries(
+                 attempt_id, execution_id, ordinal, workflow, task_class, surface,
+                 policy, workload_fingerprint, workload_fingerprint_complete, started_ms, completed_ms, status,
+                 prompt_acceptance, telemetry_complete, outcome, pinned, charged_bytes,
+                 reservation_json, terminal_json, terminal_reserve)
+             SELECT printf('attempt-%032x', n),
+                    printf('exec-%032x', n), 0, 'fixture', 'fixture',
+                    'offline', 'r2f0a-b3', 'shape-fixture', 1, n,
+                    CASE WHEN n<=3 THEN n ELSE NULL END,
+                    CASE WHEN n<=3 THEN 'terminal' ELSE 'active' END,
+                    'not_dispatched', CASE WHEN n<=3 THEN 1 ELSE 0 END,
+                    CASE WHEN n<=3 THEN 'completed' ELSE NULL END,
+                    CASE
+                        WHEN n>3 THEN 0
+                        WHEN ?2<>0 AND n<=2 THEN 0
+                        ELSE 1
+                    END,
+                    7, '{}', CASE WHEN n<=3 THEN '{}' ELSE NULL END,
+                    CASE WHEN n=4 THEN ?3 ELSE NULL END
+             FROM fill",
+            rusqlite::params![
+                i64::try_from(rows).unwrap(),
+                i64::from(eligible_terminals),
+                LEGACY_TERMINAL_RESERVE
+            ],
+        )
+        .unwrap();
+        {
+            let mut update = tx
+                .prepare(
+                    "UPDATE workflow_attempt_summaries
+                     SET reservation_json=?2, terminal_json=?3
+                     WHERE attempt_id=?1",
+                )
+                .unwrap();
+            for index in 1..=rows {
+                let expected = legacy_configured_fixture_record(index, eligible_terminals);
+                update
+                    .execute(rusqlite::params![
+                        expected.reservation.identity.attempt_id.as_str(),
+                        serde_json::to_string(&expected.reservation).unwrap(),
+                        expected
+                            .terminal
+                            .as_ref()
+                            .map(|value| serde_json::to_string(value).unwrap()),
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.execute(
+            "INSERT INTO workflow_history_attachment(attempt_id, charged_bytes)
+             VALUES(?1, 1024), (?2, 1024)",
+            rusqlite::params![
+                first_identity.attempt_id.as_str(),
+                orphan_attempt_id.as_str()
+            ],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO workflow_history_rewrite_reserve(singleton, reserve)
+             VALUES(1, ?1)",
+            [LEGACY_REWRITE_RESERVE],
+        )
+        .unwrap();
+        tx.execute_batch(
+            "CREATE TABLE sqliteAudit(
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 kind TEXT NOT NULL,
+                 score REAL NOT NULL,
+                 optional_value TEXT,
+                 payload BLOB NOT NULL
+             );",
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO sqliteAudit(kind, score, optional_value, payload)
+             VALUES(?1, ?2, NULL, ?3)",
+            rusqlite::params!["literal-prefix", 1.25_f64, LEGACY_SQLITE_AUDIT_BLOB],
+        )
+        .unwrap();
+        tx.execute_batch(
+            "CREATE TABLE task_attempt_identities(
+                 task_id TEXT PRIMARY KEY,
+                 attempt_id TEXT NOT NULL,
+                 execution_id TEXT NOT NULL,
+                 ordinal INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO task_attempt_identities(task_id, attempt_id, execution_id, ordinal)
+             VALUES(?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                LEGACY_TASK_EXECUTION_ID,
+                LEGACY_TASK_ATTEMPT_ID,
+                LEGACY_TASK_EXECUTION_ID,
+                LEGACY_TASK_ORDINAL
+            ],
+        )
+        .unwrap();
+        tx.execute_batch("PRAGMA application_id=424242; PRAGMA user_version=23;")
+            .unwrap();
+        tx.commit().unwrap();
+        if legacy_disposition {
+            conn.execute_batch(
+                "ALTER TABLE attempt_identities
+                 RENAME COLUMN history_disposition TO summary_attached;",
+            )
+            .unwrap();
+        }
+        rows
+    }
+
+    async fn assert_legacy_configured_survivors_readable(
+        store: &SqliteStore,
+        eligible_terminals: bool,
+    ) {
+        use bridge_core::workflow_history::WorkflowHistoryStore as _;
+
+        let collected = legacy_configured_fixture_record(1, eligible_terminals);
+        assert!(store
+            .attempt(&collected.reservation.identity.attempt_id)
+            .await
+            .unwrap()
+            .is_none());
+        for index in [2, 3, 4] {
+            let expected = legacy_configured_fixture_record(index, eligible_terminals);
+            let actual = store
+                .attempt(&expected.reservation.identity.attempt_id)
+                .await
+                .unwrap()
+                .expect("representative migrated survivor must remain production-readable");
+            assert_eq!(actual, expected);
+            assert_eq!(actual.terminal.is_some(), index <= 3);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(clippy::unnecessary_cast)]
+    #[test]
+    fn canonical_parent_syscall_errors_preserve_typed_precedence() {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+        fn assert_reason(error: LedgerError, expected: R) {
+            assert_eq!(error.reason, expected);
+            assert_eq!(error.sqlite_primary_code, None);
+            assert_eq!(error.sqlite_extended_code, None);
+        }
+
+        let io = std::io::Error::from_raw_os_error(libc::EIO);
+        assert_reason(history_parent_open_error(&io), R::Io);
+        assert_reason(history_parent_permission_error(&io, R::Io), R::Io);
+        assert_reason(platform_bootstrap_error(&io, false), R::Io);
+        for code in [libc::ENOENT, libc::ENOTDIR, libc::ELOOP] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert_reason(history_parent_open_error(&error), R::Open);
+            assert_reason(platform_bootstrap_error(&error, true), R::Open);
+            assert_reason(platform_bootstrap_error(&error, false), R::Io);
+        }
+        for code in [libc::EACCES, libc::EPERM, libc::EROFS] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert_reason(history_parent_open_error(&error), R::ReadOnlyParent);
+            assert_reason(platform_bootstrap_error(&error, true), R::ReadOnlyParent);
+            assert_reason(platform_bootstrap_error(&error, false), R::ReadOnlyParent);
+        }
+
+        let stable = || {
+            Ok((
+                7,
+                9,
+                unsafe { libc::geteuid() },
+                PLATFORM_DIRECTORY_FILE_TYPE,
+                0o700,
+            ))
+        };
+        assert_reason(
+            platform_handoff_child_observation_error(
+                LedgerError::new(R::ReadOnlyParent),
+                stable(),
+                (7, 9),
+                true,
+            ),
+            R::ReadOnlyParent,
+        );
+        assert_reason(
+            platform_handoff_child_observation_error(
+                LedgerError::new(R::Open),
+                stable(),
+                (7, 9),
+                true,
+            ),
+            R::Open,
+        );
+        assert_reason(
+            platform_handoff_child_observation_error(
+                LedgerError::new(R::Io),
+                stable(),
+                (7, 9),
+                true,
+            ),
+            R::Io,
+        );
+        assert_reason(
+            platform_handoff_child_observation_error(
+                LedgerError::new(R::ReadOnlyParent),
+                Ok((
+                    7,
+                    9,
+                    unsafe { libc::geteuid() },
+                    PLATFORM_DIRECTORY_FILE_TYPE,
+                    0o000,
+                )),
+                (7, 9),
+                true,
+            ),
+            R::Open,
+        );
+        assert_reason(
+            platform_handoff_child_observation_error(
+                LedgerError::new(R::ReadOnlyParent),
+                Err(LedgerError::new(R::Io)),
+                (7, 9),
+                true,
+            ),
+            R::Io,
+        );
+        assert_reason(
+            platform_handoff_open_error(
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+                stable(),
+                (7, 9),
+                true,
+            ),
+            R::ReadOnlyParent,
+        );
+        assert_reason(
+            platform_handoff_open_error(&io, stable(), (7, 9), true),
+            R::Io,
+        );
+        for observation in [
+            Ok((
+                7,
+                8,
+                unsafe { libc::geteuid() },
+                PLATFORM_DIRECTORY_FILE_TYPE,
+                0o700,
+            )),
+            Ok((
+                7,
+                9,
+                unsafe { libc::geteuid() },
+                libc::S_IFREG as u32,
+                0o700,
+            )),
+            Ok((
+                7,
+                9,
+                unsafe { libc::geteuid() } + 1,
+                PLATFORM_DIRECTORY_FILE_TYPE,
+                0o700,
+            )),
+            Ok((
+                7,
+                9,
+                unsafe { libc::geteuid() },
+                PLATFORM_DIRECTORY_FILE_TYPE,
+                0o000,
+            )),
+        ] {
+            assert_reason(
+                platform_handoff_open_error(&io, observation, (7, 9), true),
+                R::Open,
+            );
+        }
+        assert_reason(
+            platform_handoff_open_error(&io, Err(LedgerError::new(R::Io)), (7, 9), true),
+            R::Io,
+        );
+        assert_reason(
+            platform_handoff_open_error(
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+                Ok((
+                    7,
+                    9,
+                    unsafe { libc::geteuid() },
+                    PLATFORM_DIRECTORY_FILE_TYPE,
+                    0o500,
+                )),
+                (7, 9),
+                false,
+            ),
+            R::ReadOnlyParent,
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn history_parent_proof_collisions_random_failure_and_cleanup_are_exact() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::fmt::Write as _;
+        use std::os::unix::fs::symlink;
+
+        fn proof_name(bytes: [u8; 32]) -> String {
+            let mut encoded = String::with_capacity(64);
+            for byte in bytes {
+                write!(&mut encoded, "{byte:02x}").unwrap();
+            }
+            format!("{HISTORY_PARENT_PROOF_PREFIX}{encoded}")
+        }
+
+        fn arm(
+            failpoint: Option<HistoryParentProofFailpoint>,
+            random_names: impl IntoIterator<Item = [u8; 32]>,
+        ) {
+            HISTORY_PARENT_PROOF_TEST_HOOKS.with(|slot| {
+                *slot.borrow_mut() = HistoryParentProofTestHooks {
+                    failpoint,
+                    random_names: random_names.into_iter().collect(),
+                };
+            });
+        }
+
+        fn proof_entries(directory: &std::path::Path) -> Vec<std::ffi::OsString> {
+            std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| {
+                    name.to_string_lossy()
+                        .starts_with(HISTORY_PARENT_PROOF_PREFIX)
+                })
+                .collect()
+        }
+
+        let collision_dir = tempfile::tempdir().unwrap();
+        let collision_path = collision_dir.path().join("history.sqlite");
+        let regular_bytes = [1_u8; 32];
+        let symlink_bytes = [2_u8; 32];
+        let success_bytes = [3_u8; 32];
+        let regular = collision_dir.path().join(proof_name(regular_bytes));
+        let alias = collision_dir.path().join(proof_name(symlink_bytes));
+        let victim = collision_dir.path().join("victim");
+        std::fs::write(&regular, b"collision").unwrap();
+        std::fs::write(&victim, b"victim").unwrap();
+        symlink(&victim, &alias).unwrap();
+        arm(None, [regular_bytes, symlink_bytes, success_bytes]);
+        drop(HistoryParent::prove(&collision_path).unwrap());
+        assert_eq!(std::fs::read(&regular).unwrap(), b"collision");
+        assert_eq!(std::fs::read_link(&alias).unwrap(), victim);
+        assert!(!collision_dir
+            .path()
+            .join(proof_name(success_bytes))
+            .exists());
+
+        let exhausted_dir = tempfile::tempdir().unwrap();
+        let exhausted_path = exhausted_dir.path().join("history.sqlite");
+        let collisions = (16_u8..32).map(|byte| [byte; 32]).collect::<Vec<_>>();
+        for bytes in &collisions {
+            std::fs::write(exhausted_dir.path().join(proof_name(*bytes)), b"untouched").unwrap();
+        }
+        arm(None, collisions.iter().copied());
+        let error = HistoryParent::prove(&exhausted_path).err().unwrap();
+        assert_eq!(error.reason, R::Collision);
+        assert_eq!(error.sqlite_primary_code, None);
+        assert_eq!(error.sqlite_extended_code, None);
+        for bytes in collisions {
+            assert_eq!(
+                std::fs::read(exhausted_dir.path().join(proof_name(bytes))).unwrap(),
+                b"untouched"
+            );
+        }
+
+        let random_dir = tempfile::tempdir().unwrap();
+        arm(Some(HistoryParentProofFailpoint::Random), []);
+        let error = HistoryParent::prove(&random_dir.path().join("history.sqlite"))
+            .err()
+            .unwrap();
+        assert_eq!(error.reason, R::Io);
+        assert_eq!(error.sqlite_primary_code, None);
+        assert_eq!(error.sqlite_extended_code, None);
+        assert!(proof_entries(random_dir.path()).is_empty());
+
+        for (index, failpoint) in [
+            HistoryParentProofFailpoint::AfterValidatedCreate,
+            HistoryParentProofFailpoint::BeforeUnlink,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fail_dir = tempfile::tempdir().unwrap();
+            arm(Some(failpoint), [[64_u8 + index as u8; 32]]);
+            let error = HistoryParent::prove(&fail_dir.path().join("history.sqlite"))
+                .err()
+                .unwrap();
+            assert_eq!(error.reason, R::Io);
+            assert_eq!(error.sqlite_primary_code, None);
+            assert_eq!(error.sqlite_extended_code, None);
+            assert!(
+                proof_entries(fail_dir.path()).is_empty(),
+                "ordinary proof failure left an artifact"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn history_parent_accepts_owned_group_and_other_writable_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("owned-shared-parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let path = parent.join("history.sqlite");
+        drop(SqliteStore::open_shared_history(&path).unwrap());
+        assert_eq!(
+            std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn unsupported_target_refuses_all_history_writers_before_mutation() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.sqlite");
+        let selection = PlatformHistorySelection {
+            path: directory.path().join("selected/workflow-history.sqlite"),
+        };
+        let errors = [
+            selection.open_concurrent().err().unwrap(),
+            selection.open_lifetime().err().unwrap(),
+            SqliteStore::open(&path).err().unwrap(),
+            SqliteStore::open_shared_history(&path).err().unwrap(),
+            SqliteStore::open_platform_history(&path).err().unwrap(),
+            SqliteStore::open_history(&path).err().unwrap(),
+            SqliteStore::open_history_admin(&path).err().unwrap(),
+            SqliteStore::open_configured_history_admin(&path)
+                .err()
+                .unwrap(),
+            SqliteStore::open_platform_history_admin(&path)
+                .err()
+                .unwrap(),
+        ];
+        for error in errors {
+            assert_eq!(error.reason, R::Open);
+            assert_eq!(error.sqlite_primary_code, None);
+            assert_eq!(error.sqlite_extended_code, None);
+        }
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .next()
+            .is_none());
+
+        let read_only = SqliteStore::open_history_read_only(&path)
+            .err()
+            .expect("untagged read-only history keeps its existing typed refusal");
+        assert_eq!(read_only.reason, R::Migration);
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    fn assert_configured_openers_refuse_unchanged(
+        path: &std::path::Path,
+        expected: bridge_core::workflow_history::LedgerUnavailableReason,
+    ) {
+        remove_configured_fixture_locks(path);
+        let before = allocation_fixture_snapshot(path);
+        for error in [
+            SqliteStore::open(path)
+                .err()
+                .expect("untyped lifetime open must fully validate the tagged fixture"),
+            SqliteStore::open_configured_history_read_only(path)
+                .err()
+                .expect("configured read-only stats must refuse the fixture"),
+            SqliteStore::open_shared_history(path)
+                .err()
+                .expect("configured lifetime open must refuse the fixture"),
+            SqliteStore::open_configured_history_admin(path)
+                .err()
+                .expect("configured admin open must refuse the fixture"),
+        ] {
+            assert_eq!(error.reason, expected);
+            assert_eq!(error.sqlite_primary_code, None);
+            assert_eq!(error.sqlite_extended_code, None);
+        }
+        assert_eq!(
+            allocation_fixture_snapshot(path),
+            before,
+            "refusal changed database bytes or created a bridge lock/artifact"
+        );
     }
 
     fn terminal() -> AttemptTerminal {
@@ -7690,7 +16417,7 @@ mod r2f0a_history_tests {
     }
 
     #[test]
-    fn malformed_locator_migration_uses_typed_validation_without_sqlite_codes() {
+    fn tagged_malformed_locator_is_corruption_without_sqlite_codes() {
         use bridge_core::task_store::{TaskAttemptLocator, TaskStore};
         use bridge_core::workflow_history::LedgerUnavailableReason;
 
@@ -7725,7 +16452,7 @@ mod r2f0a_history_tests {
         let error = SqliteStore::open_shared_history(&path)
             .err()
             .expect("malformed locator migration must refuse opening");
-        assert_eq!(error.reason, LedgerUnavailableReason::Migration);
+        assert_eq!(error.reason, LedgerUnavailableReason::Corruption);
         assert_eq!(error.sqlite_primary_code, None);
         assert_eq!(error.sqlite_extended_code, None);
         let connection = rusqlite::Connection::open(&path).unwrap();
@@ -7947,7 +16674,7 @@ mod r2f0a_history_tests {
             .lock()
             .unwrap()
             .execute(
-                "UPDATE attempt_identities SET summary_attached=0 WHERE attempt_id=?1",
+                "UPDATE attempt_identities SET history_disposition=0 WHERE attempt_id=?1",
                 rusqlite::params![row.identity.attempt_id.as_str()],
             )
             .unwrap();
@@ -8102,6 +16829,301 @@ mod r2f0a_history_tests {
                 .reason,
             R::Corruption,
             "active status with immutable terminal evidence is corrupt"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_between_missing_projection_is_migration() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(
+            WorkflowHistoryStore::completed_between(&store, 0, i64::MAX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unchanged valid empty range must remain readable"
+        );
+
+        let row = reservation();
+        let mut value = terminal();
+        value.prompt_acceptance = "not_dispatched".into();
+        store.reserve(&row).await.unwrap();
+        assert_eq!(
+            store
+                .terminalize(&row.identity.attempt_id, &value)
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+        let completed = WorkflowHistoryStore::completed_between(&store, 0, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].reservation, row);
+        assert_eq!(completed[0].terminal, value);
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries SET ordinal='not-an-integer'
+                 WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            WorkflowHistoryStore::completed_between(&store, 0, i64::MAX)
+                .await
+                .unwrap_err()
+                .reason,
+            R::Corruption,
+            "an incompatible selected row value must remain corruption"
+        );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries SET ordinal=?2 WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str(), row.identity.ordinal],
+            )
+            .unwrap();
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE workflow_attempt_summaries DROP COLUMN workflow")
+            .unwrap();
+        assert_eq!(
+            WorkflowHistoryStore::completed_between(&store, 0, i64::MAX)
+                .await
+                .unwrap_err()
+                .reason,
+            R::Migration,
+            "a missing immutable summary projection must require migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_between_validates_reservation_projection_and_authority() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        async fn terminalized(
+            reservation: &AttemptReservation,
+            terminal: &AttemptTerminal,
+        ) -> SqliteStore {
+            let store = SqliteStore::open_in_memory().unwrap();
+            store.reserve(reservation).await.unwrap();
+            assert_eq!(
+                store
+                    .terminalize(&reservation.identity.attempt_id, terminal)
+                    .await
+                    .unwrap(),
+                TerminalWrite::Applied
+            );
+            store
+        }
+
+        fn legacy_terminal() -> AttemptTerminal {
+            let mut terminal = terminal();
+            terminal.outcome = "failed".into();
+            terminal.terminal_reason = "prompt_barrier_failed".into();
+            terminal.degraded = true;
+            terminal.prompt_acceptance = "unknown".into();
+            terminal.telemetry_complete = false;
+            terminal
+        }
+
+        // The completed-range reader must bind a selected terminal summary to
+        // that summary's immutable reservation projections and permanent
+        // identity authority. Valid reservation JSON for another attempt must
+        // not be paired with the selected attempt's terminal evidence.
+        let row_a = reservation_with_ids(
+            "exec-70000000000000000000000000000001",
+            "attempt-70000000000000000000000000000001",
+        );
+        let value_a = terminal();
+        let store = terminalized(&row_a, &value_a).await;
+        let row_b = reservation_with_ids(
+            "exec-70000000000000000000000000000002",
+            "attempt-70000000000000000000000000000002",
+        );
+        assert_eq!(row_b.surface, row_a.surface);
+        assert_eq!(row_b.prompt_acceptance, row_a.prompt_acceptance);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries SET reservation_json=?2
+                 WHERE attempt_id=?1",
+                rusqlite::params![
+                    row_a.identity.attempt_id.as_str(),
+                    serde_json::to_string(&row_b).unwrap()
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            WorkflowHistoryStore::completed_between(&store, 0, i64::MAX)
+                .await
+                .unwrap_err()
+                .reason,
+            R::Corruption,
+            "valid reservation JSON for B cannot inherit A's terminal evidence"
+        );
+
+        let row = reservation();
+        let mut value = terminal();
+        value.prompt_acceptance = "not_dispatched".into();
+        let store = terminalized(&row, &value).await;
+        let completed = WorkflowHistoryStore::completed_between(&store, 0, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].reservation, row);
+        assert_eq!(completed[0].terminal, value);
+
+        let row = reservation();
+        let store = terminalized(&row, &terminal()).await;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries SET workflow='drifted-workflow'
+                 WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            WorkflowHistoryStore::completed_between(&store, 0, i64::MAX)
+                .await
+                .unwrap_err()
+                .reason,
+            R::Corruption,
+            "duplicated immutable summary projections must match reservation JSON"
+        );
+
+        let row = reservation();
+        let store = terminalized(&row, &terminal()).await;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM attempt_identities WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            WorkflowHistoryStore::completed_between(&store, 0, i64::MAX)
+                .await
+                .unwrap_err()
+                .reason,
+            R::Corruption,
+            "a completed summary without permanent identity authority is corrupt"
+        );
+
+        let row = reservation();
+        let store = terminalized(&row, &terminal()).await;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE attempt_identities SET execution_id=?2 WHERE attempt_id=?1",
+                rusqlite::params![
+                    row.identity.attempt_id.as_str(),
+                    "exec-70000000000000000000000000000003"
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            WorkflowHistoryStore::completed_between(&store, 0, i64::MAX)
+                .await
+                .unwrap_err()
+                .reason,
+            R::Corruption,
+            "present permanent identity authority must match the selected summary"
+        );
+
+        let row = reservation();
+        let store = terminalized(&row, &terminal()).await;
+        assert!(
+            WorkflowHistoryStore::completed_between(&store, 0, 1_999)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a valid row outside the inclusive interval must remain absent"
+        );
+
+        let row = reservation();
+        let legacy = legacy_terminal();
+        let store = terminalized(&row, &legacy).await;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries SET prompt_acceptance='not_dispatched'
+                 WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+            )
+            .unwrap();
+        let completed = WorkflowHistoryStore::completed_between(&store, 0, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].reservation.prompt_acceptance, "unknown");
+        assert_eq!(completed[0].terminal, legacy);
+
+        let mut row = reservation();
+        row.prompt_acceptance = "unknown".into();
+        let legacy = legacy_terminal();
+        let store = terminalized(&row, &legacy).await;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries SET prompt_acceptance='not_dispatched'
+                 WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            WorkflowHistoryStore::completed_between(&store, 0, i64::MAX)
+                .await
+                .unwrap_err()
+                .reason,
+            R::Corruption,
+            "the legacy exception requires immutable reservation state not_dispatched"
+        );
+
+        let row = reservation();
+        let mut near_miss = legacy_terminal();
+        near_miss.terminal_reason = "provider_failed".into();
+        let store = terminalized(&row, &near_miss).await;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries SET prompt_acceptance='not_dispatched'
+                 WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            WorkflowHistoryStore::completed_between(&store, 0, i64::MAX)
+                .await
+                .unwrap_err()
+                .reason,
+            R::Corruption,
+            "a near-miss legacy terminal contradiction must remain corruption"
         );
     }
 
@@ -8488,58 +17510,293 @@ mod r2f0a_history_tests {
     }
 
     #[tokio::test]
+    async fn ordinary_readers_reject_payloadless_platform_fixture_rows() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        insert_platform_fixture_rows(&store.conn.lock().unwrap(), 1);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries
+                 SET reservation_json='{}', terminal_json=NULL",
+                [],
+            )
+            .unwrap();
+        let attempt_id =
+            bridge_core::ids::AttemptId::parse("attempt-00000000000000000000000000000001").unwrap();
+        assert_eq!(
+            store.attempt(&attempt_id).await.unwrap_err().reason,
+            R::Corruption
+        );
+        assert_eq!(
+            store
+                .completed_between(0, i64::MAX)
+                .await
+                .unwrap_err()
+                .reason,
+            R::Corruption
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_reservation_for_task_validates_lineage_projection_and_authority() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        fn task_reservation(
+            task: &bridge_core::ids::TaskId,
+            execution: &str,
+            attempt: &str,
+            ordinal: u32,
+            started_ms: i64,
+        ) -> AttemptReservation {
+            let mut row = reservation_with_ids(execution, attempt);
+            row.task_id = Some(task.clone());
+            row.identity.ordinal = ordinal;
+            row.started_ms = started_ms;
+            row
+        }
+
+        let task_a = bridge_core::ids::TaskId::parse("task-lineage-a").unwrap();
+        let task_b = bridge_core::ids::TaskId::parse("task-lineage-b").unwrap();
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let row = task_reservation(
+            &task_a,
+            "exec-10000000000000000000000000000001",
+            "attempt-10000000000000000000000000000001",
+            0,
+            1_000,
+        );
+        store.reserve(&row).await.unwrap();
+        let mut wrong_lineage = row.clone();
+        wrong_lineage.task_id = Some(task_b.clone());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries SET reservation_json=?2
+                 WHERE attempt_id=?1",
+                rusqlite::params![
+                    row.identity.attempt_id.as_str(),
+                    serde_json::to_string(&wrong_lineage).unwrap()
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .latest_reservation_for_task(&task_a)
+                .await
+                .unwrap_err()
+                .reason,
+            R::Corruption,
+            "valid JSON for another task cannot replace the selected lineage"
+        );
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let row = task_reservation(
+            &task_a,
+            "exec-20000000000000000000000000000002",
+            "attempt-20000000000000000000000000000002",
+            0,
+            1_000,
+        );
+        store.reserve(&row).await.unwrap();
+        let mut invalid = row.clone();
+        invalid.started_ms = 0;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries SET reservation_json=?2
+                 WHERE attempt_id=?1",
+                rusqlite::params![
+                    row.identity.attempt_id.as_str(),
+                    serde_json::to_string(&invalid).unwrap()
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .latest_reservation_for_task(&task_a)
+                .await
+                .unwrap_err()
+                .reason,
+            R::Corruption,
+            "invalid but deserializable reservation fields are corruption"
+        );
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let row = task_reservation(
+            &task_a,
+            "exec-30000000000000000000000000000003",
+            "attempt-30000000000000000000000000000003",
+            0,
+            1_000,
+        );
+        store.reserve(&row).await.unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries SET workflow='wrong-projection'
+                 WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .latest_reservation_for_task(&task_a)
+                .await
+                .unwrap_err()
+                .reason,
+            R::Corruption,
+            "duplicated summary projection drift is corruption"
+        );
+
+        for missing in [false, true] {
+            let store = SqliteStore::open_in_memory().unwrap();
+            let row = task_reservation(
+                &task_a,
+                if missing {
+                    "exec-40000000000000000000000000000004"
+                } else {
+                    "exec-50000000000000000000000000000005"
+                },
+                if missing {
+                    "attempt-40000000000000000000000000000004"
+                } else {
+                    "attempt-50000000000000000000000000000005"
+                },
+                0,
+                1_000,
+            );
+            store.reserve(&row).await.unwrap();
+            if missing {
+                store
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "DELETE FROM attempt_identities WHERE attempt_id=?1",
+                        rusqlite::params![row.identity.attempt_id.as_str()],
+                    )
+                    .unwrap();
+            } else {
+                store
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE attempt_identities SET owner_surface='direct_unary'
+                         WHERE attempt_id=?1",
+                        rusqlite::params![row.identity.attempt_id.as_str()],
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                store
+                    .latest_reservation_for_task(&task_a)
+                    .await
+                    .unwrap_err()
+                    .reason,
+                R::Corruption,
+                "permanent authority {} is corruption",
+                if missing { "absence" } else { "mismatch" }
+            );
+        }
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let older = task_reservation(
+            &task_a,
+            "exec-60000000000000000000000000000006",
+            "attempt-60000000000000000000000000000006",
+            0,
+            1_000,
+        );
+        let mut latest = task_reservation(
+            &task_a,
+            "exec-60000000000000000000000000000006",
+            "attempt-70000000000000000000000000000007",
+            1,
+            3_000,
+        );
+        latest.identity.parent_attempt_id = Some(older.identity.attempt_id.clone());
+        store.reserve(&older).await.unwrap();
+        store
+            .terminalize(&older.identity.attempt_id, &terminal())
+            .await
+            .unwrap();
+        store.reserve(&latest).await.unwrap();
+        assert_eq!(
+            store.latest_reservation_for_task(&task_a).await.unwrap(),
+            Some(latest),
+            "ordinal is the primary newest-lineage ordering key"
+        );
+        assert_eq!(
+            store.latest_reservation_for_task(&task_b).await.unwrap(),
+            None,
+            "a genuinely absent task remains Ok(None)"
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_capacity_admission_allows_only_one_remaining_slot() {
         use bridge_core::workflow_history::{
-            MAX_CHARGED_BYTES, PERMANENT_IDENTITY_CHARGE, RESERVED_ROW_CHARGE, RETENTION_DAYS,
+            MAX_CHARGED_BYTES, PERMANENT_IDENTITY_CHARGE, RESERVED_ROW_CHARGE,
         };
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("history.sqlite");
         let store_a = SqliteStore::open_history(&path).unwrap();
+        let admission_charge = RESERVED_ROW_CHARGE + PERMANENT_IDENTITY_CHARGE;
+        let fixture_rows = MAX_CHARGED_BYTES / admission_charge - 1;
+        let fixture_charge = fixture_rows * admission_charge;
+        assert!(
+            fixture_charge + admission_charge <= MAX_CHARGED_BYTES,
+            "the canonical fixture must leave one logical admission"
+        );
+        assert!(
+            fixture_charge + 2 * admission_charge > MAX_CHARGED_BYTES,
+            "the canonical fixture must not leave two logical admissions"
+        );
+        insert_platform_fixture_rows(&store_a.conn.lock().unwrap(), fixture_rows);
 
-        let protected = child_reservation();
-        store_a.reserve(&protected).await.unwrap();
-        store_a
-            .terminalize(&protected.identity.attempt_id, &terminal())
-            .await
-            .unwrap();
-        store_a
-            .set_pinned(&protected.identity.attempt_id, true)
-            .await
-            .unwrap();
-        store_a
-            .conn
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE workflow_attempt_summaries SET charged_bytes=?2 WHERE attempt_id=?1",
-                rusqlite::params![
-                    protected.identity.attempt_id.as_str(),
-                    (MAX_CHARGED_BYTES - RESERVED_ROW_CHARGE - 3 * PERMANENT_IDENTITY_CHARGE)
-                        as i64,
-                ],
-            )
-            .unwrap();
-
-        let expired = parent_reservation();
-        store_a.reserve(&expired).await.unwrap();
-        store_a
-            .terminalize(&expired.identity.attempt_id, &terminal())
-            .await
-            .unwrap();
         let store_b = SqliteStore::open_history(&path).unwrap();
+        let snapshot = platform_fixture_snapshot(&store_b.conn.lock().unwrap());
+        let fixture_rows_i64 = i64::try_from(fixture_rows).unwrap();
+        assert_eq!(
+            (
+                snapshot.summaries,
+                snapshot.attachments,
+                snapshot.identities
+            ),
+            (fixture_rows_i64, fixture_rows_i64, fixture_rows_i64)
+        );
+        assert_eq!(snapshot.noncanonical_summaries, 0);
+        assert_eq!(snapshot.noncanonical_attachments, 0);
+        assert_eq!(snapshot.unstable_identities, 0);
+        assert_eq!(snapshot.unstable_fixture_rows, 0);
+        assert_eq!(snapshot.allocation, (0, 0, 0));
+        assert_platform_fixture_readable(&store_b, fixture_rows, fixture_rows).await;
 
-        let future_start = 2_000 + RETENTION_DAYS * 24 * 60 * 60 * 1_000 + 1;
         let mut first = reservation_with_ids(
             "exec-77777777777777777777777777777777",
             "attempt-88888888888888888888888888888888",
         );
-        first.started_ms = future_start;
+        first.started_ms = 2_000;
         let mut second = reservation_with_ids(
             "exec-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "attempt-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         );
-        second.started_ms = future_start;
+        second.started_ms = 2_000;
+        let first_attempt_id = first.identity.attempt_id.clone();
+        let second_attempt_id = second.identity.attempt_id.clone();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let spawn = |store: SqliteStore, row: AttemptReservation| {
             let barrier = barrier.clone();
@@ -8572,11 +17829,62 @@ mod r2f0a_history_tests {
                 .count(),
             1
         );
+        let winning_attempt_id = match (&results[0], &results[1]) {
+            (
+                Ok(()),
+                Err(bridge_core::workflow_history::LedgerUnavailableReason::CapacityProtected),
+            ) => first_attempt_id.clone(),
+            (
+                Err(bridge_core::workflow_history::LedgerUnavailableReason::CapacityProtected),
+                Ok(()),
+            ) => second_attempt_id.clone(),
+            _ => unreachable!("the asserted result pair has exactly one successful reservation"),
+        };
         let inspected = SqliteStore::open_history(&path).unwrap();
+        let snapshot = platform_fixture_snapshot(&inspected.conn.lock().unwrap());
+        let expected_rows = fixture_rows_i64 + 1;
+        assert_eq!(
+            (
+                snapshot.summaries,
+                snapshot.attachments,
+                snapshot.identities
+            ),
+            (expected_rows, expected_rows, expected_rows)
+        );
+        assert_eq!(snapshot.noncanonical_summaries, 0);
+        assert_eq!(snapshot.noncanonical_attachments, 0);
+        assert_eq!(snapshot.unstable_identities, 0);
+        assert_eq!(snapshot.unstable_fixture_rows, 0);
+        assert_eq!(snapshot.allocation, (0, 0, 0));
         assert!(
-            inspected.live_history_file_bytes() <= bridge_core::workflow_history::MAX_CHARGED_BYTES,
+            inspected.live_history_file_bytes() <= MAX_CHARGED_BYTES,
             "serialized concurrent admission must preserve the physical cap"
         );
+        let first_record = inspected.attempt(&first_attempt_id).await.unwrap();
+        let second_record = inspected.attempt(&second_attempt_id).await.unwrap();
+        assert_eq!(
+            usize::from(first_record.is_some()) + usize::from(second_record.is_some()),
+            1,
+            "exactly one raced reservation must be readable"
+        );
+        let (winning_record, losing_record) = if winning_attempt_id == first_attempt_id {
+            (first_record, second_record)
+        } else {
+            (second_record, first_record)
+        };
+        assert!(
+            losing_record.is_none(),
+            "the capacity-protected raced reservation must remain absent"
+        );
+        let winner = winning_record.expect("the identified winning reservation must be readable");
+        let terminal = winner
+            .terminal
+            .expect("dead-owner reconciliation must terminalize the winning reservation");
+        assert_eq!(terminal.outcome, "interrupted");
+        assert_eq!(terminal.terminal_reason, "process_restart");
+        assert_eq!(terminal.process_liveness, "exited");
+        assert!(terminal.degraded);
+        assert_platform_fixture_readable(&inspected, fixture_rows, fixture_rows + 1).await;
     }
 
     #[tokio::test]
@@ -8991,6 +18299,7 @@ mod r2f0a_history_tests {
     async fn live_admin_pin_unpin_is_durable_idempotent_and_attempt_scoped() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("configured.sqlite");
+        let canonical_path = canonical_fixture_path(&path);
         let primary = SqliteStore::open_shared_history(&path).unwrap();
         let row = reservation();
         primary.reserve(&row).await.unwrap();
@@ -9000,7 +18309,10 @@ mod r2f0a_history_tests {
             .unwrap();
 
         let admin = SqliteStore::open_history_admin(&path).unwrap();
-        assert_eq!(admin.history_path.as_deref(), Some(path.as_path()));
+        assert_eq!(
+            admin.history_path.as_deref(),
+            Some(canonical_path.as_path())
+        );
         assert!(
             admin.live_history_file_bytes() <= bridge_core::workflow_history::MAX_CHARGED_BYTES
         );
@@ -9281,8 +18593,12 @@ mod r2f0a_history_tests {
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("platform-primary.sqlite");
+        let canonical_path = canonical_fixture_path(&path);
         let store = SqliteStore::open_platform_history(&path).unwrap();
-        assert_eq!(store.history_path.as_deref(), Some(path.as_path()));
+        assert_eq!(
+            store.history_path.as_deref(),
+            Some(canonical_path.as_path())
+        );
         assert!(store._lock.is_some());
         assert_transaction_budget(&store);
 
@@ -9303,16 +18619,292 @@ mod r2f0a_history_tests {
             "platform construction must leave checkpoint-first reconciliation to the coordinator"
         );
         assert!(reopened.live_history_file_bytes() <= MAX_CHARGED_BYTES);
-
-        let shared_path = directory.path().join("configured-shared.sqlite");
-        let shared = SqliteStore::open_shared_history(&shared_path).unwrap();
-        assert!(
-            shared.history_path.as_deref() == Some(shared_path.as_path()),
-            "the shared store must enforce the same physical database and sidecar cap"
-        );
-        assert!(shared.live_history_file_bytes() <= MAX_CHARGED_BYTES);
-        assert_transaction_budget(&shared);
     }
+
+    #[tokio::test]
+    async fn configured_history_ignores_large_unrelated_primary_bytes() {
+        use bridge_core::workflow_history::MAX_CHARGED_BYTES;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large-configured.sqlite");
+        let primary = SqliteStore::open(&path).unwrap();
+        {
+            let conn = primary.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE unrelated_primary_payload(payload BLOB NOT NULL);
+                 INSERT INTO unrelated_primary_payload(payload) VALUES(zeroblob(62914560));
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+            let unrelated_bytes: i64 = conn
+                .query_row(
+                    "SELECT length(payload) FROM unrelated_primary_payload",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unrelated_bytes, 60 * 1024 * 1024);
+        }
+        drop(primary);
+        assert!(
+            std::fs::metadata(&path).unwrap().len()
+                > MAX_CHARGED_BYTES - HISTORY_SIDECAR_HEADROOM_BYTES,
+            "the control must exceed the platform main-file budget"
+        );
+
+        let configured = SqliteStore::open_shared_history(&path)
+            .expect("configured admission is charged only for retained workflow history");
+        let row = reservation();
+        configured.reserve(&row).await.unwrap();
+        assert_eq!(
+            configured
+                .terminalize(&row.identity.attempt_id, &terminal())
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+    }
+
+    #[test]
+    fn configured_and_platform_openers_persist_distinct_allocation_kinds() {
+        fn allocation_kind(path: &std::path::Path) -> String {
+            let conn = rusqlite::Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .unwrap();
+            conn.query_row(
+                "SELECT allocation_kind FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let configured_path = directory.path().join("configured.sqlite");
+        drop(SqliteStore::open_shared_history(&configured_path).unwrap());
+        assert_eq!(allocation_kind(&configured_path), "configured");
+        let mismatch = SqliteStore::open_platform_history(&configured_path)
+            .err()
+            .expect("a platform opener must refuse configured allocation metadata");
+        assert_eq!(
+            mismatch.reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Migration
+        );
+        assert_eq!(allocation_kind(&configured_path), "configured");
+
+        let platform_path = directory.path().join("platform.sqlite");
+        drop(SqliteStore::open_platform_history(&platform_path).unwrap());
+        assert_eq!(allocation_kind(&platform_path), "platform");
+        let mismatch = SqliteStore::open_shared_history(&platform_path)
+            .err()
+            .expect("a configured opener must refuse platform allocation metadata");
+        assert_eq!(
+            mismatch.reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Migration
+        );
+        assert_eq!(allocation_kind(&platform_path), "platform");
+    }
+
+    #[test]
+    fn only_platform_context_resumes_platform_migrating_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("platform-migrating.sqlite");
+        drop(SqliteStore::open_platform_history(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE workflow_history_allocation SET allocation_state='migrating'
+             WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            SqliteStore::open_shared_history(&path)
+                .err()
+                .unwrap()
+                .reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Migration
+        );
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT allocation_state FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "migrating", "wrong-kind open must not mutate");
+        drop(conn);
+
+        drop(SqliteStore::open_platform_history(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT allocation_state FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "ready");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn platform_migrating_wal_corruption_precedes_availability_and_untyped_open_refuses() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("platform-migrating-precedence.sqlite");
+        drop(SqliteStore::open_platform_history(&path).unwrap());
+        let canonical = canonical_fixture_path(&path);
+        let writer = rusqlite::Connection::open(&canonical).unwrap();
+        let mode: String = writer
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        writer
+            .execute_batch("PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE workflow_history_allocation SET allocation_state='migrating'
+                 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        let allocation_before: (String, String, i64, i64, i64) = writer
+            .query_row(
+                "SELECT allocation_kind, allocation_state, charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let journal_before: String = writer
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_before, "wal");
+
+        let valid_before = refusal_state_snapshot(&canonical, &[directory.path()]);
+        for error in [
+            SqliteStore::open(&canonical).err().unwrap(),
+            SqliteStore::open_shared_history(&canonical).err().unwrap(),
+            SqliteStore::open_history_read_only(&canonical)
+                .err()
+                .unwrap(),
+            SqliteStore::open_history_admin(&canonical).err().unwrap(),
+        ] {
+            assert_plain_error(error, R::Migration);
+        }
+        assert_sqlite_inspection_effects_only(&valid_before, &canonical, &[directory.path()]);
+        let allocation_after: (String, String, i64, i64, i64) = writer
+            .query_row(
+                "SELECT allocation_kind, allocation_state, charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let journal_after: String = writer
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(allocation_after, allocation_before);
+        assert_eq!(journal_after, journal_before);
+        let reader = rusqlite::Connection::open(&canonical).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let pinned_charge: i64 = reader
+            .query_row(
+                "SELECT charged_bytes FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pinned_charge, 0);
+        writer
+            .execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE workflow_history_allocation SET charged_bytes=1 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        let stale_main = directory.path().join("platform-stale-main.sqlite");
+        std::fs::copy(&canonical, &stale_main).unwrap();
+        let stale_charge: i64 = rusqlite::Connection::open(&stale_main)
+            .unwrap()
+            .query_row(
+                "SELECT charged_bytes FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_charge, 0,
+            "the invalid platform counter must exist only in live WAL"
+        );
+
+        let corrupt_before = refusal_state_snapshot(&canonical, &[directory.path()]);
+        for error in [
+            SqliteStore::open(&canonical).err().unwrap(),
+            SqliteStore::open_shared_history(&canonical).err().unwrap(),
+            SqliteStore::open_configured_history_read_only(&canonical)
+                .err()
+                .unwrap(),
+            SqliteStore::open_configured_history_admin(&canonical)
+                .err()
+                .unwrap(),
+        ] {
+            assert_plain_error(error, R::Corruption);
+        }
+        assert_sqlite_inspection_effects_only(&corrupt_before, &canonical, &[directory.path()]);
+
+        writer
+            .execute(
+                "UPDATE workflow_history_allocation SET charged_bytes=0 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        reader.execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        drop(writer);
+        drop(
+            SqliteStore::open_platform_history(&canonical)
+                .expect("the valid platform context resumes a noncorrupt migrating allocation"),
+        );
+        let connection = rusqlite::Connection::open(&canonical).unwrap();
+        let state: String = connection
+            .query_row(
+                "SELECT allocation_state FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "ready");
+    }
+
     #[tokio::test]
     async fn committed_reservation_does_not_report_deferred_checkpoint_as_failure() {
         let directory = tempfile::tempdir().unwrap();
@@ -9765,31 +19357,19 @@ mod r2f0a_history_tests {
             .err()
             .expect("a read-only allocation with missing columns must be rejected");
         assert_eq!(readonly_error.reason, R::Migration);
-        assert_eq!(
-            readonly_error.sqlite_primary_code,
-            Some(rusqlite::ffi::SQLITE_ERROR)
-        );
-        assert_eq!(
-            readonly_error.sqlite_extended_code,
-            Some(rusqlite::ffi::SQLITE_ERROR)
-        );
+        assert_eq!(readonly_error.sqlite_primary_code, None);
+        assert_eq!(readonly_error.sqlite_extended_code, None);
 
         let admin_error = SqliteStore::open_history_admin(&incompatible_path)
             .err()
             .expect("an admin allocation with missing columns must be rejected");
         assert_eq!(admin_error.reason, R::Migration);
-        assert_eq!(
-            admin_error.sqlite_primary_code,
-            Some(rusqlite::ffi::SQLITE_ERROR)
-        );
-        assert_eq!(
-            admin_error.sqlite_extended_code,
-            Some(rusqlite::ffi::SQLITE_ERROR)
-        );
+        assert_eq!(admin_error.sqlite_primary_code, None);
+        assert_eq!(admin_error.sqlite_extended_code, None);
     }
 
     #[test]
-    fn migration_open_preserves_sqlite_primary_and_extended_codes() {
+    fn migration_open_refuses_unknown_schema_before_writable_ddl() {
         use bridge_core::workflow_history::LedgerUnavailableReason as R;
 
         let directory = tempfile::tempdir().unwrap();
@@ -9806,12 +19386,9 @@ mod r2f0a_history_tests {
         let error = SqliteStore::open_shared_history(&path)
             .err()
             .expect("the conflicting schema must fail migration");
-        assert_eq!(error.reason, R::Migration);
-        assert_eq!(error.sqlite_primary_code, Some(rusqlite::ffi::SQLITE_ERROR));
-        assert_eq!(
-            error.sqlite_extended_code,
-            Some(rusqlite::ffi::SQLITE_ERROR)
-        );
+        assert_eq!(error.reason, R::Corruption);
+        assert_eq!(error.sqlite_primary_code, None);
+        assert_eq!(error.sqlite_extended_code, None);
     }
 
     #[test]
@@ -9825,24 +19402,15 @@ mod r2f0a_history_tests {
             .err()
             .expect("a read-only allocation without the history schema must be rejected");
         assert_eq!(readonly_error.reason, R::Migration);
-        assert_eq!(
-            readonly_error.sqlite_primary_code,
-            Some(rusqlite::ffi::SQLITE_ERROR)
-        );
-        assert_eq!(
-            readonly_error.sqlite_extended_code,
-            Some(rusqlite::ffi::SQLITE_ERROR)
-        );
+        assert_eq!(readonly_error.sqlite_primary_code, None);
+        assert_eq!(readonly_error.sqlite_extended_code, None);
 
         let error = SqliteStore::open_history_admin(&path)
             .err()
             .expect("an allocation without the history schema must be rejected");
         assert_eq!(error.reason, R::Migration);
-        assert_eq!(error.sqlite_primary_code, Some(rusqlite::ffi::SQLITE_ERROR));
-        assert_eq!(
-            error.sqlite_extended_code,
-            Some(rusqlite::ffi::SQLITE_ERROR)
-        );
+        assert_eq!(error.sqlite_primary_code, None);
+        assert_eq!(error.sqlite_extended_code, None);
     }
 
     #[test]
@@ -9872,10 +19440,71 @@ mod r2f0a_history_tests {
     #[test]
     fn readonly_history_open_process_helper() {
         use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::fs::MetadataExt as _;
+
+        fn existing_parent(path: &std::path::Path) -> &std::path::Path {
+            let mut parent = path.parent().unwrap();
+            while !parent.exists() {
+                parent = parent.parent().unwrap();
+            }
+            parent
+        }
+
+        fn snapshot(
+            path: &std::path::Path,
+        ) -> Vec<(std::path::PathBuf, bool, u64, Option<Vec<u8>>)> {
+            fn visit(
+                root: &std::path::Path,
+                directory: &std::path::Path,
+                entries: &mut Vec<(std::path::PathBuf, bool, u64, Option<Vec<u8>>)>,
+            ) {
+                for entry in std::fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+                    let relative = entry.path().strip_prefix(root).unwrap().to_path_buf();
+                    let bytes = if metadata.is_file()
+                        && !entry.file_name().to_string_lossy().ends_with("-shm")
+                    {
+                        Some(std::fs::read(entry.path()).unwrap())
+                    } else {
+                        None
+                    };
+                    entries.push((relative, metadata.is_dir(), metadata.len(), bytes));
+                    if metadata.is_dir() {
+                        visit(root, &entry.path(), entries);
+                    }
+                }
+            }
+
+            let root = existing_parent(path);
+            let mut entries = Vec::new();
+            visit(root, root, &mut entries);
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            entries
+        }
 
         let Some(path) = std::env::var_os("A2A_BRIDGE_TEST_READONLY_PATH") else {
             return;
         };
+        let path = std::path::Path::new(&path);
+        if std::env::var_os("A2A_BRIDGE_TEST_DROPPED_IDS").is_some() {
+            assert_eq!(unsafe { libc::geteuid() }, 65_534);
+            assert_eq!(unsafe { libc::getegid() }, 65_534);
+            assert_eq!(
+                std::fs::metadata(existing_parent(path)).unwrap().uid(),
+                65_534
+            );
+        }
+        if let Some(expected_uid) = std::env::var_os("A2A_BRIDGE_TEST_PARENT_UID") {
+            let expected_uid = expected_uid.to_string_lossy().parse::<u32>().unwrap();
+            assert_eq!(unsafe { libc::geteuid() }, 65_534);
+            assert_eq!(unsafe { libc::getegid() }, 65_534);
+            assert_eq!(
+                std::fs::metadata(existing_parent(path)).unwrap().uid(),
+                expected_uid
+            );
+        }
+        let before = snapshot(path);
         let expected = match std::env::var("A2A_BRIDGE_TEST_READONLY_EXPECT")
             .unwrap()
             .as_str()
@@ -9885,18 +19514,36 @@ mod r2f0a_history_tests {
             "database" => R::ReadOnlyDatabase,
             other => panic!("unknown read-only fixture kind: {other}"),
         };
-        let error = match std::env::var("A2A_BRIDGE_TEST_READONLY_OPEN")
-            .unwrap_or_else(|_| "shared".into())
-            .as_str()
-        {
-            "shared" => SqliteStore::open_shared_history(std::path::Path::new(&path)),
-            "concurrent" => SqliteStore::open_history(std::path::Path::new(&path)),
-            "admin" => SqliteStore::open_history_admin(std::path::Path::new(&path)),
+        let opener =
+            std::env::var("A2A_BRIDGE_TEST_READONLY_OPEN").unwrap_or_else(|_| "shared".into());
+        let result = match opener.as_str() {
+            "untyped" => SqliteStore::open(path),
+            "shared" => SqliteStore::open_shared_history(path),
+            "configured" => SqliteStore::open_shared_history(path),
+            "platform" => SqliteStore::open_platform_history(path),
+            "concurrent" => SqliteStore::open_history(path),
+            "admin" => SqliteStore::open_history_admin(path),
+            "configured-admin" => SqliteStore::open_configured_history_admin(path),
+            "platform-admin" => SqliteStore::open_platform_history_admin(path),
+            "configured-stats" => SqliteStore::open_configured_history_read_only(path),
             other => panic!("unknown read-only fixture opener: {other}"),
+        };
+        if opener == "configured-stats" {
+            drop(result.expect("configured read-only stats must remain usable"));
+        } else {
+            let error = result.err().expect("read-only fixture must refuse opening");
+            assert_eq!(error.reason, expected);
         }
-        .err()
-        .expect("read-only fixture must refuse opening");
-        assert_eq!(error.reason, expected);
+        assert_eq!(snapshot(path), before);
+        assert!(std::fs::read_dir(existing_parent(path))
+            .unwrap()
+            .all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(HISTORY_PARENT_PROOF_PREFIX)
+            }));
     }
 
     #[cfg(unix)]
@@ -9904,6 +19551,26 @@ mod r2f0a_history_tests {
     fn real_readonly_parent_lock_and_database_failures_remain_distinct() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use std::os::unix::process::CommandExt;
+
+        fn chown_tree(path: &std::path::Path, uid: u32, gid: u32) {
+            use std::os::unix::ffi::OsStrExt as _;
+
+            if path.is_dir() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    chown_tree(&entry.unwrap().path(), uid, gid);
+                }
+            }
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(path.as_ptr(), uid, gid) }, 0);
+        }
+
+        fn existing_parent(path: &std::path::Path) -> &std::path::Path {
+            let mut parent = path.parent().unwrap();
+            while !parent.exists() {
+                parent = parent.parent().unwrap();
+            }
+            parent
+        }
 
         fn set_mode(path: &std::path::Path, mode: u32) {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -9926,7 +19593,11 @@ mod r2f0a_history_tests {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
             if drop_privileges {
-                command.uid(65_534).gid(65_534);
+                chown_tree(existing_parent(path), 65_534, 65_534);
+                command
+                    .uid(65_534)
+                    .gid(65_534)
+                    .env("A2A_BRIDGE_TEST_DROPPED_IDS", "1");
             }
             let output = command.output().unwrap();
             assert!(
@@ -9941,6 +19612,33 @@ mod r2f0a_history_tests {
         set_mode(directory.path(), 0o755);
         let drop_privileges = std::fs::metadata(directory.path()).unwrap().uid() == 0;
 
+        if drop_privileges {
+            let owner_parent = directory.path().join("wrong-owner-parent");
+            std::fs::create_dir(&owner_parent).unwrap();
+            set_mode(&owner_parent, 0o777);
+            let owner_path = owner_parent.join("history.sqlite");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("sqlite::r2f0a_history_tests::readonly_history_open_process_helper")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env("A2A_BRIDGE_TEST_READONLY_PATH", &owner_path)
+                .env("A2A_BRIDGE_TEST_READONLY_EXPECT", "parent")
+                .env("A2A_BRIDGE_TEST_READONLY_OPEN", "shared")
+                .env("A2A_BRIDGE_TEST_PARENT_UID", "0")
+                .uid(65_534)
+                .gid(65_534)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "owner mismatch fixture failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
         let readonly_parent = directory.path().join("readonly-parent");
         std::fs::create_dir(&readonly_parent).unwrap();
         set_mode(&readonly_parent, 0o555);
@@ -9950,6 +19648,20 @@ mod r2f0a_history_tests {
             "shared",
             drop_privileges,
         );
+        let missing_parent_ancestor = directory.path().join("readonly-missing-parent");
+        std::fs::create_dir(&missing_parent_ancestor).unwrap();
+        set_mode(&missing_parent_ancestor, 0o555);
+        run_fixture(
+            &missing_parent_ancestor
+                .join("missing")
+                .join("history.sqlite"),
+            "parent",
+            "shared",
+            drop_privileges,
+        );
+        assert!(!missing_parent_ancestor.join("missing").exists());
+        set_mode(&missing_parent_ancestor, 0o755);
+
         set_mode(&readonly_parent, 0o755);
 
         // The schema lock is deliberately present and writable in both cases:
@@ -9999,6 +19711,7 @@ mod r2f0a_history_tests {
         drop(SqliteStore::open_shared_history(&readonly_db).unwrap());
         set_mode(&readonly_db_parent, 0o777);
         set_mode(&history_schema_lock_path(&readonly_db), 0o666);
+        set_mode(&history_kind_lock_path(&readonly_db), 0o666);
         set_mode(&readonly_db, 0o444);
         run_fixture(&readonly_db, "database", "shared", drop_privileges);
         set_mode(&readonly_db, 0o600);
@@ -10025,10 +19738,91 @@ mod r2f0a_history_tests {
         drop(SqliteStore::open_shared_history(&readonly_admission_db).unwrap());
         std::fs::remove_file(history_admission_lock_path(&readonly_admission_db)).unwrap();
         set_mode(&readonly_admission_db, 0o666);
+        set_mode(&history_schema_lock_path(&readonly_admission_db), 0o666);
+        set_mode(&history_kind_lock_path(&readonly_admission_db), 0o666);
         set_mode(&readonly_admission_parent, 0o555);
         run_fixture(&readonly_admission_db, "parent", "admin", drop_privileges);
         set_mode(&readonly_admission_parent, 0o755);
         set_mode(&readonly_admission_db, 0o600);
+
+        fn prepare_matrix_fixture(
+            path: &std::path::Path,
+            configured: bool,
+        ) -> rusqlite::Connection {
+            if configured {
+                drop(SqliteStore::open_shared_history(path).unwrap());
+            } else {
+                drop(SqliteStore::open_platform_history(path).unwrap());
+            }
+            let keeper = rusqlite::Connection::open(path).unwrap();
+            keeper
+                .execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     PRAGMA wal_autocheckpoint=0;
+                     CREATE TABLE IF NOT EXISTS b2_wal_fixture(value INTEGER);
+                     INSERT INTO b2_wal_fixture VALUES(1);",
+                )
+                .unwrap();
+            for lock in [
+                history_schema_lock_path(path),
+                history_kind_lock_path(path),
+                history_admission_lock_path(path),
+            ] {
+                if !lock.exists() {
+                    std::fs::write(&lock, b"lock").unwrap();
+                }
+                set_mode(&lock, 0o666);
+            }
+            let attempts = history_attempt_lock_dir(path);
+            if !attempts.exists() {
+                std::fs::create_dir(&attempts).unwrap();
+            }
+            set_mode(&attempts, 0o700);
+            let stale = attempts.join("attempt-b2-stale.lock");
+            std::fs::write(&stale, b"").unwrap();
+            set_mode(&stale, 0o666);
+            let mut journal = path.as_os_str().to_os_string();
+            journal.push("-journal");
+            let journal = std::path::PathBuf::from(journal);
+            if !journal.exists() {
+                std::fs::write(&journal, b"").unwrap();
+            }
+            for entry in std::fs::read_dir(path.parent().unwrap()).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() {
+                    set_mode(&entry.path(), 0o666);
+                }
+            }
+            keeper
+        }
+
+        let configured_parent = directory.path().join("readonly-matrix-configured");
+        std::fs::create_dir(&configured_parent).unwrap();
+        let configured_path = configured_parent.join("history.sqlite");
+        let configured_keeper = prepare_matrix_fixture(&configured_path, true);
+        set_mode(&configured_parent, 0o555);
+        for opener in ["untyped", "configured", "admin", "configured-admin"] {
+            run_fixture(&configured_path, "parent", opener, drop_privileges);
+        }
+        run_fixture(
+            &configured_path,
+            "parent",
+            "configured-stats",
+            drop_privileges,
+        );
+        set_mode(&configured_parent, 0o755);
+        drop(configured_keeper);
+
+        let platform_parent = directory.path().join("readonly-matrix-platform");
+        std::fs::create_dir(&platform_parent).unwrap();
+        let platform_path = platform_parent.join("history.sqlite");
+        let platform_keeper = prepare_matrix_fixture(&platform_path, false);
+        set_mode(&platform_parent, 0o555);
+        for opener in ["platform", "concurrent", "platform-admin"] {
+            run_fixture(&platform_path, "parent", opener, drop_privileges);
+        }
+        set_mode(&platform_parent, 0o755);
+        drop(platform_keeper);
     }
 
     #[cfg(unix)]
@@ -10037,6 +19831,15 @@ mod r2f0a_history_tests {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         let path = directory.path().join("history.sqlite");
         let store = SqliteStore::open_history(&path).unwrap();
         let row = parent_reservation();
@@ -10099,6 +19902,4691 @@ mod r2f0a_history_tests {
         assert!(
             !attempt_lock.exists(),
             "successful terminalization removes the exact attempt lock"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn attempt_lock_unlink_proves_zero_links_for_all_four_paths() {
+        use bridge_core::workflow_history::{LedgerUnavailableReason as R, TerminalWrite};
+        use fs2::FileExt as _;
+        use std::sync::atomic::Ordering;
+
+        fn proofs() -> usize {
+            HISTORY_ATTEMPT_ZERO_LINK_PROOFS.load(Ordering::SeqCst)
+        }
+
+        // Normal release retains the exact in-memory lease fd through unlink.
+        let normal_dir = tempfile::tempdir().unwrap();
+        let normal_path = normal_dir.path().join("history.sqlite");
+        let normal = SqliteStore::open_history(&normal_path).unwrap();
+        let normal_row = parent_reservation();
+        normal.reserve(&normal_row).await.unwrap();
+        let before = proofs();
+        assert_eq!(
+            normal
+                .terminalize(&normal_row.identity.attempt_id, &terminal())
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+        assert!(proofs() > before);
+
+        // Reconciliation retains the fd returned by acquire_reconciliation_lease.
+        let reconciliation_dir = tempfile::tempdir().unwrap();
+        let reconciliation_path = reconciliation_dir.path().join("history.sqlite");
+        let abandoned = SqliteStore::open_history(&reconciliation_path).unwrap();
+        let reconciliation_row = parent_reservation();
+        abandoned.reserve(&reconciliation_row).await.unwrap();
+        drop(abandoned);
+        let before = proofs();
+        let reconciled = SqliteStore::open_history(&reconciliation_path).unwrap();
+        assert!(proofs() > before);
+        assert_eq!(
+            reconciled
+                .attempt(&reconciliation_row.identity.attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .terminal
+                .unwrap()
+                .outcome,
+            "interrupted"
+        );
+
+        // Retention has no in-memory fd: it opens without create, leases, and unlinks.
+        let retention_dir = tempfile::tempdir().unwrap();
+        let retention_path = retention_dir.path().join("history.sqlite");
+        let retention = SqliteStore::open_history(&retention_path).unwrap();
+        let retention_id =
+            bridge_core::ids::AttemptId::parse("attempt-55555555555555555555555555555555").unwrap();
+        drop(
+            retention
+                .history_attempt_lock_dir
+                .as_ref()
+                .unwrap()
+                .open_lock(&retention_id, true)
+                .unwrap()
+                .unwrap(),
+        );
+        let before = proofs();
+        retention
+            .remove_history_attempt_lock_file(&retention_id)
+            .unwrap();
+        assert!(proofs() > before);
+
+        // A stale-looking but live entry is never removed.
+        let live_id =
+            bridge_core::ids::AttemptId::parse("attempt-66666666666666666666666666666666").unwrap();
+        let live = retention
+            .history_attempt_lock_dir
+            .as_ref()
+            .unwrap()
+            .open_lock(&live_id, true)
+            .unwrap()
+            .unwrap();
+        live.try_lock_exclusive().unwrap();
+        let before = proofs();
+        assert_eq!(
+            retention
+                .remove_history_attempt_lock_file(&live_id)
+                .unwrap_err()
+                .reason,
+            R::Locked
+        );
+        assert_eq!(proofs(), before);
+        let live_path =
+            history_attempt_lock_dir(&retention_path).join(format!("{}.lock", live_id.as_str()));
+        assert!(live_path.exists());
+        drop(live);
+        retention
+            .remove_history_attempt_lock_file(&live_id)
+            .unwrap();
+
+        // Idempotent replay likewise opens the stale artifact without create.
+        let replay_dir = tempfile::tempdir().unwrap();
+        let replay_path = replay_dir.path().join("history.sqlite");
+        let replay = SqliteStore::open_history(&replay_path).unwrap();
+        let replay_row = parent_reservation();
+        replay.reserve(&replay_row).await.unwrap();
+        assert_eq!(
+            replay
+                .terminalize(&replay_row.identity.attempt_id, &terminal())
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+        drop(
+            replay
+                .history_attempt_lock_dir
+                .as_ref()
+                .unwrap()
+                .open_lock(&replay_row.identity.attempt_id, true)
+                .unwrap()
+                .unwrap(),
+        );
+        let before = proofs();
+        assert_eq!(
+            replay
+                .terminalize(&replay_row.identity.attempt_id, &terminal())
+                .await
+                .unwrap(),
+            TerminalWrite::Replayed
+        );
+        assert!(proofs() > before);
+    }
+
+    #[test]
+    fn configured_capacity_predicates_keep_byte_and_row_guards_independent() {
+        use bridge_core::workflow_history::{
+            CONFIGURED_SLOT_CHARGE, MAX_CHARGED_BYTES, MAX_TERMINAL_ROWS,
+        };
+
+        let production_slots = MAX_CHARGED_BYTES / CONFIGURED_SLOT_CHARGE;
+        assert!(configured_capacity_available(
+            (production_slots - 1) * CONFIGURED_SLOT_CHARGE,
+            production_slots - 1,
+        ));
+        assert!(!configured_capacity_available(
+            production_slots * CONFIGURED_SLOT_CHARGE,
+            production_slots,
+        ));
+        assert!(
+            !configured_capacity_available(0, MAX_TERMINAL_ROWS),
+            "the independent row predicate is exercised without an impossible fixture"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_byte_edge_terminalizes_existing_credit_and_refuses_new_active() {
+        use bridge_core::workflow_history::{CONFIGURED_SLOT_CHARGE, MAX_CHARGED_BYTES};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-byte-edge.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let production_slots = MAX_CHARGED_BYTES / CONFIGURED_SLOT_CHARGE;
+        let fixture_slots = production_slots - 1;
+        {
+            let mut conn = store.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "WITH RECURSIVE fill(n) AS (
+                     VALUES(1) UNION ALL SELECT n+1 FROM fill WHERE n<?1
+                 )
+                 INSERT INTO attempt_identities(
+                     attempt_id, execution_id, ordinal, task_id, owner_surface,
+                     history_disposition)
+                 SELECT printf('attempt-fill-%020d', n),
+                        printf('exec-fill-%023d', n), 0, NULL, 'offline', 1
+                 FROM fill",
+                rusqlite::params![i64::try_from(fixture_slots).unwrap()],
+            )
+            .unwrap();
+            tx.execute(
+                "WITH RECURSIVE fill(n) AS (
+                     VALUES(1) UNION ALL SELECT n+1 FROM fill WHERE n<?1
+                 )
+                 INSERT INTO workflow_attempt_summaries(
+                     attempt_id, execution_id, ordinal, workflow, task_class, surface,
+                     policy, workload_fingerprint, started_ms, status, prompt_acceptance,
+                     pinned, charged_bytes, reservation_json)
+                 SELECT printf('attempt-fill-%020d', n),
+                        printf('exec-fill-%023d', n), 0, 'fixture', 'fixture', 'offline',
+                        'r2f0a', 'shape-fixture', 1, 'active', 'not_dispatched',
+                        0, 16384, '{}'
+                 FROM fill",
+                rusqlite::params![i64::try_from(fixture_slots).unwrap()],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO workflow_history_attachment(attempt_id, charged_bytes)
+                 SELECT attempt_id, 1024 FROM workflow_attempt_summaries",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "UPDATE workflow_history_allocation
+                 SET charged_bytes=?1, slots_used=?2
+                 WHERE singleton=1",
+                rusqlite::params![
+                    i64::try_from(fixture_slots * CONFIGURED_SLOT_CHARGE).unwrap(),
+                    i64::try_from(fixture_slots).unwrap()
+                ],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let mut edge = reservation();
+        edge.pinned = true;
+        store.reserve(&edge).await.unwrap();
+        assert_eq!(
+            store
+                .terminalize(&edge.identity.attempt_id, &terminal())
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+        {
+            let conn = store.conn.lock().unwrap();
+            let counters: (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                counters,
+                (
+                    i64::try_from(production_slots * CONFIGURED_SLOT_CHARGE).unwrap(),
+                    i64::try_from(production_slots).unwrap(),
+                    1,
+                )
+            );
+        }
+
+        let refused = parent_reservation();
+        assert_eq!(
+            store.reserve(&refused).await.unwrap_err().reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::CapacityProtected
+        );
+        let conn = store.conn.lock().unwrap();
+        let leaked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM attempt_identities WHERE attempt_id=?1",
+                rusqlite::params![refused.identity.attempt_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked, 0, "mandatory refusal must commit no identity");
+    }
+
+    #[tokio::test]
+    async fn configured_retained_out_identities_are_uncharged_and_do_not_brick_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-identities.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "WITH RECURSIVE fill(n) AS (
+                     VALUES(1) UNION ALL SELECT n+1 FROM fill WHERE n<131072
+                 )
+                 INSERT INTO attempt_identities(
+                     attempt_id, execution_id, ordinal, task_id, owner_surface,
+                     history_disposition)
+                 SELECT printf('attempt-tomb-%019d', n),
+                        printf('exec-tomb-%022d', n), 0, NULL, 'offline', 1
+                 FROM fill",
+                [],
+            )
+            .unwrap();
+            let allocation: (i64, i64) = conn
+                .query_row(
+                    "SELECT charged_bytes, slots_used
+                     FROM workflow_history_allocation WHERE singleton=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(allocation, (0, 0));
+        }
+
+        let row = reservation();
+        store.reserve(&row).await.unwrap();
+        let conn = store.conn.lock().unwrap();
+        let allocation: (i64, i64) = conn
+            .query_row(
+                "SELECT charged_bytes, slots_used
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(allocation, (17_408, 1));
+    }
+
+    #[tokio::test]
+    async fn configured_mutations_ignore_pinned_wal_reader_and_keep_slot_charge() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-reader.sqlite");
+        drop(SqliteStore::open(&path).unwrap());
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_attempt_summaries",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let row = reservation();
+        store.reserve(&row).await.unwrap();
+        store
+            .mark_prompt_acceptance(&row.identity.attempt_id, "dispatch_uncertain")
+            .await
+            .unwrap();
+        assert!(store
+            .set_pinned(&row.identity.attempt_id, true)
+            .await
+            .unwrap());
+        assert!(store
+            .set_pinned(&row.identity.attempt_id, false)
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .terminalize(&row.identity.attempt_id, &terminal())
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+
+        let conn = store.conn.lock().unwrap();
+        let counters: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counters, (17_408, 1, 1));
+        drop(conn);
+        assert!(
+            std::fs::metadata(format!("{}-wal", path.display()))
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false),
+            "the control must retain a live WAL behind the pinned reader"
+        );
+        reader.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_retention_reclaims_one_slot_but_never_identity_authority() {
+        use bridge_core::workflow_history::{CONFIGURED_SLOT_CHARGE, RETENTION_DAYS};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-retention.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let old = parent_reservation();
+        store.reserve(&old).await.unwrap();
+        store
+            .terminalize(&old.identity.attempt_id, &terminal())
+            .await
+            .unwrap();
+
+        let mut replacement = child_reservation();
+        replacement.started_ms = 2_000 + RETENTION_DAYS * 24 * 60 * 60 * 1_000 + 1;
+        store.reserve(&replacement).await.unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            let counters: (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                counters,
+                (i64::try_from(CONFIGURED_SLOT_CHARGE).unwrap(), 1, 0)
+            );
+            let retained: (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT
+                    (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1),
+                    (SELECT COUNT(*) FROM workflow_history_attachment WHERE attempt_id=?1),
+                    (SELECT history_disposition FROM attempt_identities WHERE attempt_id=?1)",
+                    rusqlite::params![old.identity.attempt_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(retained, (0, 0, 1));
+        }
+
+        assert_eq!(
+            store.reserve(&old).await.unwrap_err().reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Collision
+        );
+        let conn = store.conn.lock().unwrap();
+        let unchanged: (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1),
+                    (SELECT COUNT(*) FROM workflow_history_attachment WHERE attempt_id=?1)",
+                rusqlite::params![old.identity.attempt_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unchanged, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn optional_unavailable_disposition_forbids_later_backfill() {
+        use bridge_core::task_store::{TaskAttemptLocator, TaskStore};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-unavailable.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = bridge_core::ids::TaskId::parse(identity.execution_id.as_str()).unwrap();
+        store
+            .create_with_attempt_locator(
+                &primary_task_record(&task, 1),
+                &TaskAttemptLocator {
+                    identity: identity.clone(),
+                    telemetry_unavailable: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .mark_attempt_telemetry_unavailable(
+                &task,
+                &identity.attempt_id,
+                bridge_core::workflow_history::LedgerUnavailableReason::CapacityProtected,
+            )
+            .await
+            .unwrap();
+
+        let mut row = reservation();
+        row.identity = identity.clone();
+        row.task_id = Some(task);
+        row.surface = ExecutionSurface::ServedTask;
+        assert_eq!(
+            store.reserve(&row).await.unwrap_err().reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Collision
+        );
+
+        let conn = store.conn.lock().unwrap();
+        let disposition: (i64, String) = conn
+            .query_row(
+                "SELECT history_disposition, history_unavailable_reason
+                 FROM attempt_identities WHERE attempt_id=?1",
+                rusqlite::params![identity.attempt_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(disposition, (2, "capacity_protected".to_owned()));
+        let allocation: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT charged_bytes, slots_used,
+                        (SELECT COUNT(*) FROM workflow_history_attachment)
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(allocation, (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn configured_reopen_refuses_counter_attachment_corruption_without_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-corrupt.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let row = reservation();
+        store.reserve(&row).await.unwrap();
+        drop(store);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF; DELETE FROM workflow_history_attachment;")
+            .unwrap();
+        drop(conn);
+
+        let error = SqliteStore::open_shared_history(&path)
+            .err()
+            .expect("configured writable reopen must recompute durable invariants");
+        assert_eq!(
+            error.reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Corruption
+        );
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let attachments: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_history_attachment",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attachments, 0,
+            "validation must not silently repair corruption"
+        );
+    }
+
+    #[test]
+    fn tagged_configured_coherent_byte_overflow_is_corruption_for_every_opener() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-coherent-overflow.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA ignore_check_constraints=ON;")
+                .unwrap();
+            insert_configured_fixture_rows(&conn, 7_711);
+        }
+        drop(store);
+
+        assert_configured_openers_refuse_unchanged(&path, R::Corruption);
+        let persisted: (i64, i64, i64) = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT charged_bytes, slots_used,
+                        (SELECT COUNT(*) FROM workflow_attempt_summaries)
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, (134_233_088, 7_711, 7_711));
+    }
+
+    #[test]
+    fn tagged_configured_counter_bounds_are_corruption_for_every_opener() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        for (name, mutation) in [
+            (
+                "charged-negative",
+                "UPDATE workflow_history_allocation SET charged_bytes=-1 WHERE singleton=1",
+            ),
+            (
+                "slots-negative",
+                "UPDATE workflow_history_allocation SET slots_used=-1 WHERE singleton=1",
+            ),
+            (
+                "terminal-negative",
+                "UPDATE workflow_history_allocation SET terminal_rows=-1 WHERE singleton=1",
+            ),
+            (
+                "slots-over-limit",
+                "UPDATE workflow_history_allocation SET slots_used=100001 WHERE singleton=1",
+            ),
+            (
+                "terminal-over-slots",
+                "UPDATE workflow_history_allocation SET terminal_rows=1 WHERE singleton=1",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(format!("{name}.sqlite"));
+            drop(SqliteStore::open_shared_history(&path).unwrap());
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA ignore_check_constraints=ON;")
+                .unwrap();
+            conn.execute(mutation, []).unwrap();
+            drop(conn);
+
+            assert_configured_openers_refuse_unchanged(&path, R::Corruption);
+        }
+    }
+
+    #[test]
+    fn tagged_configured_counter_storage_classes_are_typed_corruption() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        for column in ["charged_bytes", "slots_used", "terminal_rows"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(format!("{column}-text.sqlite"));
+            drop(SqliteStore::open_shared_history(&path).unwrap());
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA ignore_check_constraints=ON;")
+                .unwrap();
+            conn.execute(
+                &format!(
+                    "UPDATE workflow_history_allocation
+                     SET {column}='not-an-integer' WHERE singleton=1"
+                ),
+                [],
+            )
+            .unwrap();
+            drop(conn);
+
+            assert_configured_openers_refuse_unchanged(&path, R::Corruption);
+        }
+    }
+
+    #[test]
+    fn tagged_configured_impossible_fixed_fields_are_typed_corruption() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        for (name, mutation) in [
+            (
+                "kind",
+                "UPDATE workflow_history_allocation SET allocation_kind='CONFIGURED'",
+            ),
+            (
+                "state",
+                "UPDATE workflow_history_allocation SET allocation_state='READY'",
+            ),
+            (
+                "version",
+                "UPDATE workflow_history_allocation SET accounting_version=2",
+            ),
+            (
+                "byte-limit",
+                "UPDATE workflow_history_allocation SET byte_limit=134217727",
+            ),
+            (
+                "slot-limit",
+                "UPDATE workflow_history_allocation SET slot_limit=99999",
+            ),
+            (
+                "summary-charge",
+                "UPDATE workflow_history_allocation SET summary_charge=16383",
+            ),
+            (
+                "attachment-charge",
+                "UPDATE workflow_history_allocation SET attachment_charge=1023",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(format!("{name}.sqlite"));
+            drop(SqliteStore::open_shared_history(&path).unwrap());
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA ignore_check_constraints=ON;")
+                .unwrap();
+            conn.execute(mutation, []).unwrap();
+            drop(conn);
+
+            assert_configured_openers_refuse_unchanged(&path, R::Corruption);
+        }
+    }
+
+    #[test]
+    fn tagged_configured_lookalike_schema_is_migration_without_mutation() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-lookalike.sqlite");
+        drop(SqliteStore::open_shared_history(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE workflow_history_allocation;
+             CREATE TABLE workflow_history_allocation (
+                 singleton INTEGER PRIMARY KEY,
+                 allocation_kind TEXT NOT NULL,
+                 allocation_state TEXT NOT NULL,
+                 accounting_version INTEGER NOT NULL,
+                 byte_limit INTEGER NOT NULL,
+                 slot_limit INTEGER NOT NULL,
+                 summary_charge INTEGER NOT NULL,
+                 attachment_charge INTEGER NOT NULL,
+                 charged_bytes INTEGER NOT NULL,
+                 slots_used INTEGER NOT NULL,
+                 terminal_rows INTEGER NOT NULL
+             );
+             INSERT INTO workflow_history_allocation VALUES(
+                 1, 'configured', 'ready', 1, 134217728, 100000,
+                 16384, 1024, 0, 0, 0);",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_configured_openers_refuse_unchanged(&path, R::Migration);
+    }
+
+    #[test]
+    fn weak_schema_precedes_impossible_row_classification() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("weak-schema-impossible-row.sqlite");
+        drop(SqliteStore::open_shared_history(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE workflow_history_allocation;
+             CREATE TABLE workflow_history_allocation (
+                 singleton INTEGER PRIMARY KEY,
+                 allocation_kind TEXT NOT NULL,
+                 allocation_state TEXT NOT NULL,
+                 accounting_version INTEGER NOT NULL,
+                 byte_limit INTEGER NOT NULL,
+                 slot_limit INTEGER NOT NULL,
+                 summary_charge INTEGER NOT NULL,
+                 attachment_charge INTEGER NOT NULL,
+                 charged_bytes INTEGER NOT NULL,
+                 slots_used INTEGER NOT NULL,
+                 terminal_rows INTEGER NOT NULL
+             );
+             INSERT INTO workflow_history_allocation VALUES(
+                 1, 'CONFIGURED', 'ready', 1, 134217728, 100000,
+                 16384, 1024, 0, 0, 0);",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_configured_openers_refuse_unchanged(&path, R::Migration);
+    }
+
+    #[test]
+    fn allocation_discovery_rejects_case_variant_table_and_same_name_view() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        for (name, replacement) in [
+            (
+                "case-variant-table",
+                "ALTER TABLE workflow_history_allocation
+                     RENAME TO allocation_case_staging;
+                 ALTER TABLE allocation_case_staging
+                     RENAME TO WORKFLOW_HISTORY_ALLOCATION;",
+            ),
+            (
+                "same-name-view",
+                "DROP TABLE workflow_history_allocation;
+                 CREATE VIEW workflow_history_allocation(
+                     singleton, allocation_kind, allocation_state, accounting_version,
+                     byte_limit, slot_limit, summary_charge, attachment_charge,
+                     charged_bytes, slots_used, terminal_rows
+                 ) AS SELECT 1, 'configured', 'ready', 1, 134217728, 100000,
+                             16384, 1024, 0, 0, 0;",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(format!("{name}.sqlite"));
+            drop(SqliteStore::open_shared_history(&path).unwrap());
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(replacement).unwrap();
+            drop(conn);
+
+            assert_configured_openers_refuse_unchanged(&path, R::Migration);
+        }
+    }
+
+    #[test]
+    fn tagged_schema_normalization_preserves_quoted_check_literals() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-altered-literal.sqlite");
+        drop(SqliteStore::open_shared_history(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE workflow_history_allocation;
+             CREATE TABLE workflow_history_allocation (
+                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                 allocation_kind TEXT NOT NULL
+                     CHECK(allocation_kind IN ('CONFIGURED','platform')),
+                 allocation_state TEXT NOT NULL
+                     CHECK(allocation_state IN ('migrating','ready')),
+                 accounting_version INTEGER NOT NULL CHECK(accounting_version=1),
+                 byte_limit INTEGER NOT NULL CHECK(byte_limit=134217728),
+                 slot_limit INTEGER NOT NULL CHECK(slot_limit=100000),
+                 summary_charge INTEGER NOT NULL CHECK(summary_charge=16384),
+                 attachment_charge INTEGER NOT NULL CHECK(attachment_charge=1024),
+                 charged_bytes INTEGER NOT NULL
+                     CHECK(charged_bytes>=0 AND charged_bytes<=byte_limit),
+                 slots_used INTEGER NOT NULL
+                     CHECK(slots_used>=0 AND slots_used<=slot_limit),
+                 terminal_rows INTEGER NOT NULL
+                     CHECK(terminal_rows>=0 AND terminal_rows<=slots_used),
+                 CHECK(
+                     (allocation_kind='configured'
+                      AND charged_bytes=slots_used*(summary_charge+attachment_charge))
+                     OR
+                     (allocation_kind='platform' AND charged_bytes=0
+                      AND slots_used=0 AND terminal_rows=0)
+                 )
+             );
+             PRAGMA ignore_check_constraints=ON;
+             INSERT INTO workflow_history_allocation VALUES(
+                 1, 'configured', 'ready', 1, 134217728, 100000,
+                 16384, 1024, 0, 0, 0);",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_configured_openers_refuse_unchanged(&path, R::Migration);
+    }
+
+    #[test]
+    fn allocation_schema_tokens_preserve_boundaries_and_quoted_contents() {
+        assert_eq!(
+            schema_sql_tokens("singleton INTEGER \n PRIMARY\tKEY"),
+            schema_sql_tokens("SINGLETON integer primary key")
+        );
+        assert_ne!(
+            schema_sql_tokens("singleton INTEGER PRIMARY KEY"),
+            schema_sql_tokens("singleton INTEGERPRIMARY KEY")
+        );
+        assert_ne!(
+            schema_sql_tokens("charged_bytes<=byte_limit"),
+            schema_sql_tokens("charged_bytes< =byte_limit")
+        );
+        assert_eq!(
+            schema_sql_tokens("SELECT \"Case\"\"Name\", 'it''s'"),
+            schema_sql_tokens("select \"Case\"\"Name\", 'it''s'")
+        );
+        assert_ne!(
+            schema_sql_tokens("SELECT 'configured'"),
+            schema_sql_tokens("SELECT 'CONFIGURED'")
+        );
+        assert!(schema_sql_tokens("SELECT 'unterminated").is_none());
+        assert!(schema_sql_tokens("SELECT 1 -- comment").is_none());
+        assert!(schema_sql_tokens("SELECT 1 /* comment */").is_none());
+        assert!(schema_sql_tokens("SELECT @unknown").is_none());
+    }
+
+    #[test]
+    fn tagged_configured_fused_primary_key_schema_is_migration_without_mutation() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-fused-primary-key.sqlite");
+        drop(SqliteStore::open_shared_history(&path).unwrap());
+        let weak_ddl = CANONICAL_HISTORY_ALLOCATION_DDL.replacen(
+            "singleton INTEGER PRIMARY KEY",
+            "singleton INTEGERPRIMARY KEY",
+            1,
+        );
+        assert_ne!(
+            schema_sql_tokens(CANONICAL_HISTORY_ALLOCATION_DDL),
+            schema_sql_tokens(&weak_ddl)
+        );
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE workflow_history_allocation;")
+            .unwrap();
+        conn.execute_batch(&weak_ddl).unwrap();
+        conn.execute(
+            "INSERT INTO workflow_history_allocation VALUES(
+                 1, 'configured', 'ready', 1, 134217728, 100000,
+                 16384, 1024, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let (declared_type, primary_key): (String, i64) = conn
+            .query_row(
+                "SELECT type, pk FROM pragma_table_info('workflow_history_allocation')
+                 WHERE name='singleton'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(declared_type, "INTEGERPRIMARY KEY");
+        assert_eq!(
+            primary_key, 0,
+            "SQLite must prove the fused type lacks the canonical primary key"
+        );
+        drop(conn);
+
+        assert_configured_openers_refuse_unchanged(&path, R::Migration);
+    }
+
+    #[test]
+    fn tagged_allocation_requires_exactly_one_row() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-extra-allocation.sqlite");
+        drop(SqliteStore::open_shared_history(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO workflow_history_allocation VALUES(
+                 2, 'configured', 'ready', 1, 134217728, 100000,
+                 16384, 1024, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_configured_openers_refuse_unchanged(&path, R::Corruption);
+    }
+
+    #[test]
+    fn canonical_configured_immediately_below_limit_opens_on_every_surface() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-below-limit.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            insert_configured_fixture_rows(&conn, 7_710);
+        }
+        drop(store);
+
+        drop(SqliteStore::open_configured_history_read_only(&path).unwrap());
+        drop(SqliteStore::open_configured_history_admin(&path).unwrap());
+        drop(SqliteStore::open_shared_history(&path).unwrap());
+    }
+
+    #[test]
+    fn configured_legacy_migration_normalizes_summary_and_attachment_charge() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-legacy-charge.sqlite");
+        let legacy = SqliteStore::open(&path).unwrap();
+        {
+            let conn = legacy.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+            conn.execute(
+                "INSERT INTO attempt_identities(
+                     attempt_id, execution_id, ordinal, owner_surface, history_disposition)
+                 VALUES('attempt-legacy-charge','exec-legacy-charge',0,'offline',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workflow_attempt_summaries(
+                     attempt_id, execution_id, ordinal, workflow, task_class, surface,
+                     policy, workload_fingerprint, started_ms, completed_ms, status,
+                     prompt_acceptance, pinned, charged_bytes, reservation_json, terminal_json)
+                 VALUES('attempt-legacy-charge','exec-legacy-charge',0,'legacy','legacy',
+                        'offline','r2f0a','shape-legacy',1,2,'terminal',
+                        'not_dispatched',0,7,'{}','{}')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workflow_history_attachment(attempt_id, charged_bytes)
+                 VALUES('attempt-orphan-legacy-charge', 1024)",
+                [],
+            )
+            .unwrap();
+        }
+        drop(legacy);
+
+        let configured = SqliteStore::open_shared_history(&path).unwrap();
+        let conn = configured.conn.lock().unwrap();
+        let normalized: (i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT summary.charged_bytes, attachment.charged_bytes,
+                        allocation.charged_bytes, allocation.slots_used,
+                        allocation.terminal_rows
+                 FROM workflow_attempt_summaries summary
+                 JOIN workflow_history_attachment attachment USING(attempt_id)
+                 JOIN workflow_history_allocation allocation ON allocation.singleton=1
+                 WHERE summary.attempt_id='attempt-legacy-charge'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(normalized, (16_384, 1_024, 17_408, 1, 1));
+        let orphan: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_history_attachment
+                 WHERE attempt_id='attempt-orphan-legacy-charge'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan, 0, "legacy attachment state must be rebuilt exactly");
+    }
+
+    #[test]
+    fn configured_migration_preserves_caller_journal_and_header_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-policy.sqlite");
+        let primary = SqliteStore::open(&path).unwrap();
+        {
+            let conn = primary.conn.lock().unwrap();
+            conn.execute_batch("PRAGMA application_id=4242; PRAGMA user_version=17;")
+                .unwrap();
+        }
+        drop(primary);
+
+        let configured = SqliteStore::open_shared_history(&path).unwrap();
+        let conn = configured.conn.lock().unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let application_id: i64 = conn
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(application_id, 4242);
+        assert_eq!(user_version, 17);
+    }
+
+    #[tokio::test]
+    async fn platform_legacy_migration_normalizes_inflated_active_and_pinned_charges() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("platform-legacy-charges.sqlite");
+        let legacy = SqliteStore::open(&path).unwrap();
+        {
+            let conn = legacy.conn.lock().unwrap();
+            for (attempt, execution, status, pinned, charge) in [
+                (
+                    "attempt-platform-active",
+                    "exec-platform-active",
+                    "active",
+                    0,
+                    134_217_728,
+                ),
+                (
+                    "attempt-platform-pinned",
+                    "exec-platform-pinned",
+                    "terminal",
+                    1,
+                    67_108_864,
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO attempt_identities(
+                         attempt_id, execution_id, ordinal, owner_surface, history_disposition)
+                     VALUES(?1, ?2, 0, 'offline', 1)",
+                    rusqlite::params![attempt, execution],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO workflow_attempt_summaries(
+                         attempt_id, execution_id, ordinal, workflow, task_class, surface,
+                         policy, workload_fingerprint, started_ms, completed_ms, status,
+                         prompt_acceptance, pinned, charged_bytes, reservation_json, terminal_json)
+                     VALUES(?1, ?2, 0, 'legacy', 'legacy', 'offline', 'r2f0a',
+                            'shape-legacy', 1,
+                            CASE WHEN ?3='terminal' THEN 2 ELSE NULL END,
+                            ?3, 'not_dispatched', ?4, ?5, '{}',
+                            CASE WHEN ?3='terminal' THEN '{}' ELSE NULL END)",
+                    rusqlite::params![attempt, execution, status, pinned, charge],
+                )
+                .unwrap();
+            }
+        }
+        drop(legacy);
+        assert!(std::fs::metadata(&path).unwrap().len() < 4 * 1024 * 1024);
+
+        let platform = SqliteStore::open_platform_history(&path).unwrap();
+        let charges: Vec<i64> = {
+            let conn = platform.conn.lock().unwrap();
+            let mut statement = conn
+                .prepare(
+                    "SELECT charged_bytes FROM workflow_attempt_summaries
+                     ORDER BY attempt_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(charges, vec![16_384, 16_384]);
+        let allocation: (i64, i64, i64) = platform
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(allocation, (0, 0, 0));
+        platform.reserve(&reservation()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tagged_platform_reopen_normalizes_inflated_active_and_pinned_charges() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("platform-tagged-legacy-charges.sqlite");
+        let platform = SqliteStore::open_platform_history(&path).unwrap();
+        let active = reservation_with_ids(
+            "exec-f7111111111111111111111111111111",
+            "attempt-f7111111111111111111111111111111",
+        );
+        let pinned = reservation_with_ids(
+            "exec-f7222222222222222222222222222222",
+            "attempt-f7222222222222222222222222222222",
+        );
+        platform.reserve(&active).await.unwrap();
+        platform.reserve(&pinned).await.unwrap();
+        platform
+            .terminalize(&pinned.identity.attempt_id, &terminal())
+            .await
+            .unwrap();
+        platform
+            .set_pinned(&pinned.identity.attempt_id, true)
+            .await
+            .unwrap();
+        {
+            let conn = platform.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE workflow_attempt_summaries
+                 SET charged_bytes=CASE status
+                     WHEN 'active' THEN 134217728 ELSE 67108864 END",
+                [],
+            )
+            .unwrap();
+        }
+        drop(platform);
+        assert!(std::fs::metadata(&path).unwrap().len() < 4 * 1024 * 1024);
+
+        let platform = SqliteStore::open_platform_history(&path).unwrap();
+        let persisted: Vec<(String, i64)> = {
+            let conn = platform.conn.lock().unwrap();
+            let mut statement = conn
+                .prepare(
+                    "SELECT status, charged_bytes FROM workflow_attempt_summaries
+                     ORDER BY attempt_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            persisted,
+            vec![
+                ("active".to_owned(), 16_384),
+                ("terminal".to_owned(), 16_384)
+            ]
+        );
+        let allocation: (i64, i64, i64) = platform
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(allocation, (0, 0, 0));
+
+        let admitted = reservation_with_ids(
+            "exec-f7333333333333333333333333333333",
+            "attempt-f7333333333333333333333333333333",
+        );
+        platform.reserve(&admitted).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn platform_capacity_preflight_precedes_database_mutation() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("platform-oversized-legacy.sqlite");
+        let canonical_path = canonical_fixture_path(&path);
+        let legacy = SqliteStore::open(&path).unwrap();
+        {
+            let conn = legacy.conn.lock().unwrap();
+            conn.execute_batch("CREATE TABLE platform_padding(payload BLOB NOT NULL);")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO platform_padding(payload) VALUES(zeroblob(?1))",
+                rusqlite::params![57_i64 * 1024 * 1024],
+            )
+            .unwrap();
+            let checkpoint: (i64, i64, i64) = conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            assert_eq!(checkpoint.0, 0);
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "delete");
+        }
+        drop(legacy);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let main_bytes = std::fs::metadata(&path).unwrap().len();
+        assert!(main_bytes > 56 * 1024 * 1024);
+        let assert_unmutated = || {
+            let metadata = std::fs::metadata(&path).unwrap();
+            assert_eq!(metadata.len(), main_bytes);
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+            assert!(!history_admission_lock_path(&path).exists());
+            assert!(!history_attempt_lock_dir(&path).exists());
+            let conn = rusqlite::Connection::open_with_flags(
+                &canonical_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .unwrap();
+            let allocation_tables: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name=?1",
+                    rusqlite::params!["workflow_history_allocation"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!((allocation_tables, mode.as_str()), (0, "delete"));
+        };
+
+        assert_eq!(
+            SqliteStore::open_history(&path).err().unwrap().reason,
+            R::CapacityProtected
+        );
+        assert_unmutated();
+        assert_eq!(
+            SqliteStore::open_platform_history(&path)
+                .err()
+                .unwrap()
+                .reason,
+            R::CapacityProtected
+        );
+        assert_unmutated();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn platform_sidecar_capacity_preflight_precedes_database_mutation() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("platform-oversized-sidecar.sqlite");
+        let legacy = SqliteStore::open(&path).unwrap();
+        {
+            let conn = legacy.conn.lock().unwrap();
+            let checkpoint: (i64, i64, i64) = conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            assert_eq!(checkpoint.0, 0);
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "delete");
+        }
+        drop(legacy);
+
+        let mut shm_name = path.as_os_str().to_os_string();
+        shm_name.push("-shm");
+        let shm_path = std::path::PathBuf::from(shm_name);
+        let shm = std::fs::File::create(&shm_path).unwrap();
+        shm.set_len(61 * 1024 * 1024).unwrap();
+        drop(shm);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::set_permissions(&shm_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let main_bytes = std::fs::metadata(&path).unwrap().len();
+
+        assert_eq!(
+            SqliteStore::open_history(&path).err().unwrap().reason,
+            R::CapacityProtected
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), main_bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            std::fs::metadata(&shm_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!history_admission_lock_path(&path).exists());
+        assert!(!history_attempt_lock_dir(&path).exists());
+        let allocation_tables: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name=?1",
+                rusqlite::params!["workflow_history_allocation"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(allocation_tables, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_owned_lock_permissions_are_descriptor_bound() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let lock_path = directory.path().join("history.lock");
+        let pinned_path = directory.path().join("history.lock.pinned");
+        let victim = directory.path().join("victim");
+        std::fs::write(&lock_path, b"lock").unwrap();
+        std::fs::write(&victim, b"victim").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let lock = open_history_owned_file(&lock_path, R::Open, R::ReadOnlyLock).unwrap();
+        std::fs::rename(&lock_path, &pinned_path).unwrap();
+        symlink(&victim, &lock_path).unwrap();
+        set_history_file_permissions(&lock, 0o640, R::ReadOnlyLock).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "a swapped lock pathname must not redirect permission changes"
+        );
+        assert_eq!(
+            std::fs::metadata(&pinned_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn configured_history_reopens_through_symlinked_ancestor() {
+        use std::os::unix::fs::{symlink, MetadataExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let real_parent = directory.path().join("real-configured");
+        std::fs::create_dir(&real_parent).unwrap();
+        assert_eq!(std::fs::metadata(&real_parent).unwrap().uid(), unsafe {
+            libc::geteuid()
+        });
+        let alias_parent = directory.path().join("configured-alias");
+        symlink(&real_parent, &alias_parent).unwrap();
+        let supplied = alias_parent.join("history.sqlite");
+        let canonical = std::fs::canonicalize(&real_parent)
+            .unwrap()
+            .join("history.sqlite");
+
+        assert_canonical_history_path(
+            SqliteStore::open_shared_history(&supplied).unwrap(),
+            &canonical,
+        );
+        assert_canonical_history_path(
+            SqliteStore::open_shared_history(&supplied).unwrap(),
+            &canonical,
+        );
+        assert_canonical_history_path(
+            SqliteStore::open_history_read_only(&supplied).unwrap(),
+            &canonical,
+        );
+        assert_canonical_history_path(
+            SqliteStore::open_configured_history_read_only(&supplied).unwrap(),
+            &canonical,
+        );
+        assert_canonical_history_path(
+            SqliteStore::open_history_admin(&supplied).unwrap(),
+            &canonical,
+        );
+        assert_canonical_history_path(
+            SqliteStore::open_configured_history_admin(&supplied).unwrap(),
+            &canonical,
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn selected_platform_history_bootstraps_and_reopens_through_symlinked_ancestor() {
+        use std::os::unix::fs::{symlink, MetadataExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let real_parent = directory.path().join("real-platform");
+        std::fs::create_dir(&real_parent).unwrap();
+        assert_eq!(std::fs::metadata(&real_parent).unwrap().uid(), unsafe {
+            libc::geteuid()
+        });
+        let alias_parent = directory.path().join("platform-alias");
+        symlink(&real_parent, &alias_parent).unwrap();
+        let supplied = alias_parent
+            .join("opaque")
+            .join("state")
+            .join("workflow-history.sqlite");
+        let canonical = std::fs::canonicalize(&real_parent)
+            .unwrap()
+            .join("opaque")
+            .join("state")
+            .join("workflow-history.sqlite");
+        let selection = selected_history(supplied.clone());
+
+        assert_canonical_history_path(selection.open_concurrent().unwrap(), &canonical);
+        assert_canonical_history_path(selection.open_concurrent().unwrap(), &canonical);
+        assert_canonical_history_path(selection.open_lifetime().unwrap(), &canonical);
+        assert_canonical_history_path(SqliteStore::open_history(&supplied).unwrap(), &canonical);
+        assert_canonical_history_path(
+            SqliteStore::open_platform_history(&supplied).unwrap(),
+            &canonical,
+        );
+        assert_canonical_history_path(
+            SqliteStore::open_history_read_only(&supplied).unwrap(),
+            &canonical,
+        );
+        assert_canonical_history_path(
+            SqliteStore::open_platform_history_read_only(&supplied).unwrap(),
+            &canonical,
+        );
+        assert_canonical_history_path(
+            SqliteStore::open_history_admin(&supplied).unwrap(),
+            &canonical,
+        );
+        assert_canonical_history_path(
+            SqliteStore::open_platform_history_admin(&supplied).unwrap(),
+            &canonical,
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ancestor_alias_wrong_kind_openers_refuse_without_schema_or_namespace_mutation() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::fs::symlink;
+
+        let configured_root = tempfile::tempdir().unwrap();
+        let configured_parent = configured_root.path().join("configured-real");
+        std::fs::create_dir(&configured_parent).unwrap();
+        let configured_alias = configured_root.path().join("configured-alias");
+        symlink(&configured_parent, &configured_alias).unwrap();
+        let configured_supplied = configured_alias.join("history.sqlite");
+        drop(SqliteStore::open_shared_history(&configured_supplied).unwrap());
+        let configured_canonical =
+            canonical_fixture_path(&configured_parent.join("history.sqlite"));
+        let configured_before =
+            refusal_state_snapshot(&configured_canonical, &[configured_root.path()]);
+        assert!(configured_before.parent_proof_residue.is_empty());
+        assert!(configured_before.attempt_locks.is_none());
+        assert_plain_error(
+            SqliteStore::open_history(&configured_supplied)
+                .err()
+                .unwrap(),
+            R::Migration,
+        );
+        assert_refusal_state_unchanged(
+            &configured_before,
+            &configured_canonical,
+            &[configured_root.path()],
+        );
+        assert_plain_error(
+            SqliteStore::open_platform_history(&configured_supplied)
+                .err()
+                .unwrap(),
+            R::Migration,
+        );
+        assert_refusal_state_unchanged(
+            &configured_before,
+            &configured_canonical,
+            &[configured_root.path()],
+        );
+
+        let platform_root = tempfile::tempdir().unwrap();
+        let platform_parent = platform_root.path().join("platform-real");
+        std::fs::create_dir(&platform_parent).unwrap();
+        let platform_alias = platform_root.path().join("platform-alias");
+        symlink(&platform_parent, &platform_alias).unwrap();
+        let platform_supplied = platform_alias.join("history.sqlite");
+        drop(SqliteStore::open_platform_history(&platform_supplied).unwrap());
+        let platform_canonical = canonical_fixture_path(&platform_parent.join("history.sqlite"));
+        let platform_before = refusal_state_snapshot(&platform_canonical, &[platform_root.path()]);
+        assert!(platform_before.parent_proof_residue.is_empty());
+        assert_plain_error(
+            SqliteStore::open_shared_history(&platform_supplied)
+                .err()
+                .unwrap(),
+            R::Migration,
+        );
+        assert_refusal_state_unchanged(
+            &platform_before,
+            &platform_canonical,
+            &[platform_root.path()],
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn canonical_probe_reobserves_absence_after_raw_prevalidation() {
+        use std::os::unix::fs::symlink;
+
+        fn run(remove_original: bool) {
+            let directory = tempfile::tempdir().unwrap();
+            let original = directory.path().join("original");
+            let replacement = directory.path().join("replacement");
+            std::fs::create_dir(&original).unwrap();
+            std::fs::create_dir(&replacement).unwrap();
+            let alias = directory.path().join("alias");
+            symlink(&original, &alias).unwrap();
+            let supplied = alias.join("history.sqlite");
+            drop(SqliteStore::open_shared_history(&supplied).unwrap());
+            let original_database = canonical_fixture_path(&original.join("history.sqlite"));
+            let (_guard, reached, proceed) = arm_history_prevalidation_pause(&supplied);
+            let candidate = supplied.clone();
+            let opener = std::thread::spawn(move || {
+                prevalidate_tagged_history_path(
+                    &candidate,
+                    Some(HistoryAllocationKind::Configured),
+                    false,
+                )
+            });
+            reached
+                .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+                .expect("raw prevalidation did not reach its one-shot pause");
+            if remove_original {
+                std::fs::remove_file(&original_database).unwrap();
+            } else {
+                std::fs::remove_file(&alias).unwrap();
+                symlink(&replacement, &alias).unwrap();
+            }
+            proceed.send(()).unwrap();
+            assert_eq!(opener.join().unwrap().unwrap(), None);
+            assert!(
+                std::fs::read_dir(&replacement).unwrap().next().is_none(),
+                "the absent canonical replacement must remain untouched"
+            );
+        }
+
+        run(false);
+        run(true);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn canonical_probe_rejects_retargeted_final_alias_and_wrong_types() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        for case in ["symlink", "fifo", "directory"] {
+            let directory = tempfile::tempdir().unwrap();
+            let original = directory.path().join("original");
+            let replacement = directory.path().join("replacement");
+            std::fs::create_dir(&original).unwrap();
+            std::fs::create_dir(&replacement).unwrap();
+            let alias = directory.path().join("alias");
+            symlink(&original, &alias).unwrap();
+            let supplied = alias.join("history.sqlite");
+            drop(SqliteStore::open_shared_history(&supplied).unwrap());
+            let victim = directory.path().join("victim");
+            std::fs::write(&victim, b"victim-bytes").unwrap();
+            std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let victim_mode = std::fs::symlink_metadata(&victim)
+                .unwrap()
+                .permissions()
+                .mode();
+            let target = replacement.join("history.sqlite");
+            match case {
+                "symlink" => symlink(&victim, &target).unwrap(),
+                "fifo" => {
+                    let name = std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }
+                "directory" => std::fs::create_dir(&target).unwrap(),
+                _ => unreachable!(),
+            }
+            let (_guard, reached, proceed) = arm_history_prevalidation_pause(&supplied);
+            let candidate = supplied.clone();
+            let opener = std::thread::spawn(move || {
+                prevalidate_tagged_history_path(
+                    &candidate,
+                    Some(HistoryAllocationKind::Configured),
+                    false,
+                )
+            });
+            reached
+                .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+                .expect("raw prevalidation did not reach its one-shot pause");
+            std::fs::remove_file(&alias).unwrap();
+            symlink(&replacement, &alias).unwrap();
+            let target_link = (case == "symlink").then(|| std::fs::read_link(&target).unwrap());
+            let before = refusal_state_snapshot(&target, &[directory.path()]);
+            assert!(before.parent_proof_residue.is_empty());
+            proceed.send(()).unwrap();
+            assert_plain_error(opener.join().unwrap().unwrap_err(), R::Open);
+            assert_refusal_state_unchanged(&before, &target, &[directory.path()]);
+            assert_eq!(std::fs::read(&victim).unwrap(), b"victim-bytes");
+            assert_eq!(
+                std::fs::symlink_metadata(&victim)
+                    .unwrap()
+                    .permissions()
+                    .mode(),
+                victim_mode
+            );
+            if let Some(target_link) = target_link {
+                assert_eq!(std::fs::read_link(&target).unwrap(), target_link);
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn public_platform_writer_retargets_to_live_untagged_wal_and_migrates_under_lock() {
+        use fs2::FileExt as _;
+        use std::os::unix::fs::{symlink, OpenOptionsExt as _, PermissionsExt as _};
+
+        fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+            let mut value = path.as_os_str().to_os_string();
+            value.push(suffix);
+            value.into()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let replacement = directory.path().join("replacement");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        let alias = directory.path().join("alias");
+        symlink(&original, &alias).unwrap();
+        let supplied = alias.join("history.sqlite");
+        drop(SqliteStore::open_shared_history(&supplied).unwrap());
+
+        let target = canonical_fixture_path(&replacement.join("history.sqlite"));
+        let primary = SqliteStore::open(&target).unwrap();
+        let reader = rusqlite::Connection::open(&target).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_attempt_summaries",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        {
+            let connection = primary.conn.lock().unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA wal_autocheckpoint=0;
+                     CREATE TABLE current_wal_marker(value INTEGER NOT NULL);
+                     INSERT INTO current_wal_marker VALUES(1);",
+                )
+                .unwrap();
+        }
+        assert!(
+            std::fs::metadata(with_suffix(&target, "-wal"))
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false),
+            "live untagged writer did not retain its newest commit in WAL"
+        );
+        let stale_directory = tempfile::tempdir().unwrap();
+        let stale_main = stale_directory.path().join("history.sqlite");
+        std::fs::copy(&target, &stale_main).unwrap();
+        let stale_connection = rusqlite::Connection::open(&stale_main).unwrap();
+        let stale_marker: Option<i64> = stale_connection
+            .query_row("SELECT COUNT(*) FROM current_wal_marker", [], |row| {
+                row.get(0)
+            })
+            .ok();
+        assert_ne!(
+            stale_marker,
+            Some(1),
+            "the control requires newest committed state to exist only in live WAL"
+        );
+        drop(stale_connection);
+
+        let victim = directory.path().join("victim");
+        std::fs::write(&victim, b"victim-bytes").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let victim_mode = std::fs::metadata(&victim).unwrap().permissions().mode();
+        let unrelated = replacement.join("unrelated-wal");
+        std::fs::write(&unrelated, b"unrelated").unwrap();
+
+        let (_raw_control, raw_reached, raw_proceed) = arm_history_prevalidation_pause(&supplied);
+        let (_initial_control, initial_reached, initial_proceed) =
+            arm_platform_open_after_initial_probe(&target);
+        let (_migration_control, under_lock, migrate, blocked) = arm_platform_open_control(
+            &target,
+            PlatformOpenPausePoint::WhileUntaggedUnderSchemaLock,
+        );
+        let opener_path = supplied.clone();
+        let opener = std::thread::spawn(move || SqliteStore::open_history(&opener_path));
+        raw_reached
+            .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+            .expect("raw prevalidation did not observe configured A");
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&replacement, &alias).unwrap();
+        let before_inspection = refusal_state_snapshot(&target, &[directory.path()]);
+        assert!(before_inspection.parent_proof_residue.is_empty());
+        raw_proceed.send(()).unwrap();
+
+        initial_reached
+            .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+            .expect("public opener did not finish canonical live-WAL inspection");
+        assert_sqlite_inspection_effects_only(&before_inspection, &target, &[directory.path()]);
+        initial_proceed.send(()).unwrap();
+        blocked
+            .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+            .expect("public opener did not wait on the canonical primary lock");
+        reader.execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        drop(primary);
+
+        under_lock
+            .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+            .expect("public opener did not reprobe untagged state under the canonical lock");
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let independent_lock = options.open(history_schema_lock_path(&target)).unwrap();
+        let lock_error = independent_lock
+            .try_lock_exclusive()
+            .expect_err("public opener did not hold the canonical lock");
+        assert_eq!(lock_error.kind(), std::io::ErrorKind::WouldBlock);
+        migrate.send(()).unwrap();
+
+        let store = opener
+            .join()
+            .unwrap()
+            .expect("public platform writer must migrate current live-WAL state");
+        assert_eq!(store.history_path.as_deref(), Some(target.as_path()));
+        drop(store);
+        validate_history_allocation_path(&target, HistoryAllocationKind::Platform, false).unwrap();
+        let connection = rusqlite::Connection::open(&target).unwrap();
+        let allocation: (i64, String, String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), allocation_kind, allocation_state,
+                        charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(allocation, (1, "platform".into(), "ready".into(), 0, 0, 0));
+        let marker: i64 = connection
+            .query_row("SELECT COUNT(*) FROM current_wal_marker", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(marker, 1, "migration lost the WAL-only committed state");
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert!(matches!(
+            journal_mode.as_str(),
+            "delete" | "truncate" | "persist"
+        ));
+        drop(connection);
+        drop(SqliteStore::open_platform_history_read_only(&target).unwrap());
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim-bytes");
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode(),
+            victim_mode
+        );
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"unrelated");
+        assert_eq!(std::fs::read_link(&alias).unwrap(), replacement);
+        assert!(
+            std::fs::read_dir(history_attempt_lock_dir(&target))
+                .unwrap()
+                .next()
+                .is_none(),
+            "empty fixture left an attempt-lock artifact"
+        );
+        assert!(
+            refusal_state_snapshot(&target, &[directory.path()])
+                .parent_proof_residue
+                .is_empty(),
+            "parent-proof residue survived public migration"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn untagged_wal_crash_process_helper() {
+        let Some(path) = std::env::var_os("A2A_BRIDGE_TEST_UNTAGGED_WAL_CRASH_PATH") else {
+            return;
+        };
+        let store = SqliteStore::open(std::path::Path::new(&path)).unwrap();
+        let connection = store.conn.lock().unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE crash_wal_marker(value INTEGER NOT NULL);
+                 INSERT INTO crash_wal_marker VALUES(1);",
+            )
+            .unwrap();
+        unsafe { libc::_exit(17) };
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn public_platform_writer_recovers_untagged_crash_residue_wal_and_shm() {
+        fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+            let mut value = path.as_os_str().to_os_string();
+            value.push(suffix);
+            value.into()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("crash-residue.sqlite");
+        run_bounded_crash_fixture(
+            "sqlite::r2f0a_history_tests::untagged_wal_crash_process_helper",
+            "A2A_BRIDGE_TEST_UNTAGGED_WAL_CRASH_PATH",
+            &path,
+            "untagged WAL crash fixture",
+        );
+        let canonical = canonical_fixture_path(&path);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = with_suffix(&canonical, suffix);
+            let metadata = std::fs::symlink_metadata(&sidecar).unwrap();
+            assert!(
+                metadata.file_type().is_file(),
+                "crash sidecar is not regular"
+            );
+        }
+
+        let before = refusal_state_snapshot(&canonical, &[directory.path()]);
+        let (_control, reached, proceed) = arm_platform_open_after_initial_probe(&canonical);
+        let opener_path = canonical.clone();
+        let opener = std::thread::spawn(move || SqliteStore::open_history(&opener_path));
+        reached
+            .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+            .expect("public opener did not inspect crash-residue WAL");
+        assert_sqlite_inspection_effects_only(&before, &canonical, &[directory.path()]);
+        proceed.send(()).unwrap();
+        drop(
+            opener
+                .join()
+                .unwrap()
+                .expect("public opener did not recover and migrate crash-residue WAL"),
+        );
+
+        validate_history_allocation_path(&canonical, HistoryAllocationKind::Platform, false)
+            .unwrap();
+        let connection = rusqlite::Connection::open(&canonical).unwrap();
+        let marker: i64 = connection
+            .query_row("SELECT COUNT(*) FROM crash_wal_marker", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(marker, 1);
+        let allocation: (String, String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT allocation_kind, allocation_state, charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(allocation, ("platform".into(), "ready".into(), 0, 0, 0));
+        assert!(refusal_state_snapshot(&canonical, &[directory.path()])
+            .parent_proof_residue
+            .is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn canonical_probe_preserves_rollback_wrong_kind_and_corruption_precedence() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::fs::symlink;
+
+        fn fixture(case: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+            let directory = tempfile::tempdir().unwrap();
+            let original = directory.path().join("original");
+            let replacement = directory.path().join("replacement");
+            std::fs::create_dir(&original).unwrap();
+            std::fs::create_dir(&replacement).unwrap();
+            let alias = directory.path().join("alias");
+            symlink(&original, &alias).unwrap();
+            let supplied = alias.join("history.sqlite");
+            drop(SqliteStore::open_shared_history(&supplied).unwrap());
+            let target = replacement.join("history.sqlite");
+            match case {
+                "platform" | "corrupt-platform" => {
+                    drop(SqliteStore::open_platform_history(&target).unwrap());
+                    if case == "corrupt-platform" {
+                        let connection = rusqlite::Connection::open(&target).unwrap();
+                        connection
+                            .execute_batch("PRAGMA ignore_check_constraints=ON;")
+                            .unwrap();
+                        connection
+                            .execute(
+                                "UPDATE workflow_history_allocation SET charged_bytes=1
+                                 WHERE singleton=1",
+                                [],
+                            )
+                            .unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            (directory, supplied, replacement)
+        }
+
+        for (case, reason) in [
+            ("platform", R::Migration),
+            ("corrupt-platform", R::Corruption),
+        ] {
+            let (directory, supplied, replacement) = fixture(case);
+            let target = replacement.join("history.sqlite");
+            let (_guard, reached, proceed) = arm_history_prevalidation_pause(&supplied);
+            let candidate = supplied.clone();
+            let opener = std::thread::spawn(move || {
+                prevalidate_tagged_history_path(
+                    &candidate,
+                    Some(HistoryAllocationKind::Configured),
+                    false,
+                )
+            });
+            reached.recv_timeout(HISTORY_TEST_HOOK_TIMEOUT).unwrap();
+            std::fs::remove_file(supplied.parent().unwrap()).unwrap();
+            symlink(&replacement, supplied.parent().unwrap()).unwrap();
+            let before = refusal_state_snapshot(&target, &[directory.path()]);
+            assert!(before.parent_proof_residue.is_empty());
+            proceed.send(()).unwrap();
+            assert_plain_error(opener.join().unwrap().unwrap_err(), reason);
+            assert_refusal_state_unchanged(&before, &target, &[directory.path()]);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn configured_wal_wrong_kind_inspection_uses_current_state_and_only_sqlite_sidecars() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+            let mut value = path.as_os_str().to_os_string();
+            value.push(suffix);
+            value.into()
+        }
+
+        let closed_directory = tempfile::tempdir().unwrap();
+        let closed = closed_directory.path().join("configured-closed.sqlite");
+        drop(SqliteStore::open(&closed).unwrap());
+        drop(SqliteStore::open_shared_history(&closed).unwrap());
+        let closed = canonical_fixture_path(&closed);
+        assert!(
+            !with_suffix(&closed, "-wal").exists() && !with_suffix(&closed, "-shm").exists(),
+            "closed checkpointed WAL fixture retained sidecars"
+        );
+        let closed_before = refusal_state_snapshot(&closed, &[closed_directory.path()]);
+        assert_plain_error(
+            SqliteStore::open_platform_history(&closed).err().unwrap(),
+            R::Migration,
+        );
+        assert_sqlite_inspection_effects_only(&closed_before, &closed, &[closed_directory.path()]);
+
+        let live_directory = tempfile::tempdir().unwrap();
+        let live = live_directory.path().join("configured-live.sqlite");
+        drop(SqliteStore::open(&live).unwrap());
+        drop(SqliteStore::open_shared_history(&live).unwrap());
+        let live = canonical_fixture_path(&live);
+        let reader = rusqlite::Connection::open(&live).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row(
+                "SELECT charged_bytes FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let writer = rusqlite::Connection::open(&live).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE IF NOT EXISTS current_wal_marker(value INTEGER);
+                 INSERT INTO current_wal_marker VALUES(1);",
+            )
+            .unwrap();
+        assert!(
+            std::fs::metadata(with_suffix(&live, "-wal"))
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false),
+            "live fixture did not retain committed WAL state"
+        );
+        let live_before = refusal_state_snapshot(&live, &[live_directory.path()]);
+        assert_plain_error(
+            SqliteStore::open_platform_history(&live).err().unwrap(),
+            R::Migration,
+        );
+        assert_sqlite_inspection_effects_only(&live_before, &live, &[live_directory.path()]);
+
+        writer
+            .execute_batch("PRAGMA ignore_check_constraints=ON;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE workflow_history_allocation SET charged_bytes=1 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        let stale_main = live_directory.path().join("stale-main.sqlite");
+        std::fs::copy(&live, &stale_main).unwrap();
+        let stale_charge: i64 = rusqlite::Connection::open(&stale_main)
+            .unwrap()
+            .query_row(
+                "SELECT charged_bytes FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_charge, 0,
+            "the corrupt value must exist only in the live WAL for this control"
+        );
+        let corrupt_before = refusal_state_snapshot(&live, &[live_directory.path()]);
+        assert_plain_error(
+            SqliteStore::open_platform_history(&live).err().unwrap(),
+            R::Corruption,
+        );
+        assert_sqlite_inspection_effects_only(&corrupt_before, &live, &[live_directory.path()]);
+        reader.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn history_parent_open_file_retries_interrupts_and_create_enoent() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = canonical_fixture_path(&directory.path().join("history.sqlite"));
+        let parent = HistoryParent::prove(&database).unwrap();
+
+        let mut interrupted_path = database.as_os_str().to_os_string();
+        interrupted_path.push(".interrupted");
+        let interrupted_path = std::path::PathBuf::from(interrupted_path);
+        let (_guard, _) = arm_history_file_open_control(
+            &interrupted_path,
+            &[
+                (HistoryFileOpenState::Existing, libc::EINTR),
+                (HistoryFileOpenState::ExclusiveCreate, libc::EINTR),
+            ],
+            &[],
+        );
+        drop(
+            parent
+                .open_file(".interrupted", true, R::Open, R::ReadOnlyDatabase)
+                .unwrap(),
+        );
+        let (observations, actual_syscalls) = history_file_open_observations(&interrupted_path);
+        assert_eq!(observations.len(), 4);
+        assert_eq!(actual_syscalls, 2);
+        assert_eq!(observations[0].state, HistoryFileOpenState::Existing);
+        assert_eq!(
+            observations[0].outcome,
+            HistoryFileOpenObservedOutcome::Errno(libc::EINTR)
+        );
+        assert_eq!(observations[1].ordinal, 2);
+        assert_eq!(observations[2].state, HistoryFileOpenState::ExclusiveCreate);
+        assert_eq!(
+            observations[2].outcome,
+            HistoryFileOpenObservedOutcome::Errno(libc::EINTR)
+        );
+        assert_eq!(observations[3].ordinal, 4);
+
+        let mut restart_path = database.as_os_str().to_os_string();
+        restart_path.push(".restart");
+        let restart_path = std::path::PathBuf::from(restart_path);
+        let (_guard, _) = arm_history_file_open_control(
+            &restart_path,
+            &[(HistoryFileOpenState::ExclusiveCreate, libc::ENOENT)],
+            &[],
+        );
+        drop(
+            parent
+                .open_file(".restart", true, R::Open, R::ReadOnlyDatabase)
+                .unwrap(),
+        );
+        let (observations, actual_syscalls) = history_file_open_observations(&restart_path);
+        assert_eq!(observations.len(), 4);
+        assert_eq!(actual_syscalls, 3);
+        assert_eq!(
+            observations[1].outcome,
+            HistoryFileOpenObservedOutcome::Errno(libc::ENOENT)
+        );
+        assert_eq!(observations[2].state, HistoryFileOpenState::Existing);
+        assert_eq!(observations[3].state, HistoryFileOpenState::ExclusiveCreate);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn history_parent_open_file_bounds_churn_and_preserves_error_sides() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = canonical_fixture_path(&directory.path().join("history.sqlite"));
+        let parent = HistoryParent::prove(&database).unwrap();
+
+        let mut churn_path = database.as_os_str().to_os_string();
+        churn_path.push(".churn");
+        let churn_path = std::path::PathBuf::from(churn_path);
+        let mut churn = Vec::new();
+        for _ in 0..8 {
+            churn.push((HistoryFileOpenState::Existing, libc::ENOENT));
+            churn.push((HistoryFileOpenState::ExclusiveCreate, libc::EEXIST));
+        }
+        let (_guard, _) = arm_history_file_open_control(&churn_path, &churn, &[]);
+        let before = refusal_state_snapshot(&database, &[directory.path()]);
+        assert!(before.parent_proof_residue.is_empty());
+        assert_plain_error(
+            parent
+                .open_file(".churn", true, R::AdvisoryLockIo, R::ReadOnlyLock)
+                .unwrap_err(),
+            R::AdvisoryLockIo,
+        );
+        let (observations, actual_syscalls) = history_file_open_observations(&churn_path);
+        assert_eq!(observations.len(), HISTORY_FILE_OPEN_ATTEMPTS);
+        assert_eq!(
+            observations.last().unwrap().ordinal,
+            HISTORY_FILE_OPEN_ATTEMPTS
+        );
+        assert_eq!(actual_syscalls, 0);
+        assert!(!churn_path.exists());
+        assert_refusal_state_unchanged(&before, &database, &[directory.path()]);
+
+        let mut absent_path = database.as_os_str().to_os_string();
+        absent_path.push(".absent");
+        let absent_path = std::path::PathBuf::from(absent_path);
+        let (_guard, _) = arm_history_file_open_control(&absent_path, &[], &[]);
+        let before = refusal_state_snapshot(&database, &[directory.path()]);
+        assert!(before.parent_proof_residue.is_empty());
+        assert_plain_error(
+            parent
+                .open_file(".absent", false, R::Open, R::ReadOnlyDatabase)
+                .unwrap_err(),
+            R::Open,
+        );
+        assert_eq!(history_file_open_observations(&absent_path).0.len(), 1);
+        assert_refusal_state_unchanged(&before, &database, &[directory.path()]);
+
+        for errno in [libc::EACCES, libc::EROFS] {
+            let suffix = format!(".existing-permission-{errno}");
+            let mut path = database.as_os_str().to_os_string();
+            path.push(&suffix);
+            let path = std::path::PathBuf::from(path);
+            let (_guard, _) = arm_history_file_open_control(
+                &path,
+                &[(HistoryFileOpenState::Existing, errno)],
+                &[],
+            );
+            let before = refusal_state_snapshot(&database, &[directory.path()]);
+            assert!(before.parent_proof_residue.is_empty());
+            assert_plain_error(
+                parent
+                    .open_file(&suffix, true, R::Open, R::ReadOnlyDatabase)
+                    .unwrap_err(),
+                R::ReadOnlyDatabase,
+            );
+            assert_refusal_state_unchanged(&before, &database, &[directory.path()]);
+
+            let suffix = format!(".create-permission-{errno}");
+            let mut path = database.as_os_str().to_os_string();
+            path.push(&suffix);
+            let path = std::path::PathBuf::from(path);
+            let (_guard, _) = arm_history_file_open_control(
+                &path,
+                &[
+                    (HistoryFileOpenState::Existing, libc::ENOENT),
+                    (HistoryFileOpenState::ExclusiveCreate, errno),
+                ],
+                &[],
+            );
+            let before = refusal_state_snapshot(&database, &[directory.path()]);
+            assert!(before.parent_proof_residue.is_empty());
+            assert_plain_error(
+                parent
+                    .open_file(&suffix, true, R::Open, R::ReadOnlyDatabase)
+                    .unwrap_err(),
+                R::ReadOnlyParent,
+            );
+            assert_refusal_state_unchanged(&before, &database, &[directory.path()]);
+        }
+
+        let mut blocked_path = database.as_os_str().to_os_string();
+        blocked_path.push(".blocked");
+        let blocked_path = std::path::PathBuf::from(blocked_path);
+        let (_guard, _) = arm_history_file_open_control(
+            &blocked_path,
+            &[(HistoryFileOpenState::Existing, libc::EWOULDBLOCK)],
+            &[],
+        );
+        let before = refusal_state_snapshot(&database, &[directory.path()]);
+        assert!(before.parent_proof_residue.is_empty());
+        assert_plain_error(
+            parent
+                .open_file(".blocked", true, R::Open, R::ReadOnlyDatabase)
+                .unwrap_err(),
+            R::Locked,
+        );
+        assert_refusal_state_unchanged(&before, &database, &[directory.path()]);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn history_parent_open_file_refuses_validation_races_without_retry_or_cleanup() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        for (case, reopen) in [
+            ("symlink", false),
+            ("hard-link", false),
+            ("fifo", true),
+            ("directory", true),
+            ("replacement", true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let database = canonical_fixture_path(&directory.path().join("history.sqlite"));
+            let parent = HistoryParent::prove(&database).unwrap();
+            let suffix = format!(".{case}");
+            let mut child = database.as_os_str().to_os_string();
+            child.push(&suffix);
+            let child = std::path::PathBuf::from(child);
+            let victim = directory.path().join("victim");
+            std::fs::write(&victim, b"victim-bytes").unwrap();
+            std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let victim_mode = std::fs::symlink_metadata(&victim)
+                .unwrap()
+                .permissions()
+                .mode();
+            if reopen {
+                std::fs::write(&child, b"existing-entry").unwrap();
+            }
+            let injections = reopen.then_some([
+                (HistoryFileOpenState::Existing, libc::ENOENT),
+                (HistoryFileOpenState::ExclusiveCreate, libc::EEXIST),
+            ]);
+            let (_guard, (mut reached, proceed)) = arm_history_file_open_control(
+                &child,
+                injections.as_ref().map_or(&[], |values| values.as_slice()),
+                &[HistoryFileOpenPausePoint::BeforeFdValidation],
+            );
+            let opener = std::thread::spawn(move || {
+                parent.open_file(&suffix, true, R::Open, R::ReadOnlyDatabase)
+            });
+            reached
+                .remove(0)
+                .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+                .expect("open did not reach fd validation");
+            std::fs::remove_file(&child).unwrap();
+            match case {
+                "symlink" => symlink(&victim, &child).unwrap(),
+                "hard-link" => std::fs::hard_link(&victim, &child).unwrap(),
+                "fifo" => {
+                    let name = std::ffi::CString::new(child.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }
+                "directory" => std::fs::create_dir(&child).unwrap(),
+                "replacement" => std::fs::write(&child, b"replacement-bytes").unwrap(),
+                _ => unreachable!(),
+            }
+            let child_link = (case == "symlink").then(|| std::fs::read_link(&child).unwrap());
+            let before = refusal_state_snapshot(&database, &[directory.path()]);
+            assert!(before.parent_proof_residue.is_empty());
+            proceed[0].send(()).unwrap();
+            assert_plain_error(opener.join().unwrap().unwrap_err(), R::Open);
+            assert_refusal_state_unchanged(&before, &database, &[directory.path()]);
+            assert_eq!(std::fs::read(&victim).unwrap(), b"victim-bytes");
+            assert_eq!(
+                std::fs::symlink_metadata(&victim)
+                    .unwrap()
+                    .permissions()
+                    .mode(),
+                victim_mode
+            );
+            if let Some(child_link) = child_link {
+                assert_eq!(std::fs::read_link(&child).unwrap(), child_link);
+            }
+            let (observations, _) = history_file_open_observations(&child);
+            assert_eq!(
+                observations.len(),
+                if reopen { 3 } else { 2 },
+                "validation failure cannot retry open"
+            );
+            assert!(
+                child.exists(),
+                "validation failure cannot clean up the raced entry"
+            );
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = canonical_fixture_path(&directory.path().join("history.sqlite"));
+        let parent = HistoryParent::prove(&database).unwrap();
+        let mut child = database.as_os_str().to_os_string();
+        child.push(".unlinked");
+        let child = std::path::PathBuf::from(child);
+        let (_guard, (mut reached, proceed)) = arm_history_file_open_control(
+            &child,
+            &[],
+            &[HistoryFileOpenPausePoint::AfterFdValidation],
+        );
+        let opener = std::thread::spawn(move || {
+            parent.open_file(".unlinked", true, R::Open, R::ReadOnlyDatabase)
+        });
+        reached
+            .remove(0)
+            .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+            .expect("open did not finish fd validation");
+        std::fs::remove_file(&child).unwrap();
+        let before = refusal_state_snapshot(&database, &[directory.path()]);
+        assert!(before.parent_proof_residue.is_empty());
+        proceed[0].send(()).unwrap();
+        assert_plain_error(opener.join().unwrap().unwrap_err(), R::Open);
+        assert_refusal_state_unchanged(&before, &database, &[directory.path()]);
+        assert!(!child.exists());
+        assert_eq!(history_file_open_observations(&child).0.len(), 2);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn history_openers_reject_final_database_symlink_below_symlinked_ancestor() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        fn directory_entries(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+            let mut entries = std::fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let real_parent = directory.path().join("real-final-alias");
+        std::fs::create_dir(&real_parent).unwrap();
+        let alias_parent = directory.path().join("final-ancestor-alias");
+        symlink(&real_parent, &alias_parent).unwrap();
+        let victim = directory.path().join("victim.bin");
+        std::fs::write(&victim, b"opaque-victim-bytes").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let supplied = alias_parent.join("history.sqlite");
+        let canonical_final = real_parent.join("history.sqlite");
+        symlink(&victim, &canonical_final).unwrap();
+
+        let root_entries = directory_entries(directory.path());
+        let parent_entries = directory_entries(&real_parent);
+        let victim_mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        let final_target = std::fs::read_link(&canonical_final).unwrap();
+
+        for error in [
+            SqliteStore::open(&supplied).err().unwrap(),
+            SqliteStore::open_shared_history(&supplied).err().unwrap(),
+            SqliteStore::open_platform_history(&supplied).err().unwrap(),
+            SqliteStore::open_history(&supplied).err().unwrap(),
+            selected_history(supplied.clone())
+                .open_lifetime()
+                .err()
+                .unwrap(),
+            selected_history(supplied.clone())
+                .open_concurrent()
+                .err()
+                .unwrap(),
+            SqliteStore::open_history_read_only(&supplied)
+                .err()
+                .unwrap(),
+            SqliteStore::open_configured_history_read_only(&supplied)
+                .err()
+                .unwrap(),
+            SqliteStore::open_platform_history_read_only(&supplied)
+                .err()
+                .unwrap(),
+            SqliteStore::open_history_admin(&supplied).err().unwrap(),
+            SqliteStore::open_configured_history_admin(&supplied)
+                .err()
+                .unwrap(),
+            SqliteStore::open_platform_history_admin(&supplied)
+                .err()
+                .unwrap(),
+        ] {
+            assert_plain_error(error, R::Open);
+        }
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"opaque-victim-bytes");
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            victim_mode
+        );
+        assert_eq!(std::fs::read_link(&canonical_final).unwrap(), final_target);
+        assert_eq!(directory_entries(directory.path()), root_entries);
+        assert_eq!(directory_entries(&real_parent), parent_entries);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_openers_reject_database_and_lock_aliases_without_victim_mutation() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        fn make_fifo(path: &std::path::Path) {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
+
+        fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+            let mut value = path.as_os_str().to_os_string();
+            value.push(suffix);
+            value.into()
+        }
+
+        fn assert_open_refuses(path: &std::path::Path) {
+            for error in [
+                SqliteStore::open_shared_history(path).err().unwrap(),
+                SqliteStore::open_configured_history_read_only(path)
+                    .err()
+                    .unwrap(),
+                SqliteStore::open_configured_history_admin(path)
+                    .err()
+                    .unwrap(),
+                SqliteStore::open_history(path).err().unwrap(),
+            ] {
+                assert_eq!(
+                    error.reason,
+                    bridge_core::workflow_history::LedgerUnavailableReason::Open
+                );
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let victim = directory.path().join("victim");
+        std::fs::write(&victim, b"unchanged").unwrap();
+
+        let db_symlink = directory.path().join("db-symlink.sqlite");
+        symlink(&victim, &db_symlink).unwrap();
+        assert_eq!(
+            SqliteStore::open_shared_history(&db_symlink)
+                .err()
+                .unwrap()
+                .reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Open
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+
+        let lock_db = directory.path().join("lock-symlink.sqlite");
+        symlink(&victim, history_schema_lock_path(&lock_db)).unwrap();
+        assert_eq!(
+            SqliteStore::open_shared_history(&lock_db)
+                .err()
+                .unwrap()
+                .reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Open
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"unchanged");
+
+        let original = directory.path().join("original.sqlite");
+        drop(SqliteStore::open_shared_history(&original).unwrap());
+        let hard_link = directory.path().join("hard-link.sqlite");
+        std::fs::hard_link(&original, &hard_link).unwrap();
+        assert_eq!(
+            SqliteStore::open_shared_history(&hard_link)
+                .err()
+                .unwrap()
+                .reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Open
+        );
+
+        let db_directory = directory.path().join("db-directory.sqlite");
+        std::fs::create_dir(&db_directory).unwrap();
+        assert_open_refuses(&db_directory);
+        let db_fifo = directory.path().join("db-fifo.sqlite");
+        make_fifo(&db_fifo);
+        assert_open_refuses(&db_fifo);
+
+        let lock_hard_db = directory.path().join("lock-hard.sqlite");
+        std::fs::hard_link(&victim, history_schema_lock_path(&lock_hard_db)).unwrap();
+        assert_open_refuses(&lock_hard_db);
+        let lock_directory_db = directory.path().join("lock-directory.sqlite");
+        std::fs::create_dir(history_schema_lock_path(&lock_directory_db)).unwrap();
+        assert_open_refuses(&lock_directory_db);
+        let lock_fifo_db = directory.path().join("lock-fifo.sqlite");
+        make_fifo(&history_schema_lock_path(&lock_fifo_db));
+        assert_open_refuses(&lock_fifo_db);
+
+        let sidecar_symlink_db = directory.path().join("sidecar-symlink.sqlite");
+        symlink(&victim, with_suffix(&sidecar_symlink_db, "-wal")).unwrap();
+        assert_open_refuses(&sidecar_symlink_db);
+        let sidecar_hard_db = directory.path().join("sidecar-hard.sqlite");
+        std::fs::hard_link(&victim, with_suffix(&sidecar_hard_db, "-wal")).unwrap();
+        assert_open_refuses(&sidecar_hard_db);
+        let sidecar_directory_db = directory.path().join("sidecar-directory.sqlite");
+        std::fs::create_dir(with_suffix(&sidecar_directory_db, "-wal")).unwrap();
+        assert_open_refuses(&sidecar_directory_db);
+        let sidecar_fifo_db = directory.path().join("sidecar-fifo.sqlite");
+        make_fifo(&with_suffix(&sidecar_fifo_db, "-wal"));
+        assert_open_refuses(&sidecar_fifo_db);
+
+        let attempt_dir_alias_db = directory.path().join("attempt-dir-alias.sqlite");
+        symlink(&victim, history_attempt_lock_dir(&attempt_dir_alias_db)).unwrap();
+        assert_eq!(
+            SqliteStore::open_history(&attempt_dir_alias_db)
+                .err()
+                .unwrap()
+                .reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Open
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"unchanged",
+            "no alias or special-file refusal may mutate its target"
+        );
+    }
+
+    #[test]
+    fn explicit_configured_stats_reads_legacy_and_admin_migrates_bare_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-legacy.sqlite");
+        drop(SqliteStore::open(&path).unwrap());
+
+        let bare_error = SqliteStore::open_history_read_only(&path)
+            .err()
+            .expect("bare untagged selection is ambiguous");
+        assert_eq!(
+            bare_error.reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Migration
+        );
+        drop(SqliteStore::open_configured_history_read_only(&path).unwrap());
+
+        drop(SqliteStore::open_configured_history_admin(&path).unwrap());
+        let tagged = SqliteStore::open_history_read_only(&path).unwrap();
+        assert_eq!(
+            tagged.history_allocation_kind,
+            Some(HistoryAllocationKind::Configured)
+        );
+        assert_eq!(
+            SqliteStore::open_platform_history_read_only(&path)
+                .err()
+                .unwrap()
+                .reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Migration
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn platform_opener_reprobes_kind_after_winning_schema_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opposite-kind-race.sqlite");
+        let canonical_path = std::fs::canonicalize(directory.path())
+            .unwrap()
+            .join("opposite-kind-race.sqlite");
+        let (_control, reached, proceed) = arm_platform_open_after_initial_probe(&canonical_path);
+
+        let contender_path = path.clone();
+        let contender = std::thread::spawn(move || SqliteStore::open_history(&contender_path));
+        reached
+            .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+            .expect("platform contender did not finish its initial untagged probe");
+
+        drop(SqliteStore::open_shared_history(&path).unwrap());
+        proceed.send(()).unwrap();
+
+        let error = contender
+            .join()
+            .unwrap()
+            .err()
+            .expect("the stale platform probe must lose to configured metadata");
+        assert_eq!(
+            error.reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Migration
+        );
+        assert_eq!(
+            probe_history_allocation_kind(&canonical_path).unwrap(),
+            Some(HistoryAllocationKind::Configured)
+        );
+        assert!(
+            !history_attempt_lock_dir(&canonical_path).exists(),
+            "the wrong-kind loser mutated platform-only sidecars after its stale probe"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn platform_initial_probe_hook_timeout_is_typed_bounded_and_cleans_up() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("initial-probe-timeout.sqlite");
+        drop(SqliteStore::open(&path).unwrap());
+        let canonical = canonical_fixture_path(&path);
+        let before = refusal_state_snapshot(&canonical, &[directory.path()]);
+        let (control, reached, _proceed) = arm_platform_open_after_initial_probe(&canonical);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let contender_path = path.clone();
+        let contender = std::thread::spawn(move || {
+            let _ = result_tx.send(SqliteStore::open_history(&contender_path));
+        });
+        reached
+            .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+            .expect("platform opener did not reach the initial-probe hook");
+
+        let result = match result_rx
+            .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT + std::time::Duration::from_secs(1))
+        {
+            Ok(result) => result,
+            Err(error) => {
+                drop(control);
+                contender.join().unwrap();
+                panic!("initial-probe wait was not bounded: {error}");
+            }
+        };
+        contender.join().unwrap();
+        assert_plain_error(
+            result
+                .err()
+                .expect("timed-out platform opener unexpectedly succeeded"),
+            R::Io,
+        );
+        assert_sqlite_inspection_effects_only(&before, &canonical, &[directory.path()]);
+        assert!(
+            !history_kind_lock_path(&canonical).exists()
+                && !history_attempt_lock_dir(&canonical).exists(),
+            "timed-out initial inspection created bridge-owned migration artifacts"
+        );
+        drop(control);
+        assert!(
+            PLATFORM_OPEN_TEST_HOOKS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .after_initial_probe
+                .is_none(),
+            "the timed-out one-shot hook poisoned a later test"
+        );
+    }
+
+    #[test]
+    fn explicit_migration_refuses_unknown_untagged_database_without_mutation() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unknown-untagged.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE unrelated_payload(id INTEGER PRIMARY KEY, payload BLOB);
+             INSERT INTO unrelated_payload(payload) VALUES(zeroblob(4096));",
+        )
+        .unwrap();
+        drop(conn);
+        let before = std::fs::read(&path).unwrap();
+
+        for error in [
+            SqliteStore::open_shared_history(&path).err().unwrap(),
+            SqliteStore::open_platform_history(&path).err().unwrap(),
+        ] {
+            assert!(
+                matches!(error.reason, R::Corruption | R::Migration),
+                "unknown SQLite schemas must be refused as typed migration corruption"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "read-only legacy validation must precede every writable schema operation"
+        );
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let unrelated_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM unrelated_payload", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let bridge_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name IN (
+                     ?1, ?2, ?3
+                 )",
+                rusqlite::params![
+                    "workflow_attempt_summaries",
+                    "workflow_history_allocation",
+                    "attempt_identities"
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((unrelated_rows, bridge_tables), (1, 0));
+    }
+
+    #[test]
+    fn platform_interruption_before_migrating_marker_preserves_legacy_wal_policy() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("platform-pre-marker.sqlite");
+        drop(SqliteStore::open(&path).unwrap());
+        let canonical_path = std::fs::canonicalize(directory.path())
+            .unwrap()
+            .join("platform-pre-marker.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        drop(conn);
+
+        PLATFORM_OPEN_TEST_HOOKS
+            .get_or_init(|| Mutex::new(PlatformOpenTestHooks::default()))
+            .lock()
+            .unwrap()
+            .fail_before_migrating_commit = Some(canonical_path.clone());
+
+        let error = SqliteStore::open_platform_history(&path)
+            .err()
+            .expect("deterministic interruption must stop before schema mutation");
+        assert_eq!(error.reason, R::Io);
+        assert_eq!(
+            probe_history_allocation_kind(&canonical_path).unwrap(),
+            None
+        );
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            mode, "wal",
+            "journal policy cannot change before platform/migrating is durable"
+        );
+        drop(conn);
+
+        drop(SqliteStore::open_shared_history(&path).unwrap());
+        assert_eq!(
+            probe_history_allocation_kind(&canonical_path).unwrap(),
+            Some(HistoryAllocationKind::Configured)
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_legacy_read_only_projects_summary_attached_for_get_and_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy-read-projection.sqlite");
+        let canonical_path = canonical_fixture_path(&path);
+        let store = SqliteStore::open(&path).unwrap();
+        let row = reservation_with_ids(
+            "exec-f1111111111111111111111111111111",
+            "attempt-f1111111111111111111111111111111",
+        );
+        store.reserve(&row).await.unwrap();
+        store
+            .terminalize(&row.identity.attempt_id, &terminal())
+            .await
+            .unwrap();
+        drop(store);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE attempt_identities
+             RENAME COLUMN history_disposition TO summary_attached;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let read_only = SqliteStore::open_configured_history_read_only(&path).unwrap();
+        let exact = read_only
+            .attempt(&row.identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(exact.terminal.is_some());
+        let report = read_only.completed_between(0, 3_000).await.unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!(
+            report[0].reservation.identity.attempt_id,
+            row.identity.attempt_id
+        );
+        assert_eq!(
+            probe_history_allocation_kind(&canonical_path).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tagged_validation_reads_metadata_and_rows_from_one_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("validation-snapshot.sqlite");
+        let canonical_path = canonical_fixture_path(&path);
+        drop(SqliteStore::open(&path).unwrap());
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let row = reservation_with_ids(
+            "exec-f2222222222222222222222222222222",
+            "attempt-f2222222222222222222222222222222",
+        );
+        store.reserve(&row).await.unwrap();
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        let validator_path = canonical_path.clone();
+        let validator = std::thread::spawn(move || {
+            TAGGED_VALIDATION_SNAPSHOT_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(TaggedValidationSnapshotHook {
+                    reached: reached_tx,
+                    proceed: proceed_rx,
+                });
+            });
+            validate_history_allocation_path(
+                &validator_path,
+                HistoryAllocationKind::Configured,
+                false,
+            )
+        });
+        reached_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("validator did not reach the post-metadata boundary");
+
+        store
+            .terminalize(&row.identity.attempt_id, &terminal())
+            .await
+            .unwrap();
+        proceed_tx.send(()).unwrap();
+        validator
+            .join()
+            .unwrap()
+            .expect("concurrent terminalization cannot manufacture corruption");
+        validate_history_allocation_path(&canonical_path, HistoryAllocationKind::Configured, false)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn committed_retention_survives_later_replacement_admission_failure() {
+        use bridge_core::workflow_history::{
+            LedgerUnavailableReason as R, CONFIGURED_SLOT_CHARGE, RETENTION_DAYS,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("retention-admission-boundary.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let old = reservation_with_ids(
+            "exec-f3333333333333333333333333333333",
+            "attempt-f3333333333333333333333333333333",
+        );
+        store.reserve(&old).await.unwrap();
+        store
+            .terminalize(&old.identity.attempt_id, &terminal())
+            .await
+            .unwrap();
+
+        let mut replacement = followup(&old, "attempt-f4444444444444444444444444444444");
+        replacement.started_ms =
+            terminal().completed_ms + RETENTION_DAYS * 24 * 60 * 60 * 1_000 + 1;
+        arm_history_mutation_failpoint(
+            &store,
+            &replacement.identity.attempt_id,
+            HistoryMutationFailpointKind::AdmissionIo,
+        );
+        assert_eq!(store.reserve(&replacement).await.unwrap_err().reason, R::Io);
+
+        {
+            let conn = store.conn.lock().unwrap();
+            let state: (i64, i64, i64, i64, i64, i64, i64) = conn
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1),
+                         (SELECT COUNT(*) FROM workflow_history_attachment WHERE attempt_id=?1),
+                         (SELECT history_disposition FROM attempt_identities WHERE attempt_id=?1),
+                         (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?2),
+                         charged_bytes, slots_used, terminal_rows
+                     FROM workflow_history_allocation WHERE singleton=1",
+                    rusqlite::params![
+                        old.identity.attempt_id.as_str(),
+                        replacement.identity.attempt_id.as_str()
+                    ],
+                    |record| {
+                        Ok((
+                            record.get(0)?,
+                            record.get(1)?,
+                            record.get(2)?,
+                            record.get(3)?,
+                            record.get(4)?,
+                            record.get(5)?,
+                            record.get(6)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(state, (0, 0, 1, 0, 0, 0, 0));
+        }
+
+        store.reserve(&replacement).await.unwrap();
+        let counters: (i64, i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |record| Ok((record.get(0)?, record.get(1)?, record.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            counters,
+            (i64::try_from(CONFIGURED_SLOT_CHARGE).unwrap(), 1, 0)
+        );
+    }
+
+    #[test]
+    fn platform_migration_stays_migrating_until_physical_verification_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("platform-verify-transition.sqlite");
+        let canonical_path = std::fs::canonicalize(directory.path())
+            .unwrap()
+            .join("platform-verify-transition.sqlite");
+        PLATFORM_OPEN_TEST_HOOKS
+            .get_or_init(|| Mutex::new(PlatformOpenTestHooks::default()))
+            .lock()
+            .unwrap()
+            .fail_after_physical_verification = Some(canonical_path.clone());
+
+        let error = SqliteStore::open_platform_history(&path)
+            .err()
+            .expect("the deterministic post-verification interruption must fail opening");
+        assert_eq!(
+            error.reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Io
+        );
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT allocation_state FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            state, "migrating",
+            "readiness must not become durable before physical verification settles"
+        );
+        drop(conn);
+
+        drop(SqliteStore::open_platform_history(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT allocation_state FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "ready");
+    }
+
+    #[tokio::test]
+    async fn platform_admin_and_reopen_refuse_tagged_corruption_without_repair() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("platform-tagged-corrupt.sqlite");
+        let store = SqliteStore::open_platform_history(&path).unwrap();
+        let row = reservation_with_ids(
+            "exec-e1111111111111111111111111111111",
+            "attempt-e1111111111111111111111111111111",
+        );
+        store.reserve(&row).await.unwrap();
+        drop(store);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE attempt_identities SET history_disposition=0 WHERE attempt_id=?1",
+            rusqlite::params![row.identity.attempt_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let before = allocation_fixture_snapshot(&path);
+        let untyped = SqliteStore::open(&path).err().unwrap();
+        assert_eq!(
+            SqliteStore::open_platform_history(&path)
+                .err()
+                .expect("normal platform reopen must reject attached-authority corruption")
+                .reason,
+            R::Corruption
+        );
+        assert_eq!(
+            SqliteStore::open_platform_history_admin(&path)
+                .err()
+                .expect("platform admin must reject attached-authority corruption")
+                .reason,
+            R::Corruption
+        );
+        assert_eq!(untyped.reason, R::Corruption);
+        assert_eq!(untyped.sqlite_primary_code, None);
+        assert_eq!(untyped.sqlite_extended_code, None);
+        assert_eq!(allocation_fixture_snapshot(&path), before);
+
+        let disposition: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT history_disposition FROM attempt_identities WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+                |record| record.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            disposition, 0,
+            "neither opener may repair tagged platform corruption"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_admin_and_reopen_refuse_tagged_corruption_without_repair() {
+        use bridge_core::task_store::{TaskAttemptLocator, TaskStore};
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let reopen_path = directory.path().join("configured-reopen-corrupt.sqlite");
+        let store = SqliteStore::open_shared_history(&reopen_path).unwrap();
+        let row = reservation();
+        store.reserve(&row).await.unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(&reopen_path).unwrap();
+        conn.execute(
+            "UPDATE attempt_identities SET history_disposition=0 WHERE attempt_id=?1",
+            rusqlite::params![row.identity.attempt_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = SqliteStore::open_shared_history(&reopen_path)
+            .err()
+            .expect("tagged authority corruption must not be migrated as legacy state");
+        assert_eq!(error.reason, R::Corruption);
+        let conn = rusqlite::Connection::open(&reopen_path).unwrap();
+        let disposition: i64 = conn
+            .query_row(
+                "SELECT history_disposition FROM attempt_identities WHERE attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+                |record| record.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            disposition, 0,
+            "failed validation silently repaired authority"
+        );
+        drop(conn);
+
+        let admin_path = directory.path().join("configured-admin-corrupt.sqlite");
+        let store = SqliteStore::open_shared_history(&admin_path).unwrap();
+        let row = parent_reservation();
+        store.reserve(&row).await.unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(&admin_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DELETE FROM workflow_history_attachment;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = SqliteStore::open_configured_history_admin(&admin_path)
+            .err()
+            .expect("tagged admin open must recompute configured invariants");
+        assert_eq!(error.reason, R::Corruption);
+        let conn = rusqlite::Connection::open(&admin_path).unwrap();
+        let attachments: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_history_attachment",
+                [],
+                |record| record.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attachments, 0,
+            "admin validation silently repaired corruption"
+        );
+
+        let locator_path = directory.path().join("configured-locator-corrupt.sqlite");
+        let store = SqliteStore::open_shared_history(&locator_path).unwrap();
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = bridge_core::ids::TaskId::parse(identity.execution_id.as_str()).unwrap();
+        store
+            .create_with_attempt_locator(
+                &primary_task_record(&task, 1),
+                &TaskAttemptLocator {
+                    identity: identity.clone(),
+                    telemetry_unavailable: None,
+                },
+            )
+            .await
+            .unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(&locator_path).unwrap();
+        conn.execute(
+            "DELETE FROM attempt_identities WHERE attempt_id=?1",
+            rusqlite::params![identity.attempt_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            SqliteStore::open_shared_history(&locator_path)
+                .err()
+                .expect("normal reopen must reject a locator without permanent authority")
+                .reason,
+            R::Corruption
+        );
+        assert_eq!(
+            SqliteStore::open_configured_history_admin(&locator_path)
+                .err()
+                .expect("admin must reject a locator without permanent authority")
+                .reason,
+            R::Corruption
+        );
+        let identities: i64 = rusqlite::Connection::open(&locator_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM attempt_identities WHERE attempt_id=?1",
+                rusqlite::params![identity.attempt_id.as_str()],
+                |record| record.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            identities, 0,
+            "tagged open must not recreate missing locator authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_capacity_refusal_atomically_records_unavailable_disposition() {
+        use bridge_core::task_store::{TaskAttemptLocator, TaskStore};
+        use bridge_core::workflow_history::{
+            LedgerUnavailableReason as R, CONFIGURED_SLOT_CHARGE, MAX_CHARGED_BYTES,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-durable-refusal.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = bridge_core::ids::TaskId::parse(identity.execution_id.as_str()).unwrap();
+        store
+            .create_with_attempt_locator(
+                &primary_task_record(&task, 1),
+                &TaskAttemptLocator {
+                    identity: identity.clone(),
+                    telemetry_unavailable: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let production_slots = MAX_CHARGED_BYTES / CONFIGURED_SLOT_CHARGE;
+        {
+            let mut conn = store.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "WITH RECURSIVE fill(n) AS (
+                     VALUES(1) UNION ALL SELECT n+1 FROM fill WHERE n<?1
+                 )
+                 INSERT INTO attempt_identities(
+                     attempt_id, execution_id, ordinal, owner_surface, history_disposition)
+                 SELECT printf('attempt-cap-%021d', n),
+                        printf('exec-cap-%024d', n), 0, 'offline', 1
+                 FROM fill",
+                rusqlite::params![i64::try_from(production_slots).unwrap()],
+            )
+            .unwrap();
+            tx.execute(
+                "WITH RECURSIVE fill(n) AS (
+                     VALUES(1) UNION ALL SELECT n+1 FROM fill WHERE n<?1
+                 )
+                 INSERT INTO workflow_attempt_summaries(
+                     attempt_id, execution_id, ordinal, workflow, task_class, surface,
+                     policy, workload_fingerprint, started_ms, status, prompt_acceptance,
+                     pinned, charged_bytes, reservation_json)
+                 SELECT printf('attempt-cap-%021d', n),
+                        printf('exec-cap-%024d', n), 0, 'fixture', 'fixture', 'offline',
+                        'r2f0a', 'shape-fixture', 1, 'active', 'not_dispatched',
+                        1, 16384, '{}'
+                 FROM fill",
+                rusqlite::params![i64::try_from(production_slots).unwrap()],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO workflow_history_attachment(attempt_id, charged_bytes)
+                 SELECT attempt_id, 1024 FROM workflow_attempt_summaries",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "UPDATE workflow_history_allocation
+                 SET charged_bytes=?1, slots_used=?2 WHERE singleton=1",
+                rusqlite::params![
+                    i64::try_from(production_slots * CONFIGURED_SLOT_CHARGE).unwrap(),
+                    i64::try_from(production_slots).unwrap()
+                ],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let mut reservation = reservation();
+        reservation.identity = identity.clone();
+        reservation.task_id = Some(task.clone());
+        reservation.surface = ExecutionSurface::ServedTask;
+        assert_eq!(
+            store.reserve(&reservation).await.unwrap_err().reason,
+            R::CapacityProtected
+        );
+
+        {
+            let conn = store.conn.lock().unwrap();
+            let disposition: (i64, Option<String>, String) = conn
+                .query_row(
+                    "SELECT identity.history_disposition,
+                            identity.history_unavailable_reason, locator.locator_json
+                     FROM attempt_identities identity
+                     JOIN task_attempt_locators locator ON locator.task_id=identity.task_id
+                     WHERE identity.attempt_id=?1",
+                    rusqlite::params![identity.attempt_id.as_str()],
+                    |record| Ok((record.get(0)?, record.get(1)?, record.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(disposition.0, 2);
+            assert_eq!(disposition.1.as_deref(), Some("capacity_protected"));
+            let locator: TaskAttemptLocator = serde_json::from_str(&disposition.2).unwrap();
+            assert_eq!(locator.telemetry_unavailable, Some(R::CapacityProtected));
+            let leaked: (i64, i64) = conn
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1),
+                         (SELECT COUNT(*) FROM workflow_history_attachment WHERE attempt_id=?1)",
+                    rusqlite::params![identity.attempt_id.as_str()],
+                    |record| Ok((record.get(0)?, record.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(leaked, (0, 0));
+        }
+
+        {
+            let mut conn = store.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "DELETE FROM workflow_attempt_summaries
+                 WHERE attempt_id='attempt-cap-000000000000000000001'",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "UPDATE workflow_history_allocation
+                 SET charged_bytes=charged_bytes-17408, slots_used=slots_used-1
+                 WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        drop(store);
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        assert_eq!(
+            store.reserve(&reservation).await.unwrap_err().reason,
+            R::Collision
+        );
+        let conn = store.conn.lock().unwrap();
+        let counters: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT charged_bytes, slots_used,
+                        (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1)
+                 FROM workflow_history_allocation WHERE singleton=1",
+                rusqlite::params![identity.attempt_id.as_str()],
+                |record| Ok((record.get(0)?, record.get(1)?, record.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            counters,
+            (
+                i64::try_from((production_slots - 1) * CONFIGURED_SLOT_CHARGE).unwrap(),
+                i64::try_from(production_slots - 1).unwrap(),
+                0,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_admission_interruption_rolls_back_every_durable_component() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("configured-admission-interruption.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let row = reservation_with_ids(
+            "exec-a1111111111111111111111111111111",
+            "attempt-a1111111111111111111111111111111",
+        );
+        arm_history_mutation_failpoint(
+            &store,
+            &row.identity.attempt_id,
+            HistoryMutationFailpointKind::AdmissionIo,
+        );
+
+        assert_eq!(store.reserve(&row).await.unwrap_err().reason, R::Io);
+        {
+            let conn = store.conn.lock().unwrap();
+            let state: (i64, i64, i64, i64, i64) = conn
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM attempt_identities WHERE attempt_id=?1),
+                         (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1),
+                         (SELECT COUNT(*) FROM workflow_history_attachment WHERE attempt_id=?1),
+                         charged_bytes, slots_used
+                     FROM workflow_history_allocation WHERE singleton=1",
+                    rusqlite::params![row.identity.attempt_id.as_str()],
+                    |record| {
+                        Ok((
+                            record.get(0)?,
+                            record.get(1)?,
+                            record.get(2)?,
+                            record.get(3)?,
+                            record.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(state, (0, 0, 0, 0, 0));
+        }
+
+        drop(store);
+        let reopened = SqliteStore::open_shared_history(&path).unwrap();
+        reopened.reserve(&row).await.unwrap();
+        let counters: (i64, i64) = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT charged_bytes, slots_used
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |record| Ok((record.get(0)?, record.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counters, (17_408, 1));
+    }
+
+    #[tokio::test]
+    async fn configured_retention_interruption_rolls_back_then_reopens_retryably() {
+        use bridge_core::workflow_history::{
+            LedgerUnavailableReason as R, CONFIGURED_SLOT_CHARGE, RETENTION_DAYS,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("configured-retention-interruption.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let old = reservation_with_ids(
+            "exec-b1111111111111111111111111111111",
+            "attempt-b1111111111111111111111111111111",
+        );
+        store.reserve(&old).await.unwrap();
+        store
+            .terminalize(&old.identity.attempt_id, &terminal())
+            .await
+            .unwrap();
+
+        let mut replacement = followup(&old, "attempt-b2222222222222222222222222222222");
+        replacement.started_ms = 2_000 + RETENTION_DAYS * 24 * 60 * 60 * 1_000 + 1;
+        arm_history_mutation_failpoint(
+            &store,
+            &old.identity.attempt_id,
+            HistoryMutationFailpointKind::RetentionIo,
+        );
+        assert_eq!(store.reserve(&replacement).await.unwrap_err().reason, R::Io);
+
+        {
+            let conn = store.conn.lock().unwrap();
+            let state: (i64, i64, i64, i64, i64) = conn
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1),
+                         (SELECT COUNT(*) FROM workflow_history_attachment WHERE attempt_id=?1),
+                         charged_bytes, slots_used, terminal_rows
+                     FROM workflow_history_allocation WHERE singleton=1",
+                    rusqlite::params![old.identity.attempt_id.as_str()],
+                    |record| {
+                        Ok((
+                            record.get(0)?,
+                            record.get(1)?,
+                            record.get(2)?,
+                            record.get(3)?,
+                            record.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(state, (1, 1, 17_408, 1, 1));
+        }
+
+        drop(store);
+        let reopened = SqliteStore::open_shared_history(&path).unwrap();
+        reopened.reserve(&replacement).await.unwrap();
+        let state: (i64, i64, i64, i64) = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1),
+                     charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                rusqlite::params![old.identity.attempt_id.as_str()],
+                |record| {
+                    Ok((
+                        record.get(0)?,
+                        record.get(1)?,
+                        record.get(2)?,
+                        record.get(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (0, i64::try_from(CONFIGURED_SLOT_CHARGE).unwrap(), 1, 0,)
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_terminal_sqlite_full_is_io_and_preserves_retry_credit() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-terminal-full.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let row = reservation_with_ids(
+            "exec-c1111111111111111111111111111111",
+            "attempt-c1111111111111111111111111111111",
+        );
+        store.reserve(&row).await.unwrap();
+        arm_history_mutation_failpoint(
+            &store,
+            &row.identity.attempt_id,
+            HistoryMutationFailpointKind::TerminalSqliteFull,
+        );
+
+        let error = store
+            .terminalize(&row.identity.attempt_id, &terminal())
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, R::Io);
+        assert_eq!(error.sqlite_primary_code, Some(rusqlite::ffi::SQLITE_FULL));
+        assert_eq!(error.sqlite_extended_code, Some(rusqlite::ffi::SQLITE_FULL));
+        {
+            let conn = store.conn.lock().unwrap();
+            let state: (String, i64, i64, i64, i64) = conn
+                .query_row(
+                    "SELECT summary.status,
+                            summary.terminal_json IS NULL,
+                            allocation.charged_bytes,
+                            allocation.slots_used,
+                            allocation.terminal_rows
+                     FROM workflow_attempt_summaries summary
+                     JOIN workflow_history_allocation allocation ON allocation.singleton=1
+                     WHERE summary.attempt_id=?1",
+                    rusqlite::params![row.identity.attempt_id.as_str()],
+                    |record| {
+                        Ok((
+                            record.get(0)?,
+                            record.get(1)?,
+                            record.get(2)?,
+                            record.get(3)?,
+                            record.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(state, ("active".to_owned(), 1, 17_408, 1, 0));
+        }
+
+        drop(store);
+        let reopened = SqliteStore::open_shared_history(&path).unwrap();
+        assert_eq!(
+            reopened
+                .terminalize(&row.identity.attempt_id, &terminal())
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+        let state: (String, i64, i64, i64) = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT summary.status, allocation.charged_bytes,
+                        allocation.slots_used, allocation.terminal_rows
+                 FROM workflow_attempt_summaries summary
+                 JOIN workflow_history_allocation allocation ON allocation.singleton=1
+                 WHERE summary.attempt_id=?1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+                |record| {
+                    Ok((
+                        record.get(0)?,
+                        record.get(1)?,
+                        record.get(2)?,
+                        record.get(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(state, ("terminal".to_owned(), 17_408, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn configured_recovery_commits_one_row_then_resumes_after_interruption() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("configured-recovery-interruption.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let first = reservation_with_ids(
+            "exec-d1111111111111111111111111111111",
+            "attempt-d1111111111111111111111111111111",
+        );
+        let second = reservation_with_ids(
+            "exec-d2222222222222222222222222222222",
+            "attempt-d2222222222222222222222222222222",
+        );
+        let third = reservation_with_ids(
+            "exec-d3333333333333333333333333333333",
+            "attempt-d3333333333333333333333333333333",
+        );
+        for row in [&first, &second, &third] {
+            store.reserve(row).await.unwrap();
+        }
+        arm_history_mutation_failpoint(
+            &store,
+            &second.identity.attempt_id,
+            HistoryMutationFailpointKind::RecoveryIo,
+        );
+
+        assert_eq!(
+            store.interrupt_active(3_000).await.unwrap_err().reason,
+            R::Io
+        );
+        {
+            let conn = store.conn.lock().unwrap();
+            let statuses = [&first, &second, &third].map(|row| {
+                conn.query_row(
+                    "SELECT status FROM workflow_attempt_summaries WHERE attempt_id=?1",
+                    rusqlite::params![row.identity.attempt_id.as_str()],
+                    |record| record.get::<_, String>(0),
+                )
+                .unwrap()
+            });
+            assert_eq!(
+                statuses,
+                [
+                    "terminal".to_owned(),
+                    "active".to_owned(),
+                    "active".to_owned()
+                ]
+            );
+            let counters: (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT charged_bytes, slots_used, terminal_rows
+                     FROM workflow_history_allocation WHERE singleton=1",
+                    [],
+                    |record| Ok((record.get(0)?, record.get(1)?, record.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(counters, (52_224, 3, 1));
+        }
+
+        drop(store);
+        let reopened = SqliteStore::open_shared_history(&path).unwrap();
+        assert_eq!(reopened.interrupt_active(4_000).await.unwrap(), 2);
+        let counters: (i64, i64, i64) = reopened
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |record| Ok((record.get(0)?, record.get(1)?, record.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counters, (52_224, 3, 3));
+    }
+
+    #[tokio::test]
+    async fn r2f0a_b3_configured_migration_rolls_back_completely_then_retries() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("configured-migration-rollback.sqlite");
+        let rows = create_legacy_configured_capacity_fixture(&path, true, true);
+        let before = legacy_configured_snapshot(&path);
+        assert!(before
+            .tables
+            .iter()
+            .all(|table| table.name != "workflow_history_allocation"));
+        for observed in [
+            "tasks",
+            "task_journal",
+            "sqliteAudit",
+            "workflow_attempt_summaries",
+            "workflow_history_attachment",
+            "workflow_history_rewrite_reserve",
+            "task_attempt_identities",
+        ] {
+            assert!(before.tables.iter().any(|table| table.name == observed));
+        }
+        let audit_schema = before
+            .schema
+            .iter()
+            .find(|(_, name, _, _)| name == "sqliteAudit")
+            .expect("the allowed literal sqlite prefix table schema must be captured");
+        assert_eq!(audit_schema.0, "table");
+        assert_eq!(audit_schema.2, "sqliteAudit");
+        for declaration in [
+            "id INTEGER PRIMARY KEY AUTOINCREMENT",
+            "kind TEXT NOT NULL",
+            "score REAL NOT NULL",
+            "optional_value TEXT",
+            "payload BLOB NOT NULL",
+        ] {
+            assert!(audit_schema.3.contains(declaration));
+        }
+        let audit_table = before
+            .tables
+            .iter()
+            .find(|table| table.name == "sqliteAudit")
+            .expect("the allowed literal sqlite prefix table rows must be captured");
+        assert_eq!(
+            audit_table.columns,
+            ["id", "kind", "score", "optional_value", "payload"]
+        );
+        assert_eq!(
+            audit_table.rows,
+            [vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Text("literal-prefix".to_owned()),
+                rusqlite::types::Value::Real(1.25),
+                rusqlite::types::Value::Null,
+                rusqlite::types::Value::Blob(LEGACY_SQLITE_AUDIT_BLOB.to_vec()),
+            ]]
+        );
+        assert!(before
+            .schema
+            .iter()
+            .all(|(_, name, _, _)| !name.starts_with("sqlite_")));
+        assert!(before
+            .tables
+            .iter()
+            .all(|table| !table.name.starts_with("sqlite_")));
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let sqlite_internal_objects: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='sqlite_sequence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sqlite_internal_objects, 1);
+        let original_audit_blob: Vec<u8> = conn
+            .query_row("SELECT payload FROM sqliteAudit WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(original_audit_blob, LEGACY_SQLITE_AUDIT_BLOB);
+        let mut changed_audit_blob = original_audit_blob.clone();
+        changed_audit_blob[0] ^= 0xff;
+        assert_eq!(changed_audit_blob.len(), original_audit_blob.len());
+        conn.execute(
+            "UPDATE sqliteAudit SET payload=?1 WHERE id=1",
+            [&changed_audit_blob],
+        )
+        .unwrap();
+        assert_ne!(legacy_configured_snapshot(&path), before);
+        conn.execute(
+            "UPDATE sqliteAudit SET payload=?1 WHERE id=1",
+            [&original_audit_blob],
+        )
+        .unwrap();
+
+        let sensitivity_identity = legacy_configured_fixture_identity(4);
+        let original: String = conn
+            .query_row(
+                "SELECT reservation_json FROM workflow_attempt_summaries
+                 WHERE attempt_id=?1",
+                [sensitivity_identity.attempt_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let changed = original.replace("r2f0a-b3", "r2f0a-c3");
+        assert_eq!(changed.len(), original.len());
+        conn.execute(
+            "UPDATE workflow_attempt_summaries SET reservation_json=?1
+             WHERE attempt_id=?2",
+            rusqlite::params![&changed, sensitivity_identity.attempt_id.as_str()],
+        )
+        .unwrap();
+        assert_ne!(legacy_configured_snapshot(&path), before);
+        conn.execute(
+            "UPDATE workflow_attempt_summaries SET reservation_json=?1
+             WHERE attempt_id=?2",
+            rusqlite::params![&original, sensitivity_identity.attempt_id.as_str()],
+        )
+        .unwrap();
+
+        let original_rewrite: Vec<u8> = conn
+            .query_row(
+                "SELECT reserve FROM workflow_history_rewrite_reserve WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(original_rewrite, LEGACY_REWRITE_RESERVE);
+        let mut changed_rewrite = original_rewrite.clone();
+        changed_rewrite[0] ^= 0xff;
+        assert_eq!(changed_rewrite.len(), original_rewrite.len());
+        conn.execute(
+            "UPDATE workflow_history_rewrite_reserve SET reserve=?1 WHERE singleton=1",
+            rusqlite::params![&changed_rewrite],
+        )
+        .unwrap();
+        assert_ne!(legacy_configured_snapshot(&path), before);
+        conn.execute(
+            "UPDATE workflow_history_rewrite_reserve SET reserve=?1 WHERE singleton=1",
+            rusqlite::params![&original_rewrite],
+        )
+        .unwrap();
+
+        let original_terminal_reserve: Vec<u8> = conn
+            .query_row(
+                "SELECT terminal_reserve FROM workflow_attempt_summaries
+                 WHERE attempt_id=?1",
+                [sensitivity_identity.attempt_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(original_terminal_reserve, LEGACY_TERMINAL_RESERVE);
+        let null_terminal_reserves: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_attempt_summaries
+                 WHERE terminal_reserve IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(null_terminal_reserves > 0);
+        let mut changed_terminal_reserve = original_terminal_reserve.clone();
+        changed_terminal_reserve[0] ^= 0xff;
+        assert_eq!(
+            changed_terminal_reserve.len(),
+            original_terminal_reserve.len()
+        );
+        conn.execute(
+            "UPDATE workflow_attempt_summaries SET terminal_reserve=?1
+             WHERE attempt_id=?2",
+            rusqlite::params![
+                &changed_terminal_reserve,
+                sensitivity_identity.attempt_id.as_str()
+            ],
+        )
+        .unwrap();
+        assert_ne!(legacy_configured_snapshot(&path), before);
+        conn.execute(
+            "UPDATE workflow_attempt_summaries SET terminal_reserve=?1
+             WHERE attempt_id=?2",
+            rusqlite::params![
+                &original_terminal_reserve,
+                sensitivity_identity.attempt_id.as_str()
+            ],
+        )
+        .unwrap();
+
+        let original_legacy_execution: String = conn
+            .query_row(
+                "SELECT execution_id FROM task_attempt_identities WHERE task_id=?1",
+                [LEGACY_TASK_EXECUTION_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let changed_legacy_execution = original_legacy_execution.replace("b3a1", "b3a2");
+        assert_eq!(
+            changed_legacy_execution.len(),
+            original_legacy_execution.len()
+        );
+        conn.execute(
+            "UPDATE task_attempt_identities SET execution_id=?1 WHERE task_id=?2",
+            rusqlite::params![&changed_legacy_execution, LEGACY_TASK_EXECUTION_ID],
+        )
+        .unwrap();
+        assert_ne!(legacy_configured_snapshot(&path), before);
+        conn.execute(
+            "UPDATE task_attempt_identities SET execution_id=?1 WHERE task_id=?2",
+            rusqlite::params![&original_legacy_execution, LEGACY_TASK_EXECUTION_ID],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(legacy_configured_snapshot(&path), before);
+
+        arm_configured_migration_failpoint(&path);
+        let error = SqliteStore::open_shared_history(&path)
+            .err()
+            .expect("the configured migration failpoint must abort before commit");
+        assert_eq!(error.reason, R::Io);
+        assert_eq!(error.sqlite_primary_code, Some(rusqlite::ffi::SQLITE_IOERR));
+        assert_eq!(
+            error.sqlite_extended_code,
+            Some(rusqlite::ffi::SQLITE_IOERR)
+        );
+        assert_eq!(
+            legacy_configured_snapshot(&path),
+            before,
+            "BEGIN IMMEDIATE must roll back schema, disposition, attachment, charge, retention, and allocation changes"
+        );
+
+        let configured = SqliteStore::open_shared_history(&path)
+            .expect("the same untagged database must retry after the one-shot failure");
+        let state: (i64, i64, i64, i64, i64, i64, i64) = configured
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM workflow_attempt_summaries),
+                     (SELECT COUNT(*) FROM workflow_history_attachment),
+                     (SELECT COUNT(*) FROM attempt_identities
+                      WHERE history_disposition=1),
+                     (SELECT COUNT(*) FROM workflow_attempt_summaries
+                      WHERE charged_bytes<>16384),
+                     charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let retained = i64::try_from(rows - 1).unwrap();
+        assert_eq!(
+            state,
+            (
+                retained,
+                retained,
+                i64::try_from(rows).unwrap(),
+                0,
+                retained * 17_408,
+                retained,
+                2,
+            )
+        );
+        let persisted_reserves: (Vec<u8>, Vec<u8>) = configured
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT
+                     (SELECT reserve FROM workflow_history_rewrite_reserve WHERE singleton=1),
+                     (SELECT terminal_reserve FROM workflow_attempt_summaries
+                      WHERE attempt_id=?1)",
+                [legacy_configured_fixture_identity(4).attempt_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            persisted_reserves,
+            (
+                LEGACY_REWRITE_RESERVE.to_vec(),
+                LEGACY_TERMINAL_RESERVE.to_vec()
+            )
+        );
+        let imported_legacy_authority: (String, i64, Option<String>, String, i64, Option<String>) =
+            configured
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT execution_id, ordinal, task_id, owner_surface,
+                        history_disposition, history_unavailable_reason
+                 FROM attempt_identities WHERE attempt_id=?1",
+                    [LEGACY_TASK_ATTEMPT_ID],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .unwrap();
+        assert_eq!(
+            imported_legacy_authority,
+            (
+                LEGACY_TASK_EXECUTION_ID.to_owned(),
+                LEGACY_TASK_ORDINAL,
+                Some(LEGACY_TASK_EXECUTION_ID.to_owned()),
+                "served_task".to_owned(),
+                0,
+                None,
+            )
+        );
+        let legacy_table_exists: i64 = configured
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='task_attempt_identities'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_table_exists, 0);
+        assert_legacy_configured_survivors_readable(&configured, true).await;
+        drop(configured);
+
+        arm_configured_migration_failpoint(&path);
+        drop(
+            SqliteStore::open_shared_history(&path)
+                .expect("an already-tagged configured open must ignore the migration failpoint"),
+        );
+        assert!(configured_migration_failpoint_is_armed(&path));
+        clear_configured_migration_failpoint();
+
+        let platform_path = directory.path().join("platform-migration-control.sqlite");
+        drop(SqliteStore::open(&platform_path).unwrap());
+        arm_configured_migration_failpoint(&platform_path);
+        drop(
+            SqliteStore::open_platform_history(&platform_path)
+                .expect("platform migration must ignore the configured-only failpoint"),
+        );
+        assert!(configured_migration_failpoint_is_armed(&platform_path));
+        clear_configured_migration_failpoint();
+
+        arm_configured_migration_failpoint(&platform_path);
+        drop(
+            SqliteStore::open_platform_history(&platform_path)
+                .expect("tagged platform reopen must ignore the configured-only failpoint"),
+        );
+        assert!(configured_migration_failpoint_is_armed(&platform_path));
+        clear_configured_migration_failpoint();
+    }
+
+    #[tokio::test]
+    async fn r2f0a_b3_protected_over_cap_migration_is_atomic_and_collects_oldest_eligible() {
+        use bridge_core::workflow_history::{LedgerUnavailableReason as R, CONFIGURED_SLOT_CHARGE};
+
+        let protected_directory = tempfile::tempdir().unwrap();
+        let protected_path = protected_directory.path().join("protected.sqlite");
+        let rows = create_legacy_configured_capacity_fixture(&protected_path, false, false);
+        let protected_before = legacy_configured_snapshot(&protected_path);
+        let error = SqliteStore::open_shared_history(&protected_path)
+            .err()
+            .expect("an over-cap legacy allocation with no eligible terminal must refuse");
+        assert_eq!(error.reason, R::CapacityProtected);
+        assert_eq!(error.sqlite_primary_code, None);
+        assert_eq!(error.sqlite_extended_code, None);
+        assert_eq!(
+            legacy_configured_snapshot(&protected_path),
+            protected_before,
+            "capacity_protected must preserve the complete logical schema and state"
+        );
+
+        let eligible_directory = tempfile::tempdir().unwrap();
+        let eligible_path = eligible_directory.path().join("eligible.sqlite");
+        assert_eq!(
+            create_legacy_configured_capacity_fixture(&eligible_path, true, false),
+            rows
+        );
+        let configured = SqliteStore::open_shared_history(&eligible_path).unwrap();
+        let first = legacy_configured_fixture_identity(1);
+        let second = legacy_configured_fixture_identity(2);
+        let third = legacy_configured_fixture_identity(3);
+        let survivors: (i64, i64, i64, i64, i64, i64, i64, i64) = {
+            let conn = configured.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM workflow_attempt_summaries
+                      WHERE attempt_id=?1),
+                     (SELECT COUNT(*) FROM workflow_attempt_summaries
+                      WHERE attempt_id=?2
+                        AND status='terminal' AND pinned=0),
+                     (SELECT COUNT(*) FROM workflow_attempt_summaries
+                      WHERE attempt_id=?3
+                        AND status='terminal' AND pinned=1),
+                     (SELECT COUNT(*) FROM workflow_attempt_summaries
+                      WHERE status='active'),
+                     (SELECT COUNT(*) FROM workflow_history_attachment),
+                     charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                rusqlite::params![
+                    first.attempt_id.as_str(),
+                    second.attempt_id.as_str(),
+                    third.attempt_id.as_str()
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let retained = i64::try_from(rows - 1).unwrap();
+        assert_eq!(
+            survivors,
+            (
+                0,
+                1,
+                1,
+                i64::try_from(rows - 3).unwrap(),
+                retained,
+                i64::try_from((rows - 1) * CONFIGURED_SLOT_CHARGE).unwrap(),
+                retained,
+                2,
+            ),
+            "only the deterministic oldest eligible row is collected"
+        );
+        assert_legacy_configured_survivors_readable(&configured, true).await;
+    }
+
+    #[tokio::test]
+    async fn r2f0a_b3_configured_lifecycle_ignores_shared_primary_main_and_pinned_wal() {
+        use bridge_core::task_store::TaskStore;
+        use bridge_core::workflow_history::{
+            LedgerUnavailableReason as R, WorkflowHistoryStore, CONFIGURED_SLOT_CHARGE,
+            MAX_CHARGED_BYTES, RETENTION_DAYS,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-shared-primary.sqlite");
+        let primary = SqliteStore::open(&path).unwrap();
+        {
+            let conn = primary.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO tasks(
+                     id, workflow, status, result, created_ms, updated_ms)
+                 VALUES('task-b3-large-main', 'unrelated', 'completed',
+                        zeroblob(62914560), 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO turn_log(turn_id, session_id, attempt, agent, outcome)
+                 VALUES('turn-b3-main', 'session-b3-main', 0, 'unrelated', 'completed')",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+        assert!(
+            std::fs::metadata(&path).unwrap().len()
+                > MAX_CHARGED_BYTES - HISTORY_SIDECAR_HEADROOM_BYTES
+        );
+
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        {
+            let conn = primary.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO tasks(
+                     id, workflow, status, result, created_ms, updated_ms)
+                 VALUES('task-b3-large-wal', 'unrelated', 'completed',
+                        zeroblob(8388608), 2, 2)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO turn_log(turn_id, session_id, attempt, agent, outcome)
+                 VALUES('turn-b3-wal', 'session-b3-wal', 0, 'unrelated', 'completed')",
+                [],
+            )
+            .unwrap();
+        }
+        drop(primary);
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        assert!(
+            std::fs::metadata(&wal_path)
+                .map(|metadata| metadata.len() >= 8 * 1024 * 1024)
+                .unwrap_or(false),
+            "the live reader must pin a large unrelated primary WAL"
+        );
+
+        let configured = SqliteStore::open_shared_history(&path)
+            .expect("configured migration must use logical history accounting");
+        let primary_task = TaskId::parse("task-b3-normal-primary-operation").unwrap();
+        configured
+            .create(&primary_task_record(&primary_task, 10))
+            .await
+            .unwrap();
+        assert!(configured.get(&primary_task).await.unwrap().is_some());
+
+        let old = reservation_with_ids(
+            "exec-b3111111111111111111111111111111",
+            "attempt-b3111111111111111111111111111111",
+        );
+        configured.reserve(&old).await.unwrap();
+        configured
+            .mark_prompt_acceptance(&old.identity.attempt_id, "dispatch_uncertain")
+            .await
+            .unwrap();
+        assert!(configured
+            .set_pinned(&old.identity.attempt_id, true)
+            .await
+            .unwrap());
+        assert!(configured
+            .set_pinned(&old.identity.attempt_id, false)
+            .await
+            .unwrap());
+        configured
+            .terminalize(&old.identity.attempt_id, &terminal())
+            .await
+            .unwrap();
+
+        let boot = reservation_with_ids(
+            "exec-b3222222222222222222222222222222",
+            "attempt-b3222222222222222222222222222222",
+        );
+        configured.reserve(&boot).await.unwrap();
+        configured
+            .mark_prompt_acceptance(&boot.identity.attempt_id, "dispatch_uncertain")
+            .await
+            .unwrap();
+        drop(configured);
+        assert!(std::fs::metadata(&wal_path).unwrap().len() >= 8 * 1024 * 1024);
+        let configured = SqliteStore::open_shared_history(&path)
+            .expect("boot must reopen configured history while the unrelated WAL is pinned");
+        assert!(configured.get(&primary_task).await.unwrap().is_some());
+        assert_eq!(configured.interrupt_active(4_000).await.unwrap(), 1);
+        let recovered = configured
+            .attempt(&boot.identity.attempt_id)
+            .await
+            .unwrap()
+            .expect("boot recovery must remain production-readable");
+        let mut expected_boot = boot.clone();
+        expected_boot.prompt_acceptance = "dispatch_uncertain".into();
+        assert_eq!(recovered.reservation, expected_boot);
+        assert_eq!(
+            recovered.terminal,
+            Some(AttemptTerminal {
+                completed_ms: 4_000,
+                work_ms: 0,
+                end_to_end_ms: 0,
+                queue_ms: 0,
+                cancellation_ms: 0,
+                cleanup_ms: 0,
+                finalization_ms: 0,
+                outcome: "interrupted".into(),
+                terminal_reason: "process_restart".into(),
+                producer_terminal: "unknown".into(),
+                final_message: "unknown".into(),
+                process_liveness: "exited".into(),
+                terminal_evidence_capability: "unsupported".into(),
+                terminal_evidence_version: "none".into(),
+                terminal_evidence_source: "none".into(),
+                terminal_evidence_complete: false,
+                degraded: true,
+                prompt_acceptance: "dispatch_uncertain".into(),
+                cleanup_disposition: "unknown".into(),
+                node_counts: NodeCounts::default(),
+                phase_durations: Vec::new(),
+                telemetry_complete: false,
+                monotonic_clock: false,
+            })
+        );
+
+        let mut replacement = reservation_with_ids(
+            "exec-b3333333333333333333333333333333",
+            "attempt-b3333333333333333333333333333333",
+        );
+        replacement.started_ms = 2_000 + RETENTION_DAYS * 24 * 60 * 60 * 1_000 + 1;
+        configured.reserve(&replacement).await.unwrap();
+
+        let counters: (i64, i64, i64) = configured
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            counters,
+            (i64::try_from(2 * CONFIGURED_SLOT_CHARGE).unwrap(), 2, 1)
+        );
+        assert!(configured
+            .attempt(&old.identity.attempt_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        let stats = SqliteStore::open_configured_history_read_only(&path).unwrap();
+        let completed = stats.completed_between(0, i64::MAX).await.unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].reservation.identity.attempt_id,
+            boot.identity.attempt_id
+        );
+        let stats_counters: (i64, i64, i64) = stats
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stats_counters, counters);
+        assert!(std::fs::metadata(&wal_path).unwrap().len() >= 8 * 1024 * 1024);
+        reader.execute_batch("ROLLBACK").unwrap();
+
+        let platform_path = directory.path().join("platform-physical-control.sqlite");
+        let platform_legacy = SqliteStore::open(&platform_path).unwrap();
+        platform_legacy
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO tasks(
+                     id, workflow, status, result, created_ms, updated_ms)
+                 VALUES('task-b3-platform-main', 'unrelated', 'completed',
+                        zeroblob(62914560), 1, 1)",
+                [],
+            )
+            .unwrap();
+        platform_legacy
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(platform_legacy);
+        let error = SqliteStore::open_platform_history(&platform_path)
+            .err()
+            .expect("the same physical-over-cap main state must fail platform admission");
+        assert_eq!(error.reason, R::CapacityProtected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r2f0a_b3_admin_pin_and_retention_linearize_in_both_commit_orders() {
+        use bridge_core::workflow_history::{
+            LedgerUnavailableReason as R, WorkflowHistoryStore, CONFIGURED_SLOT_CHARGE,
+            RETENTION_DAYS,
+        };
+
+        fn spawn_reserve(
+            store: std::sync::Arc<SqliteStore>,
+            row: AttemptReservation,
+        ) -> std::thread::JoinHandle<Result<(), bridge_core::workflow_history::LedgerError>>
+        {
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(store.reserve(&row))
+            })
+        }
+
+        fn spawn_pin(
+            store: std::sync::Arc<SqliteStore>,
+            id: bridge_core::ids::AttemptId,
+        ) -> std::thread::JoinHandle<Result<bool, bridge_core::workflow_history::LedgerError>>
+        {
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(store.set_pinned(&id, true))
+            })
+        }
+
+        let pin_first_directory = tempfile::tempdir().unwrap();
+        let pin_first_path = pin_first_directory.path().join("pin-first.sqlite");
+        let pin_first_primary =
+            std::sync::Arc::new(SqliteStore::open_shared_history(&pin_first_path).unwrap());
+        let pin_first_admin = std::sync::Arc::new(
+            SqliteStore::open_configured_history_admin(&pin_first_path).unwrap(),
+        );
+        let pin_first_old = reservation_with_ids(
+            "exec-b3411111111111111111111111111111",
+            "attempt-b3411111111111111111111111111111",
+        );
+        pin_first_primary.reserve(&pin_first_old).await.unwrap();
+        pin_first_primary
+            .terminalize(&pin_first_old.identity.attempt_id, &terminal())
+            .await
+            .unwrap();
+        let mut pin_first_replacement = reservation_with_ids(
+            "exec-b3422222222222222222222222222222",
+            "attempt-b3422222222222222222222222222222",
+        );
+        pin_first_replacement.started_ms = 2_000 + RETENTION_DAYS * 24 * 60 * 60 * 1_000 + 1;
+
+        let (pin_reached, pin_proceed) =
+            arm_history_transaction_pause(&pin_first_path, HistoryTransactionPausePoint::SetPinned);
+        let wrong_path =
+            canonical_fixture_path(&pin_first_directory.path().join("wrong-pause-path.sqlite"));
+        history_transaction_pause(Some(&wrong_path), HistoryTransactionPausePoint::SetPinned);
+        assert!(history_transaction_pause_is_armed(
+            &pin_first_path,
+            HistoryTransactionPausePoint::SetPinned
+        ));
+        history_transaction_pause(
+            Some(&canonical_fixture_path(&pin_first_path)),
+            HistoryTransactionPausePoint::Reserve,
+        );
+        assert!(history_transaction_pause_is_armed(
+            &pin_first_path,
+            HistoryTransactionPausePoint::SetPinned
+        ));
+        assert!(matches!(
+            pin_reached.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let pin = spawn_pin(
+            pin_first_admin.clone(),
+            pin_first_old.identity.attempt_id.clone(),
+        );
+        pin_reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("pin did not acquire the real admission lease");
+        let contention = arm_history_admission_contention(&pin_first_path);
+        let unrelated =
+            canonical_fixture_path(&pin_first_directory.path().join("unrelated.sqlite"));
+        history_admission_contention_observed(Some(&unrelated));
+        assert!(history_admission_contention_is_armed(&pin_first_path));
+        assert!(!history_admission_contention_is_armed(&unrelated));
+        let retention = spawn_reserve(pin_first_primary.clone(), pin_first_replacement);
+        contention
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("retention loser did not observe the held admission lease");
+        assert!(!history_admission_contention_is_armed(&pin_first_path));
+        pin_proceed.send(()).unwrap();
+        assert!(pin.join().unwrap().unwrap());
+        retention.join().unwrap().unwrap();
+        assert!(!history_transaction_pause_is_armed(
+            &pin_first_path,
+            HistoryTransactionPausePoint::SetPinned
+        ));
+
+        let pin_first_record = pin_first_primary
+            .attempt(&pin_first_old.identity.attempt_id)
+            .await
+            .unwrap()
+            .expect("retention must observe the committed pin");
+        assert!(pin_first_record.reservation.pinned);
+        let pin_first_state: (i64, i64, i64, i64, i64) = pin_first_primary
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM workflow_history_attachment WHERE attempt_id=?1),
+                     (SELECT history_disposition FROM attempt_identities WHERE attempt_id=?1),
+                     charged_bytes, slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                rusqlite::params![pin_first_old.identity.attempt_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            pin_first_state,
+            (
+                1,
+                1,
+                i64::try_from(2 * CONFIGURED_SLOT_CHARGE).unwrap(),
+                2,
+                1,
+            )
+        );
+
+        let retention_first_directory = tempfile::tempdir().unwrap();
+        let retention_first_path = retention_first_directory
+            .path()
+            .join("retention-first.sqlite");
+        let retention_first_primary =
+            std::sync::Arc::new(SqliteStore::open_shared_history(&retention_first_path).unwrap());
+        let retention_first_admin = std::sync::Arc::new(
+            SqliteStore::open_configured_history_admin(&retention_first_path).unwrap(),
+        );
+        let retention_first_old = reservation_with_ids(
+            "exec-b3511111111111111111111111111111",
+            "attempt-b3511111111111111111111111111111",
+        );
+        retention_first_primary
+            .reserve(&retention_first_old)
+            .await
+            .unwrap();
+        retention_first_primary
+            .terminalize(&retention_first_old.identity.attempt_id, &terminal())
+            .await
+            .unwrap();
+        let mut retention_first_replacement = reservation_with_ids(
+            "exec-b3522222222222222222222222222222",
+            "attempt-b3522222222222222222222222222222",
+        );
+        retention_first_replacement.started_ms = 2_000 + RETENTION_DAYS * 24 * 60 * 60 * 1_000 + 1;
+
+        let (retention_reached, retention_proceed) = arm_history_transaction_pause(
+            &retention_first_path,
+            HistoryTransactionPausePoint::Reserve,
+        );
+        let wrong_path = canonical_fixture_path(
+            &retention_first_directory
+                .path()
+                .join("wrong-pause-path.sqlite"),
+        );
+        history_transaction_pause(Some(&wrong_path), HistoryTransactionPausePoint::Reserve);
+        assert!(history_transaction_pause_is_armed(
+            &retention_first_path,
+            HistoryTransactionPausePoint::Reserve
+        ));
+        history_transaction_pause(
+            Some(&canonical_fixture_path(&retention_first_path)),
+            HistoryTransactionPausePoint::SetPinned,
+        );
+        assert!(history_transaction_pause_is_armed(
+            &retention_first_path,
+            HistoryTransactionPausePoint::Reserve
+        ));
+        assert!(matches!(
+            retention_reached.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let retention = spawn_reserve(retention_first_primary.clone(), retention_first_replacement);
+        retention_reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("retention did not acquire the real admission lease");
+        let contention = arm_history_admission_contention(&retention_first_path);
+        let unrelated =
+            canonical_fixture_path(&retention_first_directory.path().join("unrelated.sqlite"));
+        history_admission_contention_observed(Some(&unrelated));
+        assert!(history_admission_contention_is_armed(&retention_first_path));
+        assert!(!history_admission_contention_is_armed(&unrelated));
+        let pin = spawn_pin(
+            retention_first_admin.clone(),
+            retention_first_old.identity.attempt_id.clone(),
+        );
+        contention
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("pin loser did not observe the held admission lease");
+        assert!(!history_admission_contention_is_armed(
+            &retention_first_path
+        ));
+        retention_proceed.send(()).unwrap();
+        retention.join().unwrap().unwrap();
+        assert_eq!(pin.join().unwrap().unwrap_err().reason, R::Schema);
+        assert!(!history_transaction_pause_is_armed(
+            &retention_first_path,
+            HistoryTransactionPausePoint::Reserve
+        ));
+
+        assert!(retention_first_primary
+            .attempt(&retention_first_old.identity.attempt_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(retention_first_primary
+            .completed_between(0, i64::MAX)
+            .await
+            .unwrap()
+            .is_empty());
+        let retention_first_state: (i64, i64, i64, i64, i64, i64) = retention_first_primary
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT
+                         (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1),
+                         (SELECT COUNT(*) FROM workflow_history_attachment WHERE attempt_id=?1),
+                         (SELECT history_disposition FROM attempt_identities WHERE attempt_id=?1),
+                         charged_bytes, slots_used, terminal_rows
+                     FROM workflow_history_allocation WHERE singleton=1",
+                rusqlite::params![retention_first_old.identity.attempt_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            retention_first_state,
+            (
+                0,
+                0,
+                1,
+                i64::try_from(CONFIGURED_SLOT_CHARGE).unwrap(),
+                1,
+                0,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn r2f0a_b3_retained_identity_remains_collision_authority_and_parent_lineage() {
+        use bridge_core::workflow_history::{
+            LedgerUnavailableReason as R, WorkflowHistoryStore, CONFIGURED_SLOT_CHARGE,
+            RETENTION_DAYS,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("retained-authority.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let retained = reservation_with_ids(
+            "exec-b3611111111111111111111111111111",
+            "attempt-b3611111111111111111111111111111",
+        );
+        store.reserve(&retained).await.unwrap();
+        store
+            .terminalize(&retained.identity.attempt_id, &terminal())
+            .await
+            .unwrap();
+
+        let mut collector = reservation_with_ids(
+            "exec-b3622222222222222222222222222222",
+            "attempt-b3622222222222222222222222222222",
+        );
+        collector.started_ms = 2_000 + RETENTION_DAYS * 24 * 60 * 60 * 1_000 + 1;
+        store.reserve(&collector).await.unwrap();
+        assert!(store
+            .attempt(&retained.identity.attempt_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.reserve(&retained).await.unwrap_err().reason,
+            R::Collision
+        );
+        assert_eq!(
+            store
+                .terminalize(&retained.identity.attempt_id, &terminal())
+                .await
+                .unwrap_err()
+                .reason,
+            R::Schema
+        );
+        assert_eq!(
+            store
+                .mark_prompt_acceptance(&retained.identity.attempt_id, "dispatch_uncertain",)
+                .await
+                .unwrap_err()
+                .reason,
+            R::Schema
+        );
+        assert_eq!(
+            store
+                .set_pinned(&retained.identity.attempt_id, true)
+                .await
+                .unwrap_err()
+                .reason,
+            R::Schema
+        );
+
+        let after_missing_operations: (i64, i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1),
+                     (SELECT COUNT(*) FROM workflow_history_attachment WHERE attempt_id=?1),
+                     (SELECT history_disposition FROM attempt_identities WHERE attempt_id=?1)",
+                rusqlite::params![retained.identity.attempt_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after_missing_operations, (0, 0, 1));
+
+        let child = followup(&retained, "attempt-b3633333333333333333333333333333");
+        store.reserve(&child).await.unwrap();
+        assert!(store
+            .attempt(&child.identity.attempt_id)
+            .await
+            .unwrap()
+            .is_some());
+        let final_state: (i64, i64, i64, i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1),
+                     (SELECT COUNT(*) FROM workflow_history_attachment WHERE attempt_id=?1),
+                     (SELECT history_disposition FROM attempt_identities WHERE attempt_id=?1),
+                     charged_bytes, slots_used
+                 FROM workflow_history_allocation WHERE singleton=1",
+                rusqlite::params![retained.identity.attempt_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            final_state,
+            (
+                0,
+                0,
+                1,
+                i64::try_from(2 * CONFIGURED_SLOT_CHARGE).unwrap(),
+                2,
+            )
         );
     }
 

@@ -91,6 +91,38 @@ const CONFIG_PATH: &str = "a2a-bridge.toml";
 const DEFAULT_ARTIFACT_ALLOWLIST_PATH: &str = ".github/workflow-artifact-allowlist.txt";
 const DISPOSABLE_ARTIFACT_DEST: &str = "/tmp (or /private/tmp on macOS)";
 
+#[cfg(test)]
+pub(crate) fn history_route_witness(surface: &str, writer: &str) {
+    use std::io::Write as _;
+
+    let Some(path) = std::env::var_os("A2A_BRIDGE_TEST_HISTORY_ROUTE_WITNESS") else {
+        return;
+    };
+    let expected = match (surface, writer) {
+        ("Offline", "SelectedConcurrent")
+        | ("Offline", "ConfiguredShared")
+        | ("Smoke", "SelectedConcurrent")
+        | ("Smoke", "ConfiguredShared")
+        | ("Mcp", "SelectedLifetime")
+        | ("Mcp", "ConfiguredShared")
+        | ("Serve", "SelectedLifetime")
+        | ("Serve", "ConfiguredShared") => format!("{surface} -> {writer}\n"),
+        other => panic!("invalid history-route witness value: {other:?}"),
+    };
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .expect("create one-shot history-route witness");
+    output
+        .write_all(expected.as_bytes())
+        .expect("write one-shot history-route witness");
+    output
+        .sync_all()
+        .expect("sync one-shot history-route witness");
+    std::process::exit(0);
+}
+
 fn effort_to_string(effort: &bridge_core::domain::Effort) -> String {
     match effort {
         bridge_core::domain::Effort::Minimal => "minimal".to_string(),
@@ -3315,10 +3347,19 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             } else {
                 base.join(path)
             };
-            SqliteStore::open_shared_history(&path).map(Arc::new)
+            let opened = SqliteStore::open_shared_history(&path).map(Arc::new);
+            #[cfg(test)]
+            history_route_witness("Offline", "ConfiguredShared");
+            opened
         }
-        None => bridge_store::sqlite::platform_history_path()
-            .and_then(|path| SqliteStore::open_history(&path).map(Arc::new)),
+        None => {
+            let opened = bridge_store::sqlite::select_platform_history()
+                .and_then(|selection| selection.open_concurrent())
+                .map(Arc::new);
+            #[cfg(test)]
+            history_route_witness("Offline", "SelectedConcurrent");
+            opened
+        }
     };
     // Admit the exact offline attempt before registry construction, container
     // warmup, session creation, executor resolution, or provider work. Ordinary
@@ -3851,9 +3892,17 @@ fn parse_workflow_stats_args(args: &[String]) -> Result<WorkflowStatsArgs, BoxEr
     Ok(parsed)
 }
 
-fn workflow_stats_path(args: &WorkflowStatsArgs) -> Result<std::path::PathBuf, BoxError> {
+fn workflow_stats_path(
+    args: &WorkflowStatsArgs,
+) -> Result<
+    (
+        std::path::PathBuf,
+        Option<bridge_store::sqlite::HistoryAllocationKind>,
+    ),
+    BoxError,
+> {
     if let Some(path) = &args.store {
-        return Ok(std::path::PathBuf::from(path));
+        return Ok((std::path::PathBuf::from(path), None));
     }
     if let Some(config_path) = &args.config {
         // Match the live owner exactly: MCP canonicalizes its config before
@@ -3866,20 +3915,35 @@ fn workflow_stats_path(args: &WorkflowStatsArgs) -> Result<std::path::PathBuf, B
         return match cfg.store {
             Some(store) => {
                 let path = std::path::PathBuf::from(store.path);
-                if path.is_absolute() {
-                    Ok(path)
-                } else {
-                    Ok(config_path
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new("."))
-                        .join(path))
-                }
+                Ok((
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        config_path
+                            .parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .join(path)
+                    },
+                    Some(bridge_store::sqlite::HistoryAllocationKind::Configured),
+                ))
             }
             None => bridge_store::sqlite::platform_history_path()
+                .map(|path| {
+                    (
+                        path,
+                        Some(bridge_store::sqlite::HistoryAllocationKind::Platform),
+                    )
+                })
                 .map_err(|error| format!("workflow-stats: {error}").into()),
         };
     }
     bridge_store::sqlite::platform_history_path()
+        .map(|path| {
+            (
+                path,
+                Some(bridge_store::sqlite::HistoryAllocationKind::Platform),
+            )
+        })
         .map_err(|error| format!("workflow-stats: {error}").into())
 }
 
@@ -3889,12 +3953,20 @@ async fn workflow_stats_cmd(args: &[String]) -> Result<(), BoxError> {
         return Ok(());
     }
     let parsed = parse_workflow_stats_args(args)?;
-    let path = workflow_stats_path(&parsed)?;
+    let (path, allocation_kind) = workflow_stats_path(&parsed)?;
 
     match parsed.action {
         WorkflowStatsAction::Get { attempt_id } => {
-            let store = SqliteStore::open_history_read_only(&path)
-                .map_err(|error| format!("workflow-stats: {error}"))?;
+            let store = match allocation_kind {
+                Some(bridge_store::sqlite::HistoryAllocationKind::Configured) => {
+                    SqliteStore::open_configured_history_read_only(&path)
+                }
+                Some(bridge_store::sqlite::HistoryAllocationKind::Platform) => {
+                    SqliteStore::open_platform_history_read_only(&path)
+                }
+                None => SqliteStore::open_history_read_only(&path),
+            }
+            .map_err(|error| format!("workflow-stats: {error}"))?;
             let record =
                 bridge_core::workflow_history::WorkflowHistoryStore::attempt(&store, &attempt_id)
                     .await
@@ -3916,8 +3988,16 @@ async fn workflow_stats_cmd(args: &[String]) -> Result<(), BoxError> {
             }
         }
         WorkflowStatsAction::SetPinned { attempt_id, pinned } => {
-            let store = SqliteStore::open_history_admin(&path)
-                .map_err(|error| format!("workflow-stats: {error}"))?;
+            let store = match allocation_kind {
+                Some(bridge_store::sqlite::HistoryAllocationKind::Configured) => {
+                    SqliteStore::open_configured_history_admin(&path)
+                }
+                Some(bridge_store::sqlite::HistoryAllocationKind::Platform) => {
+                    SqliteStore::open_platform_history_admin(&path)
+                }
+                None => SqliteStore::open_history_admin(&path),
+            }
+            .map_err(|error| format!("workflow-stats: {error}"))?;
             let changed = bridge_core::workflow_history::WorkflowHistoryStore::set_pinned(
                 &store,
                 &attempt_id,
@@ -3949,8 +4029,16 @@ async fn workflow_stats_cmd(args: &[String]) -> Result<(), BoxError> {
                     bridge_core::workflow_history::RETENTION_DAYS * 24 * 60 * 60 * 1000,
                 )
             });
-            let store = SqliteStore::open_history_read_only(&path)
-                .map_err(|error| format!("workflow-stats: {error}"))?;
+            let store = match allocation_kind {
+                Some(bridge_store::sqlite::HistoryAllocationKind::Configured) => {
+                    SqliteStore::open_configured_history_read_only(&path)
+                }
+                Some(bridge_store::sqlite::HistoryAllocationKind::Platform) => {
+                    SqliteStore::open_platform_history_read_only(&path)
+                }
+                None => SqliteStore::open_history_read_only(&path),
+            }
+            .map_err(|error| format!("workflow-stats: {error}"))?;
             let rows = bridge_core::workflow_history::WorkflowHistoryStore::completed_between(
                 &store, start_ms, end_ms,
             )
@@ -5689,24 +5777,31 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     };
     let (session_store, task_store, workflow_history): McpStores = match store_path {
         Some(path) => {
-            let sqlite = Arc::new(SqliteStore::open_shared_history(&path).map_err(|error| {
+            let opened = SqliteStore::open_shared_history(&path).map_err(|error| {
                 format!(
                     "a2a-bridge mcp: cannot open task/history store {path:?} ({error:?}); \
                      is another a2a-bridge serve/mcp already running on this store?"
                 )
-            })?);
+            });
+            #[cfg(test)]
+            history_route_witness("Mcp", "ConfiguredShared");
+            let sqlite = Arc::new(opened?);
             (sqlite.clone() as _, sqlite.clone() as _, Ok(sqlite as _))
         }
         None => {
-            let path = bridge_store::sqlite::platform_history_path().map_err(|error| {
+            let selection = bridge_store::sqlite::select_platform_history().map_err(|error| {
                 format!(
                     "a2a-bridge mcp: cannot select owner-private store ({})",
                     error.reason.as_str()
                 )
             })?;
-            let sqlite = Arc::new(SqliteStore::open_platform_history(&path).map_err(|error| {
+            let path = selection.path().to_path_buf();
+            let opened = selection.open_lifetime().map_err(|error| {
                 format!("a2a-bridge mcp: cannot open owner-private store {path:?} ({error:?})")
-            })?);
+            });
+            #[cfg(test)]
+            history_route_witness("Mcp", "SelectedLifetime");
+            let sqlite = Arc::new(opened?);
             (sqlite.clone() as _, sqlite.clone() as _, Ok(sqlite as _))
         }
     };
@@ -6758,6 +6853,55 @@ fn task_spec_cmd(args: &[String]) -> Result<(), BoxError> {
     }
 }
 
+type ServeHistoryStores = (
+    Arc<dyn bridge_core::task_store::TaskStore>,
+    Result<
+        Arc<dyn bridge_core::workflow_history::WorkflowHistoryStore>,
+        bridge_core::workflow_history::LedgerUnavailableReason,
+    >,
+);
+
+fn open_serve_history_stores(
+    cfg: &RegistryConfig,
+    base: &Path,
+) -> Result<ServeHistoryStores, BoxError> {
+    match cfg.store.as_ref().map(|store| store.path.clone()) {
+        Some(path) => {
+            let store_path = {
+                let path = Path::new(&path);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    base.join(path)
+                }
+            };
+            let opened = SqliteStore::open_shared_history(&store_path).map_err(|error| {
+                format!("serve: cannot open task/history store {store_path:?}: {error:?}")
+            });
+            #[cfg(test)]
+            history_route_witness("Serve", "ConfiguredShared");
+            let store = Arc::new(opened?);
+            Ok((store.clone() as _, Ok(store as _)))
+        }
+        None => {
+            let selection = bridge_store::sqlite::select_platform_history().map_err(|error| {
+                format!(
+                    "serve: cannot select owner-private store ({})",
+                    error.reason.as_str()
+                )
+            })?;
+            let path = selection.path().to_path_buf();
+            let opened = selection.open_lifetime().map_err(|error| {
+                format!("serve: cannot open owner-private store {path:?} ({error:?})")
+            });
+            #[cfg(test)]
+            history_route_witness("Serve", "SelectedLifetime");
+            let store = Arc::new(opened?);
+            Ok((store.clone() as _, Ok(store as _)))
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     // R3d1 schedule-tick owns this monotonic process-entry origin. Capture it before argument/help
@@ -7000,42 +7144,7 @@ async fn main() -> Result<(), BoxError> {
         .as_ref()
         .and_then(|s| s.resume_attempt_cap)
         .unwrap_or(3);
-    let (task_store, workflow_history): (
-        std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
-        Result<
-            Arc<dyn bridge_core::workflow_history::WorkflowHistoryStore>,
-            bridge_core::workflow_history::LedgerUnavailableReason,
-        >,
-    ) = match cfg.store.as_ref().map(|s| s.path.clone()) {
-        Some(path) => {
-            let store_path = {
-                let p = std::path::Path::new(&path);
-                if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    base.join(p)
-                }
-            };
-            let store = std::sync::Arc::new(
-                SqliteStore::open_shared_history(&store_path).map_err(|error| {
-                    format!("serve: cannot open task/history store {store_path:?}: {error:?}")
-                })?,
-            );
-            (store.clone() as _, Ok(store as _))
-        }
-        None => {
-            let path = bridge_store::sqlite::platform_history_path().map_err(|error| {
-                format!(
-                    "serve: cannot select owner-private store ({})",
-                    error.reason.as_str()
-                )
-            })?;
-            let store = std::sync::Arc::new(SqliteStore::open_platform_history(&path).map_err(
-                |error| format!("serve: cannot open owner-private store {path:?} ({error:?})"),
-            )?);
-            (store.clone() as _, Ok(store as _))
-        }
-    };
+    let (task_store, workflow_history) = open_serve_history_stores(&cfg, base)?;
 
     let metrics_cfg = cfg.metrics_config()?;
     let traces_cfg = cfg.traces_config()?;
@@ -7537,6 +7646,291 @@ mod cli_tests {
         assert_eq!(error.to_string(), "workflow-stats: store_path_not_absolute");
     }
 
+    #[tokio::test]
+    async fn workflow_stats_actions_do_not_bootstrap_an_absent_platform_root() {
+        if std::env::var_os("A2A_BRIDGE_TEST_STATS_NO_BOOTSTRAP").is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let state_root = directory.path().join("missing").join("platform-state");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("cli_tests::workflow_stats_actions_do_not_bootstrap_an_absent_platform_root")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env_remove("HOME")
+                .env_remove("XDG_STATE_HOME")
+                .env("A2A_BRIDGE_STATE_DIR", &state_root)
+                .env("A2A_BRIDGE_TEST_STATS_NO_BOOTSTRAP", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "workflow-stats no-bootstrap subprocess failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !state_root.exists(),
+                "workflow-stats subprocess created the absent platform root"
+            );
+            return;
+        }
+
+        let attempt = bridge_core::ids::AttemptIdentity::initial()
+            .unwrap()
+            .attempt_id
+            .as_str()
+            .to_owned();
+        for arguments in [
+            vec!["--json".to_owned()],
+            vec!["get".to_owned(), attempt.clone(), "--json".to_owned()],
+            vec!["pin".to_owned(), attempt.clone(), "--json".to_owned()],
+            vec!["unpin".to_owned(), attempt.clone(), "--json".to_owned()],
+        ] {
+            let error = workflow_stats_cmd(&arguments)
+                .await
+                .expect_err("an absent stats allocation must refuse without bootstrap");
+            assert!(
+                error.to_string().contains("workflow-stats:"),
+                "stats refusal lost its bounded CLI prefix: {error}"
+            );
+            let selected = bridge_store::sqlite::platform_history_path().unwrap();
+            assert!(
+                !selected.parent().unwrap().exists(),
+                "stats action {arguments:?} bootstrapped the selected root"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_history_routes_cover_selected_and_configured_branches() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        const ROUTE_TEST_NAME: &str =
+            "cli_tests::production_history_routes_cover_selected_and_configured_branches";
+
+        if let Some(case) = std::env::var_os("A2A_BRIDGE_TEST_HISTORY_ROUTE_CASE") {
+            let case = case.to_string_lossy();
+            let config_path =
+                PathBuf::from(std::env::var_os("A2A_BRIDGE_TEST_HISTORY_ROUTE_CONFIG").unwrap());
+            let input_path =
+                PathBuf::from(std::env::var_os("A2A_BRIDGE_TEST_HISTORY_ROUTE_INPUT").unwrap());
+            let session_cwd =
+                PathBuf::from(std::env::var_os("A2A_BRIDGE_TEST_HISTORY_ROUTE_CWD").unwrap());
+            if case.ends_with("configured") {
+                let configured = PathBuf::from(
+                    std::env::var_os("A2A_BRIDGE_TEST_HISTORY_ROUTE_CONFIGURED").unwrap(),
+                );
+                let error = SqliteStore::open_shared_history(&configured)
+                    .err()
+                    .expect("an absent configured parent must refuse");
+                assert_eq!(error.reason, R::ReadOnlyParent);
+                assert_eq!(error.sqlite_primary_code, None);
+                assert_eq!(error.sqlite_extended_code, None);
+                assert!(!configured.parent().unwrap().exists());
+            }
+            let result = match case.as_ref() {
+                "offline-selected" | "offline-configured" => {
+                    run_workflow_cmd(&[
+                        "probe".into(),
+                        "--input".into(),
+                        input_path.to_string_lossy().into_owned(),
+                        "--session-cwd".into(),
+                        session_cwd.to_string_lossy().into_owned(),
+                        "--config".into(),
+                        config_path.to_string_lossy().into_owned(),
+                    ])
+                    .await
+                }
+                "smoke-selected" | "smoke-configured" => {
+                    crate::smoke::smoke_cmd(&[
+                        "--agent".into(),
+                        "api".into(),
+                        "--config".into(),
+                        config_path.to_string_lossy().into_owned(),
+                        "--session-cwd".into(),
+                        session_cwd.to_string_lossy().into_owned(),
+                        "--timeout-secs".into(),
+                        "5".into(),
+                        "--acknowledge-billable".into(),
+                        "--out".into(),
+                        session_cwd
+                            .join("smoke.json")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ])
+                    .await
+                }
+                "mcp-selected" | "mcp-configured" => {
+                    std::env::remove_var(bridge_core::mcp::MANAGED_MCP_CALL_DEPTH_ENV);
+                    mcp_cmd(&[
+                        "--config".into(),
+                        config_path.to_string_lossy().into_owned(),
+                    ])
+                    .await
+                }
+                "serve-selected" | "serve-configured" => {
+                    let raw = std::fs::read_to_string(&config_path).unwrap();
+                    let cfg = RegistryConfig::parse(&raw).unwrap();
+                    open_serve_history_stores(&cfg, config_path.parent().unwrap()).map(|_| ())
+                }
+                other => panic!("unknown history route case {other}"),
+            };
+            panic!("history route witness failed to stop {case}: {result:?}");
+        }
+
+        fn wait_bounded(child: std::process::Child) -> std::process::Output {
+            let pid = child.id();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let _ = tx.send(child.wait_with_output());
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                Ok(output) => output.unwrap(),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                    rx.recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("killed route child was not reaped")
+                        .expect("wait for killed route child")
+                }
+                Err(error) => panic!("route child waiter failed: {error}"),
+            }
+        }
+
+        for (surface, expected_selected, expected_configured) in [
+            (
+                "offline",
+                "Offline -> SelectedConcurrent\n",
+                "Offline -> ConfiguredShared\n",
+            ),
+            (
+                "smoke",
+                "Smoke -> SelectedConcurrent\n",
+                "Smoke -> ConfiguredShared\n",
+            ),
+            (
+                "mcp",
+                "Mcp -> SelectedLifetime\n",
+                "Mcp -> ConfiguredShared\n",
+            ),
+            (
+                "serve",
+                "Serve -> SelectedLifetime\n",
+                "Serve -> ConfiguredShared\n",
+            ),
+        ] {
+            for (kind, expected) in [
+                ("selected", expected_selected),
+                ("configured", expected_configured),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let home = directory.path().join("home");
+                let xdg_state_home = directory.path().join("xdg-state");
+                let state_root = directory.path().join("platform").join("missing-state");
+                let lease_root = directory.path().join("leases");
+                let temp_root = directory.path().join("tmp");
+                let configured_path = directory
+                    .path()
+                    .join("configured")
+                    .join("missing-parent")
+                    .join("history.sqlite");
+                let config_path = directory.path().join("a2a-bridge.toml");
+                let prompt_path = directory.path().join("prompt.md");
+                let input_path = directory.path().join("input.md");
+                let witness_path = directory.path().join("route.txt");
+                let session_cwd = directory.path().join("cwd");
+                std::fs::create_dir(&session_cwd).unwrap();
+                std::fs::create_dir(&temp_root).unwrap();
+                std::fs::write(&prompt_path, "Reply exactly PONG.\n").unwrap();
+                std::fs::write(&input_path, "---\ntask-type: freeform\n---\nroute probe\n")
+                    .unwrap();
+                let store = if kind == "configured" {
+                    format!("\n[store]\npath = {:?}\n", configured_path)
+                } else {
+                    String::new()
+                };
+                let config = format!(
+                    r#"default = "api"
+
+[registry]
+allowed_cmds = []
+
+[server]
+addr = "127.0.0.1:0"
+{store}
+[[agents]]
+id = "api"
+kind = "api"
+base_url = "http://127.0.0.1:9/v1"
+api_key_env = "A2A_BRIDGE_ROUTE_API_KEY"
+model = "route-model"
+
+[[workflows]]
+id = "probe"
+[[workflows.nodes]]
+id = "node"
+agent = "api"
+prompt_file = {:?}
+inputs = []
+"#,
+                    prompt_path
+                );
+                std::fs::write(&config_path, config).unwrap();
+
+                let case = format!("{surface}-{kind}");
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .arg(ROUTE_TEST_NAME)
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env("HOME", &home)
+                    .env("XDG_STATE_HOME", &xdg_state_home)
+                    .env("TMPDIR", &temp_root)
+                    .env("A2A_BRIDGE_STATE_DIR", &state_root)
+                    .env("A2A_LEASE_DIR", &lease_root)
+                    .env("A2A_BRIDGE_ROUTE_API_KEY", "private-test-value")
+                    .env("A2A_BRIDGE_TEST_HISTORY_ROUTE_CASE", &case)
+                    .env("A2A_BRIDGE_TEST_HISTORY_ROUTE_CONFIG", &config_path)
+                    .env("A2A_BRIDGE_TEST_HISTORY_ROUTE_INPUT", &input_path)
+                    .env("A2A_BRIDGE_TEST_HISTORY_ROUTE_CWD", &session_cwd)
+                    .env("A2A_BRIDGE_TEST_HISTORY_ROUTE_CONFIGURED", &configured_path)
+                    .env("A2A_BRIDGE_TEST_HISTORY_ROUTE_WITNESS", &witness_path)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                let output = wait_bounded(command.spawn().unwrap());
+                assert!(
+                    output.status.success(),
+                    "route child {case} failed:\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(std::fs::read_to_string(&witness_path).unwrap(), expected);
+                assert!(!home.exists(), "{case} unexpectedly wrote below HOME");
+                assert!(
+                    !xdg_state_home.exists(),
+                    "{case} unexpectedly wrote below XDG_STATE_HOME"
+                );
+                if surface == "mcp" {
+                    assert!(std::fs::read_dir(&lease_root).unwrap().next().is_some());
+                }
+                if kind == "selected" {
+                    assert!(
+                        state_root.join("workflow-history.sqlite").is_file(),
+                        "{case} did not really open the selected database"
+                    );
+                    assert!(!configured_path.parent().unwrap().exists());
+                } else {
+                    assert!(!configured_path.parent().unwrap().exists());
+                    assert!(
+                        !state_root.exists(),
+                        "{case} fell back to the selected platform root"
+                    );
+                }
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn workflow_stats_resolves_relative_store_from_canonical_config_owner() {
@@ -7570,7 +7964,10 @@ mod cli_tests {
 
         assert_eq!(
             workflow_stats_path(&parsed).unwrap(),
-            canonical_owner.join("ledger/history.sqlite")
+            (
+                canonical_owner.join("ledger/history.sqlite"),
+                Some(bridge_store::sqlite::HistoryAllocationKind::Configured),
+            )
         );
     }
 

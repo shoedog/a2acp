@@ -4,12 +4,13 @@ use crate::ids::{AttemptId, AttemptIdentity, TaskId};
 pub const RETENTION_DAYS: i64 = 180;
 pub const MAX_TERMINAL_ROWS: u64 = 100_000;
 pub const MAX_CHARGED_BYTES: u64 = 128 * 1024 * 1024;
-/// Covers bounded reservation and terminal JSON plus conservative row,
-/// index, and WAL overhead.
+/// Fixed retained summary charge, including its pre-reserved terminal payload.
 pub const RESERVED_ROW_CHARGE: u64 = 16 * 1024;
-/// Permanent authority rows survive summary retention and therefore carry a
-/// separate bounded charge that cannot be reclaimed by summary eviction.
+pub const RETAINED_SUMMARY_CHARGE: u64 = RESERVED_ROW_CHARGE;
+/// Fixed charge for the reclaimable history attachment. Permanent identity rows are uncharged.
 pub const PERMANENT_IDENTITY_CHARGE: u64 = 1024;
+pub const HISTORY_ATTACHMENT_CHARGE: u64 = PERMANENT_IDENTITY_CHARGE;
+pub const CONFIGURED_SLOT_CHARGE: u64 = RETAINED_SUMMARY_CHARGE + HISTORY_ATTACHMENT_CHARGE;
 pub const MAX_DIMENSION_LEN: usize = 64;
 pub const MAX_FINGERPRINT_LEN: usize = 128;
 pub const MAX_PHASES: usize = 32;

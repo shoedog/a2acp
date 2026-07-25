@@ -1943,16 +1943,22 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             } else {
                 base.join(path)
             };
-            bridge_store::sqlite::SqliteStore::open_shared_history(&path)
+            let opened = bridge_store::sqlite::SqliteStore::open_shared_history(&path)
                 .map(|store| Arc::new(store) as Arc<dyn WorkflowHistoryStore>)
-                .map_err(|error| error.reason)
+                .map_err(|error| error.reason);
+            #[cfg(test)]
+            crate::history_route_witness("Smoke", "ConfiguredShared");
+            opened
         }
-        None => bridge_store::sqlite::platform_history_path()
-            .and_then(|path| {
-                bridge_store::sqlite::SqliteStore::open_history(&path)
-                    .map(|store| Arc::new(store) as Arc<dyn WorkflowHistoryStore>)
-            })
-            .map_err(|error| error.reason),
+        None => {
+            let opened = bridge_store::sqlite::select_platform_history()
+                .and_then(|selection| selection.open_concurrent())
+                .map(|store| Arc::new(store) as Arc<dyn WorkflowHistoryStore>)
+                .map_err(|error| error.reason);
+            #[cfg(test)]
+            crate::history_route_witness("Smoke", "SelectedConcurrent");
+            opened
+        }
     };
     let identity = bridge_core::ids::AttemptIdentity {
         execution_id: state.artifact.attempt.execution_id.clone(),
@@ -4158,6 +4164,34 @@ mod tests {
 
     #[tokio::test]
     async fn early_failure_artifact_redacts_selected_entry_credentials_from_request() {
+        if std::env::var_os("A2A_BRIDGE_TEST_FRESH_SMOKE_HISTORY").is_none() {
+            let platform = tempfile::tempdir().unwrap();
+            let state_root = platform.path().join("missing").join("platform-state");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg(
+                    "smoke::tests::early_failure_artifact_redacts_selected_entry_credentials_from_request",
+                )
+                .arg("--exact")
+                .arg("--nocapture")
+                .env_remove("HOME")
+                .env_remove("XDG_STATE_HOME")
+                .env("A2A_BRIDGE_STATE_DIR", &state_root)
+                .env("A2A_BRIDGE_TEST_FRESH_SMOKE_HISTORY", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fresh-root smoke secrecy regression failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                state_root.join("workflow-history.sqlite").is_file(),
+                "the production no-store smoke path did not persist terminal evidence"
+            );
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("bridge.toml");
         let secret = "selected-entry-mcp-secret";
@@ -4192,6 +4226,25 @@ mod tests {
         assert!(
             !rendered.contains(secret),
             "early failure leaked selected-entry credential: {rendered}"
+        );
+        let history_path = bridge_store::sqlite::platform_history_path().unwrap();
+        let history =
+            bridge_store::sqlite::SqliteStore::open_history_read_only(&history_path).unwrap();
+        let row = history
+            .attempt(&artifact.attempt.attempt_id)
+            .await
+            .unwrap()
+            .expect("the terminal smoke attempt must be durable");
+        let terminal = row
+            .terminal
+            .as_ref()
+            .expect("the early session-cwd refusal must be terminal");
+        assert_eq!(terminal.outcome, "failed");
+        assert_eq!(terminal.terminal_reason, "pre_effect_refusal");
+        assert_eq!(terminal.prompt_acceptance, "not_dispatched");
+        assert!(
+            !serde_json::to_string(&row).unwrap().contains(secret),
+            "durable terminal evidence leaked the selected-entry credential"
         );
     }
 

@@ -308,8 +308,8 @@ async fn workflow_stats_get_reads_live_mcp_owner_active_and_terminal_wal_rows() 
     #[cfg(not(unix))]
     let stats_config_path = cfg_path.clone();
 
-    // Initialize both complete schemas. The production owner deliberately switches
-    // only the override allocation to a bounded rollback journal during startup.
+    // Initialize both complete schemas. The configured override must preserve the
+    // caller's WAL policy rather than installing the platform rollback journal.
     drop(bridge_store::sqlite::SqliteStore::open(&configured_store_path).unwrap());
     drop(bridge_store::sqlite::SqliteStore::open(&store_path).unwrap());
     let canonical_store_path = std::fs::canonicalize(&store_path).unwrap();
@@ -398,6 +398,8 @@ async fn workflow_stats_get_reads_live_mcp_owner_active_and_terminal_wal_rows() 
     owner_stdin.flush().await.unwrap();
 
     let mut active = None;
+    let mut last_reader_error = String::new();
+    let mut last_reader_row = serde_json::Value::Null;
     for _ in 0..80 {
         let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
             .args(["workflow-stats", "get", attempt_id, "--store"])
@@ -408,16 +410,21 @@ async fn workflow_stats_get_reads_live_mcp_owner_active_and_terminal_wal_rows() 
             .unwrap();
         if output.status.success() {
             let row: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            last_reader_row = row.clone();
             if row["terminal"].is_null()
                 && row["reservation"]["prompt_acceptance"] == "dispatch_uncertain"
             {
                 active = Some(row);
                 break;
             }
+        } else {
+            last_reader_error = String::from_utf8_lossy(&output.stderr).into_owned();
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let active = active.expect("read-only CLI never observed the active WAL row");
+    let active = active.unwrap_or_else(|| {
+        panic!("read-only CLI never observed the active WAL row: {last_reader_error}; last row: {last_reader_row}")
+    });
     assert!(
         owner.try_wait().unwrap().is_none(),
         "MCP lifetime owner exited before the active read"
@@ -465,9 +472,9 @@ async fn workflow_stats_get_reads_live_mcp_owner_active_and_terminal_wal_rows() 
     let owner_mode: String = wal_writer
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .unwrap();
-    assert!(
-        matches!(owner_mode.as_str(), "delete" | "truncate" | "persist"),
-        "MCP owner did not install its bounded rollback journal: {owner_mode}"
+    assert_eq!(
+        owner_mode, "wal",
+        "configured MCP ownership changed the caller's journal policy"
     );
     let wal_mode: String = wal_writer
         .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
