@@ -24,7 +24,9 @@ pub(super) const DEFAULT_RECIPES: &str = "compatibility/floating-current.toml";
 const MAX_RECIPE_BYTES: u64 = 1024 * 1024;
 const MAX_RESOLUTION_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LOCK_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+// Shared with `compatibility` so mint-time and run-time executable bounds cannot
+// diverge (release keeps the production cap; debug/test binaries are unstripped).
+use crate::compatibility::MAX_EXECUTABLE_BYTES;
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 const MAX_ARCHIVE_METADATA_EXTENSION_BYTES: u64 = MAX_SETTINGS_BYTES;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
@@ -6276,6 +6278,37 @@ mod tests {
     enum ObservedResolutionEffect {
         Command(ResolutionCommandKind),
         PackageMaterialize,
+    }
+
+    #[test]
+    fn executable_identity_cap_admits_the_binary_this_build_produces() {
+        // Mint-time and run-time share one executable-size authority
+        // (`compatibility::MAX_EXECUTABLE_BYTES`). The bound must admit the binary this
+        // build produces: unstripped Linux test binaries sit between the release
+        // (256 MiB) and debug (512 MiB) caps, which is exactly the drift a stale
+        // duplicate of this constant once reintroduced — rejecting resolutions at load,
+        // before any run output.
+        let current_exe = std::env::current_exe().unwrap();
+        let byte_length = std::fs::metadata(&current_exe).unwrap().len();
+        assert!(
+            byte_length <= MAX_EXECUTABLE_BYTES,
+            "current test binary ({byte_length} bytes) exceeds MAX_EXECUTABLE_BYTES \
+             ({MAX_EXECUTABLE_BYTES}); raise the shared debug cap in compatibility.rs"
+        );
+
+        let identity = ExecutableIdentity {
+            canonical_path: current_exe.to_string_lossy().into_owned(),
+            sha256: "0".repeat(64),
+            byte_length,
+        };
+        validate_executable_identity("shared-cap fixture", &identity).unwrap();
+
+        let oversized = ExecutableIdentity {
+            byte_length: MAX_EXECUTABLE_BYTES + 1,
+            ..identity
+        };
+        let error = validate_executable_identity("shared-cap fixture", &oversized).unwrap_err();
+        assert!(error.contains("byte_length must be positive"), "{error}");
     }
 
     fn valid_recipes() -> String {

@@ -31,11 +31,14 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EMBEDDED_SMOKE_BYTES: usize = 8 * 1024 * 1024;
 // Release compatibility evidence keeps the production cap; debug/test-profile
-// binaries are unstripped and can exceed it in integration tests.
+// binaries are unstripped and can exceed it in integration tests. This is the
+// single executable-size authority: `compatibility_resolution` imports it so a
+// resolution this binary can mint stays loadable by `run` (a stale duplicate
+// once rejected debug candidates at resolution load before any output).
 #[cfg(not(debug_assertions))]
-const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(debug_assertions)]
-const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CATALOG_ENTRIES: usize = 128;
 const MAX_CATALOG_VALUE_BYTES: usize = 256;
 const MAX_CATALOG_TOTAL_BYTES: usize = 64 * 1024;
