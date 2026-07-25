@@ -13,6 +13,7 @@
 //     flushing any pending coalesced text (fail the task; NO silent restart).
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
 
@@ -20,7 +21,10 @@ use crate::domain::{Part, PendingKind, PendingRequest, SessionContext};
 use crate::error::BridgeError;
 use crate::ids::{SessionId, TaskId};
 use crate::orch::UsageSnapshot;
-use crate::ports::{AgentBackend, PolicyEngine, SessionStore, Update, STOP_REASON_CANCELLED};
+use crate::ports::{
+    AgentBackend, BackendObservers, DiagnosticObserver, PolicyEngine, SessionStore, Update,
+    STOP_REASON_CANCELLED,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
@@ -128,9 +132,42 @@ impl Translator {
         session: &'a SessionId,
         parts: Vec<Part>,
     ) -> Pin<Box<dyn Stream<Item = Result<Event, BridgeError>> + Send + 'a>> {
+        self.run_observed(
+            backend,
+            store,
+            policy,
+            task,
+            session,
+            parts,
+            Arc::new(crate::diagnostics::NoopDiagnosticObserver::default()),
+        )
+    }
+
+    /// Drives the same translation pipeline while transferring one
+    /// operation-scoped lifecycle observer into backend resolution/prompt
+    /// ownership. The returned stream owns the observer for exactly as long as
+    /// the backend prompt/stream is live; no backend cache or task binding may
+    /// retain it after the stream is dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_observed<'a>(
+        &self,
+        backend: &'a dyn AgentBackend,
+        store: &'a dyn SessionStore,
+        policy: &'a dyn PolicyEngine,
+        task: &'a TaskId,
+        session: &'a SessionId,
+        parts: Vec<Part>,
+        diagnostic: Arc<dyn DiagnosticObserver>,
+    ) -> Pin<Box<dyn Stream<Item = Result<Event, BridgeError>> + Send + 'a>> {
         let max_chunk = self.max_chunk;
         Box::pin(async_stream::try_stream! {
-            let mut stream = backend.prompt(session, parts).await?;
+            let mut stream = backend
+                .prompt_with_observers(
+                    session,
+                    parts,
+                    BackendObservers::diagnostic_only(diagnostic),
+                )
+                .await?;
             // Accumulated text awaiting flush as a Status chunk.
             let mut acc = String::new();
             // Full text emitted by the backend, used as the Artifact payload on Done.
@@ -258,7 +295,7 @@ mod tests {
     use crate::ports::*;
     use futures::StreamExt;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, Weak};
 
     struct FakeBackend {
         items: Mutex<Option<Vec<Result<Update, BridgeError>>>>,
@@ -281,6 +318,55 @@ mod tests {
             Ok(Box::pin(tokio_stream::iter(v)))
         }
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MarkerDiagnosticObserver;
+
+    #[async_trait::async_trait]
+    impl DiagnosticObserver for MarkerDiagnosticObserver {
+        async fn record(
+            &self,
+            _event: crate::diagnostics::DiagnosticEvent,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CompositeOnlyBackend {
+        diagnostics: Mutex<Vec<Weak<dyn DiagnosticObserver>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for CompositeOnlyBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            panic!("run_observed must use prompt_with_observers")
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            assert!(observers.rich.is_none(), "translator owns no rich sink");
+            self.diagnostics
+                .lock()
+                .unwrap()
+                .push(Arc::downgrade(&observers.diagnostic));
+            Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            })])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
             Ok(())
         }
     }
@@ -379,6 +465,47 @@ mod tests {
         let evs: Vec<Event> = evs.into_iter().map(|r| r.unwrap()).collect();
         assert_eq!(evs.first().unwrap().kind(), &EventKind::Status);
         assert!(evs.iter().any(|e| e.kind() == &EventKind::Artifact));
+    }
+
+    #[tokio::test]
+    async fn run_observed_forwards_exact_diagnostic_and_releases_it_after_stream() {
+        let backend = CompositeOnlyBackend::default();
+        let store = FakeStore::default();
+        let policy = AutoApprove;
+        let (task, session) = ids();
+        let observer: Arc<dyn DiagnosticObserver> = Arc::new(MarkerDiagnosticObserver);
+        let weak = Arc::downgrade(&observer);
+
+        let events = Translator::new()
+            .run_observed(
+                &backend,
+                &store,
+                &policy,
+                &task,
+                &session,
+                vec![],
+                observer.clone(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].is_ok());
+        let seen = backend.diagnostics.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0]
+                .upgrade()
+                .as_ref()
+                .is_some_and(|captured| Arc::ptr_eq(captured, &observer)),
+            "translator must forward the caller-owned observer"
+        );
+        drop(seen);
+        drop(observer);
+        assert!(
+            weak.upgrade().is_none(),
+            "translator/backend must not retain the operation observer"
+        );
     }
 
     #[tokio::test]

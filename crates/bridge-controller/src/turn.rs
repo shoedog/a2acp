@@ -43,4 +43,13 @@ pub trait TurnRunner: Send + Sync {
         session: &bridge_core::ids::SessionId,
         parts: Vec<bridge_core::domain::Part>,
     ) -> bool;
+
+    async fn run_turn_observed(
+        &self,
+        session: &bridge_core::ids::SessionId,
+        parts: Vec<bridge_core::domain::Part>,
+        _observer: std::sync::Arc<dyn bridge_core::ports::DiagnosticObserver>,
+    ) -> bool {
+        self.run_turn(session, parts).await
+    }
 }

@@ -21,4 +21,5 @@ tracing.workspace = true
 a2a.workspace = true
 
 [dev-dependencies]
+bridge-observ = { path = "../bridge-observ" }
 tokio-stream.workspace = true

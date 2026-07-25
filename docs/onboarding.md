@@ -1,5 +1,11 @@
 # Onboarding — running the a2a-bridge with your own agents
 
+> **Agent/operator preflight:** use the
+> [`a2a-bridge-operator` skill](../skills/a2a-bridge-operator/SKILL.md) and check the current
+> [`compatibility matrix`](compatibility.md) before spending a live agent turn. Use
+> [Compatibility and dogfooding routing](compatibility-routing.md) before selecting a provider, model,
+> effort, or independent review lens.
+
 The bridge is an A2A↔ACP server: it fronts one or more agent CLIs (kiro, codex,
 claude) — or an OpenAI-compatible HTTP backend — behind the A2A protocol, and can
 run multi-agent **review workflows**. This guide gets an external project from zero
@@ -55,9 +61,34 @@ Each `[[agents]]` entry is one backend:
 | agent  | `cmd`              | auth                          |
 |--------|--------------------|-------------------------------|
 | kiro   | `kiro-cli` `["acp"]` | none (local default)        |
-| codex  | `codex-acp`        | codex login                   |
+| codex  | `codex-acp`        | `codex login` + `pre_authenticated = true` |
 | claude | `claude-agent-acp` | claude subscription / login   |
 | api    | —                  | `OPENAI_API_KEY` (env var name) |
+
+Set `pre_authenticated = true` when an ACP process already has credentials from its host profile or a
+mounted auth file. This prevents the bridge from invoking an advertised interactive login method during
+startup. Do not combine it with `auth_method`, which explicitly asks the bridge to authenticate.
+
+Set `host_fallback_eligible = true` only on an unsandboxed `kind = "acp"` entry that may be selected by
+the local `fallback-plan` command for trusted own-repo read-only verification. The field defaults false,
+does not infer trust, and does not execute or authorize an in-process fallback. API, sandboxed ACP, and
+`container_rw` entries reject the field when true.
+
+Planning that distinct verification requires `--trusted-session-cwd <exact-owned-repo>`. The path must be
+an existing canonical directory, must exactly match the failed smoke's reported cwd as evidence, and must
+remain under the current source agent's canonical read-only mount. Only that exact path enters the emitted
+argv. The exact repo and source-mount objects each carry a plan-time canonical path plus a
+descriptor-derived persistent-object fingerprint in the closed action guard. A guarded host smoke
+revalidates both exact directory objects plus the source/target/config/executable guard before spawn; a
+same-mount symlink/sibling, source-mount symlink retarget, or inode-reuse replacement fails closed.
+Guarded composition ignores target `session_cwd`/`cwd` aliases and uses the pinned object-addressed cwd
+for native MCP/Kiro inputs, process redaction, and ACP session configuration. Filesystems without a
+durable object ID/handle cannot emit an eligible plan. It does not invoke the degraded container runtime
+for recovery or run-end cleanup and records that backstop as `not_needed`.
+
+This onboarding page is a stable behavior/setup surface, not the current release-status cursor. Current
+slice, review, and gate state is owned by
+[`reliability-execution-roadmap.md`](reliability-execution-roadmap.md).
 
 ### model / effort / mode
 

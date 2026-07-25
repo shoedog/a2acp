@@ -63,6 +63,7 @@ async fn real_codex_acp_prompt_round_trip_with_mode_applied() {
     let config = AcpConfig {
         cwd: cwd.clone(),
         mode: Some(REQUESTED_MODE.to_string()),
+        pre_authenticated: true,
         ..AcpConfig::default()
     };
 
@@ -120,6 +121,7 @@ async fn unauthenticated_codex_acp_surfaces_agent_not_authenticated() {
     let cwd = unique_temp_dir();
     let config = AcpConfig {
         cwd: cwd.clone(),
+        auth_method: Some("api-key".to_string()),
         ..AcpConfig::default()
     };
 

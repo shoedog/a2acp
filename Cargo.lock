@@ -4,12 +4,13 @@ version = 4
 
 [[package]]
 name = "a2a-bridge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a2a-lf",
  "arc-swap",
  "async-trait",
  "axum",
+ "base64",
  "bridge-a2a-inbound",
  "bridge-a2a-outbound",
  "bridge-acp",
@@ -25,12 +26,17 @@ dependencies = [
  "bridge-store",
  "bridge-workflow",
  "bridge-worktree",
+ "flate2",
  "futures",
+ "libc",
  "lsp-mcp",
  "notify",
  "reqwest",
+ "ring",
+ "semver",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -54,6 +60,12 @@ dependencies = [
  "thiserror 2.0.18",
  "uuid",
 ]
+
+[[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-client-protocol"
@@ -424,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-a2a-inbound"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a2a-lf",
  "arc-swap",
@@ -449,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-a2a-outbound"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a2a-lf",
  "async-stream",
@@ -466,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-acp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -475,21 +487,24 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "syn",
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "bridge-api"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-stream",
  "async-trait",
  "bridge-core",
  "futures",
+ "httpdate",
  "reqwest",
  "serde",
  "serde_json",
@@ -502,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-container"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -518,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-controller"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bridge-core",
@@ -533,11 +548,12 @@ dependencies = [
 
 [[package]]
 name = "bridge-coordinator"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "a2a-lf",
  "async-trait",
  "bridge-core",
+ "bridge-observ",
  "bridge-workflow",
  "futures",
  "serde",
@@ -550,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -558,6 +574,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "syn",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -569,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-mcp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bridge-coordinator",
@@ -584,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-observ"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bridge-core",
  "prometheus",
@@ -595,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-policy"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bridge-core",
@@ -607,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-registry"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -619,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bridge-core",
@@ -635,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-workflow"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -653,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-worktree"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bridge-core",
@@ -790,6 +807,15 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "crc32fast"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+dependencies = [
+ "cfg-if",
+]
 
 [[package]]
 name = "crossbeam-channel"
@@ -984,6 +1010,16 @@ name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
+name = "flate2"
+version = "1.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide",
+]
 
 [[package]]
 name = "fluent-uri"
@@ -1672,7 +1708,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lsp-mcp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1721,6 +1757,16 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+ "simd-adler32",
+]
 
 [[package]]
 name = "mio"
@@ -2495,6 +2541,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "simd-adler32"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2584,6 +2636,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
 ]
 
 [[package]]
@@ -3715,6 +3778,16 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix",
+]
 
 [[package]]
 name = "yoke"

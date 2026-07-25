@@ -1,0 +1,38 @@
+# R3d0 checked-in policy. This file is reviewable input only and grants no effects.
+schema_version = 1
+environment_owner = "wesley-macbook"
+trusted_cwd_root = "/Users/wesleyjinks/code"
+repository = "shoedog/a2acp"
+fixed_prompt_contract = "r2c-fixed-pong-v1"
+artifact_template = "schedule-evidence-v1"
+price_ranking_authority = "operator-reviewed-price-ranking-v1"
+price_snapshot_max_age_secs = 604800
+scheduled_registry = "scheduled-cases.toml"
+characterization_inventory = "characterization-profiles.toml"
+production_manifest = "manifest.toml"
+floating_recipes = "floating-current.toml"
+allowed_triggers = ["manual_characterization", "manual_compatibility", "daily", "scheduled_main", "test_merge"]
+allowed_effects = ["provider_prompt", "registry_read", "image_inspect", "image_build"]
+deferred_profiles = [
+  "kiro-qwen-host-reader: model application and reproducible reader inputs remain unavailable",
+  "openrouter: R3e not implemented",
+  "opencode: R3f not implemented",
+]
+
+[storage]
+hot_root = "~/Library/Application Support/a2a-bridge/operator/evidence"
+hot_cap_bytes = 10737418240
+hot_index_cap_bytes = 1073741824
+hot_scratch_cap_bytes = 4294967296
+hot_sealed_cap_bytes = 5368709120
+cold_root = "~/Documents/a2a-bridge/evidence-archive"
+cold_cap_bytes = 26843545600
+replication_mode = "owner_icloud"
+
+[profile_maxima]
+timeout_secs = 900
+max_tokens = 100000
+max_cost_microusd = 5000000
+attempts = 1
+retry_cap = 0
+fallback_cap = 0

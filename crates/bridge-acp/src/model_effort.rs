@@ -277,20 +277,6 @@ pub fn is_unsupported_effort_error(
         || text.contains("model_not_found")
 }
 
-pub fn resolved_log_line(
-    agent: &str,
-    model_current: &str,
-    effort_outcome: &EffortDecision,
-) -> String {
-    let effort = match effort_outcome {
-        EffortDecision::Skip => "skipped".to_string(),
-        EffortDecision::Apply { level, .. } => level.clone(),
-        EffortDecision::FellBack { from, to, .. } => format!("{to} (fell back from {from})"),
-        EffortDecision::Unsupported { from } => format!("unsupported ({from})"),
-    };
-    format!("model_effort_resolved agent={agent} model={model_current} effort={effort}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,22 +700,5 @@ mod tests {
         ));
         assert!(!is_unsupported_effort_error(-32603, "usage_update", None));
         assert!(!is_unsupported_effort_error(-32000, "Invalid value", None));
-    }
-
-    #[test]
-    fn resolved_log_line_uses_resolved_values() {
-        let line = resolved_log_line(
-            "claude",
-            "sonnet",
-            &EffortDecision::FellBack {
-                config_id: "effort".into(),
-                from: "xhigh".into(),
-                to: "high".into(),
-            },
-        );
-        assert_eq!(
-            line,
-            "model_effort_resolved agent=claude model=sonnet effort=high (fell back from xhigh)"
-        );
     }
 }

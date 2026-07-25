@@ -8,6 +8,12 @@ server running. Remote A2A callers — or the CLI — resolve the target agent(s
 runtime-mutable registry, drive them over **ACP** (the Agent Client Protocol, JSON-RPC/stdio)
 via a conformant SDK client, and get results back over SSE or as workflow output.
 
+> **Agents and operators:** start with the
+> [`a2a-bridge-operator` skill](skills/a2a-bridge-operator/SKILL.md) and the
+> [documentation index](docs/README.md). Current agent/model evidence is in
+> [`docs/compatibility.md`](docs/compatibility.md); current priorities are in
+> [`docs/roadmap.md`](docs/roadmap.md).
+
 ## What this is
 
 a2a-bridge is a **reference implementation**: a working, opinionated answer to "how do you
@@ -87,10 +93,14 @@ containers) see [AGENTS.md](AGENTS.md); for running your own multi-agent bridge 
 | `implement` | Clone a repo, implement a task on a warm containerized agent, build/test-verify, review the diff, hand off a branch. `--input <file|-> --repo <path> [--config <f>] [--merge [--onto <branch>]]` |
 | `merge <id>` | Land an **Approved** `implement` run's commit into its source repo, fast-forward, re-authored to the operator. `[--onto <branch>] [--force]` |
 | `models` | List each configured agent's advertised models/effort/modes (probed live). `[--config <f>] [--agent <id>] [--json]` |
+| `compatibility` | Validate the versioned compatibility matrix, run an explicitly selected zero-retry canary set through the existing `smoke` path, or compare pinned evidence. `validate` \| `run` \| `compare` |
+| `smoke` | Run one explicitly acknowledged, bounded, billable fixed-`PONG` turn and emit a versioned JSON artifact. `--agent <id> --config <f> --acknowledge-billable [--model <id>] [--effort <e>] [--mode <m>] [--session-cwd <repo>] [--timeout-secs <1..900>] [--out <f>]` |
+| `fallback-plan` | Validate one complete failed smoke-v2 artifact and emit, but never execute, a guarded distinct host-verification smoke. `--from <artifact> --host-agent <id> --config <f> --trusted-session-cwd <exact-owned-repo> [--confirm-trusted-own-repo-read-only]` |
 | `init` | Scaffold `a2a-bridge.toml` + prompts for the given agents. `--agents codex,claude [--dir <d>] [--force]` |
 | `validate` | Validate config schema, registry, workflow DAGs, and prompt refs — or `--repo-hygiene` (this repo's own workflow-artifact hygiene gate) |
+| `doctor` | Run a bounded, read-only preflight for config, commands/runtimes, egress, credentials, store, verify/review, and MCP/LSP. `[--config <f>] [--json]` |
 | `serve` | Run the A2A server. `[--config <path>]` |
-| `mcp` | Serve the MCP protocol over stdio, backed by the same `Coordinator` service API. `[--config <path>] [--store <path>]` |
+| `mcp` | Serve the external-controller MCP protocol over stdio, backed by the same `Coordinator` service API. Managed-agent loopback is refused. `[--config <path>] [--store <path>]` |
 | `task-spec` | Inspect/scaffold/validate typed task-spec inputs: `schema` \| `template <type>` \| `input <file>` |
 | `prompt` | Inspect the named `[[prompts]]` registry: `list` \| `show <id>` |
 | `containers` | List/reap this config's managed containers (crash-orphan cleanup): `list [--all]` \| `reap [--stale] [--force <name>]` |
@@ -125,6 +135,10 @@ A2A caller ──HTTP/JSON-RPC/SSE──▶ bridge-a2a-inbound (axum)
 every protocol adapter (A2A, CLI, MCP alike — Slice 8, ADR pending consolidation). Today
 `bridge-mcp`'s stdio adapter (`a2a-bridge mcp`) is built directly on `Arc<Coordinator>`, and the
 CLI's `submit`/`task`/`session` subcommands are thin A2A HTTP clients against a running `serve`.
+The stdio MCP adapter is supported for external operators and controllers, not as an MCP server handed
+back to an agent already managed by the same bridge. Config validation rejects the direct loopback, and a
+reserved inherited depth marker makes indirect marked launches fail before config or state-store work;
+see [ADR-0028](docs/adr/0028-per-agent-mcp.md#managed-agent-loopback-boundary).
 The A2A inbound server (`bridge-a2a-inbound`) has **not yet** been migrated onto `Coordinator`
 — it still owns its own parallel `SessionManager`/task-store wiring, duplicating some
 turn-lifecycle logic that `Coordinator` also implements. This is a known, tracked gap (see
@@ -191,12 +205,13 @@ allowed_cmds = ["kiro-cli", "codex-acp"]   # optional; defaults to the union of 
 id   = "kiro"
 cmd  = "kiro-cli"
 args = ["acp"]
-# name / model / model_provider / effort / mode / cwd / auth_method — all optional, see below
+# name / model / model_provider / effort / mode / cwd / auth_method / pre_authenticated — optional
 
 [[agents]]
 id   = "codex"
 cmd  = "codex-acp"
 args = []
+pre_authenticated = true # reuse the existing `codex login`; do not launch browser auth
 
 [server]
 addr = "127.0.0.1:8080"
@@ -217,6 +232,8 @@ addr = "127.0.0.1:8080"
 | `mode` | no | Mode id for `session/set_mode` (hard error if the agent rejects it) |
 | `cwd` | no | Working directory for `session/new`; relative values join onto the bridge's `current_dir()` |
 | `auth_method` | no | Auth method id for `authenticate` (defaults to ChatGPT-style auth when advertised, else the first advertised method); `"none"` skips client-driven `authenticate` entirely for agents already authenticated out-of-band |
+| `pre_authenticated` | no | Skip `authenticate` because credentials are already ambient (for example, `codex login` or a mounted `auth.json`); cannot be combined with `auth_method` |
+| `host_fallback_eligible` | no | Default `false`. Marks only an unsandboxed `kind="acp"` entry as an allowed target for a locally confirmed trusted-own-repo read-only fallback plan; it never asserts content trust or starts a fallback. |
 | `description`, `tags`, `version` | no | Seamed for future per-entry Agent Cards |
 
 Model/effort resolution details, the effort-level-per-model table, and the `kind="api"` fields

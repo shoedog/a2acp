@@ -6,9 +6,10 @@
 # single-use. So two independent consumers sharing one token lineage invalidate each other: when you
 # use the agent on the host, the host rotates the lineage and the container's COPY (with the now-dead
 # refresh token) goes stale (-> `session/prompt failed`). Syncing the host's CURRENT token into the
-# copy right before a run lets each short container turn "borrow" a fresh access token (valid for hours)
-# WITHOUT refreshing -> no rotation -> the host stays valid too. The copy (vs mounting the host file
-# directly) still protects the host from a container write clobbering it.
+# copy right before a run lets each short container turn "borrow" a still-valid access token WITHOUT
+# refreshing -> no rotation -> the host stays valid too. This script copies bytes and does not prove or
+# renew freshness; `a2a-bridge doctor` must green after sync. The copy (vs mounting the host file directly)
+# still protects the host from a container write clobbering it.
 #
 # Run before serve / run-workflow / implement, e.g.:
 #     deploy/containers/sync-creds.sh && a2a-bridge serve --config examples/a2a-bridge.containerized.toml

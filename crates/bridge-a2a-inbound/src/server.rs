@@ -39,24 +39,27 @@ use bridge_core::domain::{
     SessionSpec, TaskMeta,
 };
 use bridge_core::error::{A2aDisposition, BridgeError};
-use bridge_core::ids::{
-    AgentId, BatchId, ContextId, OperationId, SessionGeneration, SessionId, TaskId,
-};
+#[cfg(test)]
+use bridge_core::ids::OperationId;
+use bridge_core::ids::{AgentId, BatchId, ContextId, SessionId, TaskId};
 use bridge_core::permission::{PermissionRegistry, TurnMeta};
 use bridge_core::ports::{
-    AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, Lease, PolicyEngine,
-    RouteDecision, SessionStore,
+    AgentBackend, AgentRegistry, AuthMiddleware, DelegationPort, DiagnosticObserver, Lease,
+    PolicyEngine, RouteDecision, SessionStore,
 };
 use bridge_core::task_store::BatchItem;
 use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
 use bridge_core::SessionCwd;
 use bridge_workflow::executor::{
-    NodeTurn, NodeTurnCleanup, NodeTurnExit, WorkflowNodeDispatcher, WorkflowRunContext,
+    NodeTurn, NodeTurnCleanup, NodeTurnExit, WorkflowDiagnosticContext, WorkflowNodeDispatcher,
+    WorkflowRunContext,
 };
 use bridge_workflow::graph::WorkflowNode;
 
 use bridge_coordinator::coordinator::StatusDto;
-use bridge_coordinator::dispatch::{BindingGuard, LocalDispatch, TaskBinding, WarmTurnGuard};
+use bridge_coordinator::dispatch::{
+    BindingGuard, LocalDispatch, TaskBinding, WarmCompletionExit, WarmCompletionGuard,
+};
 use bridge_coordinator::params::{validate_cwd_str, InjectParams, PermitParams};
 use bridge_coordinator::turn_parts::assemble_turn_parts;
 use bridge_coordinator::{BatchDeps, BatchRuntime};
@@ -73,6 +76,14 @@ const JSONRPC_METHOD_NOT_FOUND: i32 = -32601;
 const JSONRPC_INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC 2.0 internal error.
 const JSONRPC_INTERNAL: i32 = -32603;
+const DIRECT_DIAGNOSTIC_CAPACITY: usize = 64;
+
+fn direct_diagnostic_observer() -> Arc<dyn DiagnosticObserver> {
+    Arc::new(
+        bridge_core::diagnostics::InMemoryDiagnosticObserver::new(DIRECT_DIAGNOSTIC_CAPACITY)
+            .expect("direct diagnostic capacity is nonzero"),
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TraceHttpConfig {
@@ -477,6 +488,7 @@ async fn resolve_configure_bind(
     routed: &RoutedCall,
     overrides: Option<&AgentOverride>,
     session_cwd: Option<SessionCwd>,
+    observer: Arc<dyn DiagnosticObserver>,
 ) -> Result<LocalDispatch, BridgeError> {
     let session = &routed.session;
     // Follow-up: a binding already exists → reuse the bound `(backend, eff)`, no
@@ -519,7 +531,7 @@ async fn resolve_configure_bind(
         }
     }
     // First message: resolve, configure, bind, and hand back an eviction guard.
-    let resolved = srv.registry().resolve(agent_id).await?;
+    let resolved = srv.registry().resolve_observed(agent_id, observer).await?;
     let eff = effective_config(&resolved.entry, overrides);
     let obs_model = eff.model.clone();
     let obs_effort = eff.effort;
@@ -622,15 +634,18 @@ async fn warm_local_dispatch(
     srv: &Arc<InboundServer>,
     agent_id: &AgentId,
     routed: &RoutedCall,
+    observer: Arc<dyn DiagnosticObserver>,
 ) -> Option<Result<LocalDispatch, BridgeError>> {
     let ctx = routed.context_id.clone()?;
     let sm = srv.session_manager().clone();
+    let completion_observer = observer.clone();
     match sm
-        .checkout_turn(
+        .checkout_turn_observed(
             &ctx,
             agent_id.clone(),
             routed.overrides.clone(),
             routed.session_cwd.clone(),
+            observer,
         )
         .await
     {
@@ -651,12 +666,14 @@ async fn warm_local_dispatch(
                     op: turn.op.clone(),
                 }),
                 guard: None,
-                warm_guard: Some(WarmTurnGuard {
+                warm_guard: Some(WarmCompletionGuard::finish_owner(
                     sm,
                     ctx,
-                    generation: turn.generation,
-                    op: turn.op.clone(),
-                }),
+                    turn.generation,
+                    turn.op.clone(),
+                    turn.expiry_intent,
+                    completion_observer,
+                )),
                 // Warm: the handle's per-turn abort token — a force-reset cancels it (cancel-tokens F2).
                 abort: turn.abort,
                 obs_ctx: obs_ctx_for_dispatch(
@@ -686,7 +703,25 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
         wf_id: &str,
         node: &WorkflowNode,
         _run_id: &str,
+        ctx: &WorkflowRunContext,
+    ) -> Result<NodeTurn, BridgeError> {
+        self.checkout_observed(
+            wf_id,
+            node,
+            _run_id,
+            ctx,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
+    }
+
+    async fn checkout_observed(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        _run_id: &str,
         _ctx: &WorkflowRunContext,
+        observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<NodeTurn, BridgeError> {
         let child = ContextId::parse(format!(
             "{}::workflow::{}::node::{}",
@@ -694,14 +729,16 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
             wf_id,
             node.id.as_str()
         ))?;
+        let completion_observer = observer.clone();
         let turn = self
             .sm
-            .checkout_child_turn(
+            .checkout_child_turn_observed(
                 &self.parent,
                 &child,
                 node.agent.clone(),
                 None,
                 self.cwd.clone(),
+                observer,
             )
             .await?;
         Ok(NodeTurn {
@@ -709,10 +746,14 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
             session: turn.session,
             seed: turn.seed,
             cleanup: Box::new(WarmNodeCleanup {
-                sm: self.sm.clone(),
-                child,
-                gen: turn.generation,
-                op: turn.op,
+                guard: WarmCompletionGuard::workflow_owner(
+                    self.sm.clone(),
+                    child,
+                    turn.generation,
+                    turn.op,
+                    turn.expiry_intent,
+                    completion_observer,
+                ),
             }),
         })
     }
@@ -720,29 +761,37 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
 
 #[allow(dead_code)] // constructed by WarmWorkflowNodeDispatcher once the producer is wired
 struct WarmNodeCleanup {
-    sm: Arc<crate::session_manager::SessionManager>,
-    child: ContextId,
-    gen: SessionGeneration,
-    op: OperationId,
+    guard: WarmCompletionGuard,
 }
 
 #[async_trait::async_trait]
 impl NodeTurnCleanup for WarmNodeCleanup {
+    fn arm_exit(&mut self, exit: &NodeTurnExit) {
+        self.guard.observe_exit(match exit {
+            NodeTurnExit::Normal => WarmCompletionExit::Normal,
+            NodeTurnExit::Canceled => WarmCompletionExit::Canceled,
+            NodeTurnExit::Error(error) => WarmCompletionExit::Error(error),
+        });
+    }
+
     async fn on_exit(self: Box<Self>, exit: NodeTurnExit) {
-        match exit {
-            NodeTurnExit::Normal => {
-                self.sm.finish_turn(&self.child, self.gen, &self.op).await;
-            }
-            NodeTurnExit::Canceled => {
-                let _ = self.sm.cancel(&self.child).await;
-            }
-            NodeTurnExit::Error(BridgeError::AgentCrashed { .. }) => {
-                self.sm.expire_turn(&self.child).await;
-            }
-            NodeTurnExit::Error(_) => {
-                self.sm.finish_turn(&self.child, self.gen, &self.op).await;
-            }
-        }
+        let _ = self.finish(exit).await;
+    }
+
+    async fn on_exit_observed(
+        self: Box<Self>,
+        exit: NodeTurnExit,
+        _observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<(), BridgeError> {
+        self.finish(exit).await
+    }
+}
+
+impl WarmNodeCleanup {
+    async fn finish(mut self: Box<Self>, exit: NodeTurnExit) -> Result<(), BridgeError> {
+        self.arm_exit(&exit);
+        let WarmNodeCleanup { guard } = *self;
+        guard.complete().await
     }
 }
 
@@ -759,8 +808,9 @@ async fn resolve_for_fanout(
     session: &SessionId,
     overrides: Option<&AgentOverride>,
     session_cwd: Option<SessionCwd>,
+    observer: Arc<dyn DiagnosticObserver>,
 ) -> Result<(Arc<dyn AgentBackend>, Box<dyn Lease>), BridgeError> {
-    let resolved = srv.registry().resolve(agent_id).await?;
+    let resolved = srv.registry().resolve_observed(agent_id, observer).await?;
     let eff = effective_config(&resolved.entry, overrides);
     resolved
         .backend
@@ -1513,23 +1563,26 @@ async fn stream_message(
             // SSE frame rather than a JSON-RPC error (streaming has already committed
             // to an SSE response).
             let agent_id = local_agent_id(&srv, &routed.target);
-            let dispatch = match warm_local_dispatch(&srv, &agent_id, &routed).await {
-                Some(r) => r,
-                None => {
-                    resolve_configure_bind(
-                        &srv,
-                        &agent_id,
-                        &routed,
-                        routed.overrides.as_ref(),
-                        routed.session_cwd.clone(),
-                    )
-                    .await
-                }
-            };
+            let diagnostic = direct_diagnostic_observer();
+            let dispatch =
+                match warm_local_dispatch(&srv, &agent_id, &routed, diagnostic.clone()).await {
+                    Some(r) => r,
+                    None => {
+                        resolve_configure_bind(
+                            &srv,
+                            &agent_id,
+                            &routed,
+                            routed.overrides.as_ref(),
+                            routed.session_cwd.clone(),
+                            diagnostic.clone(),
+                        )
+                        .await
+                    }
+                };
             match dispatch {
                 Ok(dispatch) => {
                     let _ = srv.store.put(&routed.task, &dispatch.session).await;
-                    spawn_local_producer(&srv, routed, dispatch, tx)
+                    spawn_local_producer(&srv, routed, dispatch, diagnostic, tx)
                 }
                 Err(e) => {
                     tokio::spawn(async move {
@@ -1989,11 +2042,11 @@ fn rich_snapshot_frames(
     for event in events {
         match &event.kind {
             bridge_core::orch::OrchEventKind::Plan { .. } => {
-                latest_plan = Some(crate::reattach::frame_from_orch(
+                latest_plan = crate::reattach::project_orch_frame(
                     &event.kind,
                     crate::reattach::Phase::Snapshot,
                     event.seq,
-                ));
+                );
             }
             bridge_core::orch::OrchEventKind::ToolCall {
                 tool_call_id,
@@ -2068,7 +2121,7 @@ fn rich_snapshot_frames(
         frames.push(frame);
     }
 
-    frames.extend(tool_calls.into_values().map(|tool| {
+    frames.extend(tool_calls.into_values().filter_map(|tool| {
         let kind = if let Some(base) = tool.base {
             bridge_core::orch::OrchEventKind::ToolCall {
                 tool_call_id: base.tool_call_id,
@@ -2088,7 +2141,7 @@ fn rich_snapshot_frames(
                 content: tool.patch.content,
             }
         };
-        crate::reattach::frame_from_orch(&kind, crate::reattach::Phase::Snapshot, tool.last_seq)
+        crate::reattach::project_orch_frame(&kind, crate::reattach::Phase::Snapshot, tool.last_seq)
     }));
 
     frames.sort_by_key(|frame| frame.seq);
@@ -2111,6 +2164,7 @@ fn spawn_local_producer(
     srv: &Arc<InboundServer>,
     routed: RoutedCall,
     dispatch: LocalDispatch,
+    diagnostic: Arc<dyn DiagnosticObserver>,
     tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
 ) {
     let store = srv.store.clone();
@@ -2131,7 +2185,7 @@ fn spawn_local_producer(
     tokio::spawn(async move {
         // Hold the guard for the whole producer; dropped on every return path below.
         let _guard = guard;
-        let warm = warm;
+        let mut warm = warm;
         let started = std::time::Instant::now();
         let mut ttft = None;
         let mut last_usage: Option<bridge_core::orch::UsageSnapshot> = None;
@@ -2141,13 +2195,14 @@ fn spawn_local_producer(
             backend.configure_turn(&session, meta).await;
         }
         let translator = Translator::new();
-        let mut events = translator.run(
+        let mut events = translator.run_observed(
             backend.as_ref(),
             store.as_ref(),
             policy.as_ref(),
             &task,
             &session,
             parts,
+            diagnostic,
         );
         let mut errored = false;
         // Whether the translator already emitted its own terminal frame (a
@@ -2155,6 +2210,7 @@ fn spawn_local_producer(
         // which the translator maps to a terminal Canceled event). If so we must
         // NOT append a second terminal — we honor the one it sent.
         let mut translator_terminal = false;
+        let mut disconnected = false;
         loop {
             // Race the next translator event against caller-disconnect. The
             // `tx.closed()` arm is essential for an IDLE backend stream: a producer
@@ -2167,6 +2223,9 @@ fn spawn_local_producer(
                 // Emit a terminal Canceled and STOP without polling events — a pre-first-poll abort means
                 // `backend.prompt` never runs, so the released (cleared) session is never re-minted.
                 _ = abort.cancelled() => {
+                    if let Some(warm) = warm.as_mut() {
+                        warm.observe_exit(WarmCompletionExit::Canceled);
+                    }
                     if !translator_terminal {
                         let _ = tx.send(Ok(Event::terminal(TaskOutcome::Canceled))).await;
                     }
@@ -2177,38 +2236,30 @@ fn spawn_local_producer(
                         ttft,
                         outcome: &outcome,
                     });
-                    if let Some(usage) = &last_usage {
-                        observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
-                            ctx: &obs_ctx,
-                            usage,
-                            fin: bridge_core::ports::UsageFinalization::TurnFinal,
-                        });
-                    }
-                    return;
-                }
-                _ = tx.closed() => {
-                    // Receiver gone (client disconnected) — stop driving; the `_guard`
-                    // Drop evicts the binding/lease/stash on this early return.
-                    let outcome = bridge_core::ports::TurnOutcome::Canceled;
-                    observer.record(&bridge_core::ports::ObsEvent::TurnFinished {
+                    observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
                         ctx: &obs_ctx,
-                        latency: started.elapsed(),
-                        ttft,
-                        outcome: &outcome,
+                        usage: last_usage.as_ref(),
+                        fin: bridge_core::ports::UsageFinalization::TurnFinal,
                     });
-                    if let Some(usage) = &last_usage {
-                        observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
-                            ctx: &obs_ctx,
-                            usage,
-                            fin: bridge_core::ports::UsageFinalization::TurnFinal,
-                        });
+                    if let Some(warm) = warm.take() {
+                        let _ = warm.complete().await;
                     }
                     return;
                 }
+                // Once prompt ownership exists, a queued backend result wins
+                // over a simultaneous receiver close. That makes an already-
+                // observed structured failure arm expiry before disconnect
+                // cleanup; a merely pending backend still loses immediately to
+                // `tx.closed()`. The force-reset abort remains first because it
+                // must never poll a session that has already been released.
                 maybe = events.next() => match maybe {
                     Some(ev) => ev,
                     None => break,
                 },
+                _ = tx.closed() => {
+                    disconnected = true;
+                    break;
+                }
             };
             // Slice 2: usage is telemetry — record it on the warm handle, never forward to SSE.
             if let Ok(e) = &ev {
@@ -2216,9 +2267,12 @@ fn spawn_local_producer(
                     if let Some(snap) = e.usage_snapshot() {
                         last_usage = Some(snap.clone());
                         if let Some(w) = warm.as_ref() {
-                            w.sm.record_usage(&w.ctx, w.generation, &w.op, snap.clone())
-                                .await;
+                            w.record_usage(snap.clone()).await;
                         }
+                    }
+                    if tx.is_closed() {
+                        disconnected = true;
+                        break;
                     }
                     continue;
                 }
@@ -2227,7 +2281,12 @@ fn spawn_local_producer(
                 ttft = Some(started.elapsed());
             }
             // Track whether the stream ended with an error.
-            if ev.is_err() {
+            if let Err(error) = &ev {
+                if let Some(warm) = warm.as_mut() {
+                    // Arm expiry before the channel send below can await or be
+                    // canceled by a disconnected receiver.
+                    warm.observe_exit(WarmCompletionExit::Error(error));
+                }
                 errored = true;
             }
             // Note a translator-emitted terminal (e.g. Canceled) so we don't
@@ -2235,27 +2294,42 @@ fn spawn_local_producer(
             if let Ok(e) = &ev {
                 if e.kind() == &EventKind::Terminal {
                     translator_terminal = true;
+                    if e.outcome() == Some(TaskOutcome::Canceled) {
+                        if let Some(warm) = warm.as_mut() {
+                            warm.observe_exit(WarmCompletionExit::Canceled);
+                        }
+                    }
                 }
             }
             // If the receiver is gone (client disconnected) stop driving. The
             // `_guard` Drop still evicts the binding/lease/stash on this early return.
             if tx.send(ev).await.is_err() {
-                // Receiver gone — emit exactly one TurnFinished(Canceled) then return.
-                observer.record(&bridge_core::ports::ObsEvent::TurnFinished {
-                    ctx: &obs_ctx,
-                    latency: started.elapsed(),
-                    ttft,
-                    outcome: &bridge_core::ports::TurnOutcome::Canceled,
-                });
-                if let Some(usage) = &last_usage {
-                    observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
-                        ctx: &obs_ctx,
-                        usage,
-                        fin: bridge_core::ports::UsageFinalization::TurnFinal,
-                    });
-                }
-                return;
+                disconnected = true;
+                break;
             }
+        }
+        if disconnected {
+            if let Some(warm) = warm.as_mut() {
+                warm.observe_exit(WarmCompletionExit::Canceled);
+            }
+            // Receiver gone — emit exactly one TurnFinished(Canceled), settle
+            // warm cleanup, then return. This path also handles usage events,
+            // which are intentionally not forwarded through the channel.
+            observer.record(&bridge_core::ports::ObsEvent::TurnFinished {
+                ctx: &obs_ctx,
+                latency: started.elapsed(),
+                ttft,
+                outcome: &bridge_core::ports::TurnOutcome::Canceled,
+            });
+            observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
+                ctx: &obs_ctx,
+                usage: last_usage.as_ref(),
+                fin: bridge_core::ports::UsageFinalization::TurnFinal,
+            });
+            if let Some(warm) = warm.take() {
+                let _ = warm.complete().await;
+            }
+            return;
         }
         // Append exactly one terminal frame after the inner stream ends, UNLESS
         // the translator already sent its own terminal (cancelled turn).
@@ -2281,12 +2355,18 @@ fn spawn_local_producer(
             ttft,
             outcome: &outcome,
         });
-        if let Some(usage) = &last_usage {
-            observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
-                ctx: &obs_ctx,
-                usage,
-                fin: bridge_core::ports::UsageFinalization::TurnFinal,
-            });
+        observer.record(&bridge_core::ports::ObsEvent::UsageFinalized {
+            ctx: &obs_ctx,
+            usage: last_usage.as_ref(),
+            fin: bridge_core::ports::UsageFinalization::TurnFinal,
+        });
+        if !errored && !translator_terminal {
+            if let Some(warm) = warm.as_mut() {
+                warm.observe_exit(WarmCompletionExit::Normal);
+            }
+        }
+        if let Some(warm) = warm.take() {
+            let _ = warm.complete().await;
         }
         // `_guard` drops here too (clean exit) → eviction. Channel closes on drop ->
         // SSE stream terminates after the terminal flush.
@@ -2451,6 +2531,7 @@ async fn poll_cancel_requested(store: &dyn SessionStore, local: &TaskId) {
 
 /// Build a `Source` for the local Kiro backend by running the Translator inside an
 /// `async_stream::stream!` that owns all the `Arc` clones it needs — no lifetime fight.
+#[allow(clippy::too_many_arguments)]
 fn local_kiro_source(
     label: String,
     backend: Arc<dyn AgentBackend>,
@@ -2459,17 +2540,19 @@ fn local_kiro_source(
     task: TaskId,
     session: SessionId,
     parts: Vec<Part>,
+    diagnostic: Arc<dyn DiagnosticObserver>,
 ) -> Source {
     // Build the stream by cloning Arc refs into a `'static + Send` stream.
     let stream: crate::fanout::EventStream = Box::pin(async_stream::stream! {
         let translator = Translator::new();
-        let mut events = translator.run(
+        let mut events = translator.run_observed(
             backend.as_ref(),
             store.as_ref(),
             policy.as_ref(),
             &task,
             &session,
             parts,
+            diagnostic,
         );
         while let Some(ev) = events.next().await {
             // A fan-out SOURCE must never emit a terminal frame — the fan-out
@@ -2518,6 +2601,7 @@ fn spawn_fanout_producer(
         //    out from under either path. `_lease` is kept alive until the producer
         //    task exits. A resolve/configure failure makes the local source a single
         //    labeled error frame (the coordinator's terminal still covers completion).
+        let diagnostic = direct_diagnostic_observer();
         let (kiro_source, kiro_backend, _lease): (Source, Option<Arc<dyn AgentBackend>>, _) =
             match resolve_for_fanout(
                 &srv,
@@ -2526,6 +2610,7 @@ fn spawn_fanout_producer(
                 &session,
                 overrides.as_ref(),
                 session_cwd,
+                diagnostic.clone(),
             )
             .await
             {
@@ -2538,6 +2623,7 @@ fn spawn_fanout_producer(
                         task.clone(),
                         session.clone(),
                         parts.clone(),
+                        diagnostic,
                     );
                     (src, Some(backend), Some(lease))
                 }
@@ -2796,25 +2882,34 @@ fn spawn_workflow_producer(
                 task_id: Some(routed.task.clone()),
                 prompt_id: routed.prompt_id.clone(),
             };
+            let diagnostic_ctx = WorkflowDiagnosticContext::new(
+                wf_ctx,
+                Arc::new(
+                    bridge_core::diagnostics::InMemoryDiagnosticObserverFactory::new(
+                        DIRECT_DIAGNOSTIC_CAPACITY,
+                    )
+                    .expect("direct diagnostic capacity is nonzero"),
+                ),
+            );
             let stream = match &workflow_token {
-                Some((c, _)) => executor.run_with_context_and_dispatcher(
+                Some((c, _)) => executor.run_with_diagnostic_context_and_dispatcher(
                     graph,
                     input,
                     task.as_str().into(),
                     token,
-                    wf_ctx,
+                    diagnostic_ctx,
                     Arc::new(WarmWorkflowNodeDispatcher {
                         sm: srv.session_manager().clone(),
                         parent: c.clone(),
                         cwd: routed.session_cwd.clone(),
                     }),
                 ),
-                None => executor.run_with_context(
+                None => executor.run_with_diagnostic_context(
                     graph,
                     input,
                     task.as_str().to_string(),
                     token,
-                    wf_ctx,
+                    diagnostic_ctx,
                 ),
             };
             let mut sink = SseSink { tx: tx.clone() };
@@ -3118,19 +3213,22 @@ async fn unary_message(
             // for the call's DURATION (so an interleaved cancel finds the binding) and
             // is dropped at the end of this scope → eviction after `collect().await`.
             // A follow-up reuses the binding and carries no guard (no premature evict).
-            let dispatch = match warm_local_dispatch(&srv, agent_id, &routed).await {
-                Some(r) => r,
-                None => {
-                    resolve_configure_bind(
-                        &srv,
-                        agent_id,
-                        &routed,
-                        routed.overrides.as_ref(),
-                        routed.session_cwd.clone(),
-                    )
-                    .await
-                }
-            };
+            let diagnostic = direct_diagnostic_observer();
+            let dispatch =
+                match warm_local_dispatch(&srv, agent_id, &routed, diagnostic.clone()).await {
+                    Some(r) => r,
+                    None => {
+                        resolve_configure_bind(
+                            &srv,
+                            agent_id,
+                            &routed,
+                            routed.overrides.as_ref(),
+                            routed.session_cwd.clone(),
+                            diagnostic.clone(),
+                        )
+                        .await
+                    }
+                };
             let dispatch = match dispatch {
                 Ok(d) => d,
                 Err(e) => return bridge_err_to_jsonrpc(id, &e),
@@ -3139,7 +3237,7 @@ async fn unary_message(
             // Held until this arm returns; its Drop evicts the binding/lease/stash
             // after the synchronous collect completes.
             let _guard = dispatch.guard;
-            let warm = dispatch.warm_guard;
+            let mut warm = dispatch.warm_guard;
             if let Some(meta) = dispatch.turn_meta.clone() {
                 dispatch
                     .backend
@@ -3151,13 +3249,14 @@ async fn unary_message(
             let parts =
                 assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
             let translator = Translator::new();
-            let mut events = translator.run(
+            let mut events = translator.run_observed(
                 dispatch.backend.as_ref(),
                 srv.store.as_ref(),
                 srv.policy().as_ref(),
                 &routed.task,
                 &dispatch.session,
                 parts,
+                diagnostic,
             );
             let mut collected: Vec<Result<Event, BridgeError>> = Vec::new();
             loop {
@@ -3166,6 +3265,9 @@ async fn unary_message(
                     // cancel-tokens F2 (L1 — abort arm FIRST, biased): a force-reset cancelled this turn.
                     // Record a Canceled terminal and stop without polling events (pre-first-poll → no re-mint).
                     _ = abort.cancelled() => {
+                        if let Some(warm) = warm.as_mut() {
+                            warm.observe_exit(WarmCompletionExit::Canceled);
+                        }
                         collected.push(Ok(Event::terminal(TaskOutcome::Canceled)));
                         break;
                     }
@@ -3177,13 +3279,34 @@ async fn unary_message(
                 if let Ok(e) = &ev {
                     if e.kind() == &EventKind::Usage {
                         if let (Some(snap), Some(w)) = (e.usage_snapshot(), warm.as_ref()) {
-                            w.sm.record_usage(&w.ctx, w.generation, &w.op, snap.clone())
-                                .await;
+                            w.record_usage(snap.clone()).await;
                         }
                         continue; // exclude usage from the unary output
                     }
+                    if e.kind() == &EventKind::Terminal
+                        && e.outcome() == Some(TaskOutcome::Canceled)
+                    {
+                        if let Some(warm) = warm.as_mut() {
+                            warm.observe_exit(WarmCompletionExit::Canceled);
+                        }
+                    }
+                } else if let Err(error) = &ev {
+                    if let Some(warm) = warm.as_mut() {
+                        // Synchronous fail-closed transition before any later
+                        // response serialization or cleanup await.
+                        warm.observe_exit(WarmCompletionExit::Error(error));
+                    }
                 }
                 collected.push(ev);
+            }
+            drop(events);
+            if let Some(mut warm) = warm.take() {
+                warm.observe_exit(WarmCompletionExit::Normal);
+                if let Err(cleanup_error) = warm.complete().await {
+                    if collected.iter().all(Result::is_ok) {
+                        collected.push(Err(cleanup_error));
+                    }
+                }
             }
             collected
         }
@@ -3335,6 +3458,7 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
     // (`_lease`) for the unary collect's lifetime so the slot can't retire mid-run.
     // A resolve/configure failure makes the local source a single labeled error frame.
     let agent_id = local_agent_id(&srv, &routed.target);
+    let diagnostic = direct_diagnostic_observer();
     let (kiro_source, _lease) = match resolve_for_fanout(
         &srv,
         &agent_id,
@@ -3342,6 +3466,7 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
         &routed.session,
         routed.overrides.as_ref(),
         routed.session_cwd.clone(),
+        diagnostic.clone(),
     )
     .await
     {
@@ -3354,6 +3479,7 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
                 routed.task.clone(),
                 routed.session.clone(),
                 routed.parts.clone(),
+                diagnostic,
             );
             (src, Some(lease))
         }
@@ -4446,6 +4572,10 @@ fn parts_from_params(params: &Value) -> Vec<Part> {
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+    use bridge_core::diagnostics::{
+        DiagnosticFailureClass, DiagnosticPhase, DiagnosticRedactor, FailureDiagnostic,
+        FailureDiagnosticInput, FailureDisposition,
+    };
     use bridge_core::domain::RouteTarget;
     use bridge_core::domain::{AgentEntry, AgentKind, RegistrySnapshot, SessionSpec};
     use bridge_core::domain::{
@@ -4476,6 +4606,7 @@ mod tests {
         default: AgentId,
         entries: std::collections::HashMap<String, AgentEntry>,
         backends: std::collections::HashMap<String, Arc<dyn AgentBackend>>,
+        observed: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
     }
 
     impl FakeRegistry {
@@ -4503,7 +4634,12 @@ mod tests {
                 default: AgentId::parse(default).unwrap(),
                 entries,
                 backends,
+                observed: Mutex::new(Vec::new()),
             })
+        }
+
+        fn observed(&self) -> Vec<Arc<dyn DiagnosticObserver>> {
+            self.observed.lock().unwrap().clone()
         }
     }
 
@@ -4519,6 +4655,14 @@ mod tests {
                 }),
                 _ => Err(BridgeError::UnknownAgent { id: key.to_owned() }),
             }
+        }
+        async fn resolve_observed(
+            &self,
+            id: &AgentId,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Resolved, BridgeError> {
+            self.observed.lock().unwrap().push(observer);
+            self.resolve(id).await
         }
         fn default_id(&self) -> AgentId {
             self.default.clone()
@@ -4552,6 +4696,8 @@ mod tests {
             sandbox: None,
             watchdog: None,
             auth_method: None,
+            pre_authenticated: false,
+            host_fallback_eligible: false,
             name: None,
             description: None,
             tags: vec![],
@@ -5097,6 +5243,113 @@ mod tests {
         ))
     }
 
+    #[derive(Default)]
+    struct InboundObserverBackend {
+        prompts: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for InboundObserverBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            panic!("inbound owners must use prompt_with_observers")
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            assert!(observers.rich.is_none());
+            self.prompts.lock().unwrap().push(observers.diagnostic);
+            Ok(Box::pin(tokio_stream::iter(vec![
+                Ok(Update::Text("observed".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                }),
+            ])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct InboundObserverRegistry {
+        backend: Arc<InboundObserverBackend>,
+        resolutions: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
+        fail_resolution: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for InboundObserverRegistry {
+        async fn resolve(&self, _id: &AgentId) -> Result<Resolved, BridgeError> {
+            panic!("inbound owners must use resolve_observed")
+        }
+
+        async fn resolve_observed(
+            &self,
+            id: &AgentId,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Resolved, BridgeError> {
+            self.resolutions.lock().unwrap().push(observer);
+            if self.fail_resolution {
+                return Err(BridgeError::UnknownAgent {
+                    id: id.as_str().to_string(),
+                });
+            }
+            Ok(Resolved {
+                entry: Arc::new(bare_entry(id.as_str())),
+                backend: self.backend.clone(),
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("kiro").unwrap()
+        }
+
+        async fn apply(&self, _snap: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![self.default_id()]
+        }
+    }
+
+    fn build_observer_path_server(
+        route: Arc<dyn RouteDecision>,
+        delegation: Arc<dyn DelegationPort>,
+        fail_resolution: bool,
+    ) -> (
+        Arc<InboundServer>,
+        Arc<InboundObserverRegistry>,
+        Arc<InboundObserverBackend>,
+    ) {
+        let backend = Arc::new(InboundObserverBackend::default());
+        let registry = Arc::new(InboundObserverRegistry {
+            backend: backend.clone(),
+            resolutions: Mutex::new(Vec::new()),
+            fail_resolution,
+        });
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let coordinator = test_coordinator(registry.clone(), store, Arc::new(AutoApprove));
+        let server = Arc::new(InboundServer::from_coordinator(
+            coordinator,
+            route,
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            delegation,
+            "kiro",
+        ));
+        (server, registry, backend)
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum RecordedObsEvent {
         Start(bridge_core::ports::TurnContext),
@@ -5106,6 +5359,7 @@ mod tests {
         },
         UsageFinalized {
             ctx: bridge_core::ports::TurnContext,
+            has_usage: bool,
         },
     }
 
@@ -5131,9 +5385,10 @@ mod tests {
                         outcome: (*outcome).clone(),
                     })
                 }
-                bridge_core::ports::ObsEvent::UsageFinalized { ctx, .. } => {
+                bridge_core::ports::ObsEvent::UsageFinalized { ctx, usage, .. } => {
                     out.push(RecordedObsEvent::UsageFinalized {
                         ctx: (*ctx).clone(),
+                        has_usage: usage.is_some(),
                     })
                 }
                 bridge_core::ports::ObsEvent::TaskStarted { .. }
@@ -5330,7 +5585,8 @@ mod tests {
         use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
         use bridge_core::ports::{TraceParent, TurnContext, TurnOutcome};
         use bridge_core::task_store::{
-            MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinished, TurnLogUsage,
+            MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinalized,
+            TurnLogFinished, TurnUsageFinalization,
         };
         use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
         use std::io::Write;
@@ -5395,12 +5651,14 @@ mod tests {
                 error: None,
                 created_ms: 1,
                 updated_ms: 1,
+                last_artifact_ms: None,
                 input: "input".into(),
                 workflow_spec_json,
                 resume_attempts: 0,
                 session_cwd: None,
                 batch_id: None,
                 item_id: None,
+                artifacts_purged_at: None,
             }
         }
 
@@ -5470,9 +5728,9 @@ mod tests {
                 .await
                 .unwrap();
             store
-                .update_turn_usage(&TurnLogUsage {
+                .finalize_turn_usage(&TurnLogFinalized {
                     ctx,
-                    usage: UsageSnapshot {
+                    finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                         used: None,
                         size: None,
                         cost: Some(UsageCost {
@@ -5488,7 +5746,7 @@ mod tests {
                             cached_write_tokens: None,
                         }),
                         at_ms: 100,
-                    },
+                    }),
                 })
                 .await
                 .unwrap();
@@ -5642,7 +5900,9 @@ mod tests {
                     &task,
                     &op,
                     10,
-                    bridge_core::orch::OrchEventKind::Progress { text: "one".into() },
+                    bridge_core::orch::OrchEventKind::Progress {
+                        progress: bridge_core::orch::ProgressPayload::legacy("one"),
+                    },
                 )
                 .await
                 .unwrap();
@@ -5750,7 +6010,7 @@ mod tests {
                     &op,
                     10,
                     bridge_core::orch::OrchEventKind::Progress {
-                        text: "large".repeat(64),
+                        progress: bridge_core::orch::ProgressPayload::legacy("large".repeat(64)),
                     },
                 )
                 .await
@@ -5796,7 +6056,7 @@ mod tests {
                         &op,
                         10,
                         bridge_core::orch::OrchEventKind::Progress {
-                            text: message.into(),
+                            progress: bridge_core::orch::ProgressPayload::legacy(message),
                         },
                     )
                     .await
@@ -6966,6 +7226,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_unary_and_streaming_thread_resolution_observer_into_prompt() {
+        let (server, registry, backend) =
+            build_observer_path_server(Arc::new(AlwaysKiro), Arc::new(NoDelegation), false);
+
+        let unary = router(server.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "taskId": "observer-unary", "message": { "text": "unary" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unary.status(), StatusCode::OK);
+        let unary_body = body_string(unary).await;
+        assert!(unary_body.contains("observed"), "{unary_body}");
+
+        let streaming = router(server)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "taskId": "observer-streaming", "message": { "text": "streaming" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(streaming.status(), StatusCode::OK);
+        let streaming_body = body_string(streaming).await;
+        assert!(streaming_body.contains("observed"), "{streaming_body}");
+
+        let resolutions = registry.resolutions.lock().unwrap();
+        let prompts = backend.prompts.lock().unwrap();
+        assert_eq!(resolutions.len(), 2);
+        assert_eq!(prompts.len(), 2);
+        for index in 0..2 {
+            assert!(Arc::ptr_eq(&resolutions[index], &prompts[index]));
+        }
+        assert!(
+            !Arc::ptr_eq(&resolutions[0], &resolutions[1]),
+            "each inbound operation owns a fresh observer"
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_unary_and_streaming_thread_checkout_observer_into_prompt() {
+        let (server, registry, backend) =
+            build_observer_path_server(Arc::new(AlwaysKiro), Arc::new(NoDelegation), false);
+
+        let unary = router(server.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": "observer-warm-unary-task",
+                    "message": {
+                        "contextId": "observer-warm-unary",
+                        "text": "unary"
+                    }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unary.status(), StatusCode::OK);
+        let unary_body = body_string(unary).await;
+        assert!(unary_body.contains("observed"), "{unary_body}");
+
+        let streaming = router(server)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({
+                    "taskId": "observer-warm-streaming-task",
+                    "message": {
+                        "contextId": "observer-warm-streaming",
+                        "text": "streaming"
+                    }
+                }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(streaming.status(), StatusCode::OK);
+        let streaming_body = body_string(streaming).await;
+        assert!(streaming_body.contains("observed"), "{streaming_body}");
+
+        let resolutions = registry.resolutions.lock().unwrap();
+        let prompts = backend.prompts.lock().unwrap();
+        assert_eq!(resolutions.len(), 2);
+        assert_eq!(prompts.len(), 2);
+        for index in 0..2 {
+            assert!(Arc::ptr_eq(&resolutions[index], &prompts[index]));
+        }
+        assert!(!Arc::ptr_eq(&resolutions[0], &resolutions[1]));
+    }
+
+    #[tokio::test]
+    async fn direct_unary_and_streaming_observe_resolution_failure_before_prompt() {
+        let (server, registry, backend) =
+            build_observer_path_server(Arc::new(AlwaysKiro), Arc::new(NoDelegation), true);
+
+        let unary = router(server.clone())
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "taskId": "observer-fail-unary", "message": { "text": "unary" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let unary_body = body_string(unary).await;
+        assert!(unary_body.contains("unknown agent"), "{unary_body}");
+
+        let streaming = router(server)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({ "taskId": "observer-fail-streaming", "message": { "text": "streaming" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let streaming_body = body_string(streaming).await;
+        assert!(streaming_body.contains("unknown agent"), "{streaming_body}");
+
+        assert_eq!(registry.resolutions.lock().unwrap().len(), 2);
+        assert!(
+            backend.prompts.lock().unwrap().is_empty(),
+            "translator/prompt must not begin after resolution failure"
+        );
+    }
+
+    #[tokio::test]
     async fn unary_send_message_returns_full_multichunk_artifact() {
         let srv = build(
             MultiChunkBackend::new(vec!["AL", "PHA"], "end_turn"),
@@ -8115,6 +8502,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fanout_unary_and_streaming_thread_one_local_source_observer() {
+        let delegation = FakeDelegation::new(vec![Ok(Event::artifact("peer"))], Some("peer-1"));
+        let (server, registry, backend) =
+            build_observer_path_server(Arc::new(FanoutSkillRoute), delegation, false);
+
+        let unary = router(server.clone())
+            .oneshot(post_request(methods::SEND_MESSAGE, fanout_params(), "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(unary.status(), StatusCode::OK);
+        let unary_body = body_string(unary).await;
+        assert!(unary_body.contains("observed"), "{unary_body}");
+
+        let streaming = router(server)
+            .oneshot(post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                fanout_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(streaming.status(), StatusCode::OK);
+        let streaming_body = body_string(streaming).await;
+        assert!(streaming_body.contains("observed"), "{streaming_body}");
+
+        let resolutions = registry.resolutions.lock().unwrap();
+        let prompts = backend.prompts.lock().unwrap();
+        assert_eq!(resolutions.len(), 2);
+        assert_eq!(prompts.len(), 2);
+        for index in 0..2 {
+            assert!(Arc::ptr_eq(&resolutions[index], &prompts[index]));
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_local_source_observes_resolution_failure_before_prompt() {
+        let delegation = FakeDelegation::new(vec![Ok(Event::artifact("peer"))], Some("peer-1"));
+        let (server, registry, backend) =
+            build_observer_path_server(Arc::new(FanoutSkillRoute), delegation, true);
+
+        let response = router(server)
+            .oneshot(post_request(methods::SEND_MESSAGE, fanout_params(), "1.0"))
+            .await
+            .unwrap();
+        let _ = body_string(response).await;
+
+        assert_eq!(registry.resolutions.lock().unwrap().len(), 1);
+        assert!(
+            backend.prompts.lock().unwrap().is_empty(),
+            "fan-out translator/prompt must not begin after resolution failure"
+        );
+    }
+
+    #[tokio::test]
     async fn local_kiro_source_drops_usage_events() {
         let source = local_kiro_source(
             "kiro".into(),
@@ -8124,6 +8565,7 @@ mod tests {
             TaskId::parse("task-usage").unwrap(),
             SessionId::parse("session-usage").unwrap(),
             vec![Part { text: "go".into() }],
+            direct_diagnostic_observer(),
         );
 
         let out: Vec<Result<Event, BridgeError>> = source.stream.collect().await;
@@ -8965,6 +9407,7 @@ mod tests {
         release_gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
         release_started: Arc<tokio::sync::Notify>,
         release_started_count: AtomicUsize,
+        diagnostics: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
     }
 
     impl WarmRecordingBackend {
@@ -8978,6 +9421,7 @@ mod tests {
                 release_gate: Arc::new(Mutex::new(None)),
                 release_started: Arc::new(tokio::sync::Notify::new()),
                 release_started_count: AtomicUsize::new(0),
+                diagnostics: Mutex::new(Vec::new()),
             })
         }
 
@@ -8999,6 +9443,10 @@ mod tests {
 
         fn forgotten(&self) -> Vec<String> {
             self.forgotten.lock().unwrap().clone()
+        }
+
+        fn diagnostics(&self) -> Vec<Arc<dyn DiagnosticObserver>> {
+            self.diagnostics.lock().unwrap().clone()
         }
 
         fn gate_release_session(&self) -> oneshot::Sender<()> {
@@ -9046,6 +9494,17 @@ mod tests {
             Ok(Box::pin(tokio_stream::iter(updates)))
         }
 
+        async fn prompt_with_observers(
+            &self,
+            session: &SessionId,
+            parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            assert!(observers.rich.is_none());
+            self.diagnostics.lock().unwrap().push(observers.diagnostic);
+            self.prompt(session, parts).await
+        }
+
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
             self.cancels.lock().unwrap().push(_s.as_str().to_owned());
             Ok(())
@@ -9084,6 +9543,95 @@ mod tests {
         }
     }
 
+    struct WarmErrorBackend {
+        error: BridgeError,
+        prompt_open: bool,
+        releases: AtomicUsize,
+        release_completed: tokio::sync::Notify,
+        cancels: AtomicUsize,
+        cancel_completed: tokio::sync::Notify,
+    }
+
+    impl WarmErrorBackend {
+        async fn wait_for_release_or_cancel(&self) -> &'static str {
+            loop {
+                let release = self.release_completed.notified();
+                let cancel = self.cancel_completed.notified();
+                if self.releases.load(Ordering::SeqCst) > 0 {
+                    return "release";
+                }
+                if self.cancels.load(Ordering::SeqCst) > 0 {
+                    return "cancel";
+                }
+                tokio::select! {
+                    _ = release => {}
+                    _ = cancel => {}
+                }
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for WarmErrorBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            if self.prompt_open {
+                return Err(self.error.clone());
+            }
+            Ok(Box::pin(tokio_stream::iter(vec![Err(self.error.clone())])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            self.cancel_completed.notify_waiters();
+            Ok(())
+        }
+
+        async fn configure_session(
+            &self,
+            _session: &SessionId,
+            _spec: &SessionSpec,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            self.release_completed.notify_waiters();
+            Ok(())
+        }
+    }
+
+    fn warm_structured_failure(class: DiagnosticFailureClass) -> BridgeError {
+        BridgeError::agent_failure(
+            FailureDiagnostic::build_static_code(
+                FailureDiagnosticInput {
+                    failed_phase: DiagnosticPhase::PromptStream,
+                    last_completed_phase: Some(DiagnosticPhase::PromptStart),
+                    class,
+                    disposition: FailureDisposition::Fatal,
+                    code: "ignored".to_owned(),
+                    summary: "bounded test failure".to_owned(),
+                    causes: Vec::new(),
+                    stderr_observed: false,
+                    stderr_line_count: 0,
+                    stderr_scope: None,
+                    stderr_tail: None,
+                    stderr_redaction: None,
+                    retry_after_ms: None,
+                    reset_at_ms: None,
+                    prompt_may_have_been_accepted: true,
+                },
+                "test.warm.failure",
+                &DiagnosticRedactor::default(),
+            )
+            .unwrap(),
+        )
+    }
+
     // Build the warm-session test server (mirrors session_clear_dispatch :6510-6536).
     fn seed_test_server() -> (
         Arc<InboundServer>,
@@ -9091,6 +9639,45 @@ mod tests {
         Arc<WarmRecordingBackend>,
     ) {
         let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(FakeStore::default());
+        let coord = test_coordinator(
+            registry as Arc<dyn AgentRegistry>,
+            store,
+            Arc::new(AutoApprove),
+        );
+        let sm = coord.session_manager.clone();
+        let srv = Arc::new(InboundServer::from_coordinator(
+            coord,
+            Arc::new(RegistryRoute {
+                default: AgentId::parse("a").unwrap(),
+            }),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "a",
+        ));
+        (srv, sm, backend)
+    }
+
+    fn warm_error_server(
+        error: BridgeError,
+    ) -> (
+        Arc<InboundServer>,
+        Arc<crate::session_manager::SessionManager>,
+        Arc<WarmErrorBackend>,
+    ) {
+        let backend = Arc::new(WarmErrorBackend {
+            error,
+            prompt_open: false,
+            releases: AtomicUsize::new(0),
+            release_completed: tokio::sync::Notify::new(),
+            cancels: AtomicUsize::new(0),
+            cancel_completed: tokio::sync::Notify::new(),
+        });
         let registry = FakeRegistry::with_entries(
             "a",
             vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
@@ -9241,6 +9828,483 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn warm_workflow_cleanup_expires_structured_failures_and_preserves_legacy_branches() {
+        use bridge_workflow::executor::{NodeTurnExit, WorkflowNodeDispatcher, WorkflowRunContext};
+        use bridge_workflow::graph::WorkflowNode;
+
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry as Arc<dyn AgentRegistry>,
+            std::time::Duration::from_secs(60),
+        ));
+        let dispatcher = WarmWorkflowNodeDispatcher {
+            sm: sm.clone(),
+            parent: ContextId::parse("parent-structured").unwrap(),
+            cwd: None,
+        };
+        let node = WorkflowNode {
+            id: bridge_core::ids::NodeId::parse("n1").unwrap(),
+            agent: AgentId::parse("a").unwrap(),
+            prompt_template: "go".into(),
+            inputs: vec![],
+            retry: None,
+        };
+
+        for (index, class) in [
+            DiagnosticFailureClass::Transport,
+            DiagnosticFailureClass::AgentProcess,
+            DiagnosticFailureClass::Timeout,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let workflow = format!("wf-{index}");
+            let child =
+                ContextId::parse(format!("parent-structured::workflow::{workflow}::node::n1"))
+                    .unwrap();
+            let turn = dispatcher
+                .checkout_observed(
+                    &workflow,
+                    &node,
+                    "run",
+                    &WorkflowRunContext::default(),
+                    direct_diagnostic_observer(),
+                )
+                .await
+                .unwrap();
+            turn.cleanup
+                .on_exit(NodeTurnExit::Error(warm_structured_failure(class)))
+                .await;
+            assert!(sm.status(&child).await.is_none(), "{class:?}");
+        }
+
+        let legacy_finish_child =
+            ContextId::parse("parent-structured::workflow::wf-legacy-finish::node::n1").unwrap();
+        let turn = dispatcher
+            .checkout_observed(
+                "wf-legacy-finish",
+                &node,
+                "run",
+                &WorkflowRunContext::default(),
+                direct_diagnostic_observer(),
+            )
+            .await
+            .unwrap();
+        turn.cleanup
+            .on_exit(NodeTurnExit::Error(BridgeError::StoreFailure))
+            .await;
+        assert_eq!(sm.status(&legacy_finish_child).await.unwrap().state, "idle");
+
+        let legacy_crash_child =
+            ContextId::parse("parent-structured::workflow::wf-legacy-crash::node::n1").unwrap();
+        let turn = dispatcher
+            .checkout_observed(
+                "wf-legacy-crash",
+                &node,
+                "run",
+                &WorkflowRunContext::default(),
+                direct_diagnostic_observer(),
+            )
+            .await
+            .unwrap();
+        turn.cleanup
+            .on_exit(NodeTurnExit::Error(BridgeError::agent_crashed("legacy")))
+            .await;
+        assert!(sm.status(&legacy_crash_child).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn warm_workflow_arms_structured_expiry_before_rich_sink_flush() {
+        use bridge_workflow::executor::{WorkflowExecutor, WorkflowRunContext};
+        use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+        use futures::StreamExt;
+
+        struct BlockingFlushSink {
+            entered_count: AtomicUsize,
+            entered: tokio::sync::Notify,
+            gate: Mutex<Option<oneshot::Receiver<()>>>,
+        }
+
+        impl BlockingFlushSink {
+            async fn wait_until_entered(&self) {
+                loop {
+                    let entered = self.entered.notified();
+                    if self.entered_count.load(Ordering::SeqCst) > 0 {
+                        return;
+                    }
+                    entered.await;
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RichEventSink for BlockingFlushSink {
+            fn record(&self, _kind: bridge_core::orch::OrchEventKind) {}
+
+            async fn flush(&self) -> Result<(), BridgeError> {
+                self.entered_count.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_waiters();
+                let gate = self
+                    .gate
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("flush is entered once");
+                let _ = gate.await;
+                Ok(())
+            }
+        }
+
+        struct BlockingFlushFactory(Arc<BlockingFlushSink>);
+
+        impl RichEventSinkFactory for BlockingFlushFactory {
+            fn make(&self, _node: &bridge_core::ids::NodeId) -> Arc<dyn RichEventSink> {
+                self.0.clone()
+            }
+        }
+
+        for (prompt_open, suffix) in [(true, "open"), (false, "stream")] {
+            let backend = Arc::new(WarmErrorBackend {
+                error: warm_structured_failure(DiagnosticFailureClass::AgentProcess),
+                prompt_open,
+                releases: AtomicUsize::new(0),
+                release_completed: tokio::sync::Notify::new(),
+                cancels: AtomicUsize::new(0),
+                cancel_completed: tokio::sync::Notify::new(),
+            });
+            let registry = FakeRegistry::with_entries(
+                "a",
+                vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+            );
+            let sm = Arc::new(crate::session_manager::SessionManager::new(
+                registry.clone(),
+                std::time::Duration::from_secs(60),
+            ));
+            let parent_raw = format!("parent-flush-drop-{suffix}");
+            let workflow_raw = format!("wf-flush-drop-{suffix}");
+            let parent = ContextId::parse(&parent_raw).unwrap();
+            let child =
+                ContextId::parse(format!("{parent_raw}::workflow::{workflow_raw}::node::n1"))
+                    .unwrap();
+            let dispatcher = Arc::new(WarmWorkflowNodeDispatcher {
+                sm: sm.clone(),
+                parent,
+                cwd: None,
+            });
+            let graph = Arc::new(WorkflowGraph {
+                id: bridge_core::ids::WorkflowId::parse(&workflow_raw).unwrap(),
+                nodes: vec![WorkflowNode {
+                    id: bridge_core::ids::NodeId::parse("n1").unwrap(),
+                    agent: AgentId::parse("a").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                    retry: None,
+                }],
+                panel: None,
+            });
+            let (_allow_flush, flush_gate) = oneshot::channel();
+            let sink = Arc::new(BlockingFlushSink {
+                entered_count: AtomicUsize::new(0),
+                entered: tokio::sync::Notify::new(),
+                gate: Mutex::new(Some(flush_gate)),
+            });
+            let context = WorkflowRunContext {
+                make_rich_sink: Some(Arc::new(BlockingFlushFactory(sink.clone()))),
+                ..WorkflowRunContext::default()
+            };
+
+            let run = tokio::spawn(async move {
+                WorkflowExecutor::new(registry)
+                    .run_with_context_and_dispatcher(
+                        graph,
+                        "go".into(),
+                        format!("run-flush-drop-{suffix}"),
+                        tokio_util::sync::CancellationToken::new(),
+                        context,
+                        dispatcher,
+                    )
+                    .collect::<Vec<_>>()
+                    .await
+            });
+            sink.wait_until_entered().await;
+            run.abort();
+            assert!(run.await.unwrap_err().is_cancelled());
+
+            assert_eq!(
+                backend.wait_for_release_or_cancel().await,
+                "release",
+                "dropping during {suffix} error flush must retain the structured failure"
+            );
+            assert!(
+                sm.status(&child).await.is_none(),
+                "the poisoned warm child must not return to Idle ({suffix})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_unary_and_streaming_expire_structured_backend_failures() {
+        for (method, context, class) in [
+            (
+                methods::SEND_MESSAGE,
+                "ctx-structured-unary",
+                DiagnosticFailureClass::Transport,
+            ),
+            (
+                methods::SEND_STREAMING_MESSAGE,
+                "ctx-structured-streaming",
+                DiagnosticFailureClass::Timeout,
+            ),
+        ] {
+            let (srv, sm, backend) = warm_error_server(warm_structured_failure(class));
+            let response = router(srv)
+                .oneshot(post_request(
+                    method,
+                    json!({
+                        "message": {
+                            "contextId": context,
+                            "text": "go",
+                            "metadata": { "a2a-bridge.agent": "a" }
+                        }
+                    }),
+                    "1.0",
+                ))
+                .await
+                .unwrap();
+            let _ = body_string(response).await;
+            assert_eq!(backend.releases.load(Ordering::SeqCst), 1, "{method}");
+            assert!(
+                sm.status(&ContextId::parse(context).unwrap())
+                    .await
+                    .is_none(),
+                "{method} must not return the structured-failure session to Idle"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_structured_error_beats_simultaneous_stream_receiver_close() {
+        let context = ContextId::parse("ctx-ready-error-and-close").unwrap();
+        let (srv, sm, backend) = warm_error_server(warm_structured_failure(
+            DiagnosticFailureClass::AgentProcess,
+        ));
+        let routed = RoutedCall {
+            task: TaskId::parse("task-ready-error-and-close").unwrap(),
+            session: SessionId::parse("session-ready-error-and-close").unwrap(),
+            parts: vec![Part { text: "go".into() }],
+            target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            auth: AuthContext::new(CallerId::parse("anon").unwrap()),
+            overrides: None,
+            traceparent: None,
+            prompt_id: None,
+            context_id: Some(context.clone()),
+            session_cwd: None,
+        };
+        let diagnostic = direct_diagnostic_observer();
+        let dispatch = warm_local_dispatch(
+            &srv,
+            &AgentId::parse("a").unwrap(),
+            &routed,
+            diagnostic.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        spawn_local_producer(&srv, routed, dispatch, diagnostic, tx);
+        for _ in 0..100 {
+            if backend.releases.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(backend.releases.load(Ordering::SeqCst), 1);
+        assert!(sm.status(&context).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ready_usage_burst_cannot_starve_inbound_disconnect() {
+        struct ReadyUsageBurstBackend {
+            updates: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentBackend for ReadyUsageBurstBackend {
+            async fn prompt(
+                &self,
+                _session: &SessionId,
+                _parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                let updates = self.updates.clone();
+                let ready = futures::stream::iter((0..128).map(move |_| {
+                    updates.fetch_add(1, Ordering::SeqCst);
+                    Ok(Update::Usage(UsageSnapshot {
+                        used: Some(1),
+                        size: Some(10),
+                        cost: None,
+                        terminal: None,
+                        at_ms: 0,
+                    }))
+                }));
+                Ok(Box::pin(futures::StreamExt::chain(
+                    ready,
+                    futures::stream::pending(),
+                )))
+            }
+
+            async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+
+        let observer = Arc::new(RecordingObserver::default());
+        let updates = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(ReadyUsageBurstBackend {
+            updates: updates.clone(),
+        });
+        let srv = build_with_observer(
+            backend.clone(),
+            Arc::new(AlwaysGrant),
+            observer.clone() as Arc<dyn bridge_core::ports::Observer>,
+        );
+        let dispatch = LocalDispatch {
+            backend,
+            session: SessionId::parse("ctx-ready-usage-disconnect-g0").unwrap(),
+            seed: None,
+            injects: Vec::new(),
+            turn_meta: None,
+            guard: None,
+            warm_guard: None,
+            obs_ctx: bridge_core::ports::TurnContext {
+                turn_id: bridge_core::ids::TurnId::parse("turn-ready-usage-disconnect").unwrap(),
+                session_id: ContextId::parse("ready-usage-disconnect").unwrap(),
+                task_id: Some(TaskId::parse("task-ready-usage-disconnect").unwrap()),
+                workflow: None,
+                node: None,
+                attempt: 0,
+                agent: "a".to_string(),
+                model: None,
+                effort: None,
+                mode: None,
+                prompt_id: None,
+                traceparent: None,
+            },
+            abort: tokio_util::sync::CancellationToken::new(),
+        };
+        let routed = RoutedCall {
+            task: TaskId::parse("task-ready-usage-disconnect").unwrap(),
+            session: SessionId::parse("session-ready-usage-disconnect").unwrap(),
+            parts: vec![Part { text: "go".into() }],
+            target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            auth: AuthContext::new(CallerId::parse("anon").unwrap()),
+            overrides: None,
+            traceparent: None,
+            prompt_id: None,
+            context_id: Some(ContextId::parse("ready-usage-disconnect").unwrap()),
+            session_cwd: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
+        wait_until(|| {
+            observer.snapshot().iter().any(|event| {
+                matches!(
+                    event,
+                    RecordedObsEvent::Finish {
+                        outcome: bridge_core::ports::TurnOutcome::Canceled,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+
+        assert_eq!(
+            updates.load(Ordering::SeqCst),
+            1,
+            "ready-result precedence may consume one usage item, then must honor receiver close"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_warm_workflow_with_correlation_task_uses_in_memory_observer() {
+        use bridge_workflow::executor::{WorkflowExecutor, WorkflowRunContext};
+        use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+
+        struct FixedDiagnosticFactory(Arc<dyn DiagnosticObserver>);
+        impl DiagnosticObserverFactory for FixedDiagnosticFactory {
+            fn make(
+                &self,
+                _node: &bridge_core::ids::NodeId,
+                _attempt: u32,
+            ) -> Arc<dyn DiagnosticObserver> {
+                self.0.clone()
+            }
+        }
+
+        let backend = WarmRecordingBackend::new();
+        let registry = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let sm = Arc::new(crate::session_manager::SessionManager::new(
+            registry.clone(),
+            std::time::Duration::from_secs(60),
+        ));
+        let observer = direct_diagnostic_observer();
+        let context = WorkflowRunContext {
+            task_id: Some(TaskId::parse("correlation-only-warm-workflow").unwrap()),
+            ..WorkflowRunContext::default()
+        };
+        let graph = Arc::new(WorkflowGraph {
+            id: bridge_core::ids::WorkflowId::parse("wf-observed").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: bridge_core::ids::NodeId::parse("n1").unwrap(),
+                agent: AgentId::parse("a").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+                retry: None,
+            }],
+            panel: None,
+        });
+        let dispatcher = Arc::new(WarmWorkflowNodeDispatcher {
+            sm,
+            parent: ContextId::parse("parent-observed").unwrap(),
+            cwd: None,
+        });
+
+        let events = WorkflowExecutor::new(registry.clone())
+            .run_with_diagnostic_context_and_dispatcher(
+                graph,
+                "go".into(),
+                "run-observed".into(),
+                tokio_util::sync::CancellationToken::new(),
+                WorkflowDiagnosticContext::new(
+                    context,
+                    Arc::new(FixedDiagnosticFactory(observer.clone())),
+                ),
+                dispatcher,
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(Result::is_ok));
+
+        let resolutions = registry.observed();
+        let prompts = backend.diagnostics();
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(prompts.len(), 1);
+        assert!(Arc::ptr_eq(&resolutions[0], &observer));
+        assert!(Arc::ptr_eq(&prompts[0], &observer));
+    }
+
+    #[tokio::test]
     async fn pre_producer_run_guard_drop_releases_context_unless_disarmed() {
         let runs = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let cancels = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -9342,7 +10406,7 @@ mod tests {
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
 
-        spawn_local_producer(&srv, routed, dispatch, tx);
+        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
 
         let ev = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
@@ -9404,7 +10468,7 @@ mod tests {
         };
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
-        spawn_local_producer(&srv, routed, dispatch, tx);
+        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
 
         wait_until(|| {
             matches!(
@@ -9444,6 +10508,96 @@ mod tests {
             }
         ));
         assert!(matches!(events[2], RecordedObsEvent::UsageFinalized { .. }));
+    }
+
+    #[tokio::test]
+    async fn inbound_disconnect_without_usage_emits_explicit_no_usage() {
+        let observer = std::sync::Arc::new(RecordingObserver::default());
+        let backend = std::sync::Arc::new(NoUsageIdleBackend);
+        let srv = build_with_observer(
+            backend.clone() as Arc<dyn AgentBackend>,
+            Arc::new(AlwaysGrant),
+            observer.clone() as Arc<dyn bridge_core::ports::Observer>,
+        );
+        let abort = tokio_util::sync::CancellationToken::new();
+        let dispatch = LocalDispatch {
+            backend: backend.clone() as Arc<dyn AgentBackend>,
+            session: SessionId::parse("ctx-streaming-no-usage-disconnect-g0").unwrap(),
+            seed: None,
+            injects: Vec::new(),
+            turn_meta: None,
+            guard: None,
+            warm_guard: None,
+            obs_ctx: bridge_core::ports::TurnContext {
+                turn_id: bridge_core::ids::TurnId::parse("turn-streaming-no-usage-disconnect")
+                    .unwrap(),
+                session_id: ContextId::parse("streaming-no-usage-disconnect").unwrap(),
+                task_id: Some(TaskId::parse("task-streaming-no-usage-disconnect").unwrap()),
+                workflow: None,
+                node: None,
+                attempt: 0,
+                agent: "a".to_string(),
+                model: None,
+                effort: None,
+                mode: None,
+                prompt_id: None,
+                traceparent: None,
+            },
+            abort,
+        };
+        let routed = RoutedCall {
+            task: TaskId::parse("task-streaming-no-usage-disconnect").unwrap(),
+            session: SessionId::parse("session-task-streaming-no-usage-disconnect").unwrap(),
+            parts: vec![Part { text: "hi".into() }],
+            target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            auth: AuthContext::new(CallerId::parse("anon").unwrap()),
+            overrides: None,
+            traceparent: None,
+            prompt_id: None,
+            context_id: Some(ContextId::parse("streaming-no-usage-disconnect").unwrap()),
+            session_cwd: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
+
+        wait_until(|| {
+            matches!(
+                observer.snapshot().first(),
+                Some(RecordedObsEvent::Start(_))
+            )
+        })
+        .await;
+        drop(rx);
+
+        wait_until(|| {
+            let events = observer.snapshot();
+            matches!(
+                events.as_slice(),
+                [
+                    RecordedObsEvent::Start(_),
+                    RecordedObsEvent::Finish { .. },
+                    RecordedObsEvent::UsageFinalized { .. }
+                ]
+            )
+        })
+        .await;
+
+        let events = observer.snapshot();
+        assert!(matches!(
+            events[1],
+            RecordedObsEvent::Finish {
+                outcome: bridge_core::ports::TurnOutcome::Canceled,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[2],
+            RecordedObsEvent::UsageFinalized {
+                has_usage: false,
+                ..
+            }
+        ));
     }
 
     /// Backend that immediately yields many Text events then Done, designed to saturate
@@ -9525,7 +10679,7 @@ mod tests {
         // Capacity=1: first tx.send succeeds, second blocks → dropping rx makes it fail.
         let (tx, rx) = tokio::sync::mpsc::channel(1);
 
-        spawn_local_producer(&srv, routed, dispatch, tx);
+        spawn_local_producer(&srv, routed, dispatch, direct_diagnostic_observer(), tx);
 
         // Wait for TurnStarted so the producer is running, then drop the receiver.
         wait_until(|| {
@@ -9754,6 +10908,25 @@ mod tests {
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct NoUsageIdleBackend;
+
+    #[async_trait::async_trait]
+    impl AgentBackend for NoUsageIdleBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _p: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(futures::stream::pending::<
+                Result<Update, BridgeError>,
+            >()))
         }
 
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
@@ -11625,12 +12798,14 @@ mod tests {
             error: None,
             created_ms: now,
             updated_ms: now,
+            last_artifact_ms: None,
             input: "test input".to_string(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         };
         store.create(&rec).await.unwrap();
 
@@ -11675,12 +12850,14 @@ mod tests {
             error: None,
             created_ms: now,
             updated_ms: now,
+            last_artifact_ms: None,
             input: "test input".to_string(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         };
         store.create(&rec).await.unwrap();
 
@@ -11839,12 +13016,14 @@ mod tests {
             error: None,
             created_ms: now,
             updated_ms: now,
+            last_artifact_ms: None,
             input: "test input".to_string(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         }
     }
 
@@ -12329,6 +13508,81 @@ mod tests {
         let value = serde_json::to_value(tool_frame).unwrap();
         assert_eq!(value["status"], "completed");
         assert_eq!(value["content_preview"], "opening");
+    }
+
+    #[tokio::test]
+    async fn rich_snapshot_omits_diagnostic_and_projects_later_frames() {
+        use bridge_core::diagnostics::{
+            DiagnosticEvent, DiagnosticPhase, DiagnosticRedactor, PersistedPhaseTransition,
+            PersistedPhaseTransitionInput, PhaseStatus,
+        };
+        use bridge_core::orch::{OrchEventKind, ProgressPayload};
+
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let task = bridge_core::ids::TaskId::parse("task-diagnostic-snapshot").unwrap();
+        store
+            .create(&working_record("task-diagnostic-snapshot"))
+            .await
+            .unwrap();
+        let operation = operation_id_for_task(&task);
+        let node = bridge_core::ids::NodeId::parse("node-a").unwrap();
+        let now = crate::workflow_sink::now_ms();
+        let diagnostic = DiagnosticEvent::new(
+            PersistedPhaseTransition::build(
+                PersistedPhaseTransitionInput {
+                    phase: DiagnosticPhase::Initialize,
+                    status: PhaseStatus::Started,
+                    at_ms: now,
+                    operation: None,
+                    code: Some("acp.initialize.started".into()),
+                    auth: None,
+                },
+                &DiagnosticRedactor::default(),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+
+        let diagnostic_seq = store
+            .record_event_sequenced(
+                &task,
+                &operation,
+                now,
+                OrchEventKind::Progress {
+                    progress: ProgressPayload::diagnostic(diagnostic),
+                },
+            )
+            .await
+            .unwrap();
+        let plan_seq = store
+            .record_event_sequenced(
+                &task,
+                &operation,
+                now,
+                OrchEventKind::Plan { entries: vec![] },
+            )
+            .await
+            .unwrap();
+        let node_seq = store
+            .put_node_checkpoint_sequenced(&task, &node, &operation, "done", true, now, None)
+            .await
+            .unwrap();
+        assert_eq!((diagnostic_seq, plan_seq, node_seq), (1, 2, 3));
+
+        let inputs = store.journal_fold_inputs(&task).await.unwrap();
+        assert!(matches!(
+            inputs.events[0].kind,
+            OrchEventKind::Progress { .. }
+        ));
+        let snapshot =
+            bridge_core::task_store::fold_journal_to_snapshot(&inputs.events, &inputs.scalars)
+                .unwrap();
+        let frames = rich_snapshot_frames(&snapshot, &inputs.events, None);
+        assert_eq!(
+            snapshot_tags(&frames),
+            vec![(2, "plan".into()), (3, "node_finished".into())]
+        );
     }
 
     /// (8a) Terminal task with 2 checkpoints (seqs 1, 2) + terminal_seq 3, no cursor.

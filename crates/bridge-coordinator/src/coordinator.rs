@@ -6,12 +6,14 @@ use std::time::Instant;
 use a2a;
 use bridge_core::domain::{InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
-use bridge_core::ids::{BatchId, ContextId, OperationId, TaskId, WorkflowId};
+#[cfg(test)]
+use bridge_core::ids::OperationId;
+use bridge_core::ids::{BatchId, ContextId, TaskId, WorkflowId};
 use bridge_core::orch::{AgentSessionCaps, TerminalUsage, UsageSnapshot};
 use bridge_core::permission::{PermKey, PermissionRegistry, PermissionResolution, TurnMeta};
 use bridge_core::ports::{
-    classify_failure, AgentRegistry, FailureClass, ObsEvent, Observer, PolicyEngine, SessionStore,
-    TurnContext, TurnOutcome, UsageFinalization,
+    classify_failure, AgentRegistry, DiagnosticObserver, FailureClass, ObsEvent, Observer,
+    PolicyEngine, SessionStore, TurnContext, TurnOutcome, UsageFinalization,
 };
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{BatchSummary, TaskRecord, TaskRecordStatus, TaskStore};
@@ -28,11 +30,19 @@ use crate::detached::{
     new_detached_task_id, resume_working_tasks, spawn_detached_workflow, DetachedDeps,
     TaskProgressHub,
 };
-use crate::dispatch::TaskBinding;
+use crate::dispatch::{TaskBinding, WarmCompletionExit, WarmCompletionGuard};
 use crate::params::{OpParams, PermitParams};
 use crate::turn_parts::assemble_turn_parts;
 
 static PROMPT_ID_SEQ: AtomicU64 = AtomicU64::new(1);
+const DIRECT_DIAGNOSTIC_CAPACITY: usize = 64;
+
+fn direct_diagnostic_observer() -> Arc<dyn DiagnosticObserver> {
+    Arc::new(
+        bridge_core::diagnostics::InMemoryDiagnosticObserver::new(DIRECT_DIAGNOSTIC_CAPACITY)
+            .expect("direct diagnostic capacity is nonzero"),
+    )
+}
 
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -409,11 +419,19 @@ impl Coordinator {
             .clone()
             .unwrap_or_else(|| self.registry.default_id());
         let ctx = p.context.clone().unwrap_or_else(|| self.mint_context_id());
+        let diagnostic = direct_diagnostic_observer();
         let turn = self
             .session_manager
-            .checkout_turn(&ctx, agent, Some(p.agent_override()), cwd)
+            .checkout_turn_observed(
+                &ctx,
+                agent,
+                Some(p.agent_override()),
+                cwd,
+                diagnostic.clone(),
+            )
             .await?;
-        self.collect_turn(ctx, turn, p.input).await
+        self.collect_turn_observed(ctx, turn, p.input, diagnostic)
+            .await
     }
 
     /// Continue an EXISTING warm context. Unlike `prompt`, this REUSES the context's stored fingerprint
@@ -425,8 +443,10 @@ impl Coordinator {
             .context
             .clone()
             .ok_or(BridgeError::InvalidRequest { field: "context" })?;
+        let diagnostic = direct_diagnostic_observer();
         let turn = self.session_manager.checkout_existing_turn(&ctx).await?;
-        self.collect_turn(ctx, turn, p.input).await
+        self.collect_turn_observed(ctx, turn, p.input, diagnostic)
+            .await
     }
 
     pub async fn inject(&self, req: InjectRequest) -> Result<usize, BridgeError> {
@@ -468,16 +488,32 @@ impl Coordinator {
     }
 
     /// Drive ONE warm turn to completion and collect it into a `TurnOutput`. Records usage as a side
-    /// effect (excluded from output) and returns the handle to Idle on EVERY exit — synchronously on the
-    /// normal/error path (so a sequential `continue` observes Idle deterministically), and via the drop
-    /// guard if the turn future is cancelled mid-drain (the MCP loop is sequential and never drops
-    /// mid-turn, but the Coordinator is a general service API — a cancelled caller must not strand the
-    /// handle `Running`; this mirrors the A2A unary path's `WarmTurnGuard`).
+    /// effect (excluded from output) and settles the handle on EVERY exit: normal and legacy-owner paths
+    /// return to Idle, structured failures expire through the exact cleanup claim, and cancellation uses
+    /// the drop fallback if the caller disappears mid-drain. The MCP loop is sequential, but Coordinator
+    /// is also a general service API, so a canceled caller must never strand `Running`.
+    #[cfg(test)]
     async fn collect_turn(
         &self,
         ctx: ContextId,
         turn: crate::session_manager::WarmTurn,
         input: String,
+    ) -> Result<TurnOutput, BridgeError> {
+        self.collect_turn_observed(
+            ctx,
+            turn,
+            input,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
+    }
+
+    async fn collect_turn_observed(
+        &self,
+        ctx: ContextId,
+        turn: crate::session_manager::WarmTurn,
+        input: String,
+        diagnostic: Arc<dyn DiagnosticObserver>,
     ) -> Result<TurnOutput, BridgeError> {
         let task = self.mint_prompt_task_id();
         let obs_ctx = Self::turn_context_for_warm(&ctx, Some(task.clone()), &turn);
@@ -488,15 +524,21 @@ impl Coordinator {
             Arc::new(std::sync::Mutex::new(None));
         self.observer
             .record(&ObsEvent::TurnStarted { ctx: &obs_ctx });
+        let completion = WarmCompletionGuard::finish_owner(
+            self.session_manager.clone(),
+            ctx.clone(),
+            turn.generation,
+            turn.op.clone(),
+            turn.expiry_intent.clone(),
+            diagnostic.clone(),
+        );
         let mut finish_guard = TurnFinishGuard {
             observer: self.observer.clone(),
-            sm: self.session_manager.clone(),
             ctx: obs_ctx.clone(),
-            generation: turn.generation,
-            op: turn.op.clone(),
             started,
             armed: true,
             usage: shared_usage.clone(),
+            completion: Some(completion),
         };
 
         let parts = assemble_turn_parts(
@@ -517,13 +559,14 @@ impl Coordinator {
             .await;
 
         let translator = Translator::new();
-        let mut events = translator.run(
+        let mut events = translator.run_observed(
             turn.backend.as_ref(),
             self.session_store.as_ref(),
             self.policy.as_ref(),
             &task,
             &turn.session,
             parts,
+            diagnostic,
         );
         let mut collected = Vec::new();
         let mut aborted = false;
@@ -533,6 +576,7 @@ impl Coordinator {
                 // cancel-tokens F2 (L1 — abort arm FIRST): a force-reset cancelled this turn → stop without
                 // polling events (a pre-first-poll abort means `backend.prompt` never runs → no re-mint).
                 _ = turn.abort.cancelled() => {
+                    finish_guard.observe_exit(WarmCompletionExit::Canceled);
                     aborted = true;
                     break;
                 }
@@ -556,6 +600,19 @@ impl Coordinator {
                     }
                     continue;
                 }
+                Err(error) => {
+                    // Arm expiry synchronously at the error observation site,
+                    // before collection/formatting or any cleanup await.
+                    finish_guard.observe_exit(WarmCompletionExit::Error(error));
+                    collected.push(ev);
+                }
+                Ok(event)
+                    if event.kind() == &EventKind::Terminal
+                        && event.outcome() == Some(TaskOutcome::Canceled) =>
+                {
+                    finish_guard.observe_exit(WarmCompletionExit::Canceled);
+                    collected.push(ev);
+                }
                 _ => collected.push(ev),
             }
         }
@@ -565,12 +622,13 @@ impl Coordinator {
             collected.push(Ok(Event::terminal(TaskOutcome::Canceled)));
         }
 
-        // Finish synchronously on the normal/error path, then disarm so the guard's drop is a no-op
-        // (no double finish_turn). If the future was cancelled before reaching here, the still-armed
-        // guard fires `finish_turn` on drop.
-        self.session_manager
-            .finish_turn(&ctx, turn.generation, &turn.op)
-            .await;
+        if !aborted && collected.iter().all(Result::is_ok) {
+            finish_guard.observe_exit(WarmCompletionExit::Normal);
+        }
+        // Complete synchronously on the normal/error path. Cancellation before
+        // or during this await drops the shared guard/claim and transfers cleanup
+        // to the checked unobserved path.
+        let cleanup_result = finish_guard.complete().await;
         finish_guard.disarm();
 
         if let Some(Err(e)) = collected.iter().find(|r| r.is_err()) {
@@ -581,15 +639,14 @@ impl Coordinator {
                 ttft,
                 outcome: &outcome,
             });
-            if let Some(usage) = &last_usage {
-                self.observer.record(&ObsEvent::UsageFinalized {
-                    ctx: &obs_ctx,
-                    usage,
-                    fin: UsageFinalization::TurnFinal,
-                });
-            }
+            self.observer.record(&ObsEvent::UsageFinalized {
+                ctx: &obs_ctx,
+                usage: last_usage.as_ref(),
+                fin: UsageFinalization::TurnFinal,
+            });
             return Err(e.clone());
         }
+        cleanup_result?;
         let events: Vec<Event> = collected.into_iter().filter_map(Result::ok).collect();
         let out_text = if let Some(artifact_text) = events
             .iter()
@@ -632,13 +689,11 @@ impl Coordinator {
             ttft,
             outcome: &outcome,
         });
-        if let Some(usage) = &last_usage {
-            self.observer.record(&ObsEvent::UsageFinalized {
-                ctx: &obs_ctx,
-                usage,
-                fin: UsageFinalization::TurnFinal,
-            });
-        }
+        self.observer.record(&ObsEvent::UsageFinalized {
+            ctx: &obs_ctx,
+            usage: last_usage.as_ref(),
+            fin: UsageFinalization::TurnFinal,
+        });
 
         Ok(TurnOutput {
             text: out_text,
@@ -679,12 +734,14 @@ impl Coordinator {
             error: None,
             created_ms: now,
             updated_ms: now,
+            last_artifact_ms: None,
             input: input.clone(),
             workflow_spec_json,
             resume_attempts: 0,
             session_cwd: session_cwd.as_ref().map(|c| c.as_str().to_string()),
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         };
         self.task_store.create(&rec).await?;
 
@@ -708,6 +765,7 @@ impl Coordinator {
             HashMap::new(),
             WorkflowRunContext {
                 session_cwd,
+                task_id: Some(task.clone()),
                 make_rich_sink: None,
                 observer: self.observer.clone(),
                 ..WorkflowRunContext::default()
@@ -881,23 +939,33 @@ impl Coordinator {
     }
 }
 
-/// Returns a warm handle to Idle (via `finish_turn`) if a turn future is dropped before it finishes
-/// synchronously. `collect_turn` finishes the turn synchronously on the normal/error path and then
-/// `disarm`s this guard, so on those paths the guard's `Drop` is a no-op; it only fires when the turn
-/// future is cancelled mid-drain. Mirrors the A2A unary path's `WarmTurnGuard` (the spawn-in-Drop
-/// pattern), kept local to the Coordinator because here it's disarmed after a synchronous finish.
+/// Records telemetry on a dropped coordinator turn, while the nested shared completion guard owns the
+/// exact finish/cancel/expire fallback. `collect_turn` settles synchronously on ordinary paths and then
+/// disarms this wrapper; cancellation mid-drain drops the nested guard without retaining this telemetry
+/// observer in any detached cleanup flight.
 struct TurnFinishGuard {
     observer: Arc<dyn Observer>,
-    sm: Arc<crate::session_manager::SessionManager>,
     ctx: TurnContext,
-    generation: bridge_core::ids::SessionGeneration,
-    op: OperationId,
     started: Instant,
     armed: bool,
     usage: Arc<std::sync::Mutex<Option<UsageSnapshot>>>,
+    completion: Option<WarmCompletionGuard>,
 }
 
 impl TurnFinishGuard {
+    fn observe_exit(&mut self, exit: WarmCompletionExit<'_>) {
+        if let Some(completion) = self.completion.as_mut() {
+            completion.observe_exit(exit);
+        }
+    }
+
+    async fn complete(&mut self) -> Result<(), BridgeError> {
+        match self.completion.take() {
+            Some(completion) => completion.complete().await,
+            None => Ok(()),
+        }
+    }
+
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -908,10 +976,7 @@ impl Drop for TurnFinishGuard {
         if !self.armed {
             return;
         }
-        let sm = self.sm.clone();
         let ctx = self.ctx.clone();
-        let generation = self.generation;
-        let op = self.op.clone();
         let observer = self.observer.clone();
         let started = self.started;
         observer.record(&ObsEvent::TurnFinished {
@@ -921,16 +986,15 @@ impl Drop for TurnFinishGuard {
             outcome: &TurnOutcome::Canceled,
         });
         let usage = self.usage.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(u) = usage {
-            observer.record(&ObsEvent::UsageFinalized {
-                ctx: &ctx,
-                usage: &u,
-                fin: UsageFinalization::TurnFinal,
-            });
-        }
-        tokio::spawn(async move {
-            sm.finish_turn(&ctx.session_id, generation, &op).await;
+        observer.record(&ObsEvent::UsageFinalized {
+            ctx: &ctx,
+            usage: usage.as_ref(),
+            fin: UsageFinalization::TurnFinal,
         });
+        // Dropping the still-armed shared completion guard starts its exact
+        // generation/operation-bound fallback without retaining this telemetry
+        // observer in the detached cleanup task.
+        drop(self.completion.take());
     }
 }
 
@@ -940,6 +1004,10 @@ mod tests {
     use crate::clock::ManualClock;
     use crate::session_manager::SessionManager;
     use async_trait::async_trait;
+    use bridge_core::diagnostics::{
+        DiagnosticFailureClass, DiagnosticPhase, DiagnosticRedactor, FailureDiagnostic,
+        FailureDiagnosticInput, FailureDisposition,
+    };
     use bridge_core::domain::{
         AgentEntry, AgentKind, Effort, Part, PeerTaskId, PendingRequest, PermissionDecision,
         PermissionRequest, RegistrySnapshot, SessionContext,
@@ -948,12 +1016,15 @@ mod tests {
     use bridge_core::ids::{AgentId, ContextId, NodeId, SessionId};
     use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
     use bridge_core::ports::{
-        AgentBackend, BackendStream, Lease, Resolved, TurnContext, TurnOutcome, Update,
+        AgentBackend, BackendObservers, BackendStream, DiagnosticObserver, Lease, Resolved,
+        TurnContext, TurnOutcome, Update,
     };
     use bridge_core::task_store::{
-        MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinished, TurnLogUsage,
+        MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore, TurnLogFinalized,
+        TurnLogFinished, TurnUsageFinalization,
     };
     use bridge_workflow::graph::WorkflowNode;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use tokio::sync::Notify;
@@ -1167,6 +1238,58 @@ mod tests {
         }
     }
 
+    struct ErrorBackend {
+        error: BridgeError,
+        releases: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AgentBackend for ErrorBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            Ok(Box::pin(tokio_stream::iter(vec![Err(self.error.clone())])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.releases.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn structured_agent_failure(class: DiagnosticFailureClass) -> BridgeError {
+        BridgeError::agent_failure(
+            FailureDiagnostic::build_static_code(
+                FailureDiagnosticInput {
+                    failed_phase: DiagnosticPhase::PromptStream,
+                    last_completed_phase: Some(DiagnosticPhase::PromptStart),
+                    class,
+                    disposition: FailureDisposition::Fatal,
+                    code: "ignored".to_owned(),
+                    summary: "bounded test failure".to_owned(),
+                    causes: Vec::new(),
+                    stderr_observed: false,
+                    stderr_line_count: 0,
+                    stderr_scope: None,
+                    stderr_tail: None,
+                    stderr_redaction: None,
+                    retry_after_ms: None,
+                    reset_at_ms: None,
+                    prompt_may_have_been_accepted: true,
+                },
+                "test.warm.failure",
+                &DiagnosticRedactor::default(),
+            )
+            .unwrap(),
+        )
+    }
+
     #[derive(Default)]
     struct FakeSessionStore {
         sessions: StdMutex<HashMap<String, SessionId>>,
@@ -1268,6 +1391,8 @@ mod tests {
             mcp: Vec::new(),
             mcp_delivery: Default::default(),
             auth_method: None,
+            pre_authenticated: false,
+            host_fallback_eligible: false,
             name: None,
             description: None,
             tags: Vec::new(),
@@ -1342,12 +1467,14 @@ mod tests {
             error: None,
             created_ms: 10,
             updated_ms: 10,
+            last_artifact_ms: None,
             input: "input".into(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         }
     }
 
@@ -1458,6 +1585,114 @@ mod tests {
             Arc::new(NoopObserver),
             3,
         )
+    }
+
+    #[derive(Default)]
+    struct ObserverPathBackend {
+        prompts: StdMutex<Vec<Arc<dyn DiagnosticObserver>>>,
+    }
+
+    #[async_trait]
+    impl AgentBackend for ObserverPathBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            panic!("coordinator must use the composite prompt path")
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            assert!(observers.rich.is_none());
+            self.prompts.lock().unwrap().push(observers.diagnostic);
+            Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+            })])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct ObserverPathRegistry {
+        backend: Arc<ObserverPathBackend>,
+        resolutions: StdMutex<Vec<Arc<dyn DiagnosticObserver>>>,
+    }
+
+    #[async_trait]
+    impl AgentRegistry for ObserverPathRegistry {
+        async fn resolve(&self, _id: &AgentId) -> Result<Resolved, BridgeError> {
+            panic!("coordinator checkout must use observed resolution")
+        }
+
+        async fn resolve_observed(
+            &self,
+            id: &AgentId,
+            observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Resolved, BridgeError> {
+            self.resolutions.lock().unwrap().push(observer);
+            Ok(Resolved {
+                entry: Arc::new({
+                    let mut entry = entry();
+                    entry.id = id.clone();
+                    entry
+                }),
+                backend: self.backend.clone(),
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("codex").unwrap()
+        }
+
+        async fn apply(&self, _snapshot: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![self.default_id()]
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_and_continue_thread_one_fresh_operation_observer() {
+        let backend = Arc::new(ObserverPathBackend::default());
+        let registry = Arc::new(ObserverPathRegistry {
+            backend: backend.clone(),
+            resolutions: StdMutex::new(Vec::new()),
+        });
+        let coordinator = coordinator_fixture_with_registry(
+            registry.clone(),
+            Arc::new(ManualClock::new(1_700_000_000_000)),
+        );
+
+        let first = coordinator.prompt(prompt_params("first")).await.unwrap();
+        let first_resolution = registry.resolutions.lock().unwrap()[0].clone();
+        let first_prompt = backend.prompts.lock().unwrap()[0].clone();
+        assert!(
+            Arc::ptr_eq(&first_resolution, &first_prompt),
+            "prompt must use the checkout observer for collection"
+        );
+
+        let mut continuation = prompt_params("second");
+        continuation.context = Some(first.context);
+        let _ = coordinator.continue_turn(continuation).await.unwrap();
+
+        let resolutions = registry.resolutions.lock().unwrap();
+        let prompts = backend.prompts.lock().unwrap();
+        assert_eq!(resolutions.len(), 1, "warm continue must not re-resolve");
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            !Arc::ptr_eq(&prompts[0], &prompts[1]),
+            "each coordinator operation owns a fresh observer"
+        );
     }
 
     #[tokio::test]
@@ -1779,6 +2014,7 @@ mod tests {
             usage_warning: None,
             generation: bridge_core::ids::SessionGeneration::new(1),
             op: OperationId::parse("turn-1").unwrap(),
+            expiry_intent: crate::session_manager::WarmExpiryIntent::new(),
             seed: None,
             injects: Vec::new(),
             abort,
@@ -1792,6 +2028,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.stop_reason, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn coordinator_expires_every_sampled_structured_warm_failure_but_preserves_legacy_policy()
+    {
+        for (index, class) in [
+            DiagnosticFailureClass::Transport,
+            DiagnosticFailureClass::AgentProcess,
+            DiagnosticFailureClass::Timeout,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let releases = Arc::new(AtomicUsize::new(0));
+            let backend: Arc<dyn AgentBackend> = Arc::new(ErrorBackend {
+                error: structured_agent_failure(class),
+                releases: releases.clone(),
+            });
+            let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+                entry: entry(),
+                backend,
+                resolved: Arc::new(StdMutex::new(Vec::new())),
+            });
+            let coordinator = coordinator_fixture_with_registry(
+                registry,
+                Arc::new(ManualClock::new(1_700_000_000_000)),
+            );
+            let context = ctx(&format!("ctx-structured-{index}"));
+            let mut params = prompt_params("fail");
+            params.context = Some(context.clone());
+
+            assert!(matches!(
+                coordinator.prompt(params).await,
+                Err(BridgeError::AgentFailure { .. })
+            ));
+            assert_eq!(releases.load(AtomicOrdering::SeqCst), 1, "{class:?}");
+            assert!(coordinator.session_manager.status(&context).await.is_none());
+        }
+
+        let releases = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn AgentBackend> = Arc::new(ErrorBackend {
+            error: BridgeError::agent_crashed("legacy"),
+            releases: releases.clone(),
+        });
+        let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+            entry: entry(),
+            backend,
+            resolved: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let coordinator = coordinator_fixture_with_registry(
+            registry,
+            Arc::new(ManualClock::new(1_700_000_000_000)),
+        );
+        let context = ctx("ctx-legacy-error-policy");
+        let mut params = prompt_params("fail");
+        params.context = Some(context.clone());
+        assert!(matches!(
+            coordinator.prompt(params).await,
+            Err(BridgeError::AgentCrashed { .. })
+        ));
+        assert_eq!(releases.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            coordinator
+                .session_manager
+                .status(&context)
+                .await
+                .unwrap()
+                .state,
+            "idle",
+            "coordinator legacy errors retain their pre-R2b finish behavior"
+        );
     }
 
     #[cfg(test)]
@@ -1817,6 +2124,7 @@ mod tests {
             },
             UsageFinalized {
                 ctx: TurnContext,
+                has_usage: bool,
             },
         }
 
@@ -1836,9 +2144,10 @@ mod tests {
                             outcome: (*outcome).clone(),
                         })
                     }
-                    ObsEvent::UsageFinalized { ctx, .. } => {
+                    ObsEvent::UsageFinalized { ctx, usage, .. } => {
                         g.push(RecordedObsEvent::UsageFinalized {
                             ctx: (*ctx).clone(),
+                            has_usage: usage.is_some(),
                         })
                     }
                     _ => {}
@@ -1875,6 +2184,8 @@ mod tests {
                         mcp: vec![],
                         mcp_delivery: Default::default(),
                         auth_method: None,
+                        pre_authenticated: false,
+                        host_fallback_eligible: false,
                         name: None,
                         description: None,
                         tags: vec![],
@@ -1996,10 +2307,12 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            let usages: Vec<TurnContext> = events
+            let usages: Vec<(TurnContext, bool)> = events
                 .iter()
                 .filter_map(|event| match event {
-                    RecordedObsEvent::UsageFinalized { ctx, .. } => Some(ctx.clone()),
+                    RecordedObsEvent::UsageFinalized { ctx, has_usage } => {
+                        Some((ctx.clone(), *has_usage))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -2007,7 +2320,8 @@ mod tests {
             assert_eq!(finishes.len(), 1);
             assert_eq!(usages.len(), 1);
             assert_eq!(starts[0].turn_id, finishes[0].0.turn_id);
-            assert_eq!(starts[0].turn_id, usages[0].turn_id);
+            assert_eq!(starts[0].turn_id, usages[0].0.turn_id);
+            assert!(usages[0].1);
             let start_idx = events
                 .iter()
                 .position(|e| matches!(e, RecordedObsEvent::Start(_)))
@@ -2047,6 +2361,114 @@ mod tests {
             async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
                 Ok(())
             }
+        }
+
+        struct PendingBackend;
+
+        #[async_trait::async_trait]
+        impl AgentBackend for PendingBackend {
+            async fn prompt(
+                &self,
+                _session: &SessionId,
+                _parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                Ok(Box::pin(futures::stream::pending()))
+            }
+
+            async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+        }
+
+        fn in_flight(observer: &bridge_observ::PrometheusObserver) -> i64 {
+            observer
+                .endpoint()
+                .render()
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("bridge_turns_in_flight "))
+                .expect("in-flight gauge is registered")
+                .parse()
+                .expect("in-flight gauge is an integer")
+        }
+
+        #[tokio::test]
+        async fn direct_prompt_metric_matches_running_then_idle_lifecycle() {
+            let observer = Arc::new(
+                bridge_observ::PrometheusObserver::new(bridge_observ::LabelVocabulary::default())
+                    .unwrap(),
+            );
+            let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+                backend: Arc::new(PendingBackend),
+            });
+            let sm = Arc::new(crate::session_manager::SessionManager::new(
+                registry.clone(),
+                std::time::Duration::from_secs(60),
+            ));
+            let coord = Arc::new(Coordinator::new(
+                sm,
+                None,
+                Arc::new(std::collections::HashMap::new()),
+                Arc::new(MemoryTaskStore::new()),
+                Arc::new(super::FakeSessionStore::default()),
+                Arc::new(super::AllowPolicy),
+                registry,
+                Arc::new(crate::clock::SystemClock),
+                None,
+                None,
+                observer.clone(),
+                3,
+            ));
+            let context = ContextId::parse("ctx-metric-running").unwrap();
+            let params = OpParams {
+                input: "hold".into(),
+                context: Some(context.clone()),
+                agent: Some(AgentId::parse("codex").unwrap()),
+                model: None,
+                effort: None,
+                mode: None,
+                cwd: None,
+                workflow: None,
+                skill: None,
+            };
+
+            let running_coord = coord.clone();
+            let running = tokio::spawn(async move { running_coord.prompt(params).await });
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if in_flight(&observer) == 1
+                        && coord
+                            .session_manager
+                            .status(&context)
+                            .await
+                            .is_some_and(|status| status.state == "running")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("direct turn must become visible as running and in-flight");
+
+            running.abort();
+            let _ = running.await;
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if in_flight(&observer) == 0
+                        && coord
+                            .session_manager
+                            .status(&context)
+                            .await
+                            .is_some_and(|status| status.state == "idle")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("dropped direct turn must return to idle and leave in-flight accounting");
         }
 
         #[tokio::test]
@@ -2188,7 +2610,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn collect_turn_dropped_emit_canceled_without_usage_finalized() {
+        async fn turn_finish_drop_guard_without_usage_emits_explicit_no_usage() {
             let observer = Arc::new(RecordingObserver::default());
             let backend = Arc::new(FakeBackend::new(Some(Arc::new(tokio::sync::Notify::new()))));
             let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry { backend });
@@ -2270,10 +2692,12 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            let usages: Vec<TurnContext> = events
+            let usages: Vec<(TurnContext, bool)> = events
                 .iter()
                 .filter_map(|event| match event {
-                    RecordedObsEvent::UsageFinalized { ctx, .. } => Some(ctx.clone()),
+                    RecordedObsEvent::UsageFinalized { ctx, has_usage } => {
+                        Some((ctx.clone(), *has_usage))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -2282,7 +2706,9 @@ mod tests {
             assert_eq!(finishes.len(), 1);
             assert_eq!(starts[0].turn_id, finishes[0].0.turn_id);
             assert_eq!(finishes[0].1, TurnOutcome::Canceled);
-            assert_eq!(usages.len(), 0);
+            assert_eq!(usages.len(), 1);
+            assert_eq!(starts[0].turn_id, usages[0].0.turn_id);
+            assert!(!usages[0].1);
             let start_idx = events
                 .iter()
                 .position(|e| matches!(e, RecordedObsEvent::Start(_)))
@@ -2311,6 +2737,7 @@ mod tests {
             usage_warning: None,
             generation: bridge_core::ids::SessionGeneration::new(3),
             op: op.clone(),
+            expiry_intent: crate::session_manager::WarmExpiryIntent::new(),
             seed: None,
             injects: Vec::new(),
             abort: CancellationToken::new(),
@@ -2454,12 +2881,14 @@ mod tests {
                 error: None,
                 created_ms: 1,
                 updated_ms: 1,
+                last_artifact_ms: None,
                 input: String::new(),
                 workflow_spec_json: None, // unresumable: no snapshot to reconstruct the graph
                 resume_attempts: 0,
                 session_cwd: None,
                 batch_id: None,
                 item_id: None,
+                artifacts_purged_at: None,
             })
             .await
             .unwrap();
@@ -2534,7 +2963,7 @@ mod tests {
         turn: &str,
         task: &str,
         completed_ms: i64,
-    ) -> (TurnContext, TurnLogFinished, TurnLogUsage) {
+    ) -> (TurnContext, TurnLogFinished, TurnLogFinalized) {
         let ctx = TurnContext {
             turn_id: bridge_core::ids::TurnId::parse(turn).unwrap(),
             session_id: ContextId::parse("ctx-dto").unwrap(),
@@ -2557,9 +2986,9 @@ mod tests {
             ttft: None,
             outcome: TurnOutcome::Success,
         };
-        let usage = TurnLogUsage {
+        let usage = TurnLogFinalized {
             ctx: ctx.clone(),
-            usage: UsageSnapshot {
+            finalization: TurnUsageFinalization::Usage(UsageSnapshot {
                 used: Some(999),
                 size: Some(1000),
                 cost: Some(UsageCost {
@@ -2575,7 +3004,7 @@ mod tests {
                     cached_write_tokens: None,
                 }),
                 at_ms: completed_ms,
-            },
+            }),
         };
         (ctx, finished, usage)
     }
@@ -2597,7 +3026,11 @@ mod tests {
                 .upsert_turn_finished(&finished)
                 .await
                 .unwrap();
-            fixture.task_store.update_turn_usage(&usage).await.unwrap();
+            fixture
+                .task_store
+                .finalize_turn_usage(&usage)
+                .await
+                .unwrap();
         }
 
         let dto = fixture.coordinator.status(None, Some(id)).await.unwrap();
@@ -2637,10 +3070,17 @@ mod tests {
             .upsert_turn_finished(&finished)
             .await
             .unwrap();
-        fixture.task_store.update_turn_usage(&usage).await.unwrap();
+        fixture
+            .task_store
+            .finalize_turn_usage(&usage)
+            .await
+            .unwrap();
 
         let (_ctx, finished, mut usage2) = dto_turn_ctx("turn-eur", id.as_str(), 20);
-        usage2.usage.cost = Some(UsageCost {
+        let TurnUsageFinalization::Usage(snapshot) = &mut usage2.finalization else {
+            unreachable!("dto helper always creates usage finalization")
+        };
+        snapshot.cost = Some(UsageCost {
             amount: 0.25,
             currency: "EUR".into(),
         });
@@ -2649,7 +3089,11 @@ mod tests {
             .upsert_turn_finished(&finished)
             .await
             .unwrap();
-        fixture.task_store.update_turn_usage(&usage2).await.unwrap();
+        fixture
+            .task_store
+            .finalize_turn_usage(&usage2)
+            .await
+            .unwrap();
 
         let dto = fixture.coordinator.status(None, Some(id)).await.unwrap();
 
@@ -2679,7 +3123,11 @@ mod tests {
             .upsert_turn_finished(&finished)
             .await
             .unwrap();
-        fixture.task_store.update_turn_usage(&usage).await.unwrap();
+        fixture
+            .task_store
+            .finalize_turn_usage(&usage)
+            .await
+            .unwrap();
 
         let dto = fixture.coordinator.status(None, Some(id)).await.unwrap();
 
@@ -2711,7 +3159,11 @@ mod tests {
             .upsert_turn_finished(&finished)
             .await
             .unwrap();
-        fixture.task_store.update_turn_usage(&usage).await.unwrap();
+        fixture
+            .task_store
+            .finalize_turn_usage(&usage)
+            .await
+            .unwrap();
 
         let dto = coordinator.status(None, Some(id)).await.unwrap();
 
@@ -2746,7 +3198,11 @@ mod tests {
                 .upsert_turn_finished(&finished)
                 .await
                 .unwrap();
-            fixture.task_store.update_turn_usage(&usage).await.unwrap();
+            fixture
+                .task_store
+                .finalize_turn_usage(&usage)
+                .await
+                .unwrap();
         }
 
         let dto = coordinator.status(None, Some(id)).await.unwrap();

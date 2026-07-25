@@ -93,6 +93,8 @@ fn minimal_entry(id: &AgentId) -> AgentEntry {
         sandbox: None,
         watchdog: None,
         auth_method: None,
+        pre_authenticated: false,
+        host_fallback_eligible: false,
         name: None,
         description: None,
         tags: vec![],
@@ -482,12 +484,14 @@ fn task_record(id: &str, status: TaskRecordStatus, result: Option<&str>) -> Task
         error: None,
         created_ms: now_ms(),
         updated_ms: now_ms(),
+        last_artifact_ms: None,
         input: "input text".to_string(),
         workflow_spec_json: None,
         resume_attempts: 0,
         session_cwd: None,
         batch_id: None,
         item_id: None,
+        artifacts_purged_at: None,
     }
 }
 

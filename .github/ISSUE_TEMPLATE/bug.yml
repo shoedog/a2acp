@@ -1,0 +1,90 @@
+name: Bug report
+description: Report reproducible incorrect behavior in a2a-bridge.
+title: "[Bug]: "
+labels:
+  - "kind:bug"
+  - "status:triage"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve a2a-bridge. Remove secrets, credentials, private prompts, and sensitive log content before submitting.
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: What did a2a-bridge do incorrectly?
+      placeholder: A concise description of the failure.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Choose the closest subsystem. A maintainer will apply the corresponding area label.
+      options:
+        - ACP adapter or provider
+        - Workflow execution
+        - Container runtime
+        - CLI
+        - Model compatibility
+        - Documentation
+        - Release or packaging
+        - Repository automation
+        - Unsure
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Execution environment
+      description: Where did the failure occur?
+      options:
+        - Host / non-container
+        - Managed container
+        - CI
+        - More than one environment
+        - Other or unknown
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: a2a-bridge version or commit
+      placeholder: v0.2.1 or a full commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest safe command, config fragment, and ordered steps that reproduce the problem.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: Include exit status and terminal state when available.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Paste only the smallest relevant, scrubbed log excerpt or artifact metadata.
+      render: text
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed secrets, credentials, private prompts, and sensitive log content.
+          required: true

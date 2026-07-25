@@ -1,0 +1,14 @@
+# Current host last-known-good Claude ACP canary.
+default = "claude-host"
+
+[[agents]]
+id = "claude-host"
+cmd = "claude-agent-acp"
+model = "claude-fable-5[1m]"
+effort = "xhigh"
+
+[registry]
+allowed_cmds = ["claude-agent-acp"]
+
+[server]
+addr = "127.0.0.1:8080"

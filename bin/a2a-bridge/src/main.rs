@@ -28,13 +28,37 @@
 //                                                        — stream a task's progress (SSE)
 //   a2a-bridge task-spec schema|template|input           — inspect/validate typed task-spec inputs
 //   a2a-bridge validate --config <path>                  — validate config, workflows, and prompt refs
+//   a2a-bridge smoke --agent <id> --config <path>
+//             --acknowledge-billable                    — run one bounded fixed PONG probe
+//   a2a-bridge fallback-plan --from <artifact> --host-agent <id>
+//             --config <path> --trusted-session-cwd <repo>
+//                                                       — emit a local-only host fallback plan
 
 mod catalog_probe;
+mod compatibility;
+mod compatibility_process_group;
+mod compatibility_resolution;
+mod compatibility_schedule;
+mod compatibility_schedule_admission;
+mod compatibility_schedule_authority;
+mod compatibility_schedule_evidence;
+mod compatibility_schedule_ledger;
+mod compatibility_schedule_outbox;
+mod compatibility_schedule_preflight;
+mod compatibility_schedule_retention;
+mod compatibility_schedule_schema;
+mod compatibility_schedule_state;
+mod compatibility_schedule_status;
+mod compatibility_schedule_supervisor;
+mod compatibility_schedule_transaction;
 mod config;
 mod containers;
 mod doctor;
+mod fallback_plan;
+mod local_file;
 mod route;
 mod slice;
+mod smoke;
 
 pub(crate) use bridge_controller::{
     implement, implement_resume, merge, resilient, review, turn, tweak, verify,
@@ -57,7 +81,7 @@ use bridge_policy::{
     auth::AlwaysGrant,
     permission::{AutoPolicy, DeferPolicy},
 };
-use bridge_registry::registry::{Registry, SpawnFn};
+use bridge_registry::registry::{ObservedSpawnFn, Registry, SpawnFn};
 use bridge_store::sqlite::SqliteStore;
 use config::{FileConfigSource, RegistryConfig, ServerConfig};
 use route::SkillRoute;
@@ -95,6 +119,14 @@ SUBCOMMANDS:
                       --manifest <file> [--concurrency K] [--detach] [--url <url>]
   batch               Batch store.  status <id> | list | cancel <id>
   models              List each agent's advertised models/effort/modes (probed live).  [--config <f>] [--agent <id>] [--json]
+  compatibility       Validate recipes/manifests, resolve floating candidates, run exact canaries,
+                      compare evidence, or inspect schedule status.
+                      validate | resolve | run | compare | schedule status [--json]
+  smoke               Run one explicitly acknowledged, bounded, fixed PONG probe.
+                      --agent <id> --config <f> --acknowledge-billable [--out <f>]
+  fallback-plan       Validate a local failed artifact and emit a host fallback recommendation.
+                      --from <artifact> --host-agent <id> --config <f> --trusted-session-cwd <repo>
+                      [--confirm-trusted-own-repo-read-only]
   implement --input <file|-> Clone a repo, implement the task on a warm containerized agent, verify+review, hand off.
                       --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>] [--merge [--onto <branch>]]
   merge <id>          Land an Approved run's commit into its source repo, re-authored to the operator
@@ -104,7 +136,7 @@ SUBCOMMANDS:
                       [--config <f>] [--examples-policy off|warn|deny] [--project-marker <text>]...
                       or --repo-hygiene [--artifact-allowlist <path>]
   serve               Run the A2A server.  [--config <path>]
-  mcp                 Serve the MCP protocol over stdio (one stable Coordinator; A2A/CLI/MCP are thin adapters).
+  mcp                 Serve external-controller MCP over stdio; managed-agent loopback is refused.
                       [--config <path>] [--store <path>]
   task-spec           Inspect or validate typed task-spec inputs. schema | template | input
   prompt              Inspect the named prompt registry ([[prompts]]). list | show <id>  [--config <f>]
@@ -120,7 +152,8 @@ const MCP_USAGE: &str = "\
 usage: a2a-bridge mcp [--config <path>] [--store <path>]
                       [--examples-policy off|warn|deny] [--project-marker <text>]...
 
-Serve the MCP protocol over stdio. STDOUT is reserved for NDJSON MCP replies; tracing is written to STDERR.
+Serve the external-controller MCP protocol over stdio. Managed-agent loopback is refused.
+STDOUT is reserved for NDJSON MCP replies; tracing is written to STDERR.
 
   --config <path>  registry config (default: ./a2a-bridge.toml)
   --store <path>   override the [store] path for this MCP process
@@ -159,6 +192,30 @@ container, or touches the network beyond a local `<runtime> network|image inspec
 
 Exit code is 0 unless at least one check is `fail` (warnings alone exit 0).";
 
+const SMOKE_USAGE: &str = "\
+usage: a2a-bridge smoke --agent <id> --config <path> --acknowledge-billable
+                        [--model <raw-id>] [--effort <level>] [--mode <id>]
+                        [--session-cwd <trusted-repo>] [--timeout-secs <1..900>]
+                        [--include-redacted-stderr] [--out <path>]
+                        [--expected-config-sha256 <hex>
+                         --expected-executable-sha256 <hex>
+                         --expected-session-cwd <canonical-repo>
+                         --expected-session-cwd-device <u64>
+                         --expected-session-cwd-inode <u64>
+                         --expected-session-cwd-object-sha256 <hex>
+                         --expected-source-mount <canonical-root>
+                         --expected-source-mount-device <u64>
+                         --expected-source-mount-inode <u64>
+                         --expected-source-mount-object-sha256 <hex>
+                         --fallback-source-agent <id>
+                         --require-host-fallback-eligible]
+
+Run exactly one billable agent turn with the fixed prompt `Reply exactly PONG. Do not use tools.`.
+There is no retry, fallback, workflow, resume, or caller-supplied prompt. The default timeout is 120
+seconds and the hard maximum is 900 seconds. Without --out, stdout contains only the versioned JSON
+artifact. Opaque stderr text is excluded unless --include-redacted-stderr explicitly opts into bounded
+best-effort redaction. An explicit --out path must not already exist.";
+
 const TASK_SPEC_USAGE: &str = "\
 usage: a2a-bridge task-spec schema [type]
        a2a-bridge task-spec template <type>
@@ -173,6 +230,7 @@ enum TopSubcommand {
     RunBatch,
     Batch,
     Models,
+    Compatibility,
     Implement,
     Merge,
     Containers,
@@ -185,6 +243,8 @@ enum TopSubcommand {
     TaskSpec,
     Prompt,
     Doctor,
+    Smoke,
+    FallbackPlan,
     Help,
     Serve,
     Unknown(String),
@@ -196,6 +256,7 @@ fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
         Some("run-batch") => TopSubcommand::RunBatch,
         Some("batch") => TopSubcommand::Batch,
         Some("models") => TopSubcommand::Models,
+        Some("compatibility") => TopSubcommand::Compatibility,
         Some("implement") => TopSubcommand::Implement,
         Some("merge") => TopSubcommand::Merge,
         Some("containers") => TopSubcommand::Containers,
@@ -208,6 +269,8 @@ fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
         Some("task-spec") => TopSubcommand::TaskSpec,
         Some("prompt") => TopSubcommand::Prompt,
         Some("doctor") => TopSubcommand::Doctor,
+        Some("smoke") => TopSubcommand::Smoke,
+        Some("fallback-plan") => TopSubcommand::FallbackPlan,
         Some("help") | Some("--help") | Some("-h") => TopSubcommand::Help,
         Some("serve") | None => TopSubcommand::Serve,
         Some(other) => TopSubcommand::Unknown(other.to_string()),
@@ -239,6 +302,9 @@ fn dispatcher_help(sub: &TopSubcommand, raw_args: &[String]) -> Option<&'static 
         TopSubcommand::Merge => Some(MERGE_USAGE),
         TopSubcommand::Init => Some(INIT_USAGE),
         TopSubcommand::Doctor => Some(DOCTOR_USAGE),
+        TopSubcommand::Compatibility => Some(compatibility::USAGE),
+        TopSubcommand::Smoke => Some(SMOKE_USAGE),
+        TopSubcommand::FallbackPlan => Some(fallback_plan::USAGE),
         _ => None,
     }
 }
@@ -330,6 +396,16 @@ fn acp_spawn_inputs(
     owner_config_path: &std::path::Path,
     run: &bridge_core::run_identity::RunHandle,
 ) -> Result<(String, Vec<String>, bridge_acp::acp_backend::AcpConfig), BridgeError> {
+    acp_spawn_inputs_with_cwd_binding(entry, cwd, owner_config_path, run, false)
+}
+
+fn acp_spawn_inputs_with_cwd_binding(
+    entry: &AgentEntry,
+    cwd: PathBuf,
+    owner_config_path: &std::path::Path,
+    run: &bridge_core::run_identity::RunHandle,
+    preserve_object_cwd: bool,
+) -> Result<(String, Vec<String>, bridge_acp::acp_backend::AcpConfig), BridgeError> {
     use bridge_core::domain::MountAccess;
     // Increment A: a `:ro` reader carries the run-id in its name (no same-owner concurrent clash) + the
     // full managed label set (so `recover_orphans`/`containers` classify it). `repo`/`cwd` are display-only.
@@ -338,9 +414,21 @@ fn acp_spawn_inputs(
     // possibly stale) entry. Canonicalize the cwd used for MCP `{cwd}` so the agent deterministically
     // hits the warmed entry (warm the SAME canonical path). The `:rw` implementor already does this via
     // `rw_canon`. Falls back to the raw cwd if canonicalize fails (e.g. unit tests, missing dir).
-    let mcp_cwd = std::fs::canonicalize(&cwd)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| cwd_str.clone());
+    let mcp_cwd = if preserve_object_cwd {
+        if !cwd.is_absolute() {
+            return Err(BridgeError::ConfigInvalid {
+                reason: "pinned host composition cwd must be absolute".into(),
+            });
+        }
+        cwd_str.clone()
+    } else {
+        std::fs::canonicalize(&cwd)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| cwd_str.clone())
+    };
+    if let Some(sandbox) = &entry.sandbox {
+        bridge_core::sandbox::validate_container_infrastructure(sandbox)?;
+    }
     // kiro MCP delivery (ADR-0028): write the named agent-config (prism, {cwd}-substituted) to
     // ~/.kiro/agents/<name>.json BEFORE spawn; `acp_program_argv` points kiro at it via `--agent`.
     if matches!(
@@ -378,23 +466,34 @@ fn acp_spawn_inputs(
         None => (None, Vec::new()),
     };
     let (program, argv) = acp_program_argv(entry, ro_name.as_deref(), &labels, &mcp_cwd)?;
-    let container = ro_name.map(|name| bridge_acp::acp_backend::ContainerReap {
-        runtime: entry
-            .sandbox
-            .as_ref()
-            .map(|sb| sb.runtime().to_string())
-            .unwrap_or_else(|| "docker".to_string()),
-        name,
-        reap_fn: bridge_core::reaper::production_reap_fn(),
+    let container = ro_name.map(|name| {
+        bridge_acp::acp_backend::ContainerReap::production(
+            entry
+                .sandbox
+                .as_ref()
+                .map(|sb| sb.runtime().to_string())
+                .unwrap_or_else(|| "docker".to_string()),
+            name,
+        )
     });
+    // MCP environment values are already held by the bridge and can be echoed
+    // by an adapter error. Treat them as credential-shaped diagnostic inputs;
+    // mounted auth files remain out of scope and are deliberately not read just
+    // to expand the redaction set.
+    let mut mcp_redaction_values = bridge_core::mcp::env_redaction_values(&entry.mcp, &cwd_str);
+    mcp_redaction_values.extend(bridge_core::mcp::env_redaction_values(&entry.mcp, &mcp_cwd));
+    let diagnostic_redactor =
+        bridge_core::diagnostics::DiagnosticRedactor::new(mcp_redaction_values);
     let acp = bridge_acp::acp_backend::AcpConfig {
         agent_id: entry.id.as_str().to_string(),
         cwd,
         model: entry.model.clone(),
         mode: entry.mode.clone(),
         auth_method: entry.auth_method.clone(),
+        pre_authenticated: entry.pre_authenticated,
         container,
         watchdog: entry.watchdog.clone(),
+        diagnostic_redactor,
         // ACP-param MCP delivery (claude): the entry's MCP servers ride `session/new`. Codex/kiro
         // native delivery leaves this empty (they get MCP via their native channel, not the param).
         mcp: if matches!(entry.mcp_delivery, bridge_core::mcp::McpDelivery::Acp) {
@@ -417,6 +516,13 @@ struct AcpContainerSpawn {
 }
 #[async_trait::async_trait]
 impl bridge_container::ContainerSpawn for AcpContainerSpawn {
+    fn validate_infrastructure(
+        &self,
+        sandbox: &bridge_core::domain::SandboxConfig,
+    ) -> Result<(), BridgeError> {
+        bridge_core::sandbox::validate_container_infrastructure(sandbox)
+    }
+
     async fn spawn(
         &self,
         program: &str,
@@ -424,9 +530,44 @@ impl bridge_container::ContainerSpawn for AcpContainerSpawn {
         cfg: bridge_acp::acp_backend::AcpConfig,
     ) -> Result<Arc<dyn bridge_core::ports::AgentBackend>, BridgeError> {
         let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let mut be = bridge_acp::acp_backend::AcpBackend::spawn(program, &argv_ref, cfg)
-            .await?
-            .with_policy(Arc::clone(&self.policy));
+        let controller = cfg
+            .container
+            .as_ref()
+            .map(bridge_acp::acp_backend::ContainerReap::production_controller);
+        let mut be = bridge_acp::acp_backend::AcpBackend::spawn_observed_with_container_controller(
+            program,
+            &argv_ref,
+            cfg,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+            controller,
+        )
+        .await?
+        .with_policy(Arc::clone(&self.policy));
+        if let Some(reg) = &self.permission_registry {
+            be = be
+                .with_permission_registry(Arc::clone(reg))
+                .with_permission_timeout_ms(self.perm_timeout_ms);
+        }
+        Ok(Arc::new(be) as Arc<dyn bridge_core::ports::AgentBackend>)
+    }
+
+    async fn spawn_observed(
+        &self,
+        program: &str,
+        argv: &[String],
+        cfg: bridge_acp::acp_backend::AcpConfig,
+        observer: Arc<dyn bridge_core::ports::DiagnosticObserver>,
+    ) -> Result<Arc<dyn bridge_core::ports::AgentBackend>, BridgeError> {
+        let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let controller = cfg
+            .container
+            .as_ref()
+            .map(bridge_acp::acp_backend::ContainerReap::production_controller);
+        let mut be = bridge_acp::acp_backend::AcpBackend::spawn_observed_with_container_controller(
+            program, &argv_ref, cfg, observer, controller,
+        )
+        .await?
+        .with_policy(Arc::clone(&self.policy));
         if let Some(reg) = &self.permission_registry {
             be = be
                 .with_permission_registry(Arc::clone(reg))
@@ -613,6 +754,7 @@ fn container_rw_cfg_from_entry(
         model: entry.model.clone(),
         mode: entry.mode.clone(),
         auth_method: entry.auth_method.clone(),
+        pre_authenticated: entry.pre_authenticated,
         watchdog: entry.watchdog.clone(),
         handshake_timeout: bridge_acp::acp_backend::AcpConfig::default().handshake_timeout,
         cancel_grace: bridge_acp::acp_backend::AcpConfig::default().cancel_grace,
@@ -743,9 +885,60 @@ fn validate_worktree_runtime_cfg(cfg: &RegistryConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// The production `SpawnFn` (Acp compose-or-raw / Api / ContainerRw arms) — shared by run-workflow and the
-/// `implement` subcommand so their registry builds can't drift. `owner_config_path` seeds the ContainerRw
-/// owner token.
+/// Static container preflight can fail before an ACP backend exists. In that one case the composition
+/// root owns the missing spawn lifecycle pair so the typed failure is represented in the same observer
+/// stream as the enclosing registry resolve. Once preflight succeeds, the ACP backend remains the sole
+/// owner of spawn observation.
+async fn observe_static_container_spawn_failure(
+    observer: &Arc<dyn bridge_core::ports::DiagnosticObserver>,
+    failure: &bridge_core::diagnostics::FailureDiagnostic,
+) -> Result<(), BridgeError> {
+    use bridge_core::diagnostics::{
+        DiagnosticEvent, DiagnosticRedactor, PersistedPhaseTransition,
+        PersistedPhaseTransitionInput, PhaseStatus,
+    };
+
+    for (status, event_failure) in [
+        (PhaseStatus::Started, None),
+        (PhaseStatus::Failed, Some(failure.clone())),
+    ] {
+        let transition = PersistedPhaseTransition::build(
+            PersistedPhaseTransitionInput {
+                phase: bridge_core::diagnostics::DiagnosticPhase::Spawn,
+                status,
+                at_ms: bridge_core::diagnostics::diagnostic_timestamp_ms(),
+                operation: None,
+                code: None,
+                auth: None,
+            },
+            &DiagnosticRedactor::default(),
+        )
+        .map_err(|_| BridgeError::InvalidStateTransition)?;
+        let event = DiagnosticEvent::new(transition, event_failure)
+            .map_err(|_| BridgeError::InvalidStateTransition)?;
+        observer.record(event).await?;
+    }
+    Ok(())
+}
+
+/// The production observer-aware spawn factory (Acp compose-or-raw / Api / ContainerRw arms) — shared by
+/// run-workflow and the `implement` subcommand so their registry builds can't drift.
+/// `owner_config_path` seeds the ContainerRw owner token. R2b2b consumes the observer in ACP; R2b3
+/// completes API and ContainerRw observation through the same ownership path.
+#[derive(Clone, Debug)]
+pub(crate) struct HostProcessCwd {
+    pub(crate) pinned_directory: Arc<std::fs::File>,
+    pub(crate) acp_session_cwd: PathBuf,
+    pub(crate) retain_descriptor_after_exec: bool,
+}
+
+impl HostProcessCwd {
+    fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd as _;
+        self.pinned_directory.as_raw_fd()
+    }
+}
+
 fn make_spawn_fn(
     policy_for_spawn: Arc<dyn bridge_core::ports::PolicyEngine>,
     owner_config_path: PathBuf,
@@ -753,41 +946,103 @@ fn make_spawn_fn(
     permission_registry: Option<Arc<PermissionRegistry>>,
     perm_timeout_ms: u64,
     worktree_cfg: Option<WorktreeRuntimeCfg>,
-) -> bridge_registry::registry::SpawnFn {
-    Arc::new(move |entry: Arc<AgentEntry>| {
+    host_process_cwd: Option<HostProcessCwd>,
+) -> ObservedSpawnFn {
+    Arc::new(move |entry: Arc<AgentEntry>, observer| {
         let policy = Arc::clone(&policy_for_spawn);
         let owner_config_path = owner_config_path.clone();
         let run = run.clone();
         let permission_registry = permission_registry.clone();
         let worktree_cfg = worktree_cfg.clone();
+        let host_process_cwd = host_process_cwd.clone();
         Box::pin(async move {
-            // The host child has no cwd (Supervised gets None); AcpConfig.cwd IS the ACP session cwd.
-            // Resolution chain: session_cwd → cwd → "."; then absolutize relative values.
-            let resolved =
-                resolve_static_session_cwd(entry.session_cwd.as_deref(), entry.cwd.as_deref());
-            let cwd = {
-                let p = PathBuf::from(&resolved);
-                if p.is_absolute() {
-                    p
-                } else {
-                    std::env::current_dir()
-                        .map_err(|e| BridgeError::ConfigInvalid {
-                            reason: format!("cwd: {e}"),
-                        })?
-                        .join(p)
+            // Ordinary host children inherit the bridge cwd; AcpConfig.cwd is their ACP session cwd.
+            // Guarded fallback instead composes every cwd-derived input from the pinned object's stable
+            // absolute path, then fchdirs the child to that object. Never dereference entry cwd aliases
+            // after the fallback guard has authorized the separate trusted-repo descriptor.
+            use bridge_core::domain::AgentKind;
+            if let Some(pinned) = host_process_cwd.as_ref() {
+                if !matches!(entry.kind, AgentKind::Acp) || entry.sandbox.is_some() {
+                    return Err(BridgeError::ConfigInvalid {
+                        reason: "pinned host cwd can only be applied to an unsandboxed ACP target"
+                            .into(),
+                    });
+                }
+                if !pinned.acp_session_cwd.is_absolute() {
+                    return Err(BridgeError::ConfigInvalid {
+                        reason: "pinned host ACP cwd must be absolute".into(),
+                    });
+                }
+            }
+            let cwd = match host_process_cwd.as_ref() {
+                Some(pinned) => pinned.acp_session_cwd.clone(),
+                None => {
+                    let resolved = resolve_static_session_cwd(
+                        entry.session_cwd.as_deref(),
+                        entry.cwd.as_deref(),
+                    );
+                    let p = PathBuf::from(&resolved);
+                    if p.is_absolute() {
+                        p
+                    } else {
+                        std::env::current_dir()
+                            .map_err(|e| BridgeError::ConfigInvalid {
+                                reason: format!("cwd: {e}"),
+                            })?
+                            .join(p)
+                    }
                 }
             };
-            use bridge_core::domain::AgentKind;
             match entry.kind {
                 AgentKind::Acp => {
                     // Compose-or-raw + the `:ro` reaper via the shared helper (both factories agree).
-                    let (program, argv, acp) =
-                        acp_spawn_inputs(&entry, cwd, &owner_config_path, &run)?;
+                    let inputs = if host_process_cwd.is_some() {
+                        acp_spawn_inputs_with_cwd_binding(
+                            &entry,
+                            cwd,
+                            &owner_config_path,
+                            &run,
+                            true,
+                        )
+                    } else {
+                        acp_spawn_inputs(&entry, cwd, &owner_config_path, &run)
+                    };
+                    let (program, argv, mut acp) = match inputs {
+                        Ok(inputs) => inputs,
+                        Err(error) => {
+                            if let BridgeError::AgentFailure { diagnostic } = &error {
+                                if diagnostic.failed_phase()
+                                    == bridge_core::diagnostics::DiagnosticPhase::Spawn
+                                    && diagnostic.class().is_container_fallback_class()
+                                {
+                                    observe_static_container_spawn_failure(&observer, diagnostic)
+                                        .await?;
+                                }
+                            }
+                            return Err(error);
+                        }
+                    };
+                    if let Some(pinned) = host_process_cwd.as_ref() {
+                        acp.cwd = pinned.acp_session_cwd.clone();
+                    }
                     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
-                    let mut be =
-                        bridge_acp::acp_backend::AcpBackend::spawn(&program, &argv_ref, acp)
-                            .await?
-                            .with_policy(policy);
+                    let controller = acp
+                        .container
+                        .as_ref()
+                        .map(bridge_acp::acp_backend::ContainerReap::production_controller);
+                    let mut be = bridge_acp::acp_backend::AcpBackend::spawn_observed_with_container_controller_and_pinned_cwd(
+                        &program,
+                        &argv_ref,
+                        acp,
+                        observer,
+                        controller,
+                        host_process_cwd.as_ref().map(HostProcessCwd::raw_fd),
+                        host_process_cwd
+                            .as_ref()
+                            .is_some_and(|cwd| cwd.retain_descriptor_after_exec),
+                    )
+                    .await?
+                    .with_policy(policy);
                     if let Some(reg) = permission_registry.clone() {
                         be = be
                             .with_permission_registry(reg)
@@ -1730,6 +1985,23 @@ async fn run_review_step(
 
 /// The production `tweak::TweakEffects`: the real verify/review/fix turns. Borrows the loop's setup for its
 /// lifetime; `fix` is only called when `fix_graph` is `Some` (the loop guards with `fix_available`).
+fn direct_diagnostic_observer() -> Arc<dyn bridge_core::ports::DiagnosticObserver> {
+    Arc::new(
+        bridge_core::diagnostics::InMemoryDiagnosticObserver::new(64)
+            .expect("direct diagnostic capacity is nonzero"),
+    )
+}
+
+async fn run_direct_implement_turn(
+    runner: &dyn turn::TurnRunner,
+    session: &bridge_core::ids::SessionId,
+    parts: Vec<bridge_core::domain::Part>,
+) -> bool {
+    runner
+        .run_turn_observed(session, parts, direct_diagnostic_observer())
+        .await
+}
+
 struct ProdEffects<'a> {
     verify_cfg: &'a Option<Result<verify::VerifyConfig, config::ConfigError>>,
     profile: Option<&'a bridge_core::profile::LanguageProfile>,
@@ -1785,7 +2057,7 @@ impl tweak::TweakEffects for ProdEffects<'_> {
         let parts = vec![bridge_core::domain::Part {
             text: bridge_workflow::template::render(template, &vars),
         }];
-        self.runner.run_turn(self.impl_session, parts).await
+        run_direct_implement_turn(self.runner, self.impl_session, parts).await
     }
 }
 
@@ -2341,9 +2613,10 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         None,
         120_000,
         worktree_cfg.clone(),
+        None,
     );
     let registry = Arc::new(
-        bridge_registry::registry::Registry::new(snapshot, spawn)
+        bridge_registry::registry::Registry::new_observed(snapshot, spawn)
             .map_err(|e| format!("implement: registry: {e:?}"))?,
     );
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
@@ -2360,7 +2633,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     // `.git/A2A_TASK.md` (no task interpolation), so the prompt itself is small + ASCII regardless of task.
     let edit_vars: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     let edit_input = bridge_workflow::template::render(&warm_impl.edit_template, &edit_vars);
-    let completed = turn::TurnRunner::run_turn(
+    let completed = run_direct_implement_turn(
         warm_runner.as_ref(),
         &warm_impl.impl_session,
         vec![bridge_core::domain::Part { text: edit_input }],
@@ -2665,9 +2938,10 @@ async fn implement_resume_cmd(
         None,
         120_000,
         worktree_cfg.clone(),
+        None,
     );
     let registry = Arc::new(
-        bridge_registry::registry::Registry::new(snapshot, spawn)
+        bridge_registry::registry::Registry::new_observed(snapshot, spawn)
             .map_err(|e| format!("implement --resume: registry: {e:?}"))?,
     );
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
@@ -3094,9 +3368,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         None,
         120_000,
         worktree_cfg,
+        None,
     );
     let registry = Arc::new(
-        bridge_registry::registry::Registry::new(snapshot, spawn)
+        bridge_registry::registry::Registry::new_observed(snapshot, spawn)
             .map_err(|e| format!("run-workflow: registry init error: {e:?}"))?,
     );
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
@@ -3193,7 +3468,9 @@ usage: a2a-bridge models [--config <path>] [--agent <id>] [--json]
   Pass models only when model_configurable=true; effort/mode only when those lists are present.
   --config <path>  registry config (default: ./a2a-bridge.toml)
   --agent <id>     show only this agent
-  --json           emit JSON (same shape as the card's agent-models extension params.agents)";
+  --json           emit an agent map; successful values match the card's agent-models shape, while
+                   failed probes are explicit {available:false,failure:{...}} records. Failure detail
+                   is in failure.phase/category/error/diagnostic; dynamic text is bounded and redacted";
 
 struct ModelsArgs {
     config: Option<String>,
@@ -3235,11 +3512,29 @@ fn parse_models_args(args: &[String]) -> Result<ModelsArgs, BoxError> {
     })
 }
 
-/// The catalog as the card's `params.agents` JSON object (each value via the shared `caps_to_json`).
-fn catalog_to_json(catalog: &bridge_core::catalog::ModelCatalog) -> serde_json::Value {
-    let agents: serde_json::Map<String, serde_json::Value> = catalog
+/// Render every configured probe target. Successful values retain the exact Agent Card capability
+/// shape; a failed target gets an additive CLI-only record instead of disappearing.
+fn catalog_report_to_json(
+    entries: &[(String, AgentEntry)],
+    report: &catalog_probe::CatalogProbeReport,
+) -> serde_json::Value {
+    let agents: serde_json::Map<String, serde_json::Value> = entries
         .iter()
-        .map(|(id, caps)| (id.clone(), bridge_core::catalog::caps_to_json(caps)))
+        .map(|(id, _)| {
+            let value = if let Some(caps) = report.catalog.get(id) {
+                bridge_core::catalog::caps_to_json(caps)
+            } else {
+                let failure = report
+                    .failures
+                    .get(id)
+                    .expect("every probe target has either capabilities or a failure");
+                serde_json::json!({
+                    "available": false,
+                    "failure": failure,
+                })
+            };
+            (id.clone(), value)
+        })
         .collect();
     serde_json::Value::Object(agents)
 }
@@ -3264,7 +3559,7 @@ async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
         .into_snapshot()
         .map_err(|e| format!("models: registry snapshot error: {e}"))?;
     // (id, entry) pairs, optionally filtered to one agent. Probing is on-demand (separate process from
-    // serve, so always live) and degrades per-agent.
+    // serve, so always live). The server catalog degrades per-agent; this CLI retains each failure.
     let entries: Vec<(String, AgentEntry)> = snapshot
         .entries
         .iter()
@@ -3278,15 +3573,15 @@ async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
         return Err(format!("models: no agents configured in {config_path:?}").into());
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-    let catalog = catalog_probe::probe_all(&entries, &cwd).await;
+    let report = catalog_probe::probe_all_report(&entries, &cwd).await;
     if parsed.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&catalog_to_json(&catalog))?
+            serde_json::to_string_pretty(&catalog_report_to_json(&entries, &report))?
         );
     } else {
         for (id, _) in &entries {
-            match catalog.get(id) {
+            match report.catalog.get(id) {
                 Some(caps) => {
                     let current = caps.current_model.as_deref().unwrap_or("?");
                     let configurable = if caps.models.is_empty() || caps.model_configurable {
@@ -3305,9 +3600,20 @@ async fn models_cmd(args: &[String]) -> Result<(), BoxError> {
                         println!("    modes:  {}", caps.modes.join(", "));
                     }
                 }
-                None => println!("{id}: unavailable (probe failed — see logs)"),
+                None => {
+                    let failure = report
+                        .failures
+                        .get(id)
+                        .expect("every probe target has either capabilities or a failure");
+                    println!("{id}: unavailable ({})", failure.cli_message());
+                }
             }
         }
+    }
+    // A specifically requested configured agent must never report an empty-success result. Render the
+    // machine-readable record first, then return nonzero with the same bounded safe cause on stderr.
+    if let Some(failure) = parsed.agent.as_ref().and_then(|id| report.failures.get(id)) {
+        return Err(failure.cli_message().into());
     }
     Ok(())
 }
@@ -4145,7 +4451,7 @@ fn agent_fragment(name: &str) -> &'static str {
             "\n# kiro: zero-auth local default (kiro-cli acp). ACP SDK 1.x can discover Kiro's\n# native model list, but cannot apply Kiro model pins unless the catalog marks\n# the agent `model_configurable: true`; leave model unpinned by default.\n[[agents]]\nid   = \"kiro\"\ncmd  = \"kiro-cli\"\nargs = [\"acp\"]\n"
         }
         "codex" => {
-            "\n# codex: gpt-5.5 with reasoning_effort. Auth defaults to ChatGPT-style login\n# when advertised; API-key-only installs should set auth_method explicitly.\n[[agents]]\nid    = \"codex\"\ncmd   = \"codex-acp\"\nmodel = \"gpt-5.5\"\neffort = \"high\"\n"
+            "\n# codex: gpt-5.5 with reasoning_effort. Run `codex login` first; the\n# existing login is ambient, so the bridge must not restart browser auth.\n[[agents]]\nid    = \"codex\"\ncmd   = \"codex-acp\"\npre_authenticated = true\nmodel = \"gpt-5.5\"\neffort = \"high\"\n"
         }
         "claude" => {
             "\n# claude: subscription. `model` is validated against the advertised values and\n# applied. Fable ids are blocked by this bridge; use another advertised model.\n[[agents]]\nid    = \"claude\"\ncmd   = \"claude-agent-acp\"\nmodel = \"sonnet\"\n"
@@ -4707,6 +5013,30 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         }
     }
 
+    let call_depth = match std::env::var(bridge_core::mcp::MANAGED_MCP_CALL_DEPTH_ENV) {
+        Ok(raw) => raw.parse::<u32>().map_err(|_| {
+            format!(
+                "a2a-bridge mcp: invalid {} value; expected a non-negative integer",
+                bridge_core::mcp::MANAGED_MCP_CALL_DEPTH_ENV
+            )
+        })?,
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!(
+                "a2a-bridge mcp: invalid non-Unicode {} value",
+                bridge_core::mcp::MANAGED_MCP_CALL_DEPTH_ENV
+            )
+            .into())
+        }
+    };
+    if call_depth > 0 {
+        return Err(format!(
+            "a2a-bridge mcp: managed-agent MCP loopback is unsupported ({}={call_depth}); invoke `a2a-bridge mcp` from an external controller",
+            bridge_core::mcp::MANAGED_MCP_CALL_DEPTH_ENV
+        )
+        .into());
+    }
+
     let config_path = require_config_path(explicit_config)?;
     let config_path = std::fs::canonicalize(&config_path).map_err(|e| {
         format!(
@@ -4744,13 +5074,14 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     let policy = make_policy(&cfg.server);
     let perm_registry = PermissionRegistry::new();
     let perm_timeout = permission_timeout_ms(&cfg.server);
-    let spawn: SpawnFn = make_spawn_fn(
+    let spawn: ObservedSpawnFn = make_spawn_fn(
         Arc::clone(&policy) as Arc<dyn PolicyEngine>,
         config_path.clone(),
         run.clone(),
         Some(Arc::clone(&perm_registry)),
         perm_timeout,
         worktree_cfg.clone(),
+        None,
     );
 
     let source = FileConfigSource::new(config_path.clone());
@@ -4763,7 +5094,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
             &bridge_core::liveness::FsLeaseProbe,
         );
     }
-    let registry = Arc::new(Registry::new(snapshot, spawn)?);
+    let registry = Arc::new(Registry::new_observed(snapshot, spawn)?);
 
     let base = config_path
         .parent()
@@ -5049,7 +5380,27 @@ fn validate_config_file(
     let raw = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("read {}: {e}", config_path.display()))?;
 
-    let cfg = RegistryConfig::parse(&raw).map_err(|e| format!("config parse: {e}"))?;
+    validate_config_contents(&config_path, &raw, examples_policy, project_markers, scope)
+        .map(|(report, _)| report)
+}
+
+/// Validate one already-pinned config byte snapshot and return the exact registry snapshot it
+/// produced. Security-sensitive local commands use this seam so validation and execution cannot
+/// silently reopen different config contents between phases.
+pub(crate) fn validate_config_contents(
+    config_path: &Path,
+    raw: &str,
+    examples_policy: ExamplesPolicy,
+    project_markers: &[String],
+    scope: ValidationScope,
+) -> Result<
+    (
+        ConfigValidationReport,
+        bridge_core::domain::RegistrySnapshot,
+    ),
+    BoxError,
+> {
+    let cfg = RegistryConfig::parse(raw).map_err(|e| format!("config parse: {e}"))?;
     let base = config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -5062,8 +5413,8 @@ fn validate_config_file(
     let warnings = match examples_policy {
         ExamplesPolicy::Off => Vec::new(),
         ExamplesPolicy::Warn | ExamplesPolicy::Deny => {
-            let config_in_examples = examples_ancestor(&config_path).is_some();
-            let raw_match = has_project_marker_in_examples(&config_path, &raw, project_markers);
+            let config_in_examples = examples_ancestor(config_path).is_some();
+            let raw_match = has_project_marker_in_examples(config_path, raw, project_markers);
             let workflow_prompt_match = workflows.values().any(|workflow| {
                 workflow
                     .nodes
@@ -5074,7 +5425,7 @@ fn validate_config_file(
                 .values()
                 .any(|prompt| contains_project_marker(&prompt.template, project_markers));
             if config_in_examples && (raw_match || workflow_prompt_match || named_prompt_match) {
-                examples_policy_warning_for_config(&config_path)
+                examples_policy_warning_for_config(config_path)
             } else {
                 Vec::new()
             }
@@ -5106,16 +5457,41 @@ fn validate_config_file(
             })
         })
     });
-    bridge_registry::registry::Registry::new(snap, spawn)
+    bridge_registry::registry::Registry::new(snap.clone(), spawn)
         .map_err(|e| format!("registry: {}", e.client_message()))?;
 
-    Ok(ConfigValidationReport {
-        config_path,
-        agent_count,
-        workflow_count,
-        prompt_count,
-        warnings,
-    })
+    Ok((
+        ConfigValidationReport {
+            config_path: config_path.to_path_buf(),
+            agent_count,
+            workflow_count,
+            prompt_count,
+            warnings,
+        },
+        snap,
+    ))
+}
+
+/// Validate only the registry surface consumed by the one-agent `smoke` and local `fallback-plan`
+/// commands. Workflows, prompt files, metrics, worktrees, and batch configuration cannot affect those
+/// commands and are deliberately not reopened as unbound side inputs.
+pub(crate) fn validate_registry_config_contents(
+    raw: &str,
+) -> Result<bridge_core::domain::RegistrySnapshot, BoxError> {
+    let snapshot = RegistryConfig::parse(raw)
+        .map_err(|error| format!("config parse: {error}"))?
+        .into_snapshot()
+        .map_err(|error| format!("registry snapshot: {error}"))?;
+    let spawn: SpawnFn = Arc::new(|_| {
+        Box::pin(async {
+            Err(BridgeError::ConfigInvalid {
+                reason: "registry-only validation must not spawn agents".into(),
+            })
+        })
+    });
+    bridge_registry::registry::Registry::new(snapshot.clone(), spawn)
+        .map_err(|error| format!("registry: {}", error.client_message()))?;
+    Ok(snapshot)
 }
 
 fn parse_validate_args(args: &[String]) -> Result<ValidateMode, BoxError> {
@@ -5841,6 +6217,9 @@ fn task_spec_cmd(args: &[String]) -> Result<(), BoxError> {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
+    // R3d1 schedule-tick owns this monotonic process-entry origin. Capture it before argument/help
+    // dispatch so later metadata and policy derivation can never reset the hard deadline.
+    let process_entry = std::time::Instant::now();
     // Dispatch subcommands BEFORE the server path touches the filesystem.
     let raw_args: Vec<String> = std::env::args().collect();
     let sub = parse_top_subcommand(&raw_args);
@@ -5856,6 +6235,9 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::RunBatch => return run_batch_cmd(&raw_args[2..]).await,
         TopSubcommand::Batch => return batch_cmd(&raw_args[2..]).await,
         TopSubcommand::Models => return models_cmd(&raw_args[2..]).await,
+        TopSubcommand::Compatibility => {
+            return compatibility::compatibility_cmd(&raw_args[2..], process_entry).await
+        }
         TopSubcommand::Implement => return implement_cmd(&raw_args[2..]).await,
         TopSubcommand::Merge => return merge_cmd(&raw_args[2..]).await,
         TopSubcommand::Containers => return containers_cmd(&raw_args[2..]),
@@ -5868,6 +6250,8 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::TaskSpec => return task_spec_cmd(&raw_args[2..]),
         TopSubcommand::Prompt => return prompt_cmd(&raw_args[2..]),
         TopSubcommand::Doctor => return doctor::doctor_cmd(&raw_args[2..]),
+        TopSubcommand::Smoke => return smoke::smoke_cmd(&raw_args[2..]).await,
+        TopSubcommand::FallbackPlan => return fallback_plan::fallback_plan_cmd(&raw_args[2..]),
         TopSubcommand::Help => {
             println!("{TOP_USAGE}");
             return Ok(());
@@ -5878,7 +6262,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         TopSubcommand::Unknown(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | implement | merge | containers | submit | task | task-spec | prompt | session | init | validate | doctor | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | compatibility | smoke | fallback-plan | implement | merge | containers | submit | task | task-spec | prompt | session | init | validate | doctor | help)"
             )
             .into());
         }
@@ -5953,13 +6337,14 @@ async fn main() -> Result<(), BoxError> {
     //    for the backend's lifetime, and applies the configured mode/model after
     //    each `session/new`. `model`/`mode` here are the per-MINT FALLBACK; the
     //    per-session `configure_session` overrides them at dispatch (Task 6).
-    let spawn: SpawnFn = make_spawn_fn(
+    let spawn: ObservedSpawnFn = make_spawn_fn(
         Arc::clone(&policy) as Arc<dyn PolicyEngine>,
         config_path.clone(),
         run.clone(),
         Some(Arc::clone(&perm_registry)),
         perm_timeout,
         worktree_cfg.clone(),
+        None,
     );
 
     // 5. Config source + registry. `load()` is the initial desired state; the
@@ -5999,7 +6384,7 @@ async fn main() -> Result<(), BoxError> {
         .map(|e| (e.id.as_str().to_string(), e.clone()))
         .collect();
     // Registry::new VALIDATES the snapshot → boot fails loud on bad config (spec §7).
-    let registry = Arc::new(Registry::new(snapshot, spawn)?);
+    let registry = Arc::new(Registry::new_observed(snapshot, spawn)?);
 
     // 6. Reconcile loop — consume `watch()` and `apply()` each new snapshot so
     //    on-disk edits hot-reload the live registry. The watch stream is held for
@@ -6615,6 +7000,69 @@ mod cli_tests {
         );
     }
 
+    struct ObservedOnlyTurnRunner {
+        completed: bool,
+        observed: std::sync::atomic::AtomicUsize,
+        seen: std::sync::Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl turn::TurnRunner for ObservedOnlyTurnRunner {
+        async fn run_turn(
+            &self,
+            _session: &bridge_core::ids::SessionId,
+            _parts: Vec<bridge_core::domain::Part>,
+        ) -> bool {
+            panic!("production implement turns must use run_turn_observed")
+        }
+
+        async fn run_turn_observed(
+            &self,
+            session: &bridge_core::ids::SessionId,
+            parts: Vec<bridge_core::domain::Part>,
+            _observer: Arc<dyn bridge_core::ports::DiagnosticObserver>,
+        ) -> bool {
+            self.observed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.seen.lock().unwrap().push((
+                session.as_str().to_string(),
+                parts.into_iter().map(|part| part.text).collect(),
+            ));
+            self.completed
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_implement_turn_uses_observed_runner_and_preserves_result() {
+        let session = bridge_core::ids::SessionId::parse("implement-observed").unwrap();
+
+        for completed in [true, false] {
+            let runner = ObservedOnlyTurnRunner {
+                completed,
+                observed: std::sync::atomic::AtomicUsize::new(0),
+                seen: std::sync::Mutex::new(Vec::new()),
+            };
+            let result = run_direct_implement_turn(
+                &runner,
+                &session,
+                vec![bridge_core::domain::Part {
+                    text: "implement payload".into(),
+                }],
+            )
+            .await;
+
+            assert_eq!(result, completed);
+            assert_eq!(runner.observed.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                runner.seen.lock().unwrap().as_slice(),
+                &[(
+                    "implement-observed".to_string(),
+                    vec!["implement payload".to_string()]
+                )]
+            );
+        }
+    }
+
     fn cr_entry(id: &str, mount: &str) -> AgentEntry {
         let mut e = acp_entry(id);
         e.kind = bridge_core::domain::AgentKind::ContainerRw;
@@ -6743,6 +7191,273 @@ mod cli_tests {
         assert_eq!(wd.hard_wall_clock, std::time::Duration::from_secs(600));
     }
 
+    #[test]
+    fn acp_spawn_inputs_threads_bridge_known_mcp_env_into_diagnostic_redactor() {
+        const SECRET: &str = "bridge-known-mcp-secret";
+        let mut entry = acp_entry("reader-redaction");
+        entry.mcp = vec![bridge_core::mcp::McpServerSpec {
+            name: "private-mcp".into(),
+            command: "/bin/true".into(),
+            args: vec![],
+            env: vec![
+                ("PRIVATE_TOKEN".into(), SECRET.into()),
+                ("TEMPLATED_TOKEN".into(), "alpha{cwd}omega".into()),
+            ],
+        }];
+        let run = bridge_core::run_identity::RunHandle {
+            instance_id: "run-redaction".into(),
+            host: "h".into(),
+            lease: "/l/run-redaction.lock".into(),
+            start: "0".into(),
+        };
+
+        let cwd = std::path::PathBuf::from("/tmp");
+        let raw_cwd = cwd.to_string_lossy().into_owned();
+        let effective_cwd = std::fs::canonicalize(&cwd)
+            .unwrap_or(cwd.clone())
+            .to_string_lossy()
+            .into_owned();
+        let (_, _, acp) =
+            acp_spawn_inputs(&entry, cwd, std::path::Path::new("/cfg/a2a.toml"), &run).unwrap();
+        let sanitized = acp
+            .diagnostic_redactor
+            .sanitize_stderr_line(&format!("adapter echoed {SECRET}"), 512);
+        assert!(!sanitized.contains(SECRET));
+        assert!(sanitized.contains("REDACTED KNOWN SECRET"));
+        for expanded in [
+            format!("alpha{raw_cwd}omega"),
+            format!("alpha{effective_cwd}omega"),
+        ] {
+            let sanitized = acp
+                .diagnostic_redactor
+                .sanitize_stderr_line(&format!("adapter echoed {expanded}"), 512);
+            assert!(
+                !sanitized.contains(&expanded),
+                "each value delivered after {{cwd}} substitution must be redacted"
+            );
+            assert!(sanitized.contains("REDACTED KNOWN SECRET"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn guarded_spawn_ignores_retargeted_static_cwd_for_native_mcp() {
+        use bridge_core::mcp::{McpDelivery, McpServerSpec};
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let owned_repo = temp.path().join("owned");
+        std::fs::create_dir(&owned_repo).unwrap();
+        let shared_alias = temp.path().join("source-link");
+        symlink(&owned_repo, &shared_alias).unwrap();
+
+        let snapshot =
+            crate::local_file::snapshot_directory(&owned_repo, "guarded spawn test").unwrap();
+        let pinned = crate::local_file::PinnedDirectory::open(
+            &owned_repo,
+            &snapshot.canonical_cwd,
+            &snapshot.identity,
+            "guarded spawn test",
+        )
+        .unwrap();
+        let object_cwd = pinned.acp_session_cwd();
+        let argv_log = temp.path().join("argv.log");
+        let adapter = temp.path().join("codex-acp");
+        std::fs::write(
+            &adapter,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {argv_log:?}\nexit 99\n"),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&adapter).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&adapter, permissions).unwrap();
+
+        let mut entry = acp_entry("guarded-codex");
+        entry.cmd = Some(adapter.to_string_lossy().into_owned());
+        entry.session_cwd = Some(shared_alias.to_string_lossy().into_owned());
+        entry.host_fallback_eligible = true;
+        entry.mcp_delivery = McpDelivery::CodexNative;
+        entry.mcp = vec![McpServerSpec {
+            name: "prism".into(),
+            command: "/opt/prism".into(),
+            args: vec!["--repo".into(), "{cwd}".into()],
+            env: vec![],
+        }];
+
+        // Model the review's post-authorization schedule: the source check already retained the exact
+        // owned-repo descriptor, then the shared config alias was retargeted before lazy resolution.
+        std::fs::remove_file(&shared_alias).unwrap();
+        symlink(temp.path(), &shared_alias).unwrap();
+        let broadened = std::fs::canonicalize(&shared_alias).unwrap();
+
+        let policy: std::sync::Arc<dyn bridge_core::ports::PolicyEngine> =
+            std::sync::Arc::new(AutoPolicy);
+        let spawn = make_spawn_fn(
+            policy,
+            temp.path().join("a2a-bridge.toml"),
+            bridge_core::run_identity::RunHandle {
+                instance_id: "guarded-retarget".into(),
+                host: "host".into(),
+                lease: "/lease".into(),
+                start: "0".into(),
+            },
+            None,
+            1,
+            None,
+            Some(HostProcessCwd {
+                pinned_directory: pinned.file_handle(),
+                acp_session_cwd: object_cwd.clone(),
+                retain_descriptor_after_exec: pinned.retain_descriptor_after_exec(),
+            }),
+        );
+        let observer: std::sync::Arc<dyn bridge_core::ports::DiagnosticObserver> =
+            std::sync::Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default());
+        // The fake adapter does not implement ACP; only its already-composed argv is under test.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            spawn(std::sync::Arc::new(entry), observer),
+        )
+        .await;
+
+        let argv = std::fs::read_to_string(&argv_log).expect("adapter must record composed argv");
+        let object_cwd = object_cwd.to_string_lossy();
+        assert!(
+            argv.contains(object_cwd.as_ref()),
+            "guarded MCP argv must use pinned object cwd {object_cwd:?}: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&broadened.to_string_lossy().into_owned()),
+            "guarded MCP argv leaked retargeted static cwd {broadened:?}: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn acp_spawn_inputs_constructs_only_unique_typed_container_failures() {
+        use bridge_core::diagnostics::{DiagnosticFailureClass, FailureDisposition};
+        use bridge_core::domain::{EgressPolicy, MountAccess, SandboxConfig};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().join("repo");
+        std::fs::create_dir(&mount).unwrap();
+        let credential = temp.path().join("auth.json");
+        std::fs::write(&credential, "{}").unwrap();
+        let runtime = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let healthy = SandboxConfig {
+            runtime: Some(runtime),
+            image: "reader:fixed".into(),
+            mount: mount.to_string_lossy().into_owned(),
+            access: MountAccess::Ro,
+            egress: EgressPolicy::Open,
+            volumes: vec![format!(
+                "{}:/root/.codex/auth.json:ro",
+                credential.display()
+            )],
+        };
+        let run = bridge_core::run_identity::RunHandle {
+            instance_id: "typed-container-preflight".into(),
+            host: "host".into(),
+            lease: "/lease".into(),
+            start: "0".into(),
+        };
+
+        let mut healthy_entry = acp_entry("reader");
+        healthy_entry.sandbox = Some(healthy.clone());
+        assert!(
+            acp_spawn_inputs(
+                &healthy_entry,
+                mount.clone(),
+                temp.path().join("a2a-bridge.toml").as_path(),
+                &run,
+            )
+            .is_ok(),
+            "complete healthy typed evidence should permit composition"
+        );
+
+        let mut cases = Vec::new();
+        let mut sandbox = healthy.clone();
+        sandbox.runtime = Some(
+            temp.path()
+                .join("missing-runtime")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        cases.push((DiagnosticFailureClass::ContainerRuntime, sandbox));
+        let mut sandbox = healthy.clone();
+        sandbox.image.clear();
+        cases.push((DiagnosticFailureClass::ContainerImage, sandbox));
+        let mut sandbox = healthy.clone();
+        sandbox.egress = EgressPolicy::Locked {
+            network: String::new(),
+            proxy: "http://proxy.invalid".into(),
+            no_proxy: None,
+        };
+        cases.push((DiagnosticFailureClass::ContainerNetwork, sandbox));
+        let mut sandbox = healthy.clone();
+        sandbox.mount = temp
+            .path()
+            .join("missing-mount")
+            .to_string_lossy()
+            .into_owned();
+        cases.push((DiagnosticFailureClass::ContainerMount, sandbox));
+        let mut sandbox = healthy.clone();
+        sandbox.volumes = vec![format!(
+            "{}:/root/.codex/auth.json:ro",
+            temp.path().join("missing-auth.json").display()
+        )];
+        cases.push((DiagnosticFailureClass::ContainerCredentials, sandbox));
+
+        for (expected, sandbox) in cases {
+            let mut entry = acp_entry("reader");
+            entry.sandbox = Some(sandbox);
+            let error = match acp_spawn_inputs(
+                &entry,
+                mount.clone(),
+                temp.path().join("a2a-bridge.toml").as_path(),
+                &run,
+            ) {
+                Ok(_) => panic!("{expected:?} evidence unexpectedly composed"),
+                Err(error) => error,
+            };
+            let BridgeError::AgentFailure { diagnostic } = error else {
+                panic!("{expected:?} evidence returned an unstructured error");
+            };
+            assert_eq!(diagnostic.class(), expected);
+            assert_eq!(
+                diagnostic.disposition(),
+                FailureDisposition::ContainerFallbackCandidate
+            );
+            assert!(!diagnostic.prompt_may_have_been_accepted());
+        }
+
+        let mut ambiguous = healthy;
+        ambiguous.runtime = Some(
+            temp.path()
+                .join("missing-runtime")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        ambiguous.image.clear();
+        let mut entry = acp_entry("reader");
+        entry.sandbox = Some(ambiguous);
+        let error = match acp_spawn_inputs(
+            &entry,
+            mount,
+            temp.path().join("a2a-bridge.toml").as_path(),
+            &run,
+        ) {
+            Ok(_) => panic!("contradictory evidence unexpectedly composed"),
+            Err(error) => error,
+        };
+        let BridgeError::AgentFailure { diagnostic } = error else {
+            panic!("contradictory evidence returned an unstructured error");
+        };
+        assert_eq!(diagnostic.class(), DiagnosticFailureClass::Unknown);
+        assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
+    }
+
     fn acp_entry(id: &str) -> AgentEntry {
         use bridge_core::ids::AgentId;
         use std::collections::BTreeMap;
@@ -6764,6 +7479,8 @@ mod cli_tests {
             mcp: vec![],
             mcp_delivery: Default::default(),
             auth_method: None,
+            pre_authenticated: false,
+            host_fallback_eligible: false,
             name: None,
             description: None,
             tags: vec![],
@@ -7016,6 +7733,51 @@ mod cli_tests {
     }
 
     #[test]
+    fn dispatcher_help_covers_smoke_before_the_billing_barrier() {
+        assert!(SMOKE_USAGE.starts_with("usage: a2a-bridge smoke"));
+        for help in ["--help", "-h"] {
+            let args = vec![
+                "a2a-bridge".to_string(),
+                "smoke".to_string(),
+                help.to_string(),
+            ];
+            let sub = parse_top_subcommand(&args);
+            assert_eq!(sub, TopSubcommand::Smoke);
+            assert_eq!(dispatcher_help(&sub, &args), Some(SMOKE_USAGE));
+        }
+    }
+
+    #[test]
+    fn dispatcher_help_covers_compatibility_before_the_billing_barrier() {
+        assert!(compatibility::USAGE.starts_with("usage: a2a-bridge compatibility"));
+        for help in ["--help", "-h"] {
+            let args = vec![
+                "a2a-bridge".to_string(),
+                "compatibility".to_string(),
+                help.to_string(),
+            ];
+            let sub = parse_top_subcommand(&args);
+            assert_eq!(sub, TopSubcommand::Compatibility);
+            assert_eq!(dispatcher_help(&sub, &args), Some(compatibility::USAGE));
+        }
+    }
+
+    #[test]
+    fn dispatcher_help_covers_fallback_plan_before_any_file_read() {
+        assert!(fallback_plan::USAGE.starts_with("usage: a2a-bridge fallback-plan"));
+        for help in ["--help", "-h"] {
+            let args = vec![
+                "a2a-bridge".to_string(),
+                "fallback-plan".to_string(),
+                help.to_string(),
+            ];
+            let sub = parse_top_subcommand(&args);
+            assert_eq!(sub, TopSubcommand::FallbackPlan);
+            assert_eq!(dispatcher_help(&sub, &args), Some(fallback_plan::USAGE));
+        }
+    }
+
+    #[test]
     fn dispatcher_help_does_not_fire_outside_its_narrow_contract() {
         // Not the first post-subcommand arg (nested forms are out of scope this wave).
         let nested = vec![
@@ -7153,6 +7915,7 @@ mod cli_tests {
         let codex_only = vec!["codex".to_string()];
         let cfg = build_init_config(&codex_only, None).unwrap();
         assert!(cfg.contains("default = \"codex\""));
+        assert!(cfg.contains("pre_authenticated = true"));
         // --default override must be among the selected agents.
         assert!(build_init_config(&codex_only, Some("claude")).is_err());
         assert!(build_init_config(&codex_only, Some("codex")).is_ok());
@@ -9215,8 +9978,9 @@ cmd = "cargo build --locked"
             None,
             120_000,
             None,
+            None,
         );
-        bridge_registry::registry::Registry::new(snap, spawn)
+        bridge_registry::registry::Registry::new_observed(snap, spawn)
             .expect("containerized config (incl. the impl container_rw agent) validates");
     }
 

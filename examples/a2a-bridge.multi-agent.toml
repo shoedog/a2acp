@@ -50,12 +50,12 @@ id    = "kiro"
 cmd   = "kiro-cli"
 args  = ["acp"]
 
-# codex: gpt-5.5 with reasoning_effort.
-# Auth omitted: the bridge prefers ChatGPT-style auth (`chat-gpt` or legacy `chatgpt`)
-# when advertised. Set auth_method explicitly for API-key-only installs.
+# codex: gpt-5.5 with reasoning_effort. The host `codex login` is ambient;
+# do not restart the browser login flow during bridge initialization.
 [[agents]]
 id     = "codex"
 cmd    = "codex-acp"
+pre_authenticated = true
 model  = "gpt-5.5"
 effort = "high"
 

@@ -1,0 +1,28 @@
+# R3b pinned Fable reader canary. Both isolated credentials and minimal Fable settings are required.
+default = "claude-reader"
+allowed_cwd_root = "/Users/wesleyjinks/code"
+
+[[agents]]
+id = "claude-reader"
+cmd = "claude-agent-acp"
+pre_authenticated = true
+model = "claude-fable-5[1m]"
+effort = "xhigh"
+
+[agents.sandbox]
+image = "sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1"
+mount = "/Users/wesleyjinks/code"
+access = "ro"
+egress = "locked"
+network = "a2a-egress-internal"
+proxy = "http://a2a-egress-proxy:8888"
+volumes = [
+  "/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json",
+  "/Users/wesleyjinks/code/a2a-bridge-operator-main/deploy/containers/claude-fable-settings.json:/root/.claude/settings.json:ro",
+]
+
+[registry]
+allowed_cmds = ["docker"]
+
+[server]
+addr = "127.0.0.1:8080"

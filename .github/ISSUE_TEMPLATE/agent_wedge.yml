@@ -1,0 +1,95 @@
+name: Agent wedge or stalled run
+description: Report a run that stopped making progress, parked during verification, or failed to terminate.
+title: "[Wedge]: "
+labels:
+  - "kind:wedge"
+  - "status:triage"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Preserve timing and lifecycle evidence before cleanup when safe. Remove secrets, credentials, private prompts, and sensitive log content before submitting.
+  - type: input
+    id: started_at
+    attributes:
+      label: Run start and timezone
+      placeholder: 2026-07-15 21:30 America/Denver
+    validations:
+      required: true
+  - type: input
+    id: last_progress
+    attributes:
+      label: Last observed progress and total elapsed time
+      placeholder: Last file edit at 17:22; killed after 2h54m
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent, provider, model, and effort
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Execution environment
+      options:
+        - Host / non-container
+        - Managed container
+        - CI
+        - More than one environment
+        - Other or unknown
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: a2a-bridge version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Last known phase
+      options:
+        - Startup or configuration
+        - Prompt or agent execution
+        - File editing
+        - Verification or tests
+        - Review
+        - Cleanup or terminal delivery
+        - Unknown
+    validations:
+      required: true
+  - type: textarea
+    id: timeline
+    attributes:
+      label: Timeline and progress evidence
+      description: Include timestamps for output, file edits, child-process activity, timeout/cancel, and cleanup.
+    validations:
+      required: true
+  - type: textarea
+    id: process_state
+    attributes:
+      label: Redacted process and container state
+      description: Include relevant process-tree, container lifecycle, or lease observations without credentials or prompt content.
+      render: text
+  - type: textarea
+    id: recovery
+    attributes:
+      label: Recovery action and result
+      description: State exactly what was killed or reaped, whether work verified cleanly, and whether the wedge reproduced.
+    validations:
+      required: true
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: Artifact paths or redacted excerpts
+      description: Prefer durable artifact metadata and small scrubbed excerpts over entire logs.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed secrets, credentials, private prompts, and sensitive log content.
+          required: true

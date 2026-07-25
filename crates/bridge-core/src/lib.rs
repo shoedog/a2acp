@@ -1,6 +1,7 @@
 //! bridge-core — domain core: Task/Session state machines, port traits, error model.
 
 pub mod catalog;
+pub mod diagnostics;
 pub mod domain;
 pub mod error;
 pub mod ids;
@@ -11,6 +12,7 @@ pub mod permission;
 pub mod ports;
 pub mod process;
 pub mod profile;
+pub mod provider;
 pub mod reaper;
 pub mod run_identity;
 pub mod sandbox;

@@ -4,7 +4,7 @@ use std::time::Duration;
 use bridge_core::domain::{Part, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
-use bridge_core::ports::AgentBackend;
+use bridge_core::ports::{AgentBackend, BackendObservers, DiagnosticObserver};
 use tokio::sync::Mutex;
 
 use crate::turn;
@@ -18,6 +18,13 @@ pub enum Death {
 pub fn classify_death(e: &BridgeError) -> Death {
     use BridgeError::*;
     match e {
+        AgentFailure { diagnostic } => match diagnostic.disposition() {
+            bridge_core::diagnostics::FailureDisposition::Fatal => Death::Fatal,
+            bridge_core::diagnostics::FailureDisposition::RetrySameTarget => Death::Transient,
+            bridge_core::diagnostics::FailureDisposition::ContainerFallbackCandidate => {
+                Death::Fatal
+            }
+        },
         AgentCrashed { .. } | AgentOverloaded | SessionNotFound | CancelTimeout | FrameError => {
             Death::Transient
         }
@@ -68,9 +75,30 @@ impl ResilientWarm {
 #[async_trait::async_trait]
 impl turn::TurnRunner for ResilientWarm {
     async fn run_turn(&self, session: &SessionId, parts: Vec<Part>) -> bool {
+        self.run_turn_observed(
+            session,
+            parts,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
+    }
+
+    async fn run_turn_observed(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> bool {
         loop {
             let backend = self.backend.lock().await.clone();
-            let outcome = match backend.prompt(session, parts.clone()).await {
+            let outcome = match backend
+                .prompt_with_observers(
+                    session,
+                    parts.clone(),
+                    BackendObservers::diagnostic_only(observer.clone()),
+                )
+                .await
+            {
                 Ok(stream) => turn::drain_turn(stream).await,
                 Err(e) => turn::TurnOutcome {
                     completed: false,
@@ -128,6 +156,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering as BoolOrdering};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
 
     fn done_stream() -> BackendStream {
         Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
@@ -167,6 +196,7 @@ mod tests {
             BridgeError::FrameError => "FrameError",
             BridgeError::MessageTooLarge => "MessageTooLarge",
             BridgeError::AgentCrashed { .. } => "AgentCrashed",
+            BridgeError::AgentFailure { .. } => "AgentFailure",
             BridgeError::AgentOverloaded => "AgentOverloaded",
             BridgeError::UpstreamA2aError => "UpstreamA2aError",
             BridgeError::StoreFailure => "StoreFailure",
@@ -183,6 +213,40 @@ mod tests {
 
     #[test]
     fn classify_death_table_is_exhaustive() {
+        use bridge_core::diagnostics::{
+            DiagnosticFailureClass, DiagnosticPhase, DiagnosticRedactor, FailureDiagnostic,
+            FailureDiagnosticInput, FailureDisposition,
+        };
+
+        let structured = |disposition| {
+            BridgeError::agent_failure(
+                FailureDiagnostic::build(
+                    FailureDiagnosticInput {
+                        failed_phase: DiagnosticPhase::Initialize,
+                        last_completed_phase: Some(DiagnosticPhase::Spawn),
+                        class: if disposition == FailureDisposition::ContainerFallbackCandidate {
+                            DiagnosticFailureClass::ContainerRuntime
+                        } else {
+                            DiagnosticFailureClass::Transport
+                        },
+                        disposition,
+                        code: "acp.initialize.transport".into(),
+                        summary: "failed".into(),
+                        causes: vec![],
+                        stderr_observed: false,
+                        stderr_line_count: 0,
+                        stderr_scope: None,
+                        stderr_tail: None,
+                        stderr_redaction: None,
+                        retry_after_ms: None,
+                        reset_at_ms: None,
+                        prompt_may_have_been_accepted: false,
+                    },
+                    &DiagnosticRedactor::default(),
+                )
+                .unwrap(),
+            )
+        };
         let cases = vec![
             (BridgeError::A2aVersionMismatch, Death::Fatal),
             (BridgeError::InvalidRequest { field: "x" }, Death::Fatal),
@@ -208,6 +272,15 @@ mod tests {
             (BridgeError::FrameError, Death::Transient),
             (BridgeError::MessageTooLarge, Death::Fatal),
             (BridgeError::agent_crashed("x"), Death::Transient),
+            (structured(FailureDisposition::Fatal), Death::Fatal),
+            (
+                structured(FailureDisposition::RetrySameTarget),
+                Death::Transient,
+            ),
+            (
+                structured(FailureDisposition::ContainerFallbackCandidate),
+                Death::Fatal,
+            ),
             (BridgeError::AgentOverloaded, Death::Transient),
             (BridgeError::UpstreamA2aError, Death::Fatal),
             (BridgeError::StoreFailure, Death::Fatal),
@@ -256,6 +329,7 @@ mod tests {
         clean_end: bool,
         scratch_write: Option<PathBuf>,
         scratch_absent: Option<(PathBuf, Arc<AtomicBool>)>,
+        diagnostics: StdMutex<Vec<Arc<dyn DiagnosticObserver>>>,
     }
 
     impl FakeBackend {
@@ -271,6 +345,7 @@ mod tests {
                 clean_end: false,
                 scratch_write: None,
                 scratch_absent: None,
+                diagnostics: StdMutex::new(Vec::new()),
             }
         }
 
@@ -317,6 +392,17 @@ mod tests {
             }
         }
 
+        async fn prompt_with_observers(
+            &self,
+            session: &SessionId,
+            parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            assert!(observers.rich.is_none());
+            self.diagnostics.lock().unwrap().push(observers.diagnostic);
+            self.prompt(session, parts).await
+        }
+
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
             self.cancels.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -342,6 +428,19 @@ mod tests {
     struct CountingRebuild {
         count: Arc<AtomicUsize>,
         next: Arc<FakeBackend>,
+    }
+
+    #[derive(Default)]
+    struct MarkerDiagnostic;
+
+    #[async_trait::async_trait]
+    impl DiagnosticObserver for MarkerDiagnostic {
+        async fn record(
+            &self,
+            _event: bridge_core::diagnostics::DiagnosticEvent,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
     }
 
     #[async_trait::async_trait]
@@ -387,6 +486,49 @@ mod tests {
         assert_eq!(first.retired.load(Ordering::SeqCst), 1);
         assert_eq!(second.configured.load(Ordering::SeqCst), 1);
         assert_eq!(second.prompts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn observed_turn_reuses_one_observer_for_initial_and_rebuilt_backend() {
+        let first = Arc::new(FakeBackend::new(
+            BridgeError::agent_crashed("gone"),
+            true,
+            false,
+        ));
+        let second = Arc::new(FakeBackend::new(
+            BridgeError::agent_crashed("unused"),
+            false,
+            true,
+        ));
+        let runner = ResilientWarm::new(
+            first.clone(),
+            Arc::new(CountingRebuild {
+                count: Arc::new(AtomicUsize::new(0)),
+                next: second.clone(),
+            }),
+            session_spec(),
+            1,
+            noop_reset(),
+        );
+        let session = SessionId::parse("implement-observed-test").unwrap();
+        let observer: Arc<dyn DiagnosticObserver> = Arc::new(MarkerDiagnostic);
+
+        assert!(
+            runner
+                .run_turn_observed(
+                    &session,
+                    vec![Part { text: "fix".into() }],
+                    observer.clone(),
+                )
+                .await
+        );
+
+        let first_seen = first.diagnostics.lock().unwrap();
+        let second_seen = second.diagnostics.lock().unwrap();
+        assert_eq!(first_seen.len(), 1);
+        assert_eq!(second_seen.len(), 1);
+        assert!(Arc::ptr_eq(&first_seen[0], &observer));
+        assert!(Arc::ptr_eq(&second_seen[0], &observer));
     }
 
     #[tokio::test]

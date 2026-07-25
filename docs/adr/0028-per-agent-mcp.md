@@ -49,6 +49,29 @@ the one channel each agent honors, `{cwd}`-correct for the repo the agent works 
   `KiroNative` + `[sandbox]`). **Probe finding: kiro registers MCP tools BARE** (`nav_repo_map`), not
   `mcp__<server>__*` — the review/design prompts now state both namings.
 
+### Managed-agent loopback boundary
+
+`a2a-bridge mcp` is a supported stdio adapter for an **external** operator or controller. It is not a
+supported MCP server for an agent whose turn is already managed by a2a-bridge: `run`, `continue`, and
+`run_workflow` can recursively create work, while the mutation tools can interfere with the parent turn.
+The entire nested bridge MCP surface therefore fails closed rather than trying to classify individual tools.
+
+The guard has two independent layers:
+
+1. Config validation rejects a direct `[[agents.mcp]]` command whose executable is `a2a-bridge` and whose
+   subcommand is `mcp`. Agent MCP entries also cannot set the reserved `A2A_BRIDGE_MCP_CALL_DEPTH` variable.
+2. Before delivery through the Claude ACP parameter, Codex native arguments, or Kiro native agent config,
+   the bridge removes any case-variant of that reserved name and stamps
+   `A2A_BRIDGE_MCP_CALL_DEPTH=1`. A marked `a2a-bridge mcp` process rejects the launch after command-line
+   parsing but before config resolution, store opening, lease acquisition, or coordinator construction.
+   Zero or absent depth remains the supported external-controller path; malformed values fail closed.
+
+Wrappers and symlinks inherit the marker, covering accidental indirection. This is a reliability and
+defense-in-depth boundary, not a security boundary against a deliberately hostile wrapper that deletes the
+environment variable before spawning the bridge. There is no managed-loopback opt-in. Adding recursive
+agent-driven delegation would require a separate architecture decision with explicit lineage, depth, budget,
+cancellation, and ownership semantics rather than weakening this guard.
+
 **One cwd, one source of truth (MAJOR 4).** A divergence between the native `{cwd}` and the agent's ACP session
 cwd would index prism on repo A while the agent works in repo B (silent). run-workflow **stamps `--session-cwd`
 into every snapshot entry's `session_cwd`**, so the existing `resolve_static_session_cwd` chain feeds both the

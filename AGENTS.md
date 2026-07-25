@@ -1,5 +1,12 @@
 # Using a2a-bridge (agent quickstart)
 
+> **Start here:** read the
+> [`a2a-bridge-operator` skill](skills/a2a-bridge-operator/SKILL.md) before running or diagnosing an
+> agent workflow. Check [`docs/compatibility.md`](docs/compatibility.md) for tested versions and incident
+> dispositions, and use the checked-in
+> [compatibility and dogfooding routing reference](docs/compatibility-routing.md) when selecting a model or
+> review lens. Do not infer host support from a container result or vice versa.
+
 `a2a-bridge` is an A2A↔ACP bridge **and** a multi-agent workflow runner. You can use it as a **tool** to run
 clean-room **design**, **code/spec/plan review**, or autonomous **implement** passes against *any* repo —
 each step driven by real coding agents (codex, claude, kiro, …) over the Agent Client Protocol.
@@ -30,6 +37,13 @@ cargo run -p a2a-bridge -- validate --repo-hygiene
 Use `--examples-policy deny` in cleanup/CI gates when you want to reject project-specific workflow material
 under an `examples/` directory; pass the strings that identify that project with repeated
 `--project-marker` flags, for example `--project-marker code/slicing --project-marker prism-mcp`.
+
+`a2a-bridge mcp` is an **external-controller** surface. Never point a bridge-managed agent's
+`[[agents.mcp]]` entry back at `a2a-bridge mcp`. Direct loopback configurations fail validation, every MCP
+spec delivered to a managed agent receives the reserved `A2A_BRIDGE_MCP_CALL_DEPTH=1` marker, and a marked
+bridge MCP invocation refuses before config, store, or coordinator work. Do not set that reserved variable
+in agent MCP configuration. This is a safety guard against accidental recursion, not a security boundary
+against a deliberately hostile wrapper that removes inherited environment variables.
 
 ## 1. Build / install
 
@@ -109,11 +123,214 @@ a2a-bridge serve --config ./a2a-bridge.toml
 
 ```bash
 a2a-bridge models --config ./a2a-bridge.toml            # table: each agent's advertised models/effort/modes
-a2a-bridge models --config … --agent codex --json       # one agent, JSON (card's agent-models shape)
+a2a-bridge models --config … --agent codex --json       # one agent, JSON (caps or explicit failure)
 ```
 
-Probes live, degrades per-agent. Pass any listed value to the per-request override
+Probes live and degrades per-agent. Successful JSON values use the Agent Card `agent-models` capability
+shape. A failed probe is retained as `{available:false,failure:{agent,strategy,phase,...}}`; an explicitly
+requested failed agent exits nonzero after printing that machine-readable record, while an all-agent probe
+keeps partial-success exit behavior. Failure detail is returned in place: text includes the stable phase,
+category, and deepest bounded redacted error; JSON exposes those as `failure.phase`, `failure.category`, and
+`failure.error`, plus `failure.diagnostic` when the ACP boundary supplied a typed diagnostic. There is no
+implicit external “see logs” destination. Pass any listed value to the per-request override
 (`message.metadata` `a2a-bridge.{model,effort,mode}`) or an agent's config default.
+
+## 4c. Run one explicit live smoke (billable)
+
+Only after the operator explicitly authorizes a billable turn, use the candidate release binary for one
+fixed, bounded `PONG` probe:
+
+```bash
+evidence_dir="$(mktemp -d /private/tmp/a2a-bridge-smoke.XXXXXX)"
+chmod 700 "$evidence_dir"
+cargo build --release --bin a2a-bridge
+./target/release/a2a-bridge smoke \
+  --agent codex \
+  --config /absolute/path/to/a2a-bridge.toml \
+  --model gpt-5.6-sol --effort xhigh \
+  --session-cwd /absolute/path/to/trusted-repo \
+  --timeout-secs 120 \
+  --acknowledge-billable \
+  --out "$evidence_dir/codex-host-smoke.json"
+```
+
+The command sends only `Reply exactly PONG. Do not use tools.`, resolves/configures/prompts once, never
+retries or falls back, and requires both exact `PONG` and a successful terminal event. Missing billing
+acknowledgement and malformed options refuse before config/registry/spawn work. Once argument and output
+preflight passes, an acknowledged attempt writes its versioned artifact before returning nonzero.
+Without `--out`, stdout is JSON only; human direction goes to stderr. Do not pass
+`--include-redacted-stderr` unless bounded best-effort-redacted process text is specifically required.
+An explicit output path must not already exist. On Unix, it is created owner-only as `0600` before agent
+resolution or spawn; an existing file/link or failure to apply that restriction is a pre-attempt refusal.
+
+Run `validate`, `doctor --json`, and `models --agent <id> --json` first. Claude smoke refuses before adapter
+spawn when bounded OAuth metadata is expired or has less than 16 minutes of runway; syncing an isolated
+credential copy does not refresh an expired host login. When `CLAUDE_CONFIG_DIR` is present for a host
+Claude entry, it must be a non-empty absolute path so doctor and every possible child cwd select the same
+`.credentials.json`; unset uses `$HOME/.claude/.credentials.json`. The one smoke deadline begins before
+provenance and orphan recovery, so those phases cannot consume the runway and then receive a fresh timeout;
+one deadline-first primitive refuses without polling resolution, configure, prompt, or drain when time is
+already exhausted. A stage is counted only after its future receives a poll; an unpolled prompt refusal
+records zero prompt calls and false prompt-acceptance evidence. Truthy
+`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`,
+`CLAUDE_CODE_USE_ANTHROPIC_AWS`, or `CLAUDE_CODE_USE_MANTLE` selects external provider auth and therefore
+skips first-party file OAuth on host entries; false-like or unknown values do not, and ambient host flags
+never bypass a mounted reader credential.
+Never use a stale installed binary
+for compatibility evidence, and never automatically rerun a failed or timed-out smoke: the first prompt may
+have been accepted. Do not update `docs/compatibility.md` until the release-mode artifact records the exact
+lane that actually ran.
+
+## 4d. Validate or run the compatibility matrix
+
+The checked-in compatibility manifest is non-billable to validate:
+
+```bash
+a2a-bridge compatibility validate --manifest compatibility/manifest.toml
+```
+
+Running cases is potentially billable and therefore requires an explicit lane/case selection, the
+environment owner, an acknowledgement, and a new aggregate output path:
+
+```bash
+a2a-bridge compatibility run \
+  --manifest compatibility/manifest.toml \
+  --lane pinned \
+  --environment-owner <manifest-owner> \
+  --acknowledge-billable \
+  --out /private/tmp/compatibility-aggregate.json
+```
+
+The runner canonicalizes and descriptor-pins the aggregate parent, creates aggregate and scratch entries
+relative to that retained descriptor, rechecks its identity during creation, and refuses normal or bare
+Git repository ancestors. The new mode-`0600` output immediately contains a blocking setup-incomplete
+aggregate, so later scratch/staging failure remains valid evidence instead of an empty file; keep
+compatibility evidence in disposable operator-owned storage. Manifest prerequisites use
+structured entries: `{ name = "PATH" }` means presence-only, while
+`{ name = "A2A_BRIDGE_ALLOW_FABLE", one_of = ["1", "true"] }` binds accepted non-secret values.
+Pinned adapter/CLI values require one complete semantic `<package>=<version>`. Remote API rows require
+dedicated `provider`, `api`, and `api_version` component identities; a generic execution row is not a pin.
+An alias-shaped model ID may be an exact advertised raw ID, so the runner also requires the successful
+effective model to equal the requested pin and blocks a fallback alias resolution as drift.
+
+Each eligible case invokes one bounded, privately staged snapshot of the exact candidate binary's
+fixed-PONG `smoke` once. The aggregate records its SHA-256 and byte length; the runner refuses digest
+drift, publishes the staged inode owner-executable but non-writable as mode `0500`, executes the
+verified file object instead of reopening its name, and accesses child smoke
+artifacts relative to the retained scratch descriptor. After hashing it rechecks cancellation and the
+full declared timeout headroom immediately before spawn. On Linux, the staged child closes its inherited
+candidate descriptor after exec and its scratch descriptor after opening the artifact, before ACP
+descendants. A pinned config's exact SHA-256 is an admission gate before provider spawn. Container pins
+require exact non-secret adapter/CLI labels from the configured immutable image, and the Fable reader
+also binds exactly one minimal host-mounted settings file by SHA-256; missing, unreadable, or ambiguous
+duplicate settings destinations cannot green a support case.
+There is no retry, provider fallback, implicit all-case selection, baseline update, or production-config
+mutation. A case does not start unless its declared token and observable-cost caps fit the remaining
+total headroom. Negative/non-finite cost observations fail explicitly and remain sticky across later
+usage snapshots. Comparison retains per-case
+execution/error/not-run/budget state and aggregate success/cancellation/budget state while excluding
+variable usage quantities. The checked-in manifest has reviewed R3b pins; its baseline is promoted only
+from separately authorized exact-candidate evidence. Read
+[`docs/compatibility.md`](docs/compatibility.md) and the current
+[`reliability roadmap`](docs/reliability-execution-roadmap.md) before spending a live turn.
+
+Floating-current canaries require two independent authorizations. First validate the request without
+effects, then authorize its exact registry/image effects and a new private output directory outside every
+Git repository:
+
+```bash
+./target/release/a2a-bridge compatibility validate \
+  --recipes compatibility/floating-current.toml
+
+evidence_root="$(mktemp -d /private/tmp/a2a-bridge-floating.XXXXXX)"
+chmod 700 "$evidence_root"
+./target/release/a2a-bridge compatibility resolve \
+  --recipes compatibility/floating-current.toml \
+  --case <exact-floating-case-id> \
+  --environment-owner <exact-owner-id> \
+  --runtime docker \
+  --acknowledge-resolution-effects \
+  --out "$evidence_root/resolution"
+```
+
+The recipe's selectors are requests, not compatibility evidence. Resolution may use the npm registry,
+runtime cache, and one unique disposable image tag, but it starts no adapter/provider session, calls no
+`models`, copies no credentials, replaces no shared tag, and grants no billing permission. The npm
+subprocess may create only the exact lock through the bridge's fixed npmjs CONNECT proxy; it never receives
+tree-write authority.
+The bridge downloads the exact integrity-bound npmjs HTTPS archives, requires matching package identity and
+present declared bin targets, and preflights paths/types in a case-insensitive portable ASCII namespace. It
+raw-preflights every GNU long-name/long-link and local/global PAX metadata record against a 1 MiB cap before
+tar preprocessing in both planning and materialization, accounts PAX-effective file sizes, binds symlink
+targets to the exact spelling of portable-equivalent planned paths, reserves the entire aggregate entry/byte
+budget before the first package entry write, and materializes the private tree descriptor-relatively.
+Inspect the complete `resolution.json`, validate and doctor its generated configs, then obtain separate
+authorization
+for the exact resolution id, unchanged candidate binary, selected cases, owner, and budget:
+
+```bash
+./target/release/a2a-bridge compatibility run \
+  --resolution "$evidence_root/resolution/resolution.json" \
+  --all-resolved \
+  --environment-owner <exact-owner-id> \
+  --acknowledge-billable \
+  --out "$evidence_root/floating-aggregate.json"
+
+./target/release/a2a-bridge compatibility compare \
+  --current "$evidence_root/floating-aggregate.json" \
+  --mode floating-to-pinned
+```
+
+Use `--all` and `--all-resolved` only as explicit authorizations. The run revalidates every bound artifact
+immediately before provider spawn and captures the bounded catalog from that same one-prompt session.
+`candidate_pass`, `candidate_fail`, and `candidate_unknown` are advisory canary outcomes; none promotes or
+rewrites production pins, baselines, configs, support docs, or the running operator. Retain the private
+bundle and unique tag until operator-reviewed cleanup proves that no running container uses them. Floating
+comparison rejects a baseline whose pinned-manifest identity differs from the resolution-bound production
+manifest.
+
+## 4e. Plan an explicit host verification after classified container degradation
+
+Current slice status, review evidence, sequencing, and handoff are owned solely by
+[`docs/reliability-execution-roadmap.md`](docs/reliability-execution-roadmap.md). This file defines the
+stable operator behavior and must not duplicate changing candidate hashes or gate totals.
+
+Only a complete failed smoke schema-v2 artifact can be evaluated. The source config must still be the
+same canonical regular file with the same SHA-256, its configured source agent must still be a read-only
+container using the same canonical mount, and the target must be an unsandboxed ACP entry explicitly
+marked `host_fallback_eligible = true`:
+
+```bash
+./target/release/a2a-bridge fallback-plan \
+  --from /absolute/path/to/failed-container-smoke.json \
+  --host-agent trusted-host-review \
+  --config /absolute/path/to/a2a-bridge.toml \
+  --trusted-session-cwd /absolute/path/to/exact-owned-repo \
+  --confirm-trusted-own-repo-read-only \
+  > /private/tmp/fallback-plan.json
+```
+
+The command is local and non-billable. It accepts only a pinned, bounded regular-file smoke-v2 artifact;
+hand-assembled task envelopes and historical smoke-v1 artifacts are not trusted fallback evidence. An
+ineligible plan contains no command. An eligible plan emits an absolute candidate-binary argv for a
+distinct fixed-`PONG` verification smoke, bound to the current executable/config SHA-256, source-agent
+marker, and the plan-time source mount's canonical path plus descriptor-derived persistent-object
+fingerprint. The separately supplied trusted cwd must be an existing canonical directory, must exactly
+match the artifact-reported cwd as evidence, and must remain under that mount snapshot. Only that exact
+operator-selected directory enters the host smoke argv, and its own plan-time canonical value plus a
+descriptor-derived persistent-object fingerprint are separate closed-set guard fields. Filesystems
+without a durable object ID/handle fail closed.
+
+`fallback-plan` never runs the emitted argv. Inspect the JSON and explicitly decide whether to invoke it;
+the generated smoke still contains `--acknowledge-billable`. At action time the smoke re-reads the config
+and executable and revalidates the exact cwd object, the exact source-mount object and containment, and
+the target marker before any agent spawn. Same-mount symlink/sibling, mount-symlink retarget, or
+inode-reuse replacement fails closed. Because the guarded target is already proven to be unsandboxed
+ACP, guarded composition ignores its configured `session_cwd`/`cwd` aliases and uses the pinned
+object-addressed cwd for native MCP/Kiro inputs, process redaction, and ACP session configuration. That
+smoke does not call the container runtime for recovery or run-end cleanup and records the backstop as
+`not_needed`. Never reconstruct or omit the generated guard flags by hand, and never treat a fixed
+`PONG` as a retry/resume of the original task.
 
 ## 5. Inspect / clean up containers
 
@@ -140,6 +357,11 @@ a2a-bridge containers reap  --config … --force a2a-rw-<owner>-<run>-0         
 - **Creds (containerized agents):** WRITABLE single-file copies in `~/.config/a2a-creds/{claude,codex}` —
   `cp ~/.codex/auth.json ~/.config/a2a-creds/codex/auth.json`, likewise claude (its OAuth token expires
   ~hourly, so re-copy if a claude node starts failing). See `docs/containerized-agents.md`.
+- **Live model execution:** run `a2a-bridge doctor` first. A managed agent sandbox can lack DNS while
+  approved host execution and computer-level auth remain healthy; repeat the exact minimal control via
+  approved host execution before changing auth or packages. Do not trust an inherited network marker
+  alone. Fable additionally requires `A2A_BRIDGE_ALLOW_FABLE=1`; a Fable reader must mount
+  `deploy/containers/claude-fable-settings.json` at `/root/.claude/settings.json:ro` alongside creds.
 - **Concurrency:** concurrent containerized runs are **safe with one shared config** — same repo twice or
   different repos at once. Each run stamps a unique `a2a.run` id into its container names (no clash) and
   holds an OS `flock` lease that marks it alive, so a peer's before-first-use recovery reaps only **crashed**

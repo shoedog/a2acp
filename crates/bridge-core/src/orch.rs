@@ -1,10 +1,68 @@
 //! Slice 0 minimal orchestration DTOs (bridge-owned, versioned, Ser+De). Rich variants
 //! (Plan/ToolCall/config/mode/commands) are deferred (S6/S7); the versioned +
 //! `#[serde(flatten)] kind` envelope makes those additions non-breaking.
+use crate::diagnostics::DiagnosticEvent;
 use crate::ids::{OperationId, SessionHandleRef, SourceId};
 use serde::{Deserialize, Serialize};
 
 pub const ORCH_V: u16 = 1;
+pub const DIAGNOSTIC_PROGRESS_TEXT: &str = "diagnostic transition";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProgressPayload {
+    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<DiagnosticEvent>,
+}
+
+impl ProgressPayload {
+    pub fn legacy(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            diagnostic: None,
+        }
+    }
+
+    pub fn diagnostic(diagnostic: DiagnosticEvent) -> Self {
+        Self {
+            text: DIAGNOSTIC_PROGRESS_TEXT.to_owned(),
+            diagnostic: Some(diagnostic),
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn diagnostic_event(&self) -> Option<&DiagnosticEvent> {
+        self.diagnostic.as_ref()
+    }
+}
+
+#[derive(Deserialize)]
+struct ProgressPayloadWire {
+    text: String,
+    #[serde(default)]
+    diagnostic: Option<DiagnosticEvent>,
+}
+
+impl<'de> Deserialize<'de> for ProgressPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ProgressPayloadWire::deserialize(deserializer)?;
+        if wire.diagnostic.is_some() && wire.text != DIAGNOSTIC_PROGRESS_TEXT {
+            return Err(serde::de::Error::custom(
+                "diagnostic progress text must be static",
+            ));
+        }
+        Ok(Self {
+            text: wire.text,
+            diagnostic: wire.diagnostic,
+        })
+    }
+}
 
 /// Outcome of reconciling model/effort on a LIVE warm session (Slice 1). Fieldless —
 /// the backend LOGS any rejection reason internally (no wire leak).
@@ -108,7 +166,8 @@ pub enum OrchEventKind {
         output: String,
     },
     Progress {
-        text: String,
+        #[serde(flatten)]
+        progress: ProgressPayload,
     },
     Usage {
         #[serde(flatten)]

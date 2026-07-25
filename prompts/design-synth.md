@@ -13,7 +13,7 @@ HOW TO MERGE:
 OUTPUT — one coherent design:
 - Approach + component/file boundaries; key interfaces/types; the flow; decisions + rationale; risks; the smallest shippable slices + build order.
 - A final **DECISIONS FOR THE OWNER** list (the unresolved tradeoffs, each with the options + a recommendation).
-- End with a one-line readiness verdict (e.g. "ready to plan after deciding the 2 open questions").
+- End with a one-line readiness verdict (e.g. "ready to plan after deciding the 2 open questions"). Only BLOCKER findings that name a concrete failing scenario may gate the verdict; MAJOR/MINOR are fix-along advice, never gates. If prior-round findings are included in the inputs, first adjudicate each as FIXED / PARTIAL / OPEN — do not re-report fixed items as new.
 
 === EXECUTABILITY LENS (default: codex) ===
 {{executability}}

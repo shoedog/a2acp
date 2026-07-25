@@ -52,6 +52,8 @@ fn minimal_entry(id: &AgentId) -> AgentEntry {
         sandbox: None,
         watchdog: None,
         auth_method: None,
+        pre_authenticated: false,
+        host_fallback_eligible: false,
         name: None,
         description: None,
         tags: vec![],
@@ -326,12 +328,14 @@ async fn detached_runner_persists_completed_result() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -1724,12 +1728,14 @@ async fn tasks_get_returns_completed_with_artifact() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -1785,12 +1791,14 @@ async fn cancel_terminal_detached_returns_true_state_not_recancel() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -1844,12 +1852,14 @@ async fn cancel_working_no_token_flips_to_canceled() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -1900,12 +1910,14 @@ async fn tasks_list_returns_recent_newest_first() {
                 error: None,
                 created_ms: ms,
                 updated_ms: ms,
+                last_artifact_ms: None,
                 input: String::new(),
                 workflow_spec_json: None,
                 resume_attempts: 0,
                 session_cwd: None,
                 batch_id: None,
                 item_id: None,
+                artifacts_purged_at: None,
             })
             .await
             .unwrap();
@@ -2267,12 +2279,14 @@ async fn runner_panic_finalizes_failed_no_orphan() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -2350,12 +2364,14 @@ async fn detached_runner_persists_failed_on_node_failure() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -2405,12 +2421,14 @@ async fn detached_runner_persists_canceled_on_token_fire() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -2455,12 +2473,14 @@ async fn swept_interrupted_reports_failed_over_wire() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -2525,12 +2545,14 @@ async fn detached_runner_checkpoints_each_node() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -2824,12 +2846,14 @@ async fn detached_runner_checkpoint_write_failure_fails_task() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -2880,12 +2904,14 @@ async fn detached_runner_sequenced_terminal_and_hub_cleanup() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: String::new(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -3037,12 +3063,14 @@ async fn resume_short_circuit_sets_terminal_seq() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -3093,12 +3121,14 @@ async fn resume_no_snapshot_interrupt_sets_terminal_seq() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -3272,12 +3302,14 @@ async fn resume_runs_only_pending_nodes() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -3342,12 +3374,14 @@ async fn resume_no_snapshot_interrupts() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: None,
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -3377,12 +3411,14 @@ async fn resume_unparseable_snapshot_interrupts() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: Some("not json".into()),
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -3413,6 +3449,7 @@ async fn resume_unknown_version_interrupts() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             // Valid graph, but an unknown schema version.
             workflow_spec_json: Some(review_snapshot(2)),
@@ -3420,6 +3457,7 @@ async fn resume_unknown_version_interrupts() {
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -3452,12 +3490,14 @@ async fn resume_cap_exhausted_interrupts() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: cap, // already at the cap
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -3519,6 +3559,7 @@ async fn resume_poison_task_terminates_at_cap() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             // Valid snapshot with NO terminal-node checkpoint → the short-circuit
             // never fires, so every boot would try to run the workflow again.
@@ -3527,6 +3568,7 @@ async fn resume_poison_task_terminates_at_cap() {
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -3634,12 +3676,14 @@ async fn resume_terminal_checkpoint_short_circuits() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -3823,12 +3867,14 @@ async fn resume_then_cancel_mid_run_finalizes_canceled() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
             session_cwd: None,
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -4202,12 +4248,14 @@ async fn resume_restores_session_cwd() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
             session_cwd: Some("/req".into()),
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();
@@ -4273,6 +4321,7 @@ async fn resume_corrupt_session_cwd_interrupts() {
             error: None,
             created_ms: 1,
             updated_ms: 1,
+            last_artifact_ms: None,
             input: "DIFF".into(),
             workflow_spec_json: Some(review_snapshot(1)),
             resume_attempts: 0,
@@ -4280,6 +4329,7 @@ async fn resume_corrupt_session_cwd_interrupts() {
             session_cwd: Some("relative-or-bad".into()),
             batch_id: None,
             item_id: None,
+            artifacts_purged_at: None,
         })
         .await
         .unwrap();

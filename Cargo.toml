@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*", "bin/a2a-bridge"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "AGPL-3.0-only"
 rust-version = "1.94"
@@ -25,8 +25,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 libc = "0.2"
+ring = "0.17"
 futures = "0.3"
 async-stream = "0.3"
+semver = "1"
 
 # Protocol SDKs — pinned exact versions verified 2026-07-02
 # a2a-lf is the crates.io package name for the `a2a` crate in a2aproject/a2a-rs

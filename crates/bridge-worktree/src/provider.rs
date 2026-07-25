@@ -7,7 +7,8 @@ pub trait WorktreeProvider: Send + Sync {
     /// Returns the source's ABSOLUTE git common-dir (for the sidecar / crash-prune).
     async fn add(&self, repo: &str, worktree_path: &str) -> Result<String, BridgeError>;
 
-    /// Remove the worktree + prune the source's dangling registration. Best-effort.
+    /// Remove the worktree + prune the source's dangling registration. Already
+    /// absent targets are idempotent; an incomplete real cleanup is an error.
     async fn remove(&self, repo: &str, worktree_path: &str) -> Result<(), BridgeError>;
 
     /// True if `path` is inside a git work tree.
@@ -28,6 +29,10 @@ pub(crate) fn is_repo_argv(path: &str) -> Vec<&str> {
 
 pub(crate) fn prune_argv(repo: &str) -> Vec<&str> {
     vec!["-C", repo, "worktree", "prune"]
+}
+
+pub(crate) fn list_porcelain_argv(repo: &str) -> Vec<&str> {
+    vec!["-C", repo, "worktree", "list", "--porcelain", "-z"]
 }
 
 #[cfg(test)]
@@ -51,6 +56,10 @@ mod tests {
         assert_eq!(
             prune_argv("/repo"),
             vec!["-C", "/repo", "worktree", "prune"]
+        );
+        assert_eq!(
+            list_porcelain_argv("/repo"),
+            vec!["-C", "/repo", "worktree", "list", "--porcelain", "-z"]
         );
     }
 }

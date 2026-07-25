@@ -1,0 +1,66 @@
+# R3c floating-current recipes. These selectors are requests, not compatibility evidence or support
+# claims. `compatibility resolve` must materialize exact private evidence before any billable smoke.
+schema_version = 1
+production_manifest = "manifest.toml"
+
+[limits]
+timeout_secs = 900
+max_download_bytes = 536870912
+max_unpacked_bytes = 1073741824
+max_files = 100000
+
+[artifact]
+retention_days = 30
+redaction = "strict"
+
+[[package_sets]]
+id = "codex-current"
+ecosystem = "npm"
+registry = "npmjs"
+adapter = "@agentclientprotocol/codex-acp"
+adapter_selector = "latest"
+agent_cli = "@openai/codex"
+
+[[package_sets]]
+id = "claude-current"
+ecosystem = "npm"
+registry = "npmjs"
+adapter = "@agentclientprotocol/claude-agent-acp"
+adapter_selector = "latest"
+agent_cli = "@anthropic-ai/claude-agent-sdk"
+
+[[images]]
+id = "reader-current"
+template = "node-acp-reader-v1"
+base = "docker.io/library/node:24-slim"
+package_sets = ["codex-current", "claude-current"]
+
+[[cases]]
+id = "codex-host-floating-current"
+baseline_case = "codex-host-bridge-gpt56-sol"
+package_set = "codex-current"
+target = "host-package-tree"
+config_template = "codex-host-read-only-v1"
+
+[[cases]]
+id = "codex-reader-floating-current"
+baseline_case = "codex-reader-bridge-gpt56-sol"
+package_set = "codex-current"
+target = "container-ro-image"
+config_template = "codex-reader-read-only-v1"
+image = "reader-current"
+
+[[cases]]
+id = "claude-host-floating-current"
+baseline_case = "claude-host-acp-044-fable"
+package_set = "claude-current"
+target = "host-package-tree"
+config_template = "claude-host-read-only-v1"
+
+[[cases]]
+id = "claude-reader-floating-current"
+baseline_case = "claude-reader-055-fable"
+package_set = "claude-current"
+target = "container-ro-image"
+config_template = "claude-reader-read-only-v1"
+image = "reader-current"

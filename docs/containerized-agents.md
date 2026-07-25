@@ -51,6 +51,43 @@ mount breaks refresh):
   chmod -R u+rw ~/.config/a2a-creds
   ```
 
+  **Fable-specific settings mount.** The credential copy is sufficient for normal Claude models, but
+  `claude-agent-acp` 0.55.0 did not advertise Fable from a credential-only reader home. A deliberate
+  Fable reader must also mount the checked-in minimal model/effort settings file:
+
+  ```toml
+  [[agents]]
+  id = "claude-fable-reader"
+  cmd = "claude-agent-acp"
+  pre_authenticated = true
+  model = "claude-fable-5[1m]"
+  effort = "xhigh"
+
+  [agents.sandbox]
+  image = "a2a-agent-reader:latest"
+  mount = "/absolute/path/to/code"
+  access = "ro"
+  egress = "locked"
+  network = "a2a-egress-internal"
+  proxy = "http://a2a-egress-proxy:8888"
+  volumes = [
+    "/absolute/path/to/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json",
+    "/absolute/path/to/a2a-bridge/deploy/containers/claude-fable-settings.json:/root/.claude/settings.json:ro",
+  ]
+  ```
+
+  Start that bridge process with `A2A_BRIDGE_ALLOW_FABLE=1`. The template is intentionally limited to
+  `model` and `effortLevel`; do not mount or copy the full host `~/.claude/settings.json`,
+  `~/.claude.json`, hooks, permissions, project history, or account caches. Run
+  `A2A_BRIDGE_ALLOW_FABLE=1 a2a-bridge doctor` before the live turn; it reports a missing opt-in or
+  settings mount and fails when the exact host/mounted Claude OAuth access token is expired. A token with
+  less than 16 minutes of runway warns and is ineligible for `smoke`; that covers the 15-minute maximum
+  smoke timeout plus a one-minute preflight margin. Token values are never rendered.
+
+The shipped container configs pair these mounted files with `pre_authenticated = true`. That setting is
+required for browserless ChatGPT-auth containers: it reuses the mounted login instead of invoking
+codex-acp's advertised browser-login action. Do not also set `auth_method` on the same agent.
+
 > **Token rotation (re-sync before each session).** OAuth/SSO tokens **rotate on refresh** (the refresh
 > token is single-use), so a copy goes **stale** when you use the agent *on the host* — the host rotates
 > the lineage and the copy's refresh token dies, surfacing as `session/prompt failed: transport error`.
@@ -59,12 +96,16 @@ mount breaks refresh):
 > ```bash
 > deploy/containers/sync-creds.sh && a2a-bridge serve --config examples/a2a-bridge.containerized.toml
 > ```
+> The sync copies bytes; it does **not** authenticate or refresh an already expired host token. After a fresh
+> host login and post-login sync, require both Claude host and reader doctors green before requesting new
+> explicit authorization for one new four-case aggregate.
 > (claude/codex are host-file copies; **kiro** is the `a2a-kiro-data` volume — re-run its device-flow
 > login if it has fully expired, not a host sync.)
 >
 > **Automate it (optional, macOS launchd).** Instead of running the pre-flight sync by hand, keep the
-> copies continuously fresh with a LaunchAgent that runs `sync-creds.sh` every 5 min (token TTLs are hours,
-> so the copy is always valid; short container turns don't refresh, so no rotation). A version-controlled
+> copies synchronized with a LaunchAgent that runs `sync-creds.sh` every 5 min. Synchronization does not
+> prove freshness: an expired host token is copied as expired and `doctor` must still gate execution. A
+> version-controlled
 > template lives at `deploy/containers/com.a2a-bridge.creds-refresh.plist`:
 > ```bash
 > cp deploy/containers/com.a2a-bridge.creds-refresh.plist ~/Library/LaunchAgents/
@@ -84,6 +125,27 @@ mount breaks refresh):
   ```
 - **ollama** — local needs a pulled model (`ollama pull qwen2.5-coder:7b`); cloud needs
   `OLLAMA_API_KEY` in the serve process env (`base_url = https://ollama.com/v1`).
+
+### Sandbox declaration grammar and static preflight
+
+Each `[agents.sandbox].volumes` item uses one of these exact forms:
+
+- `/absolute/container/destination` for an anonymous runtime volume;
+- `/absolute/host/source:/absolute/container/destination[:options]` for a bind;
+- `named-volume:/absolute/container/destination[:options]` for a runtime-owned named volume.
+
+Destinations must be normalized absolute paths and must not equal or nest under the primary read-only
+repository mount. Bind sources must be absolute; `~/` is rejected because the validated token is passed
+directly to runtime argv and is not shell-expanded. Runtime, image, and locked-network operands must be
+nonempty, unpadded, control-free, and must not begin with `-`; malformed declarations fail config
+validation before spawn.
+
+The credential destinations have stronger source-type gates. `/root/.claude/.credentials.json` and
+`/root/.codex/auth.json` require a host regular file; anonymous and named volumes are rejected for those
+single-file destinations. `/root/.local/share` requires a host directory or named volume. An ordinary
+missing/wrong-type bind is `container_mount`; a wrong credential source type is
+`container_credentials`. These are bounded local metadata checks only—no image pull, network query,
+container start, credential refresh, or post-failure runtime probe occurs.
 
 ## 4. Serve / run
 
@@ -156,8 +218,22 @@ backend, not `api.openai.com`); **kiro `cognito-identity.us-east-1.amazonaws.com
 
 ## 7. Fallbacks & caveats
 
-- **claude-only fallback:** if any agent's in-box auth / egress won't close, drop it and run
-  claude-only containerized (claude is the proven baseline, ADR-0013).
+- **Trusted own-repo read-only fallback:** Tier 0/1 host entries are a first-class mode for trusted
+  review/design work (ADR-0032); Tier 2 is opt-in defense-in-depth for that content class. If container
+  infrastructure is degraded, explicitly select an eligible host entry after confirming trust. The
+  bridge does not silently downgrade or automatically replay a prompt.
+- **Managed-agent execution is not the host:** an ACP process launched inside a managed agent sandbox
+  can fail DNS even while the computer is online and authenticated. Repeat the exact control through
+  approved host execution; do not rotate credentials or change adapters based only on the sandboxed
+  failure. An inherited `CODEX_SANDBOX_NETWORK_DISABLED` value is not sufficient evidence because
+  approved host commands may retain it.
+- **No fallback for untrusted or write-capable work:** third-party/untrusted reads require Tier 2, and
+  every `implement`/write path requires Tier 3 even for an owned repo. Both fail closed if the
+  container boundary is unavailable.
+- **claude-only container fallback:** if another agent's in-box auth/egress will not close, a
+  Claude-only container config remains an option only when that exact adapter/image/model row is
+  currently `PASS` in [`compatibility.md`](compatibility.md). Do not infer it from ADR-0013's historical
+  baseline.
 - **ollama cloud is host-direct egress** — a cloud `base_url` (ollama.com) is the **bridge** calling
   out (non-process), so it bypasses the container proxy. Safe, but note it; local ollama has no remote
   egress at all.
@@ -181,6 +257,14 @@ root via a symlink.
 > does NOT retain conversational memory across turns in interactive `serve`. Work continuity comes from the
 > shared `:rw` target (the clone/scratch on the host), not the container. (A warm-pool for writers is a
 > separate future slice.)
+
+> **Joinable cleanup diagnostics.** Release, warm retirement, and detached drop share one bounded
+> per-session reap flight. An observed release waits for that flight and returns its stable typed result to
+> every waiter; retirement starts cleanup before cancellable agent termination. Failures surface as
+> `container.reap.spawn_failed`, `container.reap.timeout`, `container.reap.nonzero_exit`, or
+> `container.reap.worker_panicked` and remain fatal accepted work. An observer failure cannot suppress the
+> reap, and a detached teardown does not write diagnostics after the task owner has gone away. Do not
+> interpret a cleanup failure as permission to replay the prompt or silently fall back to a host agent.
 
 Set the per-request `:rw` target via **`serve` + A2A** (`message.metadata` cwd) or, for **`run-workflow`**,
 the `--session-cwd <dir>` flag — without it, agents run in the LAUNCH cwd, not the target repo.

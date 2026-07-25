@@ -9,15 +9,30 @@ use arc_swap::ArcSwap;
 use futures::future::BoxFuture;
 use tokio::sync::{Mutex, Notify, OnceCell};
 
+use bridge_core::diagnostics::{
+    DiagnosticEvent, DiagnosticRedactor, NoopDiagnosticObserver, PersistedPhaseTransition,
+    PersistedPhaseTransitionInput, PhaseStatus,
+};
 use bridge_core::domain::{AgentEntry, AgentKind, RegistrySnapshot};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::AgentId;
-use bridge_core::ports::{AgentBackend, AgentRegistry, Lease, Resolved};
+use bridge_core::ports::{AgentBackend, AgentRegistry, DiagnosticObserver, Lease, Resolved};
 
 /// Factory that lazily spawns a backend for a slot's entry. Injected so the
 /// registry stays adapter-agnostic (real impl wires the ACP adapter; tests fake it).
 pub type SpawnFn = Arc<
     dyn Fn(Arc<AgentEntry>) -> BoxFuture<'static, Result<Arc<dyn AgentBackend>, BridgeError>>
+        + Send
+        + Sync,
+>;
+
+/// Observer-aware lazy backend factory. The operation observer is passed only
+/// to the winning `OnceCell` initializer and is never cached with the backend.
+pub type ObservedSpawnFn = Arc<
+    dyn Fn(
+            Arc<AgentEntry>,
+            Arc<dyn DiagnosticObserver>,
+        ) -> BoxFuture<'static, Result<Arc<dyn AgentBackend>, BridgeError>>
         + Send
         + Sync,
 >;
@@ -95,7 +110,7 @@ impl Lease for LeaseGuard {
 /// Runtime-mutable agent registry: lazy-spawns backends and hands out leases.
 pub struct Registry {
     state: ArcSwap<State>,
-    spawn: SpawnFn,
+    spawn: ObservedSpawnFn,
     write_lock: Mutex<()>,
     /// Grace deadline for the lease-draining retirement task: if a retired slot's
     /// leases don't reach zero within this window, the backend is force-retired.
@@ -111,6 +126,11 @@ fn validate_sandbox(
     sb: &bridge_core::domain::SandboxConfig,
     allowed_cmds: &[String],
 ) -> Result<(), BridgeError> {
+    bridge_core::sandbox::validate_sandbox_declarations(sb).map_err(|reason| {
+        BridgeError::ConfigInvalid {
+            reason: format!("invalid sandbox declaration: {reason}"),
+        }
+    })?;
     // S3: allowlist the RESOLVED RUNTIME (NOT the inner cli, which runs contained).
     let runtime = sb.runtime();
     if !allowed_cmds.iter().any(|c| c == runtime) {
@@ -123,19 +143,27 @@ fn validate_sandbox(
         bridge_core::SessionCwd::parse(&sb.mount).map_err(|_| BridgeError::ConfigInvalid {
             reason: format!("sandbox mount must be an absolute path: {}", sb.mount),
         })?;
-    // S6: no volume DEST equal-to / nested-under `mount`. Normalize both via SessionCwd so `/work/.`
-    // etc. can't slip past. Bare / anonymous vol specs (no `:dest`, or non-absolute) aren't S6-checked.
+    // S6: no parsed volume destination equal-to / nested-under `mount`. The same parser feeds static
+    // evidence and composition, including anonymous absolute destinations such as `/cache`.
     for v in &sb.volumes {
-        let dest = v.split(':').nth(1).unwrap_or("");
-        if let Ok(d) = bridge_core::SessionCwd::parse(dest) {
-            if d.as_str() == mount.as_str() || d.is_under(&mount) {
-                return Err(BridgeError::ConfigInvalid {
-                    reason: format!(
-                        "sandbox volume dest {dest:?} is nested under the mount {:?}",
-                        sb.mount
-                    ),
-                });
+        let declaration = bridge_core::sandbox::parse_sandbox_volume(v).map_err(|reason| {
+            BridgeError::ConfigInvalid {
+                reason: format!("invalid sandbox volume {v:?}: {reason}"),
             }
+        })?;
+        let d = bridge_core::SessionCwd::parse(declaration.destination()).map_err(|_| {
+            BridgeError::ConfigInvalid {
+                reason: format!("invalid sandbox volume destination in {v:?}"),
+            }
+        })?;
+        if d.as_str() == mount.as_str() || d.is_under(&mount) {
+            return Err(BridgeError::ConfigInvalid {
+                reason: format!(
+                    "sandbox volume dest {:?} is nested under the mount {:?}",
+                    declaration.destination(),
+                    sb.mount
+                ),
+            });
         }
     }
     Ok(())
@@ -236,11 +264,30 @@ impl Registry {
         Self::with_grace(snap, spawn, DEFAULT_RETIRE_GRACE)
     }
 
+    /// Build a registry whose winning lazy initializer receives the operation
+    /// diagnostic observer. Production wiring uses this constructor.
+    pub fn new_observed(
+        snap: RegistrySnapshot,
+        spawn: ObservedSpawnFn,
+    ) -> Result<Self, BridgeError> {
+        Self::with_grace_observed(snap, spawn, DEFAULT_RETIRE_GRACE)
+    }
+
     /// Like [`Registry::new`] but with an explicit lease-drain grace deadline.
     /// Tests use a short grace so the force-retire path is exercised quickly.
     pub fn with_grace(
         snap: RegistrySnapshot,
         spawn: SpawnFn,
+        grace: Duration,
+    ) -> Result<Self, BridgeError> {
+        let observed: ObservedSpawnFn = Arc::new(move |entry, _observer| spawn(entry));
+        Self::with_grace_observed(snap, observed, grace)
+    }
+
+    /// Observer-aware form of [`Registry::with_grace`].
+    pub fn with_grace_observed(
+        snap: RegistrySnapshot,
+        spawn: ObservedSpawnFn,
         grace: Duration,
     ) -> Result<Self, BridgeError> {
         validate(&snap)?;
@@ -258,6 +305,100 @@ impl Registry {
             write_lock: Mutex::new(()),
             grace,
         })
+    }
+
+    async fn observe_resolve(
+        observer: &Arc<dyn DiagnosticObserver>,
+        status: PhaseStatus,
+        code: Option<&'static str>,
+    ) -> Result<(), BridgeError> {
+        let transition = PersistedPhaseTransition::build(
+            PersistedPhaseTransitionInput {
+                phase: bridge_core::diagnostics::DiagnosticPhase::Resolve,
+                status,
+                at_ms: bridge_core::diagnostics::diagnostic_timestamp_ms(),
+                operation: None,
+                code: code.map(str::to_owned),
+                auth: None,
+            },
+            &DiagnosticRedactor::default(),
+        )
+        .map_err(|_| BridgeError::InvalidStateTransition)?;
+        let event = DiagnosticEvent::new(transition, None)
+            .map_err(|_| BridgeError::InvalidStateTransition)?;
+        observer.record(event).await
+    }
+
+    async fn resolve_with_observer(
+        &self,
+        id: &AgentId,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<Resolved, BridgeError> {
+        Self::observe_resolve(&observer, PhaseStatus::Started, None).await?;
+        loop {
+            // Clone the slot Arc out of a short scope so the ArcSwap Guard is
+            // dropped before any await (clippy: no Guard held across await).
+            let slot = {
+                let st = self.state.load();
+                st.slots.get(id).cloned()
+            };
+            let Some(slot) = slot else {
+                Self::observe_resolve(&observer, PhaseStatus::Failed, Some("agent.unknown"))
+                    .await?;
+                return Err(BridgeError::UnknownAgent {
+                    id: id.as_str().into(),
+                });
+            };
+
+            // Only the closure actually selected by OnceCell marks this resolve
+            // as the initializer. Concurrent waiters and later cache hits report
+            // `backend.reused` to their own observer.
+            let initialized_here = Arc::new(AtomicBool::new(false));
+            let initialized_in_closure = initialized_here.clone();
+            let entry_for_spawn = slot.entry.load_full();
+            let observer_for_spawn = observer.clone();
+            let backend = match slot
+                .backend
+                .get_or_try_init(|| {
+                    initialized_in_closure.store(true, SeqCst);
+                    (self.spawn)(entry_for_spawn.clone(), observer_for_spawn)
+                })
+                .await
+            {
+                Ok(backend) => backend.clone(),
+                Err(error) => {
+                    Self::observe_resolve(
+                        &observer,
+                        PhaseStatus::Failed,
+                        Some("backend.initialize_failed"),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+
+            // CRUX: take the lease (fetch_add) BEFORE checking `retired`. This closes
+            // the window where a concurrent retirement could observe leases==0 between
+            // our retired-check and our increment, and drain the backend out from under us.
+            let lease = LeaseGuard::new(
+                slot.leases.clone(),
+                slot.lease_notify.clone(),
+                slot.retired.clone(),
+            );
+            if slot.retired.load(SeqCst) {
+                drop(lease);
+                let _ = backend.retire().await;
+                continue;
+            }
+
+            let code = (!initialized_here.load(SeqCst)).then_some("backend.reused");
+            Self::observe_resolve(&observer, PhaseStatus::Completed, code).await?;
+            return Ok(Resolved {
+                entry: slot.entry.load_full(),
+                backend,
+                lease: Box::new(lease),
+            });
+        }
     }
 
     /// Detached lease-draining retirement [spec §7]. The slot is already marked
@@ -297,49 +438,16 @@ impl Registry {
 #[async_trait::async_trait]
 impl AgentRegistry for Registry {
     async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
-        loop {
-            // Clone the slot Arc out of a short scope so the ArcSwap Guard is
-            // dropped before any await (clippy: no Guard held across await).
-            let slot = {
-                let st = self.state.load();
-                st.slots.get(id).cloned()
-            }
-            .ok_or_else(|| BridgeError::UnknownAgent {
-                id: id.as_str().into(),
-            })?;
+        self.resolve_with_observer(id, Arc::new(NoopDiagnosticObserver::default()))
+            .await
+    }
 
-            // Lazily spawn the backend exactly once. On spawn failure the OnceCell
-            // stays uninitialized (not poisoned) so a later resolve can retry.
-            let entry_for_spawn = slot.entry.load_full();
-            let backend = slot
-                .backend
-                .get_or_try_init(|| (self.spawn)(entry_for_spawn.clone()))
-                .await?
-                .clone();
-
-            // CRUX: take the lease (fetch_add) BEFORE checking `retired`. This closes
-            // the window where a concurrent retirement could observe leases==0 between
-            // our retired-check and our increment, and drain the backend out from under us.
-            let lease = LeaseGuard::new(
-                slot.leases.clone(),
-                slot.lease_notify.clone(),
-                slot.retired.clone(),
-            );
-            if slot.retired.load(SeqCst) {
-                // Lost the spawn/retire race: give the lease back so retirement can
-                // drain, retire our (possibly freshly-spawned) backend, then re-resolve
-                // against current state (retired slots have left the map).
-                drop(lease);
-                let _ = backend.retire().await;
-                continue;
-            }
-
-            return Ok(Resolved {
-                entry: slot.entry.load_full(),
-                backend,
-                lease: Box::new(lease),
-            });
-        }
+    async fn resolve_observed(
+        &self,
+        id: &AgentId,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<Resolved, BridgeError> {
+        self.resolve_with_observer(id, observer).await
     }
 
     fn default_id(&self) -> AgentId {
@@ -373,9 +481,9 @@ impl AgentRegistry for Registry {
         let _g = self.write_lock.lock().await;
         // Atomic reconcile [spec §7]:
         //  - validate first → malformed config is rejected before any state change.
-        //  - reuse the live slot for a config-only edit (same cmd/args/cwd/auth_method)
+        //  - reuse the live slot for a config-only edit (same spawn-frozen identity)
         //    so its warm OnceCell backend + active leases survive [req #1].
-        //  - a new slot for an add OR a cmd/args/cwd/auth change.
+        //  - a new slot for an add OR any spawn-frozen identity change.
         //  - swap the (slots, default) pair in ONE store → no partial-snapshot window.
         //  - retire by slot-INSTANCE identity (Arc ptr) = removed ∪ replaced [req #2];
         //    retired slots are simply absent from `next` so resolve can't livelock [req #3].
@@ -392,14 +500,17 @@ impl AgentRegistry for Registry {
                     && c.args == e.args
                     && c.cwd == e.cwd
                     && c.auth_method == e.auth_method
+                    && c.pre_authenticated == e.pre_authenticated
                     && c.kind == e.kind
-                    // All three are frozen into the backend at spawn (sandbox→argv,
-                    // session_cwd→AcpConfig.cwd, api_key_env→ApiConfig) and never refreshed on warm
-                    // reuse — so a change to any MUST force a fresh slot. BEHAVIOR CHANGE: session_cwd /
-                    // api_key_env edits now drain + respawn (were previously silently ignored).
+                    // These are frozen into the backend at spawn and never refreshed on warm reuse,
+                    // so a change to any MUST force a fresh slot. In particular, auth policy changes
+                    // must not leave an already-spawned connection alive under the old policy.
                     && c.sandbox == e.sandbox
                     && c.session_cwd == e.session_cwd
                     && c.api_key_env == e.api_key_env
+                    && c.watchdog == e.watchdog
+                    && c.mcp == e.mcp
+                    && c.mcp_delivery == e.mcp_delivery
             });
             match reuse {
                 // Config-only edit: keep the warm slot, swap only its entry config.
@@ -482,9 +593,11 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bridge_core::domain::{AgentKind, Effort, RegistrySnapshot};
+    use bridge_core::diagnostics::{DiagnosticPhase, InMemoryDiagnosticObserver, PhaseStatus};
+    use bridge_core::domain::{AgentKind, Effort, RegistrySnapshot, WatchdogConfig};
     use bridge_core::ids::SessionId;
-    use bridge_core::ports::{BackendStream, Update};
+    use bridge_core::mcp::{McpDelivery, McpServerSpec};
+    use bridge_core::ports::{BackendStream, DiagnosticObserver, Update};
     use std::collections::BTreeMap;
 
     // A backend that records its `retire()` calls into a shared counter, so
@@ -531,6 +644,8 @@ mod tests {
             sandbox: None,
             watchdog: None,
             auth_method: None,
+            pre_authenticated: false,
+            host_fallback_eligible: false,
             name: None,
             description: None,
             tags: vec![],
@@ -589,6 +704,8 @@ mod tests {
                 sandbox: None,
                 watchdog: None,
                 auth_method: None,
+                pre_authenticated: false,
+                host_fallback_eligible: false,
                 name: None,
                 description: None,
                 tags: vec![],
@@ -1037,6 +1154,76 @@ mod tests {
         );
     }
 
+    fn single_entry_snapshot(entry: AgentEntry) -> RegistrySnapshot {
+        RegistrySnapshot {
+            default: entry.id.clone(),
+            entries: vec![entry],
+            allowed_cmds: vec!["fake-cmd".into()],
+        }
+    }
+
+    async fn assert_spawn_frozen_edit_replaces_slot(
+        label: &str,
+        before: AgentEntry,
+        after: AgentEntry,
+    ) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let reg = Registry::new(
+            single_entry_snapshot(before),
+            counting_spawn_recording(count.clone(), 0, retired.clone()),
+        )
+        .unwrap();
+        let agent = AgentId::parse("a").unwrap();
+
+        let old = reg.resolve(&agent).await.unwrap();
+        let slot_before = reg.slot_arc(&agent).unwrap();
+        reg.apply(single_entry_snapshot(after)).await.unwrap();
+        let slot_after = reg.slot_arc(&agent).unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&slot_before, &slot_after),
+            "{label} change must replace the spawn-frozen slot"
+        );
+        let new = reg.resolve(&agent).await.unwrap();
+        assert_eq!(
+            count.load(SeqCst),
+            2,
+            "{label} change must spawn a backend with the new configuration"
+        );
+        drop(new);
+        drop(old);
+        await_retired(&retired, 1).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_frozen_watchdog_mcp_and_delivery_edits_replace_backend() {
+        let base = entry("a");
+
+        let mut with_watchdog = base.clone();
+        with_watchdog.watchdog = Some(WatchdogConfig {
+            idle_timeout: Duration::from_secs(30),
+            hard_wall_clock: Duration::from_secs(300),
+        });
+        assert_spawn_frozen_edit_replaces_slot("watchdog", base.clone(), with_watchdog).await;
+
+        let mcp = McpServerSpec {
+            name: "repo-nav".into(),
+            command: "repo-nav-mcp".into(),
+            args: vec!["--cwd".into(), "{cwd}".into()],
+            env: vec![],
+        };
+        let mut with_mcp = base.clone();
+        with_mcp.mcp = vec![mcp.clone()];
+        assert_spawn_frozen_edit_replaces_slot("mcp", base.clone(), with_mcp).await;
+
+        let mut acp_delivery = base.clone();
+        acp_delivery.mcp = vec![mcp.clone()];
+        let mut native_delivery = acp_delivery.clone();
+        native_delivery.mcp_delivery = McpDelivery::CodexNative;
+        assert_spawn_frozen_edit_replaces_slot("mcp_delivery", acp_delivery, native_delivery).await;
+    }
+
     #[tokio::test]
     async fn cmd_change_replaces_slot_and_retires_old() {
         // Req #2: a same-id cmd change is a NEW slot → the OLD instance must be
@@ -1313,6 +1500,163 @@ mod tests {
 
         reg.apply(snapshot(&["b"])).await.unwrap(); // removes "a"
         await_retired(&retired, 1).await;
+    }
+
+    #[tokio::test]
+    async fn observed_resolve_reports_reuse_and_does_not_retain_initializer_observer() {
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let seen_observers = Arc::new(std::sync::Mutex::new(Vec::<
+            std::sync::Weak<dyn DiagnosticObserver>,
+        >::new()));
+        let spawn: ObservedSpawnFn = {
+            let spawn_count = spawn_count.clone();
+            let seen_observers = seen_observers.clone();
+            Arc::new(move |_entry, observer| {
+                spawn_count.fetch_add(1, SeqCst);
+                seen_observers
+                    .lock()
+                    .unwrap()
+                    .push(Arc::downgrade(&observer));
+                Box::pin(async move {
+                    drop(observer);
+                    Ok(Arc::new(FakeBackend {
+                        retired: Arc::new(AtomicUsize::new(0)),
+                    }) as Arc<dyn AgentBackend>)
+                })
+            })
+        };
+        let registry = Registry::new_observed(snapshot(&["a"]), spawn).unwrap();
+        let id = AgentId::parse("a").unwrap();
+
+        let first = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let first_dyn: Arc<dyn DiagnosticObserver> = first.clone();
+        let first_resolved = registry
+            .resolve_observed(&id, first_dyn.clone())
+            .await
+            .unwrap();
+        let first_events = first.snapshot().await;
+        assert_eq!(first_events.len(), 2);
+        assert_eq!(first_events[0].transition().status(), PhaseStatus::Started);
+        assert_eq!(
+            first_events[1].transition().status(),
+            PhaseStatus::Completed
+        );
+        assert!(first_events[1].transition().code().is_none());
+        drop(first_resolved);
+        drop(first_dyn);
+        drop(first);
+        assert!(
+            seen_observers.lock().unwrap()[0].upgrade().is_none(),
+            "the cached backend/registry must not retain its initialization observer"
+        );
+
+        let cached = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let cached_resolved = registry
+            .resolve_observed(&id, cached.clone())
+            .await
+            .unwrap();
+        let cached_events = cached.snapshot().await;
+        assert_eq!(cached_events.len(), 2);
+        assert!(cached_events
+            .iter()
+            .all(|event| event.transition().phase() == DiagnosticPhase::Resolve));
+        assert_eq!(
+            cached_events[1]
+                .transition()
+                .code()
+                .expect("cached completion code")
+                .as_str(),
+            "backend.reused"
+        );
+        assert_eq!(spawn_count.load(SeqCst), 1);
+        drop(cached_resolved);
+    }
+
+    struct RejectingObserver;
+
+    #[async_trait::async_trait]
+    impl DiagnosticObserver for RejectingObserver {
+        async fn record(
+            &self,
+            _event: bridge_core::diagnostics::DiagnosticEvent,
+        ) -> Result<(), BridgeError> {
+            Err(BridgeError::StoreFailure)
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_failure_prevents_resolution_before_spawn() {
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let registry =
+            Registry::new(snapshot(&["a"]), counting_spawn(spawn_count.clone(), 0)).unwrap();
+        let error = registry
+            .resolve_observed(&AgentId::parse("a").unwrap(), Arc::new(RejectingObserver))
+            .await
+            .err()
+            .expect("observer failure must abort resolution");
+        assert_eq!(error, BridgeError::StoreFailure);
+        assert_eq!(spawn_count.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_resolve_waiter_reports_backend_reused() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+        let spawn: ObservedSpawnFn = {
+            let started_tx = started_tx.clone();
+            let release_rx = release_rx.clone();
+            Arc::new(move |_entry, _observer| {
+                let started_tx = started_tx.lock().unwrap().take();
+                let release_rx = release_rx.lock().unwrap().take();
+                Box::pin(async move {
+                    started_tx.expect("one initializer").send(()).unwrap();
+                    release_rx.expect("one initializer").await.unwrap();
+                    Ok(Arc::new(FakeBackend {
+                        retired: Arc::new(AtomicUsize::new(0)),
+                    }) as Arc<dyn AgentBackend>)
+                })
+            })
+        };
+        let registry = Arc::new(Registry::new_observed(snapshot(&["a"]), spawn).unwrap());
+        let id = AgentId::parse("a").unwrap();
+        let initializer_observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+        let waiter_observer = Arc::new(InMemoryDiagnosticObserver::new(8).unwrap());
+
+        let initializer = {
+            let registry = registry.clone();
+            let id = id.clone();
+            let observer = initializer_observer.clone();
+            tokio::spawn(async move { registry.resolve_observed(&id, observer).await })
+        };
+        started_rx.await.unwrap();
+        let waiter = {
+            let registry = registry.clone();
+            let id = id.clone();
+            let observer = waiter_observer.clone();
+            tokio::spawn(async move { registry.resolve_observed(&id, observer).await })
+        };
+        tokio::task::yield_now().await;
+        release_tx.send(()).unwrap();
+        drop(initializer.await.unwrap().unwrap());
+        drop(waiter.await.unwrap().unwrap());
+
+        assert!(initializer_observer
+            .snapshot()
+            .await
+            .iter()
+            .all(|event| event.transition().code().is_none()));
+        let waiter_events = waiter_observer.snapshot().await;
+        assert_eq!(waiter_events.len(), 2);
+        assert_eq!(
+            waiter_events[1]
+                .transition()
+                .code()
+                .expect("waiter reuse code")
+                .as_str(),
+            "backend.reused"
+        );
     }
 
     // (kind_change_forces_fresh_slot removed: AgentKind is single-variant (Acp) after

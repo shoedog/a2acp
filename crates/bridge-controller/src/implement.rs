@@ -202,14 +202,23 @@ pub fn claude_cred_preflight(
     volumes: &[String],
     now_ms: i64,
 ) -> Result<(), String> {
-    if cmd != Some("claude-agent-acp") {
+    if cmd
+        .and_then(|cmd| std::path::Path::new(cmd).file_name())
+        .and_then(|name| name.to_str())
+        != Some("claude-agent-acp")
+    {
         return Ok(());
     }
     for vol in volumes {
-        let host = vol.split(':').next().unwrap_or("");
-        if !host.ends_with(".credentials.json") {
+        let Ok(declaration) = bridge_core::sandbox::parse_sandbox_volume(vol) else {
+            continue;
+        };
+        if declaration.destination() != "/root/.claude/.credentials.json" {
             continue;
         }
+        let bridge_core::sandbox::SandboxVolumeSource::Host(host) = declaration.source() else {
+            continue;
+        };
         let Ok(body) = std::fs::read_to_string(host) else {
             continue;
         };
@@ -1170,7 +1179,7 @@ mod tests {
         let exp = dir.join(format!("a2a-cred-exp-{pid}.credentials.json"));
         std::fs::write(&exp, r#"{"claudeAiOauth":{"expiresAt":500}}"#).unwrap();
         let r = claude_cred_preflight(
-            Some("claude-agent-acp"),
+            Some("/usr/local/bin/claude-agent-acp"),
             &[format!("{}:/root/.claude/.credentials.json", exp.display())],
             1000,
         );
@@ -1181,6 +1190,24 @@ mod tests {
         assert!(claude_cred_preflight(
             Some("claude-agent-acp"),
             &[format!("{}:/root/.claude/.credentials.json", ok.display())],
+            1000
+        )
+        .is_ok());
+        assert!(claude_cred_preflight(
+            Some("claude-agent-acp"),
+            &[format!(
+                "{}:/root/.claude/unrelated.credentials.json",
+                exp.display()
+            )],
+            1000
+        )
+        .is_ok());
+        assert!(claude_cred_preflight(
+            Some("claude-agent-acp"),
+            &[
+                "managed:/root/.claude/.credentials.json".into(),
+                "/root/.claude/.credentials.json".into(),
+            ],
             1000
         )
         .is_ok());

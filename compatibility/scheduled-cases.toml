@@ -1,0 +1,262 @@
+# R3d0 provider-minimal advisory profiles. These are not support claims and cannot run unattended
+# until private characterization and standing authority exist.
+schema_version = 1
+
+[[cases]]
+id = "codex-host-luna-low"
+state = "characterization_required"
+provider_family = "openai-codex"
+capability = "acp-basic"
+lane = "floating-current"
+classification = "canary"
+evidence_purpose = "provider_path_advisory"
+evidence_path = "bridge_smoke"
+probe = "minimal"
+expected_status = "PASS"
+execution_mode = "host"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+config = "configs/codex-luna-host.toml"
+agent = "codex-luna-host"
+model = "gpt-5.6-luna"
+effort = "low"
+mode = "read-only"
+expected_effective_model = "gpt-5.6-luna"
+expected_effective_effort = "low"
+expected_effective_mode = "read-only"
+session_cwd = "/Users/wesleyjinks/code/a2a-bridge"
+auth_path = "pre_authenticated"
+required_env = []
+resolution_case = "codex-host-floating-current"
+config_template = "codex-host-read-only-v1"
+adapter_family = "@agentclientprotocol/codex-acp"
+agent_cli_family = "@openai/codex"
+allowed_effects = ["registry_read", "provider_prompt"]
+
+[cases.caps]
+timeout_secs = 180
+max_tokens = 50000
+max_cost_microusd = 1000000
+attempts = 1
+retry_cap = 0
+fallback_cap = 0
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[[cases]]
+id = "codex-reader-luna-low"
+state = "characterization_required"
+provider_family = "openai-codex"
+capability = "acp-basic"
+lane = "floating-current"
+classification = "canary"
+evidence_purpose = "provider_path_advisory"
+evidence_path = "bridge_smoke"
+probe = "minimal"
+expected_status = "PASS"
+execution_mode = "container_ro"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+config = "configs/codex-luna-reader.toml"
+agent = "codex-luna-reader"
+model = "gpt-5.6-luna"
+effort = "low"
+expected_effective_model = "gpt-5.6-luna"
+expected_effective_effort = "low"
+session_cwd = "/Users/wesleyjinks/code/a2a-bridge"
+auth_path = "pre_authenticated"
+required_env = []
+resolution_case = "codex-reader-floating-current"
+config_template = "codex-reader-read-only-v1"
+adapter_family = "@agentclientprotocol/codex-acp"
+agent_cli_family = "@openai/codex"
+image_family = "node-acp-reader-v1"
+allowed_effects = ["registry_read", "image_inspect", "image_build", "provider_prompt"]
+
+[cases.caps]
+timeout_secs = 300
+max_tokens = 50000
+max_cost_microusd = 1000000
+attempts = 1
+retry_cap = 0
+fallback_cap = 0
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[[cases]]
+id = "claude-host-haiku-low"
+# `haiku` is the raw selector advertised by Claude ACP. Characterization binds and checks its
+# provider-effective mapping; the scheduler must not infer that mapping from this alias-like name.
+state = "characterization_required"
+provider_family = "anthropic-claude"
+capability = "acp-basic"
+lane = "floating-current"
+classification = "canary"
+evidence_purpose = "provider_path_advisory"
+evidence_path = "bridge_smoke"
+probe = "minimal"
+expected_status = "PASS"
+execution_mode = "host"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+config = "configs/claude-haiku-host.toml"
+agent = "claude-haiku-host"
+model = "haiku"
+effort = "low"
+expected_effective_model = "haiku"
+expected_effective_effort = "low"
+session_cwd = "/Users/wesleyjinks/code/a2a-bridge"
+auth_path = "automatic"
+required_env = []
+resolution_case = "claude-host-floating-current"
+config_template = "claude-host-read-only-v1"
+adapter_family = "@agentclientprotocol/claude-agent-acp"
+agent_cli_family = "@anthropic-ai/claude-agent-sdk"
+allowed_effects = ["registry_read", "provider_prompt"]
+
+[cases.caps]
+timeout_secs = 180
+max_tokens = 50000
+max_cost_microusd = 1000000
+attempts = 1
+retry_cap = 0
+fallback_cap = 0
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[[cases]]
+id = "claude-reader-haiku-low"
+# Reader parity uses the same advertised selector and requires its own environment characterization.
+state = "characterization_required"
+provider_family = "anthropic-claude"
+capability = "acp-basic"
+lane = "floating-current"
+classification = "canary"
+evidence_purpose = "provider_path_advisory"
+evidence_path = "bridge_smoke"
+probe = "minimal"
+expected_status = "PASS"
+execution_mode = "container_ro"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+config = "configs/claude-haiku-reader.toml"
+agent = "claude-haiku-reader"
+model = "haiku"
+effort = "low"
+expected_effective_model = "haiku"
+expected_effective_effort = "low"
+session_cwd = "/Users/wesleyjinks/code/a2a-bridge"
+auth_path = "pre_authenticated"
+required_env = []
+resolution_case = "claude-reader-floating-current"
+config_template = "claude-reader-read-only-v1"
+adapter_family = "@agentclientprotocol/claude-agent-acp"
+agent_cli_family = "@anthropic-ai/claude-agent-sdk"
+image_family = "node-acp-reader-v1"
+allowed_effects = ["registry_read", "image_inspect", "image_build", "provider_prompt"]
+
+[cases.caps]
+timeout_secs = 600
+max_tokens = 50000
+max_cost_microusd = 1000000
+attempts = 1
+retry_cap = 0
+fallback_cap = 0
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[[cases]]
+id = "claude-host-sonnet-low-effort"
+# `sonnet` is Claude ACP's advertised Sonnet 4.6 selector at this design baseline. Catalog/mapping
+# drift is evidence to evaluate, never permission to silently substitute a different model.
+state = "characterization_required"
+provider_family = "anthropic-claude"
+capability = "effort-setting"
+lane = "floating-current"
+classification = "canary"
+evidence_purpose = "provider_path_advisory"
+evidence_path = "bridge_smoke"
+probe = "minimal"
+expected_status = "PASS"
+execution_mode = "host"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+config = "configs/claude-sonnet-low-host.toml"
+agent = "claude-sonnet-low-host"
+model = "sonnet"
+effort = "low"
+expected_effective_model = "sonnet"
+expected_effective_effort = "low"
+session_cwd = "/Users/wesleyjinks/code/a2a-bridge"
+auth_path = "automatic"
+required_env = []
+resolution_case = "claude-host-floating-current"
+config_template = "claude-host-read-only-v1"
+adapter_family = "@agentclientprotocol/claude-agent-acp"
+agent_cli_family = "@anthropic-ai/claude-agent-sdk"
+allowed_effects = ["registry_read", "provider_prompt"]
+
+[cases.caps]
+timeout_secs = 180
+max_tokens = 50000
+max_cost_microusd = 2000000
+attempts = 1
+retry_cap = 0
+fallback_cap = 0
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[[cases]]
+id = "ollama-local-qwen35-9b"
+state = "characterization_required"
+provider_family = "ollama-local"
+capability = "openai-chat-completions"
+lane = "floating-current"
+classification = "canary"
+evidence_purpose = "provider_path_advisory"
+evidence_path = "bridge_smoke"
+probe = "minimal"
+expected_status = "PASS"
+execution_mode = "remote_api"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+config = "configs/ollama-local.toml"
+agent = "ollama-local"
+model = "qwen3.5:9b"
+expected_effective_model = "qwen3.5:9b"
+session_cwd = "/Users/wesleyjinks/code/a2a-bridge"
+auth_path = "api_key_env"
+credential_env = "OLLAMA_API_KEY"
+required_env = []
+config_template = "ollama-local-v1"
+adapter_family = "bridge-api-openai-compatible"
+agent_cli_family = "ollama-server"
+allowed_effects = ["provider_prompt"]
+
+[cases.caps]
+timeout_secs = 120
+max_tokens = 20000
+max_cost_microusd = 0
+attempts = 1
+retry_cap = 0
+fallback_cap = 0
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"

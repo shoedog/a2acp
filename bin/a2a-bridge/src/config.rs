@@ -550,6 +550,14 @@ pub struct AgentEntryToml {
     pub watchdog: Option<WatchdogToml>,
     #[serde(default)]
     pub auth_method: Option<String>,
+    /// Credentials are supplied out of band (for example by a mounted auth file),
+    /// so the bridge must not invoke an interactive ACP auth method.
+    #[serde(default)]
+    pub pre_authenticated: bool,
+    /// Target capability for the local R2d fallback planner. This does not assert content trust or
+    /// authorize execution; absent/default false keeps existing entries ineligible.
+    #[serde(default)]
+    pub host_fallback_eligible: bool,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -599,6 +607,15 @@ fn is_toml_bare_key(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+fn is_direct_bridge_mcp_loopback(command: &str, args: &[String]) -> bool {
+    let base = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    let is_bridge = {
+        let name = base;
+        name.eq_ignore_ascii_case("a2a-bridge") || name.eq_ignore_ascii_case("a2a-bridge.exe")
+    };
+    is_bridge && args.first().map(String::as_str) == Some("mcp")
+}
+
 fn build_mcp_specs(
     mcp: &[McpToml],
     agent_id: &str,
@@ -629,6 +646,12 @@ fn build_mcp_specs(
                 m.name
             )));
         }
+        if is_direct_bridge_mcp_loopback(&m.command, &m.args) {
+            return Err(err(format!(
+                "mcp {:?}: managed-agent loopback to `a2a-bridge mcp` is unsupported; invoke the bridge MCP from an external controller",
+                m.name
+            )));
+        }
         for a in &m.args {
             validate_cwd_template(a).map_err(|e| err(format!("mcp {:?} arg: {e}", m.name)))?;
         }
@@ -641,6 +664,14 @@ fn build_mcp_specs(
             if !is_toml_bare_key(&e.name) {
                 return Err(err(format!(
                     "mcp {:?}: env name {:?} must be a bare key (A-Za-z0-9_-)",
+                    m.name, e.name
+                )));
+            }
+            if e.name
+                .eq_ignore_ascii_case(bridge_core::mcp::MANAGED_MCP_CALL_DEPTH_ENV)
+            {
+                return Err(err(format!(
+                    "mcp {:?}: env name {:?} is reserved for bridge-managed MCP lineage",
                     m.name, e.name
                 )));
             }
@@ -1386,11 +1417,23 @@ impl RegistryConfig {
         let mut entries = Vec::with_capacity(self.agents.len());
         for a in self.agents {
             let id = AgentId::parse(a.id).map_err(|e| ConfigError::Registry(e.to_string()))?;
+            if a.pre_authenticated && a.auth_method.is_some() {
+                return Err(ConfigError::Registry(format!(
+                    "agent {:?}: pre_authenticated=true cannot be combined with auth_method",
+                    id.as_str()
+                )));
+            }
             let effort = a.effort.as_deref().map(parse_effort).transpose()?;
             let kind = match a.kind.as_deref() {
                 Some(s) => parse_kind(s)?,
                 None => AgentKind::default(),
             };
+            if matches!(kind, AgentKind::Api) && a.pre_authenticated {
+                return Err(ConfigError::Registry(format!(
+                    "api agent {:?}: pre_authenticated is only valid for ACP process agents",
+                    id.as_str()
+                )));
+            }
             // Parse-shape guard: per-kind cmd/base_url requirements. Placed before
             // `a.cmd`/`a.id` are moved into the constructed entry below.
             match kind {
@@ -1471,6 +1514,12 @@ impl RegistryConfig {
                     id.as_str()
                 )));
             }
+            if a.host_fallback_eligible && (!matches!(kind, AgentKind::Acp) || sandbox.is_some()) {
+                return Err(ConfigError::Registry(format!(
+                    "agent {:?}: host_fallback_eligible=true requires an unsandboxed kind=acp target",
+                    id.as_str()
+                )));
+            }
             let watchdog = match &a.watchdog {
                 None => None,
                 Some(wd) => {
@@ -1522,6 +1571,8 @@ impl RegistryConfig {
                 mcp,
                 mcp_delivery,
                 auth_method: a.auth_method,
+                pre_authenticated: a.pre_authenticated,
+                host_fallback_eligible: a.host_fallback_eligible,
                 name: a.name,
                 description: a.description,
                 tags: a.tags,
@@ -2031,6 +2082,183 @@ cmd = "beta-cli"
             matches!(err, ConfigError::Registry(_)),
             "expected Registry variant, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn pre_authenticated_rejects_explicit_auth_method() {
+        let toml = r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+auth_method = "chat-gpt"
+pre_authenticated = true
+
+[server]
+"#;
+
+        let parsed = RegistryConfig::parse(toml).expect("pre_authenticated is valid syntax");
+        let err = parsed.into_snapshot().unwrap_err();
+        assert!(
+            err.to_string().contains("pre_authenticated")
+                && err.to_string().contains("auth_method"),
+            "contradictory auth policy should name both settings: {err}"
+        );
+    }
+
+    #[test]
+    fn pre_authenticated_flows_into_agent_entry() {
+        let toml = r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+pre_authenticated = true
+
+[server]
+"#;
+
+        let snapshot = RegistryConfig::parse(toml)
+            .unwrap()
+            .into_snapshot()
+            .unwrap();
+        assert!(snapshot.entries[0].pre_authenticated);
+        assert!(snapshot.entries[0].auth_method.is_none());
+    }
+
+    #[test]
+    fn pre_authenticated_rejects_api_agent() {
+        let toml = r#"
+default = "api"
+
+[[agents]]
+id = "api"
+kind = "api"
+base_url = "http://localhost:11434/v1"
+pre_authenticated = true
+
+[server]
+"#;
+
+        let err = RegistryConfig::parse(toml)
+            .unwrap()
+            .into_snapshot()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("pre_authenticated")
+                && err.to_string().contains("ACP process agents"),
+            "invalid API auth policy should be explicit: {err}"
+        );
+    }
+
+    #[test]
+    fn host_fallback_eligibility_defaults_false_and_accepts_only_unsandboxed_acp() {
+        let default_snapshot = RegistryConfig::parse(
+            r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+
+[server]
+"#,
+        )
+        .unwrap()
+        .into_snapshot()
+        .unwrap();
+        assert!(!default_snapshot.entries[0].host_fallback_eligible);
+
+        let eligible_snapshot = RegistryConfig::parse(
+            r#"
+default = "codex"
+
+[[agents]]
+id = "codex"
+cmd = "codex-acp"
+host_fallback_eligible = true
+
+[server]
+"#,
+        )
+        .unwrap()
+        .into_snapshot()
+        .unwrap();
+        assert!(eligible_snapshot.entries[0].host_fallback_eligible);
+    }
+
+    #[test]
+    fn host_fallback_eligibility_rejects_non_host_read_only_targets() {
+        let invalid = [
+            (
+                "api",
+                r#"
+default = "target"
+
+[[agents]]
+id = "target"
+kind = "api"
+base_url = "http://localhost:11434/v1"
+host_fallback_eligible = true
+
+[server]
+"#,
+            ),
+            (
+                "sandboxed acp",
+                r#"
+default = "target"
+allowed_cwd_root = "/repo"
+
+[[agents]]
+id = "target"
+cmd = "codex-acp"
+host_fallback_eligible = true
+
+[agents.sandbox]
+image = "reader:latest"
+mount = "/repo"
+access = "ro"
+egress = "open"
+
+[server]
+"#,
+            ),
+            (
+                "container_rw",
+                r#"
+default = "target"
+allowed_cwd_root = "/repo"
+
+[[agents]]
+id = "target"
+kind = "container_rw"
+cmd = "codex-acp"
+host_fallback_eligible = true
+
+[agents.sandbox]
+image = "writer:latest"
+mount = "/repo"
+access = "rw"
+egress = "open"
+
+[server]
+"#,
+            ),
+        ];
+
+        for (case, toml) in invalid {
+            let error = RegistryConfig::parse(toml)
+                .unwrap()
+                .into_snapshot()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("host_fallback_eligible"),
+                "{case} rejection should name the invalid capability: {error}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3899,6 +4127,40 @@ path = "/tmp/x.db"
         assert!(super::build_mcp_specs(&[mcp_toml("p.x", "/a", &[])], "a").is_err());
         // empty name
         assert!(super::build_mcp_specs(&[mcp_toml("", "/a", &[])], "a").is_err());
+    }
+
+    #[test]
+    fn build_mcp_specs_rejects_direct_bridge_loopback_and_reserved_depth_env() {
+        let direct = mcp_toml(
+            "bridge",
+            "/opt/a2a-bridge",
+            &["mcp", "--config", "/tmp/bridge.toml"],
+        );
+        let err = super::build_mcp_specs(&[direct], "reviewer")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("managed-agent loopback"), "got: {err}");
+
+        let windows_case = mcp_toml("bridge", r"C:\tools\A2A-BRIDGE.EXE", &["mcp"]);
+        let err = super::build_mcp_specs(&[windows_case], "reviewer")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("managed-agent loopback"), "got: {err}");
+
+        let mut reserved = mcp_toml("wrapped", "/opt/wrapper", &[]);
+        reserved.env.push(super::EnvToml {
+            name: "a2a_bridge_mcp_call_depth".into(),
+            value: "0".into(),
+        });
+        let err = super::build_mcp_specs(&[reserved], "reviewer")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reserved"), "got: {err}");
+
+        assert!(
+            super::build_mcp_specs(&[mcp_toml("prism", "/opt/prism", &[])], "reviewer").is_ok(),
+            "ordinary MCP servers remain valid"
+        );
     }
 
     #[test]
