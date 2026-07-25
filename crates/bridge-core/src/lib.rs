@@ -5,15 +5,19 @@ pub mod diagnostics;
 pub mod domain;
 pub mod error;
 pub mod ids;
+#[cfg(unix)]
 pub mod liveness;
 pub mod mcp;
 pub mod orch;
 pub mod permission;
 pub mod ports;
+#[cfg(unix)]
 pub mod process;
 pub mod profile;
 pub mod provider;
+#[cfg(unix)]
 pub mod reaper;
+#[cfg(unix)]
 pub mod run_identity;
 pub mod sandbox;
 pub mod session;

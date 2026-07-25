@@ -62,10 +62,14 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Bridge-store parent authority as root
-        run: >-
-          sudo --preserve-env=PATH,RUSTUP_HOME,CARGO_HOME,RUSTFLAGS
-          cargo test -p bridge-store sqlite::r2f0a_history_tests::real_readonly_parent_lock_and_database_failures_remain_distinct
-          --locked -- --exact --nocapture --test-threads=1
+        run: |
+          sudo env \
+            "HOME=$HOME" \
+            "PATH=$PATH" \
+            "CARGO_HOME=$CARGO_HOME" \
+            "RUSTFLAGS=$RUSTFLAGS" \
+            cargo test -p bridge-store sqlite::r2f0a_history_tests::real_readonly_parent_lock_and_database_failures_remain_distinct \
+            --locked -- --exact --nocapture --test-threads=1
 
       - name: cargo deny check
         run: cargo deny check

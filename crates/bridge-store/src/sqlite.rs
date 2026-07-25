@@ -14503,7 +14503,14 @@ mod r2f0a_history_tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .expect("opener did not reach the owner-masking swap barrier");
             let filtered = anchor.join("filtered-entry");
-            std::fs::rename(anchor.join("first"), &filtered).unwrap();
+            let first = anchor.join("first");
+            // Some macOS CI filesystems refuse to rename a non-writable directory even
+            // within one parent. Make only the hidden raced-away inode writable for the
+            // fixture operation, then restore the owner-masked state before production
+            // observes the replacement or the assertions inspect the residue.
+            std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::rename(&first, &filtered).unwrap();
+            std::fs::set_permissions(&filtered, std::fs::Permissions::from_mode(0o500)).unwrap();
             std::fs::rename(&replacement, anchor.join("first")).unwrap();
             proceed.send(()).unwrap();
 
