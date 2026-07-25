@@ -55,6 +55,8 @@ pub enum BridgeError {
     FrameError,
     #[error("message too large")]
     MessageTooLarge,
+    #[error("empty final agent message")]
+    EmptyFinal,
     #[error("agent crashed: {reason}")]
     AgentCrashed { reason: String },
     #[error("agent crashed")]
@@ -112,6 +114,7 @@ pub fn warm_session_survivability(error: &BridgeError) -> WarmSessionSurvivabili
             | DiagnosticFailureClass::Canceled
             | DiagnosticFailureClass::Unknown => WarmSessionSurvivability::Expire,
         },
+        BridgeError::EmptyFinal => WarmSessionSurvivability::Expire,
         _ => WarmSessionSurvivability::PreserveOwnerBehavior,
     }
 }

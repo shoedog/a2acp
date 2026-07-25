@@ -1231,6 +1231,8 @@ mod sink_tests {
                         model: None,
                         effort: None,
                         mode: None,
+                        preflight: false,
+                        fallback_models: vec![],
                         cwd: None,
                         session_cwd: None,
                         sandbox: None,
@@ -2112,6 +2114,8 @@ mod resume_tests {
                     model: None,
                     effort: None,
                     mode: None,
+                    preflight: false,
+                    fallback_models: vec![],
                     cwd: None,
                     session_cwd: None,
                     sandbox: None,
@@ -2425,9 +2429,16 @@ mod resume_tests {
             match self.role {
                 RichRaceRole::CheckpointOwner => {
                     self.sibling_recorded.notified().await;
-                    Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
-                        stop_reason: "end_turn".into(),
-                    })])))
+                    // A non-empty final message: since the empty-final-turn policy,
+                    // a bare `Done` with no text is a node *failure* (fresh-session
+                    // retry), which would never reach the checkpoint write this
+                    // test exists to fail.
+                    Ok(Box::pin(tokio_stream::iter(vec![
+                        Ok(Update::Text("checkpoint complete".into())),
+                        Ok(Update::Done {
+                            stop_reason: "end_turn".into(),
+                        }),
+                    ])))
                 }
                 RichRaceRole::PendingRichSibling => {
                     observers
@@ -2466,6 +2477,8 @@ mod resume_tests {
                 model: None,
                 effort: None,
                 mode: None,
+                preflight: false,
+                fallback_models: vec![],
                 cwd: None,
                 session_cwd: None,
                 sandbox: None,

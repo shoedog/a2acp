@@ -208,6 +208,7 @@ mod tests {
             BridgeError::SessionExpired => "SessionExpired",
             BridgeError::HandleBusy => "HandleBusy",
             BridgeError::TaskSpecInvalid { .. } => "TaskSpecInvalid",
+            BridgeError::EmptyFinal => "EmptyFinal",
         }
     }
 
@@ -303,6 +304,9 @@ mod tests {
                 },
                 Death::Fatal,
             ),
+            // Fatal at this layer by design: the workflow executor owns the single
+            // fresh-session empty-final retry; ResilientWarm must not retry it too.
+            (BridgeError::EmptyFinal, Death::Fatal),
         ];
         for (err, want) in cases {
             let _ = table_key(&err);

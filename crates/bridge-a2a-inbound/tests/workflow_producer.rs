@@ -47,6 +47,8 @@ fn minimal_entry(id: &AgentId) -> AgentEntry {
         model: None,
         effort: None,
         mode: None,
+        preflight: false,
+        fallback_models: vec![],
         cwd: None,
         session_cwd: None,
         sandbox: None,

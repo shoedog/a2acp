@@ -117,6 +117,8 @@ mod tests {
                     model: None,
                     effort: None::<Effort>,
                     mode: None,
+                    preflight: false,
+                    fallback_models: vec![],
                     cwd: None,
                     session_cwd: None,
                     sandbox: None,

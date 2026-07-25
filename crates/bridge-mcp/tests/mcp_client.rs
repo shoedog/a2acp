@@ -201,6 +201,8 @@ fn agent_entry() -> AgentEntry {
         model: None,
         effort: Some(Effort::High),
         mode: None,
+        preflight: false,
+        fallback_models: vec![],
         cwd: None,
         session_cwd: None,
         sandbox: None,

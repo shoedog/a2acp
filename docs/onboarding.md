@@ -113,6 +113,12 @@ native model list is currently discovery-only under ACP SDK 1.x.
 | `mode`   | `session/set_mode`                            | **HARD-fails** on an unknown/invalid mode id — set only to a mode your agent advertises (the reference config omits it) |
 | api      | only `model` is applied                       | `effort`/`mode` are ignored for `kind="api"` |
 
+### Workflow preflight and fallback models
+
+`preflight = true` is optional and defaults off. When enabled on an agent entry, each workflow run sends one fixed smoke prompt before that agent's first real node turn: `Reply with exactly PONG and nothing else.` If the smoke errors or completes with an empty final message, the bridge tries the configured `fallback_models` in order, minting a new session for each candidate. The first model that replies exactly `PONG` is used for real workflow turns for that agent in the run; effort, mode, cwd, auth, sandbox, and MCP settings are otherwise unchanged.
+
+If every candidate fails, the node fails before the real prompt and the failure names every attempted model. Leave both keys absent for the previous no-preflight behavior.
+
 **Effort levels are model-dependent.** If you set a level the active model does
 not support, the bridge falls back to the highest supported level **at or below**
 it (e.g. `xhigh` runs as `high` on Sonnet 4.6 / Opus 4.6). A level *below* the

@@ -536,6 +536,12 @@ pub struct AgentEntryToml {
     pub effort: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
+    /// Enable a fixed `PONG` smoke before the first real workflow turn for this agent.
+    #[serde(default)]
+    pub preflight: bool,
+    /// Ordered raw model ids tried when the preflight smoke fails.
+    #[serde(default)]
+    pub fallback_models: Vec<String>,
     #[serde(default)]
     pub cwd: Option<String>,
     /// Static ACP session cwd for this agent (distinct from any host process cwd).
@@ -1424,6 +1430,15 @@ impl RegistryConfig {
                 )));
             }
             let effort = a.effort.as_deref().map(parse_effort).transpose()?;
+            if a.fallback_models
+                .iter()
+                .any(|model| model.is_empty() || model.trim() != model)
+            {
+                return Err(ConfigError::Registry(format!(
+                    "agent {:?}: fallback_models entries must be non-empty raw model ids without leading/trailing whitespace",
+                    id.as_str()
+                )));
+            }
             let kind = match a.kind.as_deref() {
                 Some(s) => parse_kind(s)?,
                 None => AgentKind::default(),
@@ -1564,6 +1579,8 @@ impl RegistryConfig {
                 model: a.model,
                 effort,
                 mode: a.mode,
+                preflight: a.preflight,
+                fallback_models: a.fallback_models,
                 cwd: a.cwd,
                 session_cwd: a.session_cwd,
                 sandbox,
@@ -2006,6 +2023,8 @@ cmd = "codex-acp"
 model = "gpt-5.5"
 effort = "high"
 mode = "read-only"
+preflight = true
+fallback_models = ["gpt-5.4", "gpt-5.3"]
 
 [[agents]]
 id = "kiro"
@@ -2029,6 +2048,11 @@ addr = "127.0.0.1:8080"
             .unwrap();
         assert_eq!(codex.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(codex.effort, Some(bridge_core::domain::Effort::High));
+        assert!(codex.preflight);
+        assert_eq!(
+            codex.fallback_models,
+            vec!["gpt-5.4".to_string(), "gpt-5.3".to_string()]
+        );
         let kiro = snap
             .entries
             .iter()
@@ -2061,6 +2085,25 @@ cmd = "beta-cli"
         assert!(snap.allowed_cmds.contains(&"alpha-cli".to_string()));
         assert!(snap.allowed_cmds.contains(&"beta-cli".to_string()));
         assert_eq!(snap.allowed_cmds.len(), 2);
+    }
+
+    #[test]
+    fn fallback_models_reject_empty_or_trimmed_ids() {
+        let err = RegistryConfig::parse(
+            r#"default="codex"
+[[agents]]
+id="codex"
+cmd="codex-acp"
+preflight=true
+fallback_models=["good", " bad"]
+[server]
+addr="127.0.0.1:8080"
+"#,
+        )
+        .unwrap()
+        .into_snapshot()
+        .unwrap_err();
+        assert!(err.to_string().contains("fallback_models"));
     }
 
     #[test]

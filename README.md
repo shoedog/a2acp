@@ -205,7 +205,7 @@ allowed_cmds = ["kiro-cli", "codex-acp"]   # optional; defaults to the union of 
 id   = "kiro"
 cmd  = "kiro-cli"
 args = ["acp"]
-# name / model / model_provider / effort / mode / cwd / auth_method / pre_authenticated — optional
+# name / model / model_provider / effort / mode / preflight / fallback_models / cwd / auth_method / pre_authenticated — optional
 
 [[agents]]
 id   = "codex"
@@ -230,6 +230,8 @@ addr = "127.0.0.1:8080"
 | `model_provider` | no | LLM vendor label — descriptive/routing metadata only, never sent on the wire |
 | `effort` | no | Effort tier (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`); falls back to the highest supported level ≤ requested |
 | `mode` | no | Mode id for `session/set_mode` (hard error if the agent rejects it) |
+| `preflight` | no | Default `false`. When true, workflow execution sends a fixed `PONG` smoke before this agent's first real turn in a run; failures walk `fallback_models` before failing the node. |
+| `fallback_models` | no | Ordered raw model ids used only by `preflight = true`; the selected fallback replaces `model` for that workflow run while leaving effort/mode/cwd unchanged. |
 | `cwd` | no | Working directory for `session/new`; relative values join onto the bridge's `current_dir()` |
 | `auth_method` | no | Auth method id for `authenticate` (defaults to ChatGPT-style auth when advertised, else the first advertised method); `"none"` skips client-driven `authenticate` entirely for agents already authenticated out-of-band |
 | `pre_authenticated` | no | Skip `authenticate` because credentials are already ambient (for example, `codex login` or a mounted `auth.json`); cannot be combined with `auth_method` |
