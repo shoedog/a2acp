@@ -1,13 +1,16 @@
 # Current roadmap
 
-**Updated:** 2026-07-11
+**Updated:** 2026-07-25
 
 ## Priority order
 
 1. **P0 — bridge reliability and compatibility.** Make upstream agent, adapter, SDK, model, and
    container changes detectable and diagnosable before they consume feature work. The active plan is
    [`bridge-reliability.md`](bridge-reliability.md); resume implementation from the canonical
-   [`reliability execution roadmap`](reliability-execution-roadmap.md).
+   [`reliability execution roadmap`](reliability-execution-roadmap.md). R2f0a merged through
+   [PR #48](https://github.com/shoedog/a2acp/pull/48); R2f0b is the next unstarted slice. R2f completion is
+   followed by R2g stable ingress, the remaining R3d4/R3d5 scheduling and activation work, R3e/R3f provider
+   integrations, and R4 release promotion.
 2. **M4 observability — paused after Slice 3a.** Slice 3a merged in
    [PR #19](https://github.com/shoedog/a2acp/pull/19). Slice 3b remains designed but unimplemented.
    Resume from [`m4-observability-roadmap.md`](m4-observability-roadmap.md), not from an older Slice 3
@@ -47,3 +50,8 @@ Resume Slice 3b only after the reliability program has at least:
 
 There is no committed Slice 3c design. Slice 3b completes the original M4 bounded-storage goal; 3c is
 only a reserved decision point for separately justified administration or archival work.
+
+As of 2026-07-25, the isolation disposition, smoke harness, checked-in compatibility foundations, structured
+diagnostic groundwork, and R2f0a execution/attempt ledger have landed. The resume rule is still not satisfied:
+R2f0b and the remaining R2f liveness/takeover slices, R2g stable ingress, R3d4/R3d5 trusted-trigger activation,
+and R4 promotion remain unimplemented. Do not infer permission to resume M4 retention from the R2f0a merge alone.

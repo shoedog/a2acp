@@ -1,14 +1,15 @@
 # R3d2 — authority, admission, preflights, and accounting implementation plan
 
-- **Status:** ACTIVE — R3d2a through R3d2e are implemented. Sol/xhigh reviews one through six returned `REVISE`
+- **Status:** **MERGED** by PR #41 at `06e22fafaf33d67524b46f35d12124505b6ecf9a`. R3d2a through R3d2e were
+  implemented as one boundary. Sol/xhigh reviews one through six returned `REVISE`
   through exact `8d75069`; mechanism commit `2d1640d` plus the cursor fold closed the last two residuals. Seventh
   Sol/xhigh review of exact `e74f93f` marked both residuals `RESOLVED`, preserved the other eleven closures, found no
   fresh `WRONG` or `SMELL`, and returned `APPROVE`. The single Fable/xhigh release/compatibility lens of that same
   exact head found no `WRONG`, retained two Minor nonblocking `SMELL`s for R3d5, and returned `APPROVE`. Exact
   candidate `4133d0a` passes the complete deterministic gate at binary **655/0/0** and canonical full workspace
   **2,392/0/12 ignored**; exact docs-only review head `e74f93f` independently reran the same full totals. Exact
-  review-evidence head `9b63f42` passes every deterministic release gate with the same binary/full totals. The
-  final docs-only head must reproduce the full suite before the non-draft PR
+  review-evidence head `9b63f42` passed every deterministic release gate with the same binary/full totals before
+  merge.
 - **Branch:** `agent/reliability-r3d2-authority-admission`
 - **Base:** `origin/main` at `cbcfd1f06b914064456d1798be71bacdc294f3d5`
   (PR #40 merged R3d1)

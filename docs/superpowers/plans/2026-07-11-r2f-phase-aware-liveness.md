@@ -1,11 +1,11 @@
 # R2f — Phase-aware liveness and safe takeover plan
 
-- **Status:** DESIGN APPROVED by clean-room Sol/xhigh closure review 5; D1-D11 settled; R2f0a implementation,
-  correction, native verification, and final cumulative reviews complete at exact integrated code checkpoint
-  `7b01ab4bae167d3640050dfda5de7e1478728497` on `agent/r2f0a-identity-ledger`, tree
-  `7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e`; integrated native evidence is green and independent concurrent
-  Sol/xhigh and Fable/xhigh exact-head reviews both returned `APPROVE`; after this docs-only fold receives its own
-  verification/review, ready for PR/CI and merge; R2f0b is next only after merge and is not started
+- **Status:** DESIGN APPROVED by clean-room Sol/xhigh closure review 5; D1-D11 settled; R2f0a **MERGED** by
+  [PR #48](https://github.com/shoedog/a2acp/pull/48) at merge
+  `2685ffb78ef21c987b3f63f7aba1ddc096b01189`, final PR head
+  `630b9cc9d7ae86c323b183763b3d4e83bdbfc792`, after integrated native verification and independent concurrent
+  Sol/xhigh and Fable/xhigh `APPROVE` reviews. PR Build/Lint/Coverage, macOS store, Windows unsupported-target,
+  and CLA checks are green. R2f0b is the next slice and is not started.
 - **Prerequisite:** R2b structured diagnostics merged; may proceed independently of R2c–R2e afterward
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -40,8 +40,9 @@
 - **Incident ids:** `INC-VERIFY-STALL-2026-07-11`, `INC-SHARED-WARM-CRASH-2026-07-16`,
   `INC-SHARED-SESSION-CAPACITY-2026-07-17`, `INC-SHARED-RESTART-RECOVERY-2026-07-19`,
   `INC-UNARY-NULL-FINAL-2026-07-20`,
-  [GitHub #22](https://github.com/shoedog/a2acp/issues/22), and
-  [GitHub #24](https://github.com/shoedog/a2acp/issues/24)
+  [GitHub #22](https://github.com/shoedog/a2acp/issues/22),
+  [GitHub #24](https://github.com/shoedog/a2acp/issues/24), and
+  [GitHub #47](https://github.com/shoedog/a2acp/issues/47)
 
 ## Incident evidence and limits
 
@@ -91,6 +92,14 @@ this as `INC-UNARY-NULL-FINAL-2026-07-20`: accepted-work, progress, final-messag
 separate evidence, and null-final completion must not be mislabeled as proved process death. The durable evidence is
 the [failed review-attempt report](../reviews/2026-07-20-r2f-owner-design-sol-closure-review-2-failed.md).
 
+[GitHub #47](https://github.com/shoedog/a2acp/issues/47) records the served-unary companion failure: a Codex
+prompt failed after one hour, the server logged terminal `AgentCrashed`, and the separate `submit` client remained
+silent and sleeping until the operator interrupted that client. The incident predates R2f0a, so its missing durable
+execution/attempt locator is addressed by the merged ledger boundary, but no post-merge reproduction proves the
+terminal-delivery, deepest-cause, progress, metric, or bounded-silence criteria fixed. Those remain explicit R2f0b,
+R2f1b, and R2f4 acceptance work; the earlier successful turn on the same route also prevents treating the incident as
+proof that Codex or the model was categorically unavailable.
+
 ## Workflow-node wedge evidence and current-main disposition
 
 Issues #22 and #24 are related symptoms with different proved boundaries. They must not be collapsed into one
@@ -132,21 +141,27 @@ Results:
   checked-in workflow config still has no per-agent watchdog.
 
 The primary hypothesis is supported. The alternative is only partly supported: serve-side task persistence exists,
-but the caller still receives neither a printed identifier nor a takeover locator. #22 and #24 remain open and are
-owned by R2f; no current evidence attributes the original #24 incident specifically to Kiro ACP or its provider.
+but the caller still receives neither a printed identifier nor a takeover locator. GitHub #22 was subsequently
+closed as an intake record, but its failed-root/silent-sibling acceptance behavior remains unfinished and owned by
+R2f. GitHub #24 remains open; no current evidence attributes its original incident specifically to Kiro ACP or its
+provider.
 
-### Closure contract for #22 and #24
+### Closure contracts for #22, #24, and #47
 
 - Before implementation, choose an explicit per-workflow failure policy for fan-out roots: immediate peer cancel,
   bounded grace/drain, or continued independent work under a phase-aware hard bound. Preserve intentional graceful
   degradation where a failed leg may still feed synthesis; do not silently turn every node failure into fail-fast.
-- #22 closes only when a failed root plus nonterminating sibling reaches a bounded terminal state, reports every
+- The behavior recorded by closed intake #22 is complete only when a failed root plus nonterminating sibling
+  reaches a bounded terminal state, reports every
   sibling's final/cleanup state, retains the failed node's deepest bounded sanitized cause, and exposes a usable
   attempt/recovery identifier. A silent but healthy negative control must not be terminated merely for being quiet.
 - #24 closes only after the generic silent-stream and deepest-cause mechanisms are fixed and the original
   Kiro-specific alternative has an evidence-backed disposition. That disposition may use a captured deterministic
   protocol replay or a separately authorized live quota-limited turn; never manufacture quota exhaustion or spend a
   provider turn merely to make the issue closable.
+- #47 closes only when a deterministic served-unary regression proves the server's terminal prompt failure reaches
+  `submit` within a bounded delivery interval, the client exits nonzero, the deepest sanitized cause and failed
+  outcome remain visible, and provider-execution timeout stays distinguishable from client/result-delivery stall.
 - Offline and served execution must converge on the same identifier, phase/progress, completed/pending-node, and
   takeover-artifact contract. A durable id that the invoking operator cannot discover is insufficient.
 
@@ -196,10 +211,12 @@ foreign-owner coverage for both selection wrappers; and any foreign-owned rollba
 a separate owner decision. None expands or blocks R2f0a.
 
 No ignored live/provider test was forced. The locked-egress Linux verifier could not fetch one missing `a2a-lf`
-dependency for the final six-line macOS test-only correction, so it is not Linux proof. No GitHub CI, push, PR,
-merge, release, deployment, live canary, production-server change, or post-merge operator build is proved. After this
-docs-only fold receives its own verification/review, R2f0a is ready for PR/CI and merge. R2f0b remains next only
-after merge and is not started; R2f overall, #22, #24, R2g, and R4 remain incomplete.
+dependency for the final six-line macOS test-only correction, so that attempt is not Linux proof. PR #48 later
+merged the integrated work at `2685ffb78ef21c987b3f63f7aba1ddc096b01189`; its final head
+`630b9cc9d7ae86c323b183763b3d4e83bdbfc792` passed Build/Lint/Coverage, macOS store, Windows unsupported-target,
+and CLA checks. The merge does not by itself prove a release, deployment, live canary, production-server update, or
+post-merge operator build. R2f0b is next and not started; R2f overall, the behavior retained from closed intake #22,
+open #24/#47, R2g, and R4 remain incomplete.
 
 - Mint and expose distinct `execution_id` and `attempt_id` before registry/session/provider effects. `execution_id`
   remains stable across served resume and operator takeover; every resume/takeover gets a new attempt id, ordinal,
@@ -255,6 +272,10 @@ after merge and is not started; R2f overall, #22, #24, R2g, and R4 remain incomp
   `protocol_terminal_unknown`, leaves producer/final unknown where necessary, retains independent process state and
   sticky acceptance, and never authorizes success, `AgentCrashed`, or retry. The Codex incident lane cannot close
   until the selected adapter advertises the version and passes conformance against its real mapping.
+- Reproduce #47's served-unary terminal-delivery split with a deterministic server/client boundary: after the server
+  records a terminal prompt failure, `submit` must surface the deepest bounded sanitized cause and exit nonzero
+  within the approved delivery bound. Distinguish provider execution timeout from result-delivery/client-stream
+  stall, and retain the execution/attempt locator, phase, progress, and failed outcome throughout.
 - Reproduce blocked child, exited-child/wedged waiter, silent healthy verification, failed fan-out plus silent sibling,
   delivered provider limit, silent provider stream, and active non-tool model updates. Preserve the
   hypothesis/probe/result log and do not assign the historical incident a provider/adapter root cause.
@@ -290,7 +311,8 @@ after merge and is not started; R2f overall, #22, #24, R2g, and R4 remain incomp
   mechanical orphan/impossibility may auto-cancel; silence plus absent observed progress is insufficient. At two
   hours, request cancel, publish initiating turn disposition by six seconds or transfer its exact owner, settle or
   type partial/unknown cleanup by 60 seconds, and publish primary terminal/reporting by 2:01:10.
-- Report every collateral session on a shared-process escalation. Close #22 only when failed root plus nonterminating
+- Report every collateral session on a shared-process escalation. Complete the behavior retained from #22 only
+  when a failed root plus nonterminating
   sibling reaches bounded terminal state with all node/cleanup dispositions and preserved worktree state.
 - This merge boundary cannot turn timers on unless preservation, retained-capability single-flight, unrelated-process
   survival, and worktree-diff survival tests are already green.
@@ -387,7 +409,8 @@ after merge and is not started; R2f overall, #22, #24, R2g, and R4 remain incomp
 
 ## Completion
 
-R2f is complete only after the verification stall, #22/#24, and shared-operator alternatives have evidence-backed
+R2f is complete only after the verification stall, the behavior retained from closed intake #22, open #24/#47,
+and shared-operator alternatives have evidence-backed
 dispositions; the phase-aware watchdog distinguishes the negative controls; the selected fan-out failure policy is
 bounded without breaking intentional graceful degradation; scoped termination preserves useful work; session/close
 and generation ownership are capability- and concurrency-safe; non-disruptive rotation preserves running turns and
