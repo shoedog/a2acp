@@ -1,11 +1,11 @@
 # R2f — Phase-aware liveness and safe takeover plan
 
-- **Status:** DESIGN APPROVED by clean-room Sol/xhigh closure review 5; D1-D11 settled; R2f0a implementation and
-  correction work complete at folded code checkpoint `9761b3b78c89cca079ddb1d9376514fceb77e0df` on
-  `agent/r2f0a-identity-ledger`, with approved candidate `d7f20d37a9fda493c0b8dc18339489bfe1a059a3` /
-  tree `1803a888cf77fdee378367404179cc9ba4085ee6`; final native evidence is green and independent concurrent
-  Sol/xhigh and Fable/xhigh cumulative reviews both returned `APPROVE`; ready for final operator-branch exact-head
-  review, PR/CI, and merge; R2f0b is next only after that merge and is not started
+- **Status:** DESIGN APPROVED by clean-room Sol/xhigh closure review 5; D1-D11 settled; R2f0a implementation,
+  correction, native verification, and final cumulative reviews complete at exact integrated code checkpoint
+  `7b01ab4bae167d3640050dfda5de7e1478728497` on `agent/r2f0a-identity-ledger`, tree
+  `7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e`; integrated native evidence is green and independent concurrent
+  Sol/xhigh and Fable/xhigh exact-head reviews both returned `APPROVE`; after this docs-only fold receives its own
+  verification/review, ready for PR/CI and merge; R2f0b is next only after merge and is not started
 - **Prerequisite:** R2b structured diagnostics merged; may proceed independently of R2c–R2e afterward
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -31,6 +31,12 @@
   [`../reviews/2026-07-24-r2f0a-final-cumulative-fable-review.md`](../reviews/2026-07-24-r2f0a-final-cumulative-fable-review.md)
 - **Final native macOS verification:**
   [`../reviews/2026-07-24-r2f0a-native-verification.md`](../reviews/2026-07-24-r2f0a-native-verification.md)
+- **Integrated final Sol/xhigh review — APPROVE:**
+  [`../reviews/2026-07-25-r2f0a-integrated-final-sol-review.md`](../reviews/2026-07-25-r2f0a-integrated-final-sol-review.md)
+- **Integrated final Fable/xhigh review — APPROVE:**
+  [`../reviews/2026-07-25-r2f0a-integrated-final-fable-review.md`](../reviews/2026-07-25-r2f0a-integrated-final-fable-review.md)
+- **Integrated final native macOS verification:**
+  [`../reviews/2026-07-25-r2f0a-integrated-native-verification.md`](../reviews/2026-07-25-r2f0a-integrated-native-verification.md)
 - **Incident ids:** `INC-VERIFY-STALL-2026-07-11`, `INC-SHARED-WARM-CRASH-2026-07-16`,
   `INC-SHARED-SESSION-CAPACITY-2026-07-17`, `INC-SHARED-RESTART-RECOVERY-2026-07-19`,
   `INC-UNARY-NULL-FINAL-2026-07-20`,
@@ -146,53 +152,54 @@ owned by R2f; no current evidence attributes the original #24 incident specifica
 
 ## R2f0a — Execution/attempt identity, run ledger, and stats
 
-**Folded code checkpoint:** R2f0a implementation and correction work is complete at exact clean checkpoint
-`9761b3b78c89cca079ddb1d9376514fceb77e0df` on `agent/r2f0a-identity-ledger`. That operator-re-authored
-checkpoint is byte-identical to approved candidate `d7f20d37a9fda493c0b8dc18339489bfe1a059a3`, tree
-`1803a888cf77fdee378367404179cc9ba4085ee6`.
+**Integrated closure checkpoint:** R2f0a implementation, correction, native verification, and final cumulative
+reviews are complete at exact integrated code checkpoint
+`7b01ab4bae167d3640050dfda5de7e1478728497` on `agent/r2f0a-identity-ledger`, tree
+`7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e`. This supersedes the historical folded checkpoint
+`9761b3b78c89cca079ddb1d9376514fceb77e0df` and approved candidate
+`d7f20d37a9fda493c0b8dc18339489bfe1a059a3` / tree `1803a888cf77fdee378367404179cc9ba4085ee6`; the
+[July 24 native](../reviews/2026-07-24-r2f0a-native-verification.md),
+[Sol/xhigh](../reviews/2026-07-24-r2f0a-final-cumulative-sol-review.md), and
+[Fable/xhigh](../reviews/2026-07-24-r2f0a-final-cumulative-fable-review.md) artifacts remain historical predecessor
+evidence.
 
-The isolated Tier-3 Linux implementation controller passed all 27 configured commands and its built-in review
-returned `APPROVE` on attempt 1. That Linux verifier covered format, all-target/all-feature workspace check,
-warnings-denied Clippy, debug/release builds, the named R2f0a regressions, hermetic and container-complete workspace
-lanes, repository hygiene, and diff check; its implementation checkpoint SHA-256 is
-`7779636f8327c951fbcd6bd1f515c4dc0f848f47b1045f5d599a86708f5e7fb9`.
+The integrated four-commit correction stack preserves its approved provenance:
 
-The separate [native macOS evidence](../reviews/2026-07-24-r2f0a-native-verification.md) is green at the approved
-candidate on the operator-owned host:
+- `4a6fcb90` imported approved API/handoff candidate `0cb10903`;
+- `f145535a` imported approved recovery candidate `7b8fa376`;
+- `4359dc9c` folded approved test candidates `6d34edcb`, `0b77ed87`, and `04b5792e`;
+- `7b01ab4b` folded approved lineage/Platform/test candidates `a1481ed`, `dea817be`, and `24fd4b8a`.
 
-- `cargo fmt --all -- --check` and `git diff --check 4cc71f4a..d7f20d37`: pass;
-- the foreign-owner refusal, owner-owned acceptance, bounded crash-fixture kill/reap, and public platform
-  crash-residue recovery gates each pass **1 / 0 / 0** with **200 filtered**; on the non-root host only the
-  genuinely root-required foreign-UID arm skipped;
-- the three native PID-topology process gates each pass **1 / 0 / 0** with **314 filtered** across five groups;
-- `cargo deny check`: pass with `advisories ok`, `bans ok`, `licenses ok`, and `sources ok`; existing
-  duplicate-version findings remain warnings;
-- the unskipped serial native workspace passes **2,769 / 0 / 12 ignored / 0 measured / 0 filtered** across
-  **73** result groups (**56** nonempty), including all three PID-topology tests.
+The [integrated native macOS verification](../reviews/2026-07-25-r2f0a-integrated-native-verification.md)
+(source SHA-256 `a67e1362217a3263b09a42b9e86136cd3cd8a1e044f921538eef5fc2fe91203d`) records passing fmt, locked
+all-target/all-feature check, warnings-denied Clippy, debug build, release build, exact alias regression, repository
+hygiene, and final diff/clean checks. The complete workspace emitted **73** result groups with **2,785 passed / 0
+failed / 12 ignored / 0 measured / 0 filtered**. The 12 ignored tests are repository-declared live/external-provider
+or multi-bridge cases; no command-line skips were used.
 
-The native fail-first oracle at predecessor `e6276fbc59d37b25ba4315f5e14f260310d71d2b` exposed `/var/folders/...`
-versus `/private/var/folders/...` spelling in the post-transition test comparator. The narrow correction
-canonicalizes the protected root only when deriving the already-approved exact transition paths and adds a
-cross-platform `child/..` counterexample; it changes test code only and does not evidence a production defect.
+Fail-first truth is preserved: the first final native attempt reached **2,541 passed / 1 failed / 12 ignored** before
+a test-only `/var` versus `/private/var` canonical-path expectation failed. The six-line test-only correction
+canonicalized the expected path; its exact regression passed **1 / 0 / 0** with **211 filtered**, and the full suite
+then passed. This was a test-oracle correction, not a production defect.
 
-Effective-owner closure is exact: before SQLite inspection, an existing canonical WAL or SHM must be a regular,
-single-link file owned by the process effective UID. Foreign-owned exact inputs return plain typed `Open` without
-mutation. Owner-owned configured/platform and writable/read-only controls remain accepted. Only exact WAL/SHM
-received the new ownership predicate; the database, rollback journal, and bridge locks retain their approved
-contracts.
+Independent concurrent fresh exact-head reviews also closed green. The
+[integrated Sol/xhigh review](../reviews/2026-07-25-r2f0a-integrated-final-sol-review.md) (source SHA-256
+`8f9cc3efa961492915ef59bf4563682cfb57caa76a53662813b8bc0f87da037d`) adjudicated all seven current
+mechanisms and seven inherited families `RESOLVED`, with zero `WRONG`, zero `SMELL`, and `APPROVE`. The
+[integrated Fable/xhigh review](../reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) (source SHA-256
+`623faf2ea4170b014c3b8f027cd555b387bf5fb0bb4f7aa0056c8d9304a1d6e0`) reported zero `WRONG`, one
+nonblocking `SMELL`, and `APPROVE`. Its new follow-up is to add a legacy one-method `RouteTarget::Workflow` arm to
+the existing fail-closed route coverage and document the compatibility delta for hypothetical third-party one-method
+routers. Shipping `SkillRoute` uses the explicit pre-default hook, and no incorrect production behavior was
+demonstrated. The three earlier nonblocking Fable follow-ups remain: root-only foreign-owner CI coverage;
+foreign-owner coverage for both selection wrappers; and any foreign-owned rollback-journal policy change only through
+a separate owner decision. None expands or blocks R2f0a.
 
-Independent, concurrent, one-pass
-[Sol/xhigh](../reviews/2026-07-24-r2f0a-final-cumulative-sol-review.md) and
-[Fable/xhigh](../reviews/2026-07-24-r2f0a-final-cumulative-fable-review.md) adversarial release/compatibility reviews
-both returned `APPROVE` at the same frozen candidate. Fable recorded three nonblocking `SMELL` follow-ups without
-expanding this increment: add the root-only foreign-owner arm to CI; extend the foreign-owner matrix to the two
-selection wrappers; and revisit foreign-owned rollback-journal policy only through a separate owner decision,
-because `-journal` was deliberately out of scope.
-
-This fold proves no live/billable compatibility canary, production server update, release, deployment, GitHub CI,
-PR merge, or post-merge operator build. It does not close R2f overall, #22, or #24. R2f0a is ready for the final
-operator-branch exact-head review, PR/CI, and merge; R2f0b remains next only after that merge boundary and is not
-started.
+No ignored live/provider test was forced. The locked-egress Linux verifier could not fetch one missing `a2a-lf`
+dependency for the final six-line macOS test-only correction, so it is not Linux proof. No GitHub CI, push, PR,
+merge, release, deployment, live canary, production-server change, or post-merge operator build is proved. After this
+docs-only fold receives its own verification/review, R2f0a is ready for PR/CI and merge. R2f0b remains next only
+after merge and is not started; R2f overall, #22, #24, R2g, and R4 remain incomplete.
 
 - Mint and expose distinct `execution_id` and `attempt_id` before registry/session/provider effects. `execution_id`
   remains stable across served resume and operator takeover; every resume/takeover gets a new attempt id, ordinal,
