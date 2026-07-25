@@ -596,11 +596,18 @@ fn resolve_trusted_session_cwd(
         )
         .into());
     }
-    let canonical_path = std::fs::canonicalize(path).map_err(|error| {
-        format!(
-            "schedule foundation: {label} is not a resolvable directory under the owner-approved trusted cwd root: {error}"
-        )
-    })?;
+    let canonical_path = match std::fs::canonicalize(path) {
+        Ok(canonical_path) => canonical_path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return static_identity_for_absent_session_cwd(label, path, &canonical_root, error);
+        }
+        Err(error) => {
+            return Err(format!(
+                "schedule foundation: {label} is not a resolvable directory under the owner-approved trusted cwd root: {error}"
+            )
+            .into());
+        }
+    };
     if !canonical_path.is_dir() || !canonical_path.starts_with(&canonical_root) {
         return Err(format!(
             "schedule foundation: {label} must resolve to a directory under the owner-approved trusted cwd root"
@@ -608,6 +615,56 @@ fn resolve_trusted_session_cwd(
         .into());
     }
     Ok(canonical_path)
+}
+
+/// The checked-in foundation is also validated in hermetic environments (the containerized
+/// verify gate) that mount the workspace clone at its identical host path: every ancestor of
+/// the clone — including the owner-approved trusted cwd root — then exists as a fabricated
+/// mount shell while the owner's declared session cwd does not, so the root-absent hatch in
+/// `resolve_trusted_session_cwd` cannot engage. Mirror that hatch's static-identity contract
+/// for an ABSENT declared cwd while pinning everything that remains checkable: static lexical
+/// containment already passed, a leaf that exists as a dangling symlink keeps failing, and the
+/// deepest EXISTING ancestor must canonicalize inside the trusted root so an existing
+/// symlinked prefix cannot smuggle the declared cwd outside. An owner host with the directory
+/// present never reaches this path and still completes full object resolution.
+fn static_identity_for_absent_session_cwd(
+    label: &str,
+    path: &Path,
+    canonical_root: &Path,
+    missing: std::io::Error,
+) -> Result<PathBuf, BoxError> {
+    let unresolvable = |error: &dyn std::fmt::Display| -> BoxError {
+        format!(
+            "schedule foundation: {label} is not a resolvable directory under the owner-approved trusted cwd root: {error}"
+        )
+        .into()
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Err(unresolvable(&missing)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(unresolvable(&error)),
+    }
+    let mut ancestor = path.parent();
+    while let Some(candidate) = ancestor {
+        match std::fs::symlink_metadata(candidate) {
+            Ok(_) => {
+                let canonical_ancestor =
+                    std::fs::canonicalize(candidate).map_err(|error| unresolvable(&error))?;
+                if !canonical_ancestor.is_dir() || !canonical_ancestor.starts_with(canonical_root) {
+                    return Err(format!(
+                        "schedule foundation: {label} must resolve to a directory under the owner-approved trusted cwd root"
+                    )
+                    .into());
+                }
+                return Ok(path.to_path_buf());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = candidate.parent();
+            }
+            Err(error) => return Err(unresolvable(&error)),
+        }
+    }
+    Err(unresolvable(&missing))
 }
 
 fn load_toml<T: DeserializeOwned>(path: &Path, label: &str) -> Result<LoadedToml<T>, BoxError> {
@@ -2908,6 +2965,52 @@ mod tests {
             resolve_trusted_session_cwd("offline fixture", &declared, &offline_root).unwrap(),
             declared
         );
+    }
+
+    #[test]
+    fn trusted_session_cwd_retains_static_identity_when_declared_cwd_is_absent_under_present_root()
+    {
+        // The hermetic verify container mounts the workspace clone at its identical host path,
+        // so the trusted root exists as a fabricated mount ancestor while the owner's declared
+        // session cwd does not.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("trusted-root");
+        std::fs::create_dir(&root).unwrap();
+        let declared = root.join("repository");
+        assert_eq!(
+            resolve_trusted_session_cwd("mounted-shell fixture", &declared, &root).unwrap(),
+            declared
+        );
+        let nested = root.join("nested/deeper/repository");
+        assert_eq!(
+            resolve_trusted_session_cwd("nested absent fixture", &nested, &root).unwrap(),
+            nested
+        );
+
+        #[cfg(unix)]
+        {
+            // An existing symlinked prefix that escapes the root must still fail…
+            let outside = temp.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            let link_dir = root.join("escape");
+            std::os::unix::fs::symlink(&outside, &link_dir).unwrap();
+            let error = resolve_trusted_session_cwd(
+                "absent leaf behind escaping prefix",
+                &link_dir.join("repository"),
+                &root,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("owner-approved trusted cwd root"), "{error}");
+
+            // …and a dangling leaf symlink keeps failing object resolution like before.
+            let dangling = root.join("dangling");
+            std::os::unix::fs::symlink(root.join("missing-target"), &dangling).unwrap();
+            let error = resolve_trusted_session_cwd("dangling leaf fixture", &dangling, &root)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not a resolvable directory"), "{error}");
+        }
     }
 
     #[test]
