@@ -14511,7 +14511,10 @@ mod r2f0a_history_tests {
             std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o700)).unwrap();
             std::fs::rename(&first, &filtered).unwrap();
             std::fs::set_permissions(&filtered, std::fs::Permissions::from_mode(0o500)).unwrap();
-            std::fs::rename(&replacement, anchor.join("first")).unwrap();
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let installed = anchor.join("first");
+            std::fs::rename(&replacement, &installed).unwrap();
+            std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o500)).unwrap();
             proceed.send(()).unwrap();
 
             let error = opener
@@ -14520,7 +14523,6 @@ mod r2f0a_history_tests {
                 .err()
                 .expect("an owner-masked replacement must refuse");
             assert_plain_error(error, R::ReadOnlyParent);
-            let installed = anchor.join("first");
             assert_eq!(
                 std::fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
                 0o500
@@ -20163,12 +20165,13 @@ mod r2f0a_history_tests {
         }
 
         fn run_fixture(
+            executable: &std::path::Path,
             path: &std::path::Path,
             expected: &str,
             opener: &str,
             drop_privileges: bool,
         ) {
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            let mut command = std::process::Command::new(executable);
             command
                 .arg("sqlite::r2f0a_history_tests::readonly_history_open_process_helper")
                 .arg("--exact")
@@ -20197,13 +20200,25 @@ mod r2f0a_history_tests {
         let directory = tempfile::tempdir().unwrap();
         set_mode(directory.path(), 0o755);
         let drop_privileges = std::fs::metadata(directory.path()).unwrap().uid() == 0;
+        let current_exe = std::env::current_exe().unwrap();
+        let test_executable = if drop_privileges {
+            // GitHub's workspace ancestry is not guaranteed to be searchable by the
+            // dropped UID. Re-execute the same test binary from the deliberately
+            // world-searchable fixture root so this test measures store permissions.
+            let helper = directory.path().join("bridge-store-readonly-helper");
+            std::fs::copy(&current_exe, &helper).unwrap();
+            set_mode(&helper, 0o755);
+            helper
+        } else {
+            current_exe
+        };
 
         if drop_privileges {
             let owner_parent = directory.path().join("wrong-owner-parent");
             std::fs::create_dir(&owner_parent).unwrap();
             set_mode(&owner_parent, 0o777);
             let owner_path = owner_parent.join("history.sqlite");
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = std::process::Command::new(&test_executable)
                 .arg("sqlite::r2f0a_history_tests::readonly_history_open_process_helper")
                 .arg("--exact")
                 .arg("--nocapture")
@@ -20229,6 +20244,7 @@ mod r2f0a_history_tests {
         std::fs::create_dir(&readonly_parent).unwrap();
         set_mode(&readonly_parent, 0o555);
         run_fixture(
+            &test_executable,
             &readonly_parent.join("missing-lock.sqlite"),
             "parent",
             "shared",
@@ -20238,6 +20254,7 @@ mod r2f0a_history_tests {
         std::fs::create_dir(&missing_parent_ancestor).unwrap();
         set_mode(&missing_parent_ancestor, 0o555);
         run_fixture(
+            &test_executable,
             &missing_parent_ancestor
                 .join("missing")
                 .join("history.sqlite"),
@@ -20260,7 +20277,13 @@ mod r2f0a_history_tests {
         std::fs::write(&missing_lifetime_lock, b"lock").unwrap();
         set_mode(&missing_lifetime_lock, 0o666);
         set_mode(&missing_lifetime_parent, 0o555);
-        run_fixture(&missing_lifetime_db, "parent", "shared", drop_privileges);
+        run_fixture(
+            &test_executable,
+            &missing_lifetime_db,
+            "parent",
+            "shared",
+            drop_privileges,
+        );
         set_mode(&missing_lifetime_parent, 0o755);
 
         let missing_concurrent_parent = directory.path().join("missing-concurrent-database");
@@ -20274,6 +20297,7 @@ mod r2f0a_history_tests {
         set_mode(&missing_concurrent_attempts, 0o777);
         set_mode(&missing_concurrent_parent, 0o555);
         run_fixture(
+            &test_executable,
             &missing_concurrent_db,
             "parent",
             "concurrent",
@@ -20288,7 +20312,13 @@ mod r2f0a_history_tests {
         let readonly_lock = history_schema_lock_path(&readonly_lock_db);
         std::fs::write(&readonly_lock, b"lock").unwrap();
         set_mode(&readonly_lock, 0o400);
-        run_fixture(&readonly_lock_db, "lock", "shared", drop_privileges);
+        run_fixture(
+            &test_executable,
+            &readonly_lock_db,
+            "lock",
+            "shared",
+            drop_privileges,
+        );
         set_mode(&readonly_lock, 0o600);
 
         let readonly_db_parent = directory.path().join("readonly-database");
@@ -20299,7 +20329,13 @@ mod r2f0a_history_tests {
         set_mode(&history_schema_lock_path(&readonly_db), 0o666);
         set_mode(&history_kind_lock_path(&readonly_db), 0o666);
         set_mode(&readonly_db, 0o444);
-        run_fixture(&readonly_db, "database", "shared", drop_privileges);
+        run_fixture(
+            &test_executable,
+            &readonly_db,
+            "database",
+            "shared",
+            drop_privileges,
+        );
         set_mode(&readonly_db, 0o600);
 
         let readonly_concurrent_parent = directory.path().join("readonly-concurrent-database");
@@ -20311,6 +20347,7 @@ mod r2f0a_history_tests {
         set_mode(&history_attempt_lock_dir(&readonly_concurrent_db), 0o777);
         set_mode(&readonly_concurrent_db, 0o444);
         run_fixture(
+            &test_executable,
             &readonly_concurrent_db,
             "database",
             "concurrent",
@@ -20327,7 +20364,13 @@ mod r2f0a_history_tests {
         set_mode(&history_schema_lock_path(&readonly_admission_db), 0o666);
         set_mode(&history_kind_lock_path(&readonly_admission_db), 0o666);
         set_mode(&readonly_admission_parent, 0o555);
-        run_fixture(&readonly_admission_db, "parent", "admin", drop_privileges);
+        run_fixture(
+            &test_executable,
+            &readonly_admission_db,
+            "parent",
+            "admin",
+            drop_privileges,
+        );
         set_mode(&readonly_admission_parent, 0o755);
         set_mode(&readonly_admission_db, 0o600);
 
@@ -20388,9 +20431,16 @@ mod r2f0a_history_tests {
         let configured_keeper = prepare_matrix_fixture(&configured_path, true);
         set_mode(&configured_parent, 0o555);
         for opener in ["untyped", "configured", "admin", "configured-admin"] {
-            run_fixture(&configured_path, "parent", opener, drop_privileges);
+            run_fixture(
+                &test_executable,
+                &configured_path,
+                "parent",
+                opener,
+                drop_privileges,
+            );
         }
         run_fixture(
+            &test_executable,
             &configured_path,
             "parent",
             "configured-stats",
@@ -20405,7 +20455,13 @@ mod r2f0a_history_tests {
         let platform_keeper = prepare_matrix_fixture(&platform_path, false);
         set_mode(&platform_parent, 0o555);
         for opener in ["platform", "concurrent", "platform-admin"] {
-            run_fixture(&platform_path, "parent", opener, drop_privileges);
+            run_fixture(
+                &test_executable,
+                &platform_path,
+                "parent",
+                opener,
+                drop_privileges,
+            );
         }
         set_mode(&platform_parent, 0o755);
         drop(platform_keeper);
