@@ -9,7 +9,7 @@ HOW TO MERGE:
 - If one lens reported an error marker instead of a review (a node failed), note the missing lens and synthesize from the one that succeeded.
 
 OUTPUT FORMAT:
-A single prioritized list, **BLOCKER → MAJOR → MINOR**, each with task/step, issue, and fix. End with a one-line verdict: executable as-is, or the specific fixes required before building.
+A single prioritized list, **BLOCKER → MAJOR → MINOR**, each with task/step, issue, and fix. End with a one-line verdict: executable as-is, or the specific fixes required before building. Only BLOCKER findings that name a concrete failing scenario may gate the verdict; MAJOR/MINOR are fix-along advice, never gates. If prior-round findings are included in the inputs, first adjudicate each as FIXED / PARTIAL / OPEN — do not re-report fixed items as new.
 
 === EXECUTABILITY (compile / ordering / ripple lens) ===
 {{exec}}

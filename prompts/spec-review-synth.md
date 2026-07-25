@@ -9,7 +9,7 @@ HOW TO MERGE:
 - If one lens reported an error marker instead of a review (a node failed), note the missing lens and synthesize from the one that succeeded.
 
 OUTPUT FORMAT:
-A single prioritized list, **BLOCKER → MAJOR → MINOR**, each with section, issue, and suggested resolution. End with a one-line verdict: ready to plan, or the specific changes required first.
+A single prioritized list, **BLOCKER → MAJOR → MINOR**, each with section, issue, and suggested resolution. End with a one-line verdict: ready to plan, or the specific changes required first. Only BLOCKER findings that name a concrete failing scenario may gate the verdict; MAJOR/MINOR are fix-along advice, never gates. If prior-round findings are included in the inputs, first adjudicate each as FIXED / PARTIAL / OPEN — do not re-report fixed items as new.
 
 === RIGOR (completeness / ambiguity lens) ===
 {{rigor}}
