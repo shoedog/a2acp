@@ -3,6 +3,8 @@
 **Roadmap:** H1-1 (★★★) · **Labels:** `kind:enhancement`, `area:storage`, `area:observability`, `priority:p1`, `status:triage`
 **Design of record:** `docs/superpowers/specs/2026-07-10-m4-slice3-retention-design-rev6.md` · **Resume checklist:** `docs/m4-observability-roadmap.md`
 **Depends on:** reliability program delivering the smoke harness / compatibility matrix / phase-specific errors / pinned+floating lanes (the `roadmap.md` resume rule).
+**Current gate (2026-07-25):** R2f0a is merged, but the resume rule remains unmet; R2f liveness/terminal delivery,
+R2g stable ingress, R3d4/R3d5 activation, and R4 promotion are still pending.
 
 ## Problem
 The SQLite store grows without bound. `task_journal`, `task_node_checkpoints`, `turn_log`, and artifacts

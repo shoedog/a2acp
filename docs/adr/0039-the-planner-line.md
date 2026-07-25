@@ -6,7 +6,7 @@
 **Upholds:** ADR-0008 (no orchestrator inside the bridge; the orchestrator is the caller) and its 5-condition
 re-trigger rule.
 **RFC:** [`../rfc-agents-workflows-part2-memory-delegation.md`](../rfc-agents-workflows-part2-memory-delegation.md) §2.3–2.4, §3.
-**Related issue:** [#36](https://github.com/shoedog/a2acp/issues/36) (the loopback door).
+**Related issue (resolved):** [#36](https://github.com/shoedog/a2acp/issues/36), fixed by merged PR #46.
 
 ---
 
@@ -29,10 +29,11 @@ reproducibility, and the tier containment model all fail together.
     disqualified by cross-tier laundering (ADR-0038).
 - **Supported "agents calling agents" path:** an *external* caller driving `a2a-bridge mcp` — precisely
   ADR-0008's model (the planner is the caller; the bridge stays a deterministic executor).
-- **Loopback is unsupported and guarded.** A bridge-managed agent whose `[[agents.mcp]]` points at the
-  bridge's own MCP can invoke `run_workflow` mid-turn today, unguarded (issue #36). Enforcement: stamp a
-  call-depth marker (env var / MCP `clientInfo`) through `a2a-bridge mcp` spawns and have the Coordinator
-  reject `run_workflow` above depth 1 unless explicitly configured. Fail loud.
+- **Loopback is unsupported and guarded.** Issue #36 / PR #46 implemented two fail-closed layers: config
+  validation rejects a direct managed-agent `a2a-bridge mcp` command (and the reserved lineage variable), while
+  every MCP delivered to a managed agent receives `A2A_BRIDGE_MCP_CALL_DEPTH=1` and a nested `a2a-bridge mcp`
+  refuses before config or store work. External-controller MCP remains supported. The lineage marker is a
+  deterministic safety guard, not a security boundary against a deliberately hostile wrapper that strips it.
 
 ## Consequences
 

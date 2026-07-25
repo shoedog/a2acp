@@ -126,19 +126,19 @@ flowchart TD
     <div class="cap"><span class="k">Invariant</span><span class="v">The executor still takes <code>Arc&lt;WorkflowGraph&gt;</code> per run — it <b>can never observe a def mutation mid-run</b>. Every editor write goes file→watcher, so there is one source of truth and no split-brain.</span></div>
 
     <div class="callout">
-      <span class="mk">Phase 0 bug</span>
-      <p>Found while grounding the RFC and <b>verified</b>: <code>registry.rs:496-511</code>'s warm-reuse
-        criterion omits the spawn-frozen <code>mcp</code>/<code>mcp_delivery</code>/<code>watchdog</code>, so
-        editing only an agent's tools hot-reloads into a stale warm process. Filed as
-        <a href="https://github.com/shoedog/a2acp/issues/35">issue #35</a> — a prerequisite fix for the split,
-        where agents are differentiated chiefly by toolset.</p>
+      <span class="mk">Phase 0 bug — resolved</span>
+      <p>Found while grounding the RFC and <b>verified on its original base</b>: the warm-reuse criterion
+        omitted the spawn-frozen <code>mcp</code>/<code>mcp_delivery</code>/<code>watchdog</code>, so editing
+        only an agent's tools hot-reloaded into a stale warm process. The fix tracked as
+        <a href="https://github.com/shoedog/a2acp/issues/35">issue #35</a> has landed in PR #43, satisfying
+        this prerequisite; current <code>Registry::apply</code> compares all three fields.</p>
     </div>
   </section>
 
   <section>
     <div class="sec-head"><span class="sec-num">03</span><h2>Phased plan</h2></div>
     <ul class="phases">
-      <li class="p0"><span class="id">Phase 0</span><span class="tx"><b>Reuse-criterion fix</b> (issue #35) — add mcp/mcp_delivery/watchdog to the spawn-frozen comparison. Small, ships alone, prerequisite for both shifts.</span></li>
+      <li class="p0"><span class="id">Phase 0</span><span class="tx"><b>Reuse-criterion fix — complete</b> (issue #35, PR #43) — mcp/mcp_delivery/watchdog now participate in the spawn-frozen comparison, satisfying the prerequisite for both shifts.</span></li>
       <li><span class="id">W1</span><span class="tx"><b>WorkflowCatalog</b> + unified snapshot + ordered reconcile + def_hash. The cheapest first increment; executor untouched.</span></li>
       <li><span class="id">W2</span><span class="tx"><b>WorkflowConfigStore write-back</b> + Coordinator/MCP <code>workflow upsert/remove/list</code> — the DAG editor's server half.</span></li>
       <li><span class="id">S2a</span><span class="tx"><b>Domain split</b>, pure refactor — ProviderEntry/AgentDef/compose_agent + legacy synthesis; golden parity across <code>examples/</code>.</span></li>

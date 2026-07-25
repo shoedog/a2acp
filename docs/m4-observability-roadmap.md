@@ -1,6 +1,8 @@
 # M4 observability — pause point, next slices, and deferred ledger
 
-- **Status:** paused after Slice 3a on 2026-07-11
+- **Status:** paused after Slice 3a; revalidated 2026-07-25. R2f0a is merged, but the reliability resume rule
+  remains unmet because R2f liveness/terminal delivery, R2g stable ingress, R3d4/R3d5 activation, and R4 promotion
+  are still pending.
 - **Design of record for retention:**
   [`superpowers/specs/2026-07-10-m4-slice3-retention-design-rev6.md`](superpowers/specs/2026-07-10-m4-slice3-retention-design-rev6.md)
 

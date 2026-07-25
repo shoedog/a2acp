@@ -1,6 +1,7 @@
 # Workflow ideas — brainstorm
 
 **Created:** 2026-07-17
+**Reconciled:** 2026-07-25 against `origin/main` `2685ffb78ef21c987b3f63f7aba1ddc096b01189`
 **Status:** exploratory brainstorm, non-committed. Seeds for new `[[workflows]]` (and a few implement-style
 loops) that exploit the bridge's existing strengths: multi-agent cross-family DAGs (fan-out / pipeline /
 fan-in), containerized verify, prism diff-slicing, LSP nav, durable detached runs, and A2A delegation.
@@ -13,6 +14,39 @@ Each idea lists the seams it reuses, a rough maturity/risk, and open questions �
 **Primitive legend used below:** `FANOUT` parallel lenses → synth · `PIPELINE` staged nodes · `LOOP`
 implement-style edit/verify iteration · `VERIFY` containerized build/test · `SLICE` prism diff-slice ·
 `NAV` lsp-mcp · `DETACHED` durable resumable run · `DELEGATE` A2A peer.
+
+## Current substrate and dependency reconciliation
+
+This section updates feasibility without scheduling any idea:
+
+- R2f0a merged by PR #48. Caller-visible execution/attempt identities, the bounded workflow-history ledger, and
+  stats/reporting are now real substrate for triage, long pipelines, run autopsy, supervised work, and routing
+  calibration. They do **not** prove meaningful-progress recording, terminal-evidence delivery, automatic liveness
+  bounds, preservation/takeover, or safe process replacement; those remain R2f0b through R2f4.
+- PR #48 also added [`../prompts/dispatch-brief-contract.md`](../prompts/dispatch-brief-contract.md), a reusable
+  bounded handoff contract for targeted agent work. It is not the typed per-workflow JSON/SARIF output proposed by
+  roadmap H2-3.
+- R3d0–R3d3 merged a default-off scheduler, authority/admission, and evidence/status/retention foundation. R3d4
+  trusted triggers and R3d5 characterization/activation are not started, so “scheduled,” “nightly,” or “weekly”
+  ideas below remain design concepts rather than enabled unattended jobs.
+- R2g stable ingress is queued after R2f and not designed in detail. Cross-repo peer work (#14) can use today's
+  explicit A2A delegation, but durable affinity across a served-binary promotion or restart must wait for R2g.
+- OpenRouter and OpenCode are not integrated; they remain R3e/R3f after completed R3d. Do not list either as a
+  runnable matrix member or fallback today.
+- The registry defect originally linked from the agents/workflows RFC as issue #35 is closed and merged through
+  PR #43. It is no longer a blocker for these ideas.
+
+| Idea group | Current limiting dependency |
+|---|---|
+| #1 security review, #2 consensus, #6 doc drift, #16 precedent | Mostly prompt/config work today; machine-readable gating still wants H2-3. |
+| #4 triage, #7 feature, #13 intake, #15 autopsy, #17 supervised implement | R2f0b progress/terminal evidence plus later preservation/takeover or durable human-wait semantics, depending on the idea. |
+| #3 test generation, #5 dependency upgrade, #9 sweep, #11 prompt tuning, #12 bisect | Write-loop isolation and verification costs; #9 additionally remains blocked on H2-1 same-target write locks. |
+| #8 benchmark, #10 release check, #18 route calibration | Stable structured outputs and budget/cost policy; scheduled execution additionally waits for R3d4/R3d5. |
+| #14 contract check | Explicit peer configuration works today; stable ingress/affinity across upgrades waits for R2g. |
+| #19 repo brief, #20 evidence brief | Sandboxed probing/egress policy and bounded cost; both require explicit operator selection and are not automatic. |
+
+The W2 consumer's Codex smoke problem reported during this refresh was resolved by selecting its pre-authenticated
+bridge configuration. It does not add a new workflow-engine or provider-compatibility requirement.
 
 ---
 
@@ -152,8 +186,8 @@ reconcile with R4's promotion gate so they don't disagree?
 - **Structured output (H2-3) is a force multiplier** for #1, #2, #3, #8, #10 — several of these want
   machine-readable verdicts/scores, which the current char-cap coalescing can't cleanly provide.
 - **A "quality canary" pairing:** #6 (doc-drift) and an eval-backed review canary (roadmap H1-3) both want to
-  run *scheduled* against the repo/pinned agents — the same scheduling substrate the reliability program is
-  building for compatibility canaries could host all three.
+  run *scheduled* against the repo/pinned agents — the merged default-off R3d0–R3d3 substrate could host all
+  three only after R3d4 trusted triggers and R3d5 characterization/activation land.
 - **Two-engines constraint (ADR-0024)** shadows #4, #5, #7, #9 wherever they want a loop *inside* a pipeline;
   they're cleanest after engine unification (roadmap H3-1) or with explicit Coordinator-level gating.
 - **Start where the seam is cheapest:** #6 (doc-drift) and #2 (consensus) are the lowest-risk first builds —

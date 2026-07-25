@@ -1,20 +1,62 @@
 # a2a-bridge — Improvements & New-Features Roadmap (proposal)
 
 **Created:** 2026-07-17
+**Reconciled:** 2026-07-25 against `origin/main` `2685ffb78ef21c987b3f63f7aba1ddc096b01189`
 **Status:** non-normative proposal. This complements — it does not replace —
 [`roadmap.md`](roadmap.md) (the priority cursor) and
 [`reliability-execution-roadmap.md`](reliability-execution-roadmap.md) (the active P0 program).
 Per project convention, GitHub Issues is the canonical intake; items here are linked into
 [`roadmap.md`](roadmap.md) only when actually scheduled. Issue stubs for the near-term items live in
 [`roadmap-issues/`](roadmap-issues/).
-**Scope:** everything *other than* the reliability program (R0–R4), which is owned by its own track.
+**Scope:** feature and maintenance ideas outside the reliability program. The status and follow-up index below
+cross-links reliability work so this proposal does not hide unfinished prerequisites; it never supersedes the
+reliability roadmap's sequencing or completion claims.
 
-**Source basis:** current code (`~99.5k` LOC, 16 crates, v0.2.1, AGPL-3.0), the maintainer's own
+**Source basis:** current code (17 workspace packages, v0.2.1, AGPL-3.0), the maintainer's own
 [`2026-07-03-strategic-analysis.md`](2026-07-03-strategic-analysis.md) (M1–M5 / L1–L10),
 [`analysis-second-opinion.md`](analysis-second-opinion.md),
-[`orchestration-improvements-2026-06-17.md`](orchestration-improvements-2026-06-17.md), the 33 ADRs under
-[`adr/`](adr/), [`m4-observability-roadmap.md`](m4-observability-roadmap.md), and the `SSOT_AGENTS_BRIDGE_COORDINATION.md`
+[`orchestration-improvements-2026-06-17.md`](orchestration-improvements-2026-06-17.md), the 32 ADRs under
+[`adr/`](adr/) on the original base plus ADR stubs 0033–0039 added by this PR (39 total),
+[`m4-observability-roadmap.md`](m4-observability-roadmap.md), and the `SSOT_AGENTS_BRIDGE_COORDINATION.md`
 cross-repo request (a working-tree coordination doc, not tracked on `main`).
+
+---
+
+## 2026-07-25 reconciliation snapshot
+
+This is a convenience index, not a second release cursor. Follow the linked focused plans for exact contracts and
+[`reliability-execution-roadmap.md`](reliability-execution-roadmap.md) for the current handoff.
+
+| Track | Current state | Next or deferred boundary |
+|---|---|---|
+| R2f0a execution/attempt identity, ledger, and stats | **MERGED** by [PR #48](https://github.com/shoedog/a2acp/pull/48) at `2685ffb7`; final PR head `630b9cc9`; CI green | No release, deployment, live canary, or operator rebuild is implied by the merge. |
+| R2f liveness/takeover | **ACTIVE**; R2f0b is not started | R2f0b, R2f1a, R2f1b, R2f2, R2f3a, R2f3b, R2f3c, then R2f4. Open [#24](https://github.com/shoedog/a2acp/issues/24) and [#47](https://github.com/shoedog/a2acp/issues/47) remain inputs. GitHub #22 is closed as intake, but its failed-root/silent-sibling acceptance behavior remains R2f work. |
+| R2e authenticated in-process fallback | **DEFERRED / policy-blocked** | Requires a separately approved authenticated attestation design; it is off the critical path. |
+| R2g stable ingress/release handoff | **QUEUED after R2f**; focused owner design not started | Stable local ingress, exact task/session/SSE affinity, side-by-side promotion/rollback, safe store ownership, and predecessor drain. |
+| R3 compatibility | R3a–R3c and R3d0–R3d3 **MERGED** | R3d4 trusted triggers and remote check publication, then R3d5 characterization/staged activation. Both are unstarted. |
+| Provider expansion | R3e OpenRouter and R3f OpenCode **NOT STARTED** | Follow completed R3d; remain explicit providers, never automatic fallback. R3f follows R3e. |
+| R4 release promotion | **NOT STARTED** | Reproducible dependency/image pins, candidate smokes, promotion, and rollback after R3. |
+| M4 observability | Slice 3a **MERGED**; Slice 3b designed but unimplemented; no committed 3c design | Still parked behind the reliability exit rule in [`roadmap.md`](roadmap.md). Slice 3c is only a reserved decision point. |
+
+### Confirmed nonblocking and deferred follow-ups
+
+These items survived their approving reviews or were explicitly deferred; none should be mistaken for a blocker on
+the already-merged slice.
+
+| Origin | Follow-up | Owner / timing |
+|---|---|---|
+| R2f0a final Fable review | Add a legacy one-method `RouteTarget::Workflow` arm to fail-closed route coverage and document the compatibility delta for hypothetical third-party one-method routers. | Narrow compatibility/test follow-up; shipping `SkillRoute` already uses the explicit pre-default hook. |
+| R2f0a final Fable review | Exercise the foreign-UID WAL/SHM regression in root-capable CI. | Test-coverage follow-up; CI currently runs a different parent-authority regression with `sudo`, not this foreign-sidecar arm. |
+| R2f0a final Fable review | Extend the foreign-owner route matrix to both selection-based openers. | Test-coverage follow-up. |
+| R2f0a final Fable review | Decide policy for a foreign-owned rollback journal before changing behavior. | Separate owner decision; no implementation is authorized by the review. |
+| R2b2 closure | Replace the retained Git command fixture limitation and bounded-yield polling with stronger direct coverage. | Minor test debt; schedule only when touching those seams. |
+| R3b closure | Fault-inject OS-thread/fresh-runtime creation and, if practical, strengthen the five-second post-SIGKILL exit oracle for pathological OS states. | Accepted nonblocking fault-boundary debt. |
+| R3d2 Fable review | Characterize unreadable/SIP-protected real-host process identities and narrow staged module-wide `dead_code` allowances. | Mandatory pre-activation hardening in R3d5. |
+| R3d3 Fable review | Cosmetic evidence-reader hygiene. | Optional cleanup; no demonstrated failure scenario. |
+| Operator lifecycle incident | A stop/start restored the served bridge, but the underlying long-lived-process degradation/restart cause is not proved. | R2f3b/R2f3c evidence input; R2g owns non-disruptive process replacement. |
+
+The W2 Codex smoke failure discussed during this refresh was resolved by changing that consumer's bridge config to
+the pre-authenticated route. Treat it as resolved configuration evidence, not as a new provider or bridge outage.
 
 ---
 
@@ -30,8 +72,9 @@ roughly one non-trivial slice every few days to two weeks. Horizons below are ex
 and every near-term horizon assumes it competes with the reliability P0 for the same review budget.
 
 **Relationship to the reliability program (Track A — in progress, not owned here).**
-R3d (owner-bound scheduled canaries) is starting; R3e (OpenRouter) and R3f (OpenCode) follow; R4
-(reproducible release + promotion gate) closes the program. Several items here have a hard
+R2f0a is merged and R2f0b is next. After the remaining R2f work, the current queue is R2g stable ingress,
+R3d4/R3d5 scheduling and staged activation, R3e OpenRouter, R3f OpenCode, then R4 reproducible release/promotion.
+Several items here have a hard
 **"resume-after"** dependency on Track A deliverables (the compatibility matrix, phase-specific errors,
 pinned/floating lanes, the smoke harness) — those dependencies are called out per item. Nothing in this
 roadmap should merge changes into the reliability slices' scope.
@@ -46,6 +89,10 @@ These are low-risk, high-leverage cleanups that either close a *stated* gap or r
 agent confusion. They can slot between reliability slices without competing for the heavy review budget.
 
 ### H0-1 ★★★ Reconcile docs with the shipped Coordinator + controller extractions
+**Status (2026-07-25): open and revalidated.** `README.md` still says the A2A inbound server has not migrated
+to `Coordinator` even though the composition root builds one Coordinator and constructs
+`InboundServer::from_coordinator`; the crate table still omits `bridge-controller`.
+
 **Value.** The two largest deferred items in the July-3 strategic analysis — #10 (make `InboundServer` a
 thin adapter over `Coordinator`) and #9 (extract the ~6.4k-line implement/review/tweak/merge/verify loop
 into a `bridge-controller` library) — have **substantially shipped in code** (`InboundServer::from_coordinator`,
@@ -62,7 +109,12 @@ one-time doc edit is the stopgap. (c) Don't overstate: the migration is *structu
 (see H0-2), so describe it as "adapter-over-Coordinator, accessor cleanup pending," not "complete."
 
 ### H0-2 ★★ Close the Coordinator `*_ref()` accessor leak (finish #10 cleanly)
-**Value.** `Coordinator` exposes ~20 `*_ref()` accessors handing out `Arc<Mutex<HashMap<…>>>` internals
+**Status (2026-07-25): open and revalidated.** `Coordinator` still exposes registry, policy, store, executor,
+workflow, permission, batch, binding, cancellation, run, and progress-hub references consumed by the inbound
+adapter.
+
+**Value.** `Coordinator` currently exposes 12 `*_ref()` accessors, including accessors that hand out
+`Arc<Mutex<HashMap<…>>>` internals
 (bindings, cancel maps, progress hubs) to the adapters. So "thin adapter over one service API" leaks mutable
 shared state through handles instead of methods — the exact coupling the migration was meant to remove. Left
 alone, every new adapter (H3 federation, H3 team-mode, future MCP tools) re-couples to internals and the
@@ -75,6 +127,9 @@ incrementally, one accessor family per change, each behind the existing coordina
 (`Idle/Running/Resetting/Compacting`) — this is where the migration was deferred because it's bug-prone.
 
 ### H0-3 ★★★ Enforce `allowed_cwd_root` on the local `run-workflow` path
+**Status (2026-07-25): open and revalidated.** Serve/MCP and worktree paths carry the root, while local
+`run-workflow` still accepts `--session-cwd` without enforcing the configured root at its entry boundary.
+
 **Value.** A genuine security *under*-enforcement gap the project has self-diagnosed: the served HTTP/A2A
 path gates target cwd against `allowed_cwd_root`, but local `run-workflow` does **not**. Any workflow run
 locally can target an arbitrary repo. Small change, real containment win, and it removes an asterisk from the
@@ -86,6 +141,9 @@ for the trusted-own-repo case is consistent with ADR-0032's "under-enforcement i
 regression that a local run outside the root is refused.
 
 ### H0-4 ★ Repo hygiene: evict root scratch binaries; decide `lsp-mcp`'s home
+**Status (2026-07-25): open and revalidated.** All four scratch binaries remain tracked at repository root, and
+`lsp-mcp` remains a workspace member with no recorded extraction decision.
+
 **Value.** `check_boxerr` / `check_okor` / `check_pathbuf` / `check_vecstr` are stray ~440 KB binaries at the
 repo root — noise the hygiene gate exists to prevent. Separately, `crates/lsp-mcp` (~1.5k LOC, its own
 binary) has **zero bridge dependencies** — it's an orphaned co-tenant that inflates the workspace build (a
@@ -100,12 +158,13 @@ in-container-nav story (ADR-0031) since `implement`'s verify container bundles t
 
 ## Horizon 1 — Near-term, highest priority (next 1–3 months, post-reliability-core)
 
-These are the four I'd put first once the R3 core lands. Each is high-value, builds on a seam that already
+These are the four I'd put first once the reliability resume rule permits feature work. Each is high-value, builds on a seam that already
 exists, and is either already-designed or a "productize what's already measured" play. Issue stubs:
 [`roadmap-issues/`](roadmap-issues/).
 
 ### H1-1 ★★★ M4 Slice 3b — TTL retention (bounded storage)
-**Status.** *Designed and signed off, not implemented.* Design of record:
+**Status (2026-07-25).** *Designed and signed off, not implemented, and still parked by the reliability resume
+rule.* Design of record:
 `docs/superpowers/specs/2026-07-10-m4-slice3-retention-design-rev6.md` (6 adversarial revisions); resume
 checklist in [`m4-observability-roadmap.md`](m4-observability-roadmap.md). Slice 3a (retention *safety*
 foundation — ownership, finalization barriers, recency, DDL-only migration, **no deletion**) already merged
@@ -117,9 +176,9 @@ the operator now runs long-lived (a shared operator on `127.0.0.1:18080` is alre
 unbounded growth is a when-not-if failure. The design is done and the safety substrate is merged, so this is
 high value at comparatively low residual risk — mostly execution against a reviewed contract.
 
-**Why it sits in H1 not H0.** [`roadmap.md`](roadmap.md)'s explicit resume rule gates 3b behind the
-reliability program delivering the smoke harness, compatibility matrix, phase-specific errors, and
-pinned/floating lanes — i.e. it resumes *after* the R3 core, which is exactly the H1 window.
+**Why it sits in H1 not H0.** [`roadmap.md`](roadmap.md)'s explicit resume rule still gates 3b. Several
+foundations have landed, including the smoke harness, compatibility schemas, diagnostics, and R2f0a ledger, but
+phase-aware liveness/terminal delivery, stable ingress, trusted-trigger activation, and release promotion remain.
 
 **Technical design considerations.**
 - Implement the rev6 contract *as written* — it supersedes older sketches. Only `[storage].artifact_retention_days`
@@ -139,6 +198,9 @@ pinned/floating lanes — i.e. it resumes *after* the R3 core, which is exactly 
   marker after an absent body (purge-between-reads race tests).
 
 ### H1-2 ★★★ Cost & quota governance (productize the cost data already captured)
+**Status (2026-07-25): open.** R2f0a added bounded workflow-history accounting and reports, not user-facing
+provider budget admission or quota governance.
+
 **Value.** `turn_log` already records `tokens` and `cost` per turn, and `bridge_turn_cost_total` /
 `bridge_turn_tokens_total` metrics already exist — but **nothing enforces a budget**. The self-diagnosed
 risk is blunt: "a misconfigured batch can burn a day of quota." A single fan-out or `run-batch` with a bad
@@ -163,6 +225,9 @@ budgets and USD accounting).
   whether cost surfacing rides that change or stays operator-side (metrics + journal) first.
 
 ### H1-3 ★★★ Review-quality eval harness expansion (M3)
+**Status (2026-07-25): open.** No merged consumer yet turns the stored prompt/model/effort dimensions into the
+cross-cell quality measurements described below.
+
 **Value.** Self-hosted multi-agent review *is* the product thesis, and it is almost unmeasured: the
 `evals/` harness grades only the `code-review` workflow, over a 15-item seeded-defect corpus, last run
 2026-07-04, and it does **not** yet consume the `turn_log` eval columns (`prompt_id` / `model` / `effort`)
@@ -187,6 +252,11 @@ data-driven.
   the dedicated non-RO build/test step or a containerized-Linux verify.
 
 ### H1-4 ★★ serve lifecycle & operator ergonomics
+**Status (2026-07-25): split.** The reliability-critical identity/readiness/affinity, safe store ownership,
+side-by-side promotion/rollback, and predecessor drain are now explicitly owned by queued R2g. This roadmap item
+retains the later operator ergonomics—portable launch supervision, friendly discovery, and UI/CLI experience—and
+must consume rather than duplicate R2g's contract.
+
 **Value.** There is a live, cross-repo request for exactly this (the `SSOT_AGENTS_BRIDGE_COORDINATION.md`
 working-tree coordination doc): a second project wanted a bounded delegation route and hit the fact that
 `serve` is a **bare foreground process** — no daemonization,
@@ -196,18 +266,13 @@ bridge servers"). The operator is compensating with hand-written `SERVICE.md` co
 ownership-ledger-by-context-id, and a creds-refresh launchd plist that hardcodes a checkout path. This is
 friction *today*, not hypothetically.
 **Technical design considerations.**
-- **Sequence deliberately** (the maintainer's stated preference): ship *identity + preflight* before any
-  daemon-lifecycle machinery. Concretely: (1) add a config-fingerprint to the Agent Card so a client can
-  confirm it's talking to the intended server; (2) add a `submit`/client preflight that checks that
-  fingerprint and the bound config; (3) add a real readiness signal (a `/health` endpoint or bless the
-  existing `GET /.well-known/agent-card.json` as the contract). Only *then* evaluate a supervised
-  launchd/systemd contract with a PID/owner record — introducing daemon machinery is a separate, later call.
-- **Do not** let a client infer ownership from an occupied port, a tmux name, or a stale PID — the coordination
-  doc is explicit that clients must not opportunistically start/replace/kill `serve`. Encode an explicit
-  server-owner contract instead.
-- Generalize the ownership ledger the operator is hand-running (context-id acquire/release so a coordinated
-  rebuild can wait for an empty ledger) into a first-class, queryable serve concept — this is the seed of
-  H3 team/multi-user mode, so design the identity model with that in mind.
+- Treat [`superpowers/plans/2026-07-20-r2g-stable-ingress.md`](superpowers/plans/2026-07-20-r2g-stable-ingress.md)
+  as the sole owner of release/process identity, readiness, request affinity, safe store ownership, drain, and
+  promotion/rollback. This item starts only at R2g's public operator contract.
+- **Do not** let a client infer ownership from an occupied port, a tmux name, or a stale PID. Clients must not
+  opportunistically start, replace, or kill `serve`; preserve R2g's explicit owner and affinity evidence.
+- Generalize any post-R2g operator UX around the durable execution/attempt/task/session identities rather than a
+  hand-maintained context-only ledger. This is the seed of H3 team/multi-user mode.
 - Fix the creds-refresh plist's hardcoded path (`/Users/wesleyjinks/code/a2a-bridge/...`) as part of this —
   it's a deployment-portability bug.
 - File the accepted work as GitHub issues (canonical intake) and link into the reliability roadmap only when
@@ -305,8 +370,9 @@ confidence 93 that it's viable); needs its own spec → dual-review → live-gat
 pool (H2-2) and controller cleanup (H0-2) stabilize the pieces it would unify.
 See the runtime-workflows + Agent/Provider-split RFC ([`rfc-agents-workflows.md`](rfc-agents-workflows.md),
 [diagram](rfc-agents-workflows-diagram.html), and [Part II — memory/delegation](rfc-agents-workflows-part2-memory-delegation.md)),
-which concludes those capability shifts are **orthogonal to L5** and can land first; it also surfaced a
-Phase-0 registry defect ([issue #35](https://github.com/shoedog/a2acp/issues/35)).
+which concludes those capability shifts are **orthogonal to L5** and can land first. Its Phase-0 registry defect
+([issue #35](https://github.com/shoedog/a2acp/issues/35)) is **closed**, with the fix merged through PR #43; it is
+no longer a prerequisite blocker.
 
 ### H3-2 ★★ A2A federation v1 (L1)
 Signed Agent Cards, per-caller identity (not just a forwarded bearer), TLS/authz, multi-tenancy. Called out
@@ -377,6 +443,6 @@ surfaces.
 3. **Under-enforcement, not over-protection, is the self-diagnosed security posture.** H0-3 (cwd gate),
    same-target write locks (H2-1), and the model-endpoint exfiltration accepted-risk all point the same way:
    containment is opt-in and has holes. Close the cheap ones early.
-4. **Build on the reliability program's concurrency payoff.** R2b/R2c/R3 have paid down enormous warm-session,
+4. **Build on the reliability program's concurrency payoff.** R2b/R2c/R2f0a/R3 have paid down enormous warm-session,
    cleanup-ordering, and cost-accounting debt with adversarial rigor. The warm pool (H2-2), budgets (H1-2), and
    engine unification (H3-1) should reuse those primitives, never re-derive them.

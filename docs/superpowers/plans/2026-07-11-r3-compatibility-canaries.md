@@ -1,6 +1,12 @@
 # R3 — Compatibility manifest and canary implementation plan
 
-- **Status:** overall R3 **ACTIVE**; R3a **MERGED** at `3927df3f` by PR #31; R3b
+- **Current status (2026-07-25):** overall R3 **ACTIVE**. R3a–R3c and R3d0–R3d3 are **MERGED**. R3d4
+  trusted triggers and R3d5 characterization/staged activation are **NOT STARTED**; after the active R2f work and
+  queued R2g stable-ingress boundary, those complete R3d before R3e OpenRouter and R3f OpenCode. R4 remains the
+  separate final promotion increment. Resume current sequencing from
+  [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md), not from an era-specific next
+  action retained inside the chronological evidence below.
+- **Historical delivery record:** R3a **MERGED** at `3927df3f` by PR #31; R3b
   **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at
   `983398427c9f04861a2f1da501a7650c4a1cdd80` by PR #33; R3d design is **APPROVED / MERGED**
   at exact design head `b54840a017b87521677f1f95c3f7be69de55361d` by PR #37, merge
@@ -2935,8 +2941,9 @@ implementation and release/compatibility lens then found no `WRONG`, three nonbl
 `/private/tmp/a2a-bridge-r3d1-fable-lens-review/review.md`, 7,837 bytes, SHA-256
 `088676af7e11beb4d33f1c4410dcf5bfc4a0e55dc1eaa689288934a04de01bed`. No post-approval mechanism change
 occurred; this fold only records review evidence and carries the three integration-hardening smells into R3d2.
-Continue R3d2 through the focused authority/admission/accounting plan above. Preserve R3c/R4 inputs, keep R2f
-operator lifecycle work out of R3d, and never touch the long-lived operator lifecycle from this slice.
+At that historical boundary, the next step was R3d2 through the focused authority/admission/accounting plan above;
+it later merged through PR #41. The boundary preserved R3c/R4 inputs, kept R2f operator lifecycle work out of R3d,
+and did not touch the long-lived operator lifecycle.
 
 ## R3e — OpenRouter provider expansion
 

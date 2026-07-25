@@ -4,7 +4,7 @@
 **Status:** Proposed (stub)
 
 **Amends:** ADR-0005 §8 (config schema, additively). **Builds on:** ADR-0028 (per-agent MCP).
-**Prerequisite:** [issue #35](https://github.com/shoedog/a2acp/issues/35) (registry reuse-criterion fix).
+**Prerequisite (satisfied):** [issue #35](https://github.com/shoedog/a2acp/issues/35) (registry reuse-criterion fix), merged in PR #43.
 **RFC:** [`../rfc-agents-workflows.md`](../rfc-agents-workflows.md) §3.
 
 ---
@@ -37,6 +37,6 @@ multiplies against the substrate axis.
   field on one agent is a load error.
 - **Warm-session invalidation classification** (a tested contract, not folklore): a provider/tools change
   falls out of config-only reuse and forces respawn + lease-drain; a pure `role_prompt`/model-default edit is
-  config-only and keeps the warm backend. This depends on the #35 fix, which adds `mcp`/`mcp_delivery`/
-  `watchdog` to the reuse criterion.
+  config-only and keeps the warm backend. The merged #35 fix adds `mcp`/`mcp_delivery`/`watchdog` to
+  the reuse criterion.
 - Provider slot-sharing by spawn-frozen `InstanceKey` and per-agent AgentCards are deferred, evidence-gated.

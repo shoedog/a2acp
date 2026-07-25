@@ -1,7 +1,9 @@
-# serve lifecycle & operator ergonomics (identity + preflight before daemon machinery)
+# serve lifecycle & operator ergonomics (post-R2g UX and supervision)
 
 **Roadmap:** H1-4 (★★) · **Labels:** `kind:enhancement`, `area:serve`, `area:cli`, `area:ops`, `priority:p2`, `status:triage`
 **Origin:** `SSOT_AGENTS_BRIDGE_COORDINATION.md` (live cross-repo request).
+**Dependency:** reliability R2g owns stable ingress, identity/readiness/affinity, safe store ownership, drain, and
+side-by-side promotion/rollback. This stub must consume that contract and must not duplicate it.
 
 ## Problem
 `serve` is a bare foreground process: no daemonization, no PID/owner record, no auto-port selection, no
@@ -10,22 +12,19 @@ the Agent Card cannot distinguish two differently configured servers). The opera
 hand-written `SERVICE.md` conventions, an ownership-ledger-by-context-id, and a creds-refresh launchd plist
 that hardcodes a checkout path. This is friction today, not hypothetically.
 
-## Scope (sequence deliberately — identity/preflight first, daemon machinery only after)
-- [ ] Config-fingerprint on the Agent Card so a client can confirm it's talking to the intended server.
-- [ ] `submit`/client preflight that checks the fingerprint + bound config before sending.
-- [ ] A real readiness signal: a `/health` endpoint, or formally bless `GET /.well-known/agent-card.json` as
-      the readiness contract.
-- [ ] Generalize the hand-run ownership ledger (context-id acquire/release; a coordinated rebuild waits for an
-      empty ledger) into a first-class, queryable serve concept. Design the identity model as the seed of
-      team/multi-user mode (H3-3).
+## Scope (post-R2g operator ergonomics)
+- [ ] Present R2g's release/process identity, readiness, affinity, drain, and recovery evidence through a friendly
+      local operator CLI; do not create a second fingerprint/readiness protocol.
+- [ ] Build discovery and diagnostics around the merged execution/attempt/task/session identities rather than a
+      hand-maintained context-only ownership ledger.
 - [ ] Fix the creds-refresh plist hardcoded path (`/Users/wesleyjinks/code/a2a-bridge/...`) — portability bug.
 - [ ] **Later / separate decision:** a supervised launchd/systemd contract with a PID/owner record. Do not
-      introduce daemon lifecycle machinery in this issue.
+      introduce daemon lifecycle machinery before R2g defines promotion, rollback, and predecessor drain.
 
 ## Non-goals / guardrails
 - A client must never infer ownership from an occupied port, a tmux name, or a stale PID, and must never
   opportunistically start/replace/kill `serve`. Encode an explicit server-owner contract instead.
 
 ## Value
-Removes real, current cross-repo friction and lays the identity groundwork for team mode (H3-3), budgets
-(H1-2), and federation (H3-2) without prematurely committing to daemon machinery.
+Removes real, current cross-repo friction and turns R2g's identity groundwork into usable operator experience for
+team mode (H3-3), budgets (H1-2), and federation (H3-2) without prematurely committing to daemon machinery.

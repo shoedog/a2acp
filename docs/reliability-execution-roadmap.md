@@ -1,35 +1,34 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main base:** `origin/main` at `345941db91a7d898884bfe79e573433484ccafcc` on 2026-07-20
-  (PR #46 merged the managed-agent MCP loopback guard, after PR #45 merged the provider-free #22/#24 R2f incident
-  intake, PR #44 merged the classified model-probe fix, PR #43 merged the registry/metrics fixes, and PR #42 merged
-  R3d3)
-- **Completed through:** R3d3 **MERGED** at `3c02bf3f`; standalone issues #35/#39 **MERGED** at `0f84a5ca`
-  and issue #30 **MERGED** at `0d628271`; issue #36 **MERGED** by PR #46 at `345941db`; R2f incident intake
-  **MERGED** by PR #45 at `db0eb28f`; R2e remains deferred and off the critical path
-- **Active slice:** R2f design is **APPROVED** on `agent/r2f-owner-design`, based directly on `345941db`; R2f0a
-  implementation, correction, native verification, and final cumulative reviews are complete on
-  `agent/r2f0a-identity-ledger` at exact integrated checkpoint
-  `7b01ab4bae167d3640050dfda5de7e1478728497`, tree
-  `7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e`. Integrated
+- **Current main base:** `origin/main` at `2685ffb78ef21c987b3f63f7aba1ddc096b01189` on 2026-07-25
+  (PR #48 merged R2f0a after PR #46 merged the managed-agent MCP loopback guard, PR #45 merged the provider-free
+  #22/#24 R2f incident intake, PR #44 merged the classified model-probe fix, PR #43 merged the registry/metrics
+  fixes, and PR #42 merged R3d3)
+- **Completed through:** R2f0a **MERGED** by PR #48 at `2685ffb78ef21c987b3f63f7aba1ddc096b01189`
+  (final PR head `630b9cc9d7ae86c323b183763b3d4e83bdbfc792`); R3d3 **MERGED** at `3c02bf3f`;
+  standalone issues #35/#39 **MERGED** at `0f84a5ca`, issue #30 **MERGED** at `0d628271`, issue #36
+  **MERGED** by PR #46 at `345941db`, and R2f incident intake **MERGED** by PR #45 at `db0eb28f`. R2e remains
+  deferred and off the critical path.
+- **Active slice:** R2f design is **APPROVED** and R2f0a is merged. Its integrated
   [native macOS verification](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md),
   [Sol/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md), and
-  [Fable/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) evidence is green; the two
-  reviews returned `APPROVE`. After this docs-only fold receives its own verification/review, R2f0a is ready for
-  PR/CI and merge; R2f0b is next only after merge and is not started.
+  [Fable/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) evidence is green; both
+  reviews returned `APPROVE`, and PR #48's Build/Lint/Coverage, macOS store, Windows unsupported-target, and CLA
+  checks passed. R2f0b is next and is not started.
 - **Issue #36 closure:** **FAIL-FIRST REGRESSIONS PROVED / TWO-LAYER GUARD IMPLEMENTED / FOCUSED GATES GREEN /
   FULL WORKSPACE GATE GREEN / PR #46 MERGED**. Config admission is **1/0**, core Codex/Kiro delivery is **14/0**,
   ACP framing is **1/0**, and the real-process MCP boundary is **6/0**. The canonical full serial workspace is
   **2,538/0/12 ignored** across **72** groups (**55** nonempty). Format/diff, workspace check, warnings-denied
   all-target Clippy, locked release workspace build, repository hygiene **37/7**, and dependency policy are
   green. No provider, compatibility, production-server, or live controller turn was exercised.
-- **R2f intake/design:** **#22 CONFIRMED / #24 PARTIALLY CONFIRMED / DETERMINISTIC CURRENT-MAIN PROBES GREEN /
+- **R2f intake/design:** **#22 BEHAVIOR CONFIRMED (GITHUB INTAKE CLOSED) / #24 PARTIALLY CONFIRMED AND OPEN /
+  #47 OPEN / DETERMINISTIC CURRENT-MAIN PROBES GREEN /
   D1-D11 OWNER-APPROVED / CLOSURE REVIEW 5 APPROVE / EVERY INHERITED ITEM FIXED / NO NEW WRONG OR SMELL /
   R2f0a IMPLEMENTATION+CORRECTION COMPLETE / [INTEGRATED NATIVE VERIFIED](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md) /
   [INTEGRATED FINAL SOL APPROVE](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md) /
   [INTEGRATED FINAL FABLE APPROVE](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) /
-  DOCS-FOLD VERIFICATION/REVIEW, PR/CI, MERGE NEXT / R2f0b NOT STARTED**.
+  PR #48 MERGED WITH GREEN CI / R2f0b NEXT AND NOT STARTED**.
   Fan-out policy, the three liveness clocks, workflow telemetry and its
   180-day/100,000-row/128-MiB retention boundary, provisional review budgets, and local-only destructive takeover
   were owner-approved on 2026-07-20. Health enforcement is explicitly production-operator-only; two-strike
@@ -111,10 +110,12 @@
   foreign-owner CI coverage, foreign-owner coverage for both selection wrappers, and any foreign-owned rollback-
   journal policy change only through a separate owner decision. No ignored live/provider test was forced. Locked-
   egress Linux could not fetch one missing `a2a-lf` dependency for the final six-line macOS test-only correction,
-  so it is not Linux proof. No GitHub CI, push, PR, merge, release, deployment, live canary, production-server
-  change, or post-merge operator build is proved. After this docs-only fold receives its own verification/review,
-  R2f0a is ready for PR/CI and merge. R2f0b is next only after merge and is not started; R2f overall, #22, #24,
-  R2g, and R4 are not complete.
+  so that attempt is not Linux proof. PR #48 later merged at
+  `2685ffb78ef21c987b3f63f7aba1ddc096b01189`; final head
+  `630b9cc9d7ae86c323b183763b3d4e83bdbfc792` passed Build/Lint/Coverage, macOS store, Windows unsupported-target,
+  and CLA checks. The merge does not by itself prove a release, deployment, live canary, production-server update,
+  or post-merge operator build. R2f0b is next and not started; R2f overall, the behavior retained from closed intake
+  #22, open #24/#47, R2g, R3d4/R3d5, R3e/R3f, and R4 are not complete.
 - **R3d3 closure:** **TENTH SOL APPROVE / SINGLE FABLE LENS COMPLETE / DOCS-ONLY REMEDIATION FOLDED / FINAL GATE
   GREEN / PR #42 MERGED** at merge `3c02bf3f`, code commit `1647fa6`, exact Sol-reviewed docs head `1637b5b`, and
   exact Fable-reviewed docs head `f7f9ebd`, after the original R3d3a-e checkpoints
@@ -809,11 +810,10 @@
   `SMELL`s, returned `READY`, and ended `GATE: APPROVE`. Its non-USD cost wording gap is fixed in this docs
   fold; its other verification/fault-boundary items remain accepted/nonblocking. R3b is
   **MERGED** at `504c1e43` by PR #32. Reviews are not compatibility evidence.
-- **Last merged full workspace gate:** PR #46 issue #36 host serial **2,538/0/12 ignored** across
-  **72** result groups (**55** nonempty). Format/diff, workspace all-target check, warnings-denied Clippy,
-  locked release build, repository hygiene **37/7**, dependency policy, PR Build/Lint/Coverage, and CLA were
-  green. Its config-admission, core-delivery, ACP-framing, and real-process MCP boundary gates passed as recorded
-  above without a provider turn.
+- **Last merged full workspace gate:** R2f0a's integrated native gate emitted **73** result groups with
+  **2,785 passed / 0 failed / 12 ignored / 0 measured / 0 filtered**. PR #48's final head then passed remote
+  Build/Lint/Coverage, macOS store, Windows unsupported-target, and CLA checks, including the root parent-authority
+  and platform-portability gates. No provider turn was part of those deterministic gates.
 - **Current execution boundary:** R3b has four minimal bridge-smoke support cases (Codex host,
   Codex reader, Claude 0.44 host, Claude 0.55 Fable reader) and five explicit non-goal/unrun historical
   rows (Claude direct CLI, Claude 0.55 host ACP, managed-no-egress negative, Kiro host, Kiro reader).
@@ -826,16 +826,13 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** verify/review this docs-only fold, then proceed to PR/CI and merge for integrated R2f0a
-  checkpoint `7b01ab4bae167d3640050dfda5de7e1478728497`, tree
-  `7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e`. The integrated
-  [native](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md),
-  [Sol/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md), and
-  [Fable/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) evidence is green. R2f0b
-  follows only after merge and is not started.
+- **Next action:** start R2f0b from current main. First freeze the exact post-PR-#48 base and write the focused
+  implementation boundary for meaningful progress, terminal evidence, and recorder work before editing. Include
+  deterministic coverage for open #47's served-unary server/client terminal-delivery split and preserve the
+  generic/Kiro-specific evidence split for open #24. R2f0b is not started.
   Do not launch a provider-specific reproduction or intentionally exhaust Kiro quota for R2f; that live gate requires
-  separate authorization from any design-review turn. OpenRouter/OpenCode remain R3e/R3f after the reliability/
-  open-issue work and before R4.
+  separate authorization from any design-review turn. After R2f, continue R2g, then finish R3d4/R3d5 before R3e
+  OpenRouter and R3f OpenCode; R4 remains the final release-promotion increment.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
 - **Active focused owner design:**
@@ -862,9 +859,17 @@ R2a provenance (MERGED)
   -> R2b3 API/provider mapping + remaining container/dispatch observation (MERGED)
   -> R2c explicit one-turn billable smoke (MERGED)
        -> R2d local non-billable fallback plan (MERGED)
-            -> R3 compatibility manifest + pinned/floating canaries + OpenRouter/OpenCode
+            -> R3 compatibility manifest + pinned/floating/scheduling foundation
                (R3a/R3b/R3c/R3d0/R3d1/R3d2/R3d3 MERGED; R3d DESIGN MERGED)
-                 -> R4 reproducible dependency/image pins + release promotion gate
+
+R2f0a identity/ledger/stats (MERGED by PR #48)
+  -> R2f0b/1a/1b/2/3a/3b/3c/4 liveness, takeover, health, and closure (ACTIVE; 0b NEXT)
+    -> R2g stable ingress/release handoff (QUEUED)
+      -> R3d4 trusted triggers and remote check publication (NOT STARTED)
+        -> R3d5 characterization and staged activation (NOT STARTED)
+          -> R3e OpenRouter (NOT STARTED)
+            -> R3f OpenCode (NOT STARTED)
+              -> R4 reproducible dependency/image pins + release promotion gate (NOT STARTED)
 
 R2e authenticated in-process fallback is DEFERRED and off the critical path.
 It requires R2d plus a separately approved authenticated-policy/attestation design.
@@ -875,20 +880,20 @@ inherited families, returned `REVISE` on the direct-unary durability/identity bo
 `SMELL` are folded. Distinct closure review 4 fixed those items and all six older families, retained the incident
 terminal contract `PARTIAL`, and returned `REVISE` on the missing authoritative ACP terminal-evidence mechanism. That
 `WRONG` is folded. Distinct closure review 5 fixed that item and all review-4 regression families, found no new
-`WRONG` or `SMELL`, and returned `APPROVE`. R2f0a implementation, correction, native verification, and final cumulative reviews are complete at integrated
-checkpoint `7b01ab4bae167d3640050dfda5de7e1478728497`, tree
+`WRONG` or `SMELL`, and returned `APPROVE`. R2f0a implementation, correction, native verification, and final
+cumulative reviews are complete at integrated checkpoint `7b01ab4bae167d3640050dfda5de7e1478728497`, tree
 `7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e`. Integrated
 [native evidence](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md) is green, and independent
 concurrent [Sol/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md) and
 [Fable/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) reviews both returned `APPROVE`.
-After this docs-only fold receives its own verification/review, PR/CI and merge remain before R2f0b may start.
-Health
-enforcement is explicit-production-only with approved differential and self-clearing recovery, planned drain
+PR #48 merged R2f0a at `2685ffb78ef21c987b3f63f7aba1ddc096b01189` with green CI. R2f0b may now start
+from current main but is not started. Health enforcement is explicit-production-only with approved differential
+and self-clearing recovery, planned drain
 preserves exact running/warm ownership, and process deployment is split at an approved R2f3c-to-R2g boundary. No
 owner bound remains open;
 R3d may display a future read-only R2f health result but cannot perform operator lifecycle actions.
 
-R2f (active) -> R2g stable ingress (queued) -> R3e/R3f provider integrations -> R4 release promotion.
+R2f (active at R2f0b) -> R2g stable ingress -> R3d4/R3d5 -> R3e/R3f -> R4 release promotion.
 ```
 
 M4 Slice 3b/3c remains parked until the reliability exit gates in
@@ -908,9 +913,9 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2c — live smoke | **MERGED** at `be54bc51` by PR #28 (initial Fable/xhigh review `REVISE`; closure re-review `APPROVE` at `0e3b8ce`; attempt 1 rejected for initial `0644`; permission-fold review `APPROVE` at `23384622`; create-new closure review `APPROVE` at `ffb7e891`; full host workspace **1,933 / 0 / 12 ignored**; separately authorized attempt 2 on `1c9e4a43` passed artifact-exact in 8.770 s with mode `0600`, exact terminal `PONG`, no retry/fallback, and clean teardown) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
-| R2f — phase-aware liveness/takeover | **ACTIVE / R2f0a IMPLEMENTATION+CORRECTION COMPLETE / INTEGRATED NATIVE VERIFIED / INTEGRATED SOL+FABLE APPROVE / DOCS-FOLD VERIFICATION/REVIEW, PR/CI, MERGE NEXT / R2f0b NOT STARTED** (31-second ACP and 6-second cancellation observable bounds) at exact checkpoint `7b01ab4bae167d3640050dfda5de7e1478728497` on `agent/r2f0a-identity-ledger`, tree `7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e` | [R2f owner design](superpowers/specs/2026-07-20-r2f-owner-design.md), [implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md), [short-bound spike](superpowers/spikes/2026-07-20-r2f-short-bound-validation.md), [review 1](superpowers/reviews/2026-07-20-r2f-owner-design-sol-review-1.md), [closure review 1](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-1.md), [failed closure re-review 2](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-2-failed.md), [closure review 3](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-3.md), [closure review 4](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-4.md), [closure review 5](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-5.md), historical July 24 [Sol](superpowers/reviews/2026-07-24-r2f0a-final-cumulative-sol-review.md), [Fable](superpowers/reviews/2026-07-24-r2f0a-final-cumulative-fable-review.md), and [native](superpowers/reviews/2026-07-24-r2f0a-native-verification.md), integrated [Sol](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md), [Fable](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md), and [native](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md) | Verify/review this docs-only fold, then PR/CI and merge; implement `0b/1a/1b/2/3a/3b/3c/4` only after merge. |
+| R2f — phase-aware liveness/takeover | **ACTIVE / R2f0a MERGED BY PR #48 / GREEN CI / R2f0b NEXT AND NOT STARTED** (31-second ACP and 6-second cancellation observable bounds). R2f0a integrated checkpoint `7b01ab4bae167d3640050dfda5de7e1478728497`; final PR head `630b9cc9d7ae86c323b183763b3d4e83bdbfc792`; merge `2685ffb78ef21c987b3f63f7aba1ddc096b01189`. | [R2f owner design](superpowers/specs/2026-07-20-r2f-owner-design.md), [implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md), [short-bound spike](superpowers/spikes/2026-07-20-r2f-short-bound-validation.md), integrated [Sol](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md), [Fable](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md), and [native](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md) | Start R2f0b from merged main; then implement `1a/1b/2/3a/3b/3c/4` in order. |
 | R2g — stable ingress/release handoff | **QUEUED AFTER R2f / SCOPE BOUNDARY APPROVED / FOCUSED OWNER DESIGN NOT STARTED** | [R2g queued plan](superpowers/plans/2026-07-20-r2g-stable-ingress.md) | Stable local ingress, exact task/session/SSE affinity, side-by-side release promotion/rollback, safe store ownership, predecessor drain, and operator integration. No provider integration is mixed into this slice. |
-| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at `b54840a` by PR #37; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`; R3d2 **MERGED** by PR #41 at `06e22faf`; R3d3 **MERGED** by PR #42 at `3c02bf3f` after the tenth Sol approval, single Fable release/compatibility lens, docs remediation, exact deterministic gates, and green CI/CLA. Exact R3d3 evidence-fold head `d3bf503` passed binary **779/0/0**, full workspace **2,519/0/12 ignored**, and every deterministic release/validator gate; the full review/remediation chain and hashes remain in the focused plan and cursor detail above. No live compatibility gate or production state/iCloud/runtime/notification effect was part of R3d3. `INC-SHARED-RESTART-RECOVERY-2026-07-19` remains R2f lifecycle evidence, not R3d3 verification or root-cause proof. | [R3d3 implementation plan](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md) | Evidence/index/retention foundation, sealing, cold storage, GC/migration, then status/outbox/notifications; merged default-off boundary. |
+| R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** by PR #37; R3d0–R3d3 **MERGED** by PRs #38/#40/#41/#42. R3d4 trusted triggers and R3d5 characterization/activation are **NOT STARTED**. R3e OpenRouter and R3f OpenCode are **NOT STARTED** and follow completed R3d. R3d3 remains default-off; no live compatibility gate or production state/iCloud/runtime/notification effect was part of it. | [R3 design/implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md), [R3d3 plan](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md) | After R2f/R2g, implement R3d4 triggers, R3d5 characterization/activation, R3e, then R3f; each keeps its own reviewed, default-off or separately authorized effect boundary. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
 R2b2 executes on one merge branch in four durable internal commits: **2a** observer/storage/registry
@@ -979,6 +984,20 @@ separation, and a non-disruptive generation drain/rotate design that never inter
 sessions. R3d remains one-shot only and may later display, but never act on, a separate R2f health artifact.
 Do not automatically replay the failed request or treat the isolated review as compatibility evidence.
 
+### Active incident: served Codex terminal failure did not reach `submit`
+
+[GitHub #47](https://github.com/shoedog/a2acp/issues/47) records a served-unary Codex request that reached
+configuration resolution, remained client-silent for one hour, then logged `acp.prompt_failed` and generic
+`AgentCrashed` on the server while the separate `submit` client stayed sleeping until the operator interrupted it.
+An earlier turn on the same route completed, so the evidence does not establish categorical provider/model failure.
+
+R2f0a now supplies caller-visible execution/attempt identity and a mandatory direct-unary safety row, closing only
+the missing-identity/ledger substrate. No post-merge reproduction proves terminal delivery, deepest-cause
+projection, progress/outcome metrics, or the distinction between provider execution timeout and client/result-
+delivery stall. R2f0b owns the deterministic terminal-evidence and recorder regression; R2f1b owns the bounded
+delivery/liveness behavior; R2f4 owns provider-free closure and any separately authorized adapter conformance.
+Do not retry the historical accepted prompt or infer closure from the R2f0a merge.
+
 ### Resolved incident: synchronized but expired Claude OAuth reached billable prompt
 
 `INC-R3B-CLAUDE-OAUTH-EXPIRY-2026-07-16` records authorized pinned attempt 1. The exact candidate
@@ -1014,7 +1033,7 @@ selected and when delayed recovery still reaches the fake adapter; fresh-token a
 reach it. Full deterministic/review closure, a fresh host login, post-login sync, two green Claude doctors,
 and separate operator authorization preceded attempt 2; attempt 1 itself was never replayed.
 
-### Active incident: reader containers remained created but never started
+### Retained incident: reader containers remained created but never started
 
 `INC-R3B-CONTAINER-START-STALL-2026-07-16` records authorized pinned attempt 2. Exact candidate SHA-256
 `323b4e21...a079` and manifest `5d18cefe...c235d828` ran one four-case aggregate with zero
@@ -1199,8 +1218,9 @@ Next action:
   PR #43 at `0f84a5ca9975d260279282f4198e11a080767dcb`, then #30 merged through PR #44 at
   `0d628271a910168230491e8610a31f92f7063cbc`. R2f incident intake merged through PR #45 at
   `db0eb28f48ad5f15e6848d1975d6de6776e13692`, and issue #36 merged through PR #46 at
-  `345941db91a7d898884bfe79e573433484ccafcc`, the current main. The active R2f0a source branch is
-  `agent/r2f0a-identity-ledger` at exact integrated checkpoint
+  `345941db91a7d898884bfe79e573433484ccafcc`. R2f0a then merged through PR #48 at current main
+  `2685ffb78ef21c987b3f63f7aba1ddc096b01189`, final PR head
+  `630b9cc9d7ae86c323b183763b3d4e83bdbfc792`. Its integrated implementation checkpoint was
   `7b01ab4bae167d3640050dfda5de7e1478728497`, tree
   `7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e`. D1-D11 remain approved and the complete design-review chain is
   preserved. Closure re-review 2 accepted work but failed null-final with no verdict and no retry. Distinct clean-room
@@ -1215,9 +1235,10 @@ Next action:
   [native macOS verification](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md) is green, and
   independent concurrent [Sol/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md) and
   [Fable/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) exact-head reviews both returned
-  `APPROVE`. After this docs-only fold receives its own verification/review, R2f0a is ready for PR/CI and merge;
-  R2f0b remains next only after merge and is not started. No live/billable canary, production server update, release,
-  deployment, GitHub CI, PR merge, post-merge operator build, R2f completion, #22 closure, or #24 closure is proved. The design and exact slice order are in
+  `APPROVE`. PR #48's Build/Lint/Coverage, macOS store, Windows unsupported-target, and CLA checks passed. R2f0b is
+  next and is not started. No live/billable canary, production-server update, release, deployment, or post-merge
+  operator build is proved by that merge. R2f completion, the behavior retained from closed intake #22, and open
+  #24/#47 remain unproved. The design and exact slice order are in
   `2026-07-20-r2f-owner-design.md` and `2026-07-11-r2f-phase-aware-liveness.md`. R3d3's focused restart plan remains
   `2026-07-19-r3d3-evidence-status-retention.md`. R3d3a through R3d3e are checkpointed at `21427e6`,
   `739495a`, `7ed0446`, `84fbbf3`, and `33ec5c3`. Exact `db109b7` received bridge-mediated Sol/xhigh **REVISE**

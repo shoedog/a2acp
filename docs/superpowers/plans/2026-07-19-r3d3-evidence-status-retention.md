@@ -1,6 +1,12 @@
 # R3d3 — evidence, status, and retention implementation plan
 
-**Status:** R3d3a through R3d3e are checkpointed at `21427e6`, `739495a`, `7ed0446`, `84fbbf3`, and `33ec5c3` on
+**Current status (2026-07-25):** R3d3 is **MERGED** by PR #42 at
+`3c02bf3f419da8bcec032f2d84609d6db9e4fcc6`. R3d4 trusted triggers and remote check publication and R3d5
+characterization/staged activation are **NOT STARTED**. Resume their sequencing from the central reliability
+roadmap; R3d3 remains a merged default-off foundation and did not itself activate production effects.
+
+**Historical closure record:** R3d3a through R3d3e were checkpointed at `21427e6`, `739495a`, `7ed0446`,
+`84fbbf3`, and `33ec5c3` on
 `agent/reliability-r3d3-evidence-retention` from merged R3d2 `origin/main`
 `06e22fafaf33d67524b46f35d12124505b6ecf9a` (PR #41). The first two bridge-mediated Sol/xhigh adversarial
 implementation reviews returned **REVISE** on exact `db109b7` and `f485092`; their remediations are checkpointed at
@@ -154,8 +160,8 @@ workspace log have SHA-256 `f0aab23069ff1fe9ca5a87764de719d7502ed81d36d8a44ebda9
 release binary remains SHA-256 `9d24382603a637ad777cf58f2c16ed6d1e7a6f5e18f3635dd72a91ba6c9452a0`. This docs-only
 evidence fold reproduced every gate at exact head `d3bf503`: binary **779/0/0**, workspace
 **2,519/0/12 ignored**, and binary/workspace/release SHA-256 `7a10121e...195a`, `61ffea8c...89a3`, and
-`9d243826...52a0`. Non-draft PR #42 is open and mergeable; at PR creation CLA was green and Build/Lint/Coverage was
-running. The
+`9d243826...52a0`. At that historical boundary, non-draft PR #42 was open and mergeable; it later merged at the
+current-status commit above. The
 implementation remains local, non-billable, default-off, and has one merge boundary; the separately authorized
 Fable review was the only provider turn in this closure step.
 
@@ -644,8 +650,8 @@ isolated probe observed the pre-existing bridge-core start-probe timeout; no sou
 authoritative canonical suites at `f7f9ebd` and `e4cd340` passed it. Preserve that as verifier/host timing evidence,
 not a rebaseline or an R3d3 fix. Exact evidence-fold head `d3bf503` reproduced every gate with binary **779/0/0**
 and workspace **2,519/0/12 ignored**; binary/workspace/release SHA-256 are `7a10121e...195a`,
-`61ffea8c...89a3`, and `9d243826...52a0`. Non-draft PR #42 is open and mergeable; at PR creation CLA was green and
-Build/Lint/Coverage was running. Merge only when every required check is green.
+`61ffea8c...89a3`, and `9d243826...52a0`. Non-draft PR #42 subsequently merged with required checks green at the
+current-status commit above.
 
 One dogfood incident is deliberately deferred outside R3d3 correctness. Operator release `983398427c9f0486`
 served a healthy agent card/model catalog and green Codex doctor/provenance checks with zero unfinished tasks and
@@ -745,7 +751,6 @@ stale next-action bullet while every inspected mechanism checked out. This fold 
 the documentation-precision `SMELL`, accepts one cosmetic source `SMELL` as nonblocking, and does not run a Fable
 rereview. Artifact SHA-256 is `8b8bc4e0...bc07`. Exact remediation head `e4cd340` passes binary **779/0/0**, full
 workspace **2,519/0/12 ignored**, and every deterministic gate. Exact evidence-fold head `d3bf503` reproduced those
-gates; non-draft PR #42 is open and required checks must be green before merge. No production operator rebuild or
-swap is
+gates; non-draft PR #42 subsequently merged with required checks green. No production operator rebuild or swap was
 part of this slice; preserve `INC-SHARED-RESTART-RECOVERY-2026-07-19` for later R2f investigation rather than
 treating restart as a fix.
