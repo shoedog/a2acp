@@ -47,7 +47,11 @@ const CLEANUP_TIMEOUT_SECS: u64 = 10;
 const MAX_CAPTURED_TEXT_BYTES: usize = 1024;
 const DIAGNOSTIC_CAPACITY: usize = 128;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
-const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+// Shared with `compatibility` so plan-time pinning and smoke-time rechecks agree
+// (release keeps the production cap; debug/test binaries are unstripped and larger).
+// A stale 256 MiB copy here made the guarded-smoke executable recheck fail its
+// bounded read in hermetic verify and misreport `smoke.fallback_executable_drift`.
+use crate::compatibility::MAX_EXECUTABLE_BYTES;
 const MAX_ARTIFACT_TEXT_BYTES: usize = 16 * 1024;
 const MAX_CATALOG_ENTRIES: usize = 128;
 const MAX_CATALOG_VALUE_BYTES: usize = 256;
