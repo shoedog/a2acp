@@ -569,7 +569,7 @@ fn tagged_validation_after_metadata() {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum HistoryMutationFailpointKind {
     AdmissionIo,
     RetentionIo,
@@ -578,6 +578,7 @@ enum HistoryMutationFailpointKind {
 }
 
 #[cfg(test)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct HistoryMutationFailpoint {
     path: std::path::PathBuf,
     attempt_id: String,
@@ -585,7 +586,7 @@ struct HistoryMutationFailpoint {
 }
 
 #[cfg(test)]
-static HISTORY_MUTATION_FAILPOINT: std::sync::OnceLock<Mutex<Option<HistoryMutationFailpoint>>> =
+static HISTORY_MUTATION_FAILPOINTS: std::sync::OnceLock<Mutex<HashSet<HistoryMutationFailpoint>>> =
     std::sync::OnceLock::new();
 
 #[cfg(test)]
@@ -594,19 +595,21 @@ fn history_mutation_failpoint(
     attempt_id: &bridge_core::ids::AttemptId,
     kind: HistoryMutationFailpointKind,
 ) -> Result<(), bridge_core::workflow_history::LedgerError> {
-    let mut armed = HISTORY_MUTATION_FAILPOINT
-        .get_or_init(|| Mutex::new(None))
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let failpoint = HistoryMutationFailpoint {
+        path: path.to_path_buf(),
+        attempt_id: attempt_id.as_str().to_owned(),
+        kind,
+    };
+    let mut armed = HISTORY_MUTATION_FAILPOINTS
+        .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
-        .unwrap();
-    let matches = armed.as_ref().is_some_and(|failpoint| {
-        Some(failpoint.path.as_path()) == path
-            && failpoint.attempt_id == attempt_id.as_str()
-            && failpoint.kind == kind
-    });
-    if !matches {
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !armed.remove(&failpoint) {
         return Ok(());
     }
-    let failpoint = armed.take().unwrap();
     if failpoint.kind == HistoryMutationFailpointKind::TerminalSqliteFull {
         let error = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
@@ -11883,6 +11886,9 @@ mod r2f0a_history_tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     static PLATFORM_BOOTSTRAP_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    // Singleton platform-open hook slots require test-level serialization under default-parallel runs.
+    static PLATFORM_OPEN_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     struct PlatformPauseGuard {
         path: std::path::PathBuf,
@@ -13278,6 +13284,9 @@ mod r2f0a_history_tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn run_owner_owned_sidecar_controls() {
+        let _platform_open_test_serial_guard = PLATFORM_OPEN_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for (case, kind, route) in [
             (
                 "configured-read-only",
@@ -13972,6 +13981,9 @@ mod r2f0a_history_tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn selected_platform_creators_wait_and_reprobe_untagged_and_migrating_winners() {
+        let _platform_open_test_serial_guard = PLATFORM_OPEN_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for point in [
             PlatformOpenPausePoint::WhileUntaggedUnderSchemaLock,
             PlatformOpenPausePoint::AfterMigratingBeforeReady,
@@ -14575,6 +14587,11 @@ mod r2f0a_history_tests {
                 assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
                 assert_eq!(metadata.permissions().mode() & 0o777, 0);
                 assert!(!anchor.join("first/second").exists());
+                assert_eq!(
+                    unsafe { libc::umask(0o077) },
+                    0o777,
+                    "the isolated owner-masking child must retain its semantic umask until exit cleanup"
+                );
             }
             "wrong-owner-anchor" | "read-only-anchor" => {
                 assert!(std::fs::read_dir(&anchor).unwrap().next().is_none());
@@ -14913,14 +14930,17 @@ mod r2f0a_history_tests {
         attempt_id: &bridge_core::ids::AttemptId,
         kind: HistoryMutationFailpointKind,
     ) {
-        *HISTORY_MUTATION_FAILPOINT
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .unwrap() = Some(HistoryMutationFailpoint {
+        let failpoint = HistoryMutationFailpoint {
             path: store.history_path.clone().unwrap(),
             attempt_id: attempt_id.as_str().to_owned(),
             kind,
-        });
+        };
+        let inserted = HISTORY_MUTATION_FAILPOINTS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(failpoint);
+        assert!(inserted, "an identical history mutation failpoint leaked");
     }
 
     fn insert_configured_fixture_rows(conn: &rusqlite::Connection, slots: u64) {
@@ -21527,6 +21547,10 @@ mod r2f0a_history_tests {
         use fs2::FileExt as _;
         use std::os::unix::fs::{symlink, OpenOptionsExt as _, PermissionsExt as _};
 
+        let _platform_open_test_serial_guard = PLATFORM_OPEN_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
             let mut value = path.as_os_str().to_os_string();
             value.push(suffix);
@@ -21724,6 +21748,10 @@ mod r2f0a_history_tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn public_platform_writer_recovers_untagged_crash_residue_wal_and_shm() {
+        let _platform_open_test_serial_guard = PLATFORM_OPEN_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         fn with_suffix(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
             let mut value = path.as_os_str().to_os_string();
             value.push(suffix);
@@ -22475,6 +22503,9 @@ mod r2f0a_history_tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn platform_opener_reprobes_kind_after_winning_schema_lock() {
+        let _platform_open_test_serial_guard = PLATFORM_OPEN_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("opposite-kind-race.sqlite");
         let canonical_path = std::fs::canonicalize(directory.path())
@@ -22515,6 +22546,9 @@ mod r2f0a_history_tests {
     fn platform_initial_probe_hook_timeout_is_typed_bounded_and_cleans_up() {
         use bridge_core::workflow_history::LedgerUnavailableReason as R;
 
+        let _platform_open_test_serial_guard = PLATFORM_OPEN_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("initial-probe-timeout.sqlite");
         drop(SqliteStore::open(&path).unwrap());
@@ -22622,6 +22656,9 @@ mod r2f0a_history_tests {
     fn platform_interruption_before_migrating_marker_preserves_legacy_wal_policy() {
         use bridge_core::workflow_history::LedgerUnavailableReason as R;
 
+        let _platform_open_test_serial_guard = PLATFORM_OPEN_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("platform-pre-marker.sqlite");
         drop(SqliteStore::open(&path).unwrap());
@@ -22836,6 +22873,9 @@ mod r2f0a_history_tests {
 
     #[test]
     fn platform_migration_stays_migrating_until_physical_verification_finishes() {
+        let _platform_open_test_serial_guard = PLATFORM_OPEN_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("platform-verify-transition.sqlite");
         let canonical_path = std::fs::canonicalize(directory.path())
@@ -23270,6 +23310,205 @@ mod r2f0a_history_tests {
             )
             .unwrap();
         assert_eq!(counters, (17_408, 1));
+    }
+
+    #[tokio::test]
+    async fn configured_mutation_failpoints_are_isolated_by_store() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let first_directory = tempfile::tempdir().unwrap();
+        let first_path = first_directory.path().join("first-configured-store.sqlite");
+        let first_store = SqliteStore::open_shared_history(&first_path).unwrap();
+        let first = reservation_with_ids(
+            "exec-a2111111111111111111111111111111",
+            "attempt-a2111111111111111111111111111111",
+        );
+
+        let second_directory = tempfile::tempdir().unwrap();
+        let second_path = second_directory
+            .path()
+            .join("second-configured-store.sqlite");
+        let second_store = SqliteStore::open_shared_history(&second_path).unwrap();
+        let second = reservation_with_ids(
+            "exec-a2222222222222222222222222222222",
+            "attempt-a2222222222222222222222222222222",
+        );
+
+        arm_history_mutation_failpoint(
+            &first_store,
+            &first.identity.attempt_id,
+            HistoryMutationFailpointKind::AdmissionIo,
+        );
+        arm_history_mutation_failpoint(
+            &second_store,
+            &second.identity.attempt_id,
+            HistoryMutationFailpointKind::AdmissionIo,
+        );
+
+        assert_plain_error(first_store.reserve(&first).await.unwrap_err(), R::Io);
+        assert_plain_error(second_store.reserve(&second).await.unwrap_err(), R::Io);
+
+        for (store, row) in [(&first_store, &first), (&second_store, &second)] {
+            let state: (i64, i64, i64, i64, i64) = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM attempt_identities WHERE attempt_id=?1),
+                         (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1),
+                         (SELECT COUNT(*) FROM workflow_history_attachment WHERE attempt_id=?1),
+                         charged_bytes, slots_used
+                     FROM workflow_history_allocation WHERE singleton=1",
+                    rusqlite::params![row.identity.attempt_id.as_str()],
+                    |record| {
+                        Ok((
+                            record.get(0)?,
+                            record.get(1)?,
+                            record.get(2)?,
+                            record.get(3)?,
+                            record.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(state, (0, 0, 0, 0, 0));
+        }
+
+        first_store.reserve(&first).await.unwrap();
+        second_store.reserve(&second).await.unwrap();
+        for store in [&first_store, &second_store] {
+            let counters: (i64, i64) = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT charged_bytes, slots_used
+                     FROM workflow_history_allocation WHERE singleton=1",
+                    [],
+                    |record| Ok((record.get(0)?, record.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(counters, (17_408, 1));
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_mutation_failpoint_mismatches_do_not_consume_exact_entry() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-mismatch-control.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let row = reservation_with_ids(
+            "exec-a3111111111111111111111111111111",
+            "attempt-a3111111111111111111111111111111",
+        );
+        let other = reservation_with_ids(
+            "exec-a3222222222222222222222222222222",
+            "attempt-a3222222222222222222222222222222",
+        );
+        arm_history_mutation_failpoint(
+            &store,
+            &row.identity.attempt_id,
+            HistoryMutationFailpointKind::AdmissionIo,
+        );
+
+        let mismatched_path = directory.path().join("another-configured-store.sqlite");
+        assert!(history_mutation_failpoint(
+            Some(&mismatched_path),
+            &row.identity.attempt_id,
+            HistoryMutationFailpointKind::AdmissionIo,
+        )
+        .is_ok());
+        assert!(history_mutation_failpoint(
+            store.history_path.as_deref(),
+            &other.identity.attempt_id,
+            HistoryMutationFailpointKind::AdmissionIo,
+        )
+        .is_ok());
+        assert!(history_mutation_failpoint(
+            store.history_path.as_deref(),
+            &row.identity.attempt_id,
+            HistoryMutationFailpointKind::RetentionIo,
+        )
+        .is_ok());
+
+        assert_plain_error(store.reserve(&row).await.unwrap_err(), R::Io);
+        let state: (i64, i64, i64, i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM attempt_identities WHERE attempt_id=?1),
+                     (SELECT COUNT(*) FROM workflow_attempt_summaries WHERE attempt_id=?1),
+                     (SELECT COUNT(*) FROM workflow_history_attachment WHERE attempt_id=?1),
+                     charged_bytes, slots_used
+                 FROM workflow_history_allocation WHERE singleton=1",
+                rusqlite::params![row.identity.attempt_id.as_str()],
+                |record| {
+                    Ok((
+                        record.get(0)?,
+                        record.get(1)?,
+                        record.get(2)?,
+                        record.get(3)?,
+                        record.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(state, (0, 0, 0, 0, 0));
+
+        store.reserve(&row).await.unwrap();
+        let counters: (i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT charged_bytes, slots_used
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |record| Ok((record.get(0)?, record.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counters, (17_408, 1));
+    }
+
+    #[test]
+    fn identical_history_mutation_failpoint_arm_fails_loudly_and_preserves_entry() {
+        use bridge_core::workflow_history::LedgerUnavailableReason as R;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configured-duplicate-arm.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let row = reservation_with_ids(
+            "exec-a4111111111111111111111111111111",
+            "attempt-a4111111111111111111111111111111",
+        );
+        arm_history_mutation_failpoint(
+            &store,
+            &row.identity.attempt_id,
+            HistoryMutationFailpointKind::AdmissionIo,
+        );
+
+        let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            arm_history_mutation_failpoint(
+                &store,
+                &row.identity.attempt_id,
+                HistoryMutationFailpointKind::AdmissionIo,
+            );
+        }));
+        assert!(duplicate.is_err(), "an identical arm must fail loudly");
+        assert_plain_error(
+            history_mutation_failpoint(
+                store.history_path.as_deref(),
+                &row.identity.attempt_id,
+                HistoryMutationFailpointKind::AdmissionIo,
+            )
+            .unwrap_err(),
+            R::Io,
+        );
     }
 
     #[tokio::test]
