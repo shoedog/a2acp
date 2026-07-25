@@ -1,9 +1,11 @@
 # R2f — Phase-aware liveness and safe takeover plan
 
-- **Status:** DESIGN APPROVED by clean-room Sol/xhigh closure review 5; D1-D11 settled; every inherited item fixed;
-  no new `WRONG` or `SMELL`; R2f0a implementation-complete and fully host-verified at source checkpoint
-  `74bb1283` on `agent/r2f0a-identity-ledger`; final frozen-head Sol/xhigh full-branch review is pending; R2f0b
-  follows only after the R2f0a review/merge boundary
+- **Status:** DESIGN APPROVED by clean-room Sol/xhigh closure review 5; D1-D11 settled; R2f0a implementation and
+  correction work complete at folded code checkpoint `9761b3b78c89cca079ddb1d9376514fceb77e0df` on
+  `agent/r2f0a-identity-ledger`, with approved candidate `d7f20d37a9fda493c0b8dc18339489bfe1a059a3` /
+  tree `1803a888cf77fdee378367404179cc9ba4085ee6`; final native evidence is green and independent concurrent
+  Sol/xhigh and Fable/xhigh cumulative reviews both returned `APPROVE`; ready for final operator-branch exact-head
+  review, PR/CI, and merge; R2f0b is next only after that merge and is not started
 - **Prerequisite:** R2b structured diagnostics merged; may proceed independently of R2c–R2e afterward
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -23,6 +25,12 @@
   [`../reviews/2026-07-20-r2f-owner-design-sol-closure-review-4.md`](../reviews/2026-07-20-r2f-owner-design-sol-closure-review-4.md)
 - **Closure review 5 — APPROVE:**
   [`../reviews/2026-07-20-r2f-owner-design-sol-closure-review-5.md`](../reviews/2026-07-20-r2f-owner-design-sol-closure-review-5.md)
+- **Final cumulative Sol/xhigh review — APPROVE:**
+  [`../reviews/2026-07-24-r2f0a-final-cumulative-sol-review.md`](../reviews/2026-07-24-r2f0a-final-cumulative-sol-review.md)
+- **Final cumulative Fable/xhigh review — APPROVE:**
+  [`../reviews/2026-07-24-r2f0a-final-cumulative-fable-review.md`](../reviews/2026-07-24-r2f0a-final-cumulative-fable-review.md)
+- **Final native macOS verification:**
+  [`../reviews/2026-07-24-r2f0a-native-verification.md`](../reviews/2026-07-24-r2f0a-native-verification.md)
 - **Incident ids:** `INC-VERIFY-STALL-2026-07-11`, `INC-SHARED-WARM-CRASH-2026-07-16`,
   `INC-SHARED-SESSION-CAPACITY-2026-07-17`, `INC-SHARED-RESTART-RECOVERY-2026-07-19`,
   `INC-UNARY-NULL-FINAL-2026-07-20`,
@@ -138,29 +146,53 @@ owned by R2f; no current evidence attributes the original #24 incident specifica
 
 ## R2f0a — Execution/attempt identity, run ledger, and stats
 
-**Implementation checkpoint:** Owner-run host verification for source checkpoint `74bb1283` on
-`agent/r2f0a-identity-ledger` reports these gates and results:
+**Folded code checkpoint:** R2f0a implementation and correction work is complete at exact clean checkpoint
+`9761b3b78c89cca079ddb1d9376514fceb77e0df` on `agent/r2f0a-identity-ledger`. That operator-re-authored
+checkpoint is byte-identical to approved candidate `d7f20d37a9fda493c0b8dc18339489bfe1a059a3`, tree
+`1803a888cf77fdee378367404179cc9ba4085ee6`.
 
-- `cargo fmt --all -- --check`: pass;
-- `git diff --check`: pass;
-- `cargo check --workspace --all-targets --all-features --locked`: pass;
-- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: pass;
-- `cargo build --release --locked --bin a2a-bridge`: pass;
-- `cargo deny check`: pass with `advisories ok`, `bans ok`, `licenses ok`, and `sources ok`; the existing
-  duplicate-version warnings remained warnings;
-- `cargo run -p a2a-bridge -- validate --repo-hygiene`: pass with 37 tracked artifacts and 7 validated example
-  configs;
-- `cargo test -p a2a-bridge --bin a2a-bridge --locked
-  cli_tests::workflow_stats_resolves_relative_store_from_canonical_config_owner -- --exact --nocapture
-  --test-threads=1`: 1 passed, 0 failed;
-- `cargo test --workspace --locked -- --test-threads=1`: 2,654 passed, 0 failed, 12 ignored, 0 measured, 0
-  filtered out.
+The isolated Tier-3 Linux implementation controller passed all 27 configured commands and its built-in review
+returned `APPROVE` on attempt 1. That Linux verifier covered format, all-target/all-feature workspace check,
+warnings-denied Clippy, debug/release builds, the named R2f0a regressions, hermetic and container-complete workspace
+lanes, repository hygiene, and diff check; its implementation checkpoint SHA-256 is
+`7779636f8327c951fbcd6bd1f515c4dc0f848f47b1045f5d599a86708f5e7fb9`.
 
-Incremental/cumulative implementation review and host-only portability correction review approved their exact
-inputs. Final frozen-head Sol/xhigh full-branch review remains pending. These are supplied host-verification
-results, not gates rerun from this documentation-only fold. No live or billable provider smoke, production
-served-server update, deployment, release, merge, GitHub CI, or provider-compatibility claim is made; #22, #24,
-and the overall R2f completion contract remain open. R2f0b is next only after the R2f0a review/merge boundary.
+The separate [native macOS evidence](../reviews/2026-07-24-r2f0a-native-verification.md) is green at the approved
+candidate on the operator-owned host:
+
+- `cargo fmt --all -- --check` and `git diff --check 4cc71f4a..d7f20d37`: pass;
+- the foreign-owner refusal, owner-owned acceptance, bounded crash-fixture kill/reap, and public platform
+  crash-residue recovery gates each pass **1 / 0 / 0** with **200 filtered**; on the non-root host only the
+  genuinely root-required foreign-UID arm skipped;
+- the three native PID-topology process gates each pass **1 / 0 / 0** with **314 filtered** across five groups;
+- `cargo deny check`: pass with `advisories ok`, `bans ok`, `licenses ok`, and `sources ok`; existing
+  duplicate-version findings remain warnings;
+- the unskipped serial native workspace passes **2,769 / 0 / 12 ignored / 0 measured / 0 filtered** across
+  **73** result groups (**56** nonempty), including all three PID-topology tests.
+
+The native fail-first oracle at predecessor `e6276fbc59d37b25ba4315f5e14f260310d71d2b` exposed `/var/folders/...`
+versus `/private/var/folders/...` spelling in the post-transition test comparator. The narrow correction
+canonicalizes the protected root only when deriving the already-approved exact transition paths and adds a
+cross-platform `child/..` counterexample; it changes test code only and does not evidence a production defect.
+
+Effective-owner closure is exact: before SQLite inspection, an existing canonical WAL or SHM must be a regular,
+single-link file owned by the process effective UID. Foreign-owned exact inputs return plain typed `Open` without
+mutation. Owner-owned configured/platform and writable/read-only controls remain accepted. Only exact WAL/SHM
+received the new ownership predicate; the database, rollback journal, and bridge locks retain their approved
+contracts.
+
+Independent, concurrent, one-pass
+[Sol/xhigh](../reviews/2026-07-24-r2f0a-final-cumulative-sol-review.md) and
+[Fable/xhigh](../reviews/2026-07-24-r2f0a-final-cumulative-fable-review.md) adversarial release/compatibility reviews
+both returned `APPROVE` at the same frozen candidate. Fable recorded three nonblocking `SMELL` follow-ups without
+expanding this increment: add the root-only foreign-owner arm to CI; extend the foreign-owner matrix to the two
+selection wrappers; and revisit foreign-owned rollback-journal policy only through a separate owner decision,
+because `-journal` was deliberately out of scope.
+
+This fold proves no live/billable compatibility canary, production server update, release, deployment, GitHub CI,
+PR merge, or post-merge operator build. It does not close R2f overall, #22, or #24. R2f0a is ready for the final
+operator-branch exact-head review, PR/CI, and merge; R2f0b remains next only after that merge boundary and is not
+started.
 
 - Mint and expose distinct `execution_id` and `attempt_id` before registry/session/provider effects. `execution_id`
   remains stable across served resume and operator takeover; every resume/takeover gets a new attempt id, ordinal,

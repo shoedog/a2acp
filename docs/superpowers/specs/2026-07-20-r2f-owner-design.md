@@ -1,9 +1,11 @@
 # R2f focused owner design — bounded liveness, telemetry, and non-disruptive ownership (v1)
 
-- **Status:** DESIGN APPROVED by clean-room Sol/xhigh closure review 5; D1-D11 settled; every inherited item fixed;
-  no new `WRONG` or `SMELL`; R2f0a implementation-complete and fully host-verified at source checkpoint
-  `74bb1283` on `agent/r2f0a-identity-ledger`; final frozen-head Sol/xhigh full-branch review is pending; R2f0b
-  follows only after the R2f0a review/merge boundary
+- **Status:** DESIGN APPROVED by clean-room Sol/xhigh closure review 5; D1-D11 settled; R2f0a implementation and
+  correction work complete at folded code checkpoint `9761b3b78c89cca079ddb1d9376514fceb77e0df` on
+  `agent/r2f0a-identity-ledger`, with approved candidate `d7f20d37a9fda493c0b8dc18339489bfe1a059a3` /
+  tree `1803a888cf77fdee378367404179cc9ba4085ee6`; final native evidence is green and independent concurrent
+  Sol/xhigh and Fable/xhigh cumulative reviews both returned `APPROVE`; ready for final operator-branch exact-head
+  review, PR/CI, and merge; R2f0b is next only after that merge and is not started
 - **Base:** `345941db91a7d898884bfe79e573433484ccafcc`
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Execution plan:** [`../plans/2026-07-11-r2f-phase-aware-liveness.md`](../plans/2026-07-11-r2f-phase-aware-liveness.md)
@@ -17,6 +19,12 @@
   [`../reviews/2026-07-20-r2f-owner-design-sol-closure-review-4.md`](../reviews/2026-07-20-r2f-owner-design-sol-closure-review-4.md)
 - **Closure review 5 — APPROVE:**
   [`../reviews/2026-07-20-r2f-owner-design-sol-closure-review-5.md`](../reviews/2026-07-20-r2f-owner-design-sol-closure-review-5.md)
+- **Final cumulative Sol/xhigh review — APPROVE:**
+  [`../reviews/2026-07-24-r2f0a-final-cumulative-sol-review.md`](../reviews/2026-07-24-r2f0a-final-cumulative-sol-review.md)
+- **Final cumulative Fable/xhigh review — APPROVE:**
+  [`../reviews/2026-07-24-r2f0a-final-cumulative-fable-review.md`](../reviews/2026-07-24-r2f0a-final-cumulative-fable-review.md)
+- **Final native macOS verification:**
+  [`../reviews/2026-07-24-r2f0a-native-verification.md`](../reviews/2026-07-24-r2f0a-native-verification.md)
 - **Incidents:** `INC-VERIFY-STALL-2026-07-11`, `INC-SHARED-WARM-CRASH-2026-07-16`,
   `INC-SHARED-SESSION-CAPACITY-2026-07-17`, `INC-SHARED-RESTART-RECOVERY-2026-07-19`,
   `INC-UNARY-NULL-FINAL-2026-07-20`, GitHub #22, and GitHub #24
@@ -25,9 +33,12 @@ This document records owner policy and does not claim that current `main` can de
 stagnant workflow, persist workflow durations, close ACP sessions, take over a process tree, or rotate a live
 backend generation safely. The implementation plan remains the slice breakdown; this document is the normative
 decision surface now that every owner item is settled. Review 1 and closure reviews 1, 3, and 4 are folded; closure
-review 5 approved the corrected design; R2f0a is now implementation-complete and fully host-verified at source
-checkpoint `74bb1283`, while the final frozen-head review and merge boundary remain pending. The failed null-final
-attempt remains incident evidence only.
+review 5 approved the corrected design. R2f0a implementation and correction work is complete at folded checkpoint
+`9761b3b78c89cca079ddb1d9376514fceb77e0df`, byte-identical to approved candidate
+`d7f20d37a9fda493c0b8dc18339489bfe1a059a3` / tree `1803a888cf77fdee378367404179cc9ba4085ee6`.
+The final native evidence is green and both independent cumulative reviews returned `APPROVE`; the final
+operator-branch exact-head review, PR/CI, and merge remain pending. The failed null-final attempt remains incident
+evidence only, and R2f0b is not started.
 
 ## 1. Current-main facts
 
@@ -926,7 +937,37 @@ correction and every closure-review-4 regression family `FIXED`, found no new `W
 The review confirmed that ACP prompt/capability metadata and vendor notifications provide an implementable extension
 seam; current codex-acp exposes the native turn-terminal, phase, turn-id, and ordered-drain sources required by the
 planned mapping; every unsupported/missing/order/conflict path remains conservative; and the design does not claim
-the actual Codex incident closed before adapter conformance. R2f0a is implementation-complete and fully host-verified
-at source checkpoint `74bb1283`; final frozen-head Sol/xhigh full-branch review is pending before the review/merge
-boundary, and R2f0b follows only after that boundary. No provider/live gate, automatic re-review, retry, fallback
-provider, or second billable attempt is authorized by the approval turn itself.
+the actual Codex incident closed before adapter conformance. No provider/live gate, automatic re-review, retry,
+fallback provider, or second billable attempt is authorized by the approval turn itself.
+
+## 15. R2f0a implementation closure
+
+R2f0a implementation and correction work is complete at operator-re-authored code checkpoint
+`9761b3b78c89cca079ddb1d9376514fceb77e0df` on `agent/r2f0a-identity-ledger`, byte-identical to approved
+candidate `d7f20d37a9fda493c0b8dc18339489bfe1a059a3` / tree
+`1803a888cf77fdee378367404179cc9ba4085ee6`. The separate
+[native macOS verification](../reviews/2026-07-24-r2f0a-native-verification.md) records green focused gates and an
+unskipped serial workspace result of **2,769 passed / 0 failed / 12 ignored / 0 measured / 0 filtered** across
+**73** result groups (**56** nonempty). It is distinct from the isolated Tier-3 Linux controller's 27-command
+verifier and built-in attempt-1 `APPROVE`.
+
+The native fail-first at predecessor `e6276fbc59d37b25ba4315f5e14f260310d71d2b` was a test-only protected-root
+alias oracle: macOS exposed caller-spelled `/var/folders/...` versus canonical `/private/var/folders/...`, and the
+narrow correction canonicalizes only the root used to derive approved exact transition paths. It does not indicate
+a production defect.
+
+The effective-owner rule is closed exactly as approved. Before SQLite inspection, an existing exact canonical WAL
+or SHM must be regular, single-link, and owned by the process effective UID; a foreign-owned exact input returns
+plain typed `Open` with no mutation. Owner-owned configured/platform and writable/read-only controls remain
+accepted. Only exact WAL/SHM received the new predicate; rollback journal policy was deliberately unchanged.
+
+Independent, concurrent, one-pass
+[Sol/xhigh](../reviews/2026-07-24-r2f0a-final-cumulative-sol-review.md) and
+[Fable/xhigh](../reviews/2026-07-24-r2f0a-final-cumulative-fable-review.md) adversarial release/compatibility reviews
+both returned `APPROVE` at the same frozen candidate. Fable's three nonblocking `SMELL` follow-ups remain outside
+this approved increment: add the root-only foreign-owner arm to CI, extend the foreign-owner matrix to the two
+selection wrappers, and reconsider foreign-owned `-journal` only through a separate owner decision.
+
+R2f0a is ready for the final operator-branch exact-head review, PR/CI, and merge. R2f0b remains next only after that
+merge and is not started. No live/billable compatibility canary, production server update, release, deployment,
+GitHub CI, PR merge, post-merge operator build, R2f completion, #22 closure, or #24 closure is proved by this fold.
