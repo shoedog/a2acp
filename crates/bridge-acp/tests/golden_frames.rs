@@ -300,6 +300,37 @@ fn set_config_option_request_is_wire_conformant() {
     );
 }
 
+// session/set_model wire-golden for ACP models-state selection.
+#[test]
+fn set_model_request_is_wire_conformant() {
+    use agent_client_protocol::schema::v1::SessionId as AgentSessionId;
+
+    let req =
+        AcpBackend::set_model_request(AgentSessionId::new("agent-sess-1"), "gpt-5.6-sol[xhigh]");
+    let params: Value = serde_json::to_value(&req).expect("SetSessionModelRequest serializes");
+
+    let expected_params = serde_json::json!({
+        "sessionId": "agent-sess-1",
+        "modelId": "gpt-5.6-sol[xhigh]"
+    });
+    assert_eq!(
+        params, expected_params,
+        "session/set_model params must be {{\"sessionId\":<id>,\"modelId\":<id>}}, got {params:?}"
+    );
+
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "session/set_model",
+        "params": params,
+    });
+    assert_eq!(
+        frame.get("method"),
+        Some(&Value::from("session/set_model")),
+        "the request method must be the snake_case `session/set_model`: {frame:?}"
+    );
+}
+
 // session/cancel wire-golden [Cl-M4] (ACP §11A). `session/cancel` is a JSON-RPC
 // NOTIFICATION — NOT a request — so the wire frame has a `method` and `params`
 // but NO `id` and no response, with `params:{ "sessionId": <agent id> }`. We

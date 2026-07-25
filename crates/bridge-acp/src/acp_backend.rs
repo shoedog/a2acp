@@ -30,17 +30,18 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
-    Agent, Client, ConnectTo, ConnectionTo, Error as AcpError, ErrorCode, Lines,
+    Agent, Client, ConnectTo, ConnectionTo, Error as AcpError, ErrorCode, JsonRpcMessage,
+    JsonRpcRequest, JsonRpcResponse, Lines, UntypedMessage,
 };
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, OwnedMutexGuard};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::model_effort::{
-    caps_from_config_options, effort_opt, is_blocked_model, is_unsupported_effort_error,
-    model_values, resolve_effort, resolve_model, EffortDecision, ModelDecision,
-    ModelResolutionError, EFFORT_ORDER,
+    caps_from_config_options, effort_level_name, effort_opt, is_blocked_model,
+    is_unsupported_effort_error, model_id_effort, model_values, resolve_effort, resolve_model,
+    resolve_model_state, EffortDecision, ModelDecision, ModelResolutionError, EFFORT_ORDER,
 };
 use bridge_core::catalog::AgentCaps;
 use bridge_core::diagnostics::{
@@ -91,6 +92,219 @@ const DEFAULT_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// escalation when we nuke the agent process on a cancel/drop timeout.
 const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 const CONTAINER_START_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+const SESSION_NEW_METHOD: &str = "session/new";
+const SESSION_SET_MODEL_METHOD: &str = "session/set_model";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+struct ModelAwareNewSessionRequest(NewSessionRequest);
+
+impl ModelAwareNewSessionRequest {
+    fn new(inner: NewSessionRequest) -> Self {
+        Self(inner)
+    }
+}
+
+impl JsonRpcMessage for ModelAwareNewSessionRequest {
+    fn matches_method(method: &str) -> bool {
+        method == SESSION_NEW_METHOD
+    }
+
+    fn method(&self) -> &str {
+        SESSION_NEW_METHOD
+    }
+
+    fn to_untyped_message(&self) -> Result<UntypedMessage, AcpError> {
+        UntypedMessage::new(SESSION_NEW_METHOD, &self.0)
+    }
+
+    fn parse_message(method: &str, params: &impl Serialize) -> Result<Self, AcpError> {
+        if method != SESSION_NEW_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast_params(params).map(Self)
+    }
+}
+
+impl JsonRpcRequest for ModelAwareNewSessionRequest {
+    type Response = ModelAwareNewSessionResponse;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ModelAwareNewSessionResponse {
+    session_id: AgentSessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modes: Option<SessionModeState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    config_options: Option<Vec<SessionConfigOption>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    models: Option<SessionModelState>,
+}
+
+#[cfg(test)]
+impl ModelAwareNewSessionResponse {
+    fn new(session_id: impl Into<AgentSessionId>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            modes: None,
+            config_options: None,
+            models: None,
+        }
+    }
+
+    fn modes(mut self, modes: Option<SessionModeState>) -> Self {
+        self.modes = modes;
+        self
+    }
+
+    fn config_options(mut self, config_options: Vec<SessionConfigOption>) -> Self {
+        self.config_options = Some(config_options);
+        self
+    }
+
+    fn models(mut self, models: Option<SessionModelState>) -> Self {
+        self.models = models;
+        self
+    }
+}
+
+impl JsonRpcResponse for ModelAwareNewSessionResponse {
+    fn into_json(self, _method: &str) -> Result<serde_json::Value, AcpError> {
+        serde_json::to_value(self).map_err(AcpError::into_internal_error)
+    }
+
+    fn from_value(method: &str, value: serde_json::Value) -> Result<Self, AcpError> {
+        if method != SESSION_NEW_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast(&value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SessionModelState {
+    #[serde(default)]
+    current_model_id: String,
+    #[serde(default)]
+    available_models: Vec<SessionModel>,
+}
+
+impl SessionModelState {
+    #[cfg(test)]
+    fn new(current_model_id: impl Into<String>, model_ids: Vec<String>) -> Self {
+        Self {
+            current_model_id: current_model_id.into(),
+            available_models: model_ids.into_iter().map(SessionModel::new).collect(),
+        }
+    }
+
+    fn values(&self) -> Vec<String> {
+        self.available_models
+            .iter()
+            .map(|model| model.model_id.clone())
+            .collect()
+    }
+
+    fn supports_effort_suffix(&self) -> bool {
+        self.available_models
+            .iter()
+            .any(|model| model_id_effort(&model.model_id).is_some())
+    }
+
+    fn with_current(mut self, current_model_id: impl Into<String>) -> Self {
+        self.current_model_id = current_model_id.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SessionModel {
+    model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+#[cfg(test)]
+impl SessionModel {
+    fn new(model_id: impl Into<String>) -> Self {
+        let model_id = model_id.into();
+        Self {
+            name: Some(model_id.clone()),
+            model_id,
+            description: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionModelRequest {
+    session_id: AgentSessionId,
+    model_id: String,
+}
+
+impl SetSessionModelRequest {
+    fn new(session_id: AgentSessionId, model_id: impl Into<String>) -> Self {
+        Self {
+            session_id,
+            model_id: model_id.into(),
+        }
+    }
+}
+
+impl JsonRpcMessage for SetSessionModelRequest {
+    fn matches_method(method: &str) -> bool {
+        method == SESSION_SET_MODEL_METHOD
+    }
+
+    fn method(&self) -> &str {
+        SESSION_SET_MODEL_METHOD
+    }
+
+    fn to_untyped_message(&self) -> Result<UntypedMessage, AcpError> {
+        UntypedMessage::new(SESSION_SET_MODEL_METHOD, self)
+    }
+
+    fn parse_message(method: &str, params: &impl Serialize) -> Result<Self, AcpError> {
+        if method != SESSION_SET_MODEL_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast_params(params)
+    }
+}
+
+impl JsonRpcRequest for SetSessionModelRequest {
+    type Response = SetSessionModelResponse;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SetSessionModelResponse {}
+
+#[cfg(test)]
+impl SetSessionModelResponse {
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+impl JsonRpcResponse for SetSessionModelResponse {
+    fn into_json(self, _method: &str) -> Result<serde_json::Value, AcpError> {
+        serde_json::to_value(self).map_err(AcpError::into_internal_error)
+    }
+
+    fn from_value(method: &str, value: serde_json::Value) -> Result<Self, AcpError> {
+        if method != SESSION_SET_MODEL_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast(&value)
+    }
+}
 
 const RICH_CONTENT_CAP: usize = 2048;
 const RICH_VEC_CAP: usize = 64;
@@ -1000,6 +1214,19 @@ impl Drop for TurnAcceptanceGuard {
 #[derive(Clone, Default)]
 struct ConfigSurface {
     opts: Vec<SessionConfigOption>,
+    models: Option<SessionModelState>,
+}
+
+impl ConfigSurface {
+    fn new(opts: Vec<SessionConfigOption>, models: Option<SessionModelState>) -> Self {
+        Self { opts, models }
+    }
+
+    fn supports_effort_model_ids(&self) -> bool {
+        self.models
+            .as_ref()
+            .is_some_and(SessionModelState::supports_effort_suffix)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1582,6 +1809,13 @@ impl AcpBackend {
         NewSessionRequest::new(cwd).mcp_servers(servers)
     }
 
+    fn model_aware_new_session_request(
+        cwd: impl Into<PathBuf>,
+        mcp: &[bridge_core::mcp::McpServerSpec],
+    ) -> ModelAwareNewSessionRequest {
+        ModelAwareNewSessionRequest::new(Self::new_session_request(cwd, mcp))
+    }
+
     /// Build the `session/prompt` request the backend sends for a turn: the
     /// agent session id plus each bridge `Part` mapped to a tagged text
     /// `ContentBlock`. ACP §11A: the wire field is `prompt` (an array of tagged
@@ -1642,6 +1876,28 @@ impl AcpBackend {
             SessionConfigId::new(config_id.into()),
             SessionConfigValueId::new(value.into()),
         )
+    }
+
+    #[must_use]
+    pub fn set_model_request(
+        agent_id: AgentSessionId,
+        model_id: impl Into<String>,
+    ) -> SetSessionModelRequest {
+        SetSessionModelRequest::new(agent_id, model_id)
+    }
+
+    async fn set_model(
+        cx: &ConnectionTo<Agent>,
+        agent_id: &AgentSessionId,
+        model_id: &str,
+    ) -> Result<(), agent_client_protocol::Error> {
+        cx.send_request::<SetSessionModelRequest>(Self::set_model_request(
+            agent_id.clone(),
+            model_id,
+        ))
+        .block_task()
+        .await?;
+        Ok(())
     }
 
     async fn set_config_option(
@@ -1735,6 +1991,43 @@ impl AcpBackend {
         Ok((opts0.to_vec(), Some("unadvertised".to_string()), None))
     }
 
+    async fn configure_model_state(
+        cx: &ConnectionTo<Agent>,
+        agent_session_id: &AgentSessionId,
+        agent_id: &str,
+        models0: &SessionModelState,
+        model: Option<&str>,
+        effort: Option<Effort>,
+    ) -> Result<(SessionModelState, Option<String>, Option<String>, bool), BridgeError> {
+        let values = models0.values();
+        let current = models0.current_model_id.clone();
+        if model.is_none() && is_blocked_model(&current) {
+            return Err(BridgeError::config_invalid(format!(
+                "agent {agent_id} current model={current} is blocked by this bridge; configure a non-blocked model"
+            )));
+        }
+
+        match Self::resolve_model_state_or_invalid(agent_id, model, effort, &current, &values)? {
+            ModelDecision::Default => Ok((models0.clone(), Some(current), None, false)),
+            ModelDecision::Apply(value) => {
+                Self::set_model(cx, agent_session_id, &value)
+                    .await
+                    .map_err(|e| {
+                        BridgeError::agent_crashed(format!(
+                            "session/set_model rejected modelId={value}: {e}"
+                        ))
+                    })?;
+                let effort_folded = effort.is_some() && model_id_effort(&value).is_some();
+                Ok((
+                    models0.clone().with_current(value.clone()),
+                    Some(value.clone()),
+                    Some(value),
+                    effort_folded,
+                ))
+            }
+        }
+    }
+
     /// Validate a configured model against the advertised values, mapping a miss to
     /// a fatal `config_invalid` that lists them (logged/CLI; redacted on the wire).
     fn resolve_model_or_invalid(
@@ -1743,6 +2036,26 @@ impl AcpBackend {
         values: &[String],
     ) -> Result<ModelDecision, BridgeError> {
         resolve_model(model, values).map_err(|err| match err {
+            ModelResolutionError::Blocked { want, valid } => BridgeError::config_invalid(format!(
+                "agent {agent_id} model={want} is blocked by this bridge; valid models: {}",
+                valid.join(", ")
+            )),
+            ModelResolutionError::NotAdvertised(err) => BridgeError::config_invalid(format!(
+                "agent {agent_id} model={} is not advertised; valid models: {}",
+                err.want,
+                err.valid.join(", ")
+            )),
+        })
+    }
+
+    fn resolve_model_state_or_invalid(
+        agent_id: &str,
+        model: Option<&str>,
+        effort: Option<Effort>,
+        current: &str,
+        values: &[String],
+    ) -> Result<ModelDecision, BridgeError> {
+        resolve_model_state(model, effort, current, values).map_err(|err| match err {
             ModelResolutionError::Blocked { want, valid } => BridgeError::config_invalid(format!(
                 "agent {agent_id} model={want} is blocked by this bridge; valid models: {}",
                 valid.join(", ")
@@ -1768,19 +2081,49 @@ impl AcpBackend {
         effort: Option<Effort>,
         purpose: ApplyPurpose,
     ) -> Result<(ConfigSurface, String), ApplyConfigError> {
-        let (mut refreshed_opts, model_current, applied_model) =
-            Self::configure_model_option(cx, agent_session_id, agent_id, &surface.opts, model)
+        let (mut refreshed_opts, mut refreshed_models, model_current, applied_model, effort_folded) =
+            if let Some(models) = surface.models.as_ref() {
+                let (models, current, applied, folded) = Self::configure_model_state(
+                    cx,
+                    agent_session_id,
+                    agent_id,
+                    models,
+                    model,
+                    effort,
+                )
                 .await
                 .map_err(|err| match err {
                     err @ BridgeError::ConfigInvalid { .. } => ApplyConfigError::NotAdvertised(err),
                     err @ BridgeError::AgentCrashed { .. } => ApplyConfigError::Rejected(err),
                     err => ApplyConfigError::Rejected(err),
                 })?;
+                (
+                    surface.opts.clone(),
+                    Some(models),
+                    current,
+                    applied,
+                    folded.then_some(effort).flatten(),
+                )
+            } else {
+                let (opts, current, applied) = Self::configure_model_option(
+                    cx,
+                    agent_session_id,
+                    agent_id,
+                    &surface.opts,
+                    model,
+                )
+                .await
+                .map_err(|err| match err {
+                    err @ BridgeError::ConfigInvalid { .. } => ApplyConfigError::NotAdvertised(err),
+                    err @ BridgeError::AgentCrashed { .. } => ApplyConfigError::Rejected(err),
+                    err => ApplyConfigError::Rejected(err),
+                })?;
+                (opts, None, current, applied, None)
+            };
 
-        // PF-9: a WARM reconcile must apply the requested model EXACTLY. `configure_model_option`
-        // can return Ok with a stale/unchanged `current` (e.g. empty refreshed opts) — at Warm
-        // that is NOT an exact apply, so fail rather than let the fingerprint advance to a model
-        // the live session may not be using. (Mint keeps today's lenient behavior.)
+        // PF-9: a WARM reconcile must apply the requested model EXACTLY. The
+        // config-option surface can return Ok with stale/unchanged `current`
+        // (e.g. empty refreshed opts); at Warm that is NOT an exact apply.
         if matches!(purpose, ApplyPurpose::Warm) {
             if let Some(want) = applied_model.as_deref() {
                 if model_current.as_deref() != Some(want) {
@@ -1794,49 +2137,59 @@ impl AcpBackend {
             }
         }
 
-        let effort_outcome = match effort_opt(&refreshed_opts) {
-            Some(advertised) => {
-                let decision = resolve_effort(effort, &advertised);
-                match decision {
-                    EffortDecision::Unsupported { from } => {
-                        AcpTraceEvent::EffortBelowMinimum {
-                            advertised_count: AcpTraceEvent::bounded_count(advertised.levels.len()),
-                        }
-                        .emit();
-                        EffortDecision::Unsupported { from }
-                    }
-                    EffortDecision::Skip => EffortDecision::Skip,
-                    decision @ (EffortDecision::Apply { .. } | EffortDecision::FellBack { .. }) => {
-                        match Self::apply_effort_walkdown(
-                            cx,
-                            agent_session_id,
-                            agent_id,
-                            decision,
-                            &advertised.levels,
-                        )
-                        .await
-                        {
-                            Ok((decision, refreshed)) => {
-                                if let Some(opts) = refreshed {
-                                    refreshed_opts = opts;
-                                }
-                                decision
-                            }
-                            Err(err) => {
-                                if matches!(purpose, ApplyPurpose::Warm) {
-                                    return Err(ApplyConfigError::Rejected(err));
-                                }
-                                EffortDecision::Skip
-                            }
-                        }
-                    }
-                }
+        let effort_outcome = if let Some(effort) = effort_folded {
+            EffortDecision::Apply {
+                config_id: "models".to_string(),
+                level: effort_level_name(effort).to_string(),
             }
-            None => {
-                if effort.is_some() {
-                    AcpTraceEvent::EffortOptionMissing.emit();
+        } else {
+            match effort_opt(&refreshed_opts) {
+                Some(advertised) => {
+                    let decision = resolve_effort(effort, &advertised);
+                    match decision {
+                        EffortDecision::Unsupported { from } => {
+                            AcpTraceEvent::EffortBelowMinimum {
+                                advertised_count: AcpTraceEvent::bounded_count(
+                                    advertised.levels.len(),
+                                ),
+                            }
+                            .emit();
+                            EffortDecision::Unsupported { from }
+                        }
+                        EffortDecision::Skip => EffortDecision::Skip,
+                        decision @ (EffortDecision::Apply { .. }
+                        | EffortDecision::FellBack { .. }) => {
+                            match Self::apply_effort_walkdown(
+                                cx,
+                                agent_session_id,
+                                agent_id,
+                                decision,
+                                &advertised.levels,
+                            )
+                            .await
+                            {
+                                Ok((decision, refreshed)) => {
+                                    if let Some(opts) = refreshed {
+                                        refreshed_opts = opts;
+                                    }
+                                    decision
+                                }
+                                Err(err) => {
+                                    if matches!(purpose, ApplyPurpose::Warm) {
+                                        return Err(ApplyConfigError::Rejected(err));
+                                    }
+                                    EffortDecision::Skip
+                                }
+                            }
+                        }
+                    }
                 }
-                EffortDecision::Skip
+                None => {
+                    if effort.is_some() {
+                        AcpTraceEvent::EffortOptionMissing.emit();
+                    }
+                    EffortDecision::Skip
+                }
             }
         };
         let model_current_for_log = model_current.as_deref().unwrap_or("unknown");
@@ -1862,9 +2215,7 @@ impl AcpBackend {
         }
 
         Ok((
-            ConfigSurface {
-                opts: refreshed_opts,
-            },
+            ConfigSurface::new(refreshed_opts, refreshed_models.take()),
             model_current_for_log.to_string(),
         ))
     }
@@ -3173,8 +3524,10 @@ impl AcpBackend {
                                 None,
                             )
                             .await?;
-                        let req =
-                            Self::new_session_request(PathBuf::from(&cwd_for_mint), &mcp_for_mint);
+                        let req = Self::model_aware_new_session_request(
+                            PathBuf::from(&cwd_for_mint),
+                            &mcp_for_mint,
+                        );
                         // From request installation until durable minted-cwd
                         // publication, the process may have consumed a
                         // cwd-expanded credential that a later bounded policy
@@ -3205,6 +3558,7 @@ impl AcpBackend {
                         let id = resp.session_id;
                         let opts0 = resp.config_options.unwrap_or_default();
                         let modes0 = resp.modes;
+                        let models0 = resp.models;
                         lifecycle
                             .record(
                                 DiagnosticPhase::SessionCreate,
@@ -3268,7 +3622,11 @@ impl AcpBackend {
 
                         // (3) model remains hard. (4) effort remains best-effort, but is
                         // observed as its own typed operation after model settles.
-                        let mut refreshed_surface = ConfigSurface { opts: opts0 };
+                        let mut refreshed_surface = ConfigSurface::new(opts0, models0);
+                        let fold_model_effort = refreshed_surface.supports_effort_model_ids()
+                            && model.is_some()
+                            && effort.is_some();
+                        let model_phase_effort = if fold_model_effort { effort } else { None };
                         // Always validate the advertised/current model surface. With no
                         // pin this still rejects a bridge-blocked current model, matching
                         // the pre-observation safety contract.
@@ -3287,7 +3645,7 @@ impl AcpBackend {
                             &agent_id_for_mint,
                             &refreshed_surface,
                             model.as_deref(),
-                            None,
+                            model_phase_effort,
                             ApplyPurpose::Mint,
                         )
                         .await
@@ -3323,7 +3681,7 @@ impl AcpBackend {
                                 None,
                             )
                             .await?;
-                        if effort.is_some() {
+                        if effort.is_some() && !fold_model_effort {
                             lifecycle
                                 .record(
                                     DiagnosticPhase::ConfigApply,
@@ -3379,15 +3737,15 @@ impl AcpBackend {
                         *entry.config_surface.lock().expect("config_surface lock") =
                             Some(refreshed_surface);
 
-                        let mut session_catalog = caps_from_config_options(
-                            &entry
-                                .config_surface
-                                .lock()
-                                .expect("config_surface lock")
-                                .as_ref()
-                                .expect("mint stored its config surface")
-                                .opts,
-                        );
+                        let stored_surface = entry
+                            .config_surface
+                            .lock()
+                            .expect("config_surface lock")
+                            .as_ref()
+                            .expect("mint stored its config surface")
+                            .clone();
+                        let mut session_catalog = caps_from_config_options(&stored_surface.opts);
+                        Self::merge_session_models(&mut session_catalog, stored_surface.models);
                         Self::merge_session_modes(&mut session_catalog, modes0);
                         if let Some(mode) = mode.as_ref() {
                             session_catalog.current_mode = Some(mode.clone());
@@ -3724,7 +4082,7 @@ impl AcpBackend {
             }
         };
         // session/new with NO MCP servers — discovery configures nothing.
-        let req = Self::new_session_request(cwd.to_path_buf(), &[]);
+        let req = Self::model_aware_new_session_request(cwd.to_path_buf(), &[]);
         let resp = match cx.send_request(req).block_task().await {
             Ok(resp) => resp,
             Err(error) => {
@@ -3761,6 +4119,7 @@ impl AcpBackend {
         } else {
             AgentCaps::default()
         };
+        Self::merge_session_models(&mut caps, resp.models);
         Self::merge_session_modes(&mut caps, resp.modes);
         Ok(caps)
     }
@@ -3777,6 +4136,33 @@ impl AcpBackend {
             .into_iter()
             .map(|mode| mode.id.0.to_string())
             .collect();
+    }
+
+    fn caps_from_model_state(models: &SessionModelState) -> AgentCaps {
+        let mut values = models
+            .values()
+            .into_iter()
+            .filter(|model| !is_blocked_model(model))
+            .collect::<Vec<_>>();
+        values.dedup();
+        let current =
+            (!is_blocked_model(&models.current_model_id)).then(|| models.current_model_id.clone());
+        AgentCaps {
+            current_model: current,
+            model_configurable: !values.is_empty(),
+            models: values,
+            ..AgentCaps::default()
+        }
+    }
+
+    fn merge_session_models(caps: &mut AgentCaps, models: Option<SessionModelState>) {
+        let Some(models) = models else {
+            return;
+        };
+        let model_caps = Self::caps_from_model_state(&models);
+        caps.current_model = model_caps.current_model;
+        caps.models = model_caps.models;
+        caps.model_configurable = model_caps.model_configurable;
     }
 
     /// The configured cancel grace (see [`AcpConfig::cancel_grace`]). Falls back
@@ -5009,6 +5395,7 @@ impl AgentBackend for AcpBackend {
         {
             Ok((refreshed, _)) => {
                 let mut catalog = caps_from_config_options(&refreshed.opts);
+                Self::merge_session_models(&mut catalog, refreshed.models.clone());
                 let mut catalogs = self
                     .session_catalogs
                     .lock()
@@ -7439,6 +7826,12 @@ mod tests {
         /// When set, the `session/set_mode` handler REJECTS the request with a
         /// JSON-RPC error (modeling an agent that does not know the mode id).
         reject_set_mode: Arc<AtomicBool>,
+        /// Model ids observed via `session/set_model` requests (in order).
+        set_models: Arc<Mutex<Vec<String>>>,
+        /// Fires every time a `session/set_model` is recorded.
+        set_model_seen: Arc<Notify>,
+        /// When set, the `session/set_model` handler REJECTS the request.
+        reject_set_model: Arc<AtomicBool>,
         /// Auth-method ids observed via `authenticate` requests (in order).
         authenticates: Arc<Mutex<Vec<String>>>,
         /// When set, the `authenticate` handler REJECTS with a JSON-RPC error
@@ -7448,6 +7841,8 @@ mod tests {
         auth_methods: Arc<Mutex<Vec<AuthMethod>>>,
         /// Optional SDK session mode state advertised from `session/new`.
         session_modes: Arc<Mutex<Option<SessionModeState>>>,
+        /// Optional ACP `models` state advertised from `session/new`.
+        session_models: Arc<Mutex<Option<SessionModelState>>>,
 
         // ── Increment 3b: session/set_config_option (effort) ──────────────────
         /// `(config_id, value_id)` pairs observed via `session/set_config_option`.
@@ -7517,10 +7912,14 @@ mod tests {
                 set_modes: Arc::new(Mutex::new(Vec::new())),
                 set_mode_seen: Arc::new(Notify::new()),
                 reject_set_mode: Arc::new(AtomicBool::new(false)),
+                set_models: Arc::new(Mutex::new(Vec::new())),
+                set_model_seen: Arc::new(Notify::new()),
+                reject_set_model: Arc::new(AtomicBool::new(false)),
                 authenticates: Arc::new(Mutex::new(Vec::new())),
                 reject_authenticate: Arc::new(AtomicBool::new(false)),
                 auth_methods: Arc::new(Mutex::new(Vec::new())),
                 session_modes: Arc::new(Mutex::new(None)),
+                session_models: Arc::new(Mutex::new(None)),
                 set_config_options: Arc::new(Mutex::new(Vec::new())),
                 set_config_seen: Arc::new(Notify::new()),
                 reject_set_config: Arc::new(AtomicBool::new(false)),
@@ -7594,6 +7993,20 @@ mod tests {
             }
 
             options
+        }
+
+        async fn advertise_session_models(&self, current: &str, values: &[&str]) {
+            *self.session_models.lock().await = Some(SessionModelState::new(
+                current,
+                values.iter().map(|value| (*value).to_string()).collect(),
+            ));
+        }
+
+        async fn refresh_session_model_current(&self, model_id: &str) {
+            let mut guard = self.session_models.lock().await;
+            if let Some(models) = guard.clone() {
+                *guard = Some(models.with_current(model_id.to_string()));
+            }
         }
 
         async fn refresh_config_current(&self, config_id: &str, value_id: &str) {
@@ -7961,6 +8374,7 @@ mod tests {
             let r_auth = rec.clone();
             let r_new = rec.clone();
             let r_mode = rec.clone();
+            let r_model = rec.clone();
             let r_config = rec.clone();
             let r_prompt = rec.clone();
             let r_cancel = rec.clone();
@@ -8023,6 +8437,25 @@ mod tests {
                     agent_client_protocol::on_receive_request!(),
                 )
                 .on_receive_request(
+                    move |req: SetSessionModelRequest,
+                          responder: agent_client_protocol::Responder<SetSessionModelResponse>,
+                          _cx| {
+                        let r = r_model.clone();
+                        async move {
+                            r.set_models.lock().await.push(req.model_id.clone());
+                            r.set_model_seen.notify_one();
+                            if r.reject_set_model.load(Ordering::SeqCst) {
+                                responder.respond_with_internal_error("unknown model id")?;
+                            } else {
+                                r.refresh_session_model_current(&req.model_id).await;
+                                responder.respond(SetSessionModelResponse::new())?;
+                            }
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
                     move |req: SetSessionConfigOptionRequest,
                           responder: agent_client_protocol::Responder<
                         SetSessionConfigOptionResponse,
@@ -8061,8 +8494,8 @@ mod tests {
                     agent_client_protocol::on_receive_request!(),
                 )
                 .on_receive_request(
-                    move |req: NewSessionRequest,
-                          responder: agent_client_protocol::Responder<NewSessionResponse>,
+                    move |req: ModelAwareNewSessionRequest,
+                          responder: agent_client_protocol::Responder<ModelAwareNewSessionResponse>,
                           _cx| {
                         let r = r_new.clone();
                         async move {
@@ -8070,7 +8503,7 @@ mod tests {
                                 r.new_session_calls.fetch_add(1, Ordering::SeqCst) + 1;
                             // Record the cwd the client sent so Task-4 tests can
                             // assert the correct cwd reached the wire.
-                            *r.new_session_cwd.lock().await = Some(req.cwd);
+                            *r.new_session_cwd.lock().await = Some(req.0.cwd);
                             // Signal entry BEFORE awaiting the gate so a driver can
                             // deterministically know the mint is in flight (no sleep).
                             r.new_session_started.notify_one();
@@ -8080,14 +8513,16 @@ mod tests {
                                 r.new_session_gate.notified().await;
                             }
                             let modes = r.session_modes.lock().await.clone();
+                            let models = r.session_models.lock().await.clone();
                             let minted_id = if r.unique_minted_ids.load(Ordering::SeqCst) {
                                 format!("{}-{mint_sequence}", r.minted_id)
                             } else {
                                 r.minted_id.to_string()
                             };
                             responder.respond(
-                                NewSessionResponse::new(AgentSessionId::new(minted_id))
+                                ModelAwareNewSessionResponse::new(AgentSessionId::new(minted_id))
                                     .modes(modes)
+                                    .models(models)
                                     .config_options(r.advertised_config_options().await),
                             )?;
                             Ok(())
@@ -11838,6 +12273,154 @@ mod tests {
         assert!(
             rec.set_config_options.lock().await.is_empty(),
             "invalid model must fail before set_config_option is sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_field_folds_model_and_effort_into_set_model() {
+        let rec = Recorder::new("agent-sess-MODELS-FOLD");
+        rec.advertise_session_models(
+            "gpt-5.6-sol[medium]",
+            &[
+                "gpt-5.6-sol[medium]",
+                "gpt-5.6-sol[high]",
+                "gpt-5.6-sol[xhigh]",
+            ],
+        )
+        .await;
+        let cfg = AcpConfig {
+            agent_id: "recorder".to_string(),
+            ..test_config()
+        };
+        let be = connect_recording_with(rec.clone(), cfg).await;
+        let key = bkey("bridge-MODELS-FOLD");
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: Some("gpt-5.6-sol".to_string()),
+                effort: Some(Effort::Xhigh),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        be.ensure_session(&key).await.unwrap();
+
+        assert_eq!(
+            rec.set_models.lock().await.as_slice(),
+            &["gpt-5.6-sol[xhigh]".to_string()],
+            "effort-suffixed model surfaces must select the exact modelId via session/set_model"
+        );
+        assert!(
+            rec.set_config_options.lock().await.is_empty(),
+            "models field takes precedence over legacy model/effort config options"
+        );
+        let catalog = be.session_catalog(&key).expect("catalog retained");
+        assert_eq!(catalog.current_model.as_deref(), Some("gpt-5.6-sol[xhigh]"));
+        assert_eq!(
+            catalog.models,
+            vec![
+                "gpt-5.6-sol[medium]",
+                "gpt-5.6-sol[high]",
+                "gpt-5.6-sol[xhigh]"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_config_option_model_path_still_applies_when_models_absent() {
+        let rec = Recorder::new("agent-sess-LEGACY-MODEL");
+        let cfg = AcpConfig {
+            agent_id: "recorder".to_string(),
+            model: Some("m".to_string()),
+            ..test_config()
+        };
+        let be = connect_recording_with(rec.clone(), cfg).await;
+        let key = bkey("bridge-LEGACY-MODEL");
+
+        be.ensure_session(&key).await.unwrap();
+
+        assert!(rec.set_models.lock().await.is_empty());
+        assert_eq!(
+            rec.set_config_options.lock().await.as_slice(),
+            &[("model".to_string(), "m".to_string())],
+            "agents without models state keep the legacy config-option path"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_field_unadvertised_model_fails_before_rpc_with_catalog() {
+        let rec = Recorder::new("agent-sess-MODELS-MISS");
+        rec.advertise_model_config.store(false, Ordering::SeqCst);
+        rec.advertise_effort_config.store(false, Ordering::SeqCst);
+        rec.advertise_session_models("gpt-5.5[medium]", &["gpt-5.5[medium]", "gpt-5.5[xhigh]"])
+            .await;
+        let cfg = AcpConfig {
+            agent_id: "recorder".to_string(),
+            ..test_config()
+        };
+        let be = connect_recording_with(rec.clone(), cfg).await;
+        let key = bkey("bridge-MODELS-MISS");
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: Some("gpt-5.6-sol".to_string()),
+                effort: Some(Effort::Xhigh),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        match be.ensure_session(&key).await {
+            Err(error) => {
+                let diagnostic = assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::ConfigApply,
+                    DiagnosticFailureClass::Model,
+                    false,
+                );
+                let cause = diagnostic.causes().join(" ");
+                assert!(cause.contains("gpt-5.6-sol with effort xhigh"), "{cause}");
+                assert!(cause.contains("valid models:"), "{cause}");
+                assert!(cause.contains("gpt-5.5[medium]"), "{cause}");
+                assert!(cause.contains("gpt-5.5[xhigh]"), "{cause}");
+            }
+            other => panic!("unadvertised models-field selection must fail mint, got {other:?}"),
+        }
+        assert!(
+            rec.set_models.lock().await.is_empty()
+                && rec.set_config_options.lock().await.is_empty(),
+            "invalid model/effort must fail before any model-selection RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_options_reads_models_field_over_config_option_models() {
+        let rec = Recorder::new("agent-sess-MODELS-DESCRIBE");
+        rec.advertise_session_models(
+            "gpt-5.6-sol[medium]",
+            &["gpt-5.6-sol[medium]", "gpt-5.6-sol[xhigh]"],
+        )
+        .await;
+        let be = connect_recording(rec.clone()).await;
+
+        let caps = be
+            .describe_options(std::path::Path::new("/tmp"))
+            .await
+            .expect("describe_options succeeds");
+
+        assert_eq!(caps.current_model.as_deref(), Some("gpt-5.6-sol[medium]"));
+        assert_eq!(
+            caps.models,
+            vec!["gpt-5.6-sol[medium]", "gpt-5.6-sol[xhigh]"]
+        );
+        assert!(caps.model_configurable);
+        assert_eq!(
+            caps.effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max"],
+            "legacy config options still contribute separate effort capabilities"
         );
     }
 

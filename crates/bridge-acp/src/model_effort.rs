@@ -81,6 +81,155 @@ pub fn resolve_model(
     }
 }
 
+pub fn model_id_effort(id: &str) -> Option<&str> {
+    if let Some(without_close) = id.strip_suffix(']') {
+        if let Some((_, suffix)) = without_close.rsplit_once('[') {
+            if rank(suffix).is_some() {
+                return Some(suffix);
+            }
+        }
+    }
+
+    id.rsplit_once('/')
+        .and_then(|(_, suffix)| rank(suffix).map(|_| suffix))
+}
+
+pub fn model_id_base(id: &str) -> &str {
+    if let Some(without_close) = id.strip_suffix(']') {
+        if let Some((base, suffix)) = without_close.rsplit_once('[') {
+            if rank(suffix).is_some() {
+                return base;
+            }
+        }
+    }
+
+    if let Some((base, suffix)) = id.rsplit_once('/') {
+        if rank(suffix).is_some() {
+            return base;
+        }
+    }
+
+    id
+}
+
+fn find_model_for_base_and_effort(valid: &[String], base: &str, effort: &str) -> Option<String> {
+    valid
+        .iter()
+        .find(|value| model_id_base(value) == base && model_id_effort(value) == Some(effort))
+        .cloned()
+}
+
+fn base_has_effort_variants(valid: &[String], base: &str) -> bool {
+    valid
+        .iter()
+        .any(|value| model_id_base(value) == base && model_id_effort(value).is_some())
+}
+
+fn preferred_model_for_base(valid: &[String], current: &str, base: &str) -> Option<String> {
+    if valid.iter().any(|value| value == base) {
+        return Some(base.to_string());
+    }
+
+    if model_id_base(current) == base && valid.iter().any(|value| value == current) {
+        return Some(current.to_string());
+    }
+
+    find_model_for_base_and_effort(valid, base, "medium").or_else(|| {
+        valid
+            .iter()
+            .find(|value| model_id_base(value) == base)
+            .cloned()
+    })
+}
+
+fn model_effort_want(want: Option<&str>, effort: Option<Effort>, current: &str) -> String {
+    match (want, effort) {
+        (Some(model), Some(effort)) => {
+            format!("{} with effort {}", model, effort_level_name(effort))
+        }
+        (Some(model), None) => model.to_string(),
+        (None, Some(effort)) => {
+            format!(
+                "current model {current} with effort {}",
+                effort_level_name(effort)
+            )
+        }
+        (None, None) => current.to_string(),
+    }
+}
+
+/// Resolve a model pin against ACP `models.availableModels`.
+///
+/// Some agents encode reasoning effort directly in `modelId`
+/// (`gpt-5.6-sol[xhigh]` or `gpt-5.5/xhigh`). In that surface, a requested
+/// effort is part of model selection: it must match an advertised `modelId`
+/// rather than falling through to the separate config-option effort walk-down.
+pub fn resolve_model_state(
+    want: Option<&str>,
+    effort: Option<Effort>,
+    current: &str,
+    values: &[String],
+) -> Result<ModelDecision, ModelResolutionError> {
+    if want.is_none() && effort.is_none() {
+        return Ok(ModelDecision::Default);
+    }
+
+    let valid = allowed_model_values(values);
+    if let Some(raw) = want {
+        if is_blocked_model(raw) {
+            return Err(ModelResolutionError::Blocked {
+                want: raw.to_string(),
+                valid,
+            });
+        }
+    }
+
+    if let Some(raw) = want {
+        let candidates = if apply_alias(raw) == raw {
+            vec![raw]
+        } else {
+            vec![raw, apply_alias(raw)]
+        };
+
+        for candidate in candidates {
+            if effort.is_none() && valid.iter().any(|value| value == candidate) {
+                return Ok(ModelDecision::Apply(candidate.to_string()));
+            }
+
+            let base = model_id_base(candidate);
+            if let Some(effort) = effort {
+                if let Some(selected) =
+                    find_model_for_base_and_effort(&valid, base, effort_level_name(effort))
+                {
+                    return Ok(ModelDecision::Apply(selected));
+                }
+                if valid.iter().any(|value| value == candidate)
+                    && !base_has_effort_variants(&valid, base)
+                {
+                    return Ok(ModelDecision::Apply(candidate.to_string()));
+                }
+            } else if let Some(selected) = preferred_model_for_base(&valid, current, base) {
+                return Ok(ModelDecision::Apply(selected));
+            }
+        }
+    } else if let Some(effort) = effort {
+        let base = model_id_base(current);
+        if let Some(selected) =
+            find_model_for_base_and_effort(&valid, base, effort_level_name(effort))
+        {
+            return Ok(ModelDecision::Apply(selected));
+        }
+        if !base_has_effort_variants(&valid, base) {
+            return Ok(ModelDecision::Default);
+        }
+    }
+
+    Err(ModelResolutionError::NotAdvertised(ModelNotAdvertised {
+        want: model_effort_want(want, effort, current),
+        valid,
+    }))
+}
+
 fn select_values(sel_options: &SessionConfigSelectOptions) -> Vec<String> {
     match sel_options {
         SessionConfigSelectOptions::Ungrouped(options) => options
@@ -453,6 +602,96 @@ mod tests {
             )
             .unwrap(),
             ModelDecision::Apply("gpt-5-6-sol".into())
+        );
+    }
+
+    #[test]
+    fn model_id_effort_recognizes_reasoning_suffixes_only() {
+        assert_eq!(model_id_base("gpt-5.6-sol[xhigh]"), "gpt-5.6-sol");
+        assert_eq!(model_id_effort("gpt-5.6-sol[xhigh]"), Some("xhigh"));
+        assert_eq!(model_id_base("gpt-5.5/xhigh"), "gpt-5.5");
+        assert_eq!(model_id_effort("gpt-5.5/xhigh"), Some("xhigh"));
+        assert_eq!(model_id_base("sonnet[1m]"), "sonnet[1m]");
+        assert_eq!(model_id_effort("sonnet[1m]"), None);
+    }
+
+    #[test]
+    fn model_state_resolves_model_and_bracket_effort_suffix() {
+        let values = strings(&[
+            "gpt-5.6-sol[medium]",
+            "gpt-5.6-sol[high]",
+            "gpt-5.6-sol[xhigh]",
+        ]);
+        assert_eq!(
+            resolve_model_state(
+                Some("gpt-5.6-sol"),
+                Some(Effort::Xhigh),
+                "gpt-5.6-sol[medium]",
+                &values,
+            )
+            .unwrap(),
+            ModelDecision::Apply("gpt-5.6-sol[xhigh]".into())
+        );
+    }
+
+    #[test]
+    fn model_state_resolves_model_and_slash_effort_suffix() {
+        let values = strings(&["gpt-5.5/medium", "gpt-5.5/high", "gpt-5.5/xhigh"]);
+        assert_eq!(
+            resolve_model_state(
+                Some("gpt-5.5"),
+                Some(Effort::High),
+                "gpt-5.5/medium",
+                &values,
+            )
+            .unwrap(),
+            ModelDecision::Apply("gpt-5.5/high".into())
+        );
+    }
+
+    #[test]
+    fn model_state_effort_only_uses_current_model_base() {
+        let values = strings(&[
+            "gpt-5.5/medium",
+            "gpt-5.5/xhigh",
+            "gpt-5.6-sol/medium",
+            "gpt-5.6-sol/xhigh",
+        ]);
+        assert_eq!(
+            resolve_model_state(None, Some(Effort::Xhigh), "gpt-5.6-sol/medium", &values).unwrap(),
+            ModelDecision::Apply("gpt-5.6-sol/xhigh".into())
+        );
+    }
+
+    #[test]
+    fn model_state_plain_model_does_not_consume_separate_effort() {
+        let values = strings(&["default", "haiku"]);
+        assert_eq!(
+            resolve_model_state(Some("haiku"), Some(Effort::High), "default", &values).unwrap(),
+            ModelDecision::Apply("haiku".into())
+        );
+        assert_eq!(
+            resolve_model_state(None, Some(Effort::High), "default", &values).unwrap(),
+            ModelDecision::Default
+        );
+    }
+
+    #[test]
+    fn model_state_unadvertised_effort_errors_with_catalog() {
+        let values = strings(&["gpt-5.6-sol[medium]", "gpt-5.6-sol[high]"]);
+        let err = resolve_model_state(
+            Some("gpt-5.6-sol"),
+            Some(Effort::Xhigh),
+            "gpt-5.6-sol[medium]",
+            &values,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ModelResolutionError::NotAdvertised(ModelNotAdvertised {
+                want: "gpt-5.6-sol with effort xhigh".into(),
+                valid: values,
+            })
         );
     }
 

@@ -2686,6 +2686,67 @@ fn catalog_strings<'a>(
         .collect()
 }
 
+fn catalog_model_id_effort(id: &str) -> Option<&str> {
+    const EFFORT_SUFFIXES: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+    if let Some(without_close) = id.strip_suffix(']') {
+        if let Some((_, suffix)) = without_close.rsplit_once('[') {
+            if EFFORT_SUFFIXES.contains(&suffix) {
+                return Some(suffix);
+            }
+        }
+    }
+
+    id.rsplit_once('/')
+        .and_then(|(_, suffix)| EFFORT_SUFFIXES.contains(&suffix).then_some(suffix))
+}
+
+fn catalog_model_id_base(id: &str) -> &str {
+    if let Some(without_close) = id.strip_suffix(']') {
+        if let Some((base, suffix)) = without_close.rsplit_once('[') {
+            if catalog_model_id_effort(id) == Some(suffix) {
+                return base;
+            }
+        }
+    }
+
+    if let Some((base, suffix)) = id.rsplit_once('/') {
+        if catalog_model_id_effort(id) == Some(suffix) {
+            return base;
+        }
+    }
+
+    id
+}
+
+fn catalog_current_model_matches_request(
+    current_model: Option<&str>,
+    model: &str,
+    effort: Option<&str>,
+) -> bool {
+    let Some(current_model) = current_model else {
+        return false;
+    };
+    current_model == model
+        || effort.is_some_and(|effort| {
+            catalog_model_id_base(current_model) == model
+                && catalog_model_id_effort(current_model) == Some(effort)
+        })
+}
+
+fn catalog_effort_matches_request(
+    efforts: &[&str],
+    current_model: Option<&str>,
+    effort: Option<&str>,
+) -> bool {
+    let Some(effort) = effort else {
+        return true;
+    };
+    efforts.contains(&effort)
+        || current_model
+            .is_some_and(|current_model| catalog_model_id_effort(current_model) == Some(effort))
+}
+
 fn valid_available_catalog_for(
     smoke: &Value,
     model: &str,
@@ -2742,8 +2803,8 @@ fn valid_available_catalog_for(
         || configurable && models.is_empty()
         || current_model.is_some_and(|current| !models.contains(&current))
         || current_mode.is_some_and(|current| !modes.contains(&current))
-        || current_model != Some(model)
-        || effort.is_some_and(|effort| !efforts.contains(&effort))
+        || !catalog_current_model_matches_request(current_model, model, effort)
+        || !catalog_effort_matches_request(&efforts, current_model, effort)
         || mode.is_some_and(|mode| !modes.contains(&mode) || current_mode != Some(mode))
     {
         return false;
@@ -6612,6 +6673,38 @@ agent_cli = "@openai/codex=0.144.1"
             );
             assert!(!aggregate.success);
         }
+    }
+
+    #[test]
+    fn available_catalog_accepts_effort_suffixed_current_model_ids() {
+        let mut case = case("only", EvidenceStatus::Pass);
+        case.effort = Some("xhigh".into());
+        let mut artifact = smoke(&case, true, Some(1));
+
+        artifact["target"]["model_catalog"]["current_model"] = json!("test-model[xhigh]");
+        artifact["target"]["model_catalog"]["models"] =
+            json!(["test-model[medium]", "test-model[xhigh]"]);
+        artifact["target"]["model_catalog"]["effort_levels"] = json!([]);
+        assert!(
+            valid_available_catalog(&artifact, &case),
+            "codex-acp models-field catalogs may encode effort in current_model/modelId"
+        );
+
+        artifact["target"]["model_catalog"]["current_model"] = json!("test-model/xhigh");
+        artifact["target"]["model_catalog"]["models"] =
+            json!(["test-model/medium", "test-model/xhigh"]);
+        assert!(
+            valid_available_catalog(&artifact, &case),
+            "slash-style effort suffixes are also accepted"
+        );
+
+        artifact["target"]["model_catalog"]["current_model"] = json!("test-model/high");
+        artifact["target"]["model_catalog"]["models"] =
+            json!(["test-model/medium", "test-model/high"]);
+        assert!(
+            !valid_available_catalog(&artifact, &case),
+            "a suffixed modelId with the wrong effort must not satisfy the requested pin"
+        );
     }
 
     #[tokio::test]
