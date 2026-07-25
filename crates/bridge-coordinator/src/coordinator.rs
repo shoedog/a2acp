@@ -2982,20 +2982,41 @@ mod tests {
         task_store: Arc<MemoryTaskStore>,
     }
 
-    /// Delegating primary store that refuses exactly the first recovered
-    /// terminal projection write. This models a summary commit followed by a
-    /// one-shot primary transaction failure at the boot boundary.
+    /// Delegating primary store with one-shot faults around the recovered
+    /// terminal projection transaction and its exact post-write read.
     struct OneShotPendingTaskStore {
         inner: MemoryTaskStore,
         fail_pending_once: std::sync::atomic::AtomicBool,
+        fail_after_pending_once: std::sync::atomic::AtomicBool,
+        fail_pending_read_once: std::sync::atomic::AtomicBool,
         fail_scan_once: std::sync::atomic::AtomicBool,
     }
 
     impl OneShotPendingTaskStore {
         fn new() -> Self {
+            Self::with_faults(true, false, false)
+        }
+
+        fn ambiguous_commit() -> Self {
+            Self::with_faults(false, true, false)
+        }
+
+        fn post_commit_read_failure() -> Self {
+            Self::with_faults(false, false, true)
+        }
+
+        fn with_faults(
+            fail_pending_once: bool,
+            fail_after_pending_once: bool,
+            fail_pending_read_once: bool,
+        ) -> Self {
             Self {
                 inner: MemoryTaskStore::new(),
-                fail_pending_once: std::sync::atomic::AtomicBool::new(true),
+                fail_pending_once: std::sync::atomic::AtomicBool::new(fail_pending_once),
+                fail_after_pending_once: std::sync::atomic::AtomicBool::new(
+                    fail_after_pending_once,
+                ),
+                fail_pending_read_once: std::sync::atomic::AtomicBool::new(fail_pending_read_once),
                 fail_scan_once: std::sync::atomic::AtomicBool::new(false),
             }
         }
@@ -3178,7 +3199,8 @@ mod tests {
             {
                 return Err(BridgeError::StoreFailure);
             }
-            self.inner
+            let committed = self
+                .inner
                 .set_terminal_sequenced_pending(
                     task,
                     operation_id,
@@ -3189,7 +3211,15 @@ mod tests {
                     attempt_id,
                     terminal,
                 )
-                .await
+                .await;
+            if committed.is_ok()
+                && self
+                    .fail_after_pending_once
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(BridgeError::StoreFailure);
+            }
+            committed
         }
 
         async fn pending_terminal_projection(
@@ -3197,6 +3227,12 @@ mod tests {
             task: &TaskId,
         ) -> Result<Option<bridge_core::task_store::PendingTerminalProjection>, BridgeError>
         {
+            if self
+                .fail_pending_read_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(BridgeError::StoreFailure);
+            }
             self.inner.pending_terminal_projection(task).await
         }
 
@@ -4849,8 +4885,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn checkpoint_summary_replays_after_one_shot_primary_failure_on_second_boot() {
+    async fn checkpoint_recovery_fixture(
+        store: Arc<OneShotPendingTaskStore>,
+        fingerprint: &'static [u8],
+    ) -> (
+        crate::detached::DetachedDeps,
+        Arc<MemoryWorkflowHistoryStore>,
+        bridge_core::ids::AttemptIdentity,
+        TaskId,
+        TaskAttemptLocator,
+    ) {
         let graph = workflow("code-review");
         let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
         let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
@@ -4858,7 +4902,6 @@ mod tests {
             identity: identity.clone(),
             telemetry_unavailable: None,
         };
-        let store = Arc::new(OneShotPendingTaskStore::new());
         let mut record = working_record(task.clone());
         record.workflow = graph.id.as_str().to_owned();
         record.input = typed_code_review_input().to_owned();
@@ -4888,7 +4931,7 @@ mod tests {
                 surface: bridge_core::workflow_history::ExecutionSurface::ServedTask,
                 policy: "r2f0a".into(),
                 workload_fingerprint: bridge_core::workflow_history::fingerprint_workload_shape(
-                    b"checkpoint-primary-one-shot",
+                    fingerprint,
                 ),
                 started_ms: 1,
                 workload_fingerprint_complete: true,
@@ -4897,7 +4940,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let store_dyn: Arc<dyn TaskStore> = store.clone();
+        let store_dyn: Arc<dyn TaskStore> = store;
         let history_dyn: Arc<dyn WorkflowHistoryStore> = history.clone();
         let deps = crate::detached::DetachedDeps {
             task_store: store_dyn,
@@ -4909,44 +4952,229 @@ mod tests {
             observer: Arc::new(NoopObserver),
             workflow_history: Some(Ok(history_dyn)),
         };
+        (deps, history, identity, task, locator)
+    }
 
-        assert!(
-            !crate::detached::reconcile_terminal_checkpoints(&deps).await,
-            "the first boot must report the primary write failure"
-        );
+    fn checkpoint_recovery_coordinator(
+        store: Arc<OneShotPendingTaskStore>,
+        history: Arc<MemoryWorkflowHistoryStore>,
+        backend: Arc<FakeBackend>,
+    ) -> Coordinator {
+        let graph = workflow("code-review");
+        let mut workflows = HashMap::new();
+        workflows.insert(graph.id.clone(), graph);
+        let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+            entry: entry(),
+            backend,
+            resolved: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+        let session_manager = Arc::new(SessionManager::new_with_clock(
+            registry.clone(),
+            Duration::from_secs(60),
+            clock.clone(),
+        ));
+        let task_store: Arc<dyn TaskStore> = store;
+        let session_store: Arc<dyn SessionStore> = Arc::new(FakeSessionStore::default());
+        let policy: Arc<dyn PolicyEngine> = Arc::new(AllowPolicy);
+        let executor = Arc::new(WorkflowExecutor::new(registry.clone()));
+        let selected_history: Arc<dyn WorkflowHistoryStore> = history;
+        Coordinator::new(
+            session_manager,
+            Some(executor),
+            Arc::new(workflows),
+            task_store,
+            session_store,
+            policy,
+            registry,
+            clock,
+            Some(SessionCwd::parse("/tmp").unwrap()),
+            None,
+            Arc::new(NoopObserver),
+            3,
+        )
+        .with_workflow_history(Ok(selected_history))
+    }
+
+    #[tokio::test]
+    async fn checkpoint_summary_replays_after_one_shot_primary_failure_on_second_boot() {
+        let store = Arc::new(OneShotPendingTaskStore::new());
+        let (_deps, history, identity, task, locator) =
+            checkpoint_recovery_fixture(store.clone(), b"checkpoint-primary-one-shot").await;
+        let backend = Arc::new(FakeBackend::new(None));
+        let coordinator =
+            checkpoint_recovery_coordinator(store.clone(), history.clone(), backend.clone());
+
         assert_eq!(
-            store.get(&task).await.unwrap().unwrap().status,
-            TaskRecordStatus::Working
+            coordinator.resume().await,
+            Err(BridgeError::StoreFailure),
+            "the first boot must refuse serving after the primary write failure"
+        );
+        let first_boot_task = store.get(&task).await.unwrap().unwrap();
+        assert_eq!(first_boot_task.status, TaskRecordStatus::Working);
+        let recovered_completed_ms = first_boot_task
+            .last_artifact_ms
+            .unwrap_or(first_boot_task.updated_ms)
+            .max(1);
+        assert_eq!(
+            first_boot_task.resume_attempts, 0,
+            "failed reconciliation must not mint a resume"
         );
         assert!(store
             .pending_terminal_projection(&task)
             .await
             .unwrap()
             .is_none());
-        let first_terminal = history
+        let first_attempt = history
             .attempt(&identity.attempt_id)
             .await
             .unwrap()
-            .unwrap()
-            .terminal
-            .expect("the first boot committed the recovered summary");
-
-        assert!(crate::detached::reconcile_terminal_checkpoints(&deps).await);
-        assert_eq!(
-            store.get(&task).await.unwrap().unwrap().status,
-            TaskRecordStatus::Completed
+            .unwrap();
+        assert!(
+            first_attempt.terminal.is_none(),
+            "the optional summary must remain active until primary intent is durable"
         );
-        let replayed = history
+
+        assert_eq!(
+            coordinator.resume().await,
+            Ok(()),
+            "the second boot must settle the exact recovered attempt"
+        );
+        let second_boot_task = store.get(&task).await.unwrap().unwrap();
+        assert_eq!(second_boot_task.status, TaskRecordStatus::Completed);
+        assert_eq!(
+            second_boot_task.result.as_deref(),
+            Some("stable-checkpoint-output")
+        );
+        assert_eq!(
+            second_boot_task.resume_attempts, 0,
+            "checkpoint recovery must not mint a successor attempt"
+        );
+        assert!(store
+            .pending_terminal_projection(&task)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.get_attempt_locator(&task).await.unwrap(),
+            Some(locator)
+        );
+        let terminal = history
             .attempt(&identity.attempt_id)
             .await
             .unwrap()
             .unwrap()
             .terminal
-            .expect("the second boot replays the same summary");
-        assert_eq!(replayed, first_terminal);
-        assert_eq!(replayed.terminal_reason, "terminal_checkpoint_recovered");
-        assert_eq!(replayed.completed_ms, first_terminal.completed_ms);
+            .expect("the second boot settles the recovered summary");
+        assert_eq!(terminal.terminal_reason, "terminal_checkpoint_recovered");
+        assert_eq!(terminal.completed_ms, recovered_completed_ms);
+        assert_eq!(
+            backend.prompt_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "checkpoint recovery must not prompt a successor"
+        );
     }
+
+    #[tokio::test]
+    async fn checkpoint_recovery_accepts_exact_pending_row_after_ambiguous_commit() {
+        let store = Arc::new(OneShotPendingTaskStore::ambiguous_commit());
+        let (deps, history, identity, task, locator) =
+            checkpoint_recovery_fixture(store.clone(), b"checkpoint-primary-ambiguous-commit")
+                .await;
+
+        assert!(
+            crate::detached::reconcile_terminal_checkpoints(&deps).await,
+            "the exact pending read must recover an ambiguous write result"
+        );
+        let persisted = store.get(&task).await.unwrap().unwrap();
+        assert_eq!(persisted.status, TaskRecordStatus::Completed);
+        assert_eq!(
+            persisted.result.as_deref(),
+            Some("stable-checkpoint-output")
+        );
+        assert_eq!(persisted.resume_attempts, 0);
+        assert!(store
+            .pending_terminal_projection(&task)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.get_attempt_locator(&task).await.unwrap(),
+            Some(locator)
+        );
+        let terminal = history
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .expect("ambiguous primary commit settles exact terminal evidence");
+        assert_eq!(terminal.terminal_reason, "terminal_checkpoint_recovered");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_recovery_pending_read_failure_is_settled_by_next_scan() {
+        let store = Arc::new(OneShotPendingTaskStore::post_commit_read_failure());
+        let (deps, history, identity, task, locator) =
+            checkpoint_recovery_fixture(store.clone(), b"checkpoint-primary-post-commit-read")
+                .await;
+
+        assert!(
+            !crate::detached::reconcile_terminal_checkpoints(&deps).await,
+            "the first boot must fail closed when the post-commit read fails"
+        );
+        let public = store.get(&task).await.unwrap().unwrap();
+        assert_eq!(public.status, TaskRecordStatus::Working);
+        assert_eq!(public.resume_attempts, 0);
+        let pending = store
+            .pending_terminal_projection(&task)
+            .await
+            .unwrap()
+            .expect("the committed primary intent remains hidden and recoverable");
+        assert_eq!(pending.task.id, task);
+        assert_eq!(pending.task.status, TaskRecordStatus::Completed);
+        assert_eq!(
+            pending.task.result.as_deref(),
+            Some("stable-checkpoint-output")
+        );
+        assert_eq!(pending.attempt_id, identity.attempt_id);
+        assert_eq!(
+            store.get_attempt_locator(&task).await.unwrap(),
+            Some(locator)
+        );
+        assert!(
+            history
+                .attempt(&identity.attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .terminal
+                .is_none(),
+            "summary settlement must not outrun the failed exact pending read"
+        );
+
+        assert!(crate::detached::reconcile_pending_terminal_projections(&deps).await);
+        let published = store.get(&task).await.unwrap().unwrap();
+        assert_eq!(published.status, TaskRecordStatus::Completed);
+        assert_eq!(published.resume_attempts, 0);
+        assert!(store
+            .pending_terminal_projection(&task)
+            .await
+            .unwrap()
+            .is_none());
+        let mut expected_terminal = pending.terminal;
+        expected_terminal.prompt_acceptance = "dispatch_uncertain".to_string();
+        assert_eq!(
+            history
+                .attempt(&identity.attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .terminal,
+            Some(expected_terminal)
+        );
+    }
+
     #[tokio::test]
     async fn failed_checkpoint_summary_publishes_only_with_exact_primary_marker() {
         let graph = workflow("code-review");

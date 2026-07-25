@@ -3299,16 +3299,9 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
         } else {
             (None, Some(output.as_str()))
         };
-        // Recovered terminal evidence is settled first on purpose. If the
-        // following primary write fails or its result is ambiguous, the next
-        // boot regenerates the same evidence from durable checkpoint times and
-        // receives an idempotent summary replay.
-        if !settle_terminal_evidence(deps, &record.id, &locator.identity.attempt_id, &terminal)
-            .await
-        {
-            safe_to_interrupt = false;
-            continue;
-        }
+        // Persist the hidden primary terminal intent before settling optional
+        // summary evidence. Whether this call succeeds or returns an ambiguous
+        // error, the exact pending read below is the authority for proceeding.
         let primary = deps
             .task_store
             .set_terminal_sequenced_pending(
@@ -3328,7 +3321,12 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
             .await
         {
             Ok(Some(pending))
-                if pending.attempt_id == locator.identity.attempt_id
+                if pending.task.id == record.id
+                    && pending.task.status == status
+                    && pending.task.result.as_deref() == result
+                    && pending.task.error.as_deref() == error
+                    && locator.belongs_to(&pending.task.id)
+                    && pending.attempt_id == locator.identity.attempt_id
                     && pending.terminal == terminal =>
             {
                 pending
@@ -3353,16 +3351,7 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
                 continue;
             }
         };
-        if let Err(error) = deps
-            .task_store
-            .mark_terminal_projection_ready(&pending.task.id, &pending.attempt_id)
-            .await
-        {
-            tracing::warn!(
-                task = pending.task.id.as_str(),
-                error = ?error,
-                "checkpoint reconciliation: terminal projection publication failed"
-            );
+        if !settle_pending_terminal_projection(deps, &pending).await {
             safe_to_interrupt = false;
         }
     }
