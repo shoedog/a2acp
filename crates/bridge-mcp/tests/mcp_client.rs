@@ -724,12 +724,19 @@ async fn tools_call_permit_resolves_pending_permission() {
 #[tokio::test]
 async fn tools_call_run_workflow_returns_task_id() {
     let mut reqs = initialize_reqs();
+    let identity = AttemptIdentity::initial().unwrap();
     reqs.push(req(
         2,
         "tools/call",
         json!({
             "name": "run_workflow",
-            "arguments": with_attempt_identity(json!({ "workflow": "code-review", "input": "---\ntask-type: freeform\n---\nreview this", "cwd": "/tmp/repo" }))
+            "arguments": {
+                "workflow": "code-review",
+                "input": "---\ntask-type: freeform\n---\nreview this",
+                "cwd": "/tmp/repo",
+                "execution_id": identity.execution_id.as_str(),
+                "attempt_id": identity.attempt_id.as_str()
+            }
         }),
     ));
     let replies = run_session(fixture().coord, reqs).await;
@@ -737,10 +744,13 @@ async fn tools_call_run_workflow_returns_task_id() {
     // initialize + tools/call -> 2 replies (notifications/initialized has none).
     assert_eq!(replies.len(), 2);
     let body = text_body(&replies[1]);
-    let task_id = body["task_id"].as_str().unwrap();
-    assert!(
-        !task_id.is_empty(),
-        "run_workflow returns a task id, got {task_id:?}"
+    assert_eq!(body["task_id"], identity.execution_id.as_str());
+    assert_eq!(body["execution_id"], identity.execution_id.as_str());
+    assert_eq!(body["attempt_id"], identity.attempt_id.as_str());
+    assert_eq!(body["attempt_ordinal"], identity.ordinal);
+    assert_eq!(
+        body["parent_attempt_id"],
+        serde_json::to_value(identity.parent_attempt_id).unwrap()
     );
 }
 

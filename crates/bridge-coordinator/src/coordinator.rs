@@ -1201,11 +1201,32 @@ impl Coordinator {
     }
 
     /// Submit a detached workflow run and return its durable task id.
-    pub async fn run_workflow(&self, p: OpParams) -> Result<WorkflowLocator, BridgeError> {
-        self.run_workflow_with_identity(p, None).await
+    ///
+    /// This compatibility entry point retains the historical start-on-call
+    /// behavior: it mints identity internally, and the detached runner may
+    /// begin before the awaiting caller observes the returned task id.
+    pub async fn run_workflow(&self, p: OpParams) -> Result<TaskId, BridgeError> {
+        Ok(self.run_workflow_inner(p, None).await?.task_id)
     }
 
+    /// Submit a detached workflow under an identity already visible to the
+    /// caller and return the exact admitted locator.
+    ///
+    /// ```compile_fail
+    /// # use bridge_coordinator::{params::OpParams, Coordinator};
+    /// # async fn optional_identity_is_rejected(coordinator: &Coordinator, p: OpParams) {
+    /// let _ = coordinator.run_workflow_with_identity(p, None).await;
+    /// # }
+    /// ```
     pub async fn run_workflow_with_identity(
+        &self,
+        p: OpParams,
+        identity: bridge_core::ids::AttemptIdentity,
+    ) -> Result<WorkflowLocator, BridgeError> {
+        self.run_workflow_inner(p, Some(identity)).await
+    }
+
+    async fn run_workflow_inner(
         &self,
         p: OpParams,
         supplied_identity: Option<bridge_core::ids::AttemptIdentity>,
@@ -4566,14 +4587,11 @@ mod tests {
             Arc::new(FakeBackend::new(Some(gate))),
         );
 
-        let locator = fixture
+        let id: TaskId = fixture
             .coordinator
             .run_workflow(workflow_params())
             .await
             .unwrap();
-        let id = locator.task_id.clone();
-        assert_eq!(id.as_str(), locator.execution_id.as_str());
-        assert_eq!(locator.attempt_ordinal, 0);
         let rec = fixture.task_store.get(&id).await.unwrap().unwrap();
 
         assert_eq!(rec.id, id);
@@ -4601,7 +4619,7 @@ mod tests {
         let history = Arc::new(MemoryWorkflowHistoryStore::new());
         let coordinator = coordinator.with_workflow_history(Ok(history.clone()));
 
-        let locator = coordinator.run_workflow(workflow_params()).await.unwrap();
+        let task_id: TaskId = coordinator.run_workflow(workflow_params()).await.unwrap();
         let rows = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let rows = history.completed_between(0, i64::MAX).await.unwrap();
@@ -4614,12 +4632,7 @@ mod tests {
         .await
         .expect("workflow summary terminalizes");
         assert_eq!(
-            task_store
-                .get(&locator.task_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
+            task_store.get(&task_id).await.unwrap().unwrap().status,
             TaskRecordStatus::Completed
         );
         assert_eq!(rows.len(), 1);
@@ -4665,7 +4678,22 @@ mod tests {
         } = coordinator_fixture(Arc::new(workflows));
         let coordinator = coordinator.with_workflow_history(Err(LedgerUnavailableReason::Open));
 
-        let locator = coordinator.run_workflow(workflow_params()).await.unwrap();
+        let supplied_identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let locator = coordinator
+            .run_workflow_with_identity(workflow_params(), supplied_identity.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            locator.task_id.as_str(),
+            supplied_identity.execution_id.as_str()
+        );
+        assert_eq!(locator.execution_id, supplied_identity.execution_id);
+        assert_eq!(locator.attempt_id, supplied_identity.attempt_id);
+        assert_eq!(locator.attempt_ordinal, supplied_identity.ordinal);
+        assert_eq!(
+            locator.parent_attempt_id,
+            supplied_identity.parent_attempt_id
+        );
         assert_eq!(
             locator.telemetry_unavailable,
             Some(LedgerUnavailableReason::Open)

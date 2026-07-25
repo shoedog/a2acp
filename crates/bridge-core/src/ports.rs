@@ -251,11 +251,14 @@ pub trait RouteDecision: Send + Sync {
     /// registry default. `None` defers only that default lookup until after a
     /// direct-unary attempt has passed its mandatory identity admission.
     ///
-    /// Implementations must make this boundary explicit: this method must not
-    /// consult a registry default or perform any equivalent default-agent
-    /// lookup. Routers with no default-dependent path may return
-    /// `self.route(meta).map(Some)` explicitly.
-    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError>;
+    /// The conservative default preserves released one-method implementors and
+    /// defers their entire `route` call until after direct-unary admission. It
+    /// deliberately does not call `route` or consult any registry default.
+    /// Routers with no default-dependent path may override this with
+    /// `self.route(meta).map(Some)`.
+    fn route_before_default(&self, _meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        Ok(None)
+    }
 
     fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError>;
 }
@@ -716,12 +719,9 @@ mod tests {
         }
     }
 
+    /// Exact released-shape compile regression: implements only `route`.
     struct AlwaysKiro;
     impl RouteDecision for AlwaysKiro {
-        fn route_before_default(&self, t: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
-            self.route(t).map(Some)
-        }
-
         fn route(&self, _t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
             Ok(RouteTarget::Local(AgentId::parse("kiro")?))
         }

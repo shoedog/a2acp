@@ -127,19 +127,21 @@ async fn dispatch(id: &Value, params: &Value, coord: &Coordinator) -> Value {
             OpParams::from_mcp_args_for_workflow(&args),
             bridge_coordinator::params::attempt_identity_from_mcp_args(&args),
         ) {
-            (Ok(p), Ok(identity)) => coord
-                .run_workflow_with_identity(p, Some(identity))
-                .await
-                .map(|locator| {
-                    json!({
-                        "task_id": locator.task_id.as_str(),
-                        "execution_id": locator.execution_id.as_str(),
-                        "attempt_id": locator.attempt_id.as_str(),
-                        "attempt_ordinal": locator.attempt_ordinal,
-                        "parent_attempt_id": locator.parent_attempt_id,
-                        "telemetry_unavailable": locator.telemetry_unavailable,
+            (Ok(p), Ok(identity)) => {
+                coord
+                    .run_workflow_with_identity(p, identity)
+                    .await
+                    .map(|locator| {
+                        json!({
+                            "task_id": locator.task_id.as_str(),
+                            "execution_id": locator.execution_id.as_str(),
+                            "attempt_id": locator.attempt_id.as_str(),
+                            "attempt_ordinal": locator.attempt_ordinal,
+                            "parent_attempt_id": locator.parent_attempt_id,
+                            "telemetry_unavailable": locator.telemetry_unavailable,
+                        })
                     })
-                }),
+            }
             (Err(e), _) | (_, Err(e)) => Err(e),
         },
         "status" => match parse_status_args(&args) {

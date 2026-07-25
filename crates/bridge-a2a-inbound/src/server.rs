@@ -1601,7 +1601,7 @@ async fn stream_message(
         };
         let locator = match srv
             .coordinator()
-            .run_workflow_with_identity(op, Some(identity))
+            .run_workflow_with_identity(op, identity)
             .await
         {
             Ok(locator) => locator,
@@ -3530,14 +3530,30 @@ async fn unary_message(
         let target = match srv.route.route(&task_meta) {
             Ok(target @ RouteTarget::Local(_)) => target,
             Ok(_) => {
-                return bridge_err_to_jsonrpc(
-                    id,
-                    &BridgeError::InvalidRequest {
-                        field: "deferred default route",
-                    },
-                )
+                let route_error = BridgeError::InvalidRequest {
+                    field: "deferred default route",
+                };
+                if let Some(history) = direct_history.as_mut() {
+                    if let Err(durable_error) = history
+                        .finish("failed", "route_failed", true, "not_needed")
+                        .await
+                    {
+                        return bridge_err_to_jsonrpc(id, &durable_error);
+                    }
+                }
+                return bridge_err_to_jsonrpc(id, &route_error);
             }
-            Err(error) => return bridge_err_to_jsonrpc(id, &error),
+            Err(route_error) => {
+                if let Some(history) = direct_history.as_mut() {
+                    if let Err(durable_error) = history
+                        .finish("failed", "route_failed", true, "not_needed")
+                        .await
+                    {
+                        return bridge_err_to_jsonrpc(id, &durable_error);
+                    }
+                }
+                return bridge_err_to_jsonrpc(id, &route_error);
+            }
         };
         routed.target = target;
         routed.default_route_deferred = false;
@@ -3782,7 +3798,7 @@ async fn unary_message(
             };
             return match srv
                 .coordinator()
-                .run_workflow_with_identity(op, Some(supplied_identity))
+                .run_workflow_with_identity(op, supplied_identity)
                 .await
             {
                 Ok(locator) => {
@@ -5728,6 +5744,45 @@ mod tests {
                     RouteTarget::Local(self.registry.default_id())
                 }
             })
+        }
+    }
+
+    #[test]
+    fn specialized_router_keeps_explicit_pre_default_override() {
+        let backend = FakeBackend::new();
+        let registry = FakeRegistry::single("kiro", backend);
+        let default_lookups = Arc::new(AtomicUsize::new(0));
+        let route = ProductionLikeDefaultRoute {
+            registry,
+            default_lookups: default_lookups.clone(),
+        };
+        let meta = TaskMeta {
+            agent: Some(AgentId::parse("kiro").unwrap()),
+            ..TaskMeta::default()
+        };
+
+        assert!(matches!(
+            route.route_before_default(&meta).unwrap(),
+            Some(RouteTarget::Local(agent)) if agent.as_str() == "kiro"
+        ));
+        assert_eq!(default_lookups.load(Ordering::SeqCst), 0);
+    }
+
+    /// Released one-method shape: the default defers this whole call.
+    struct CountingReleasedRoute {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RouteDecision for CountingReleasedRoute {
+        fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match meta.skill.as_deref() {
+                Some("delegate") => Ok(RouteTarget::Delegate),
+                Some("route-error") => Err(BridgeError::InvalidRequest {
+                    field: "released route",
+                }),
+                _ => Ok(RouteTarget::Local(AgentId::parse("kiro")?)),
+            }
         }
     }
     /// Routes `skill=="delegate"` to `Delegate`, everything else to local kiro.
@@ -8058,14 +8113,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn colliding_unary_refuses_before_production_like_default_lookup() {
+    async fn released_route_runs_once_only_after_direct_admission() {
         let backend = FakeBackend::new();
         let registry = FakeRegistry::single("kiro", backend.clone());
         let history = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
-        let default_lookups = Arc::new(AtomicUsize::new(0));
-        let route = Arc::new(ProductionLikeDefaultRoute {
-            registry: registry.clone(),
-            default_lookups: default_lookups.clone(),
+        let route_calls = Arc::new(AtomicUsize::new(0));
+        let route = Arc::new(CountingReleasedRoute {
+            calls: route_calls.clone(),
         });
         let sessions = Arc::new(FakeStore::default());
         let coordinator = coordinator_over_with_workflow_history(
@@ -8127,7 +8181,7 @@ mod tests {
             .unwrap();
         let refusal: Value = serde_json::from_str(&body_string(refusal).await).unwrap();
         assert!(refusal.get("error").is_some(), "{refusal}");
-        assert_eq!(default_lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(route_calls.load(Ordering::SeqCst), 0);
         assert!(
             registry.observed().is_empty(),
             "collision reached registry resolution"
@@ -8156,7 +8210,7 @@ mod tests {
         let omitted_body: Value =
             serde_json::from_str(&body_string(omitted_response).await).unwrap();
         assert!(omitted_body.get("error").is_none(), "{omitted_body}");
-        assert_eq!(default_lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(route_calls.load(Ordering::SeqCst), 1);
         let omitted_row = history
             .attempt(&omitted.attempt_id)
             .await
@@ -8179,7 +8233,7 @@ mod tests {
 
         backend.prompted.store(false, Ordering::SeqCst);
         let explicit = bridge_core::ids::AttemptIdentity::initial().unwrap();
-        let explicit_response = router(server)
+        let explicit_response = router(server.clone())
             .oneshot(raw_post_request(
                 methods::SEND_MESSAGE,
                 json!({
@@ -8200,9 +8254,123 @@ mod tests {
         let explicit_body: Value =
             serde_json::from_str(&body_string(explicit_response).await).unwrap();
         assert!(explicit_body.get("error").is_none(), "{explicit_body}");
-        assert_eq!(default_lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(route_calls.load(Ordering::SeqCst), 2);
         assert!(backend.prompted.load(Ordering::SeqCst));
+
+        for skill in ["delegate", "route-error"] {
+            backend.prompted.store(false, Ordering::SeqCst);
+            let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+            let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+            let calls_before = route_calls.load(Ordering::SeqCst);
+            let resolutions_before = registry.observed().len();
+            let response = router(server.clone())
+                .oneshot(raw_post_request(
+                    methods::SEND_MESSAGE,
+                    json!({
+                        "taskId": identity.execution_id.as_str(),
+                        "message": {
+                            "taskId": identity.execution_id.as_str(),
+                            "text": "must stop after compatibility routing",
+                            "metadata": {
+                                "a2a-bridge.skill": skill,
+                                "a2a-bridge.execution_id": identity.execution_id.as_str(),
+                                "a2a-bridge.attempt_id": identity.attempt_id.as_str()
+                            }
+                        }
+                    }),
+                ))
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+            assert!(body.get("error").is_some(), "{body}");
+            assert_eq!(route_calls.load(Ordering::SeqCst), calls_before + 1);
+            assert_eq!(registry.observed().len(), resolutions_before);
+            assert!(!backend.prompted.load(Ordering::SeqCst));
+            assert_eq!(sessions.session_for(&task).await.unwrap(), None);
+
+            let row = history
+                .attempt(&identity.attempt_id)
+                .await
+                .unwrap()
+                .expect("admitted compatibility-route attempt exists");
+            assert_eq!(row.reservation.prompt_acceptance, "not_dispatched");
+            let terminal = row.terminal.expect("route failure terminalized");
+            assert_eq!(terminal.outcome, "failed");
+            assert_eq!(terminal.terminal_reason, "route_failed");
+            assert_eq!(terminal.prompt_acceptance, "not_dispatched");
+            assert_eq!(terminal.cleanup_disposition, "not_needed");
+        }
     }
+    #[tokio::test]
+    async fn released_route_terminal_failure_takes_precedence() {
+        let backend = FakeBackend::new();
+        let registry = FakeRegistry::single("kiro", backend.clone());
+        let history = Arc::new(FanoutPromptBarrierHistory::default());
+        history.fail_terminal.store(true, Ordering::SeqCst);
+        let route_calls = Arc::new(AtomicUsize::new(0));
+        let sessions = Arc::new(FakeStore::default());
+        let coordinator = coordinator_over_with_workflow_history(
+            registry.clone(),
+            sessions.clone(),
+            Arc::new(AutoApprove),
+            None,
+            std::collections::HashMap::new(),
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+            Ok(history.clone()),
+        );
+        let server = Arc::new(InboundServer::from_coordinator(
+            coordinator,
+            Arc::new(CountingReleasedRoute {
+                calls: route_calls.clone(),
+            }),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "kiro",
+        ));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+
+        let response = router(server)
+            .oneshot(raw_post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": identity.execution_id.as_str(),
+                    "message": {
+                        "taskId": identity.execution_id.as_str(),
+                        "text": "terminal settlement must win",
+                        "metadata": {
+                            "a2a-bridge.skill": "route-error",
+                            "a2a-bridge.execution_id": identity.execution_id.as_str(),
+                            "a2a-bridge.attempt_id": identity.attempt_id.as_str()
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("durable evidence unavailable: io"));
+        assert_eq!(route_calls.load(Ordering::SeqCst), 1);
+        assert!(registry.observed().is_empty());
+        assert!(!backend.prompted.load(Ordering::SeqCst));
+        assert_eq!(sessions.session_for(&task).await.unwrap(), None);
+        assert!(history
+            .inner
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .expect("admitted row remains inspectable")
+            .terminal
+            .is_none());
+    }
+
     #[tokio::test]
     async fn unary_send_message_returns_artifact() {
         let srv = build(FakeBackend::new(), Arc::new(AlwaysGrant));
@@ -9566,6 +9734,7 @@ mod tests {
         inner: bridge_core::workflow_history::MemoryWorkflowHistoryStore,
         mark_calls: AtomicUsize,
         terminal_calls: AtomicUsize,
+        fail_terminal: AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -9596,6 +9765,12 @@ mod tests {
             bridge_core::workflow_history::TerminalWrite,
             bridge_core::workflow_history::LedgerError,
         > {
+            if self.fail_terminal.load(Ordering::SeqCst) {
+                return Err(bridge_core::workflow_history::LedgerError::new(
+                    bridge_core::workflow_history::LedgerUnavailableReason::Io,
+                ));
+            }
+
             self.terminal_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.terminalize(id, terminal).await
         }

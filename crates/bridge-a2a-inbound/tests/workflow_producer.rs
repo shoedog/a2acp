@@ -1021,6 +1021,14 @@ async fn workflow_stream_disconnect_keeps_durable_owner_and_exact_replay() {
         identity.attempt_id.as_str()
     );
     assert_eq!(
+        get["result"]["task"]["metadata"]["attempt_ordinal"],
+        identity.ordinal
+    );
+    assert_eq!(
+        get["result"]["task"]["metadata"]["parent_attempt_id"],
+        serde_json::to_value(identity.parent_attempt_id.clone()).unwrap()
+    );
+    assert_eq!(
         get["result"]["task"]["status"]["state"],
         "TASK_STATE_COMPLETED"
     );
@@ -1049,6 +1057,9 @@ async fn workflow_stream_disconnect_keeps_durable_owner_and_exact_replay() {
             frame["kind"] == "attempt_locator"
                 && frame["execution_id"] == identity.execution_id.as_str()
                 && frame["attempt_id"] == identity.attempt_id.as_str()
+                && frame["ordinal"] == identity.ordinal
+                && frame["parent_attempt_id"]
+                    == serde_json::to_value(identity.parent_attempt_id.clone()).unwrap()
         })
         .expect("terminal replay carries the authoritative locator");
     let terminal_index = frames
@@ -1685,13 +1696,19 @@ async fn unary_workflow_send_returns_working_task() {
 
     let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
     let srv = build_workflow_server_with_task_store(store.clone());
+    let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
     let resp = srv
         .router()
         .oneshot(post_request(
             methods::SEND_MESSAGE,
-            json!({ "message": {
+            json!({ "taskId": identity.execution_id.as_str(), "message": {
+                "taskId": identity.execution_id.as_str(),
                 "text": "---\ntask-type: freeform\n---\nDIFF",
-                "metadata": { "a2a-bridge.skill": "code-review" }
+                "metadata": {
+                    "a2a-bridge.skill": "code-review",
+                    "a2a-bridge.execution_id": identity.execution_id.as_str(),
+                    "a2a-bridge.attempt_id": identity.attempt_id.as_str()
+                }
             }}),
         ))
         .await
@@ -1704,7 +1721,22 @@ async fn unary_workflow_send_returns_working_task() {
     assert!(body.get("error").is_none(), "must not be an error: {body}");
     let task = &body["result"]["task"];
     let id = task["id"].as_str().expect("task id present");
-    assert_ne!(id, "task-1", "detached submit must mint a unique id");
+    assert_eq!(id, identity.execution_id.as_str());
+    assert_eq!(task["contextId"], identity.execution_id.as_str());
+    assert_eq!(
+        task["metadata"]["execution_id"],
+        identity.execution_id.as_str()
+    );
+    assert_eq!(task["metadata"]["attempt_id"], identity.attempt_id.as_str());
+    let locator = &body["result"]["locator"];
+    assert_eq!(locator["task_id"], identity.execution_id.as_str());
+    assert_eq!(locator["execution_id"], identity.execution_id.as_str());
+    assert_eq!(locator["attempt_id"], identity.attempt_id.as_str());
+    assert_eq!(locator["attempt_ordinal"], identity.ordinal);
+    assert_eq!(
+        locator["parent_attempt_id"],
+        serde_json::to_value(identity.parent_attempt_id.clone()).unwrap()
+    );
     let state = task["status"]["state"]
         .as_str()
         .or_else(|| task["state"].as_str());
