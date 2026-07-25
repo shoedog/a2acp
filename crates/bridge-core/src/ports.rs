@@ -247,6 +247,19 @@ pub trait SessionStore: Send + Sync {
 
 /// Sync routing decision — no async needed; plain fn.
 pub trait RouteDecision: Send + Sync {
+    /// Resolve every request-derived route that does not require consulting a
+    /// registry default. `None` defers only that default lookup until after a
+    /// direct-unary attempt has passed its mandatory identity admission.
+    ///
+    /// The conservative default preserves released one-method implementors and
+    /// defers their entire `route` call until after direct-unary admission. It
+    /// deliberately does not call `route` or consult any registry default.
+    /// Routers with no default-dependent path may override this with
+    /// `self.route(meta).map(Some)`.
+    fn route_before_default(&self, _meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        Ok(None)
+    }
+
     fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError>;
 }
 
@@ -447,8 +460,38 @@ pub enum ObsEvent<'a> {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum WorkflowObsEvent<'a> {
+    Started {
+        task_class: &'a str,
+        surface: &'a str,
+    },
+    Finished {
+        attempt_id: &'a crate::ids::AttemptId,
+        workflow: &'a str,
+        task_class: &'a str,
+        surface: &'a str,
+        policy: &'a str,
+        outcome: &'a str,
+        telemetry_complete: bool,
+        work_seconds: f64,
+        end_to_end_seconds: f64,
+    },
+    /// Balance a previously emitted `Started` event when no trustworthy primary
+    /// terminal record can be read. This must not create a terminal counter or
+    /// duration sample.
+    Stopped {
+        task_class: &'a str,
+        surface: &'a str,
+    },
+    TelemetryUnavailable {
+        reason: crate::workflow_history::LedgerUnavailableReason,
+    },
+}
+
 pub trait Observer: Send + Sync {
     fn record(&self, e: &ObsEvent<'_>);
+    fn record_workflow(&self, _event: &WorkflowObsEvent<'_>) {}
 }
 
 // ─── Registry / config-source ports (Increment 3b §4.5) ──────────────────────
@@ -484,6 +527,15 @@ pub trait AgentRegistry: Send + Sync {
     }
     /// Return the default agent id for this registry.
     fn default_id(&self) -> crate::ids::AgentId;
+    /// Return the currently configured model/effort/mode without resolving or
+    /// spawning a backend. Registries that cannot prove this shape return None;
+    /// callers must mark the resulting workload fingerprint incomplete.
+    fn configured_effective(
+        &self,
+        _id: &crate::ids::AgentId,
+    ) -> Option<crate::domain::EffectiveConfig> {
+        None
+    }
     /// Atomically reconcile the registry to the given snapshot. [§4.5]
     async fn apply(&self, snapshot: RegistrySnapshot) -> Result<(), BridgeError>;
     /// Drop the cached backend for `agent` so the next `resolve` RESPAWNS a fresh process (E6 retry
@@ -667,6 +719,7 @@ mod tests {
         }
     }
 
+    /// Exact released-shape compile regression: implements only `route`.
     struct AlwaysKiro;
     impl RouteDecision for AlwaysKiro {
         fn route(&self, _t: &TaskMeta) -> Result<RouteTarget, BridgeError> {

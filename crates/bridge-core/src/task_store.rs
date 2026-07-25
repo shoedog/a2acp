@@ -103,6 +103,20 @@ pub struct BatchRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BatchChildAttempt {
+    pub item_id: String,
+    pub task_id: crate::ids::TaskId,
+    pub status: TaskRecordStatus,
+    pub execution_id: crate::ids::ExecutionId,
+    pub attempt_id: crate::ids::AttemptId,
+    pub attempt_ordinal: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_attempt_id: Option<crate::ids::AttemptId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_unavailable: Option<crate::workflow_history::LedgerUnavailableReason>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct BatchSummary {
     pub id: crate::ids::BatchId,
     pub workflow: String,
@@ -114,6 +128,8 @@ pub struct BatchSummary {
     pub running: u32,
     pub pending: u32,
     pub children: Vec<(String, crate::ids::TaskId, TaskRecordStatus)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_attempts: Vec<BatchChildAttempt>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,6 +291,39 @@ pub enum JournalRead {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaskAttemptLocator {
+    pub identity: crate::ids::AttemptIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_unavailable: Option<crate::workflow_history::LedgerUnavailableReason>,
+}
+
+/// A terminal task row whose public projection is deliberately withheld until
+/// the exact attempt summary or its bounded telemetry-unavailable marker is
+/// durable. `terminal` is the immutable evidence that must be replayed after a
+/// restart; callers must never regenerate it from a new wall clock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingTerminalProjection {
+    pub task: TaskRecord,
+    pub attempt_id: crate::ids::AttemptId,
+    pub terminal_seq: i64,
+    pub terminal: crate::workflow_history::AttemptTerminal,
+}
+
+impl TaskAttemptLocator {
+    pub fn belongs_to(&self, task: &TaskId) -> bool {
+        self.identity.execution_id.as_str() == task.as_str()
+    }
+
+    pub fn is_direct_successor_of(&self, prior: &Self) -> bool {
+        self.telemetry_unavailable.is_none()
+            && self.identity.execution_id == prior.identity.execution_id
+            && prior.identity.ordinal.checked_add(1) == Some(self.identity.ordinal)
+            && self.identity.parent_attempt_id.as_ref() == Some(&prior.identity.attempt_id)
+            && self.identity.attempt_id != prior.identity.attempt_id
+    }
+}
+
 /// Outcome of a `claim_resume_attempt` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeClaim {
@@ -289,6 +338,20 @@ pub trait TaskStore: Send + Sync {
     /// Non-clobbering INSERT. A duplicate id MUST return an error (NOT upsert),
     /// so a resubmit/colliding id can never overwrite a terminal result.
     async fn create(&self, rec: &TaskRecord) -> Result<(), BridgeError>;
+    /// Atomically admit the primary task row and its initial attempt identity.
+    /// Production stores override this so a task can never become observable
+    /// without its locator, and an attempt collision cannot leave a partial row.
+    async fn create_with_attempt_locator(
+        &self,
+        _rec: &TaskRecord,
+        _locator: &TaskAttemptLocator,
+    ) -> Result<(), BridgeError> {
+        // There is no safe compatibility implementation for this method: a
+        // two-call fallback can expose a primary row without its authoritative
+        // locator when the second write fails. Implementations that support
+        // served workflows must provide one atomic admission primitive.
+        Err(BridgeError::StoreFailure)
+    }
     /// Set the terminal status + result/error on an existing row.
     async fn set_terminal(
         &self,
@@ -299,6 +362,46 @@ pub trait TaskStore: Send + Sync {
         updated_ms: i64,
     ) -> Result<(), BridgeError>;
     async fn get(&self, id: &TaskId) -> Result<Option<TaskRecord>, BridgeError>;
+    /// Persist the initial served attempt locator before provider work begins.
+    /// This is create-only: replacing an existing lineage requires the atomic
+    /// resume claim below.
+    async fn put_attempt_locator(
+        &self,
+        _task: &TaskId,
+        _locator: &TaskAttemptLocator,
+    ) -> Result<(), BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+    /// Attach a bounded telemetry failure to the exact current attempt without
+    /// changing its identity or allowing a stale writer to rewrite new lineage.
+    async fn mark_attempt_telemetry_unavailable(
+        &self,
+        _task: &TaskId,
+        _attempt: &crate::ids::AttemptId,
+        _reason: crate::workflow_history::LedgerUnavailableReason,
+    ) -> Result<(), BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+    /// Read the authoritative current attempt locator. Unsupported safety
+    /// reads fail closed rather than fabricating absence.
+    async fn get_attempt_locator(
+        &self,
+        _task: &TaskId,
+    ) -> Result<Option<TaskAttemptLocator>, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+    /// Return exact attempts whose primary task is durably terminal and whose
+    /// locator carries the authoritative bounded telemetry-unavailable marker.
+    /// Boot reconciliation uses this set to avoid inventing a conflicting
+    /// optional summary on this and every later restart.
+    async fn terminal_attempts_with_telemetry_markers(
+        &self,
+    ) -> Result<Vec<crate::ids::AttemptId>, BridgeError> {
+        // A served-workflow store must implement the durable scan. Silently
+        // returning an empty set could overwrite marker-only evidence during
+        // boot reconciliation.
+        Err(BridgeError::StoreFailure)
+    }
     /// Newest-first, capped at `limit`.
     async fn list(&self, limit: usize) -> Result<Vec<TaskRecord>, BridgeError>;
     /// Flip every `Working` row to `Interrupted`; returns the count flipped.
@@ -337,6 +440,20 @@ pub trait TaskStore: Send + Sync {
         cap: u32,
         now_ms: i64,
     ) -> Result<ResumeClaim, BridgeError>;
+    /// Atomically consume one resume slot and compare-and-swap the durable
+    /// attempt locator. A crash can therefore observe either the old attempt
+    /// with an unspent slot or the new attempt with a spent slot, never a
+    /// consumed slot paired with reusable old lineage.
+    async fn claim_resume_attempt_with_locator(
+        &self,
+        _task: &TaskId,
+        _cap: u32,
+        _now_ms: i64,
+        _expected: &TaskAttemptLocator,
+        _next: &TaskAttemptLocator,
+    ) -> Result<ResumeClaim, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
     /// Return all rows whose status is `Working` (for the boot-time resume scan).
     async fn working_tasks(&self) -> Result<Vec<TaskRecord>, BridgeError>;
 
@@ -425,6 +542,17 @@ pub trait TaskStore: Send + Sync {
     ) -> Result<ChildClaim, BridgeError> {
         Err(BridgeError::StoreFailure)
     }
+    /// Atomically claim a batch child together with its initial attempt locator.
+    async fn claim_batch_child_with_locator(
+        &self,
+        _batch: &BatchId,
+        _item: &str,
+        _rec: &TaskRecord,
+        _locator: &TaskAttemptLocator,
+    ) -> Result<ChildClaim, BridgeError> {
+        // Fail before mutation unless child and locator admission is atomic.
+        Err(BridgeError::StoreFailure)
+    }
     /// CAS `Working` -> `Canceling`; false if not currently working.
     async fn cancel_batch_if_working(&self, _id: &BatchId, _ts: i64) -> Result<bool, BridgeError> {
         Err(BridgeError::StoreFailure)
@@ -492,6 +620,53 @@ pub trait TaskStore: Send + Sync {
         error: Option<&str>,
         ts: i64,
     ) -> Result<i64, BridgeError>;
+
+    /// Atomically write primary terminality together with immutable exact-attempt
+    /// evidence and mark the public terminal projection pending. Implementations
+    /// used for served workflows must override this method.
+    #[allow(clippy::too_many_arguments)]
+    async fn set_terminal_sequenced_pending(
+        &self,
+        _task: &TaskId,
+        _operation_id: &OperationId,
+        _status: TaskRecordStatus,
+        _result: Option<&str>,
+        _error: Option<&str>,
+        _ts: i64,
+        _attempt_id: &crate::ids::AttemptId,
+        _terminal: &crate::workflow_history::AttemptTerminal,
+    ) -> Result<i64, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    /// Return one pending terminal projection, including its exact persisted
+    /// terminal evidence. This is an internal recovery read and is intentionally
+    /// not subject to the public Working projection.
+    /// Unsupported recovery reads fail closed rather than fabricating an empty
+    /// projection.
+    async fn pending_terminal_projection(
+        &self,
+        _task: &TaskId,
+    ) -> Result<Option<PendingTerminalProjection>, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    /// Return every terminal projection that must be reconciled before serving.
+    /// Stores that do not implement the recovery scan fail closed at boot.
+    async fn pending_terminal_projections(
+        &self,
+    ) -> Result<Vec<PendingTerminalProjection>, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    /// Publish a pending terminal row only when the exact attempt still owns it.
+    async fn mark_terminal_projection_ready(
+        &self,
+        _task: &TaskId,
+        _attempt_id: &crate::ids::AttemptId,
+    ) -> Result<(), BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
 
     /// Persist a rich orchestration event with a monotonic seq.
     ///
@@ -638,6 +813,10 @@ pub struct MemoryTaskStore {
     /// Writers that touch both `inner` and `turn_log` must hold this before either map.
     journal_fold_guard: Mutex<()>,
     inner: Mutex<HashMap<String, TaskRecord>>,
+    attempt_locators: Mutex<HashMap<String, TaskAttemptLocator>>,
+    /// Global attempt admission index. The current locator remains keyed by task,
+    /// while this index prevents a retired attempt identity from being reused.
+    attempt_identities: Mutex<HashMap<String, (String, u32, String)>>,
     batches: Mutex<HashMap<BatchId, BatchRecord>>,
     /// Tasks created under S6 code have complete journal coverage from birth.
     birth: Mutex<HashSet<String>>,
@@ -648,6 +827,9 @@ pub struct MemoryTaskStore {
     /// Per-task terminal seq. Key: task_id.
     terminal_seqs: Mutex<HashMap<String, i64>>,
     /// In-progress node starts. Key: (task_id, node_id) → (seq, ts).
+    /// Terminal rows withheld until summary/marker reconciliation succeeds.
+    /// Key: task id.
+    pending_terminal: Mutex<HashMap<String, PendingTerminalProjection>>,
     starts: Mutex<HashMap<(String, String), (i64, i64)>>,
     turn_log: Mutex<HashMap<String, TurnLogRow>>,
     /// Per-task durable orchestration journal rows. Key: task_id.
@@ -670,12 +852,15 @@ impl MemoryTaskStore {
             now_ms,
             journal_fold_guard: Mutex::new(()),
             inner: Mutex::new(HashMap::new()),
+            attempt_locators: Mutex::new(HashMap::new()),
+            attempt_identities: Mutex::new(HashMap::new()),
             batches: Mutex::new(HashMap::new()),
             birth: Mutex::new(HashSet::new()),
             checkpoints: Mutex::new(HashMap::new()),
             seq_counters: Mutex::new(HashMap::new()),
             terminal_seqs: Mutex::new(HashMap::new()),
             starts: Mutex::new(HashMap::new()),
+            pending_terminal: Mutex::new(HashMap::new()),
             turn_log: Mutex::new(HashMap::new()),
             journals: Mutex::new(HashMap::new()),
         }
@@ -693,6 +878,20 @@ impl MemoryTaskStore {
         {
             row.last_artifact_ms = Some(artifact_ms);
         }
+    }
+
+    fn project_pending_as_working(&self, mut row: TaskRecord) -> TaskRecord {
+        if self
+            .pending_terminal
+            .lock()
+            .unwrap()
+            .contains_key(row.id.as_str())
+        {
+            row.status = TaskRecordStatus::Working;
+            row.result = None;
+            row.error = None;
+        }
+        row
     }
 
     /// Allocate and return the next seq for the given task.
@@ -720,6 +919,44 @@ impl TaskStore for MemoryTaskStore {
             .insert(rec.id.as_str().to_string());
         Ok(())
     }
+    async fn create_with_attempt_locator(
+        &self,
+        rec: &TaskRecord,
+        locator: &TaskAttemptLocator,
+    ) -> Result<(), BridgeError> {
+        if !locator.belongs_to(&rec.id) {
+            return Err(BridgeError::StoreFailure);
+        }
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let mut tasks = self.inner.lock().unwrap();
+        let mut locators = self.attempt_locators.lock().unwrap();
+        let mut identities = self.attempt_identities.lock().unwrap();
+        if tasks.contains_key(rec.id.as_str())
+            || locators.contains_key(rec.id.as_str())
+            || identities.contains_key(locator.identity.attempt_id.as_str())
+            || identities.values().any(|(execution, ordinal, _)| {
+                execution == locator.identity.execution_id.as_str()
+                    && *ordinal == locator.identity.ordinal
+            })
+        {
+            return Err(BridgeError::StoreFailure);
+        }
+        tasks.insert(rec.id.as_str().to_owned(), rec.clone());
+        locators.insert(rec.id.as_str().to_owned(), locator.clone());
+        identities.insert(
+            locator.identity.attempt_id.as_str().to_owned(),
+            (
+                locator.identity.execution_id.as_str().to_owned(),
+                locator.identity.ordinal,
+                rec.id.as_str().to_owned(),
+            ),
+        );
+        self.birth
+            .lock()
+            .unwrap()
+            .insert(rec.id.as_str().to_owned());
+        Ok(())
+    }
     async fn set_terminal(
         &self,
         id: &TaskId,
@@ -729,6 +966,14 @@ impl TaskStore for MemoryTaskStore {
         updated_ms: i64,
     ) -> Result<(), BridgeError> {
         let _guard = self.journal_fold_guard.lock().unwrap();
+        if self
+            .pending_terminal
+            .lock()
+            .unwrap()
+            .contains_key(id.as_str())
+        {
+            return Err(BridgeError::StoreFailure);
+        }
         let mut g = self.inner.lock().unwrap();
         let row = g.get_mut(id.as_str()).ok_or(BridgeError::StoreFailure)?;
         row.status = status;
@@ -737,12 +982,118 @@ impl TaskStore for MemoryTaskStore {
         row.updated_ms = durable_retention_ms(updated_ms);
         Ok(())
     }
+    async fn put_attempt_locator(
+        &self,
+        task: &TaskId,
+        locator: &TaskAttemptLocator,
+    ) -> Result<(), BridgeError> {
+        if !locator.belongs_to(task) {
+            return Err(BridgeError::StoreFailure);
+        }
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        if !self.inner.lock().unwrap().contains_key(task.as_str()) {
+            return Err(BridgeError::TaskNotFound);
+        }
+        let mut locators = self.attempt_locators.lock().unwrap();
+        let mut identities = self.attempt_identities.lock().unwrap();
+        if locators.contains_key(task.as_str())
+            || identities.contains_key(locator.identity.attempt_id.as_str())
+            || identities.values().any(|(execution, ordinal, _)| {
+                execution == locator.identity.execution_id.as_str()
+                    && *ordinal == locator.identity.ordinal
+            })
+        {
+            return Err(BridgeError::StoreFailure);
+        }
+        locators.insert(task.as_str().to_string(), locator.clone());
+        identities.insert(
+            locator.identity.attempt_id.as_str().to_owned(),
+            (
+                locator.identity.execution_id.as_str().to_owned(),
+                locator.identity.ordinal,
+                task.as_str().to_owned(),
+            ),
+        );
+        Ok(())
+    }
+
+    async fn mark_attempt_telemetry_unavailable(
+        &self,
+        task: &TaskId,
+        attempt: &crate::ids::AttemptId,
+        reason: crate::workflow_history::LedgerUnavailableReason,
+    ) -> Result<(), BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let mut locators = self.attempt_locators.lock().unwrap();
+        let locator = locators
+            .get_mut(task.as_str())
+            .ok_or(BridgeError::StoreFailure)?;
+        if &locator.identity.attempt_id != attempt {
+            return Err(BridgeError::StoreFailure);
+        }
+        locator.telemetry_unavailable = Some(reason);
+        Ok(())
+    }
+
+    async fn get_attempt_locator(
+        &self,
+        task: &TaskId,
+    ) -> Result<Option<TaskAttemptLocator>, BridgeError> {
+        Ok(self
+            .attempt_locators
+            .lock()
+            .unwrap()
+            .get(task.as_str())
+            .cloned())
+    }
+
+    async fn terminal_attempts_with_telemetry_markers(
+        &self,
+    ) -> Result<Vec<crate::ids::AttemptId>, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let pending = self.pending_terminal.lock().unwrap();
+        let tasks = self.inner.lock().unwrap();
+        let locators = self.attempt_locators.lock().unwrap();
+        let mut attempts = Vec::new();
+        for (task_id, task) in tasks.iter() {
+            if !task.status.is_terminal() || pending.contains_key(task_id) {
+                continue;
+            }
+            let Some(locator) = locators.get(task_id) else {
+                continue;
+            };
+            if !locator.belongs_to(&task.id) {
+                return Err(BridgeError::StoreFailure);
+            }
+            if locator.telemetry_unavailable.is_some() {
+                attempts.push(locator.identity.attempt_id.clone());
+            }
+        }
+        attempts.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        Ok(attempts)
+    }
+
     async fn get(&self, id: &TaskId) -> Result<Option<TaskRecord>, BridgeError> {
-        Ok(self.inner.lock().unwrap().get(id.as_str()).cloned())
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let row = self.inner.lock().unwrap().get(id.as_str()).cloned();
+        Ok(row.map(|row| self.project_pending_as_working(row)))
     }
     async fn list(&self, limit: usize) -> Result<Vec<TaskRecord>, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let pending = self.pending_terminal.lock().unwrap();
         let g = self.inner.lock().unwrap();
-        let mut v: Vec<TaskRecord> = g.values().cloned().collect();
+        let mut v: Vec<TaskRecord> = g
+            .values()
+            .cloned()
+            .map(|mut row| {
+                if pending.contains_key(row.id.as_str()) {
+                    row.status = TaskRecordStatus::Working;
+                    row.result = None;
+                    row.error = None;
+                }
+                row
+            })
+            .collect();
         v.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
         v.truncate(limit);
         Ok(v)
@@ -825,6 +1176,57 @@ impl TaskStore for MemoryTaskStore {
         }
         row.resume_attempts += 1;
         row.updated_ms = durable_retention_ms(now_ms); // last_resume_ms is folded into updated_ms for the in-memory store; the SQLite store has the dedicated column.
+        Ok(ResumeClaim::Resumable {
+            attempt: row.resume_attempts,
+        })
+    }
+    async fn claim_resume_attempt_with_locator(
+        &self,
+        task: &TaskId,
+        cap: u32,
+        now_ms: i64,
+        expected: &TaskAttemptLocator,
+        next: &TaskAttemptLocator,
+    ) -> Result<ResumeClaim, BridgeError> {
+        if !expected.belongs_to(task) || !next.is_direct_successor_of(expected) {
+            return Err(BridgeError::StoreFailure);
+        }
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let mut tasks = self.inner.lock().unwrap();
+        let mut locators = self.attempt_locators.lock().unwrap();
+        let mut identities = self.attempt_identities.lock().unwrap();
+        let row = tasks
+            .get_mut(task.as_str())
+            .ok_or(BridgeError::StoreFailure)?;
+        if row.status != TaskRecordStatus::Working || locators.get(task.as_str()) != Some(expected)
+        {
+            return Err(BridgeError::StoreFailure);
+        }
+        if row.resume_attempts >= cap {
+            return Ok(ResumeClaim::Exhausted);
+        }
+        if identities.contains_key(next.identity.attempt_id.as_str())
+            || identities.values().any(|(execution, ordinal, _)| {
+                execution == next.identity.execution_id.as_str()
+                    && *ordinal == next.identity.ordinal
+            })
+        {
+            return Err(BridgeError::StoreFailure);
+        }
+        row.resume_attempts = row
+            .resume_attempts
+            .checked_add(1)
+            .ok_or(BridgeError::StoreFailure)?;
+        row.updated_ms = durable_retention_ms(now_ms);
+        locators.insert(task.as_str().to_string(), next.clone());
+        identities.insert(
+            next.identity.attempt_id.as_str().to_owned(),
+            (
+                next.identity.execution_id.as_str().to_owned(),
+                next.identity.ordinal,
+                task.as_str().to_owned(),
+            ),
+        );
         Ok(ResumeClaim::Resumable {
             attempt: row.resume_attempts,
         })
@@ -1083,13 +1485,21 @@ impl TaskStore for MemoryTaskStore {
         max_events: usize,
         max_bytes: usize,
     ) -> Result<JournalRead, BridgeError> {
-        let events = self
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let mut events = self
             .journals
             .lock()
             .unwrap()
             .get(task.as_str())
             .cloned()
             .unwrap_or_default();
+        let pending_seq = self
+            .pending_terminal
+            .lock()
+            .unwrap()
+            .get(task.as_str())
+            .map(|pending| pending.terminal_seq);
+        events.retain(|(seq, _)| pending_seq.is_none_or(|terminal| *seq < terminal));
 
         // Preflight (mirrors the SQLite COUNT/SUM): compute the event count and total
         // JSONL byte size WITHOUT retaining the assembled body, so an over-limit journal
@@ -1196,10 +1606,20 @@ impl TaskStore for MemoryTaskStore {
     }
 
     async fn batch_children(&self, id: &BatchId) -> Result<Vec<TaskRecord>, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let pending = self.pending_terminal.lock().unwrap();
         let g = self.inner.lock().unwrap();
         Ok(g.values()
             .filter(|r| r.batch_id.as_ref() == Some(id))
             .cloned()
+            .map(|mut row| {
+                if pending.contains_key(row.id.as_str()) {
+                    row.status = TaskRecordStatus::Working;
+                    row.result = None;
+                    row.error = None;
+                }
+                row
+            })
             .collect())
     }
 
@@ -1230,6 +1650,59 @@ impl TaskStore for MemoryTaskStore {
         let task_id = rec.id.as_str().to_string();
         g.insert(task_id.clone(), rec);
         self.birth.lock().unwrap().insert(task_id);
+        Ok(ChildClaim::Created)
+    }
+
+    async fn claim_batch_child_with_locator(
+        &self,
+        batch: &BatchId,
+        item: &str,
+        rec: &TaskRecord,
+        locator: &TaskAttemptLocator,
+    ) -> Result<ChildClaim, BridgeError> {
+        if !locator.belongs_to(&rec.id) {
+            return Err(BridgeError::StoreFailure);
+        }
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let mut tasks = self.inner.lock().unwrap();
+        if let Some(existing) = tasks.values().find(|row| {
+            row.batch_id.as_ref() == Some(batch) && row.item_id.as_deref() == Some(item)
+        }) {
+            return Ok(if existing.status == TaskRecordStatus::Working {
+                ChildClaim::ExistingWorking
+            } else {
+                ChildClaim::ExistingTerminal
+            });
+        }
+        let mut locators = self.attempt_locators.lock().unwrap();
+        let mut identities = self.attempt_identities.lock().unwrap();
+        if tasks.contains_key(rec.id.as_str())
+            || locators.contains_key(rec.id.as_str())
+            || identities.contains_key(locator.identity.attempt_id.as_str())
+            || identities.values().any(|(execution, ordinal, _)| {
+                execution == locator.identity.execution_id.as_str()
+                    && *ordinal == locator.identity.ordinal
+            })
+        {
+            return Err(BridgeError::StoreFailure);
+        }
+        let mut record = rec.clone();
+        record.batch_id = Some(batch.clone());
+        record.item_id = Some(item.to_owned());
+        tasks.insert(rec.id.as_str().to_owned(), record);
+        locators.insert(rec.id.as_str().to_owned(), locator.clone());
+        identities.insert(
+            locator.identity.attempt_id.as_str().to_owned(),
+            (
+                locator.identity.execution_id.as_str().to_owned(),
+                locator.identity.ordinal,
+                rec.id.as_str().to_owned(),
+            ),
+        );
+        self.birth
+            .lock()
+            .unwrap()
+            .insert(rec.id.as_str().to_owned());
         Ok(ChildClaim::Created)
     }
 
@@ -1391,6 +1864,14 @@ impl TaskStore for MemoryTaskStore {
         ts: i64,
     ) -> Result<i64, BridgeError> {
         let _guard = self.journal_fold_guard.lock().unwrap();
+        if self
+            .pending_terminal
+            .lock()
+            .unwrap()
+            .contains_key(task.as_str())
+        {
+            return Err(BridgeError::StoreFailure);
+        }
         let artifact_ms = self.retention_now_ms();
         {
             let mut inner = self.inner.lock().unwrap();
@@ -1439,6 +1920,155 @@ impl TaskStore for MemoryTaskStore {
         Ok(seq)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn set_terminal_sequenced_pending(
+        &self,
+        task: &TaskId,
+        operation_id: &OperationId,
+        status: TaskRecordStatus,
+        result: Option<&str>,
+        error: Option<&str>,
+        ts: i64,
+        attempt_id: &crate::ids::AttemptId,
+        terminal: &crate::workflow_history::AttemptTerminal,
+    ) -> Result<i64, BridgeError> {
+        if !status.is_terminal() || terminal.validate().is_err() {
+            return Err(BridgeError::StoreFailure);
+        }
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        if let Some(pending) = self
+            .pending_terminal
+            .lock()
+            .unwrap()
+            .get(task.as_str())
+            .cloned()
+        {
+            let compatible = pending.attempt_id == *attempt_id
+                && pending.terminal == *terminal
+                && pending.task.status == status
+                && pending.task.result.as_deref() == result
+                && pending.task.error.as_deref() == error;
+            return compatible
+                .then_some(pending.terminal_seq)
+                .ok_or(BridgeError::StoreFailure);
+        }
+        let locator_matches = self
+            .attempt_locators
+            .lock()
+            .unwrap()
+            .get(task.as_str())
+            .is_some_and(|locator| {
+                locator.belongs_to(task) && locator.identity.attempt_id == *attempt_id
+            });
+        if !locator_matches {
+            return Err(BridgeError::StoreFailure);
+        }
+
+        let artifact_ms = self.retention_now_ms();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let row = inner
+                .get_mut(task.as_str())
+                .ok_or(BridgeError::StoreFailure)?;
+            if row.status != TaskRecordStatus::Working {
+                return Err(BridgeError::StoreFailure);
+            }
+            Self::bump_last_artifact(row, artifact_ms);
+        }
+        // Reserve a unique durable cursor for the exact-attempt marker. Clean
+        // summary success leaves this cursor unused; degraded projection emits
+        // the marker here and the terminal at the immediately following seq.
+        let _marker_seq = self.next_seq(task.as_str());
+        let seq = self.next_seq(task.as_str());
+        let task_record = {
+            let mut inner = self.inner.lock().unwrap();
+            let row = inner
+                .get_mut(task.as_str())
+                .ok_or(BridgeError::StoreFailure)?;
+            row.status = status;
+            row.result = result.map(str::to_owned);
+            row.error = error.map(str::to_owned);
+            row.updated_ms = durable_retention_ms(ts);
+            row.clone()
+        };
+        self.terminal_seqs
+            .lock()
+            .unwrap()
+            .insert(task.as_str().to_owned(), seq);
+        self.starts
+            .lock()
+            .unwrap()
+            .retain(|(task_id, _), _| task_id != task.as_str());
+        let event = crate::orch::OrchEvent {
+            v: crate::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: operation_id.clone(),
+            session: None,
+            source: None,
+            kind: crate::orch::OrchEventKind::Terminal {
+                status: terminal_status_from_record(&status),
+                output: result.or(error).unwrap_or("").to_owned(),
+            },
+        };
+        self.journals
+            .lock()
+            .unwrap()
+            .entry(task.as_str().to_owned())
+            .or_default()
+            .push((seq, event));
+        self.pending_terminal.lock().unwrap().insert(
+            task.as_str().to_owned(),
+            PendingTerminalProjection {
+                task: task_record,
+                attempt_id: attempt_id.clone(),
+                terminal_seq: seq,
+                terminal: terminal.clone(),
+            },
+        );
+        Ok(seq)
+    }
+
+    async fn pending_terminal_projection(
+        &self,
+        task: &TaskId,
+    ) -> Result<Option<PendingTerminalProjection>, BridgeError> {
+        Ok(self
+            .pending_terminal
+            .lock()
+            .unwrap()
+            .get(task.as_str())
+            .cloned())
+    }
+
+    async fn pending_terminal_projections(
+        &self,
+    ) -> Result<Vec<PendingTerminalProjection>, BridgeError> {
+        Ok(self
+            .pending_terminal
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn mark_terminal_projection_ready(
+        &self,
+        task: &TaskId,
+        attempt_id: &crate::ids::AttemptId,
+    ) -> Result<(), BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let mut pending = self.pending_terminal.lock().unwrap();
+        match pending.get(task.as_str()) {
+            Some(row) if &row.attempt_id == attempt_id => {
+                pending.remove(task.as_str());
+                Ok(())
+            }
+            _ => Err(BridgeError::StoreFailure),
+        }
+    }
+
     async fn record_event_sequenced(
         &self,
         task: &TaskId,
@@ -1479,12 +2109,21 @@ impl TaskStore for MemoryTaskStore {
         task: &TaskId,
         after_seq: i64,
     ) -> Result<Vec<crate::orch::OrchEvent>, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let pending_seq = self
+            .pending_terminal
+            .lock()
+            .unwrap()
+            .get(task.as_str())
+            .map(|pending| pending.terminal_seq);
         let g = self.journals.lock().unwrap();
         let mut out: Vec<crate::orch::OrchEvent> = g
             .get(task.as_str())
             .into_iter()
             .flat_map(|rows| rows.iter())
-            .filter(|(seq, _event)| *seq > after_seq)
+            .filter(|(seq, _event)| {
+                *seq > after_seq && pending_seq.is_none_or(|terminal| *seq < terminal)
+            })
             .map(|(seq, event)| {
                 let mut event = event.clone();
                 event.seq = *seq;
@@ -1497,7 +2136,7 @@ impl TaskStore for MemoryTaskStore {
 
     async fn journal_fold_inputs(&self, task: &TaskId) -> Result<JournalFoldInputs, BridgeError> {
         let _guard = self.journal_fold_guard.lock().unwrap();
-        let row = {
+        let mut row = {
             let g = self.inner.lock().unwrap();
             g.get(task.as_str())
                 .cloned()
@@ -1511,12 +2150,28 @@ impl TaskStore for MemoryTaskStore {
             let g = self.terminal_seqs.lock().unwrap();
             g.get(task.as_str()).copied()
         };
+        let pending_seq = self
+            .pending_terminal
+            .lock()
+            .unwrap()
+            .get(task.as_str())
+            .map(|pending| pending.terminal_seq);
+        let terminal_seq = if pending_seq.is_some() {
+            row.status = TaskRecordStatus::Working;
+            row.result = None;
+            row.error = None;
+            None
+        } else {
+            terminal_seq
+        };
+        let cut_seq = pending_seq.map_or(cut_seq, |seq| seq.saturating_sub(1));
         let complete_from_birth = self.birth.lock().unwrap().contains(task.as_str());
         let mut events: Vec<crate::orch::OrchEvent> = {
             let g = self.journals.lock().unwrap();
             g.get(task.as_str())
                 .into_iter()
                 .flat_map(|rows| rows.iter())
+                .filter(|(seq, _event)| pending_seq.is_none_or(|terminal| *seq < terminal))
                 .map(|(seq, event)| {
                     let mut event = event.clone();
                     event.seq = *seq;
@@ -1539,7 +2194,8 @@ impl TaskStore for MemoryTaskStore {
     }
 
     async fn progress_snapshot(&self, task: &TaskId) -> Result<TaskProgressSnapshot, BridgeError> {
-        let row = {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let mut row = {
             let g = self.inner.lock().unwrap();
             g.get(task.as_str())
                 .cloned()
@@ -1553,6 +2209,21 @@ impl TaskStore for MemoryTaskStore {
             let g = self.terminal_seqs.lock().unwrap();
             g.get(task.as_str()).copied()
         };
+        let pending_seq = self
+            .pending_terminal
+            .lock()
+            .unwrap()
+            .get(task.as_str())
+            .map(|pending| pending.terminal_seq);
+        let terminal_seq = if pending_seq.is_some() {
+            row.status = TaskRecordStatus::Working;
+            row.result = None;
+            row.error = None;
+            None
+        } else {
+            terminal_seq
+        };
+        let cut_seq = pending_seq.map_or(cut_seq, |seq| seq.saturating_sub(1));
         let mut checkpoints: Vec<(NodeId, String, bool, i64)> = {
             let g = self.checkpoints.lock().unwrap();
             let mut out = Vec::new();
@@ -1760,6 +2431,192 @@ mod tests {
             item_id: Some(item.to_string()),
             artifacts_purged_at: None,
         }
+    }
+    #[derive(Default)]
+    struct DefaultAtomicMethodStore {
+        create_calls: std::sync::atomic::AtomicUsize,
+        child_claim_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TaskStore for DefaultAtomicMethodStore {
+        async fn create(&self, _rec: &TaskRecord) -> Result<(), BridgeError> {
+            self.create_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn set_terminal(
+            &self,
+            _id: &TaskId,
+            _status: TaskRecordStatus,
+            _result: Option<&str>,
+            _error: Option<&str>,
+            _updated_ms: i64,
+        ) -> Result<(), BridgeError> {
+            Err(BridgeError::StoreFailure)
+        }
+
+        async fn get(&self, _id: &TaskId) -> Result<Option<TaskRecord>, BridgeError> {
+            Ok(None)
+        }
+
+        async fn list(&self, _limit: usize) -> Result<Vec<TaskRecord>, BridgeError> {
+            Ok(Vec::new())
+        }
+
+        async fn sweep_interrupted(&self, _updated_ms: i64) -> Result<u64, BridgeError> {
+            Ok(0)
+        }
+
+        async fn cancel_if_working(
+            &self,
+            _id: &TaskId,
+            _updated_ms: i64,
+        ) -> Result<bool, BridgeError> {
+            Ok(false)
+        }
+
+        async fn put_node_checkpoint(
+            &self,
+            _task: &TaskId,
+            _node: &NodeId,
+            _output: &str,
+            _ok: bool,
+            _ts: i64,
+        ) -> Result<(), BridgeError> {
+            Err(BridgeError::StoreFailure)
+        }
+
+        async fn node_checkpoints(
+            &self,
+            _task: &TaskId,
+        ) -> Result<Vec<(NodeId, String, bool, Option<UsageSnapshot>)>, BridgeError> {
+            Ok(Vec::new())
+        }
+
+        async fn claim_resume_attempt(
+            &self,
+            _task: &TaskId,
+            _cap: u32,
+            _now_ms: i64,
+        ) -> Result<ResumeClaim, BridgeError> {
+            Err(BridgeError::StoreFailure)
+        }
+
+        async fn working_tasks(&self) -> Result<Vec<TaskRecord>, BridgeError> {
+            Ok(Vec::new())
+        }
+
+        async fn claim_batch_child(
+            &self,
+            _batch: &BatchId,
+            _item: &str,
+            _rec: &TaskRecord,
+        ) -> Result<ChildClaim, BridgeError> {
+            self.child_claim_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ChildClaim::Created)
+        }
+
+        async fn record_node_started(
+            &self,
+            _task: &TaskId,
+            _node: &NodeId,
+            _operation_id: &OperationId,
+            _ts: i64,
+        ) -> Result<i64, BridgeError> {
+            Err(BridgeError::StoreFailure)
+        }
+
+        async fn put_node_checkpoint_sequenced(
+            &self,
+            _task: &TaskId,
+            _node: &NodeId,
+            _operation_id: &OperationId,
+            _output: &str,
+            _ok: bool,
+            _ts: i64,
+            _usage: Option<&UsageSnapshot>,
+        ) -> Result<i64, BridgeError> {
+            Err(BridgeError::StoreFailure)
+        }
+
+        async fn set_terminal_sequenced(
+            &self,
+            _task: &TaskId,
+            _operation_id: &OperationId,
+            _status: TaskRecordStatus,
+            _result: Option<&str>,
+            _error: Option<&str>,
+            _ts: i64,
+        ) -> Result<i64, BridgeError> {
+            Err(BridgeError::StoreFailure)
+        }
+
+        async fn journal_from(
+            &self,
+            _task: &TaskId,
+            _after_seq: i64,
+        ) -> Result<Vec<OrchEvent>, BridgeError> {
+            Ok(Vec::new())
+        }
+
+        async fn progress_snapshot(
+            &self,
+            _task: &TaskId,
+        ) -> Result<TaskProgressSnapshot, BridgeError> {
+            Err(BridgeError::StoreFailure)
+        }
+    }
+
+    #[tokio::test]
+    async fn non_atomic_task_store_defaults_fail_before_primary_mutation() {
+        let store = DefaultAtomicMethodStore::default();
+        let identity = crate::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let locator = TaskAttemptLocator {
+            identity,
+            telemetry_unavailable: None,
+        };
+        let record = rec(task.as_str(), 1);
+
+        assert!(store
+            .create_with_attempt_locator(&record, &locator)
+            .await
+            .is_err());
+        assert_eq!(
+            store.create_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        let batch = BatchId::parse("batch-atomic-default").unwrap();
+        let child = batch_child_record(&task, &batch, "item-1");
+        assert!(store
+            .claim_batch_child_with_locator(&batch, "item-1", &child, &locator)
+            .await
+            .is_err());
+        assert_eq!(
+            store
+                .child_claim_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            store.pending_terminal_projections().await,
+            Err(BridgeError::StoreFailure),
+            "a store without a durable recovery scan must fail the serving gate closed"
+        );
+        assert_eq!(
+            store.get_attempt_locator(&task).await,
+            Err(BridgeError::StoreFailure),
+            "unsupported identity reads must not fabricate an absent locator"
+        );
+        assert_eq!(
+            store.pending_terminal_projection(&task).await,
+            Err(BridgeError::StoreFailure),
+            "unsupported recovery reads must not fabricate an absent projection"
+        );
     }
 
     #[tokio::test]
@@ -2748,6 +3605,211 @@ mod tests {
                 .await
                 .unwrap(),
             Some(NodeCheckpointOutput::TooLarge { bytes: 12 })
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_primary_admission_rejects_completed_cross_execution_attempt_reuse() {
+        let store = MemoryTaskStore::new();
+        let first_identity = crate::ids::AttemptIdentity::initial().unwrap();
+        let first_task = TaskId::parse(first_identity.execution_id.as_str()).unwrap();
+        let first_locator = TaskAttemptLocator {
+            identity: first_identity.clone(),
+            telemetry_unavailable: None,
+        };
+        store
+            .create_with_attempt_locator(&rec(first_task.as_str(), 1), &first_locator)
+            .await
+            .unwrap();
+        store
+            .set_terminal(
+                &first_task,
+                TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+
+        let mut colliding_identity = crate::ids::AttemptIdentity::initial().unwrap();
+        let colliding_task = TaskId::parse(colliding_identity.execution_id.as_str()).unwrap();
+        colliding_identity.attempt_id = first_identity.attempt_id;
+        let colliding_locator = TaskAttemptLocator {
+            identity: colliding_identity,
+            telemetry_unavailable: None,
+        };
+        assert!(store
+            .create_with_attempt_locator(&rec(colliding_task.as_str(), 3), &colliding_locator,)
+            .await
+            .is_err());
+        assert_eq!(store.get(&colliding_task).await.unwrap(), None);
+        assert_eq!(
+            store.get_attempt_locator(&colliding_task).await.unwrap(),
+            None,
+            "a global collision cannot leave a task or locator partially visible"
+        );
+        assert_eq!(
+            store.get_attempt_locator(&first_task).await.unwrap(),
+            Some(first_locator)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_primary_attempt_collision_has_exactly_one_atomic_winner() {
+        let store = Arc::new(MemoryTaskStore::new());
+        let first_identity = crate::ids::AttemptIdentity::initial().unwrap();
+        let mut second_identity = crate::ids::AttemptIdentity::initial().unwrap();
+        second_identity.attempt_id = first_identity.attempt_id.clone();
+        let first_task = TaskId::parse(first_identity.execution_id.as_str()).unwrap();
+        let second_task = TaskId::parse(second_identity.execution_id.as_str()).unwrap();
+        let first_record = rec(first_task.as_str(), 1);
+        let second_record = rec(second_task.as_str(), 1);
+        let first_locator = TaskAttemptLocator {
+            identity: first_identity,
+            telemetry_unavailable: None,
+        };
+        let second_locator = TaskAttemptLocator {
+            identity: second_identity,
+            telemetry_unavailable: None,
+        };
+
+        let first_store = store.clone();
+        let second_store = store.clone();
+        let (first, second) = tokio::join!(
+            async move {
+                first_store
+                    .create_with_attempt_locator(&first_record, &first_locator)
+                    .await
+            },
+            async move {
+                second_store
+                    .create_with_attempt_locator(&second_record, &second_locator)
+                    .await
+            }
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        let rows = store.list(10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(store
+            .get_attempt_locator(&rows[0].id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn attempt_locator_is_create_only_task_bound_and_atomically_advanced() {
+        let store = MemoryTaskStore::new();
+        let first_identity = crate::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(first_identity.execution_id.as_str()).unwrap();
+        store.create(&rec(task.as_str(), 1)).await.unwrap();
+        let first = TaskAttemptLocator {
+            identity: first_identity.clone(),
+            telemetry_unavailable: None,
+        };
+
+        let unrelated = TaskAttemptLocator {
+            identity: crate::ids::AttemptIdentity::initial().unwrap(),
+            telemetry_unavailable: None,
+        };
+        assert!(store.put_attempt_locator(&task, &unrelated).await.is_err());
+        store.put_attempt_locator(&task, &first).await.unwrap();
+        assert!(
+            store.put_attempt_locator(&task, &first).await.is_err(),
+            "initial locator insertion is create-only"
+        );
+
+        let next = TaskAttemptLocator {
+            identity: first_identity.resume().unwrap(),
+            telemetry_unavailable: None,
+        };
+        let mut forged = next.clone();
+        forged.identity.parent_attempt_id = None;
+        assert!(store
+            .claim_resume_attempt_with_locator(&task, 3, 2, &first, &forged)
+            .await
+            .is_err());
+        assert_eq!(
+            store.get_attempt_locator(&task).await.unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(store.get(&task).await.unwrap().unwrap().resume_attempts, 0);
+
+        assert_eq!(
+            store
+                .claim_resume_attempt_with_locator(&task, 3, 2, &first, &next)
+                .await
+                .unwrap(),
+            ResumeClaim::Resumable { attempt: 1 }
+        );
+        assert_eq!(
+            store.get_attempt_locator(&task).await.unwrap(),
+            Some(next.clone())
+        );
+        assert_eq!(store.get(&task).await.unwrap().unwrap().resume_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn telemetry_marker_and_resume_cas_are_scoped_to_the_current_attempt() {
+        let store = MemoryTaskStore::new();
+        let first_identity = crate::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(first_identity.execution_id.as_str()).unwrap();
+        store.create(&rec(task.as_str(), 1)).await.unwrap();
+        let first = TaskAttemptLocator {
+            identity: first_identity.clone(),
+            telemetry_unavailable: None,
+        };
+        let next = TaskAttemptLocator {
+            identity: first_identity.resume().unwrap(),
+            telemetry_unavailable: None,
+        };
+        store.put_attempt_locator(&task, &first).await.unwrap();
+        store
+            .claim_resume_attempt_with_locator(&task, 1, 2, &first, &next)
+            .await
+            .unwrap();
+
+        assert!(store
+            .mark_attempt_telemetry_unavailable(
+                &task,
+                &first.identity.attempt_id,
+                crate::workflow_history::LedgerUnavailableReason::Io,
+            )
+            .await
+            .is_err());
+        store
+            .mark_attempt_telemetry_unavailable(
+                &task,
+                &next.identity.attempt_id,
+                crate::workflow_history::LedgerUnavailableReason::Io,
+            )
+            .await
+            .unwrap();
+        let current = store.get_attempt_locator(&task).await.unwrap().unwrap();
+        assert_eq!(
+            current.telemetry_unavailable,
+            Some(crate::workflow_history::LedgerUnavailableReason::Io)
+        );
+
+        let third = TaskAttemptLocator {
+            identity: next.identity.resume().unwrap(),
+            telemetry_unavailable: None,
+        };
+        assert!(store
+            .claim_resume_attempt_with_locator(&task, 2, 3, &first, &third)
+            .await
+            .is_err());
+        assert_eq!(
+            store
+                .claim_resume_attempt_with_locator(&task, 1, 3, &current, &third)
+                .await
+                .unwrap(),
+            ResumeClaim::Exhausted
+        );
+        assert_eq!(
+            store.get_attempt_locator(&task).await.unwrap(),
+            Some(current)
         );
     }
 

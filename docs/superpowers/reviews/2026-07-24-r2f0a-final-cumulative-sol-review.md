@@ -1,0 +1,74 @@
+I’ll use the required `a2a-bridge-operator` skill to enforce the repository’s read-only workflow and evidence boundaries. I’ll first authenticate the frozen Git/artifact state, then read the authorities and cumulative diff, adjudicate every item in order, and recheck the boundary before the terminal verdict. I will not run builds/tests, use network/provider/container surfaces, or delegate.The initial freeze matches every declared boundary fact: clean branch/index/worktree, exact HEAD/base trees and merge base, ancestor relation, 36 commits, the stated 9 paths and shortstat, and a clean `git diff --check`. All seven supplied artifacts also match their declared SHA-256 values. I’m now reading the governing skill and normative documents before using any prior review or verification as evidence.The governing materials confirm this is strictly the R2f0a source/test gate: timeout policy, adapter evidence, takeover, session-close/health/drain, stable ingress, provider integrations, and live compatibility remain deferred. I have not invoked any executable validation; all gate claims will remain labeled as authenticated supplied evidence. Next I’m reading the prior owner/alias correction records and then tracing the exact implementation and tests independently.The prior review’s sole blocker is now represented by a narrow production change plus three subsequent test-fixture/oracle commits. The public-route changes outside `sqlite.rs` preserve configured-versus-selected authority and add one-shot route witnesses; the stats CLI now selects allocation-specific read-only/admin openers. I’m entering the 33,415-line SQLite patch now, reading it sequentially rather than sampling large test sections.*Context compacted to fit the model's context window.*
+
+The production/schema half is internally consistent so far: typed openers re-prevalidate raw and canonical paths before SQLite, allocation authority is now explicit, and configured/platform admission stays separated. I’m continuing linearly through the remaining diff before targeting the owner predicate and its public-route proof.The cumulative rewrite preserves the original task-store behaviors while adding durable attempt identity before terminal/history projection; I have not found an inherited error that would make the new owner-route tests vacuous. The next section covers the history reserve/read implementation and is the highest-risk SQL mapping area.The effective-owner predicate is present exactly at the pre-SQLite no-follow probe: only canonical `-wal`/`-shm` require `uid == geteuid`, while the main DB, rollback journal, and bridge locks keep their former kind/link contracts and a mismatch returns plain `Open`. I’m now checking reserve/retention and immutable reader projections for column-order or authority drift.The latest and completed readers use one SQLite snapshot, left-join permanent authority, map every projection explicitly, call the shared validator, and retain deterministic ordering. The only legacy relaxation is the exact failed prompt-barrier terminal shape; all other projection mismatches remain corruption. I’m continuing through the large regression body, including fail-first and negative controls.The owner proof is substantive: root creates valid live WAL state, transfers the entire fixture to UID/GID 65534, restores exactly one WAL or SHM to foreign ownership, and the child invokes all ten public opener families while comparing full filesystem state after each plain-`Open` refusal. Owner-owned configured/platform read-only and writable controls, including real crash-residue transition, are separate. No earlier lock error is accepted as success.The crash controller has distinct readiness and execution deadlines, ties readiness to the spawned PID, kills and synchronously reaps that exact child, preserves normal exit 17, and has a waitpid/ECHILD regression. The transition oracle canonicalizes only the protected root used for its narrow database/sidecar/attempt-lock whitelist, freezes unrelated namespace and bridge locks, and requires surviving sidecars plus an empty owner-owned 0700 attempt-lock directory.*Context compacted to fit the model's context window.*
+
+I’ve now covered the previously truncated section of the cumulative patch. It contains the allocation-edge, retention, lock-lifecycle, owner-mode, and read-only route controls; I’m continuing through the remaining test corpus before making any closure claim.The cumulative diff is now fully read, including the large B3 and correction-stack regression sections. No mismatch or demonstrated defect has emerged yet; I’m switching from patch chronology to current-HEAD caller tracing so the final adjudication rests on the code that actually ships.*Context compacted to fit the model's context window.*
+
+The cumulative semantic pass is complete. I found no concrete regression; I’m now re-authenticating the frozen Git boundary and every supplied artifact so the verdict is tied to the same candidate I reviewed.The final boundary recheck matches exactly, and all artifact digests remain authentic. I’m tightening the evidence wording around the inherited public-read family before issuing the terminal verdict; this remains read-only source inspection.## Frozen boundary
+
+MATCH. Final read-only recheck confirmed:
+
+- Clean branch `implement/impl-6025-b0q56l47`
+- HEAD `d7f20d37a9fda493c0b8dc18339489bfe1a059a3`, tree `1803a888cf77fdee378367404179cc9ba4085ee6`
+- Base and merge base `4cc71f4a7e7e82500041d117ed5484f305ed6f13`, tree `4b4c399fa73c9c5b78efb308c520ce275c9e00f0`
+- Base is an ancestor; exactly 36 commits
+- Exactly 9 paths, 23,921 insertions, 8,908 deletions; path inventory matches the task
+- `git diff --check` passed with no output
+
+All named artifact SHA-256 values matched exactly. The checkpoint remains `Approved` with SHA-256 `7779636f8327c951fbcd6bd1f515c4dc0f848f47b1045f5d599a86708f5e7fb9`.
+
+## Required mechanisms
+
+1. **RESOLVED — Latest-lineage authority.** [`latest_reservation_for_task`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/crates/bridge-store/src/sqlite.rs:8749>) reads immutable summary projections and the left-joined permanent attempt authority in one statement, preserves newest-first selection and `None`, and sends the result through the shared validator at [`sqlite.rs:7944`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/crates/bridge-store/src/sqlite.rs:7944>). Foreign, absent, or mismatched authority becomes typed failure rather than fabricated absence.
+
+2. **RESOLVED — Stable roots and creator convergence.** Root selection at [`sqlite.rs:9348`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/crates/bridge-store/src/sqlite.rs:9348>) requires absolute explicit/HOME roots and permits relative XDG fallback only through validated absolute HOME. [`HistoryParent::open_file`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/crates/bridge-store/src/sqlite.rs:7148>) implements existing-open, exclusive creation, `EEXIST` convergence, bounded validation retry, and descriptor/path identity checks. Raw/canonical aliases, wrong kinds, umask, `libc::mode_t`, and Linux/macOS coverage remain represented.
+
+3. **RESOLVED — Completed-range authority.** [`completed_between`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/crates/bridge-store/src/sqlite.rs:9119>) reads summary, terminal, and left-joined authority together. Its 33-column mapping is aligned, range and ordering remain intact, and each row receives shared immutable-projection and raw-terminal validation.
+
+4. **RESOLVED — Legacy compatibility and schema mapping.** The conservative `unknown` projection is restricted to the exact degraded prompt-barrier evidence shape in the exact-attempt and completed readers. Error classifiers at [`sqlite.rs:7764`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/crates/bridge-store/src/sqlite.rs:7764>) map completed-query schema/setup failures to Migration while preserving Open, IO, read-only, lock, corruption, and row-decoding classifications.
+
+5. **RESOLVED — Pre-SQLite effective-owner admission.** [`preflight_history_path`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/crates/bridge-store/src/sqlite.rs:7589>) requires exact WAL/SHM entries to be regular, single-link, and owned by `geteuid()`. Other suffix contracts are unchanged. All configured, platform, concurrent, read-only/stats, admin, and selected-platform paths reach prevalidation before SQLite or bridge mutation; raw and canonical passes apply the same predicate.
+
+6. **RESOLVED — Foreign/owner proof.** The fixture and route matrix beginning at [`sqlite.rs:12764`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/crates/bridge-store/src/sqlite.rs:12764>) create valid configured/platform WAL state, transfer the fixture to the child UID, restore exactly the selected WAL or SHM to foreign ownership, exercise all ten named public opener classes, require plain typed Open, and compare the complete protected snapshot. Owner-owned controls cover configured/platform, writable/read-only, WAL/SHM, and real platform crash residue.
+
+7. **RESOLVED — Crash/transition oracle closure.** [`run_bounded_crash_fixture_with_timeout`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/crates/bridge-store/src/sqlite.rs:12844>) gives readiness and execution separate deadlines, kills and reaps the exact child, and preserves normal exit 17. The transition oracle at [`sqlite.rs:13041`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/crates/bridge-store/src/sqlite.rs:13041>) narrowly normalizes the protected-root spelling, permits only exact database/SQLite transition artifacts, preserves unrelated/lock/namespace state, and requires safe surviving sidecars plus an empty owner-private mode-0700 `.attempt-locks`. Supplied fail-first evidence demonstrates the immediate predecessor failed the alias oracle on Linux and macOS.
+
+## Inherited closure families
+
+1. **RESOLVED — Original full-review failures.** Direct-attempt identity is durably reserved before routing/provider effects in [`coordinator.rs:266`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/crates/bridge-coordinator/src/coordinator.rs:266>); configured-history quota constants remain logical in [`workflow_history.rs:4`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/crates/bridge-core/src/workflow_history.rs:4>); GetTask falls back only on `Ok(None)` and propagates errors at [`server.rs:4527`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/crates/bridge-a2a-inbound/src/server.rs:4527>); direct telemetry remains explicitly incomplete rather than fabricated. Task safety/recovery defaults fail closed at [`task_store.rs:386`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/crates/bridge-core/src/task_store.rs:386>).
+
+2. **RESOLVED — B1 schema/allocation/lifecycle.** Schema normalization, charge/identity metadata, terminal reserve, pins/retention, active/terminal rows, tombstones, reopen/reconciliation, and concurrency are enforced through transactional admission and validation. Capacity refusal occurs before commit, so unrelated configured data and partial admission are not exposed.
+
+3. **RESOLVED — B2 platform bootstrap/path ownership.** No-store selection produces one platform ledger; configured failures do not fall through. Bootstrap begins with prevalidation before namespace mutation, then performs canonical handoff, proof/lock handling, validation, and creator convergence. Public modes, unsupported targets, umask, and replacement-race checks remain covered.
+
+4. **RESOLVED — B3 transitions/concurrency.** Current production and tests exercise real transactions, admission contention, WAL/reopen, migration, reserve, pins, retention, and simultaneous creators. Logical snapshot comparison includes BLOBs and internal-looking user names using SQLite’s actual `GLOB` namespace exclusion.
+
+5. **RESOLVED — Read-only inspection/refusal.** Allocation type/state is checked before bridge effects; primary errors retain precedence. Migrating acceptance is confined to its true platform-resume path. Typed refusals use exact non-mutation snapshots, while accepted WAL-backed inspection permits only SQLite-managed exact canonical WAL/SHM changes.
+
+6. **RESOLVED — Public compatibility.** Offline, served, direct A2A, MCP, smoke, container/process, constructor, and trait paths retain wire/auth/disposition behavior and converge on the configured/platform history policy. Route selection in [`main.rs:3341`](</Users/wesleyjinks/code/.a2a-implement/impl-6025-b0q56l47/bin/a2a-bridge/src/main.rs:3341>) preserves configured-error precedence.
+
+7. **RESOLVED — Regression quality.** Repairs have production-path, negative, and edge coverage. Owner refusal tests invoke public openers; controls use valid owner-owned state; bounded-child proof uses real process behavior; the native-alias regression is deterministic and supplied fail-first evidence records the immediate predecessor failure. No earlier SQLite error makes the new owner regression vacuous because the owner predicate executes first.
+
+8. **RESOLVED — Scope/deferrals.** The range does not falsely claim or prematurely expose R2f0b, R2f1–R2f4, R2g, scheduler/quarantine, provider-integration, release, deployment, or compatibility-canary closure. The intentionally stale post-fold document cursor is not treated as a source defect.
+
+## Fresh findings
+
+**WRONG — none.**
+
+**SMELL — none.**
+
+The effective-owner policy complies with the literal authority: unsafe or foreign canonical WAL/SHM identities refuse before SQLite with typed Open and exact non-mutation; successful inspection may change only SQLite-managed exact canonical WAL/SHM state. Raw/canonical repetition does not bypass or broaden that rule.
+
+I accepted without rerunning:
+
+- All 27 supplied Tier-3 Linux commands and the built-in attempt-1 APPROVE
+- Native format check
+- Four focused bridge-store gates: foreign-owner refusal, owner-owned acceptance, bounded child kill/reap, and public platform crash-residue recovery
+- Three native PID-topology process gates
+- `cargo deny check`
+- Full native serial workspace suite: 2,769 passed, 0 failed, 12 ignored, 0 measured, 0 filtered; 73 result groups, 56 nonempty
+- Supplied native `git diff --check`
+
+I reran only read-only boundary, ancestry, inventory, digest, checkpoint, and `git diff --check` authentication. I did not build, test, format, install, use network/GitHub, start containers, invoke another provider, or operate the served bridge. Semantic navigation services were unavailable, so the review used direct complete diff, caller, production, migration, and test-source inspection. Live canaries, fold, docs update, GitHub CI, merge, release, deployment, and production operation remain unverified and unclaimed.
+
+R2F0A FINAL CORRECTION STACK: APPROVE

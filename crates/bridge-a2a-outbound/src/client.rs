@@ -27,10 +27,12 @@ use tokio::sync::watch;
 /// The CLI's `run-workflow --serve` path MUST mint one: the server's fresh-send
 /// fallback otherwise synthesises the constant stub `TaskId::parse("task-1")`,
 /// which collides concurrent `--serve` runs in the durable store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TaskIdMode {
     /// Mint a fresh `taskId` (`a2a::new_task_id`).
     Mint,
+    /// Use an already caller-visible task locator.
+    Explicit(String),
     /// Leave `taskId` unset.
     #[default]
     None,
@@ -170,8 +172,9 @@ impl A2aClient {
         parts: &[Part],
         opts: &SendOpts,
     ) -> Result<reqwest::Response, ClientError> {
-        let task_id = match opts.task_id {
+        let task_id = match &opts.task_id {
             TaskIdMode::Mint => Some(a2a::new_task_id()),
+            TaskIdMode::Explicit(value) => Some(value.clone()),
             TaskIdMode::None => None,
         };
         let metadata = opts

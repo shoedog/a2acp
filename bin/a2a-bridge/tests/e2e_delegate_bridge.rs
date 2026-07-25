@@ -41,6 +41,10 @@ use serde_json::json;
 struct AlwaysKiroRoute;
 
 impl RouteDecision for AlwaysKiroRoute {
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        self.route(meta).map(Some)
+    }
+
     fn route(&self, _meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
         Ok(RouteTarget::Local(AgentId::parse("kiro")?))
     }
@@ -50,6 +54,10 @@ impl RouteDecision for AlwaysKiroRoute {
 struct E2eSkillRoute;
 
 impl RouteDecision for E2eSkillRoute {
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        self.route(meta).map(Some)
+    }
+
     fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
         if meta.skill.as_deref() == Some("delegate") {
             Ok(RouteTarget::Delegate)
@@ -102,7 +110,7 @@ async fn bridge_a_delegates_through_bridge_b_to_kiro() {
     let store_b = Arc::new(SqliteStore::open_in_memory().expect("sqlite in-memory (B)"));
 
     let server_b = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             common::single_agent_registry("kiro", backend_b),
             store_b,
             Arc::new(AutoPolicy),
@@ -142,7 +150,7 @@ async fn bridge_a_delegates_through_bridge_b_to_kiro() {
     let backend_a: Arc<dyn bridge_core::ports::AgentBackend> = Arc::new(BridgeABackend);
 
     let server_a = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             common::single_agent_registry("kiro", backend_a),
             store_a,
             Arc::new(AutoPolicy),

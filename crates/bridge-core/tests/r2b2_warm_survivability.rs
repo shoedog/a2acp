@@ -78,10 +78,21 @@ fn every_valid_nonfatal_disposition_still_expires_the_current_session() {
 }
 
 #[test]
+fn durable_evidence_unavailable_expires_the_current_session() {
+    assert_eq!(
+        warm_session_survivability(&BridgeError::DurableEvidenceUnavailable {
+            reason: "prompt barrier",
+        }),
+        WarmSessionSurvivability::Expire,
+    );
+}
+
+#[test]
 fn legacy_errors_preserve_the_owning_paths_existing_policy() {
     let legacy = [
         BridgeError::A2aVersionMismatch,
         BridgeError::InvalidRequest { field: "input" },
+        BridgeError::IdentityUnavailable,
         BridgeError::TaskNotFound,
         BridgeError::SessionNotFound,
         BridgeError::ConfigMismatch { field: "model" },

@@ -1,5 +1,7 @@
 //! Workflow DAG types + validation. Edges are implicit from each node's `inputs`.
+use bridge_core::domain::{EffectiveConfig, Effort};
 use bridge_core::ids::{AgentId, NodeId, WorkflowId};
+use bridge_core::ports::AgentRegistry;
 use std::collections::{BTreeMap, HashSet};
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -63,6 +65,105 @@ pub enum WorkflowError {
     UnknownInput { node: String, input: String },
     Cyclic,
     NotSingleTerminal(usize),
+}
+
+fn push_field(target: &mut String, value: &str) {
+    use std::fmt::Write as _;
+    let _ = write!(target, "{}:", value.len());
+    target.push_str(value);
+}
+
+fn push_optional(target: &mut String, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            target.push('1');
+            push_field(target, value);
+        }
+        None => target.push('0'),
+    }
+}
+
+fn effort_name(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Minimal => "minimal",
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::Xhigh => "xhigh",
+        Effort::Max => "max",
+    }
+}
+
+fn push_effective_config(target: &mut String, config: &EffectiveConfig) {
+    push_optional(target, config.model.as_deref());
+    push_optional(target, config.effort.map(effort_name));
+    push_optional(target, config.mode.as_deref());
+}
+
+/// Return a stable, prompt-free hash of the configured graph shape and whether
+/// every referenced agent's model/effort/mode configuration was observable
+/// without resolving a backend.
+pub fn workload_fingerprint_with(
+    graph: &WorkflowGraph,
+    mut configured_effective: impl FnMut(&AgentId) -> Option<EffectiveConfig>,
+) -> (String, bool) {
+    use std::fmt::Write as _;
+    let mut canonical = String::new();
+    push_field(&mut canonical, graph.id.as_str());
+    let mut nodes: Vec<_> = graph.nodes.iter().collect();
+    nodes.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+    let mut complete = true;
+    for node in nodes {
+        canonical.push('n');
+        push_field(&mut canonical, node.id.as_str());
+        push_field(&mut canonical, node.agent.as_str());
+        match configured_effective(&node.agent) {
+            Some(config) => {
+                canonical.push('1');
+                push_effective_config(&mut canonical, &config);
+            }
+            None => {
+                complete = false;
+                canonical.push('0');
+            }
+        }
+        let mut inputs: Vec<_> = node.inputs.iter().map(NodeId::as_str).collect();
+        inputs.sort_unstable();
+        let _ = write!(&mut canonical, "i{}:", inputs.len());
+        for input in inputs {
+            push_field(&mut canonical, input);
+        }
+        match &node.retry {
+            Some(retry) => {
+                canonical.push('1');
+                let _ = write!(
+                    &mut canonical,
+                    "{}:{}:{};",
+                    retry.max_attempts,
+                    retry.backoff_ms,
+                    retry.backoff_cap_ms.unwrap_or(u64::MAX)
+                );
+            }
+            None => canonical.push('0'),
+        }
+    }
+    if let Some(panel) = &graph.panel {
+        canonical.push('p');
+        for (key, value) in &panel.weights {
+            push_field(&mut canonical, key);
+            let _ = write!(&mut canonical, "{:016x};", value.to_bits());
+        }
+    } else {
+        canonical.push('q');
+    }
+    (
+        bridge_core::workflow_history::fingerprint_workload_shape(canonical.as_bytes()),
+        complete,
+    )
+}
+
+pub fn workload_fingerprint(graph: &WorkflowGraph, registry: &dyn AgentRegistry) -> (String, bool) {
+    workload_fingerprint_with(graph, |agent| registry.configured_effective(agent))
 }
 
 impl WorkflowGraph {
@@ -318,5 +419,78 @@ mod tests {
             1
         );
         assert_eq!(capped.attempts(), 5);
+    }
+
+    fn configured(model: &str) -> EffectiveConfig {
+        EffectiveConfig {
+            model: Some(model.to_owned()),
+            effort: Some(Effort::High),
+            mode: Some("default".to_owned()),
+        }
+    }
+
+    #[test]
+    fn workload_fingerprint_is_prompt_free_and_node_order_stable() {
+        let first = WorkflowGraph {
+            id: WorkflowId::parse("review").unwrap(),
+            nodes: vec![
+                node("draft", "codex", &[]),
+                node("synth", "claude", &["draft"]),
+            ],
+            panel: None,
+        };
+        let mut second = first.clone();
+        second.nodes.reverse();
+        second.nodes[0].prompt_template = "entirely different secret prompt".into();
+        second.nodes[1].prompt_template = "another prompt".into();
+
+        let lookup = |agent: &AgentId| match agent.as_str() {
+            "codex" => Some(configured("gpt-5.5")),
+            "claude" => Some(configured("claude-sonnet")),
+            _ => None,
+        };
+        let left = workload_fingerprint_with(&first, lookup);
+        let right = workload_fingerprint_with(&second, lookup);
+        assert_eq!(left, right);
+        assert!(left.1);
+    }
+
+    #[test]
+    fn workload_fingerprint_partitions_config_topology_and_unknown_config() {
+        let base = WorkflowGraph {
+            id: WorkflowId::parse("review").unwrap(),
+            nodes: vec![
+                node("draft", "codex", &[]),
+                node("synth", "claude", &["draft"]),
+            ],
+            panel: None,
+        };
+        let baseline = workload_fingerprint_with(&base, |agent| {
+            Some(configured(match agent.as_str() {
+                "codex" => "gpt-5.5",
+                _ => "claude-sonnet",
+            }))
+        });
+
+        let model_changed = workload_fingerprint_with(&base, |agent| {
+            Some(configured(match agent.as_str() {
+                "codex" => "gpt-5.6",
+                _ => "claude-sonnet",
+            }))
+        });
+        assert_ne!(baseline.0, model_changed.0);
+
+        let mut topology_changed = base.clone();
+        topology_changed.nodes[1].inputs.clear();
+        let topology =
+            workload_fingerprint_with(&topology_changed, |_| Some(configured("same-model")));
+        let same_config_base = workload_fingerprint_with(&base, |_| Some(configured("same-model")));
+        assert_ne!(same_config_base.0, topology.0);
+
+        let unknown = workload_fingerprint_with(&base, |agent| {
+            (agent.as_str() == "codex").then(|| configured("gpt-5.5"))
+        });
+        assert!(!unknown.1);
+        assert_ne!(baseline.0, unknown.0);
     }
 }

@@ -79,9 +79,11 @@ pub fn tool_schemas() -> Vec<Value> {
                     "model": { "type": "string" },
                     "effort": { "type": "string" },
                     "mode": { "type": "string" },
-                    "cwd": { "type": "string" }
+                    "cwd": { "type": "string" },
+                    "execution_id": { "type": "string", "pattern": "^exec-[0-9a-f]{32}$" },
+                    "attempt_id": { "type": "string", "pattern": "^attempt-[0-9a-f]{32}$" }
                 },
-                "required": ["input"]
+                "required": ["input", "execution_id", "attempt_id"]
             }
         }),
         json!({
@@ -91,9 +93,11 @@ pub fn tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "input": { "type": "string" },
-                    "context": { "type": "string" }
+                    "context": { "type": "string" },
+                    "execution_id": { "type": "string", "pattern": "^exec-[0-9a-f]{32}$" },
+                    "attempt_id": { "type": "string", "pattern": "^attempt-[0-9a-f]{32}$" }
                 },
-                "required": ["input", "context"]
+                "required": ["input", "context", "execution_id", "attempt_id"]
             }
         }),
         json!({
@@ -149,20 +153,28 @@ pub fn tool_schemas() -> Vec<Value> {
                 "properties": {
                     "workflow": { "type": "string" },
                     "input": { "type": "string" },
-                    "cwd": { "type": "string" }
+                    "cwd": { "type": "string" },
+                    "execution_id": { "type": "string", "pattern": "^exec-[0-9a-f]{32}$" },
+                    "attempt_id": { "type": "string", "pattern": "^attempt-[0-9a-f]{32}$" }
                 },
-                "required": ["workflow", "input"]
+                "required": ["workflow", "input", "execution_id", "attempt_id"]
             }
         }),
         json!({
             "name": "status",
-            "description": "Return status for exactly one warm context or detached task.",
+            "description": "Return status for exactly one warm context, detached task, or durable attempt.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "context": { "type": "string" },
-                    "task_id": { "type": "string" }
-                }
+                    "task_id": { "type": "string" },
+                    "attempt_id": { "type": "string", "pattern": "^attempt-[0-9a-f]{32}$" }
+                },
+                "oneOf": [
+                    { "required": ["context"] },
+                    { "required": ["task_id"] },
+                    { "required": ["attempt_id"] }
+                ]
             }
         }),
         json!({

@@ -37,6 +37,10 @@ use serde_json::json;
 struct E2eKiroRoute;
 
 impl RouteDecision for E2eKiroRoute {
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        self.route(meta).map(Some)
+    }
+
     fn route(&self, _meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
         Ok(RouteTarget::Local(AgentId::parse("kiro")?))
     }
@@ -75,7 +79,7 @@ async fn real_kiro_round_trip_returns_pong() {
     let base_url = format!("http://{addr}");
 
     let server = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             common::single_agent_registry("kiro", backend),
             store,
             policy,

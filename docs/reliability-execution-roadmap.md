@@ -1,25 +1,120 @@
 # Bridge reliability execution and handoff roadmap
 
 - **Program status:** active P0
-- **Current main base:** `origin/main` at `db0eb28f48ad5f15e6848d1975d6de6776e13692` on 2026-07-20
-  (PR #45 merged the provider-free #22/#24 R2f incident intake with CI and CLA green, after PR #44 merged the
-  classified model-probe fix, PR #43 merged the registry/metrics fixes, and PR #42 merged R3d3)
+- **Current main base:** `origin/main` at `345941db91a7d898884bfe79e573433484ccafcc` on 2026-07-20
+  (PR #46 merged the managed-agent MCP loopback guard, after PR #45 merged the provider-free #22/#24 R2f incident
+  intake, PR #44 merged the classified model-probe fix, PR #43 merged the registry/metrics fixes, and PR #42 merged
+  R3d3)
 - **Completed through:** R3d3 **MERGED** at `3c02bf3f`; standalone issues #35/#39 **MERGED** at `0f84a5ca`
-  and issue #30 **MERGED** at `0d628271`; R2f incident intake **MERGED** by PR #45 at `db0eb28f`; R2e remains
-  deferred and off the critical path
-- **Active slice:** standalone issue #36 managed-agent MCP loopback guard on
-  `agent/fix-mcp-loopback-guard`, based directly on `db0eb28f`; no provider turn is required
-- **Current #36 gate:** **FAIL-FIRST REGRESSIONS PROVED / TWO-LAYER GUARD IMPLEMENTED / FOCUSED GATES GREEN /
-  FULL WORKSPACE GATE GREEN**. Config admission is **1/0**, core Codex/Kiro delivery is **14/0**, ACP framing is
-  **1/0**, and the real-process MCP boundary is **6/0**. The canonical full serial workspace is
+  and issue #30 **MERGED** at `0d628271`; issue #36 **MERGED** by PR #46 at `345941db`; R2f incident intake
+  **MERGED** by PR #45 at `db0eb28f`; R2e remains deferred and off the critical path
+- **Active slice:** R2f design is **APPROVED** on `agent/r2f-owner-design`, based directly on `345941db`; R2f0a
+  implementation, correction, native verification, and final cumulative reviews are complete on
+  `agent/r2f0a-identity-ledger` at exact integrated checkpoint
+  `7b01ab4bae167d3640050dfda5de7e1478728497`, tree
+  `7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e`. Integrated
+  [native macOS verification](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md),
+  [Sol/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md), and
+  [Fable/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) evidence is green; the two
+  reviews returned `APPROVE`. After this docs-only fold receives its own verification/review, R2f0a is ready for
+  PR/CI and merge; R2f0b is next only after merge and is not started.
+- **Issue #36 closure:** **FAIL-FIRST REGRESSIONS PROVED / TWO-LAYER GUARD IMPLEMENTED / FOCUSED GATES GREEN /
+  FULL WORKSPACE GATE GREEN / PR #46 MERGED**. Config admission is **1/0**, core Codex/Kiro delivery is **14/0**,
+  ACP framing is **1/0**, and the real-process MCP boundary is **6/0**. The canonical full serial workspace is
   **2,538/0/12 ignored** across **72** groups (**55** nonempty). Format/diff, workspace check, warnings-denied
   all-target Clippy, locked release workspace build, repository hygiene **37/7**, and dependency policy are
   green. No provider, compatibility, production-server, or live controller turn was exercised.
-- **R2f intake closure:** **#22 CONFIRMED / #24 PARTIALLY CONFIRMED / DETERMINISTIC CURRENT-MAIN PROBES GREEN /
-  FOCUSED OWNER DESIGN NOT STARTED**. The exact scheduler characterization reproduced the failed-root/silent-sibling
-  wedge at **1/0**, and the ACP delivered-error, disabled-watchdog, and configured-watchdog controls each passed
+- **R2f intake/design:** **#22 CONFIRMED / #24 PARTIALLY CONFIRMED / DETERMINISTIC CURRENT-MAIN PROBES GREEN /
+  D1-D11 OWNER-APPROVED / CLOSURE REVIEW 5 APPROVE / EVERY INHERITED ITEM FIXED / NO NEW WRONG OR SMELL /
+  R2f0a IMPLEMENTATION+CORRECTION COMPLETE / [INTEGRATED NATIVE VERIFIED](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md) /
+  [INTEGRATED FINAL SOL APPROVE](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md) /
+  [INTEGRATED FINAL FABLE APPROVE](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) /
+  DOCS-FOLD VERIFICATION/REVIEW, PR/CI, MERGE NEXT / R2f0b NOT STARTED**.
+  Fan-out policy, the three liveness clocks, workflow telemetry and its
+  180-day/100,000-row/128-MiB retention boundary, provisional review budgets, and local-only destructive takeover
+  were owner-approved on 2026-07-20. Health enforcement is explicitly production-operator-only; two-strike
+  differential recovery, self-clearing external/auth states, sticky instance-local quarantine, and proved-dead
+  successor handling are approved. Planned drain preserves running and warm ownership. R2f3c is a bounded handoff
+  contract; stable ingress is queued as R2g. The short-bound spike is complete: representative real ACP/process/
+  Docker/SQLite mechanisms support the candidate numeric envelope, while the 30-second half-open and 60-second debt
+  retry remain explicitly policy-only until implemented. D11 is owner-approved with a 31-second observable ACP
+  bound around the 30-second internal deadline and a 6-second observable cancellation bound around the 5-second
+  cooperative grace. A follow-up exact stacked 5-second-wait plus 500-ms termination probe passed **1/0** across ten
+  process groups with a 5.508361-second maximum and no survivor. Fresh bridge-mediated Sol/xhigh review 1 returned
+  five `WRONG` and four `SMELL`; the durable report is
+  [`review 1`](superpowers/reviews/2026-07-20-r2f-owner-design-sol-review-1.md). Those nine corrections were folded.
+  Fresh [`closure review 1`](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-1.md) adjudicated
+  seven `FIXED`/two `PARTIAL`, then returned one new `WRONG` and four new `SMELL`. The second fold preserves
+  close ordinal 0 across crash-before-dispatch, gives a shared generation one process-action flight, binds preserved
+  worktrees against run-end/boot sweeps, closes every telemetry-ledger surface/failure, defines truthful session
+  capacity sources, and aligns the stale handoff. Closure re-review 2 then accepted the exact prompt and performed
+  active inspection on the still-live read-only ACP generation, but Codex emitted `task_complete` after 185.355
+  seconds with `last_agent_message: null`; unary submit mapped it to `AgentCrashed`, the store gained no task/turn
+  row, and no final review exists. The attempt was not retried. The durable
+  [`failed-attempt report`](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-2-failed.md) records
+  `INC-UNARY-NULL-FINAL-2026-07-20`. One newly authorized distinct
+  [`closure review 3`](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-3.md) then adjudicated all
+  six inherited families `FIXED`, kept the incident-derived direct-unary contract `PARTIAL`, and returned `REVISE`
+  on one `WRONG` plus one `SMELL`: optional fail-open telemetry could leave accepted direct unary with no durable
+  row, and the caller-visible pre-prompt id channel was unspecified. The current fold requires caller-minted,
+  pre-network-visible execution/attempt ids plus one mandatory core safety reservation in the already selected
+  ledger before direct-unary effects; missing/invalid/colliding ids or unavailable durability refuse pre-effect,
+  while optional workflow summaries and later enrichment remain fail-open. Distinct
+  [`closure review 4`](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-4.md) marked both of those
+  corrections and all six older families `FIXED`, retained the incident terminal contract `PARTIAL`, and returned
+  `REVISE` on one new High `WRONG`: current ACP loses the producer-terminal/final-presence distinction and cannot
+  distinguish null-final completion from a genuine live-process per-turn error. The fold now defines negotiated
+  `a2a_bridge.turn_evidence.v1`, exact turn/attempt correlation, authoritative Codex terminal/final sources, typed
+  unsupported/missing/malformed/late/conflicting outcomes, sticky acceptance, and no retry. The actual selected Codex
+  adapter must pass conformance before incident closure. The exact
+  scheduler characterization reproduced the failed-root/silent-sibling wedge at **1/0**, and the ACP
+  delivered-error, disabled-watchdog, and configured-watchdog controls each passed
   **1/0**. The durable disposition and closure contract live in the
   [`R2f plan`](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md).
+  Distinct clean-room Sol/xhigh
+  [`closure review 5`](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-5.md) then adjudicated the
+  terminal-evidence correction and every review-4 regression family `FIXED`, found no new `WRONG` or `SMELL`, and
+  returned `R2F OWNER DESIGN: APPROVE`. It confirmed the pinned ACP extension seams and installed codex-acp native
+  sources are sufficient for the planned mapping while retaining actual adapter conformance as an implementation/
+  live gate rather than claiming the incident closed.
+- **R2f0a integrated closure:** Implementation, correction, native verification, and final cumulative reviews are
+  complete at exact checkpoint `7b01ab4bae167d3640050dfda5de7e1478728497`, tree
+  `7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e`. This supersedes the historical folded checkpoint
+  `9761b3b78c89cca079ddb1d9376514fceb77e0df` and approved candidate
+  `d7f20d37a9fda493c0b8dc18339489bfe1a059a3` / tree `1803a888cf77fdee378367404179cc9ba4085ee6`;
+  the July 24 [native](superpowers/reviews/2026-07-24-r2f0a-native-verification.md),
+  [Sol/xhigh](superpowers/reviews/2026-07-24-r2f0a-final-cumulative-sol-review.md), and
+  [Fable/xhigh](superpowers/reviews/2026-07-24-r2f0a-final-cumulative-fable-review.md) records remain historical
+  predecessor evidence. The integrated correction stack preserves provenance: `4a6fcb90` imported approved
+  API/handoff candidate `0cb10903`; `f145535a` imported approved recovery candidate `7b8fa376`; `4359dc9c` folded
+  approved test candidates `6d34edcb`, `0b77ed87`, and `04b5792e`; and `7b01ab4b` folded approved
+  lineage/Platform/test candidates `a1481ed`, `dea817be`, and `24fd4b8a`.
+  The [integrated native macOS verification](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md)
+  (source SHA-256 `a67e1362217a3263b09a42b9e86136cd3cd8a1e044f921538eef5fc2fe91203d`) passes fmt, locked
+  all-target/all-feature check, warnings-denied Clippy, debug and release builds, the exact alias regression,
+  repository hygiene, and final diff/clean checks. Its complete workspace emitted **73** groups with **2,785 passed
+  / 0 failed / 12 ignored / 0 measured / 0 filtered**. The 12 ignored tests are repository-declared live/external-
+  provider or multi-bridge cases; no command-line skips were used. Fail-first remains explicit: the first final
+  native attempt reached **2,541 passed / 1 failed / 12 ignored** before a test-only `/var` versus `/private/var`
+  canonical-path expectation failed. The six-line test-only correction canonicalized the expected path, its exact
+  test passed **1 / 0 / 0** with **211 filtered**, and the full suite then passed; this was not a production defect.
+  The fresh independent concurrent exact-head
+  [Sol/xhigh review](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md) (source SHA-256
+  `8f9cc3efa961492915ef59bf4563682cfb57caa76a53662813b8bc0f87da037d`) adjudicated all seven current
+  mechanisms and seven inherited families `RESOLVED`, with zero `WRONG`, zero `SMELL`, and `APPROVE`. The
+  [Fable/xhigh review](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) (source SHA-256
+  `623faf2ea4170b014c3b8f027cd555b387bf5fb0bb4f7aa0056c8d9304a1d6e0`) reported zero `WRONG`, one
+  nonblocking `SMELL`, and `APPROVE`. Its new nonblocking follow-up is to add a legacy one-method
+  `RouteTarget::Workflow` arm to existing fail-closed route coverage and document the compatibility delta for
+  hypothetical third-party one-method routers; shipping `SkillRoute` uses the explicit pre-default hook, and no
+  incorrect production behavior was demonstrated. The earlier nonblocking Fable follow-ups remain root-only
+  foreign-owner CI coverage, foreign-owner coverage for both selection wrappers, and any foreign-owned rollback-
+  journal policy change only through a separate owner decision. No ignored live/provider test was forced. Locked-
+  egress Linux could not fetch one missing `a2a-lf` dependency for the final six-line macOS test-only correction,
+  so it is not Linux proof. No GitHub CI, push, PR, merge, release, deployment, live canary, production-server
+  change, or post-merge operator build is proved. After this docs-only fold receives its own verification/review,
+  R2f0a is ready for PR/CI and merge. R2f0b is next only after merge and is not started; R2f overall, #22, #24,
+  R2g, and R4 are not complete.
 - **R3d3 closure:** **TENTH SOL APPROVE / SINGLE FABLE LENS COMPLETE / DOCS-ONLY REMEDIATION FOLDED / FINAL GATE
   GREEN / PR #42 MERGED** at merge `3c02bf3f`, code commit `1647fa6`, exact Sol-reviewed docs head `1637b5b`, and
   exact Fable-reviewed docs head `f7f9ebd`, after the original R3d3a-e checkpoints
@@ -714,10 +809,11 @@
   `SMELL`s, returned `READY`, and ended `GATE: APPROVE`. Its non-USD cost wording gap is fixed in this docs
   fold; its other verification/fault-boundary items remain accepted/nonblocking. R3b is
   **MERGED** at `504c1e43` by PR #32. Reviews are not compatibility evidence.
-- **Last merged full workspace gate:** PR #45 R2f incident intake host serial **2,531/0/12 ignored** across
+- **Last merged full workspace gate:** PR #46 issue #36 host serial **2,538/0/12 ignored** across
   **72** result groups (**55** nonempty). Format/diff, workspace all-target check, warnings-denied Clippy,
   locked release build, repository hygiene **37/7**, dependency policy, PR Build/Lint/Coverage, and CLA were
-  green. Its four deterministic incident controls each passed **1/0** without a provider turn.
+  green. Its config-admission, core-delivery, ACP-framing, and real-process MCP boundary gates passed as recorded
+  above without a provider turn.
 - **Current execution boundary:** R3b has four minimal bridge-smoke support cases (Codex host,
   Codex reader, Claude 0.44 host, Claude 0.55 Fable reader) and five explicit non-goal/unrun historical
   rows (Claude direct CLI, Claude 0.55 host ACP, managed-no-egress negative, Kiro host, Kiro reader).
@@ -730,13 +826,20 @@
   resolution does not imply billing permission; candidate pass/fail/unknown never mutates production pins,
   the pinned manifest/baseline, configs, Containerfiles, lockfiles, support docs, or the running operator.
   Review turns and deterministic doctor/tests are not compatibility evidence.
-- **Next action:** finish the full deterministic gate and merge issue #36 as a separate policy-and-guard
-  increment, then conduct the focused owner R2f design decisions named in its plan before source implementation.
-  Do not launch a provider turn or intentionally exhaust Kiro quota for R2f; a provider-specific reproduction
-  requires separate authorization. OpenRouter/OpenCode remain R3e/R3f after the reliability/open-issue work and
-  before R4.
+- **Next action:** verify/review this docs-only fold, then proceed to PR/CI and merge for integrated R2f0a
+  checkpoint `7b01ab4bae167d3640050dfda5de7e1478728497`, tree
+  `7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e`. The integrated
+  [native](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md),
+  [Sol/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md), and
+  [Fable/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) evidence is green. R2f0b
+  follows only after merge and is not started.
+  Do not launch a provider-specific reproduction or intentionally exhaust Kiro quota for R2f; that live gate requires
+  separate authorization from any design-review turn. OpenRouter/OpenCode remain R3e/R3f after the reliability/
+  open-issue work and before R4.
 - **Design of record:**
   [`superpowers/specs/2026-07-11-bridge-reliability-r2-design.md`](superpowers/specs/2026-07-11-bridge-reliability-r2-design.md)
+- **Active focused owner design:**
+  [`superpowers/specs/2026-07-20-r2f-owner-design.md`](superpowers/specs/2026-07-20-r2f-owner-design.md)
 - **Active implementation plan:**
   [`superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md`](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md)
 - **Operating runbook:**
@@ -765,8 +868,27 @@ R2a provenance (MERGED)
 
 R2e authenticated in-process fallback is DEFERRED and off the critical path.
 It requires R2d plus a separately approved authenticated-policy/attestation design.
-R2f shared liveness/session-capacity/drain work has completed incident intake and awaits focused owner design;
+R2f shared liveness/session-capacity/drain work has completed incident intake and D1-D11 owner approval. Sol/xhigh
+closure review 1 returned `REVISE`; its one `WRONG`, four `SMELL`, and two inherited partials are folded, and closure
+re-review 2 accepted work but terminated null-final with no verdict. Clean-room closure review 3 fixed all six
+inherited families, returned `REVISE` on the direct-unary durability/identity boundary, and that one `WRONG` plus one
+`SMELL` are folded. Distinct closure review 4 fixed those items and all six older families, retained the incident
+terminal contract `PARTIAL`, and returned `REVISE` on the missing authoritative ACP terminal-evidence mechanism. That
+`WRONG` is folded. Distinct closure review 5 fixed that item and all review-4 regression families, found no new
+`WRONG` or `SMELL`, and returned `APPROVE`. R2f0a implementation, correction, native verification, and final cumulative reviews are complete at integrated
+checkpoint `7b01ab4bae167d3640050dfda5de7e1478728497`, tree
+`7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e`. Integrated
+[native evidence](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md) is green, and independent
+concurrent [Sol/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md) and
+[Fable/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) reviews both returned `APPROVE`.
+After this docs-only fold receives its own verification/review, PR/CI and merge remain before R2f0b may start.
+Health
+enforcement is explicit-production-only with approved differential and self-clearing recovery, planned drain
+preserves exact running/warm ownership, and process deployment is split at an approved R2f3c-to-R2g boundary. No
+owner bound remains open;
 R3d may display a future read-only R2f health result but cannot perform operator lifecycle actions.
+
+R2f (active) -> R2g stable ingress (queued) -> R3e/R3f provider integrations -> R4 release promotion.
 ```
 
 M4 Slice 3b/3c remains parked until the reliability exit gates in
@@ -786,7 +908,8 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2c — live smoke | **MERGED** at `be54bc51` by PR #28 (initial Fable/xhigh review `REVISE`; closure re-review `APPROVE` at `0e3b8ce`; attempt 1 rejected for initial `0644`; permission-fold review `APPROVE` at `23384622`; create-new closure review `APPROVE` at `ffb7e891`; full host workspace **1,933 / 0 / 12 ignored**; separately authorized attempt 2 on `1c9e4a43` passed artifact-exact in 8.770 s with mode `0600`, exact terminal `PONG`, no retry/fallback, and clean teardown) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
-| R2f — phase-aware liveness/takeover | **INTAKE REVALIDATED / FOCUSED OWNER DESIGN NOT STARTED** (four operator incidents plus GitHub #22/#24) | [R2f implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md) | Select a bounded fan-out failure policy without breaking graceful degradation; converge offline/served attempt identity and takeover artifacts; instrument verification progress; then separately diagnose shared transport versus session-capacity debt and design capability-gated close plus non-disruptive generation drain/rotation. |
+| R2f — phase-aware liveness/takeover | **ACTIVE / R2f0a IMPLEMENTATION+CORRECTION COMPLETE / INTEGRATED NATIVE VERIFIED / INTEGRATED SOL+FABLE APPROVE / DOCS-FOLD VERIFICATION/REVIEW, PR/CI, MERGE NEXT / R2f0b NOT STARTED** (31-second ACP and 6-second cancellation observable bounds) at exact checkpoint `7b01ab4bae167d3640050dfda5de7e1478728497` on `agent/r2f0a-identity-ledger`, tree `7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e` | [R2f owner design](superpowers/specs/2026-07-20-r2f-owner-design.md), [implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md), [short-bound spike](superpowers/spikes/2026-07-20-r2f-short-bound-validation.md), [review 1](superpowers/reviews/2026-07-20-r2f-owner-design-sol-review-1.md), [closure review 1](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-1.md), [failed closure re-review 2](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-2-failed.md), [closure review 3](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-3.md), [closure review 4](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-4.md), [closure review 5](superpowers/reviews/2026-07-20-r2f-owner-design-sol-closure-review-5.md), historical July 24 [Sol](superpowers/reviews/2026-07-24-r2f0a-final-cumulative-sol-review.md), [Fable](superpowers/reviews/2026-07-24-r2f0a-final-cumulative-fable-review.md), and [native](superpowers/reviews/2026-07-24-r2f0a-native-verification.md), integrated [Sol](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md), [Fable](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md), and [native](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md) | Verify/review this docs-only fold, then PR/CI and merge; implement `0b/1a/1b/2/3a/3b/3c/4` only after merge. |
+| R2g — stable ingress/release handoff | **QUEUED AFTER R2f / SCOPE BOUNDARY APPROVED / FOCUSED OWNER DESIGN NOT STARTED** | [R2g queued plan](superpowers/plans/2026-07-20-r2g-stable-ingress.md) | Stable local ingress, exact task/session/SSE affinity, side-by-side release promotion/rollback, safe store ownership, predecessor drain, and operator integration. No provider integration is mixed into this slice. |
 | R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** at `b54840a` by PR #37; R3d0 **MERGED** by PR #38 at `c2d147fb`; R3d1 **MERGED** by PR #40 at `cbcfd1f`; R3d2 **MERGED** by PR #41 at `06e22faf`; R3d3 **MERGED** by PR #42 at `3c02bf3f` after the tenth Sol approval, single Fable release/compatibility lens, docs remediation, exact deterministic gates, and green CI/CLA. Exact R3d3 evidence-fold head `d3bf503` passed binary **779/0/0**, full workspace **2,519/0/12 ignored**, and every deterministic release/validator gate; the full review/remediation chain and hashes remain in the focused plan and cursor detail above. No live compatibility gate or production state/iCloud/runtime/notification effect was part of R3d3. `INC-SHARED-RESTART-RECOVERY-2026-07-19` remains R2f lifecycle evidence, not R3d3 verification or root-cause proof. | [R3d3 implementation plan](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md) | Evidence/index/retention foundation, sealing, cold storage, GC/migration, then status/outbox/notifications; merged default-off boundary. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
 
@@ -1074,9 +1197,28 @@ Next action:
   `06e22fafaf33d67524b46f35d12124505b6ecf9a` with CI and CLA green. R3d3 merged through PR #42 at
   `3c02bf3f419da8bcec032f2d84609d6db9e4fcc6` with CI and CLA green. Standalone fixes #35/#39 merged through
   PR #43 at `0f84a5ca9975d260279282f4198e11a080767dcb`, then #30 merged through PR #44 at
-  `0d628271a910168230491e8610a31f92f7063cbc`, the current main. The active branch is now
-  `agent/r2f-incident-intake`; its no-provider #22/#24 revalidation and closure split are in
-  `2026-07-11-r2f-phase-aware-liveness.md`. R3d3's focused restart plan remains
+  `0d628271a910168230491e8610a31f92f7063cbc`. R2f incident intake merged through PR #45 at
+  `db0eb28f48ad5f15e6848d1975d6de6776e13692`, and issue #36 merged through PR #46 at
+  `345941db91a7d898884bfe79e573433484ccafcc`, the current main. The active R2f0a source branch is
+  `agent/r2f0a-identity-ledger` at exact integrated checkpoint
+  `7b01ab4bae167d3640050dfda5de7e1478728497`, tree
+  `7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e`. D1-D11 remain approved and the complete design-review chain is
+  preserved. Closure re-review 2 accepted work but failed null-final with no verdict and no retry. Distinct clean-room
+  closure review 3 fixed all six inherited families and returned `REVISE` on one direct-unary durability `WRONG`
+  plus one caller-visible-id `SMELL`; both were folded through mandatory pre-effect core evidence and caller-minted,
+  pre-network-visible ids. Distinct closure review 4 marked those corrections and all six older families `FIXED`,
+  retained the incident terminal contract `PARTIAL`, and returned `REVISE` on one new High `WRONG` for the missing
+  authoritative ACP terminal-evidence seam. The fold defined negotiated versioned terminal evidence, exact
+  correlation, authoritative Codex sources, typed unknown/conflict behavior, and no retry. Distinct clean-room
+  closure review 5 adjudicated that correction and every review-4 regression family `FIXED`, found no new `WRONG`
+  or `SMELL`, and returned `APPROVE`. The integrated
+  [native macOS verification](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md) is green, and
+  independent concurrent [Sol/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md) and
+  [Fable/xhigh](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) exact-head reviews both returned
+  `APPROVE`. After this docs-only fold receives its own verification/review, R2f0a is ready for PR/CI and merge;
+  R2f0b remains next only after merge and is not started. No live/billable canary, production server update, release,
+  deployment, GitHub CI, PR merge, post-merge operator build, R2f completion, #22 closure, or #24 closure is proved. The design and exact slice order are in
+  `2026-07-20-r2f-owner-design.md` and `2026-07-11-r2f-phase-aware-liveness.md`. R3d3's focused restart plan remains
   `2026-07-19-r3d3-evidence-status-retention.md`. R3d3a through R3d3e are checkpointed at `21427e6`,
   `739495a`, `7ed0446`, `84fbbf3`, and `33ec5c3`. Exact `db109b7` received bridge-mediated Sol/xhigh **REVISE**
   with eight `WRONG` findings and one `SMELL`; first remediation code is checkpointed at `49dd5b3`. Exact

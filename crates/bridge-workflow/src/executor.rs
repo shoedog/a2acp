@@ -15,6 +15,8 @@ use bridge_core::SessionCwd;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -44,6 +46,12 @@ impl Default for WorkflowRunContext {
     }
 }
 
+/// An optional, fail-open telemetry barrier polled immediately before the
+/// provider prompt future. Callers absorb persistence failures inside the
+/// callback so workflow telemetry can never cancel the primary workload.
+pub type PromptDispatchBarrier =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// Additive diagnostic-authority wrapper for workflow execution. Keeping the
 /// factory out of [`WorkflowRunContext`] preserves source compatibility for
 /// downstream exhaustive struct literals while making durable authority an
@@ -52,11 +60,21 @@ impl Default for WorkflowRunContext {
 pub struct WorkflowDiagnosticContext {
     request: WorkflowRunContext,
     factory: Arc<dyn DiagnosticObserverFactory>,
+    prompt_dispatch: Option<PromptDispatchBarrier>,
 }
 
 impl WorkflowDiagnosticContext {
     pub fn new(request: WorkflowRunContext, factory: Arc<dyn DiagnosticObserverFactory>) -> Self {
-        Self { request, factory }
+        Self {
+            request,
+            factory,
+            prompt_dispatch: None,
+        }
+    }
+
+    pub fn with_prompt_dispatch_barrier(mut self, barrier: PromptDispatchBarrier) -> Self {
+        self.prompt_dispatch = Some(barrier);
+        self
     }
 
     pub fn in_memory(request: WorkflowRunContext) -> Self {
@@ -69,8 +87,14 @@ impl WorkflowDiagnosticContext {
         )
     }
 
-    fn into_parts(self) -> (WorkflowRunContext, Arc<dyn DiagnosticObserverFactory>) {
-        (self.request, self.factory)
+    fn into_parts(
+        self,
+    ) -> (
+        WorkflowRunContext,
+        Arc<dyn DiagnosticObserverFactory>,
+        Option<PromptDispatchBarrier>,
+    ) {
+        (self.request, self.factory, self.prompt_dispatch)
     }
 }
 
@@ -169,6 +193,92 @@ impl NodeDisposition {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowCleanupDisposition {
+    Complete,
+    Failed,
+    NotNeeded,
+}
+
+impl WorkflowCleanupDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::NotNeeded => "not_needed",
+        }
+    }
+}
+
+#[derive(Default)]
+struct WorkflowCleanupTracker {
+    state: std::sync::Mutex<WorkflowCleanupState>,
+}
+
+#[derive(Default)]
+struct WorkflowCleanupState {
+    observed: u32,
+    failed: bool,
+    intervals: Vec<(std::time::Instant, std::time::Instant)>,
+}
+
+impl WorkflowCleanupTracker {
+    fn record(&self, started: std::time::Instant, finished: std::time::Instant, succeeded: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.observed = state.observed.saturating_add(1);
+        state.failed |= !succeeded;
+        state.intervals.push((started, finished));
+    }
+
+    fn observation(&self) -> (WorkflowCleanupDisposition, u64) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let disposition = if state.failed {
+            WorkflowCleanupDisposition::Failed
+        } else if state.observed == 0 {
+            WorkflowCleanupDisposition::NotNeeded
+        } else {
+            WorkflowCleanupDisposition::Complete
+        };
+        let mut intervals = state.intervals.clone();
+        intervals.sort_unstable_by_key(|(started, _)| *started);
+        let mut total = std::time::Duration::ZERO;
+        if let Some((mut current_start, mut current_end)) = intervals.first().copied() {
+            for (started, finished) in intervals.into_iter().skip(1) {
+                if started <= current_end {
+                    current_end = current_end.max(finished);
+                } else {
+                    total = total.saturating_add(current_end.duration_since(current_start));
+                    current_start = started;
+                    current_end = finished;
+                }
+            }
+            total = total.saturating_add(current_end.duration_since(current_start));
+        }
+        (
+            disposition,
+            u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
+        )
+    }
+}
+
+async fn cleanup_warm_turn(
+    cleanup: Box<dyn NodeTurnCleanup>,
+    exit: NodeTurnExit,
+    observer: Arc<dyn DiagnosticObserver>,
+    tracker: &WorkflowCleanupTracker,
+) -> Result<(), BridgeError> {
+    let started = std::time::Instant::now();
+    let result = cleanup.on_exit_observed(exit, observer).await;
+    tracker.record(started, std::time::Instant::now(), result.is_ok());
+    result
+}
+
 #[derive(Clone, Copy)]
 enum ColdCleanupAction {
     Forget,
@@ -180,8 +290,10 @@ async fn cleanup_cold_session(
     session: &SessionId,
     observer: &Arc<dyn DiagnosticObserver>,
     action: ColdCleanupAction,
+    tracker: &WorkflowCleanupTracker,
 ) -> Result<(), BridgeError> {
-    match action {
+    let started = std::time::Instant::now();
+    let result = match action {
         ColdCleanupAction::Forget => {
             backend
                 .forget_session_observed(session, observer.clone())
@@ -192,7 +304,9 @@ async fn cleanup_cold_session(
                 .release_session_observed(session, observer.clone())
                 .await
         }
-    }
+    };
+    tracker.record(started, std::time::Instant::now(), result.is_ok());
+    result
 }
 
 enum RenderInput {
@@ -322,6 +436,10 @@ pub enum WorkflowEvent {
         output: String,
         usage: Option<bridge_core::orch::UsageSnapshot>,
     },
+    CleanupObserved {
+        disposition: WorkflowCleanupDisposition,
+        duration_ms: u64,
+    },
     Terminal {
         outcome: WorkflowOutcome,
         output: String,
@@ -371,6 +489,12 @@ impl WorkflowExecutor {
         Self { registry }
     }
 
+    /// Compute the configured workload partition without resolving or spawning
+    /// any agent backend.
+    pub fn workload_fingerprint(&self, graph: &WorkflowGraph) -> (String, bool) {
+        crate::graph::workload_fingerprint(graph, self.registry.as_ref())
+    }
+
     /// Run one node: render its prompt from `vars`, resolve+configure+prompt+drain, forget.
     /// Returns (text, ok, usage, disposition). On any failure returns the error marker + ok=false.
     #[allow(clippy::too_many_arguments)]
@@ -383,6 +507,8 @@ impl WorkflowExecutor {
         cancel: &CancellationToken,
         ctx: &WorkflowRunContext,
         diagnostic_factory: &Arc<dyn DiagnosticObserverFactory>,
+        prompt_dispatch: &Option<PromptDispatchBarrier>,
+        cleanup_tracker: &WorkflowCleanupTracker,
         dispatcher: Option<&Arc<dyn WorkflowNodeDispatcher>>,
     ) -> (String, bool, Option<UsageSnapshot>, NodeDisposition) {
         if cancel.is_cancelled() {
@@ -420,10 +546,13 @@ impl WorkflowExecutor {
                 }
             };
             if cancel.is_cancelled() {
-                let cleanup = turn
-                    .cleanup
-                    .on_exit_observed(NodeTurnExit::Normal, diagnostic.clone())
-                    .await;
+                let cleanup = cleanup_warm_turn(
+                    turn.cleanup,
+                    NodeTurnExit::Normal,
+                    diagnostic.clone(),
+                    cleanup_tracker,
+                )
+                .await;
                 let (text, outcome) = match cleanup {
                     Ok(()) => (
                         format!("[node {} canceled]", node.id.as_str()),
@@ -468,11 +597,16 @@ impl WorkflowExecutor {
                 // the concrete backend result first so a structured failure
                 // can arm warm-session expiry. A pending prompt still yields
                 // immediately to cancellation.
-                s = turn.backend.prompt_with_observers(
-                    &turn.session,
-                    parts,
-                    BackendObservers::new(diagnostic.clone(), rich_sink.clone()),
-                ) => match s {
+                s = async {
+                    if let Some(barrier) = prompt_dispatch {
+                        barrier().await;
+                    }
+                    turn.backend.prompt_with_observers(
+                        &turn.session,
+                        parts,
+                        BackendObservers::new(diagnostic.clone(), rich_sink.clone()),
+                    ).await
+                } => match s {
                     Ok(s) => s,
                     Err(e) => {
                         turn
@@ -489,10 +623,13 @@ impl WorkflowExecutor {
                         }
                         let text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
                         let fail_out = TurnOutcome::Failed(classify_failure(&e));
-                        let _ = turn
-                            .cleanup
-                            .on_exit_observed(NodeTurnExit::Error(e), diagnostic.clone())
-                            .await;
+                        let _ = cleanup_warm_turn(
+                            turn.cleanup,
+                            NodeTurnExit::Error(e),
+                            diagnostic.clone(),
+                            cleanup_tracker,
+                        )
+                        .await;
                         ctx.observer.record(&ObsEvent::TurnFinished {
                             ctx: &obs_ctx,
                             latency: turn_start.elapsed(),
@@ -520,10 +657,13 @@ impl WorkflowExecutor {
                             );
                         }
                     }
-                    let cleanup = turn
-                        .cleanup
-                        .on_exit_observed(NodeTurnExit::Canceled, diagnostic.clone())
-                        .await;
+                    let cleanup = cleanup_warm_turn(
+                        turn.cleanup,
+                        NodeTurnExit::Canceled,
+                        diagnostic.clone(),
+                        cleanup_tracker,
+                    )
+                    .await;
                     let (text, outcome) = match cleanup {
                         Ok(()) => (
                             format!("[node {} canceled]", node.id.as_str()),
@@ -647,10 +787,8 @@ impl WorkflowExecutor {
                 NodeTurnExit::Normal if ok => TurnOutcome::Success,
                 NodeTurnExit::Normal => TurnOutcome::Failed(FailureClass::Other),
             };
-            let cleanup_result = turn
-                .cleanup
-                .on_exit_observed(exit, diagnostic.clone())
-                .await;
+            let cleanup_result =
+                cleanup_warm_turn(turn.cleanup, exit, diagnostic.clone(), cleanup_tracker).await;
             if let Err(error) = cleanup_result {
                 if !had_primary_failure {
                     ok = false;
@@ -815,6 +953,7 @@ impl WorkflowExecutor {
                                 &session,
                                 &diagnostic,
                                 action,
+                                cleanup_tracker,
                             )
                             .await
                             .is_ok();
@@ -829,6 +968,7 @@ impl WorkflowExecutor {
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
+                            cleanup_tracker,
                         )
                         .await;
                         break 'attempt Attempt::Fatal {
@@ -843,6 +983,7 @@ impl WorkflowExecutor {
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
+                            cleanup_tracker,
                         )
                         .await
                         {
@@ -872,11 +1013,16 @@ impl WorkflowExecutor {
                         .map(|factory| factory.make(&node.id));
                     let mut stream = tokio::select! {
                         biased;
-                        s = resolved.backend.prompt_with_observers(
-                            &session,
-                            vec![Part { text: rendered.clone() }],
-                            BackendObservers::new(diagnostic.clone(), rich_sink.clone()),
-                        ) => match s {
+                        s = async {
+                            if let Some(barrier) = prompt_dispatch {
+                                barrier().await;
+                            }
+                            resolved.backend.prompt_with_observers(
+                                &session,
+                                vec![Part { text: rendered.clone() }],
+                                BackendObservers::new(diagnostic.clone(), rich_sink.clone()),
+                            ).await
+                        } => match s {
                             Ok(s) => s,
                             Err(e) => {
                                 if let Some(sink) = &rich_sink {
@@ -899,6 +1045,7 @@ impl WorkflowExecutor {
                                         &session,
                                         &diagnostic,
                                         action,
+                                        cleanup_tracker,
                                     )
                                     .await
                                     .is_ok();
@@ -913,6 +1060,7 @@ impl WorkflowExecutor {
                                     &session,
                                     &diagnostic,
                                     ColdCleanupAction::Forget,
+                                    cleanup_tracker,
                                 )
                                 .await;
                                 break 'attempt Attempt::Fatal {
@@ -932,21 +1080,28 @@ impl WorkflowExecutor {
                                     );
                                 }
                             }
-                            match cleanup_cold_session(
+                            // The prompt future may have crossed the provider's
+                            // acceptance boundary before yielding its stream. A
+                            // workflow cancel must therefore request backend
+                            // cancellation even while prompt-open is pending,
+                            // then settle the session teardown before projecting
+                            // a terminal outcome.
+                            let cancel_error = resolved
+                                .backend
+                                .cancel_observed(&session, diagnostic.clone())
+                                .await
+                                .err();
+                            let cleanup_error = cleanup_cold_session(
                                 &resolved.backend,
                                 &session,
                                 &diagnostic,
                                 ColdCleanupAction::Forget,
+                                cleanup_tracker,
                             )
                             .await
-                            {
-                                Ok(()) => {
-                                    break 'attempt Attempt::Canceled {
-                                        marker: format!("[node {} canceled]", node.id.as_str()),
-                                        usage: None,
-                                    };
-                                }
-                                Err(error) => {
+                            .err();
+                            match cancel_error.or(cleanup_error) {
+                                Some(error) => {
                                     break 'attempt Attempt::Fatal {
                                         text: format!(
                                             "[node {} cleanup failed: {:?}]",
@@ -955,6 +1110,12 @@ impl WorkflowExecutor {
                                         ),
                                         usage: None,
                                         failure_class: classify_failure(&error),
+                                    };
+                                }
+                                None => {
+                                    break 'attempt Attempt::Canceled {
+                                        marker: format!("[node {} canceled]", node.id.as_str()),
+                                        usage: None,
                                     };
                                 }
                             }
@@ -1055,6 +1216,7 @@ impl WorkflowExecutor {
                                     &session,
                                     &diagnostic,
                                     ColdCleanupAction::Forget,
+                                    cleanup_tracker,
                                 )
                                 .await;
                                 break 'attempt Attempt::Fatal {
@@ -1075,6 +1237,7 @@ impl WorkflowExecutor {
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
+                            cleanup_tracker,
                         )
                         .await
                         .err();
@@ -1110,6 +1273,7 @@ impl WorkflowExecutor {
                                 &session,
                                 &diagnostic,
                                 action,
+                                cleanup_tracker,
                             )
                             .await
                             .is_ok();
@@ -1125,6 +1289,7 @@ impl WorkflowExecutor {
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
+                            cleanup_tracker,
                         )
                         .await;
                         break 'attempt Attempt::Fatal {
@@ -1138,6 +1303,7 @@ impl WorkflowExecutor {
                         &session,
                         &diagnostic,
                         ColdCleanupAction::Forget,
+                        cleanup_tracker,
                     )
                     .await;
                     if ok {
@@ -1435,7 +1601,7 @@ impl WorkflowExecutor {
         seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
         ctx: WorkflowDiagnosticContext,
     ) -> WorkflowStream {
-        let (ctx, diagnostic_factory) = ctx.into_parts();
+        let (ctx, diagnostic_factory, prompt_dispatch) = ctx.into_parts();
         self.run_from_with_context_inner(
             graph,
             input,
@@ -1444,6 +1610,7 @@ impl WorkflowExecutor {
             seed,
             ctx,
             diagnostic_factory,
+            prompt_dispatch,
             None,
         )
     }
@@ -1481,7 +1648,7 @@ impl WorkflowExecutor {
         ctx: WorkflowDiagnosticContext,
         dispatcher: Arc<dyn WorkflowNodeDispatcher>,
     ) -> WorkflowStream {
-        let (ctx, diagnostic_factory) = ctx.into_parts();
+        let (ctx, diagnostic_factory, prompt_dispatch) = ctx.into_parts();
         self.run_from_with_context_inner(
             graph,
             input,
@@ -1490,6 +1657,7 @@ impl WorkflowExecutor {
             seed,
             ctx,
             diagnostic_factory,
+            prompt_dispatch,
             Some(dispatcher),
         )
     }
@@ -1504,15 +1672,21 @@ impl WorkflowExecutor {
         seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
         ctx: WorkflowRunContext,
         diagnostic_factory: Arc<dyn DiagnosticObserverFactory>,
+        prompt_dispatch: Option<PromptDispatchBarrier>,
         dispatcher: Option<Arc<dyn WorkflowNodeDispatcher>>,
     ) -> WorkflowStream {
         let this = WorkflowExecutor {
             registry: self.registry.clone(),
         };
         Box::pin(async_stream::stream! {
+            let cleanup_tracker = Arc::new(WorkflowCleanupTracker::default());
             let base_render_vars = match render_vars_for_input(&input) {
                 Ok(vars) => vars,
                 Err(msg) => {
+                    yield Ok(WorkflowEvent::CleanupObserved {
+                        disposition: WorkflowCleanupDisposition::NotNeeded,
+                        duration_ms: 0,
+                    });
                     yield Ok(WorkflowEvent::Terminal {
                         outcome: WorkflowOutcome::Failed,
                         output: msg,
@@ -1624,6 +1798,8 @@ impl WorkflowExecutor {
                                 let wf_id = graph.id.as_str().to_string();
                                 let ctx = ctx.clone();
                                 let diagnostic_factory = diagnostic_factory.clone();
+                                let prompt_dispatch = prompt_dispatch.clone();
+                                let cleanup_tracker = cleanup_tracker.clone();
                                 let dispatcher = dispatcher.clone();
                                 let this = &this;
                                 inflight.push(Box::pin(async move {
@@ -1637,6 +1813,8 @@ impl WorkflowExecutor {
                                         &cancel,
                                         &ctx,
                                         &diagnostic_factory,
+                                        &prompt_dispatch,
+                                        cleanup_tracker.as_ref(),
                                         dispatcher.as_ref(),
                                     ).await;
                                     (node.id.clone(), text, ok, usage, disposition)
@@ -1674,12 +1852,23 @@ impl WorkflowExecutor {
                 .copied()
                 .map(NodeDisposition::workflow_outcome)
                 .unwrap_or_else(|| {
-                    if cancel.is_cancelled() {
+                    // Cancellation stops downstream scheduling. If an in-flight
+                    // node reports a concrete failure (including failed cancel
+                    // or teardown), that evidence outranks the generic canceled
+                    // fallback for the never-started terminal node.
+                    if dispositions.values().any(|d| *d == NodeDisposition::Failed) {
+                        WorkflowOutcome::Failed
+                    } else if cancel.is_cancelled() {
                         WorkflowOutcome::Canceled
                     } else {
                         WorkflowOutcome::Failed
                     }
                 });
+            let (cleanup_disposition, cleanup_ms) = cleanup_tracker.observation();
+            yield Ok(WorkflowEvent::CleanupObserved {
+                disposition: cleanup_disposition,
+                duration_ms: cleanup_ms,
+            });
             yield Ok(WorkflowEvent::Terminal { outcome, output: term_text });
         })
     }
@@ -1697,6 +1886,28 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn cleanup_duration_is_the_union_of_overlapping_intervals() {
+        let tracker = WorkflowCleanupTracker::default();
+        let base = std::time::Instant::now();
+        tracker.record(base, base + std::time::Duration::from_millis(30), true);
+        tracker.record(
+            base + std::time::Duration::from_millis(10),
+            base + std::time::Duration::from_millis(40),
+            false,
+        );
+        tracker.record(
+            base + std::time::Duration::from_millis(60),
+            base + std::time::Duration::from_millis(70),
+            true,
+        );
+
+        assert_eq!(
+            tracker.observation(),
+            (WorkflowCleanupDisposition::Failed, 50)
+        );
+    }
 
     #[derive(Default)]
     pub(super) struct Rec {
@@ -2484,9 +2695,16 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
 
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert!(matches!(
             &events[0],
+            WorkflowEvent::CleanupObserved {
+                disposition: WorkflowCleanupDisposition::NotNeeded,
+                duration_ms: 0
+            }
+        ));
+        assert!(matches!(
+            &events[1],
             WorkflowEvent::Terminal {
                 outcome: WorkflowOutcome::Failed,
                 output
@@ -3543,6 +3761,16 @@ mod tests {
                 })
                 .unwrap();
 
+            assert!(events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .any(|event| matches!(
+                    event,
+                    WorkflowEvent::CleanupObserved {
+                        disposition: WorkflowCleanupDisposition::Failed,
+                        ..
+                    }
+                )));
             assert!(!ok);
             assert!(output.contains(expected_fragment), "{output}");
             assert_eq!(terminal, WorkflowOutcome::Failed);
@@ -4163,6 +4391,16 @@ mod tests {
                 })
                 .unwrap();
             assert!(!finished.0);
+            assert!(events
+                .iter()
+                .filter_map(|event| event.as_ref().ok())
+                .any(|event| matches!(
+                    event,
+                    WorkflowEvent::CleanupObserved {
+                        disposition: WorkflowCleanupDisposition::Failed,
+                        ..
+                    }
+                )));
             assert!(finished.1.contains(expected_fragment), "{}", finished.1);
             assert_eq!(exits.lock().unwrap().len(), 1);
         }
@@ -4332,6 +4570,13 @@ mod tests {
             } if output == "WARM"
         ));
         assert_eq!(*rec.forgets.lock().unwrap(), 0, "warm path must not forget");
+        assert!(matches!(
+            &events[events.len() - 2],
+            WorkflowEvent::CleanupObserved {
+                disposition: WorkflowCleanupDisposition::Complete,
+                ..
+            }
+        ));
         assert_eq!(rec.prompt_sessions.lock().unwrap().as_slice(), [session]);
         assert_eq!(exits.lock().unwrap().as_slice(), ["normal"]);
     }
@@ -6112,6 +6357,7 @@ mod tests {
 #[cfg(test)]
 mod observability_tests {
     use super::*;
+    use crate::executor::tests::{FakeRegistry, Rec as PromptRec};
     use crate::graph::{RetryPolicy, WorkflowGraph, WorkflowNode};
     use bridge_core::domain::Part;
     use bridge_core::error::BridgeError;
@@ -7233,5 +7479,103 @@ mod observability_tests {
             rec.0.lock().unwrap().as_slice(),
             ["turn_finished", "no_usage_finalized", "node_finished"]
         );
+    }
+
+    fn prompt_barrier_fixture() -> (WorkflowExecutor, Arc<PromptRec>) {
+        let rec = Arc::new(PromptRec::default());
+        let registry = Arc::new(FakeRegistry {
+            backends: [("codex".to_owned(), ("done".to_owned(), rec.clone()))].into(),
+        });
+        (WorkflowExecutor::new(registry), rec)
+    }
+
+    #[tokio::test]
+    async fn prompt_dispatch_barrier_completes_before_provider_poll() {
+        let (executor, rec) = prompt_barrier_fixture();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let barrier: PromptDispatchBarrier = {
+            let entered = entered.clone();
+            let release = release.clone();
+            Arc::new(move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    entered.notify_one();
+                    let permit = release.acquire().await.unwrap();
+                    permit.forget();
+                })
+            })
+        };
+        let ctx = WorkflowDiagnosticContext::in_memory(WorkflowRunContext::default())
+            .with_prompt_dispatch_barrier(barrier);
+        let run = tokio::spawn(async move {
+            executor
+                .run_with_diagnostic_context(
+                    make_single_node_graph(),
+                    "input".into(),
+                    "run".into(),
+                    CancellationToken::new(),
+                    ctx,
+                )
+                .collect::<Vec<_>>()
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        assert!(
+            rec.prompts.lock().unwrap().is_empty(),
+            "provider prompt must remain unpolled while the durable barrier is pending"
+        );
+        release.add_permits(1);
+        let events = run.await.unwrap();
+        assert!(!rec.prompts.lock().unwrap().is_empty());
+        assert!(matches!(
+            events.last().unwrap().as_ref().unwrap(),
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_prompt_poll_does_not_claim_acceptance() {
+        let (executor, rec) = prompt_barrier_fixture();
+        let barrier_calls = Arc::new(AtomicUsize::new(0));
+        let barrier: PromptDispatchBarrier = {
+            let barrier_calls = barrier_calls.clone();
+            Arc::new(move || {
+                let barrier_calls = barrier_calls.clone();
+                Box::pin(async move {
+                    barrier_calls.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+        };
+        let token = CancellationToken::new();
+        token.cancel();
+        let events = executor
+            .run_with_diagnostic_context(
+                make_single_node_graph(),
+                "input".into(),
+                "run".into(),
+                token,
+                WorkflowDiagnosticContext::in_memory(WorkflowRunContext::default())
+                    .with_prompt_dispatch_barrier(barrier),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(barrier_calls.load(Ordering::SeqCst), 0);
+        assert!(rec.prompts.lock().unwrap().is_empty());
+        assert!(matches!(
+            events.last().unwrap().as_ref().unwrap(),
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Canceled,
+                ..
+            }
+        ));
     }
 }

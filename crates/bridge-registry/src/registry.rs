@@ -454,6 +454,13 @@ impl AgentRegistry for Registry {
         self.state.load().default.clone()
     }
 
+    fn configured_effective(&self, id: &AgentId) -> Option<bridge_core::domain::EffectiveConfig> {
+        let state = self.state.load();
+        let slot = state.slots.get(id)?;
+        let entry = slot.entry.load();
+        Some(bridge_core::domain::effective_config(entry.as_ref(), None))
+    }
+
     fn mcp_advertisement(&self) -> Vec<(String, Vec<String>)> {
         // Read each slot's (swappable) entry config — NO spawn — and report the MCP server names
         // for agents that have any. Sorted for a stable agent-card (ADR-0028).

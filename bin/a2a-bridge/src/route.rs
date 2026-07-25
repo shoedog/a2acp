@@ -34,21 +34,24 @@ impl SkillRoute {
 }
 
 impl RouteDecision for SkillRoute {
-    fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
-        match meta.skill.as_deref() {
-            Some("delegate") => Ok(RouteTarget::Delegate),
-            Some("fan-out") => Ok(RouteTarget::Fanout),
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        let target = match meta.skill.as_deref() {
+            Some("delegate") => Some(RouteTarget::Delegate),
+            Some("fan-out") => Some(RouteTarget::Fanout),
             // A skill naming a configured workflow routes to that workflow. Checked
             // before the Local fallback so a `skill="code-review"` runs the DAG.
-            Some(s) if self.knows_workflow(s) => Ok(RouteTarget::Workflow(
+            Some(s) if self.knows_workflow(s) => Some(RouteTarget::Workflow(
                 bridge_core::ids::WorkflowId::parse(s)?,
             )),
-            _ => Ok(RouteTarget::Local(
-                meta.agent
-                    .clone()
-                    .unwrap_or_else(|| self.registry.default_id()),
-            )),
-        }
+            _ => meta.agent.clone().map(RouteTarget::Local),
+        };
+        Ok(target)
+    }
+
+    fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+        Ok(self
+            .route_before_default(meta)?
+            .unwrap_or_else(|| RouteTarget::Local(self.registry.default_id())))
     }
 }
 
@@ -155,6 +158,19 @@ mod tests {
     }
 
     // ---- Task 9 route tests ----
+
+    #[test]
+    fn skill_route_exposes_omitted_agent_without_reading_default() {
+        let r = skill_route_with_default("codex");
+        assert!(r
+            .route_before_default(&TaskMeta {
+                skill: None,
+                agent: None,
+                ..Default::default()
+            })
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn skill_route_uses_registry_default_when_no_agent() {

@@ -4,7 +4,7 @@ use bridge_coordinator::params::{InjectParams, OpParams, PermitParams};
 use bridge_coordinator::session_manager::ResetOutcome;
 use bridge_coordinator::Coordinator;
 use bridge_core::error::BridgeError;
-use bridge_core::ids::{ContextId, TaskId};
+use bridge_core::ids::{AttemptId, ContextId, TaskId};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -68,25 +68,46 @@ async fn dispatch(id: &Value, params: &Value, coord: &Coordinator) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
     let result = match tool {
-        "run" => match OpParams::from_mcp_args(&args) {
-            Ok(p) => coord.prompt(p).await.map(|o| {
-                json!({
-                    "text": o.text,
-                    "stop_reason": o.stop_reason,
-                    "context": o.context.as_str()
+        "run" => match (
+            OpParams::from_mcp_args(&args),
+            bridge_coordinator::params::attempt_identity_from_mcp_args(&args),
+        ) {
+            (Ok(p), Ok(identity)) => {
+                let locator = identity.clone();
+                coord.prompt_with_identity(p, identity).await.map(|o| {
+                    json!({
+                        "text": o.text,
+                        "stop_reason": o.stop_reason,
+                        "context": o.context.as_str(),
+                        "execution_id": locator.execution_id.as_str(),
+                        "attempt_id": locator.attempt_id.as_str(),
+                        "attempt_ordinal": locator.ordinal,
+                    })
                 })
-            }),
-            Err(e) => Err(e),
+            }
+            (Err(e), _) | (_, Err(e)) => Err(e),
         },
-        "continue" => match OpParams::from_mcp_args(&args) {
-            Ok(p) => coord.continue_turn(p).await.map(|o| {
-                json!({
-                    "text": o.text,
-                    "stop_reason": o.stop_reason,
-                    "context": o.context.as_str()
-                })
-            }),
-            Err(e) => Err(e),
+        "continue" => match (
+            OpParams::from_mcp_args(&args),
+            bridge_coordinator::params::attempt_identity_from_mcp_args(&args),
+        ) {
+            (Ok(p), Ok(identity)) => {
+                let locator = identity.clone();
+                coord
+                    .continue_turn_with_identity(p, identity)
+                    .await
+                    .map(|o| {
+                        json!({
+                            "text": o.text,
+                            "stop_reason": o.stop_reason,
+                            "context": o.context.as_str(),
+                            "execution_id": locator.execution_id.as_str(),
+                            "attempt_id": locator.attempt_id.as_str(),
+                            "attempt_ordinal": locator.ordinal,
+                        })
+                    })
+            }
+            (Err(e), _) | (_, Err(e)) => Err(e),
         },
         "inject" => match InjectParams::from_mcp_args(&args) {
             Ok(p) => coord
@@ -102,18 +123,40 @@ async fn dispatch(id: &Value, params: &Value, coord: &Coordinator) -> Value {
                 .map(|resolved| json!({ "resolved": resolved })),
             Err(e) => Err(e),
         },
-        "run_workflow" => match OpParams::from_mcp_args_for_workflow(&args) {
-            Ok(p) => coord
-                .run_workflow(p)
-                .await
-                .map(|task| json!({ "task_id": task.as_str() })),
-            Err(e) => Err(e),
+        "run_workflow" => match (
+            OpParams::from_mcp_args_for_workflow(&args),
+            bridge_coordinator::params::attempt_identity_from_mcp_args(&args),
+        ) {
+            (Ok(p), Ok(identity)) => {
+                coord
+                    .run_workflow_with_identity(p, identity)
+                    .await
+                    .map(|locator| {
+                        json!({
+                            "task_id": locator.task_id.as_str(),
+                            "execution_id": locator.execution_id.as_str(),
+                            "attempt_id": locator.attempt_id.as_str(),
+                            "attempt_ordinal": locator.attempt_ordinal,
+                            "parent_attempt_id": locator.parent_attempt_id,
+                            "telemetry_unavailable": locator.telemetry_unavailable,
+                        })
+                    })
+            }
+            (Err(e), _) | (_, Err(e)) => Err(e),
         },
         "status" => match parse_status_args(&args) {
-            Ok((ctx, task)) => coord
-                .status(ctx, task)
+            Ok(StatusArgs::Context(ctx)) => coord
+                .status(Some(ctx), None)
                 .await
                 .map(|dto| serde_json::to_value(dto).unwrap_or_default()),
+            Ok(StatusArgs::Task(task)) => coord
+                .status(None, Some(task))
+                .await
+                .map(|dto| serde_json::to_value(dto).unwrap_or_default()),
+            Ok(StatusArgs::Attempt(attempt)) => coord
+                .attempt_status(&attempt)
+                .await
+                .map(|record| serde_json::to_value(record).unwrap_or_default()),
             Err(e) => Err(e),
         },
         "clear" => match parse_ctx(&args) {
@@ -140,20 +183,41 @@ async fn dispatch(id: &Value, params: &Value, coord: &Coordinator) -> Value {
     }
 }
 
-fn parse_status_args(args: &Value) -> Result<(Option<ContextId>, Option<TaskId>), BridgeError> {
-    let ctx = args
+enum StatusArgs {
+    Context(ContextId),
+    Task(TaskId),
+    Attempt(AttemptId),
+}
+
+fn parse_status_args(args: &Value) -> Result<StatusArgs, BridgeError> {
+    let context = args
         .get("context")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .map(ContextId::parse)
         .transpose()
         .map_err(|_| BridgeError::InvalidRequest { field: "context" })?;
     let task = args
         .get("task_id")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .map(TaskId::parse)
         .transpose()
         .map_err(|_| BridgeError::InvalidRequest { field: "task_id" })?;
-    Ok((ctx, task))
+    let attempt = args
+        .get("attempt_id")
+        .and_then(Value::as_str)
+        .map(AttemptId::parse)
+        .transpose()
+        .map_err(|_| BridgeError::InvalidRequest {
+            field: "attempt_id",
+        })?;
+    match (context, task, attempt) {
+        (Some(context), None, None) => Ok(StatusArgs::Context(context)),
+        (None, Some(task), None) => Ok(StatusArgs::Task(task)),
+        (None, None, Some(attempt)) => Ok(StatusArgs::Attempt(attempt)),
+        _ => Err(BridgeError::InvalidRequest {
+            field: "context|task_id|attempt_id (exactly one)",
+        }),
+    }
 }
 
 fn parse_ctx(args: &Value) -> Result<ContextId, BridgeError> {

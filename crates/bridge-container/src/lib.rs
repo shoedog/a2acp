@@ -1666,6 +1666,13 @@ mod tests {
     impl ContainerSpawn for RejectingPreflightSpawn {
         fn validate_infrastructure(&self, sandbox: &SandboxConfig) -> Result<(), BridgeError> {
             let mut invalid = sandbox.clone();
+            invalid.runtime = Some(
+                std::env::current_exe()
+                    .expect("current test executable should resolve")
+                    .to_str()
+                    .expect("current test executable path should be UTF-8")
+                    .to_owned(),
+            );
             invalid.image.clear();
             bridge_core::sandbox::validate_container_infrastructure(&invalid)
         }

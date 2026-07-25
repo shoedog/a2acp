@@ -36,6 +36,10 @@ fn sse_data_payloads(body: &str) -> Vec<String> {
 struct IntegKiroRoute;
 
 impl RouteDecision for IntegKiroRoute {
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        self.route(meta).map(Some)
+    }
+
     fn route(&self, _meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
         Ok(RouteTarget::Local(AgentId::parse("kiro")?))
     }
@@ -59,7 +63,7 @@ fn build_router() -> axum::Router {
     let auth = Arc::new(AlwaysGrant);
 
     let server = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             common::single_agent_registry("kiro", backend),
             store,
             policy,

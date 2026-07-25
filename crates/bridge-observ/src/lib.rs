@@ -2,7 +2,7 @@
 
 use bridge_core::orch::{TerminalUsage, UsageSnapshot};
 use bridge_core::ports::{
-    FailureClass, ObsEvent, Observer, TurnContext, TurnOutcome, UsageFinalization,
+    FailureClass, ObsEvent, Observer, TurnContext, TurnOutcome, UsageFinalization, WorkflowObsEvent,
 };
 use bridge_core::task_store::{
     TaskStore, TurnLogFinalized, TurnLogFinished, TurnUsageFinalization,
@@ -40,6 +40,12 @@ impl Observer for FanoutObserver {
     fn record(&self, e: &ObsEvent<'_>) {
         for sink in &self.sinks {
             let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| sink.record(e)));
+        }
+    }
+
+    fn record_workflow(&self, event: &WorkflowObsEvent<'_>) {
+        for sink in &self.sinks {
+            let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| sink.record_workflow(event)));
         }
     }
 }
@@ -83,6 +89,10 @@ impl Observer for DedupObserver {
             _ => {}
         }
         self.inner.record(e);
+    }
+
+    fn record_workflow(&self, event: &WorkflowObsEvent<'_>) {
+        self.inner.record_workflow(event);
     }
 }
 
@@ -132,7 +142,7 @@ pub struct LabelVocabulary {
 
 #[derive(Default)]
 pub struct TurnDedupe {
-    seen: Mutex<(HashSet<String>, HashSet<String>)>,
+    seen: Mutex<(HashSet<String>, HashSet<String>, HashSet<String>)>,
 }
 
 impl TurnDedupe {
@@ -144,6 +154,11 @@ impl TurnDedupe {
     pub fn mark_usage(&self, turn_id: &bridge_core::ids::TurnId) -> bool {
         let mut lock = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         lock.1.insert(turn_id.as_str().to_string())
+    }
+
+    pub fn mark_workflow(&self, attempt_id: &bridge_core::ids::AttemptId) -> bool {
+        let mut lock = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        lock.2.insert(attempt_id.as_str().to_string())
     }
 
     pub fn seed_finished(&self, turn_id: &bridge_core::ids::TurnId) {
@@ -339,10 +354,18 @@ pub struct PrometheusObserver {
     cost_dropped: IntCounterVec,
     tokens_total: IntCounterVec,
     dropped_total: IntCounterVec,
+    workflow_metrics: WorkflowMetrics,
 }
 
 impl PrometheusObserver {
     pub fn new(vocab: LabelVocabulary) -> Result<Self, prometheus::Error> {
+        Self::new_with_workflow_vocabulary(vocab, WorkflowLabelVocabulary::default())
+    }
+
+    pub fn new_with_workflow_vocabulary(
+        vocab: LabelVocabulary,
+        workflow_vocabulary: WorkflowLabelVocabulary,
+    ) -> Result<Self, prometheus::Error> {
         let registry = Registry::new();
         let turns_total = CounterVec::new(
             Opts::new(
@@ -406,6 +429,8 @@ impl PrometheusObserver {
         ] {
             registry.register(collector)?;
         }
+        let workflow_metrics =
+            WorkflowMetrics::new_with_registry(registry.clone(), workflow_vocabulary)?;
 
         Ok(Self {
             registry,
@@ -422,7 +447,12 @@ impl PrometheusObserver {
             cost_dropped,
             tokens_total,
             dropped_total,
+            workflow_metrics,
         })
+    }
+
+    pub fn workflow_metrics(&self) -> &WorkflowMetrics {
+        &self.workflow_metrics
     }
 
     pub fn endpoint(&self) -> MetricsEndpoint {
@@ -514,6 +544,32 @@ impl PrometheusObserver {
             {
                 self.dedupe.seed_usage(&row.turn_id);
             }
+        }
+    }
+    pub fn rebuild_from_workflow_history(
+        &self,
+        rows: &[bridge_core::workflow_history::CompletedAttempt],
+    ) {
+        for row in rows {
+            let projected = bridge_core::workflow_history::compatibility_project_completed(row);
+            let row = projected.as_ref();
+            if !self
+                .dedupe
+                .mark_workflow(&row.reservation.identity.attempt_id)
+            {
+                continue;
+            }
+            self.workflow_metrics
+                .record_terminal(&WorkflowMetricSample {
+                    workflow: &row.reservation.workflow,
+                    task_class: &row.reservation.task_class,
+                    surface: row.reservation.surface.as_str(),
+                    policy: &row.reservation.policy,
+                    outcome: &row.terminal.outcome,
+                    telemetry_complete: row.terminal.telemetry_complete,
+                    work_seconds: row.terminal.work_ms as f64 / 1000.0,
+                    end_to_end_seconds: row.terminal.end_to_end_ms as f64 / 1000.0,
+                });
         }
     }
 
@@ -623,6 +679,53 @@ impl Observer for PrometheusObserver {
             | ObsEvent::TaskFinished { .. }
             | ObsEvent::NodeStarted { .. }
             | ObsEvent::NodeFinished { .. } => {}
+        }
+    }
+
+    fn record_workflow(&self, event: &WorkflowObsEvent<'_>) {
+        match event {
+            WorkflowObsEvent::Started {
+                task_class,
+                surface,
+            } => {
+                self.workflow_metrics.set_in_flight(task_class, surface, 1);
+            }
+            WorkflowObsEvent::Finished {
+                attempt_id,
+                workflow,
+                task_class,
+                surface,
+                policy,
+                outcome,
+                telemetry_complete,
+                work_seconds,
+                end_to_end_seconds,
+            } => {
+                self.workflow_metrics.set_in_flight(task_class, surface, -1);
+                if !self.dedupe.mark_workflow(attempt_id) {
+                    return;
+                }
+                self.workflow_metrics
+                    .record_terminal(&WorkflowMetricSample {
+                        workflow,
+                        task_class,
+                        surface,
+                        policy,
+                        outcome,
+                        telemetry_complete: *telemetry_complete,
+                        work_seconds: *work_seconds,
+                        end_to_end_seconds: *end_to_end_seconds,
+                    });
+            }
+            WorkflowObsEvent::Stopped {
+                task_class,
+                surface,
+            } => {
+                self.workflow_metrics.set_in_flight(task_class, surface, -1);
+            }
+            WorkflowObsEvent::TelemetryUnavailable { reason } => {
+                self.workflow_metrics.record_telemetry_unavailable(*reason);
+            }
         }
     }
 }
@@ -1628,5 +1731,413 @@ mod tests {
         // Calling init_stderr() twice must not panic.
         init_stderr();
         init_stderr();
+    }
+}
+
+/// Closed workflow metric vocabulary. Unknown configured values collapse to `other`;
+/// locator/session/generation identifiers are intentionally absent from this API.
+#[derive(Clone, Debug, Default)]
+pub struct WorkflowLabelVocabulary {
+    pub workflows: HashSet<String>,
+    pub task_classes: HashSet<String>,
+    pub policies: HashSet<String>,
+}
+pub struct WorkflowMetricSample<'a> {
+    pub workflow: &'a str,
+    pub task_class: &'a str,
+    pub surface: &'a str,
+    pub policy: &'a str,
+    pub outcome: &'a str,
+    pub telemetry_complete: bool,
+    pub work_seconds: f64,
+    pub end_to_end_seconds: f64,
+}
+
+pub struct WorkflowMetrics {
+    registry: Registry,
+    vocabulary: WorkflowLabelVocabulary,
+    total: CounterVec,
+    work_duration: HistogramVec,
+    end_to_end_duration: HistogramVec,
+    in_flight: prometheus::IntGaugeVec,
+    telemetry_unavailable: IntCounterVec,
+}
+impl WorkflowMetrics {
+    pub fn new(vocabulary: WorkflowLabelVocabulary) -> Result<Self, prometheus::Error> {
+        Self::new_with_registry(Registry::new(), vocabulary)
+    }
+
+    fn new_with_registry(
+        registry: Registry,
+        vocabulary: WorkflowLabelVocabulary,
+    ) -> Result<Self, prometheus::Error> {
+        let labels = &["workflow", "task_class", "surface", "policy", "outcome"];
+        let total = CounterVec::new(
+            Opts::new(
+                "bridge_workflows_total",
+                "Terminal workflow attempts by bounded dimensions",
+            ),
+            labels,
+        )?;
+        let buckets = vec![
+            1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1_800.0, 3_600.0, 7_200.0, 14_400.0,
+            28_800.0, 43_200.0,
+        ];
+        let work_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "bridge_workflow_work_duration_seconds",
+                "Workflow monotonic work duration",
+            )
+            .buckets(buckets.clone()),
+            labels,
+        )?;
+        let end_to_end_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "bridge_workflow_end_to_end_duration_seconds",
+                "Workflow queue through finalization duration",
+            )
+            .buckets(buckets),
+            labels,
+        )?;
+        let in_flight = prometheus::IntGaugeVec::new(
+            Opts::new("bridge_workflows_in_flight", "Current workflow attempts"),
+            &["task_class", "surface"],
+        )?;
+        let telemetry_unavailable = IntCounterVec::new(
+            Opts::new(
+                "bridge_workflow_telemetry_unavailable_total",
+                "Optional history reservation failures",
+            ),
+            &["reason"],
+        )?;
+        for collector in [
+            Box::new(total.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(work_duration.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(end_to_end_duration.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(in_flight.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(telemetry_unavailable.clone()) as Box<dyn prometheus::core::Collector>,
+        ] {
+            registry.register(collector)?;
+        }
+        Ok(Self {
+            registry,
+            vocabulary,
+            total,
+            work_duration,
+            end_to_end_duration,
+            in_flight,
+            telemetry_unavailable,
+        })
+    }
+    fn norm(set: &HashSet<String>, value: &str) -> String {
+        if set.contains(value) {
+            value.to_string()
+        } else {
+            "other".to_string()
+        }
+    }
+    fn surface(value: &str) -> &'static str {
+        match value {
+            "offline" => "offline",
+            "served_task" => "served_task",
+            "direct_unary" => "direct_unary",
+            "mcp" => "mcp",
+            _ => "other",
+        }
+    }
+    fn outcome(value: &str) -> &'static str {
+        match value {
+            "completed" => "completed",
+            "failed" => "failed",
+            "canceled" => "canceled",
+            "interrupted" => "interrupted",
+            _ => "other",
+        }
+    }
+    pub fn record_terminal(&self, sample: &WorkflowMetricSample<'_>) {
+        let workflow = Self::norm(&self.vocabulary.workflows, sample.workflow);
+        let task_class = Self::norm(&self.vocabulary.task_classes, sample.task_class);
+        let policy = Self::norm(&self.vocabulary.policies, sample.policy);
+        let labels = [
+            &*workflow,
+            &*task_class,
+            Self::surface(sample.surface),
+            &*policy,
+            Self::outcome(sample.outcome),
+        ];
+        self.total.with_label_values(&labels).inc();
+        if sample.telemetry_complete {
+            self.work_duration
+                .with_label_values(&labels)
+                .observe(sample.work_seconds);
+            self.end_to_end_duration
+                .with_label_values(&labels)
+                .observe(sample.end_to_end_seconds);
+        }
+    }
+    pub fn set_in_flight(&self, task_class: &str, surface: &str, delta: i64) {
+        let task_class = Self::norm(&self.vocabulary.task_classes, task_class);
+        let gauge = self
+            .in_flight
+            .with_label_values(&[&task_class, Self::surface(surface)]);
+        if delta >= 0 {
+            gauge.add(delta);
+        } else {
+            gauge.sub(delta.saturating_abs());
+        }
+    }
+    pub fn record_telemetry_unavailable(
+        &self,
+        reason: bridge_core::workflow_history::LedgerUnavailableReason,
+    ) {
+        self.telemetry_unavailable
+            .with_label_values(&[reason.as_str()])
+            .inc();
+    }
+    pub fn endpoint(&self) -> MetricsEndpoint {
+        MetricsEndpoint {
+            registry: self.registry.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod r2f0a_workflow_metric_tests {
+    use super::*;
+
+    #[test]
+    fn workflow_metrics_have_multi_hour_buckets_and_no_identity_labels() {
+        let metrics = WorkflowMetrics::new(WorkflowLabelVocabulary {
+            workflows: HashSet::from(["code-review".into()]),
+            task_classes: HashSet::from(["review".into()]),
+            policies: HashSet::from(["r2f0a".into()]),
+        })
+        .unwrap();
+        metrics.record_terminal(&WorkflowMetricSample {
+            workflow: "unknown-configured-workflow",
+            task_class: "review",
+            surface: "offline",
+            policy: "r2f0a",
+            outcome: "completed",
+            telemetry_complete: true,
+            work_seconds: 8_000.0,
+            end_to_end_seconds: 43_200.0,
+        });
+        let text = metrics.endpoint().render().unwrap();
+        assert!(text.contains("bridge_workflow_work_duration_seconds_bucket"));
+        assert!(text.contains("le=\"43200\""));
+        assert!(text.contains("workflow=\"other\""));
+        for forbidden in [
+            "execution_id",
+            "attempt_id",
+            "task_id",
+            "session_id",
+            "generation_id",
+            "workload_fingerprint",
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden} must not be a label");
+        }
+    }
+
+    #[test]
+    fn stopped_attempt_balances_in_flight_without_fabricating_terminal_metrics() {
+        let observer = PrometheusObserver::new_with_workflow_vocabulary(
+            LabelVocabulary::default(),
+            WorkflowLabelVocabulary {
+                workflows: HashSet::from(["code-review".into()]),
+                task_classes: HashSet::from(["review".into()]),
+                policies: HashSet::from(["r2f0a".into()]),
+            },
+        )
+        .unwrap();
+        observer.record_workflow(&WorkflowObsEvent::Started {
+            task_class: "review",
+            surface: "served_task",
+        });
+        observer.record_workflow(&WorkflowObsEvent::Stopped {
+            task_class: "review",
+            surface: "served_task",
+        });
+
+        let text = observer.endpoint().render().unwrap();
+        let gauge = text
+            .lines()
+            .find(|line| {
+                line.starts_with("bridge_workflows_in_flight{")
+                    && line.contains("task_class=\"review\"")
+                    && line.contains("surface=\"served_task\"")
+            })
+            .expect("in-flight series exists");
+        assert!(gauge.ends_with(" 0"), "{gauge}");
+        assert!(!text
+            .lines()
+            .any(|line| line.starts_with("bridge_workflows_total{")));
+    }
+    fn completed_attempt(
+        identity: bridge_core::ids::AttemptIdentity,
+    ) -> bridge_core::workflow_history::CompletedAttempt {
+        bridge_core::workflow_history::CompletedAttempt {
+            reservation: bridge_core::workflow_history::AttemptReservation {
+                identity,
+                task_id: None,
+                workflow: "code-review".into(),
+                task_class: "review".into(),
+                surface: bridge_core::workflow_history::ExecutionSurface::Offline,
+                policy: "r2f0a".into(),
+                workload_fingerprint: "shape-a".into(),
+                started_ms: 1_000,
+                workload_fingerprint_complete: true,
+                prompt_acceptance: "not_dispatched".into(),
+                pinned: false,
+            },
+            terminal: bridge_core::workflow_history::AttemptTerminal {
+                completed_ms: 2_000,
+                work_ms: 700,
+                end_to_end_ms: 1_000,
+                queue_ms: 0,
+                cancellation_ms: 0,
+                cleanup_ms: 0,
+                finalization_ms: 300,
+                outcome: "completed".into(),
+                terminal_reason: "completed".into(),
+                producer_terminal: "unknown".into(),
+                final_message: "unknown".into(),
+                process_liveness: "unknown".into(),
+                terminal_evidence_capability: "unsupported".into(),
+                terminal_evidence_version: "none".into(),
+                terminal_evidence_source: "none".into(),
+                terminal_evidence_complete: false,
+                degraded: false,
+                prompt_acceptance: "not_dispatched".into(),
+                cleanup_disposition: "complete".into(),
+                node_counts: bridge_core::workflow_history::NodeCounts {
+                    completed: 1,
+                    ..bridge_core::workflow_history::NodeCounts::default()
+                },
+                phase_durations: Vec::new(),
+                telemetry_complete: true,
+                monotonic_clock: true,
+            },
+        }
+    }
+
+    fn workflow_total(text: &str) -> f64 {
+        text.lines()
+            .find(|line| {
+                line.starts_with("bridge_workflows_total{")
+                    && line.contains("workflow=\"code-review\"")
+                    && line.contains("outcome=\"completed\"")
+            })
+            .and_then(|line| line.rsplit_once(' '))
+            .and_then(|(_, value)| value.parse().ok())
+            .expect("completed workflow total exists")
+    }
+
+    #[test]
+    fn workflow_history_rebuild_and_live_finish_dedupe_by_attempt() {
+        let observer = PrometheusObserver::new_with_workflow_vocabulary(
+            LabelVocabulary::default(),
+            WorkflowLabelVocabulary {
+                workflows: HashSet::from(["code-review".into()]),
+                task_classes: HashSet::from(["review".into()]),
+                policies: HashSet::from(["r2f0a".into()]),
+            },
+        )
+        .unwrap();
+        let first = completed_attempt(bridge_core::ids::AttemptIdentity::initial().unwrap());
+
+        observer.rebuild_from_workflow_history(std::slice::from_ref(&first));
+        observer.rebuild_from_workflow_history(std::slice::from_ref(&first));
+        assert_eq!(workflow_total(&observer.endpoint().render().unwrap()), 1.0);
+
+        observer.record_workflow(&WorkflowObsEvent::Started {
+            task_class: "review",
+            surface: "offline",
+        });
+        observer.record_workflow(&WorkflowObsEvent::Finished {
+            attempt_id: &first.reservation.identity.attempt_id,
+            workflow: "code-review",
+            task_class: "review",
+            surface: "offline",
+            policy: "r2f0a",
+            outcome: "completed",
+            telemetry_complete: true,
+            work_seconds: 0.7,
+            end_to_end_seconds: 1.0,
+        });
+        assert_eq!(workflow_total(&observer.endpoint().render().unwrap()), 1.0);
+
+        let second = completed_attempt(bridge_core::ids::AttemptIdentity::initial().unwrap());
+        observer.record_workflow(&WorkflowObsEvent::Started {
+            task_class: "review",
+            surface: "offline",
+        });
+        observer.record_workflow(&WorkflowObsEvent::Finished {
+            attempt_id: &second.reservation.identity.attempt_id,
+            workflow: "code-review",
+            task_class: "review",
+            surface: "offline",
+            policy: "r2f0a",
+            outcome: "completed",
+            telemetry_complete: true,
+            work_seconds: 0.7,
+            end_to_end_seconds: 1.0,
+        });
+        assert_eq!(workflow_total(&observer.endpoint().render().unwrap()), 2.0);
+    }
+
+    #[test]
+    fn legacy_and_new_incomplete_timing_is_not_observed_live_or_rebuilt() {
+        let observer = PrometheusObserver::new_with_workflow_vocabulary(
+            LabelVocabulary::default(),
+            WorkflowLabelVocabulary {
+                workflows: HashSet::from(["code-review".into()]),
+                task_classes: HashSet::from(["review".into()]),
+                policies: HashSet::from(["r2f0a".into()]),
+            },
+        )
+        .unwrap();
+        let mut rebuilt = completed_attempt(bridge_core::ids::AttemptIdentity::initial().unwrap());
+        rebuilt.reservation.surface = bridge_core::workflow_history::ExecutionSurface::DirectUnary;
+        rebuilt.terminal.work_ms = rebuilt.terminal.end_to_end_ms;
+        rebuilt.terminal.finalization_ms = 0;
+        rebuilt.terminal.phase_durations = vec![bridge_core::workflow_history::PhaseDuration {
+            phase: "work".into(),
+            duration_ms: rebuilt.terminal.work_ms,
+        }];
+
+        observer.rebuild_from_workflow_history(std::slice::from_ref(&rebuilt));
+
+        let live = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        observer.record_workflow(&WorkflowObsEvent::Started {
+            task_class: "review",
+            surface: "direct_unary",
+        });
+        observer.record_workflow(&WorkflowObsEvent::Finished {
+            attempt_id: &live.attempt_id,
+            workflow: "code-review",
+            task_class: "review",
+            surface: "direct_unary",
+            policy: "r2f0a",
+            outcome: "completed",
+            telemetry_complete: false,
+            work_seconds: 0.0,
+            end_to_end_seconds: 0.0,
+        });
+
+        let text = observer.endpoint().render().unwrap();
+        assert_eq!(workflow_total(&text), 2.0);
+        for metric in [
+            "bridge_workflow_work_duration_seconds",
+            "bridge_workflow_end_to_end_duration_seconds",
+        ] {
+            assert!(
+                !text
+                    .lines()
+                    .any(|line| line.starts_with(metric)
+                        && line.contains("surface=\"direct_unary\"")),
+                "incomplete timing must not create a duration series: {text}"
+            );
+        }
     }
 }

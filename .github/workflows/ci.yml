@@ -61,6 +61,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Bridge-store parent authority as root
+        run: |
+          sudo env \
+            "HOME=$HOME" \
+            "PATH=$PATH" \
+            "CARGO_HOME=$CARGO_HOME" \
+            "RUSTFLAGS=$RUSTFLAGS" \
+            cargo test -p bridge-store sqlite::r2f0a_history_tests::real_readonly_parent_lock_and_database_failures_remain_distinct \
+            --locked -- --exact --nocapture --test-threads=1
+
       - name: cargo deny check
         run: cargo deny check
 
@@ -91,3 +101,55 @@ jobs:
 
       - name: Coverage — bridge-mcp (≥70% line coverage)
         run: cargo llvm-cov --package bridge-mcp --fail-under-lines 70
+
+  bridge-store-macos:
+    name: Bridge Store (macOS 14)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-bridge-store-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Test bridge-store
+        run: cargo test -p bridge-store --locked -- --test-threads=1
+
+  bridge-store-unsupported-windows:
+    name: Bridge Store Unsupported Target (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-bridge-store-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Test unsupported history target contract
+        run: >-
+          cargo test -p bridge-store sqlite::r2f0a_history_tests::unsupported_target_refuses_all_history_writers_before_mutation
+          --locked -- --exact --nocapture

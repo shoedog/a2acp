@@ -25,6 +25,10 @@ pub enum BridgeError {
     A2aVersionMismatch,
     #[error("invalid request: {field}")]
     InvalidRequest { field: &'static str },
+    #[error("execution identity unavailable")]
+    IdentityUnavailable,
+    #[error("durable evidence unavailable: {reason}")]
+    DurableEvidenceUnavailable { reason: &'static str },
     #[error("task not found")]
     TaskNotFound,
     #[error("session not found")]
@@ -93,6 +97,7 @@ pub fn warm_session_survivability(error: &BridgeError) -> WarmSessionSurvivabili
     use crate::diagnostics::DiagnosticFailureClass;
 
     match error {
+        BridgeError::DurableEvidenceUnavailable { .. } => WarmSessionSurvivability::Expire,
         BridgeError::AgentFailure { diagnostic } => match diagnostic.class() {
             DiagnosticFailureClass::Config
             | DiagnosticFailureClass::Authentication
@@ -172,6 +177,7 @@ impl BridgeError {
             | ConfigReseedRequired { .. }
             | SessionExpired
             | HandleBusy => RejectRequest,
+            IdentityUnavailable | DurableEvidenceUnavailable { .. } => RejectRequest,
             AuthRequired { .. } | AgentNotAuthenticated => SetState(S::AuthRequired),
             PermissionRequired { .. } => SetState(S::InputRequired),
             CancelTimeout => SetState(S::Canceled),

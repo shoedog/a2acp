@@ -199,6 +199,10 @@ struct SmokeBridge {
 #[serde(deny_unknown_fields)]
 struct SmokeAttempt {
     id: String,
+    #[serde(default, rename = "execution_id")]
+    _execution_id: Option<String>,
+    #[serde(default, rename = "attempt_id")]
+    _attempt_id: Option<String>,
     timeout_secs: u64,
     started_at_ms: i64,
     ended_at_ms: i64,

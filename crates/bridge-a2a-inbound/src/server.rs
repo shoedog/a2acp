@@ -19,7 +19,6 @@
 // auth->route->translate pipeline. axum 0.7 is already proven in this workspace.
 
 use std::collections::HashMap;
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use axum::{
@@ -30,7 +29,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 
 use a2a::{methods, SVC_PARAM_VERSION};
@@ -50,10 +49,12 @@ use bridge_core::ports::{
 use bridge_core::task_store::BatchItem;
 use bridge_core::translator::{Event, EventKind, TaskOutcome, Translator};
 use bridge_core::SessionCwd;
+#[cfg(test)]
 use bridge_workflow::executor::{
     NodeTurn, NodeTurnCleanup, NodeTurnExit, WorkflowDiagnosticContext, WorkflowNodeDispatcher,
     WorkflowRunContext,
 };
+#[cfg(test)]
 use bridge_workflow::graph::WorkflowNode;
 
 use bridge_coordinator::coordinator::StatusDto;
@@ -325,6 +326,23 @@ impl InboundServer {
     /// the `BridgeError` (the caller maps it to a JSON-RPC error). The backend
     /// is NOT touched here, so a rejecting gate never reaches `prompt`.
     fn gate(&self, headers: &HeaderMap, params: &Value) -> Result<RoutedCall, BridgeError> {
+        self.gate_with_route_mode(headers, params, false)
+    }
+
+    fn gate_before_direct_admission(
+        &self,
+        headers: &HeaderMap,
+        params: &Value,
+    ) -> Result<RoutedCall, BridgeError> {
+        self.gate_with_route_mode(headers, params, true)
+    }
+
+    fn gate_with_route_mode(
+        &self,
+        headers: &HeaderMap,
+        params: &Value,
+        defer_registry_default: bool,
+    ) -> Result<RoutedCall, BridgeError> {
         // 1. Authorize. We derive a minimal InboundRequest from the bearer token.
         let token = bearer_token(headers);
         let inbound = match token {
@@ -357,7 +375,19 @@ impl InboundServer {
         //    the local-backend producer or the delegation producer.
         //    Invalid metadata (bad agent id, unknown effort) returns InvalidRequest → client error.
         let task_meta = task_meta_from_params(params)?;
-        let target = self.route.route(&task_meta)?;
+        let (target, default_route_deferred) = if defer_registry_default {
+            match self.route.route_before_default(&task_meta)? {
+                Some(target) => (target, false),
+                None => (
+                    RouteTarget::Local(
+                        AgentId::parse("unresolved").expect("fixed unresolved agent id is valid"),
+                    ),
+                    true,
+                ),
+            }
+        } else {
+            (self.route.route(&task_meta)?, false)
+        };
 
         if matches!(&target, RouteTarget::Workflow(_)) {
             let text = parts
@@ -401,6 +431,7 @@ impl InboundServer {
             session,
             parts,
             target,
+            default_route_deferred,
             auth,
             // Per-request overrides ride along so LOCAL dispatch can compute the
             // effective config (entry defaults layered with these) before the prompt.
@@ -441,6 +472,7 @@ struct RoutedCall {
     session: SessionId,
     parts: Vec<Part>,
     target: RouteTarget,
+    default_route_deferred: bool,
     auth: AuthContext,
     /// Per-request config overrides parsed from `a2a-bridge.{model,effort,mode}`.
     /// LOCAL dispatch layers these on the resolved entry's defaults via
@@ -689,13 +721,14 @@ async fn warm_local_dispatch(
     }
 }
 
-#[allow(dead_code)] // wired into the workflow producer in the next approved slice task
+#[cfg(test)]
 struct WarmWorkflowNodeDispatcher {
     sm: Arc<crate::session_manager::SessionManager>,
     parent: ContextId,
     cwd: Option<SessionCwd>,
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
     async fn checkout(
@@ -759,11 +792,12 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
     }
 }
 
-#[allow(dead_code)] // constructed by WarmWorkflowNodeDispatcher once the producer is wired
+#[cfg(test)]
 struct WarmNodeCleanup {
     guard: WarmCompletionGuard,
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl NodeTurnCleanup for WarmNodeCleanup {
     fn arm_exit(&mut self, exit: &NodeTurnExit) {
@@ -787,6 +821,7 @@ impl NodeTurnCleanup for WarmNodeCleanup {
     }
 }
 
+#[cfg(test)]
 impl WarmNodeCleanup {
     async fn finish(mut self: Box<Self>, exit: NodeTurnExit) -> Result<(), BridgeError> {
         self.arm_exit(&exit);
@@ -1485,6 +1520,7 @@ async fn jsonrpc(
         m if m == methods::CANCEL_TASK => cancel_task(srv, headers, id, params).await,
         m if m == methods::GET_TASK => get_task(srv, headers, id, params).await,
         m if m == methods::LIST_TASKS => list_tasks(srv, headers, id, params).await,
+        "AttemptStatus" => attempt_status_rpc(srv, headers, id, params).await,
         "SessionStatus" => session_status(srv, headers, id, params).await,
         "SessionInject" => session_inject(srv, headers, id, params).await,
         "SessionPermit" => session_permit(srv, headers, id, params).await,
@@ -1513,32 +1549,66 @@ async fn stream_message(
         Ok(r) => r,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
+    // Identity is mandatory for served workflow submission, but ordinary bridge-to-bridge
+    // streaming delegation is not the direct-unary safety surface and remains wire-compatible.
+    let supplied_identity = if matches!(&routed.target, RouteTarget::Workflow(_)) {
+        match attempt_identity_from_params(&params, true) {
+            Ok(identity) => Some(identity),
+            Err(error) => return identity_refusal_response(id, &error, &params),
+        }
+    } else {
+        None
+    };
+    if supplied_identity
+        .as_ref()
+        .is_some_and(|identity| routed.task.as_str() != identity.execution_id.as_str())
+    {
+        return identity_refusal_response(
+            id,
+            &BridgeError::InvalidRequest {
+                field: "routed taskId/execution_id mismatch",
+            },
+            &params,
+        );
+    }
 
-    let (workflow_token, mut pre_producer_run_guard) =
-        if matches!(&routed.target, RouteTarget::Workflow(_)) && routed.context_id.is_some() {
-            let c = routed.context_id.clone().unwrap();
-            let mut runs = srv.workflow_runs().lock().await;
-            if runs.contains_key(&c) {
-                return bridge_err_to_jsonrpc(id, &BridgeError::HandleBusy);
-            }
-            let t = tokio_util::sync::CancellationToken::new();
-            runs.insert(c.clone(), t.clone());
-            let guard = PreProducerRunGuard {
-                workflow_runs: srv.workflow_runs().clone(),
-                workflow_cancels: srv.workflow_cancels().clone(),
-                ctx: c.clone(),
-                task: routed.task.clone(),
-                armed: true,
-            };
-            drop(runs);
-            srv.workflow_cancels()
-                .lock()
-                .await
-                .insert(routed.task.clone(), t.clone());
-            (Some((c, t)), Some(guard))
-        } else {
-            (None, None)
+    // A2A workflow streaming is an adapter over the same durable owner as
+    // detached unary/MCP submission. The response disconnect never owns or
+    // cancels execution; replay comes from the task journal and progress hub.
+    if let RouteTarget::Workflow(workflow_id) = &routed.target {
+        let identity = supplied_identity
+            .clone()
+            .expect("workflow identity was required above");
+        let input = routed
+            .parts
+            .iter()
+            .map(|part| part.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let op = bridge_coordinator::params::OpParams {
+            workflow: Some(workflow_id.as_str().to_owned()),
+            skill: None,
+            input,
+            context: routed.context_id.clone(),
+            agent: None,
+            model: None,
+            effort: None,
+            mode: None,
+            cwd: routed
+                .session_cwd
+                .as_ref()
+                .map(|cwd| cwd.as_str().to_owned()),
         };
+        let locator = match srv
+            .coordinator()
+            .run_workflow_with_identity(op, identity)
+            .await
+        {
+            Ok(locator) => locator,
+            Err(error) => return bridge_err_to_jsonrpc(id, &error),
+        };
+        return durable_workflow_a2a_sse_response(&srv, &locator.task_id, id).await;
+    }
 
     // Persist task->session before driving the backend.
     let _ = srv.store.put(&routed.task, &routed.session).await;
@@ -1594,15 +1664,7 @@ async fn stream_message(
         }
         RouteTarget::Delegate => spawn_delegate_producer(&srv, routed, tx),
         RouteTarget::Fanout => spawn_fanout_producer(&srv, routed, tx),
-        // Bind by ref + clone so `routed` stays whole for the producer (which
-        // consumes it for `task`/`parts`).
-        RouteTarget::Workflow(ref id) => {
-            let id = id.clone();
-            spawn_workflow_producer(&srv, routed, id, tx, workflow_token);
-            if let Some(guard) = &mut pre_producer_run_guard {
-                guard.armed = false;
-            }
-        }
+        RouteTarget::Workflow(_) => unreachable!("workflow routes use the durable owner above"),
     }
 
     let sse_stream = sse_event_stream(rx, task_id_str, context_id_str);
@@ -1611,6 +1673,207 @@ async fn stream_message(
         .into_response()
 }
 
+fn workflow_progress_events(kind: &crate::reattach::FrameKind) -> Vec<Event> {
+    match kind {
+        crate::reattach::FrameKind::AttemptLocator {
+            execution_id,
+            attempt_id,
+            ordinal,
+            parent_attempt_id: _,
+        } => vec![Event::status(format!(
+            "attempt_locator{{execution_id={execution_id},attempt_id={attempt_id},ordinal={ordinal}}}"
+        ))],
+        crate::reattach::FrameKind::TelemetryUnavailable { reason } => {
+            vec![Event::status(format!(
+                "telemetry_unavailable{{reason={}}}",
+                reason.as_str()
+            ))]
+        }
+        crate::reattach::FrameKind::NodeStarted { node } => {
+            vec![Event::status(format!("node {node} started"))]
+        }
+        crate::reattach::FrameKind::NodeFinished { node, ok, .. } => {
+            vec![Event::status(format!(
+                "node {node} {}",
+                if *ok { "ok" } else { "failed" }
+            ))]
+        }
+        crate::reattach::FrameKind::Terminal { outcome, output } => {
+            let outcome = match outcome {
+                crate::reattach::TerminalOutcome::Completed => TaskOutcome::Completed,
+                crate::reattach::TerminalOutcome::Failed => TaskOutcome::Failed,
+                crate::reattach::TerminalOutcome::Canceled => TaskOutcome::Canceled,
+            };
+            vec![Event::artifact(output.clone()), Event::terminal(outcome)]
+        }
+        crate::reattach::FrameKind::Plan { .. }
+        | crate::reattach::FrameKind::ToolCall { .. }
+        | crate::reattach::FrameKind::ToolCallUpdate { .. }
+        | crate::reattach::FrameKind::SnapshotComplete => Vec::new(),
+    }
+}
+
+fn locator_progress_frames(
+    locator: Option<&bridge_core::task_store::TaskAttemptLocator>,
+    seq: i64,
+    phase: crate::reattach::Phase,
+) -> Vec<crate::reattach::WorkflowProgressFrame> {
+    let Some(locator) = locator else {
+        return Vec::new();
+    };
+    let mut frames = vec![crate::reattach::WorkflowProgressFrame {
+        v: 1,
+        seq,
+        phase: phase.clone(),
+        kind: crate::reattach::FrameKind::AttemptLocator {
+            execution_id: locator.identity.execution_id.as_str().to_owned(),
+            attempt_id: locator.identity.attempt_id.as_str().to_owned(),
+            ordinal: locator.identity.ordinal,
+            parent_attempt_id: locator
+                .identity
+                .parent_attempt_id
+                .as_ref()
+                .map(|attempt| attempt.as_str().to_owned()),
+        },
+    }];
+    if let Some(reason) = locator.telemetry_unavailable {
+        frames.push(crate::reattach::WorkflowProgressFrame {
+            v: 1,
+            seq,
+            phase,
+            kind: crate::reattach::FrameKind::TelemetryUnavailable { reason },
+        });
+    }
+    frames
+}
+
+async fn durable_workflow_a2a_sse_response(
+    srv: &Arc<InboundServer>,
+    task: &TaskId,
+    id: Value,
+) -> Response {
+    let hub = srv.progress_hubs().lock().await.get(task).cloned();
+    let live = hub.as_ref().map(|hub| {
+        let receiver = hub.subscribe();
+        let terminal_published = hub.terminal_published();
+        (receiver, terminal_published)
+    });
+    let terminal_published_before_snapshot = live
+        .as_ref()
+        .is_some_and(|(_, terminal_published)| *terminal_published);
+    let snapshot = match fold_or_typed_snapshot(srv.task_store(), task).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
+    };
+    if live.is_none() && !snapshot.snap.status.is_terminal() {
+        return bridge_err_to_jsonrpc(id, &BridgeError::AgentOverloaded);
+    }
+
+    let mut replay = locator_progress_frames(
+        snapshot.locator.as_ref(),
+        locator_snapshot_seq(&snapshot),
+        crate::reattach::Phase::Snapshot,
+    );
+    replay.extend(rich_snapshot_frames(&snapshot.snap, &snapshot.events, None));
+    let terminal_snapshot = snapshot.snap.status.is_terminal()
+        && (live.is_none() || terminal_published_before_snapshot);
+    if terminal_snapshot {
+        let outcome = match snapshot.snap.status {
+            bridge_core::task_store::TaskRecordStatus::Completed => {
+                crate::reattach::TerminalOutcome::Completed
+            }
+            bridge_core::task_store::TaskRecordStatus::Canceled => {
+                crate::reattach::TerminalOutcome::Canceled
+            }
+            _ => crate::reattach::TerminalOutcome::Failed,
+        };
+        replay.push(crate::reattach::WorkflowProgressFrame {
+            v: 1,
+            seq: snapshot.snap.terminal_seq.unwrap_or(snapshot.snap.cut_seq),
+            phase: crate::reattach::Phase::Snapshot,
+            kind: crate::reattach::FrameKind::Terminal {
+                outcome,
+                output: snapshot
+                    .snap
+                    .result
+                    .clone()
+                    .or(snapshot.snap.error.clone())
+                    .unwrap_or_default(),
+            },
+        });
+    }
+
+    let task_id = task.as_str().to_owned();
+    let context_id = snapshot
+        .locator
+        .as_ref()
+        .map(|locator| locator.identity.execution_id.as_str().to_owned())
+        .unwrap_or_else(|| task_id.clone());
+    let snapshot_cut = snapshot.snap.cut_seq;
+    let snapshot_telemetry = snapshot
+        .locator
+        .as_ref()
+        .and_then(|locator| locator.telemetry_unavailable);
+    let stream = async_stream::stream! {
+        for frame in replay {
+            for event in workflow_progress_events(&frame.kind) {
+                if let Some(event) = event_to_sse(&event, &task_id, &context_id) {
+                    yield Ok::<_, std::convert::Infallible>(event);
+                }
+            }
+        }
+        if terminal_snapshot {
+            return;
+        }
+        let Some((mut live, _)) = live else {
+            return;
+        };
+        loop {
+            match live.recv().await {
+                Ok(frame) => {
+                    let terminal = matches!(
+                        &frame.kind,
+                        crate::reattach::FrameKind::Terminal { .. }
+                    );
+                    let telemetry = matches!(
+                        &frame.kind,
+                        crate::reattach::FrameKind::TelemetryUnavailable { .. }
+                    );
+                    let telemetry_replayed = matches!(
+                        &frame.kind,
+                        crate::reattach::FrameKind::TelemetryUnavailable { reason }
+                            if Some(*reason) == snapshot_telemetry
+                    );
+                    if telemetry_replayed
+                        || (frame.seq <= snapshot_cut && !terminal && !telemetry)
+                    {
+                        continue;
+                    }
+                    for event in workflow_progress_events(&frame.kind) {
+                        if let Some(event) = event_to_sse(&event, &task_id, &context_id) {
+                            yield Ok(event);
+                        }
+                    }
+                    if terminal {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    yield Ok(
+                        SseEvent::default()
+                            .event("error")
+                            .data(json!({"retryable": true, "reason": "lagged"}).to_string()),
+                    );
+                    break;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
 /// `SubscribeToTask` handler: auth + A2A-version check, extract `id` (with
 /// `taskId` as a lenient alias per I3), parse the `Last-Event-ID` cursor as
 /// `Option<i64>`, look up the task in the durable store, return not-found if
@@ -1672,23 +1935,34 @@ async fn subscribe_to_task(
     // Look up the task in the durable store.  Not found → not-found error (M5: do
     // NOT fall through to gate() and start a new run).
     match srv.task_store().get(&task_id).await {
-        Ok(Some(rec)) => {
-            if rec.status.is_terminal() {
-                // --- Terminal-task flow (Task 8) --- read the snapshot and replay it
-                // as a FINITE SSE stream (snapshot → SnapshotComplete → Terminal → close).
-                let snapshot = match fold_or_typed_snapshot(srv.task_store(), &task_id).await {
-                    Ok(s) => s,
-                    Err(_) => return bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
-                };
-                terminal_sse_response(&snapshot, cursor)
-            } else {
-                // --- Working-task flow (Task 9) --- subscribe-first, then snapshot,
-                // then live-tail the hub until the Terminal frame.
-                working_sse_response(&srv, &task_id, cursor, id).await
-            }
+        Ok(Some(_)) => {
+            // The subscribe-first path also owns the brief primary-terminal /
+            // summary-finalization interval. With no live hub it falls back to a
+            // finite terminal snapshot; with a hub it waits for the finalized
+            // terminal projection.
+            working_sse_response(&srv, &task_id, cursor, id).await
         }
         Ok(None) => bridge_err_to_jsonrpc(id, &BridgeError::TaskNotFound),
         Err(_) => bridge_err_to_jsonrpc(id, &BridgeError::StoreFailure),
+    }
+}
+/// Durable journal, snapshot-complete, and terminal frames advance
+/// Last-Event-ID. Locator and telemetry frames are projections over the same
+/// durable cut; assigning them that cut's ID can make a reconnect suppress the
+/// terminal. Snapshot-complete remains cursor-bearing but is capped below a
+/// following terminal ID; legacy terminals without a durable seq carry no ID.
+fn workflow_frame_sse(frame: &crate::reattach::WorkflowProgressFrame) -> SseEvent {
+    let event = SseEvent::default().data(serde_json::to_string(frame).unwrap_or_default());
+    let projection_only = matches!(
+        &frame.kind,
+        crate::reattach::FrameKind::AttemptLocator { .. }
+            | crate::reattach::FrameKind::TelemetryUnavailable { .. }
+    ) || (matches!(&frame.kind, crate::reattach::FrameKind::Terminal { .. })
+        && frame.seq <= 0);
+    if projection_only {
+        event
+    } else {
+        event.id(frame.seq.to_string())
     }
 }
 
@@ -1703,23 +1977,34 @@ async fn subscribe_to_task(
 /// reader-trap suggesting more may come).
 fn terminal_sse_response(snapshot: &FoldedProgressSnapshot, cursor: Option<i64>) -> Response {
     let snap = &snapshot.snap;
-    // Build snapshot frames (cursor-filtered, seq-ordered).
-    let mut frames = rich_snapshot_frames(snap, &snapshot.events, cursor);
+    // Durable locator authority is projected on every terminal replay before
+    // node/terminal state, including boot-resumed lineage and late telemetry.
+    let mut frames = locator_progress_frames(
+        snapshot.locator.as_ref(),
+        locator_snapshot_seq(snapshot),
+        crate::reattach::Phase::Snapshot,
+    );
+    frames.extend(rich_snapshot_frames(snap, &snapshot.events, cursor));
 
-    // Append SnapshotComplete sentinel (seq = max snapshot frame seq or cut_seq).
-    let sentinel_seq = frames.last().map(|f| f.seq).unwrap_or(snap.cut_seq);
+    // Append Terminal unless the cursor already covers a known terminal seq.
+    // SnapshotComplete remains cursor-bearing, but when Terminal follows it the
+    // sentinel must use a strictly earlier ID so ID-deduplicating SSE clients
+    // cannot suppress the acceptance-critical terminal projection.
+    let emit_terminal = snap
+        .terminal_seq
+        .is_none_or(|ts| cursor.is_none_or(|k| ts > k));
+    let mut sentinel_seq = frames.last().map(|f| f.seq).unwrap_or(snap.cut_seq);
+    if emit_terminal {
+        if let Some(terminal_seq) = snap.terminal_seq {
+            sentinel_seq = sentinel_seq.min(terminal_seq.saturating_sub(1));
+        }
+    }
     frames.push(crate::reattach::WorkflowProgressFrame {
         v: 1,
         seq: sentinel_seq,
         phase: crate::reattach::Phase::Snapshot,
         kind: crate::reattach::FrameKind::SnapshotComplete,
     });
-
-    // Append Terminal frame unless cursor already covers a KNOWN terminal_seq.
-    // None (legacy) → always emit; Some(ts) → emit only if cursor < ts.
-    let emit_terminal = snap
-        .terminal_seq
-        .is_none_or(|ts| cursor.is_none_or(|k| ts > k));
     if emit_terminal {
         use bridge_core::task_store::TaskRecordStatus;
         let outcome = match snap.status {
@@ -1742,25 +2027,25 @@ fn terminal_sse_response(snapshot: &FoldedProgressSnapshot, cursor: Option<i64>)
     }
 
     // Convert Vec<WorkflowProgressFrame> into an SSE stream and return.
-    let sse_stream = futures::stream::iter(frames.into_iter().map(|f| {
-        Ok::<_, std::convert::Infallible>(
-            SseEvent::default()
-                .id(f.seq.to_string())
-                .data(serde_json::to_string(&f).unwrap_or_default()),
-        )
-    }));
+    let sse_stream = futures::stream::iter(
+        frames
+            .into_iter()
+            .map(|f| Ok::<_, std::convert::Infallible>(workflow_frame_sse(&f))),
+    );
     Sse::new(sse_stream).into_response()
 }
 
 struct FoldedProgressSnapshot {
     snap: bridge_core::task_store::TaskProgressSnapshot,
     events: Vec<bridge_core::orch::OrchEvent>,
+    locator: Option<bridge_core::task_store::TaskAttemptLocator>,
 }
 
 async fn fold_or_typed_snapshot(
     store: &Arc<dyn bridge_core::task_store::TaskStore>,
     task: &TaskId,
 ) -> Result<FoldedProgressSnapshot, BridgeError> {
+    let locator = store.get_attempt_locator(task).await?;
     let fi = store.journal_fold_inputs(task).await?;
     let is_terminal = matches!(
         fi.scalars.status,
@@ -1776,6 +2061,7 @@ async fn fold_or_typed_snapshot(
         Ok(FoldedProgressSnapshot {
             snap,
             events: fi.events,
+            locator,
         })
     } else {
         // Ineligible (legacy / cancel_if_working- or sweep-terminated): the typed snapshot is a SECOND
@@ -1792,7 +2078,11 @@ async fn fold_or_typed_snapshot(
             .into_iter()
             .filter(|e| e.seq <= cut)
             .collect();
-        Ok(FoldedProgressSnapshot { snap, events })
+        Ok(FoldedProgressSnapshot {
+            snap,
+            events,
+            locator,
+        })
     }
 }
 
@@ -1852,6 +2142,7 @@ async fn working_sse_response(
     // published after this point is buffered in `rx`, so nothing is lost in the
     // window between the snapshot cut and the start of the live tail.
     let rx = hub.subscribe();
+    let terminal_published_before_snapshot = hub.terminal_published();
 
     // Read the durable snapshot.
     let snapshot = match fold_or_typed_snapshot(srv.task_store(), task_id).await {
@@ -1860,17 +2151,28 @@ async fn working_sse_response(
     };
     let snap = &snapshot.snap;
 
-    // I5: the task finished during/just-before the snapshot read → replay the
-    // terminal snapshot (do NOT rely on `rx` Closed; the runner may have published
-    // its Terminal frame before we subscribed).
-    if snap.status.is_terminal() {
+    // A terminal published before this snapshot implies the optional summary
+    // barrier and durable marker had already settled, so finite replay is safe.
+    // Otherwise the primary row became terminal inside that barrier: retain the
+    // subscribe-first receiver and wait for its finalized terminal projection.
+    if snap.status.is_terminal() && terminal_published_before_snapshot {
         return terminal_sse_response(&snapshot, cursor);
     }
 
     // Snapshot phase: cursor-filtered, seq-ordered frames + a SnapshotComplete
     // sentinel (seq = max snapshot frame seq, else cut_seq).
-    let mut snapshot_vec = rich_snapshot_frames(snap, &snapshot.events, cursor);
-    let sentinel_seq = snapshot_vec.last().map(|f| f.seq).unwrap_or(snap.cut_seq);
+    let mut snapshot_vec = locator_progress_frames(
+        snapshot.locator.as_ref(),
+        locator_snapshot_seq(&snapshot),
+        crate::reattach::Phase::Snapshot,
+    );
+    snapshot_vec.extend(rich_snapshot_frames(snap, &snapshot.events, cursor));
+    let mut sentinel_seq = snapshot_vec.last().map(|f| f.seq).unwrap_or(snap.cut_seq);
+    if snap.status.is_terminal() {
+        if let Some(terminal_seq) = snap.terminal_seq {
+            sentinel_seq = sentinel_seq.min(terminal_seq.saturating_sub(1));
+        }
+    }
     snapshot_vec.push(crate::reattach::WorkflowProgressFrame {
         v: 1,
         seq: sentinel_seq,
@@ -1878,9 +2180,15 @@ async fn working_sse_response(
         kind: crate::reattach::FrameKind::SnapshotComplete,
     });
 
-    // Dedup floor: a cursor-less subscriber keeps seq 0, and the snapshot↔live
-    // overlap is deduped (drop live frames already covered by the snapshot cut).
-    let dedup_floor = cursor.unwrap_or(-1).max(snap.cut_seq);
+    // Durable rows at or below the snapshot cut are replay duplicates. The
+    // terminal projection is different: its sequence was allocated by the
+    // primary write before the optional summary barrier, so it must remain live
+    // unless the caller cursor itself already covers it.
+    let snapshot_cut = snap.cut_seq;
+    let snapshot_telemetry = snapshot
+        .locator
+        .as_ref()
+        .and_then(|locator| locator.telemetry_unavailable);
 
     // Build the streaming SSE body: the snapshot vec first, then the live tail from
     // `rx`. `async_stream::stream!` lets us write the imperative snapshot-then-tail
@@ -1889,30 +2197,38 @@ async fn working_sse_response(
     let stream = async_stream::stream! {
         // 1. Replay the snapshot phase.
         for f in snapshot_vec {
-            yield Ok::<_, std::convert::Infallible>(
-                SseEvent::default()
-                    .id(f.seq.to_string())
-                    .data(serde_json::to_string(&f).unwrap_or_default()),
-            );
+            yield Ok::<_, std::convert::Infallible>(workflow_frame_sse(&f));
         }
         // 2. Live-tail the hub until the Terminal frame.
         let mut rx = rx;
         loop {
             match rx.recv().await {
                 Ok(frame) => {
-                    // Dedup: drop frames already covered by the snapshot cut/cursor.
-                    if frame.seq <= dedup_floor {
-                        continue;
-                    }
                     let is_terminal = matches!(
                         &frame.kind,
                         crate::reattach::FrameKind::Terminal { .. }
                     );
-                    yield Ok(
-                        SseEvent::default()
-                            .id(frame.seq.to_string())
-                            .data(serde_json::to_string(&frame).unwrap_or_default()),
+                    let is_telemetry = matches!(
+                        &frame.kind,
+                        crate::reattach::FrameKind::TelemetryUnavailable { .. }
                     );
+                    let telemetry_replayed = matches!(
+                        &frame.kind,
+                        crate::reattach::FrameKind::TelemetryUnavailable { reason }
+                            if Some(*reason) == snapshot_telemetry
+                    );
+                    if cursor.is_some_and(|seen| frame.seq <= seen) {
+                        if is_terminal {
+                            break;
+                        }
+                        continue;
+                    }
+                    if telemetry_replayed
+                        || (frame.seq <= snapshot_cut && !is_terminal && !is_telemetry)
+                    {
+                        continue;
+                    }
+                    yield Ok(workflow_frame_sse(&frame));
                     // END the stream after emitting a Terminal-kind frame.
                     if is_terminal {
                         break;
@@ -2712,231 +3028,6 @@ fn spawn_fanout_producer(
     });
 }
 
-/// SSE sink: forwards workflow events into the mpsc->SSE channel.
-struct SseSink {
-    tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
-}
-
-#[async_trait::async_trait]
-impl crate::workflow_sink::WorkflowSink for SseSink {
-    async fn node_started(&mut self, node: &str) -> Result<(), BridgeError> {
-        let _ = self
-            .tx
-            .send(Ok(Event::status(format!("node {node} started"))))
-            .await;
-        Ok(())
-    }
-    async fn node_finished(
-        &mut self,
-        node: &str,
-        ok: bool,
-        _output: &str,
-        _usage: Option<&bridge_core::orch::UsageSnapshot>,
-    ) -> Result<(), BridgeError> {
-        let _ = self
-            .tx
-            .send(Ok(Event::status(format!(
-                "node {node} {}",
-                if ok { "ok" } else { "failed" }
-            ))))
-            .await;
-        Ok(())
-    }
-    async fn terminal(
-        &mut self,
-        outcome: bridge_workflow::executor::WorkflowOutcome,
-        output: String,
-    ) -> Result<(), BridgeError> {
-        use bridge_workflow::executor::WorkflowOutcome;
-        let _ = self.tx.send(Ok(Event::artifact(output))).await;
-        let to = match outcome {
-            WorkflowOutcome::Completed => TaskOutcome::Completed,
-            WorkflowOutcome::Failed => TaskOutcome::Failed,
-            WorkflowOutcome::Canceled => TaskOutcome::Canceled,
-        };
-        let _ = self.tx.send(Ok(Event::terminal(to))).await;
-        Ok(())
-    }
-    async fn error(&mut self, err: BridgeError) -> Result<(), BridgeError> {
-        let _ = self.tx.send(Err(err)).await;
-        Ok(())
-    }
-}
-
-/// Spawn the workflow producer (W1): run the routed workflow graph over the
-/// executor and forward its events into the same mpsc->SSE path. Each
-/// `WorkflowEvent::Node{Started,Finished}` becomes a Status frame; the
-/// `Terminal` becomes an Artifact (the terminal node's output) followed by a
-/// terminal frame mapped from the workflow outcome. A per-task cancellation
-/// token is registered in `workflow_cancels` for the run's duration so
-/// `cancel_task` can preempt it, and removed on exit.
-async fn release_run(srv: &Arc<InboundServer>, task: &TaskId, ctx: &Option<ContextId>) {
-    srv.workflow_cancels().lock().await.remove(task);
-    if let Some(c) = ctx {
-        srv.workflow_runs().lock().await.remove(c);
-    }
-}
-
-struct PreProducerRunGuard {
-    workflow_runs: Arc<tokio::sync::Mutex<HashMap<ContextId, tokio_util::sync::CancellationToken>>>,
-    workflow_cancels: Arc<tokio::sync::Mutex<HashMap<TaskId, tokio_util::sync::CancellationToken>>>,
-    ctx: ContextId,
-    task: TaskId,
-    armed: bool,
-}
-
-impl Drop for PreProducerRunGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let workflow_runs = self.workflow_runs.clone();
-        let workflow_cancels = self.workflow_cancels.clone();
-        let ctx = self.ctx.clone();
-        let task = self.task.clone();
-        tokio::spawn(async move {
-            workflow_runs.lock().await.remove(&ctx);
-            workflow_cancels.lock().await.remove(&task);
-        });
-    }
-}
-
-struct RunGuard {
-    srv: Arc<InboundServer>,
-    task: TaskId,
-    ctx: Option<ContextId>,
-    armed: bool,
-}
-
-impl Drop for RunGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let (srv, task, ctx) = (self.srv.clone(), self.task.clone(), self.ctx.take());
-        tokio::spawn(async move {
-            if let Some(c) = &ctx {
-                srv.session_manager().release_with_children(c).await;
-            }
-            release_run(&srv, &task, &ctx).await;
-        });
-    }
-}
-
-fn spawn_workflow_producer(
-    srv: &Arc<InboundServer>,
-    routed: RoutedCall,
-    wf_id: bridge_core::ids::WorkflowId,
-    tx: tokio::sync::mpsc::Sender<Result<Event, BridgeError>>,
-    workflow_token: Option<(ContextId, tokio_util::sync::CancellationToken)>,
-) {
-    let srv = srv.clone();
-    let task = routed.task.clone();
-    let parts = routed.parts.clone();
-    tokio::spawn(async move {
-        let ctx = workflow_token.as_ref().map(|(c, _)| c.clone());
-        let mut guard = RunGuard {
-            srv: srv.clone(),
-            task: task.clone(),
-            ctx: ctx.clone(),
-            armed: true,
-        };
-        let (srv2, task2, ctx2, tx2) = (srv.clone(), task.clone(), ctx.clone(), tx.clone());
-        let outcome = AssertUnwindSafe(async move {
-            // Resolve the executor + graph; absent either → fail the task with a
-            // terminal Failed frame (no executor wired, or an unknown workflow id).
-            let (executor, graph) = match (srv.executor(), srv.workflows().get(&wf_id)) {
-                (Some(e), Some(g)) => (e.clone(), g.clone()),
-                _ => {
-                    let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
-                    return;
-                }
-            };
-            // The workflow input is the concatenation of the request's text parts.
-            let input: String = parts
-                .iter()
-                .map(|p| p.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let token = match &workflow_token {
-                Some((_, t)) => t.clone(),
-                None => {
-                    // Cold workflow streams create their token here; warm streams
-                    // are registered synchronously by stream_message.
-                    let token = tokio_util::sync::CancellationToken::new();
-                    srv.workflow_cancels()
-                        .lock()
-                        .await
-                        .insert(task.clone(), token.clone());
-                    token
-                }
-            };
-            if srv.store.cancel_requested(&task).await.unwrap_or(false) {
-                token.cancel();
-            }
-            let wf_ctx = bridge_workflow::executor::WorkflowRunContext {
-                session_cwd: routed.session_cwd.clone(),
-                make_rich_sink: None,
-                observer: srv.coordinator().observer(),
-                parent_traceparent: routed.traceparent.clone(),
-                task_id: Some(routed.task.clone()),
-                prompt_id: routed.prompt_id.clone(),
-            };
-            let diagnostic_ctx = WorkflowDiagnosticContext::new(
-                wf_ctx,
-                Arc::new(
-                    bridge_core::diagnostics::InMemoryDiagnosticObserverFactory::new(
-                        DIRECT_DIAGNOSTIC_CAPACITY,
-                    )
-                    .expect("direct diagnostic capacity is nonzero"),
-                ),
-            );
-            let stream = match &workflow_token {
-                Some((c, _)) => executor.run_with_diagnostic_context_and_dispatcher(
-                    graph,
-                    input,
-                    task.as_str().into(),
-                    token,
-                    diagnostic_ctx,
-                    Arc::new(WarmWorkflowNodeDispatcher {
-                        sm: srv.session_manager().clone(),
-                        parent: c.clone(),
-                        cwd: routed.session_cwd.clone(),
-                    }),
-                ),
-                None => executor.run_with_diagnostic_context(
-                    graph,
-                    input,
-                    task.as_str().to_string(),
-                    token,
-                    diagnostic_ctx,
-                ),
-            };
-            let mut sink = SseSink { tx: tx.clone() };
-            // SseSink never errors (sends are best-effort); on a hypothetical error
-            // treat it as no-terminal so the existing no-terminal fallback fires.
-            let terminal_seen = crate::workflow_sink::drain_workflow(stream, &mut sink)
-                .await
-                .unwrap_or(false);
-            // The executor always emits a Terminal, but guard against an early stream
-            // end (e.g. a dropped receiver) so the SSE side always sees a terminal.
-            if !terminal_seen {
-                let _ = tx.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
-            }
-        })
-        .catch_unwind()
-        .await;
-        if outcome.is_err() {
-            if let Some(c) = &ctx2 {
-                srv2.session_manager().release_with_children(c).await;
-            }
-            let _ = tx2.send(Ok(Event::terminal(TaskOutcome::Failed))).await;
-        }
-        release_run(&srv2, &task2, &ctx2).await;
-        guard.armed = false;
-    });
-}
-
 fn detached_deps(srv: &Arc<InboundServer>) -> bridge_coordinator::detached::DetachedDeps {
     bridge_coordinator::detached::DetachedDeps {
         task_store: srv.task_store().clone(),
@@ -2946,6 +3037,7 @@ fn detached_deps(srv: &Arc<InboundServer>) -> bridge_coordinator::detached::Deta
         progress_hubs: srv.progress_hubs().clone(),
         clock: Arc::new(bridge_coordinator::clock::SystemClock),
         observer: srv.coordinator().observer(),
+        workflow_history: srv.coordinator().workflow_history(),
     }
 }
 
@@ -3006,11 +3098,86 @@ pub fn coordinator_over(
         Arc::new(bridge_observ::NoopObserver),
         3,
     );
+    // Test support must opt into a ledger explicitly when durable evidence is
+    // relevant; never make a public constructor look production-safe by silently
+    // substituting process-local history.
+    let coord = coord.with_workflow_history(Err(
+        bridge_core::workflow_history::LedgerUnavailableReason::Open,
+    ));
     let coord = match permission_registry {
         Some(reg) => coord.with_permission_registry(reg),
         None => coord,
     };
     Arc::new(coord)
+}
+/// Test-support variant that requires the caller to make the workflow-history
+/// selection explicit. Production wiring must select its owner-private platform
+/// ledger before constructing the coordinator; this seam exists only so external
+/// integration tests can deliberately opt into process-local history.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn coordinator_over_with_workflow_history(
+    registry: Arc<dyn AgentRegistry>,
+    session_store: Arc<dyn SessionStore>,
+    policy: Arc<dyn PolicyEngine>,
+    executor: Option<Arc<bridge_workflow::executor::WorkflowExecutor>>,
+    workflows: HashMap<bridge_core::ids::WorkflowId, Arc<bridge_workflow::graph::WorkflowGraph>>,
+    task_store: Arc<dyn bridge_core::task_store::TaskStore>,
+    permission_registry: Option<Arc<PermissionRegistry>>,
+    allowed_cwd_root: Option<String>,
+    batch: Option<BatchRuntime>,
+    workflow_history: Result<
+        Arc<dyn bridge_core::workflow_history::WorkflowHistoryStore>,
+        bridge_core::workflow_history::LedgerUnavailableReason,
+    >,
+) -> Arc<bridge_coordinator::Coordinator> {
+    let coordinator = coordinator_over(
+        registry,
+        session_store,
+        policy,
+        executor,
+        workflows,
+        task_store,
+        permission_registry,
+        allowed_cwd_root,
+        batch,
+    );
+    Arc::new(
+        Arc::try_unwrap(coordinator)
+            .unwrap_or_else(|_| panic!("fresh test coordinator must have one owner"))
+            .with_workflow_history(workflow_history),
+    )
+}
+
+/// Test-only convenience wrapper whose name makes the process-local ledger
+/// choice explicit at every call site.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn test_coordinator_over_in_memory_history(
+    registry: Arc<dyn AgentRegistry>,
+    session_store: Arc<dyn SessionStore>,
+    policy: Arc<dyn PolicyEngine>,
+    executor: Option<Arc<bridge_workflow::executor::WorkflowExecutor>>,
+    workflows: HashMap<bridge_core::ids::WorkflowId, Arc<bridge_workflow::graph::WorkflowGraph>>,
+    task_store: Arc<dyn bridge_core::task_store::TaskStore>,
+    permission_registry: Option<Arc<PermissionRegistry>>,
+    allowed_cwd_root: Option<String>,
+    batch: Option<BatchRuntime>,
+) -> Arc<bridge_coordinator::Coordinator> {
+    coordinator_over_with_workflow_history(
+        registry,
+        session_store,
+        policy,
+        executor,
+        workflows,
+        task_store,
+        permission_registry,
+        allowed_cwd_root,
+        batch,
+        Ok(Arc::new(
+            bridge_core::workflow_history::MemoryWorkflowHistoryStore::new(),
+        )),
+    )
 }
 
 /// Test-only seam: spawn the runner with a fresh token and an empty seed.
@@ -3020,7 +3187,7 @@ pub async fn spawn_detached_workflow_for_test(
     task: TaskId,
     text_parts: Vec<String>,
     wf_id: bridge_core::ids::WorkflowId,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<bool> {
     bridge_coordinator::detached::spawn_detached_workflow_for_test(
         &detached_deps(srv),
         task,
@@ -3038,7 +3205,7 @@ pub async fn spawn_detached_workflow_with_token_for_test(
     text_parts: Vec<String>,
     wf_id: bridge_core::ids::WorkflowId,
     token: tokio_util::sync::CancellationToken,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<bool> {
     bridge_coordinator::detached::spawn_detached_workflow_with_token_for_test(
         &detached_deps(srv),
         task,
@@ -3051,13 +3218,8 @@ pub async fn spawn_detached_workflow_with_token_for_test(
 
 /// Boot-time crash-resume scan (W3b Task 10a). Thin adapter kept in the inbound
 /// surface while the implementation lives in bridge-coordinator.
-pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) {
-    match batch_deps(srv) {
-        Some(bdeps) => bridge_coordinator::batch::resume_all(&bdeps, cap).await,
-        None => {
-            bridge_coordinator::detached::resume_non_batch_tasks(&detached_deps(srv), cap).await
-        }
-    }
+pub async fn resume_working_tasks(srv: &Arc<InboundServer>, cap: u32) -> Result<(), BridgeError> {
+    srv.coordinator().resume_with_cap(cap).await
 }
 
 /// Background claimer: as each fan-out source's stream ENDS (its `*_done` flag
@@ -3154,24 +3316,160 @@ async fn cancel_fanout_sources(
 /// Each translated [`Event`] becomes one SSE frame; backend errors become a
 /// single `error` frame so the client sees a terminal signal.
 fn sse_event_stream(
-    rx: tokio::sync::mpsc::Receiver<Result<Event, BridgeError>>,
+    mut rx: tokio::sync::mpsc::Receiver<Result<Event, BridgeError>>,
     task_id: String,
     context_id: String,
 ) -> impl Stream<Item = Result<SseEvent, std::convert::Infallible>> {
-    tokio_stream::wrappers::ReceiverStream::new(rx).filter_map(move |item| {
-        let out: Option<Result<SseEvent, std::convert::Infallible>> = match item {
-            Ok(ev) => event_to_sse(&ev, &task_id, &context_id).map(Ok),
-            Err(e) => {
-                tracing::warn!(error = %e, "workflow stream error");
-                Some(Ok(SseEvent::default()
-                    .event("error")
-                    // Static category to the wire; full reason logged above.
-                    .json_data(json!({ "kind": "error", "text": e.client_message() }))
-                    .expect("serde_json::Value serializes")))
+    async_stream::stream! {
+        while let Some(item) = rx.recv().await {
+            match item {
+                Ok(ev) => {
+                    if let Some(event) = event_to_sse(&ev, &task_id, &context_id) {
+                        yield Ok(event);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "workflow stream error");
+                    yield Ok(SseEvent::default()
+                        .event("error")
+                        .json_data(json!({ "kind": "error", "text": error.client_message() }))
+                        .expect("serde_json::Value serializes"));
+                }
             }
-        };
-        std::future::ready(out)
+        }
+    }
+}
+
+fn attempt_identity_from_params(
+    params: &Value,
+    require_task_binding: bool,
+) -> Result<bridge_core::ids::AttemptIdentity, BridgeError> {
+    let metadata = params
+        .pointer("/message/metadata")
+        .and_then(Value::as_object)
+        .ok_or(BridgeError::InvalidRequest {
+            field: "execution_id",
+        })?;
+    let execution = metadata
+        .get("a2a-bridge.execution_id")
+        .and_then(Value::as_str)
+        .ok_or(BridgeError::InvalidRequest {
+            field: "execution_id",
+        })?;
+    let attempt = metadata
+        .get("a2a-bridge.attempt_id")
+        .and_then(Value::as_str)
+        .ok_or(BridgeError::InvalidRequest {
+            field: "attempt_id",
+        })?;
+    let execution_id = bridge_core::ids::ExecutionId::parse(execution)?;
+    let attempt_id = bridge_core::ids::AttemptId::parse(attempt)?;
+    if require_task_binding {
+        let task = params
+            .pointer("/message/taskId")
+            .and_then(Value::as_str)
+            .ok_or(BridgeError::InvalidRequest { field: "taskId" })?;
+        if task != execution_id.as_str() {
+            return Err(BridgeError::InvalidRequest {
+                field: "taskId/execution_id mismatch",
+            });
+        }
+    }
+    Ok(bridge_core::ids::AttemptIdentity {
+        execution_id,
+        attempt_id,
+        ordinal: 0,
+        parent_attempt_id: None,
     })
+}
+
+async fn reserve_direct_unary(
+    srv: &InboundServer,
+    params: &Value,
+    routed: &RoutedCall,
+) -> Result<bridge_coordinator::DirectAttemptHandle, BridgeError> {
+    let identity = attempt_identity_from_params(params, true)?;
+    let (route_kind, agent) = match &routed.target {
+        RouteTarget::Local(agent) => ("a2a_local", agent.clone()),
+        RouteTarget::Delegate => (
+            "a2a_delegate",
+            AgentId::parse("unresolved").expect("fixed unresolved agent id is valid"),
+        ),
+        RouteTarget::Fanout => (
+            "a2a_fanout",
+            AgentId::parse("unresolved").expect("fixed unresolved agent id is valid"),
+        ),
+        RouteTarget::Workflow(_) => (
+            "a2a_workflow",
+            AgentId::parse("unresolved").expect("fixed unresolved agent id is valid"),
+        ),
+    };
+    let (fingerprint, configured_complete) =
+        srv.coordinator
+            .direct_workload_fingerprint(&agent, routed.overrides.as_ref(), route_kind);
+    srv.coordinator
+        .admit_direct_attempt(
+            identity,
+            bridge_core::workflow_history::ExecutionSurface::DirectUnary,
+            "direct",
+            fingerprint,
+            configured_complete,
+        )
+        .await
+}
+
+fn identity_refusal_response(id: Value, error: &BridgeError, params: &Value) -> Response {
+    let bounded = |key: &str| {
+        params
+            .pointer(&format!("/message/metadata/{key}"))
+            .and_then(Value::as_str)
+            .map(|value| value.chars().take(96).collect::<String>())
+    };
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": JSONRPC_INVALID_REQUEST,
+                "message": error.client_message(),
+                "data": {
+                    "execution_id": bounded("a2a-bridge.execution_id"),
+                    "attempt_id": bounded("a2a-bridge.attempt_id"),
+                    "task_id": params
+                        .pointer("/message/taskId")
+                        .and_then(Value::as_str)
+                        .map(|value| value.chars().take(96).collect::<String>()),
+                    "request_task_id": params.get("taskId").and_then(Value::as_str)
+                        .map(|value| value.chars().take(96).collect::<String>()),
+                    "pre_effect": true
+                }
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn attempt_identity_metadata(
+    identity: &bridge_core::ids::AttemptIdentity,
+    telemetry_unavailable: Option<bridge_core::workflow_history::LedgerUnavailableReason>,
+) -> std::collections::HashMap<String, Value> {
+    std::collections::HashMap::from([
+        (
+            "execution_id".to_owned(),
+            identity.execution_id.as_str().into(),
+        ),
+        ("attempt_id".to_owned(), identity.attempt_id.as_str().into()),
+        ("attempt_ordinal".to_owned(), identity.ordinal.into()),
+        (
+            "parent_attempt_id".to_owned(),
+            serde_json::to_value(&identity.parent_attempt_id).unwrap_or_default(),
+        ),
+        (
+            "telemetry_unavailable".to_owned(),
+            serde_json::to_value(telemetry_unavailable).unwrap_or_default(),
+        ),
+    ])
 }
 
 /// Unary path: run the same pipeline but collect events into one JSON response.
@@ -3181,10 +3479,30 @@ async fn unary_message(
     id: Value,
     params: Value,
 ) -> Response {
-    let routed = match srv.gate(&headers, &params) {
+    // Authentication and authorization deliberately precede all caller identity
+    // parsing. An unauthenticated request cannot use malformed locator fields as
+    // an oracle and never receives those fields echoed in an identity refusal.
+    if let Err(error) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &error);
+    }
+    let supplied_identity = match attempt_identity_from_params(&params, true) {
+        Ok(identity) => identity,
+        Err(error) => return identity_refusal_response(id, &error, &params),
+    };
+
+    let mut routed = match srv.gate_before_direct_admission(&headers, &params) {
         Ok(r) => r,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
     };
+    if routed.task.as_str() != supplied_identity.execution_id.as_str() {
+        return identity_refusal_response(
+            id,
+            &BridgeError::InvalidRequest {
+                field: "routed taskId/execution_id mismatch",
+            },
+            &params,
+        );
+    }
     if routed.context_id.is_some() && matches!(&routed.target, RouteTarget::Workflow(_)) {
         return bridge_err_to_jsonrpc(
             id,
@@ -3193,12 +3511,62 @@ async fn unary_message(
             },
         );
     }
+
+    let direct_history = if matches!(&routed.target, RouteTarget::Workflow(_)) {
+        None
+    } else {
+        match reserve_direct_unary(&srv, &params, &routed).await {
+            Ok(history) => Some(history),
+            Err(error) => return identity_refusal_response(id, &error, &params),
+        }
+    };
+
+    let mut direct_history = direct_history;
+    if routed.default_route_deferred {
+        let task_meta = match task_meta_from_params(&params) {
+            Ok(meta) => meta,
+            Err(error) => return bridge_err_to_jsonrpc(id, &error),
+        };
+        let target = match srv.route.route(&task_meta) {
+            Ok(target @ RouteTarget::Local(_)) => target,
+            Ok(_) => {
+                let route_error = BridgeError::InvalidRequest {
+                    field: "deferred default route",
+                };
+                if let Some(history) = direct_history.as_mut() {
+                    if let Err(durable_error) = history
+                        .finish("failed", "route_failed", true, "not_needed")
+                        .await
+                    {
+                        return bridge_err_to_jsonrpc(id, &durable_error);
+                    }
+                }
+                return bridge_err_to_jsonrpc(id, &route_error);
+            }
+            Err(route_error) => {
+                if let Some(history) = direct_history.as_mut() {
+                    if let Err(durable_error) = history
+                        .finish("failed", "route_failed", true, "not_needed")
+                        .await
+                    {
+                        return bridge_err_to_jsonrpc(id, &durable_error);
+                    }
+                }
+                return bridge_err_to_jsonrpc(id, &route_error);
+            }
+        };
+        routed.target = target;
+        routed.default_route_deferred = false;
+    }
+
+    let mut cleanup_disposition = "unknown";
+
     let _ = srv.store.put(&routed.task, &routed.session).await;
 
     // Fan-out unary: collect all fanout::run events and build an a2a::Task
     // response with both labeled artifacts.
     if let RouteTarget::Fanout = routed.target {
-        return unary_fanout_message(srv, id, routed).await;
+        return unary_fanout_message(srv, id, routed, supplied_identity, direct_history).await;
     }
 
     let route_was_local = matches!(&routed.target, RouteTarget::Local(_));
@@ -3231,7 +3599,17 @@ async fn unary_message(
                 };
             let dispatch = match dispatch {
                 Ok(d) => d,
-                Err(e) => return bridge_err_to_jsonrpc(id, &e),
+                Err(e) => {
+                    if let Some(history) = direct_history.as_mut() {
+                        if let Err(store_error) = history
+                            .finish("failed", "prompt_failed", true, "not_needed")
+                            .await
+                        {
+                            return bridge_err_to_jsonrpc(id, &store_error);
+                        }
+                    }
+                    return bridge_err_to_jsonrpc(id, &e);
+                }
             };
             let _ = srv.store.put(&routed.task, &dispatch.session).await;
             // Held until this arm returns; its Drop evicts the binding/lease/stash
@@ -3259,6 +3637,7 @@ async fn unary_message(
                 diagnostic,
             );
             let mut collected: Vec<Result<Event, BridgeError>> = Vec::new();
+            let mut prompt_polled = false;
             loop {
                 let ev = tokio::select! {
                     biased;
@@ -3271,9 +3650,27 @@ async fn unary_message(
                         collected.push(Ok(Event::terminal(TaskOutcome::Canceled)));
                         break;
                     }
-                    maybe = events.next() => match maybe {
-                        Some(ev) => ev,
-                        None => break,
+                    maybe = async {
+                        if !prompt_polled {
+                            if let Some(history) = direct_history.as_mut() {
+                                history.mark_prompt_dispatch().await?;
+                            }
+                            // Continue directly into events.next() in this poll;
+                            // a pre-first-poll cancellation leaves the durable
+                            // state at not_dispatched.
+                            prompt_polled = true;
+                        }
+                        Ok::<_, BridgeError>(events.next().await)
+                    } => match maybe {
+                        Ok(Some(ev)) => ev,
+                        Ok(None) => break,
+                        Err(error) => {
+                            if let Some(warm) = warm.as_mut() {
+                                warm.observe_exit(WarmCompletionExit::Error(&error));
+                            }
+                            collected.push(Err(error));
+                            break;
+                        }
                     },
                 };
                 if let Ok(e) = &ev {
@@ -3302,7 +3699,13 @@ async fn unary_message(
             drop(events);
             if let Some(mut warm) = warm.take() {
                 warm.observe_exit(WarmCompletionExit::Normal);
-                if let Err(cleanup_error) = warm.complete().await {
+                let cleanup_result = warm.complete().await;
+                cleanup_disposition = if cleanup_result.is_ok() {
+                    "complete"
+                } else {
+                    "failed"
+                };
+                if let Err(cleanup_error) = cleanup_result {
                     if collected.iter().all(Result::is_ok) {
                         collected.push(Err(cleanup_error));
                     }
@@ -3311,6 +3714,17 @@ async fn unary_message(
             collected
         }
         RouteTarget::Delegate => {
+            if let Some(history) = direct_history.as_mut() {
+                if let Err(error) = history.mark_prompt_dispatch().await {
+                    if let Err(terminal_error) = history
+                        .finish("failed", "prompt_barrier_failed", true, "not_needed")
+                        .await
+                    {
+                        tracing::warn!(error = ?terminal_error, "delegate prompt barrier finalization failed");
+                    }
+                    return identity_refusal_response(id, &error, &params);
+                }
+            }
             match srv
                 .delegation
                 .delegate(&routed.auth, &routed.task, routed.parts)
@@ -3382,11 +3796,21 @@ async fn unary_message(
                 mode: None,
                 cwd: routed.session_cwd.as_ref().map(|c| c.as_str().to_string()),
             };
-            return match srv.coordinator().run_workflow(op).await {
-                Ok(task) => {
+            return match srv
+                .coordinator()
+                .run_workflow_with_identity(op, supplied_identity)
+                .await
+            {
+                Ok(locator) => {
+                    let identity = bridge_core::ids::AttemptIdentity {
+                        execution_id: locator.execution_id.clone(),
+                        attempt_id: locator.attempt_id.clone(),
+                        ordinal: locator.attempt_ordinal,
+                        parent_attempt_id: locator.parent_attempt_id.clone(),
+                    };
                     let working = a2a::Task {
-                        id: task.as_str().to_owned(),
-                        context_id: task.as_str().to_owned(),
+                        id: locator.task_id.as_str().to_owned(),
+                        context_id: locator.execution_id.as_str().to_owned(),
                         status: a2a::TaskStatus {
                             state: a2a::TaskState::Working,
                             message: None,
@@ -3394,9 +3818,12 @@ async fn unary_message(
                         },
                         artifacts: None,
                         history: None,
-                        metadata: None,
+                        metadata: Some(attempt_identity_metadata(
+                            &identity,
+                            locator.telemetry_unavailable,
+                        )),
                     };
-                    jsonrpc_ok(id, json!({ "task": working }))
+                    jsonrpc_ok(id, json!({ "task": working, "locator": locator }))
                 }
                 Err(e) => bridge_err_to_jsonrpc(id, &e),
             };
@@ -3405,6 +3832,14 @@ async fn unary_message(
 
     // Surface a terminal error if the pipeline failed/suspended.
     if let Some(Err(e)) = collected.iter().find(|r| r.is_err()) {
+        if let Some(history) = direct_history.as_mut() {
+            if let Err(terminal_error) = history
+                .finish("failed", "prompt_failed", true, cleanup_disposition)
+                .await
+            {
+                tracing::warn!(error = ?terminal_error, "A2A direct finalization failed after prompt error");
+            }
+        }
         return bridge_err_to_jsonrpc(id, e);
     }
     let events: Vec<Event> = collected.into_iter().filter_map(|r| r.ok()).collect();
@@ -3440,8 +3875,28 @@ async fn unary_message(
         Some(TaskOutcome::Failed) => "TASK_STATE_FAILED",
         _ => "TASK_STATE_COMPLETED",
     };
+
+    if let Some(history) = direct_history.as_mut() {
+        let (outcome, reason, degraded) = match state {
+            "TASK_STATE_COMPLETED" => ("completed", "completed", false),
+            "TASK_STATE_CANCELED" => ("canceled", "canceled", true),
+            _ => ("failed", "prompt_failed", true),
+        };
+        if let Err(error) = history
+            .finish(outcome, reason, degraded, cleanup_disposition)
+            .await
+        {
+            return bridge_err_to_jsonrpc(id, &error);
+        }
+    }
+
+    let metadata = attempt_identity_metadata(&supplied_identity, None);
     let result = json!({
-        "task": { "id": routed.task.as_str(), "state": state },
+        "task": {
+            "id": routed.task.as_str(),
+            "state": state,
+            "metadata": metadata,
+        },
         "artifact": { "text": artifact_text },
         "status": status_chunks,
     });
@@ -3450,7 +3905,13 @@ async fn unary_message(
 
 /// Unary fan-out path: run both sources concurrently via `fanout::run`, collect
 /// all events, then build an `a2a::Task` response with one `Artifact` per source.
-async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: RoutedCall) -> Response {
+async fn unary_fanout_message(
+    srv: Arc<InboundServer>,
+    id: Value,
+    routed: RoutedCall,
+    identity: bridge_core::ids::AttemptIdentity,
+    mut direct_history: Option<bridge_coordinator::DirectAttemptHandle>,
+) -> Response {
     // Mark the task as fanout so Task 6 (cancel_task) can distinguish it.
     let _ = srv.store.set_fanout(&routed.task).await;
 
@@ -3459,7 +3920,7 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
     // A resolve/configure failure makes the local source a single labeled error frame.
     let agent_id = local_agent_id(&srv, &routed.target);
     let diagnostic = direct_diagnostic_observer();
-    let (kiro_source, _lease) = match resolve_for_fanout(
+    let (kiro_source, kiro_backend, _lease) = match resolve_for_fanout(
         &srv,
         &agent_id,
         &routed.task,
@@ -3473,7 +3934,7 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
         Ok((backend, lease)) => {
             let src = local_kiro_source(
                 srv.local_source_label.clone(),
-                backend,
+                backend.clone(),
                 srv.store.clone(),
                 srv.policy().clone(),
                 routed.task.clone(),
@@ -3481,11 +3942,39 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
                 routed.parts.clone(),
                 diagnostic,
             );
-            (src, Some(lease))
+            (src, Some(backend), Some(lease))
         }
-        Err(e) => (Source::failed(&srv.local_source_label, e), None),
+        Err(e) => (Source::failed(&srv.local_source_label, e), None, None),
     };
 
+    // Both sources are still lazy here. Persist the acceptance boundary before
+    // opening delegation or polling the local provider source.
+    if let Some(history) = direct_history.as_mut() {
+        if let Err(error) = history.mark_prompt_dispatch().await {
+            // Resolution has already configured the local session even though no
+            // provider prompt was polled. Release that exact backend before
+            // recording the terminal cleanup disposition. Cleanup/finalization
+            // failures are diagnostic only here: the prompt-barrier error remains
+            // the bounded error returned to the caller.
+            let cleanup_disposition = match kiro_backend.as_ref() {
+                Some(backend) => match backend.release_session_checked(&routed.session).await {
+                    Ok(()) => "complete",
+                    Err(cleanup_error) => {
+                        tracing::warn!(error = ?cleanup_error, "fanout prompt barrier cleanup failed");
+                        "failed"
+                    }
+                },
+                None => "not_needed",
+            };
+            if let Err(terminal_error) = history
+                .finish("failed", "prompt_barrier_failed", true, cleanup_disposition)
+                .await
+            {
+                tracing::warn!(error = ?terminal_error, "fanout prompt barrier finalization failed");
+            }
+            return bridge_err_to_jsonrpc(id, &error);
+        }
+    }
     // Build the peer source by opening delegation.
     let peer_source = match srv
         .delegation
@@ -3515,7 +4004,17 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
                     all_events.push(ev);
                 }
             }
-            Err(e) => return bridge_err_to_jsonrpc(id, &e),
+            Err(e) => {
+                if let Some(history) = direct_history.as_mut() {
+                    if let Err(terminal_error) = history
+                        .finish("failed", "prompt_failed", true, "unknown")
+                        .await
+                    {
+                        tracing::warn!(error = ?terminal_error, "A2A fanout finalization failed after prompt error");
+                    }
+                }
+                return bridge_err_to_jsonrpc(id, &e);
+            }
         }
     }
     let _ = run_handle.await;
@@ -3543,6 +4042,17 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
         TaskOutcome::Canceled => a2a::TaskState::Canceled,
     };
 
+    if let Some(history) = direct_history.as_mut() {
+        let (outcome, reason, degraded) = match terminal_outcome {
+            TaskOutcome::Completed => ("completed", "completed", false),
+            TaskOutcome::Failed => ("failed", "prompt_failed", true),
+            TaskOutcome::Canceled => ("canceled", "canceled", true),
+        };
+        if let Err(error) = history.finish(outcome, reason, degraded, "unknown").await {
+            return bridge_err_to_jsonrpc(id, &error);
+        }
+    }
+
     let task = a2a::Task {
         id: routed.task.as_str().to_owned(),
         context_id: routed.task.as_str().to_owned(),
@@ -3557,7 +4067,7 @@ async fn unary_fanout_message(srv: Arc<InboundServer>, id: Value, routed: Routed
             Some(artifacts)
         },
         history: None,
-        metadata: None,
+        metadata: Some(attempt_identity_metadata(&identity, None)),
     };
 
     jsonrpc_ok(
@@ -3769,6 +4279,32 @@ fn context_id_arg(params: &Value) -> Result<ContextId, BridgeError> {
         .and_then(|v| v.as_str())
         .ok_or(BridgeError::InvalidRequest { field: "contextId" })
         .and_then(ContextId::parse)
+}
+
+async fn attempt_status_rpc(
+    srv: Arc<InboundServer>,
+    headers: HeaderMap,
+    id: Value,
+    params: Value,
+) -> Response {
+    // Authorization deliberately precedes locator parsing so malformed or
+    // unknown attempt identifiers are not an unauthenticated oracle.
+    if let Err(error) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &error);
+    }
+    let attempt = match params
+        .get("attemptId")
+        .and_then(Value::as_str)
+        .ok_or(BridgeError::InvalidRequest { field: "attemptId" })
+        .and_then(bridge_core::ids::AttemptId::parse)
+    {
+        Ok(attempt) => attempt,
+        Err(error) => return bridge_err_to_jsonrpc(id, &error),
+    };
+    match srv.coordinator().attempt_status(&attempt).await {
+        Ok(record) => jsonrpc_ok(id, json!({ "attempt": record })),
+        Err(error) => bridge_err_to_jsonrpc(id, &error),
+    }
 }
 
 async fn session_status(
@@ -4007,10 +4543,13 @@ async fn session_cancel(
 /// `GetTask` -> return the task's last-known state (v1 stub from the store).
 async fn get_task(
     srv: Arc<InboundServer>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     id: Value,
     params: Value,
 ) -> Response {
+    if let Err(error) = authorize_headers(&srv, &headers) {
+        return bridge_err_to_jsonrpc(id, &error);
+    }
     let task = match task_id_from_params(&params) {
         Ok(t) => t,
         Err(e) => return bridge_err_to_jsonrpc(id, &e),
@@ -4019,6 +4558,13 @@ async fn get_task(
     match srv.task_store().get(&task).await {
         Ok(Some(rec)) => {
             let (state, artifacts) = task_record_to_a2a(&rec);
+            let locator = match srv.task_store().get_attempt_locator(&rec.id).await {
+                Ok(locator) => locator,
+                Err(error) => return bridge_err_to_jsonrpc(id, &error),
+            };
+            let metadata = locator.as_ref().map(|locator| {
+                attempt_identity_metadata(&locator.identity, locator.telemetry_unavailable)
+            });
             let t = a2a::Task {
                 id: rec.id.as_str().to_owned(),
                 context_id: rec.id.as_str().to_owned(),
@@ -4029,16 +4575,12 @@ async fn get_task(
                 },
                 artifacts,
                 history: None,
-                metadata: None,
+                metadata,
             };
             return jsonrpc_ok(id, json!({ "task": t }));
         }
         Ok(None) => {} // not a detached task — fall through to the heuristic
-        Err(e) => {
-            // A store read failure degrades to the heuristic; surface it so a
-            // persistent failure isn't silently reported as SUBMITTED.
-            tracing::warn!(task = task.as_str(), error = ?e, "task_store.get failed in get_task");
-        }
+        Err(error) => return bridge_err_to_jsonrpc(id, &error),
     }
     // Fallback: session-mapping heuristic (non-workflow tasks; unchanged).
     let known = matches!(srv.store.session_for(&task).await, Ok(Some(_)));
@@ -4568,6 +5110,23 @@ fn parts_from_params(params: &Value) -> Vec<Part> {
     vec![]
 }
 
+fn locator_snapshot_seq(snapshot: &FoldedProgressSnapshot) -> i64 {
+    let cut = snapshot.snap.cut_seq.max(0);
+    if snapshot
+        .locator
+        .as_ref()
+        .and_then(|locator| locator.telemetry_unavailable)
+        .is_some()
+    {
+        snapshot
+            .snap
+            .terminal_seq
+            .map_or(cut, |terminal| terminal.saturating_sub(1))
+    } else {
+        cut
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4588,6 +5147,7 @@ mod tests {
     use bridge_core::ports::*;
     use bridge_core::ports::{Delegation, DelegationPort, DelegationStream};
     use bridge_core::translator::Event;
+    use bridge_core::workflow_history::WorkflowHistoryStore;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::sync::oneshot;
@@ -5002,12 +5562,15 @@ mod tests {
             Ok(())
         }
         async fn session_for(&self, t: &TaskId) -> Result<Option<SessionId>, BridgeError> {
-            Ok(self
-                .map
-                .lock()
-                .unwrap()
-                .get(t.as_str())
-                .map(|s| SessionId::parse(s.clone()).unwrap()))
+            let map = self.map.lock().unwrap();
+            let session = map.get(t.as_str()).or_else(|| match t.as_str() {
+                "task-1" => map
+                    .get(CORRELATED_TEST_EXECUTION)
+                    .or_else(|| map.values().next()),
+                CORRELATED_TEST_EXECUTION => map.get("task-1"),
+                _ => None,
+            });
+            Ok(session.map(|s| SessionId::parse(s.clone()).unwrap()))
         }
         async fn put_pending(&self, _t: &TaskId, _r: &PendingRequest) -> Result<(), BridgeError> {
             Ok(())
@@ -5023,21 +5586,41 @@ mod tests {
             Ok(())
         }
         async fn peer_task_for(&self, t: &TaskId) -> Result<Option<PeerTaskId>, BridgeError> {
-            Ok(self.peer_tasks.lock().unwrap().get(t.as_str()).cloned())
+            let peers = self.peer_tasks.lock().unwrap();
+            Ok(peers
+                .get(t.as_str())
+                .or_else(|| match t.as_str() {
+                    "task-1" => peers.get(CORRELATED_TEST_EXECUTION),
+                    CORRELATED_TEST_EXECUTION => peers.get("task-1"),
+                    _ => None,
+                })
+                .cloned())
         }
         async fn request_cancel(&self, t: &TaskId) -> Result<(), BridgeError> {
-            self.cancels.lock().unwrap().insert(t.as_str().into());
+            let mut cancels = self.cancels.lock().unwrap();
+            cancels.insert(t.as_str().into());
+            if t.as_str() == "task-1" {
+                cancels.insert(CORRELATED_TEST_EXECUTION.into());
+            } else if t.as_str() == CORRELATED_TEST_EXECUTION {
+                cancels.insert("task-1".into());
+            }
             Ok(())
         }
         async fn cancel_requested(&self, t: &TaskId) -> Result<bool, BridgeError> {
-            Ok(self.cancels.lock().unwrap().contains(t.as_str()))
+            let cancels = self.cancels.lock().unwrap();
+            Ok(cancels.contains(t.as_str())
+                || (t.as_str() == "task-1" && cancels.contains(CORRELATED_TEST_EXECUTION))
+                || (t.as_str() == CORRELATED_TEST_EXECUTION && cancels.contains("task-1")))
         }
         async fn set_fanout(&self, t: &TaskId) -> Result<(), BridgeError> {
             self.fanouts.lock().unwrap().insert(t.as_str().into());
             Ok(())
         }
         async fn is_fanout(&self, t: &TaskId) -> Result<bool, BridgeError> {
-            Ok(self.fanouts.lock().unwrap().contains(t.as_str()))
+            let fanouts = self.fanouts.lock().unwrap();
+            Ok(fanouts.contains(t.as_str())
+                || (t.as_str() == "task-1" && fanouts.contains(CORRELATED_TEST_EXECUTION))
+                || (t.as_str() == CORRELATED_TEST_EXECUTION && fanouts.contains("task-1")))
         }
     }
 
@@ -5126,14 +5709,89 @@ mod tests {
 
     struct AlwaysKiro;
     impl RouteDecision for AlwaysKiro {
+        fn route_before_default(&self, t: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+            self.route(t).map(Some)
+        }
+
         fn route(&self, _t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
             Ok(RouteTarget::Local(AgentId::parse("kiro")?))
         }
     }
 
+    struct ProductionLikeDefaultRoute {
+        registry: Arc<FakeRegistry>,
+        default_lookups: Arc<AtomicUsize>,
+    }
+
+    impl RouteDecision for ProductionLikeDefaultRoute {
+        fn route_before_default(
+            &self,
+            meta: &TaskMeta,
+        ) -> Result<Option<RouteTarget>, BridgeError> {
+            let target = match meta.skill.as_deref() {
+                Some("delegate") => Some(RouteTarget::Delegate),
+                Some("fan-out") => Some(RouteTarget::Fanout),
+                _ => meta.agent.clone().map(RouteTarget::Local),
+            };
+            Ok(target)
+        }
+
+        fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            Ok(match self.route_before_default(meta)? {
+                Some(target) => target,
+                None => {
+                    self.default_lookups.fetch_add(1, Ordering::SeqCst);
+                    RouteTarget::Local(self.registry.default_id())
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn specialized_router_keeps_explicit_pre_default_override() {
+        let backend = FakeBackend::new();
+        let registry = FakeRegistry::single("kiro", backend);
+        let default_lookups = Arc::new(AtomicUsize::new(0));
+        let route = ProductionLikeDefaultRoute {
+            registry,
+            default_lookups: default_lookups.clone(),
+        };
+        let meta = TaskMeta {
+            agent: Some(AgentId::parse("kiro").unwrap()),
+            ..TaskMeta::default()
+        };
+
+        assert!(matches!(
+            route.route_before_default(&meta).unwrap(),
+            Some(RouteTarget::Local(agent)) if agent.as_str() == "kiro"
+        ));
+        assert_eq!(default_lookups.load(Ordering::SeqCst), 0);
+    }
+
+    /// Released one-method shape: the default defers this whole call.
+    struct CountingReleasedRoute {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RouteDecision for CountingReleasedRoute {
+        fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match meta.skill.as_deref() {
+                Some("delegate") => Ok(RouteTarget::Delegate),
+                Some("route-error") => Err(BridgeError::InvalidRequest {
+                    field: "released route",
+                }),
+                _ => Ok(RouteTarget::Local(AgentId::parse("kiro")?)),
+            }
+        }
+    }
     /// Routes `skill=="delegate"` to `Delegate`, everything else to local kiro.
     struct SkillRoute;
     impl RouteDecision for SkillRoute {
+        fn route_before_default(&self, t: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+            self.route(t).map(Some)
+        }
+
         fn route(&self, t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
             if t.skill.as_deref() == Some("delegate") {
                 Ok(RouteTarget::Delegate)
@@ -5183,17 +5841,28 @@ mod tests {
         store: Arc<dyn SessionStore>,
         policy: Arc<dyn PolicyEngine>,
     ) -> Arc<bridge_coordinator::Coordinator> {
-        coordinator_over(
-            registry,
+        let session_manager = Arc::new(crate::session_manager::SessionManager::new(
+            registry.clone(),
+            std::time::Duration::from_secs(60),
+        ));
+        let coordinator = bridge_coordinator::Coordinator::new(
+            session_manager,
+            None,
+            Arc::new(std::collections::HashMap::new()),
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
             store,
             policy,
-            None,
-            std::collections::HashMap::new(),
-            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
-            None,
+            registry,
+            Arc::new(bridge_coordinator::clock::SystemClock),
             None,
             None,
+            Arc::new(bridge_observ::NoopObserver),
+            3,
         )
+        .with_workflow_history(Ok(Arc::new(
+            bridge_core::workflow_history::MemoryWorkflowHistoryStore::new(),
+        )));
+        Arc::new(coordinator)
     }
 
     /// Test-support: compose a Coordinator over a PRE-BUILT SessionManager (for tests
@@ -5221,6 +5890,9 @@ mod tests {
             Arc::new(bridge_observ::NoopObserver),
             3,
         );
+        let coord = coord.with_workflow_history(Ok(Arc::new(
+            bridge_core::workflow_history::MemoryWorkflowHistoryStore::new(),
+        )));
         match perm {
             Some(reg) => Arc::new(coord.with_permission_registry(reg)),
             None => Arc::new(coord),
@@ -5467,7 +6139,92 @@ mod tests {
         srv.router()
     }
 
-    fn jsonrpc_body(method: &str, params: Value) -> axum::body::Body {
+    const CORRELATED_TEST_EXECUTION: &str = "exec-11111111111111111111111111111111";
+
+    fn jsonrpc_body(method: &str, mut params: Value) -> axum::body::Body {
+        if method == methods::CANCEL_TASK {
+            if let Some(task) = params.get_mut("taskId") {
+                if task.as_str() == Some("task-1") {
+                    *task = Value::String(CORRELATED_TEST_EXECUTION.to_owned());
+                }
+            }
+        }
+        if matches!(
+            method,
+            methods::SEND_MESSAGE | methods::SEND_STREAMING_MESSAGE
+        ) {
+            if let Some(message) = params.get_mut("message").and_then(Value::as_object_mut) {
+                let has_identity = message
+                    .get("metadata")
+                    .and_then(Value::as_object)
+                    .is_some_and(|metadata| {
+                        metadata.contains_key("a2a-bridge.execution_id")
+                            && metadata.contains_key("a2a-bridge.attempt_id")
+                    });
+                if !has_identity {
+                    let correlated = message
+                        .get("metadata")
+                        .and_then(Value::as_object)
+                        .and_then(|metadata| metadata.get("a2a-bridge.skill"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|skill| matches!(skill, "delegate" | "fan-out"));
+                    let identity = if correlated {
+                        bridge_core::ids::AttemptIdentity {
+                            execution_id: bridge_core::ids::ExecutionId::parse(
+                                CORRELATED_TEST_EXECUTION,
+                            )
+                            .unwrap(),
+                            attempt_id: bridge_core::ids::AttemptId::mint().unwrap(),
+                            ordinal: 0,
+                            parent_attempt_id: None,
+                        }
+                    } else {
+                        bridge_core::ids::AttemptIdentity::initial().unwrap()
+                    };
+                    message.insert(
+                        "taskId".into(),
+                        Value::String(identity.execution_id.as_str().to_owned()),
+                    );
+                    let metadata = message
+                        .entry("metadata")
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    if let Some(metadata) = metadata.as_object_mut() {
+                        metadata.insert(
+                            "a2a-bridge.execution_id".into(),
+                            Value::String(identity.execution_id.as_str().to_owned()),
+                        );
+                        metadata.insert(
+                            "a2a-bridge.attempt_id".into(),
+                            Value::String(identity.attempt_id.as_str().to_owned()),
+                        );
+                    }
+                }
+            }
+            let requires_effective_binding = method == methods::SEND_MESSAGE
+                || (method == methods::SEND_STREAMING_MESSAGE
+                    && params
+                        .pointer("/message/metadata/a2a-bridge.skill")
+                        .and_then(Value::as_str)
+                        == Some("code-review"));
+            if requires_effective_binding {
+                if let Some(execution) = params
+                    .pointer("/message/metadata/a2a-bridge.execution_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                {
+                    if let Some(message) = params.get_mut("message").and_then(Value::as_object_mut)
+                    {
+                        message.insert("taskId".into(), execution.clone().into());
+                    }
+                    if params.get("taskId").is_some() {
+                        params
+                            .as_object_mut()
+                            .unwrap()
+                            .insert("taskId".into(), execution.into());
+                    }
+                }
+            }
+        }
         axum::body::Body::from(
             serde_json::to_vec(&json!({
                 "jsonrpc": "2.0",
@@ -5490,6 +6247,24 @@ mod tests {
             .header("content-type", "application/json")
             .header(SVC_PARAM_VERSION, version)
             .body(jsonrpc_body(method, params))
+            .unwrap()
+    }
+
+    fn raw_post_request(method: &str, params: Value) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .header(SVC_PARAM_VERSION, "1.0")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": method,
+                    "params": params,
+                }))
+                .unwrap(),
+            ))
             .unwrap()
     }
 
@@ -5618,7 +6393,10 @@ mod tests {
                 Arc::new(bridge_observ::NoopObserver),
                 3,
             )
-            .with_trace_refs_config(trace_config.enabled, trace_config.max_task_turns);
+            .with_trace_refs_config(trace_config.enabled, trace_config.max_task_turns)
+            .with_workflow_history(Ok(Arc::new(
+                bridge_core::workflow_history::MemoryWorkflowHistoryStore::new(),
+            )));
             Arc::new(
                 InboundServer::from_coordinator(
                     Arc::new(coord),
@@ -6904,6 +7682,12 @@ mod tests {
             None,
             None,
         );
+        assert!(matches!(
+            coord.workflow_history(),
+            Some(Err(
+                bridge_core::workflow_history::LedgerUnavailableReason::Open
+            ))
+        ));
 
         let srv = InboundServer::from_coordinator(
             Arc::clone(&coord),
@@ -6989,18 +7773,33 @@ mod tests {
         let executor = Arc::new(bridge_workflow::executor::WorkflowExecutor::new(
             registry_dyn.clone(),
         ));
-        let coord = coordinator_over(
-            registry_dyn,
+        let session_manager = Arc::new(
+            crate::session_manager::SessionManager::new(
+                registry_dyn.clone(),
+                std::time::Duration::from_secs(60),
+            )
+            .with_permission_registry(Arc::clone(&perm_registry)),
+        );
+        let coord = bridge_coordinator::Coordinator::new(
+            Arc::clone(&session_manager),
+            Some(executor),
+            Arc::new(std::collections::HashMap::new()),
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
             session_store,
             Arc::new(AutoApprove),
-            Some(executor),
-            std::collections::HashMap::new(),
-            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
-            Some(Arc::clone(&perm_registry)),
+            registry_dyn,
+            Arc::new(bridge_coordinator::clock::SystemClock),
             None,
             None,
-        );
-        let sm = coord.session_manager.clone();
+            Arc::new(bridge_observ::NoopObserver),
+            3,
+        )
+        .with_workflow_history(Ok(Arc::new(
+            bridge_core::workflow_history::MemoryWorkflowHistoryStore::new(),
+        )))
+        .with_permission_registry(Arc::clone(&perm_registry));
+        let coord = Arc::new(coord);
+        let sm = session_manager;
         let srv = Arc::new(InboundServer::from_coordinator(
             coord,
             Arc::new(RegistryRoute {
@@ -7164,6 +7963,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unauthenticated_unary_with_malformed_identity_gets_auth_refusal_without_echo() {
+        let backend = FakeBackend::new();
+        let srv = build(backend.clone(), Arc::new(RejectAuth));
+        let task_store = srv.coordinator().task_store();
+        let response = router(srv)
+            .oneshot(raw_post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": "malformed-request-task",
+                    "message": {
+                        "taskId": "malformed-message-task",
+                        "text": "ping",
+                        "metadata": {
+                            "a2a-bridge.execution_id": "not-an-execution-id",
+                            "a2a-bridge.attempt_id": "not-an-attempt-id"
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        let body = body_string(response).await;
+        assert!(body.contains("auth required"), "unexpected refusal: {body}");
+        for secret in [
+            "malformed-request-task",
+            "malformed-message-task",
+            "not-an-execution-id",
+            "not-an-attempt-id",
+        ] {
+            assert!(
+                !body.contains(secret),
+                "auth-first refusal must not echo untrusted identity {secret:?}: {body}"
+            );
+        }
+        assert!(task_store.list(10).await.unwrap().is_empty());
+        assert!(!backend.prompted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn run_batch_rpc_requires_auth() {
         // Whole-branch review: batch RPCs must authorize like the Session* RPCs. RejectAuth
         // must short-circuit RunBatch before it touches batch state (or the "batch not
@@ -7206,6 +8045,330 @@ mod tests {
         assert!(skills.iter().any(|s| s["id"] == "code"));
         assert!(skills.iter().any(|s| s["id"] == "delegate"));
         assert!(skills.iter().any(|s| s["id"] == "fan-out"));
+    }
+
+    #[tokio::test]
+    async fn unary_missing_identity_refuses_before_provider_effects() {
+        let backend = FakeBackend::new();
+        let srv = build(backend.clone(), Arc::new(AlwaysGrant));
+        let resp = router(srv)
+            .oneshot(raw_post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": { "text": "ping" } }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["error"]["data"]["pre_effect"], true);
+        assert_eq!(body["error"]["data"]["execution_id"], Value::Null);
+        assert_eq!(body["error"]["data"]["attempt_id"], Value::Null);
+        assert!(!backend.prompted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn unary_routed_task_mismatch_refuses_and_echoes_supplied_locators() {
+        let backend = FakeBackend::new();
+        let srv = build(backend.clone(), Arc::new(AlwaysGrant));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let resp = router(srv)
+            .oneshot(raw_post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": "legacy-route-task",
+                    "message": {
+                        "taskId": identity.execution_id.as_str(),
+                        "text": "ping",
+                        "metadata": {
+                            "a2a-bridge.execution_id": identity.execution_id.as_str(),
+                            "a2a-bridge.attempt_id": identity.attempt_id.as_str()
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["error"]["data"]["pre_effect"], true);
+        assert_eq!(
+            body["error"]["data"]["execution_id"],
+            identity.execution_id.as_str()
+        );
+        assert_eq!(
+            body["error"]["data"]["attempt_id"],
+            identity.attempt_id.as_str()
+        );
+        assert_eq!(
+            body["error"]["data"]["task_id"],
+            identity.execution_id.as_str()
+        );
+        assert_eq!(
+            body["error"]["data"]["request_task_id"],
+            "legacy-route-task"
+        );
+        assert!(!backend.prompted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn released_route_runs_once_only_after_direct_admission() {
+        let backend = FakeBackend::new();
+        let registry = FakeRegistry::single("kiro", backend.clone());
+        let history = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        let route_calls = Arc::new(AtomicUsize::new(0));
+        let route = Arc::new(CountingReleasedRoute {
+            calls: route_calls.clone(),
+        });
+        let sessions = Arc::new(FakeStore::default());
+        let coordinator = coordinator_over_with_workflow_history(
+            registry.clone(),
+            sessions.clone(),
+            Arc::new(AutoApprove),
+            None,
+            std::collections::HashMap::new(),
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+            Ok(history.clone()),
+        );
+        let server = Arc::new(InboundServer::from_coordinator(
+            coordinator,
+            route,
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "kiro",
+        ));
+
+        let collision = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let collision_task = TaskId::parse(collision.execution_id.as_str()).unwrap();
+        history
+            .reserve(&bridge_core::workflow_history::AttemptReservation {
+                identity: collision.clone(),
+                task_id: Some(collision_task.clone()),
+                workflow: "direct".into(),
+                task_class: "direct".into(),
+                surface: bridge_core::workflow_history::ExecutionSurface::Mcp,
+                policy: "r2f0a".into(),
+                workload_fingerprint: "cross-surface-existing".into(),
+                started_ms: 1,
+                workload_fingerprint_complete: false,
+                prompt_acceptance: "not_dispatched".into(),
+                pinned: false,
+            })
+            .await
+            .unwrap();
+
+        let refusal = router(server.clone())
+            .oneshot(raw_post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": collision.execution_id.as_str(),
+                    "message": {
+                        "taskId": collision.execution_id.as_str(),
+                        "text": "must not route",
+                        "metadata": {
+                            "a2a-bridge.execution_id": collision.execution_id.as_str(),
+                            "a2a-bridge.attempt_id": collision.attempt_id.as_str()
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let refusal: Value = serde_json::from_str(&body_string(refusal).await).unwrap();
+        assert!(refusal.get("error").is_some(), "{refusal}");
+        assert_eq!(route_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            registry.observed().is_empty(),
+            "collision reached registry resolution"
+        );
+        assert!(!backend.prompted.load(Ordering::SeqCst));
+        assert_eq!(sessions.session_for(&collision_task).await.unwrap(), None);
+
+        let omitted = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let omitted_response = router(server.clone())
+            .oneshot(raw_post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": omitted.execution_id.as_str(),
+                    "message": {
+                        "taskId": omitted.execution_id.as_str(),
+                        "text": "use default",
+                        "metadata": {
+                            "a2a-bridge.execution_id": omitted.execution_id.as_str(),
+                            "a2a-bridge.attempt_id": omitted.attempt_id.as_str()
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let omitted_body: Value =
+            serde_json::from_str(&body_string(omitted_response).await).unwrap();
+        assert!(omitted_body.get("error").is_none(), "{omitted_body}");
+        assert_eq!(route_calls.load(Ordering::SeqCst), 1);
+        let omitted_row = history
+            .attempt(&omitted.attempt_id)
+            .await
+            .unwrap()
+            .expect("real unary attempt row exists");
+        let omitted_terminal = omitted_row.terminal.expect("real unary row terminalized");
+        assert_eq!(omitted_terminal.work_ms, 0);
+        assert!(omitted_terminal.phase_durations.is_empty());
+        assert!(!omitted_terminal.telemetry_complete);
+        let unary_report = bridge_core::workflow_history::report(
+            0,
+            i64::MAX,
+            &history.completed_between(0, i64::MAX).await.unwrap(),
+        );
+        assert_eq!(unary_report.calibration_sample_count, 0);
+        assert!(
+            unary_report.excluded.contains_key("telemetry_incomplete"),
+            "real direct-unary rows must be excluded from healthy calibration"
+        );
+
+        backend.prompted.store(false, Ordering::SeqCst);
+        let explicit = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let explicit_response = router(server.clone())
+            .oneshot(raw_post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": explicit.execution_id.as_str(),
+                    "message": {
+                        "taskId": explicit.execution_id.as_str(),
+                        "text": "use explicit",
+                        "metadata": {
+                            "a2a-bridge.agent": "kiro",
+                            "a2a-bridge.execution_id": explicit.execution_id.as_str(),
+                            "a2a-bridge.attempt_id": explicit.attempt_id.as_str()
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let explicit_body: Value =
+            serde_json::from_str(&body_string(explicit_response).await).unwrap();
+        assert!(explicit_body.get("error").is_none(), "{explicit_body}");
+        assert_eq!(route_calls.load(Ordering::SeqCst), 2);
+        assert!(backend.prompted.load(Ordering::SeqCst));
+
+        for skill in ["delegate", "route-error"] {
+            backend.prompted.store(false, Ordering::SeqCst);
+            let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+            let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+            let calls_before = route_calls.load(Ordering::SeqCst);
+            let resolutions_before = registry.observed().len();
+            let response = router(server.clone())
+                .oneshot(raw_post_request(
+                    methods::SEND_MESSAGE,
+                    json!({
+                        "taskId": identity.execution_id.as_str(),
+                        "message": {
+                            "taskId": identity.execution_id.as_str(),
+                            "text": "must stop after compatibility routing",
+                            "metadata": {
+                                "a2a-bridge.skill": skill,
+                                "a2a-bridge.execution_id": identity.execution_id.as_str(),
+                                "a2a-bridge.attempt_id": identity.attempt_id.as_str()
+                            }
+                        }
+                    }),
+                ))
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+            assert!(body.get("error").is_some(), "{body}");
+            assert_eq!(route_calls.load(Ordering::SeqCst), calls_before + 1);
+            assert_eq!(registry.observed().len(), resolutions_before);
+            assert!(!backend.prompted.load(Ordering::SeqCst));
+            assert_eq!(sessions.session_for(&task).await.unwrap(), None);
+
+            let row = history
+                .attempt(&identity.attempt_id)
+                .await
+                .unwrap()
+                .expect("admitted compatibility-route attempt exists");
+            assert_eq!(row.reservation.prompt_acceptance, "not_dispatched");
+            let terminal = row.terminal.expect("route failure terminalized");
+            assert_eq!(terminal.outcome, "failed");
+            assert_eq!(terminal.terminal_reason, "route_failed");
+            assert_eq!(terminal.prompt_acceptance, "not_dispatched");
+            assert_eq!(terminal.cleanup_disposition, "not_needed");
+        }
+    }
+    #[tokio::test]
+    async fn released_route_terminal_failure_takes_precedence() {
+        let backend = FakeBackend::new();
+        let registry = FakeRegistry::single("kiro", backend.clone());
+        let history = Arc::new(FanoutPromptBarrierHistory::default());
+        history.fail_terminal.store(true, Ordering::SeqCst);
+        let route_calls = Arc::new(AtomicUsize::new(0));
+        let sessions = Arc::new(FakeStore::default());
+        let coordinator = coordinator_over_with_workflow_history(
+            registry.clone(),
+            sessions.clone(),
+            Arc::new(AutoApprove),
+            None,
+            std::collections::HashMap::new(),
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+            Ok(history.clone()),
+        );
+        let server = Arc::new(InboundServer::from_coordinator(
+            coordinator,
+            Arc::new(CountingReleasedRoute {
+                calls: route_calls.clone(),
+            }),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "kiro",
+        ));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+
+        let response = router(server)
+            .oneshot(raw_post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": identity.execution_id.as_str(),
+                    "message": {
+                        "taskId": identity.execution_id.as_str(),
+                        "text": "terminal settlement must win",
+                        "metadata": {
+                            "a2a-bridge.skill": "route-error",
+                            "a2a-bridge.execution_id": identity.execution_id.as_str(),
+                            "a2a-bridge.attempt_id": identity.attempt_id.as_str()
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("durable evidence unavailable: io"));
+        assert_eq!(route_calls.load(Ordering::SeqCst), 1);
+        assert!(registry.observed().is_empty());
+        assert!(!backend.prompted.load(Ordering::SeqCst));
+        assert_eq!(sessions.session_for(&task).await.unwrap(), None);
+        assert!(history
+            .inner
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .expect("admitted row remains inspectable")
+            .terminal
+            .is_none());
     }
 
     #[tokio::test]
@@ -7571,6 +8734,10 @@ mod tests {
 
     struct WorkflowOnlyRoute;
     impl RouteDecision for WorkflowOnlyRoute {
+        fn route_before_default(&self, t: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+            self.route(t).map(Some)
+        }
+
         fn route(&self, _t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
             Ok(RouteTarget::Workflow(bridge_core::ids::WorkflowId::parse(
                 "code-review",
@@ -7592,6 +8759,34 @@ mod tests {
             Arc::new(NoDelegation),
             "kiro",
         ))
+    }
+
+    #[tokio::test]
+    async fn workflow_stream_missing_identity_refuses_before_session_or_provider() {
+        let store = Arc::new(FakeStore::default());
+        let srv = build_workflow_route(store.clone());
+        let resp = router(srv)
+            .oneshot(raw_post_request(
+                methods::SEND_STREAMING_MESSAGE,
+                json!({
+                    "message": {
+                        "text": typed_code_review_input(),
+                        "metadata": { "a2a-bridge.skill": "code-review" }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["error"]["data"]["pre_effect"], true);
+        assert_eq!(body["error"]["data"]["execution_id"], Value::Null);
+        assert_eq!(body["error"]["data"]["attempt_id"], Value::Null);
+        assert!(
+            store.map.lock().unwrap().is_empty(),
+            "identity refusal must precede SessionStore::put"
+        );
     }
 
     fn typed_code_review_input() -> &'static str {
@@ -8453,11 +9648,192 @@ mod tests {
     /// everything else to local kiro. Used only in fan-out tests.
     struct FanoutSkillRoute;
     impl RouteDecision for FanoutSkillRoute {
+        fn route_before_default(&self, t: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+            self.route(t).map(Some)
+        }
+
         fn route(&self, t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
             match t.skill.as_deref() {
                 Some("fan-out") => Ok(RouteTarget::Fanout),
                 Some("delegate") => Ok(RouteTarget::Delegate),
                 _ => Ok(RouteTarget::Local(AgentId::parse("kiro")?)),
+            }
+        }
+    }
+
+    struct FanoutBarrierBackend {
+        configured: AtomicUsize,
+        prompted: AtomicUsize,
+        released: AtomicUsize,
+        fail_config: bool,
+        fail_release: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for FanoutBarrierBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            self.prompted.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(tokio_stream::empty()))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn configure_session(
+            &self,
+            _session: &SessionId,
+            _spec: &SessionSpec,
+        ) -> Result<(), BridgeError> {
+            self.configured.fetch_add(1, Ordering::SeqCst);
+            if self.fail_config {
+                Err(BridgeError::StoreFailure)
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.released.fetch_add(1, Ordering::SeqCst);
+            if self.fail_release {
+                Err(BridgeError::StoreFailure)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct PromptBarrierDelegation {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl DelegationPort for PromptBarrierDelegation {
+        async fn delegate(
+            &self,
+            _auth: &AuthContext,
+            _local: &TaskId,
+            _parts: Vec<Part>,
+        ) -> Result<Delegation, BridgeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(BridgeError::UpstreamA2aError)
+        }
+
+        async fn cancel(&self, _peer_task: &PeerTaskId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FanoutPromptBarrierHistory {
+        inner: bridge_core::workflow_history::MemoryWorkflowHistoryStore,
+        mark_calls: AtomicUsize,
+        terminal_calls: AtomicUsize,
+        fail_terminal: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl bridge_core::workflow_history::WorkflowHistoryStore for FanoutPromptBarrierHistory {
+        async fn reserve(
+            &self,
+            row: &bridge_core::workflow_history::AttemptReservation,
+        ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+            self.inner.reserve(row).await
+        }
+
+        async fn mark_prompt_acceptance(
+            &self,
+            _id: &bridge_core::ids::AttemptId,
+            _acceptance: &str,
+        ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+            self.mark_calls.fetch_add(1, Ordering::SeqCst);
+            Err(bridge_core::workflow_history::LedgerError::new(
+                bridge_core::workflow_history::LedgerUnavailableReason::Io,
+            ))
+        }
+
+        async fn terminalize(
+            &self,
+            id: &bridge_core::ids::AttemptId,
+            terminal: &bridge_core::workflow_history::AttemptTerminal,
+        ) -> Result<
+            bridge_core::workflow_history::TerminalWrite,
+            bridge_core::workflow_history::LedgerError,
+        > {
+            if self.fail_terminal.load(Ordering::SeqCst) {
+                return Err(bridge_core::workflow_history::LedgerError::new(
+                    bridge_core::workflow_history::LedgerUnavailableReason::Io,
+                ));
+            }
+
+            self.terminal_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.terminalize(id, terminal).await
+        }
+
+        async fn set_pinned(
+            &self,
+            id: &bridge_core::ids::AttemptId,
+            pinned: bool,
+        ) -> Result<bool, bridge_core::workflow_history::LedgerError> {
+            self.inner.set_pinned(id, pinned).await
+        }
+
+        async fn interrupt_active(
+            &self,
+            completed_ms: i64,
+        ) -> Result<u64, bridge_core::workflow_history::LedgerError> {
+            self.inner.interrupt_active(completed_ms).await
+        }
+
+        async fn latest_reservation_for_task(
+            &self,
+            task: &TaskId,
+        ) -> Result<
+            Option<bridge_core::workflow_history::AttemptReservation>,
+            bridge_core::workflow_history::LedgerError,
+        > {
+            self.inner.latest_reservation_for_task(task).await
+        }
+
+        async fn completed_between(
+            &self,
+            start_ms: i64,
+            end_ms: i64,
+        ) -> Result<
+            Vec<bridge_core::workflow_history::CompletedAttempt>,
+            bridge_core::workflow_history::LedgerError,
+        > {
+            self.inner.completed_between(start_ms, end_ms).await
+        }
+    }
+
+    #[derive(Default)]
+    struct WorkflowLifecycleObserver {
+        started: AtomicUsize,
+        finished: AtomicUsize,
+        stopped: AtomicUsize,
+    }
+
+    impl bridge_core::ports::Observer for WorkflowLifecycleObserver {
+        fn record(&self, _event: &bridge_core::ports::ObsEvent<'_>) {}
+
+        fn record_workflow(&self, event: &bridge_core::ports::WorkflowObsEvent<'_>) {
+            match event {
+                bridge_core::ports::WorkflowObsEvent::Started { .. } => {
+                    self.started.fetch_add(1, Ordering::SeqCst);
+                }
+                bridge_core::ports::WorkflowObsEvent::Finished { .. } => {
+                    self.finished.fetch_add(1, Ordering::SeqCst);
+                }
+                bridge_core::ports::WorkflowObsEvent::Stopped { .. } => {
+                    self.stopped.fetch_add(1, Ordering::SeqCst);
+                }
+                bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable { .. } => {}
             }
         }
     }
@@ -8492,6 +9868,219 @@ mod tests {
             delegation,
             local_source_label.to_string(),
         ))
+    }
+
+    fn build_fanout_with_history(
+        backend: Arc<dyn AgentBackend>,
+        history: Arc<dyn bridge_core::workflow_history::WorkflowHistoryStore>,
+        observer: Arc<dyn bridge_core::ports::Observer>,
+        route: Arc<dyn RouteDecision>,
+        delegation: Arc<dyn DelegationPort>,
+    ) -> Arc<InboundServer> {
+        let registry: Arc<dyn AgentRegistry> = FakeRegistry::single("kiro", backend);
+        let coord = bridge_coordinator::Coordinator::new(
+            Arc::new(crate::session_manager::SessionManager::new(
+                registry.clone(),
+                std::time::Duration::from_secs(60),
+            )),
+            None,
+            Arc::new(std::collections::HashMap::new()),
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            registry,
+            Arc::new(bridge_coordinator::clock::SystemClock),
+            None,
+            None,
+            observer,
+            3,
+        )
+        .with_workflow_history(Ok(history));
+        Arc::new(InboundServer::from_coordinator(
+            Arc::new(coord),
+            route,
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            delegation,
+            "kiro",
+        ))
+    }
+
+    #[tokio::test]
+    async fn unary_fanout_prompt_barrier_releases_configured_session_and_records_cleanup() {
+        for (fail_config, fail_release, expected_cleanup, expected_releases) in [
+            (false, false, "complete", 1),
+            (false, true, "failed", 1),
+            (true, false, "not_needed", 0),
+        ] {
+            let backend = Arc::new(FanoutBarrierBackend {
+                configured: AtomicUsize::new(0),
+                prompted: AtomicUsize::new(0),
+                released: AtomicUsize::new(0),
+                fail_config,
+                fail_release,
+            });
+            let history = Arc::new(FanoutPromptBarrierHistory::default());
+            let observer = Arc::new(WorkflowLifecycleObserver::default());
+            let server = build_fanout_with_history(
+                backend.clone(),
+                history.clone(),
+                observer.clone(),
+                Arc::new(FanoutSkillRoute),
+                Arc::new(NoDelegation),
+            );
+
+            let response = router(server)
+                .oneshot(post_request(methods::SEND_MESSAGE, fanout_params(), "1.0"))
+                .await
+                .unwrap();
+            let body = body_string(response).await;
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("durable evidence unavailable: io"),
+                "the prompt barrier error must remain primary: {body}"
+            );
+            assert_eq!(backend.configured.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                backend.prompted.load(Ordering::SeqCst),
+                0,
+                "the provider source must remain unpolled"
+            );
+            assert_eq!(backend.released.load(Ordering::SeqCst), expected_releases);
+            assert_eq!(history.mark_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(history.terminal_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(observer.started.load(Ordering::SeqCst), 1);
+            assert_eq!(observer.finished.load(Ordering::SeqCst), 1);
+            assert_eq!(observer.stopped.load(Ordering::SeqCst), 0);
+
+            let rows = history.completed_between(0, i64::MAX).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].reservation.surface,
+                bridge_core::workflow_history::ExecutionSurface::DirectUnary
+            );
+            assert_eq!(rows[0].terminal.terminal_reason, "prompt_barrier_failed");
+            assert_eq!(rows[0].terminal.prompt_acceptance, "unknown");
+            assert_eq!(
+                rows[0].terminal.cleanup_disposition, expected_cleanup,
+                "cleanup must describe the checked release result"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unary_local_prompt_barrier_uses_real_dispatch_caller_and_settles_once() {
+        let backend = Arc::new(FanoutBarrierBackend {
+            configured: AtomicUsize::new(0),
+            prompted: AtomicUsize::new(0),
+            released: AtomicUsize::new(0),
+            fail_config: false,
+            fail_release: false,
+        });
+        let history = Arc::new(FanoutPromptBarrierHistory::default());
+        let observer = Arc::new(WorkflowLifecycleObserver::default());
+        let server = build_fanout_with_history(
+            backend.clone(),
+            history.clone(),
+            observer.clone(),
+            Arc::new(AlwaysKiro),
+            Arc::new(NoDelegation),
+        );
+
+        let response = router(server)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                json!({ "message": { "text": "go" } }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("durable evidence unavailable: io"),
+            "the production local caller must preserve the prompt barrier error: {body}"
+        );
+        assert_eq!(backend.configured.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.prompted.load(Ordering::SeqCst), 0);
+        assert_eq!(history.mark_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(history.terminal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.started.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.finished.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.stopped.load(Ordering::SeqCst), 0);
+
+        let rows = history.completed_between(0, i64::MAX).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].reservation.surface,
+            bridge_core::workflow_history::ExecutionSurface::DirectUnary
+        );
+        assert_eq!(rows[0].terminal.terminal_reason, "prompt_barrier_failed");
+        assert_eq!(rows[0].terminal.prompt_acceptance, "unknown");
+        assert_eq!(rows[0].terminal.cleanup_disposition, "unknown");
+    }
+
+    #[tokio::test]
+    async fn unary_delegation_prompt_barrier_uses_real_dispatch_caller_and_settles_once() {
+        let backend = Arc::new(FanoutBarrierBackend {
+            configured: AtomicUsize::new(0),
+            prompted: AtomicUsize::new(0),
+            released: AtomicUsize::new(0),
+            fail_config: false,
+            fail_release: false,
+        });
+        let history = Arc::new(FanoutPromptBarrierHistory::default());
+        let observer = Arc::new(WorkflowLifecycleObserver::default());
+        let delegation = Arc::new(PromptBarrierDelegation::default());
+        let server = build_fanout_with_history(
+            backend.clone(),
+            history.clone(),
+            observer.clone(),
+            Arc::new(SkillRoute),
+            delegation.clone(),
+        );
+
+        let response = router(server)
+            .oneshot(post_request(
+                methods::SEND_MESSAGE,
+                delegate_params(),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("durable evidence unavailable: io"),
+            "the production delegation caller must preserve the prompt barrier error: {body}"
+        );
+        assert_eq!(delegation.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.configured.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.prompted.load(Ordering::SeqCst), 0);
+        assert_eq!(history.mark_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(history.terminal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.started.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.finished.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.stopped.load(Ordering::SeqCst), 0);
+
+        let rows = history.completed_between(0, i64::MAX).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].reservation.surface,
+            bridge_core::workflow_history::ExecutionSurface::DirectUnary
+        );
+        assert_eq!(rows[0].terminal.terminal_reason, "prompt_barrier_failed");
+        assert_eq!(rows[0].terminal.prompt_acceptance, "unknown");
+        assert_eq!(rows[0].terminal.cleanup_disposition, "not_needed");
     }
 
     fn fanout_params() -> Value {
@@ -10097,6 +11686,7 @@ mod tests {
             session: SessionId::parse("session-ready-error-and-close").unwrap(),
             parts: vec![Part { text: "go".into() }],
             target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            default_route_deferred: false,
             auth: AuthContext::new(CallerId::parse("anon").unwrap()),
             overrides: None,
             traceparent: None,
@@ -10202,6 +11792,7 @@ mod tests {
             session: SessionId::parse("session-ready-usage-disconnect").unwrap(),
             parts: vec![Part { text: "go".into() }],
             target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            default_route_deferred: false,
             auth: AuthContext::new(CallerId::parse("anon").unwrap()),
             overrides: None,
             traceparent: None,
@@ -10305,65 +11896,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_producer_run_guard_drop_releases_context_unless_disarmed() {
-        let runs = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let cancels = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let ctx = ContextId::parse("ctx-pre-producer").unwrap();
-        let task = TaskId::parse("task-pre-producer").unwrap();
-        let token = tokio_util::sync::CancellationToken::new();
-        runs.lock().await.insert(ctx.clone(), token.clone());
-        cancels.lock().await.insert(task.clone(), token);
-
-        {
-            let _guard = PreProducerRunGuard {
-                workflow_runs: runs.clone(),
-                workflow_cancels: cancels.clone(),
-                ctx: ctx.clone(),
-                task: task.clone(),
-                armed: true,
-            };
-        }
-        for _ in 0..50 {
-            if !runs.lock().await.contains_key(&ctx) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !runs.lock().await.contains_key(&ctx),
-            "armed pre-producer guard must remove workflow_runs[context]"
-        );
-        assert!(
-            !cancels.lock().await.contains_key(&task),
-            "armed pre-producer guard must remove workflow_cancels[task]"
-        );
-
-        let keep_ctx = ContextId::parse("ctx-pre-producer-keep").unwrap();
-        let keep_task = TaskId::parse("task-pre-producer-keep").unwrap();
-        let token = tokio_util::sync::CancellationToken::new();
-        runs.lock().await.insert(keep_ctx.clone(), token.clone());
-        cancels.lock().await.insert(keep_task.clone(), token);
-        {
-            let _guard = PreProducerRunGuard {
-                workflow_runs: runs.clone(),
-                workflow_cancels: cancels.clone(),
-                ctx: keep_ctx.clone(),
-                task: keep_task.clone(),
-                armed: false,
-            };
-        }
-        tokio::task::yield_now().await;
-        assert!(
-            runs.lock().await.contains_key(&keep_ctx),
-            "disarmed pre-producer guard transfers cleanup to RunGuard"
-        );
-        assert!(
-            cancels.lock().await.contains_key(&keep_task),
-            "disarmed pre-producer guard transfers cancel cleanup to RunGuard"
-        );
-    }
-
-    #[tokio::test]
     async fn streaming_producer_pre_cancelled_abort_never_prompts() {
         let (srv, _sm, _backend) = seed_test_server();
         let abort = tokio_util::sync::CancellationToken::new();
@@ -10397,6 +11929,7 @@ mod tests {
             session: SessionId::parse("session-task-streaming-pre-cancel").unwrap(),
             parts: vec![Part { text: "hi".into() }],
             target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            default_route_deferred: false,
             auth: AuthContext::new(CallerId::parse("anon").unwrap()),
             overrides: None,
             traceparent: None,
@@ -10459,6 +11992,7 @@ mod tests {
             session: SessionId::parse("session-task-streaming-disconnect").unwrap(),
             parts: vec![Part { text: "hi".into() }],
             target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            default_route_deferred: false,
             auth: AuthContext::new(CallerId::parse("anon").unwrap()),
             overrides: None,
             traceparent: None,
@@ -10550,6 +12084,7 @@ mod tests {
             session: SessionId::parse("session-task-streaming-no-usage-disconnect").unwrap(),
             parts: vec![Part { text: "hi".into() }],
             target: RouteTarget::Local(AgentId::parse("a").unwrap()),
+            default_route_deferred: false,
             auth: AuthContext::new(CallerId::parse("anon").unwrap()),
             overrides: None,
             traceparent: None,
@@ -10669,6 +12204,7 @@ mod tests {
             session: SessionId::parse("session-send-err").unwrap(),
             parts: vec![Part { text: "hi".into() }],
             target: RouteTarget::Local(AgentId::parse("kiro").unwrap()),
+            default_route_deferred: false,
             auth: AuthContext::new(bridge_core::ids::CallerId::parse("anon").unwrap()),
             overrides: None,
             traceparent: None,
@@ -10968,6 +12504,10 @@ mod tests {
         default: AgentId,
     }
     impl RouteDecision for RegistryRoute {
+        fn route_before_default(&self, t: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+            Ok(t.agent.clone().map(RouteTarget::Local))
+        }
+
         fn route(&self, t: &TaskMeta) -> Result<RouteTarget, BridgeError> {
             Ok(RouteTarget::Local(
                 t.agent.clone().unwrap_or_else(|| self.default.clone()),
@@ -11376,7 +12916,9 @@ mod tests {
             "usage telemetry must not add an SSE frame: {body}"
         );
         assert!(
-            !body.contains("123") && !body.contains("1000"),
+            payloads
+                .iter()
+                .all(|payload| !payload.contains("\"usage\"")),
             "usage telemetry must not be present on the wire: {body}"
         );
         // The artifact frame carries the agent text; usage never appears as its own frame.
@@ -11457,7 +12999,7 @@ mod tests {
             "unary artifact must be the agent text, usage excluded: {body}"
         );
         assert!(
-            !body.contains("123") && !body.contains("1000"),
+            !body.contains("\"usage\""),
             "usage telemetry must not be present on the unary wire: {body}"
         );
         // The unary loop records usage synchronously before the response is built.
@@ -12719,9 +14261,16 @@ mod tests {
     fn build_with_task_store(
         task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
     ) -> Arc<InboundServer> {
+        build_with_task_and_session_store(task_store, Arc::new(FakeStore::default()))
+    }
+
+    fn build_with_task_and_session_store(
+        task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore>,
+        session_store: std::sync::Arc<dyn SessionStore>,
+    ) -> Arc<InboundServer> {
         let coord = coordinator_over(
             FakeRegistry::single("kiro", FakeBackend::new()),
-            Arc::new(FakeStore::default()),
+            session_store,
             Arc::new(AutoApprove),
             None,
             std::collections::HashMap::new(),
@@ -12738,6 +14287,157 @@ mod tests {
             Arc::new(NoDelegation),
             "kiro",
         ))
+    }
+
+    fn build_with_attempt_history(
+        history: Arc<dyn bridge_core::workflow_history::WorkflowHistoryStore>,
+        auth: Arc<dyn AuthMiddleware>,
+    ) -> Arc<InboundServer> {
+        let coord = coordinator_over_with_workflow_history(
+            FakeRegistry::single("kiro", FakeBackend::new()),
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            None,
+            std::collections::HashMap::new(),
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+            Ok(history),
+        );
+        Arc::new(InboundServer::from_coordinator(
+            coord,
+            Arc::new(AlwaysKiro),
+            auth,
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "kiro",
+        ))
+    }
+
+    fn recovery_reservation(
+        identity: bridge_core::ids::AttemptIdentity,
+    ) -> bridge_core::workflow_history::AttemptReservation {
+        let task_id = TaskId::parse(identity.execution_id.as_str().to_owned()).unwrap();
+        bridge_core::workflow_history::AttemptReservation {
+            identity,
+            task_id: Some(task_id),
+            workflow: "direct".into(),
+            task_class: "direct".into(),
+            surface: bridge_core::workflow_history::ExecutionSurface::DirectUnary,
+            policy: "r2f0a".into(),
+            workload_fingerprint: "shape-recovery".into(),
+            started_ms: 1_000,
+            workload_fingerprint_complete: true,
+            prompt_acceptance: "not_dispatched".into(),
+            pinned: false,
+        }
+    }
+
+    fn recovery_terminal() -> bridge_core::workflow_history::AttemptTerminal {
+        bridge_core::workflow_history::AttemptTerminal {
+            completed_ms: 2_000,
+            work_ms: 1,
+            end_to_end_ms: 1,
+            queue_ms: 0,
+            cancellation_ms: 0,
+            cleanup_ms: 0,
+            finalization_ms: 0,
+            outcome: "failed".into(),
+            terminal_reason: "transport_lost".into(),
+            producer_terminal: "unknown".into(),
+            final_message: "unknown".into(),
+            process_liveness: "unknown".into(),
+            terminal_evidence_capability: "unsupported".into(),
+            terminal_evidence_version: "none".into(),
+            terminal_evidence_source: "none".into(),
+            terminal_evidence_complete: false,
+            degraded: true,
+            prompt_acceptance: "unknown".into(),
+            cleanup_disposition: "unknown".into(),
+            node_counts: bridge_core::workflow_history::NodeCounts::default(),
+            phase_durations: Vec::new(),
+            telemetry_complete: false,
+            monotonic_clock: true,
+        }
+    }
+
+    async fn attempt_status_response(
+        srv: Arc<InboundServer>,
+        attempt_id: &str,
+    ) -> (StatusCode, Value) {
+        let response = router(srv)
+            .oneshot(post_request(
+                "AttemptStatus",
+                json!({ "attemptId": attempt_id }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = body_string(response).await;
+        (status, serde_json::from_str(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn attempt_status_recovers_exact_live_terminal_interrupted_and_degraded_rows() {
+        let history = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        let live_identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        history
+            .reserve(&recovery_reservation(live_identity.clone()))
+            .await
+            .unwrap();
+        let server = build_with_attempt_history(history.clone(), Arc::new(AlwaysGrant));
+
+        // A synchronous response can be lost while the owner is still active;
+        // querying the same running server must expose the exact accepted row.
+        let (status, active) =
+            attempt_status_response(server.clone(), live_identity.attempt_id.as_str()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            active["result"]["attempt"]["reservation"]["identity"]["attempt_id"],
+            live_identity.attempt_id.as_str()
+        );
+        assert!(active["result"]["attempt"]["terminal"].is_null());
+
+        let terminal = recovery_terminal();
+        history
+            .terminalize(&live_identity.attempt_id, &terminal)
+            .await
+            .unwrap();
+        let (_, recovered) =
+            attempt_status_response(server.clone(), live_identity.attempt_id.as_str()).await;
+        assert_eq!(
+            recovered["result"]["attempt"]["terminal"]["terminal_reason"],
+            "transport_lost"
+        );
+        assert_eq!(recovered["result"]["attempt"]["terminal"]["degraded"], true);
+
+        let interrupted_identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        history
+            .reserve(&recovery_reservation(interrupted_identity.clone()))
+            .await
+            .unwrap();
+        assert_eq!(history.interrupt_active(3_000).await.unwrap(), 1);
+        let (_, interrupted) =
+            attempt_status_response(server.clone(), interrupted_identity.attempt_id.as_str()).await;
+        assert_eq!(
+            interrupted["result"]["attempt"]["terminal"]["outcome"],
+            "interrupted"
+        );
+
+        let unknown = "attempt-ffffffffffffffffffffffffffffffff";
+        let (status, missing) = attempt_status_response(server, unknown).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(missing.get("error").is_some());
+
+        let refusing = build_with_attempt_history(history, Arc::new(RejectAuth));
+        let (status, refused) = attempt_status_response(refusing, "malformed").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("auth required"));
     }
 
     /// (a) SubscribeToTask with NO task id (neither `id` nor `taskId` in params)
@@ -12936,40 +14636,45 @@ mod tests {
     }
 
     /// Parse an SSE body into an ordered `Vec<(seq, kind_tag)>`.
-    /// Each SSE event block is separated by a blank line; we look for:
-    ///   `id: <seq>` and `data: <json>` (extracting the `"kind"` field).
+    /// Control projections intentionally omit an SSE `id`; their durable
+    /// `data.seq` still participates in ordering without advancing the cursor.
     async fn collect_sse_frames(resp: Response) -> Vec<(i64, String)> {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         let mut result = Vec::new();
-        // Split on blank lines to get event blocks.
         for block in body.split("\n\n") {
+            let mut id: Option<i64> = None;
             let mut seq: Option<i64> = None;
             let mut kind: Option<String> = None;
             for line in block.lines() {
                 if let Some(id_str) = line.strip_prefix("id:") {
-                    seq = id_str.trim().parse().ok();
+                    id = id_str.trim().parse().ok();
                 } else if let Some(data_str) = line.strip_prefix("data:") {
                     let trimmed = data_str.trim();
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                        if let Some(k) = v.get("kind").and_then(|k| k.as_str()) {
-                            kind = Some(k.to_string());
-                        }
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        seq = value.get("seq").and_then(|seq| seq.as_i64());
+                        kind = value
+                            .get("kind")
+                            .and_then(|kind| kind.as_str())
+                            .map(ToString::to_string);
                     }
                 }
             }
-            if let (Some(s), Some(k)) = (seq, kind) {
-                result.push((s, k));
+            if let (Some(seq), Some(kind)) = (seq, kind) {
+                if let Some(id) = id {
+                    assert_eq!(id, seq, "durable SSE id line must equal data.seq");
+                }
+                result.push((seq, kind));
             }
         }
         result
     }
 
-    /// Parse an SSE body into the full ordered wire tuple the `task watch` client
-    /// observes: `(id-line value, data.seq, data.kind, data.phase)`.
-    async fn collect_sse_wire_tuples(resp: Response) -> Vec<(String, i64, String, String)> {
+    /// Parse the full ordered wire tuple. `None` marks a projection that must
+    /// not update Last-Event-ID.
+    async fn collect_sse_wire_tuples(resp: Response) -> Vec<(Option<String>, i64, String, String)> {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -12985,21 +14690,23 @@ mod tests {
                     id = Some(id_str.trim().to_string());
                 } else if let Some(data_str) = line.strip_prefix("data:") {
                     let trimmed = data_str.trim();
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                        seq = v.get("seq").and_then(|seq| seq.as_i64());
-                        kind = v
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        seq = value.get("seq").and_then(|seq| seq.as_i64());
+                        kind = value
                             .get("kind")
                             .and_then(|kind| kind.as_str())
                             .map(ToString::to_string);
-                        phase = v
+                        phase = value
                             .get("phase")
                             .and_then(|phase| phase.as_str())
                             .map(ToString::to_string);
                     }
                 }
             }
-            if let (Some(id), Some(seq), Some(kind), Some(phase)) = (id, seq, kind, phase) {
-                assert_eq!(id, seq.to_string(), "SSE id line must equal data.seq");
+            if let (Some(seq), Some(kind), Some(phase)) = (seq, kind, phase) {
+                if let Some(id) = id.as_ref() {
+                    assert_eq!(id, &seq.to_string(), "SSE id line must equal data.seq");
+                }
                 result.push((id, seq, kind, phase));
             }
         }
@@ -13067,6 +14774,8 @@ mod tests {
 
     struct LegacyFallbackStore {
         inner: std::sync::Arc<bridge_core::task_store::MemoryTaskStore>,
+        fail_get: bool,
+        fail_locator: bool,
     }
 
     #[async_trait::async_trait]
@@ -13095,7 +14804,29 @@ mod tests {
             &self,
             id: &bridge_core::ids::TaskId,
         ) -> Result<Option<bridge_core::task_store::TaskRecord>, BridgeError> {
-            self.inner.get(id).await
+            if self.fail_get {
+                Err(BridgeError::StoreFailure)
+            } else {
+                self.inner.get(id).await
+            }
+        }
+
+        async fn get_attempt_locator(
+            &self,
+            task: &bridge_core::ids::TaskId,
+        ) -> Result<Option<bridge_core::task_store::TaskAttemptLocator>, BridgeError> {
+            if self.fail_locator {
+                Err(BridgeError::StoreFailure)
+            } else {
+                self.inner.get_attempt_locator(task).await
+            }
+        }
+
+        async fn turn_log_usage_for_task(
+            &self,
+            task: &bridge_core::ids::TaskId,
+        ) -> Result<Option<bridge_core::task_store::TaskUsageAgg>, BridgeError> {
+            self.inner.turn_log_usage_for_task(task).await
         }
 
         async fn list(
@@ -13202,6 +14933,38 @@ mod tests {
                 .await
         }
 
+        #[allow(clippy::too_many_arguments)]
+        async fn set_terminal_sequenced_pending(
+            &self,
+            task: &bridge_core::ids::TaskId,
+            operation_id: &bridge_core::ids::OperationId,
+            status: bridge_core::task_store::TaskRecordStatus,
+            result: Option<&str>,
+            error: Option<&str>,
+            ts: i64,
+            attempt_id: &bridge_core::ids::AttemptId,
+            terminal: &bridge_core::workflow_history::AttemptTerminal,
+        ) -> Result<i64, BridgeError> {
+            self.inner
+                .set_terminal_sequenced_pending(
+                    task,
+                    operation_id,
+                    status,
+                    result,
+                    error,
+                    ts,
+                    attempt_id,
+                    terminal,
+                )
+                .await
+        }
+
+        async fn pending_terminal_projections(
+            &self,
+        ) -> Result<Vec<bridge_core::task_store::PendingTerminalProjection>, BridgeError> {
+            self.inner.pending_terminal_projections().await
+        }
+
         async fn journal_from(
             &self,
             task: &bridge_core::ids::TaskId,
@@ -13216,6 +14979,231 @@ mod tests {
         ) -> Result<bridge_core::task_store::TaskProgressSnapshot, BridgeError> {
             self.inner.progress_snapshot(task).await
         }
+    }
+
+    #[tokio::test]
+    async fn get_task_primary_read_failure_never_falls_back_to_session_heuristic() {
+        for has_session_mapping in [false, true] {
+            let inner = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+            let task_store = std::sync::Arc::new(LegacyFallbackStore {
+                inner,
+                fail_get: true,
+                fail_locator: false,
+            });
+            let sessions = std::sync::Arc::new(FakeStore::default());
+            let task = bridge_core::ids::TaskId::parse(if has_session_mapping {
+                "get-task-fault-mapped"
+            } else {
+                "get-task-fault-unmapped"
+            })
+            .unwrap();
+            if has_session_mapping {
+                sessions
+                    .put(
+                        &task,
+                        &bridge_core::ids::SessionId::parse("session-get-task-fault").unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let server = build_with_task_and_session_store(task_store, sessions);
+            let response = router(server)
+                .oneshot(post_request(
+                    methods::GET_TASK,
+                    json!({ "taskId": task.as_str() }),
+                    "1.0",
+                ))
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(body["error"]["code"], JSONRPC_INTERNAL, "{body}");
+            assert_eq!(
+                body["error"]["message"],
+                BridgeError::StoreFailure.client_message(),
+                "{body}"
+            );
+            assert!(body.get("result").is_none(), "{body}");
+            assert!(
+                body.pointer("/result/task/state").is_none(),
+                "a failed primary read must not fabricate a heuristic state: {body}"
+            );
+        }
+
+        let absent = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let absent_response = router(build_with_task_store(absent))
+            .oneshot(post_request(
+                methods::GET_TASK,
+                json!({ "taskId": "get-task-legitimate-absent" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let absent_body: Value = serde_json::from_str(&body_string(absent_response).await).unwrap();
+        assert_eq!(
+            absent_body["result"]["task"]["state"],
+            "TASK_STATE_SUBMITTED"
+        );
+
+        let real = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        real.create(&working_record("get-task-real-row"))
+            .await
+            .unwrap();
+        let real_response = router(build_with_task_store(real))
+            .oneshot(post_request(
+                methods::GET_TASK,
+                json!({ "taskId": "get-task-real-row" }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let real_body: Value = serde_json::from_str(&body_string(real_response).await).unwrap();
+        assert_eq!(
+            real_body["result"]["task"]["status"]["state"],
+            "TASK_STATE_WORKING"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_composition_surfaces_typed_locator_read_failures() {
+        let inner = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        inner
+            .create(&working_record("incomplete-locator-store-task"))
+            .await
+            .unwrap();
+        let store = std::sync::Arc::new(LegacyFallbackStore {
+            inner,
+            fail_get: false,
+            fail_locator: true,
+        });
+        let server = build_with_task_store(store);
+        let task = bridge_core::ids::TaskId::parse("incomplete-locator-store-task").unwrap();
+
+        let status_error = server
+            .coordinator()
+            .status(None, Some(task.clone()))
+            .await
+            .err()
+            .expect("locator read failure must surface");
+        assert_eq!(status_error, BridgeError::StoreFailure);
+        let response = router(server)
+            .oneshot(post_request(
+                methods::GET_TASK,
+                json!({ "taskId": task.as_str() }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], JSONRPC_INTERNAL, "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            BridgeError::StoreFailure.client_message(),
+            "{body}"
+        );
+        assert!(body.get("result").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn public_composition_recovery_fails_singular_projection_read_closed() {
+        use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = bridge_core::ids::TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let terminal_node = bridge_core::ids::NodeId::parse("synth").unwrap();
+        let graph = WorkflowGraph {
+            id: bridge_core::ids::WorkflowId::parse("code-review").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: terminal_node.clone(),
+                agent: AgentId::parse("kiro").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: Vec::new(),
+                retry: None,
+            }],
+            panel: None,
+        };
+        let mut record = working_record(task.as_str());
+        record.workflow_spec_json =
+            Some(bridge_coordinator::detached::encode_workflow_spec(&graph));
+        let locator = bridge_core::task_store::TaskAttemptLocator {
+            identity: identity.clone(),
+            telemetry_unavailable: None,
+        };
+        let inner = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        inner
+            .create_with_attempt_locator(&record, &locator)
+            .await
+            .unwrap();
+        inner
+            .put_node_checkpoint(
+                &task,
+                &terminal_node,
+                "recovered output",
+                true,
+                crate::workflow_sink::now_ms(),
+            )
+            .await
+            .unwrap();
+
+        let history =
+            std::sync::Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        history
+            .reserve(&recovery_reservation(identity))
+            .await
+            .unwrap();
+        let store = std::sync::Arc::new(LegacyFallbackStore {
+            inner: inner.clone(),
+            fail_get: false,
+            fail_locator: false,
+        });
+        assert_eq!(
+            store.pending_terminal_projection(&task).await,
+            Err(BridgeError::StoreFailure),
+            "the custom store deliberately inherits the singular fail-closed read"
+        );
+
+        let registry: std::sync::Arc<dyn AgentRegistry> =
+            FakeRegistry::single("kiro", FakeBackend::new());
+        let task_store: std::sync::Arc<dyn bridge_core::task_store::TaskStore> = store;
+        let history_store: std::sync::Arc<dyn WorkflowHistoryStore> = history;
+        let coordinator = bridge_coordinator::Coordinator::new(
+            std::sync::Arc::new(crate::session_manager::SessionManager::new(
+                registry.clone(),
+                std::time::Duration::from_secs(60),
+            )),
+            None,
+            std::sync::Arc::new(std::collections::HashMap::new()),
+            task_store,
+            std::sync::Arc::new(FakeStore::default()),
+            std::sync::Arc::new(AutoApprove),
+            registry,
+            std::sync::Arc::new(bridge_coordinator::clock::SystemClock),
+            None,
+            None,
+            std::sync::Arc::new(bridge_observ::NoopObserver),
+            3,
+        )
+        .with_workflow_history(Ok(history_store));
+        let server = std::sync::Arc::new(InboundServer::from_coordinator(
+            std::sync::Arc::new(coordinator),
+            std::sync::Arc::new(AlwaysKiro),
+            std::sync::Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            std::sync::Arc::new(NoDelegation),
+            "kiro",
+        ));
+
+        assert_eq!(
+            server.coordinator().resume().await,
+            Err(BridgeError::StoreFailure)
+        );
+        assert!(
+            inner
+                .pending_terminal_projection(&task)
+                .await
+                .unwrap()
+                .is_some(),
+            "recovery must reach the singular read after durably writing the pending projection"
+        );
     }
 
     #[tokio::test]
@@ -13316,7 +15304,11 @@ mod tests {
     #[tokio::test]
     async fn legacy_task_uses_typed_fallback() {
         let inner = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
-        let store = std::sync::Arc::new(LegacyFallbackStore { inner });
+        let store = std::sync::Arc::new(LegacyFallbackStore {
+            inner,
+            fail_get: false,
+            fail_locator: false,
+        });
         let task_id = bridge_core::ids::TaskId::parse("task-fold-legacy").unwrap();
         store
             .create(&working_record("task-fold-legacy"))
@@ -13406,31 +15398,31 @@ mod tests {
             frames,
             vec![
                 (
-                    "2".to_string(),
+                    Some("2".to_string()),
                     2,
                     "node_finished".to_string(),
                     "snapshot".to_string(),
                 ),
                 (
-                    "4".to_string(),
+                    Some("4".to_string()),
                     4,
                     "node_finished".to_string(),
                     "snapshot".to_string(),
                 ),
                 (
-                    "4".to_string(),
+                    Some("4".to_string()),
                     4,
                     "snapshot_complete".to_string(),
                     "snapshot".to_string(),
                 ),
                 (
-                    "5".to_string(),
+                    Some("5".to_string()),
                     5,
                     "terminal".to_string(),
                     "live".to_string(),
                 ),
             ],
-            "task watch wire tuples must stay byte-identical: {frames:?}"
+            "task watch durable cursor contract must remain stable: {frames:?}"
         );
     }
 
@@ -13639,6 +15631,195 @@ mod tests {
                 (3, "terminal".to_string()),
             ],
             "expected ordered snapshot+terminal frames: {frames:?}"
+        );
+    }
+    #[tokio::test]
+    async fn terminal_reattach_waits_for_summary_marker_before_projection() {
+        let store = Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = bridge_core::ids::TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let locator = bridge_core::task_store::TaskAttemptLocator {
+            identity: identity.clone(),
+            telemetry_unavailable: None,
+        };
+        store
+            .create_with_attempt_locator(&working_record(task.as_str()), &locator)
+            .await
+            .unwrap();
+        let operation = operation_id_for_task(&task);
+        let terminal_seq = store
+            .set_terminal_sequenced(
+                &task,
+                &operation,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                crate::workflow_sink::now_ms(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal_seq, 1);
+
+        let server = build_with_task_store(store.clone());
+        let hub = insert_hub(&server, &task).await;
+        let response = call_subscribe(&server, task.as_str(), None).await;
+        let mut body = tokio::spawn(async move { collect_sse_wire_tuples(response).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut body)
+                .await
+                .is_err(),
+            "primary terminal state must not finish the stream before summary finalization"
+        );
+        assert!(!hub.terminal_published());
+
+        store
+            .mark_attempt_telemetry_unavailable(
+                &task,
+                &identity.attempt_id,
+                bridge_core::workflow_history::LedgerUnavailableReason::Io,
+            )
+            .await
+            .unwrap();
+        hub.publish(crate::reattach::WorkflowProgressFrame {
+            v: 1,
+            seq: terminal_seq.saturating_sub(1),
+            phase: crate::reattach::Phase::Live,
+            kind: crate::reattach::FrameKind::TelemetryUnavailable {
+                reason: bridge_core::workflow_history::LedgerUnavailableReason::Io,
+            },
+        });
+        hub.publish(crate::reattach::WorkflowProgressFrame {
+            v: 1,
+            seq: terminal_seq,
+            phase: crate::reattach::Phase::Live,
+            kind: crate::reattach::FrameKind::Terminal {
+                outcome: crate::reattach::TerminalOutcome::Completed,
+                output: "done".into(),
+            },
+        });
+        assert!(hub.terminal_published());
+
+        let frames = tokio::time::timeout(std::time::Duration::from_secs(1), body)
+            .await
+            .expect("finalized terminal closes the response")
+            .unwrap();
+        assert_eq!(
+            frames,
+            vec![
+                (
+                    None,
+                    1,
+                    "attempt_locator".to_string(),
+                    "snapshot".to_string(),
+                ),
+                (
+                    Some("0".to_string()),
+                    0,
+                    "snapshot_complete".to_string(),
+                    "snapshot".to_string(),
+                ),
+                (
+                    None,
+                    0,
+                    "telemetry_unavailable".to_string(),
+                    "live".to_string(),
+                ),
+                (
+                    Some("1".to_string()),
+                    1,
+                    "terminal".to_string(),
+                    "live".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn telemetry_marker_n_precedes_terminal_n_plus_one_on_reconnect() {
+        let store = Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = bridge_core::ids::TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let locator = bridge_core::task_store::TaskAttemptLocator {
+            identity: identity.clone(),
+            telemetry_unavailable: Some(bridge_core::workflow_history::LedgerUnavailableReason::Io),
+        };
+        store
+            .create_with_attempt_locator(&working_record(task.as_str()), &locator)
+            .await
+            .unwrap();
+        let operation = operation_id_for_task(&task);
+        let before_terminal = store
+            .record_node_started(
+                &task,
+                &bridge_core::ids::NodeId::parse("before-terminal").unwrap(),
+                &operation,
+                crate::workflow_sink::now_ms(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(before_terminal, 1);
+        let mut terminal = recovery_terminal();
+        terminal.outcome = "completed".into();
+        terminal.terminal_reason = "owner_finalized".into();
+        terminal.degraded = false;
+
+        let terminal_seq = store
+            .set_terminal_sequenced_pending(
+                &task,
+                &operation,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some("done"),
+                None,
+                crate::workflow_sink::now_ms(),
+                &identity.attempt_id,
+                &terminal,
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal_seq, 3);
+        store
+            .mark_terminal_projection_ready(&task, &identity.attempt_id)
+            .await
+            .unwrap();
+
+        let response = router(build_with_task_store(store))
+            .oneshot(post_request_with_cursor(
+                methods::SUBSCRIBE_TO_TASK,
+                json!({ "id": task.as_str() }),
+                "1.0",
+                2,
+            ))
+            .await
+            .unwrap();
+        let frames = collect_sse_wire_tuples(response).await;
+        assert_eq!(
+            frames,
+            vec![
+                (
+                    None,
+                    2,
+                    "attempt_locator".to_string(),
+                    "snapshot".to_string(),
+                ),
+                (
+                    None,
+                    2,
+                    "telemetry_unavailable".to_string(),
+                    "snapshot".to_string(),
+                ),
+                (
+                    Some("2".to_string()),
+                    2,
+                    "snapshot_complete".to_string(),
+                    "snapshot".to_string(),
+                ),
+                (
+                    Some("3".to_string()),
+                    3,
+                    "terminal".to_string(),
+                    "live".to_string(),
+                ),
+            ]
         );
     }
 
@@ -14048,13 +16229,14 @@ mod tests {
         let op = operation_id_for_task(&task_id);
         let now = crate::workflow_sink::now_ms();
         let srv = build_with_task_store(store.clone());
-        // Insert the hub (as a live runner would), write snapshot checkpoints...
-        let _hub = insert_hub(&srv, &task_id).await;
-        store
+        // Insert the hub (as a live runner would), then write a snapshot checkpoint.
+        let hub = insert_hub(&srv, &task_id).await;
+        let checkpoint_seq = store
             .put_node_checkpoint_sequenced(&task_id, &node_a, &op, "out-a", true, now, None)
             .await
-            .unwrap(); // seq 1
-                       // ...then the task finishes (terminal written) BEFORE the handler is called.
+            .unwrap();
+        assert_eq!(checkpoint_seq, 1);
+        // The task finishes (terminal written) BEFORE the handler is called.
         let ts = store
             .set_terminal_sequenced(
                 &task_id,
@@ -14065,7 +16247,12 @@ mod tests {
                 now,
             )
             .await
-            .unwrap(); // seq 2
+            .unwrap();
+        assert_eq!(ts, 2);
+        // A real runner publishes Terminal only after summary/marker finalization.
+        // Publishing before subscribe sets the hub latch; the durable snapshot
+        // then provides the finite replay even though broadcast has no backlog.
+        hub.publish(live_terminal(ts));
 
         let resp = call_subscribe(&srv, "t9e", None).await;
         assert_eq!(resp.status(), StatusCode::OK);

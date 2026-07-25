@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -12,12 +12,18 @@ use bridge_core::domain::{
     PermissionRequest, RegistrySnapshot, SessionContext,
 };
 use bridge_core::error::BridgeError;
-use bridge_core::ids::{AgentId, ContextId, NodeId, OperationId, SessionId, TaskId, WorkflowId};
+use bridge_core::ids::{
+    AgentId, AttemptIdentity, ContextId, NodeId, OperationId, SessionId, TaskId, WorkflowId,
+};
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, BackendStream, Lease, PolicyEngine, Resolved, SessionStore, Update,
 };
 use bridge_core::session_cwd::SessionCwd;
 use bridge_core::task_store::{MemoryTaskStore, TaskStore};
+use bridge_core::workflow_history::{
+    AttemptReservation, AttemptTerminal, CompletedAttempt, LedgerError, LedgerUnavailableReason,
+    MemoryWorkflowHistoryStore, TerminalWrite, WorkflowHistoryStore,
+};
 use bridge_mcp::framing::FrameReader;
 use bridge_workflow::executor::WorkflowExecutor;
 use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
@@ -32,6 +38,8 @@ impl Lease for NoopLease {}
 struct FakeBackend {
     text: String,
     releases: AtomicUsize,
+    prompts: AtomicUsize,
+    fail_release: AtomicBool,
 }
 
 impl FakeBackend {
@@ -39,11 +47,17 @@ impl FakeBackend {
         Self {
             text: text.into(),
             releases: AtomicUsize::new(0),
+            prompts: AtomicUsize::new(0),
+            fail_release: AtomicBool::new(false),
         }
     }
 
     fn releases(&self) -> usize {
         self.releases.load(Ordering::SeqCst)
+    }
+
+    fn prompts(&self) -> usize {
+        self.prompts.load(Ordering::SeqCst)
     }
 }
 
@@ -54,6 +68,7 @@ impl AgentBackend for FakeBackend {
         _session: &SessionId,
         _parts: Vec<Part>,
     ) -> Result<BackendStream, BridgeError> {
+        self.prompts.fetch_add(1, Ordering::SeqCst);
         let updates = vec![
             Ok(Update::Text(self.text.clone())),
             Ok(Update::Done {
@@ -69,6 +84,15 @@ impl AgentBackend for FakeBackend {
 
     async fn release_session(&self, _session: &SessionId) {
         self.releases.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        self.releases.fetch_add(1, Ordering::SeqCst);
+        if self.fail_release.load(Ordering::SeqCst) {
+            Err(BridgeError::StoreFailure)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -183,6 +207,113 @@ impl PolicyEngine for AllowPolicy {
     }
 }
 
+struct PromptBarrierHistory {
+    inner: MemoryWorkflowHistoryStore,
+    marks: AtomicUsize,
+    terminals: AtomicUsize,
+    backend: Arc<FakeBackend>,
+    releases_at_terminal: AtomicUsize,
+}
+
+impl PromptBarrierHistory {
+    fn new(backend: Arc<FakeBackend>) -> Self {
+        Self {
+            inner: MemoryWorkflowHistoryStore::default(),
+            marks: AtomicUsize::default(),
+            terminals: AtomicUsize::default(),
+            backend,
+            releases_at_terminal: AtomicUsize::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl WorkflowHistoryStore for PromptBarrierHistory {
+    async fn reserve(&self, row: &AttemptReservation) -> Result<(), LedgerError> {
+        self.inner.reserve(row).await
+    }
+
+    async fn mark_prompt_acceptance(
+        &self,
+        _id: &bridge_core::ids::AttemptId,
+        _acceptance: &str,
+    ) -> Result<(), LedgerError> {
+        self.marks.fetch_add(1, Ordering::SeqCst);
+        Err(LedgerError::new(LedgerUnavailableReason::Io))
+    }
+
+    async fn terminalize(
+        &self,
+        id: &bridge_core::ids::AttemptId,
+        terminal: &AttemptTerminal,
+    ) -> Result<TerminalWrite, LedgerError> {
+        self.releases_at_terminal
+            .store(self.backend.releases(), Ordering::SeqCst);
+        self.terminals.fetch_add(1, Ordering::SeqCst);
+        self.inner.terminalize(id, terminal).await
+    }
+
+    async fn set_pinned(
+        &self,
+        id: &bridge_core::ids::AttemptId,
+        pinned: bool,
+    ) -> Result<bool, LedgerError> {
+        self.inner.set_pinned(id, pinned).await
+    }
+
+    async fn interrupt_active(&self, completed_ms: i64) -> Result<u64, LedgerError> {
+        self.inner.interrupt_active(completed_ms).await
+    }
+
+    async fn latest_reservation_for_task(
+        &self,
+        task: &TaskId,
+    ) -> Result<Option<AttemptReservation>, LedgerError> {
+        self.inner.latest_reservation_for_task(task).await
+    }
+
+    async fn completed_between(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<CompletedAttempt>, LedgerError> {
+        self.inner.completed_between(start_ms, end_ms).await
+    }
+}
+
+#[derive(Default)]
+struct WorkflowLifecycleObserver {
+    started: AtomicUsize,
+    finished: AtomicUsize,
+    stopped: AtomicUsize,
+}
+
+impl bridge_core::ports::Observer for WorkflowLifecycleObserver {
+    fn record(&self, _event: &bridge_core::ports::ObsEvent<'_>) {}
+
+    fn record_workflow(&self, event: &bridge_core::ports::WorkflowObsEvent<'_>) {
+        match event {
+            bridge_core::ports::WorkflowObsEvent::Started { .. } => {
+                self.started.fetch_add(1, Ordering::SeqCst);
+            }
+            bridge_core::ports::WorkflowObsEvent::Finished { .. } => {
+                self.finished.fetch_add(1, Ordering::SeqCst);
+            }
+            bridge_core::ports::WorkflowObsEvent::Stopped { .. } => {
+                self.stopped.fetch_add(1, Ordering::SeqCst);
+            }
+            bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable { .. } => {}
+        }
+    }
+}
+
+struct PromptBarrierFixture {
+    coord: Arc<Coordinator>,
+    backend: Arc<FakeBackend>,
+    history: Arc<PromptBarrierHistory>,
+    observer: Arc<WorkflowLifecycleObserver>,
+}
+
 struct Fixture {
     coord: Arc<Coordinator>,
     backend: Arc<FakeBackend>,
@@ -233,6 +364,54 @@ fn workflow(id: &str) -> Arc<WorkflowGraph> {
 }
 
 fn fixture() -> Fixture {
+    fixture_with_split_storage(false)
+}
+
+fn split_storage_fixture() -> Fixture {
+    fixture_with_split_storage(true)
+}
+
+fn prompt_barrier_fixture(fail_release: bool) -> PromptBarrierFixture {
+    let backend = Arc::new(FakeBackend::new("must not be prompted"));
+    backend.fail_release.store(fail_release, Ordering::SeqCst);
+    let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+        entry: agent_entry(),
+        backend: backend.clone(),
+    });
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+    let session_manager = Arc::new(SessionManager::new_with_clock(
+        registry.clone(),
+        Duration::from_secs(60),
+        clock.clone(),
+    ));
+    let history = Arc::new(PromptBarrierHistory::new(backend.clone()));
+    let observer = Arc::new(WorkflowLifecycleObserver::default());
+    let coord = Arc::new(
+        Coordinator::new(
+            session_manager,
+            None,
+            Arc::new(HashMap::new()),
+            Arc::new(MemoryTaskStore::new()),
+            Arc::new(FakeSessionStore::default()),
+            Arc::new(AllowPolicy),
+            registry,
+            clock,
+            Some(SessionCwd::parse("/tmp").unwrap()),
+            None,
+            observer.clone(),
+            3,
+        )
+        .with_workflow_history(Ok(history.clone())),
+    );
+    PromptBarrierFixture {
+        coord,
+        backend,
+        history,
+        observer,
+    }
+}
+
+fn fixture_with_split_storage(split_storage: bool) -> Fixture {
     let backend = Arc::new(FakeBackend::new("backend text"));
     let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
         entry: agent_entry(),
@@ -244,7 +423,16 @@ fn fixture() -> Fixture {
         SessionManager::new_with_clock(registry.clone(), Duration::from_secs(60), clock.clone())
             .with_permission_registry(perm_registry.clone()),
     );
-    let task_store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());
+    let (task_store, workflow_history): (Arc<dyn TaskStore>, Arc<dyn WorkflowHistoryStore>) =
+        if split_storage {
+            (
+                Arc::new(MemoryTaskStore::new()),
+                Arc::new(bridge_store::sqlite::SqliteStore::open_in_memory().unwrap()),
+            )
+        } else {
+            let shared = Arc::new(bridge_store::sqlite::SqliteStore::open_in_memory().unwrap());
+            (shared.clone(), shared)
+        };
     let session_store: Arc<dyn SessionStore> = Arc::new(FakeSessionStore::default());
     let policy: Arc<dyn PolicyEngine> = Arc::new(AllowPolicy);
     let mut workflows = HashMap::new();
@@ -268,6 +456,7 @@ fn fixture() -> Fixture {
             Arc::new(bridge_observ::NoopObserver),
             3,
         )
+        .with_workflow_history(Ok(workflow_history))
         .with_permission_registry(perm_registry.clone()),
     );
     Fixture {
@@ -283,6 +472,20 @@ fn text_body(reply: &Value) -> Value {
 
 fn req(id: i64, method: &str, params: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+}
+
+fn with_attempt_identity(mut arguments: Value) -> Value {
+    let identity = AttemptIdentity::initial().unwrap();
+    let object = arguments.as_object_mut().unwrap();
+    object.insert(
+        "execution_id".into(),
+        Value::String(identity.execution_id.as_str().to_owned()),
+    );
+    object.insert(
+        "attempt_id".into(),
+        Value::String(identity.attempt_id.as_str().to_owned()),
+    );
+    arguments
 }
 
 fn initialize_reqs() -> Vec<Value> {
@@ -362,21 +565,87 @@ async fn initialize_echoes_version_and_lists_tools() {
 }
 
 #[tokio::test]
+async fn framed_tools_call_prompt_barrier_cleans_up_before_one_terminal_write() {
+    for (fail_release, expected_cleanup, expected_releases) in
+        [(false, "complete", 1), (true, "failed", 2)]
+    {
+        let fixture = prompt_barrier_fixture(fail_release);
+        let identity = AttemptIdentity::initial().unwrap();
+        let mut requests = initialize_reqs();
+        requests.push(req(
+            2,
+            "tools/call",
+            json!({
+                "name": "run",
+                "arguments": {
+                    "input": "must remain unpolled",
+                    "agent": "codex",
+                    "cwd": "/tmp/repo",
+                    "execution_id": identity.execution_id.as_str(),
+                    "attempt_id": identity.attempt_id.as_str(),
+                }
+            }),
+        ));
+
+        let replies = run_session(fixture.coord.clone(), requests).await;
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[1]["result"]["isError"], true);
+        assert_eq!(
+            replies[1]["result"]["content"][0]["text"],
+            "durable evidence unavailable: io"
+        );
+        assert_eq!(fixture.backend.prompts(), 0);
+        assert_eq!(
+            fixture.history.releases_at_terminal.load(Ordering::SeqCst),
+            1,
+            "the prompt barrier must make exactly one release attempt before terminalization",
+        );
+        // The prompt barrier owns one generation-bound checked release. If it
+        // fails, the cleanup-failed tombstone is retried exactly once when this
+        // process-level harness sends EOF and runs shutdown.
+        assert_eq!(fixture.backend.releases(), expected_releases);
+        assert_eq!(fixture.history.marks.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.history.terminals.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.observer.started.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.observer.finished.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.observer.stopped.load(Ordering::SeqCst), 0);
+
+        let rows = fixture
+            .history
+            .completed_between(0, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reservation.identity, identity);
+        assert_eq!(
+            rows[0].reservation.surface,
+            bridge_core::workflow_history::ExecutionSurface::Mcp
+        );
+        assert_eq!(rows[0].terminal.terminal_reason, "prompt_barrier_failed");
+        assert_eq!(rows[0].terminal.cleanup_disposition, expected_cleanup);
+        assert_eq!(rows[0].terminal.prompt_acceptance, "unknown");
+    }
+}
+
+#[tokio::test]
 async fn tools_call_inject_queues_for_existing_context() {
     let fixture = fixture();
     let out = fixture
         .coord
-        .prompt(bridge_coordinator::params::OpParams {
-            workflow: None,
-            skill: None,
-            input: "hello".into(),
-            context: None,
-            agent: Some(AgentId::parse("codex").unwrap()),
-            model: None,
-            effort: None,
-            mode: None,
-            cwd: Some("/tmp/repo".into()),
-        })
+        .prompt_with_identity(
+            bridge_coordinator::params::OpParams {
+                workflow: None,
+                skill: None,
+                input: "hello".into(),
+                context: None,
+                agent: Some(AgentId::parse("codex").unwrap()),
+                model: None,
+                effort: None,
+                mode: None,
+                cwd: Some("/tmp/repo".into()),
+            },
+            AttemptIdentity::initial().unwrap(),
+        )
         .await
         .unwrap();
     let mut reqs = initialize_reqs();
@@ -455,12 +724,19 @@ async fn tools_call_permit_resolves_pending_permission() {
 #[tokio::test]
 async fn tools_call_run_workflow_returns_task_id() {
     let mut reqs = initialize_reqs();
+    let identity = AttemptIdentity::initial().unwrap();
     reqs.push(req(
         2,
         "tools/call",
         json!({
             "name": "run_workflow",
-            "arguments": { "workflow": "code-review", "input": "---\ntask-type: freeform\n---\nreview this", "cwd": "/tmp/repo" }
+            "arguments": {
+                "workflow": "code-review",
+                "input": "---\ntask-type: freeform\n---\nreview this",
+                "cwd": "/tmp/repo",
+                "execution_id": identity.execution_id.as_str(),
+                "attempt_id": identity.attempt_id.as_str()
+            }
         }),
     ));
     let replies = run_session(fixture().coord, reqs).await;
@@ -468,10 +744,40 @@ async fn tools_call_run_workflow_returns_task_id() {
     // initialize + tools/call -> 2 replies (notifications/initialized has none).
     assert_eq!(replies.len(), 2);
     let body = text_body(&replies[1]);
-    let task_id = body["task_id"].as_str().unwrap();
-    assert!(
-        !task_id.is_empty(),
-        "run_workflow returns a task id, got {task_id:?}"
+    assert_eq!(body["task_id"], identity.execution_id.as_str());
+    assert_eq!(body["execution_id"], identity.execution_id.as_str());
+    assert_eq!(body["attempt_id"], identity.attempt_id.as_str());
+    assert_eq!(body["attempt_ordinal"], identity.ordinal);
+    assert_eq!(
+        body["parent_attempt_id"],
+        serde_json::to_value(identity.parent_attempt_id).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn split_task_and_history_authority_refuses_workflow_before_prompt() {
+    let fixture = split_storage_fixture();
+    let mut reqs = initialize_reqs();
+    reqs.push(req(
+        2,
+        "tools/call",
+        json!({
+            "name": "run_workflow",
+            "arguments": with_attempt_identity(json!({
+                "workflow": "code-review",
+                "input": "---\ntask-type: freeform\n---\nreview this",
+                "cwd": "/tmp/repo"
+            }))
+        }),
+    ));
+
+    let replies = run_session(fixture.coord.clone(), reqs).await;
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[1]["result"]["isError"], true);
+    assert_eq!(
+        fixture.backend.prompts(),
+        0,
+        "split authority must refuse before any provider prompt effect"
     );
 }
 
@@ -526,7 +832,7 @@ async fn clean_eof_triggers_shutdown() {
     reqs.push(req(
         2,
         "tools/call",
-        json!({ "name": "run", "arguments": { "input": "hello", "cwd": "/tmp/repo" } }),
+        json!({ "name": "run", "arguments": with_attempt_identity(json!({ "input": "hello", "cwd": "/tmp/repo" })) }),
     ));
     // After run_session returns, serve has already hit EOF -> shutdown() -> returned.
     let replies = run_session(coord.clone(), reqs).await;

@@ -29,6 +29,7 @@ use bridge_core::orch::{OrchEventKind, UsageSnapshot};
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, BackendObservers, PolicyEngine, Resolved, RichEventSink, Update,
 };
+use bridge_core::workflow_history::WorkflowHistoryStore;
 use bridge_core::SessionCwd;
 use bridge_registry::registry::Registry;
 use futures::StreamExt;
@@ -52,6 +53,33 @@ const MAX_ARTIFACT_TEXT_BYTES: usize = 16 * 1024;
 const MAX_CATALOG_ENTRIES: usize = 128;
 const MAX_CATALOG_VALUE_BYTES: usize = 256;
 const MAX_CATALOG_TOTAL_BYTES: usize = 64 * 1024;
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_WORKFLOW_OBSERVER: Arc<dyn bridge_core::ports::Observer>;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_RESOLVED_BACKEND: Arc<dyn AgentBackend>;
+}
+
+fn smoke_resolved_backend(default: Arc<dyn AgentBackend>) -> Arc<dyn AgentBackend> {
+    #[cfg(test)]
+    if let Ok(backend) = TEST_RESOLVED_BACKEND.try_with(Arc::clone) {
+        return backend;
+    }
+    default
+}
+
+fn smoke_workflow_observer() -> Arc<dyn bridge_core::ports::Observer> {
+    #[cfg(test)]
+    if let Ok(observer) = TEST_WORKFLOW_OBSERVER.try_with(Arc::clone) {
+        return observer;
+    }
+
+    Arc::new(bridge_observ::NoopObserver)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FallbackSmokeGuard {
@@ -456,6 +484,8 @@ struct BridgeIdentity {
 #[derive(Serialize)]
 struct AttemptRecord {
     id: String,
+    execution_id: bridge_core::ids::ExecutionId,
+    attempt_id: bridge_core::ids::AttemptId,
     timeout_secs: u64,
     started_at_ms: i64,
     ended_at_ms: i64,
@@ -736,6 +766,68 @@ pub(crate) fn ordinary_pre_spawn_cleanup_wire_value() -> Value {
         .expect("the fixed smoke cleanup record is serializable")
 }
 
+type SmokeHistoryGuard = bridge_coordinator::DirectAttemptHandle;
+
+fn cleanup_disposition(record: &CleanupRecord) -> &'static str {
+    let steps = [record.cancel, record.release, record.retire];
+    if steps
+        .iter()
+        .any(|step| matches!(*step, "failed" | "timed_out"))
+    {
+        return "failed";
+    }
+    if steps.iter().all(|step| *step == "not_needed") && record.run_scoped_backstop == "not_needed"
+    {
+        return "not_needed";
+    }
+    if record.run_scoped_backstop != "not_needed" {
+        return "unknown";
+    }
+    if steps
+        .iter()
+        .all(|step| matches!(*step, "completed" | "not_needed"))
+    {
+        "complete"
+    } else {
+        "unknown"
+    }
+}
+
+async fn finalize_smoke_with_history(
+    mut history: SmokeHistoryGuard,
+    mut state: ArtifactState,
+    include_redacted_stderr: bool,
+) -> SmokeArtifactV2 {
+    let cleanup_disposition = cleanup_disposition(&state.artifact.cleanup);
+    if let Err(error) = history
+        .finish_with_completeness(
+            "failed",
+            "pre_effect_refusal",
+            true,
+            cleanup_disposition,
+            false,
+        )
+        .await
+    {
+        state.artifact.success = false;
+        let accepted = state.artifact.attempt.prompt_may_have_been_accepted;
+        if state.failure.is_none() {
+            state.fail_static(
+                DiagnosticPhase::Teardown,
+                DiagnosticFailureClass::Persistence,
+                "smoke.durable_evidence_unavailable",
+                "Smoke terminal evidence could not be persisted",
+                accepted,
+            );
+        }
+        tracing::warn!(
+            reason = error.client_message(),
+            "smoke terminal evidence unavailable"
+        );
+    }
+    state.finalize(include_redacted_stderr).await
+}
+
 struct ArtifactState {
     artifact: SmokeArtifactV2,
     failure: Option<FailureDiagnostic>,
@@ -750,6 +842,8 @@ impl ArtifactState {
             std::process::id(),
             crate::implement::nonce(8)
         );
+        let identity = bridge_core::ids::AttemptIdentity::initial()
+            .expect("operating-system secure randomness is available");
         Self {
             artifact: SmokeArtifactV2 {
                 schema_version: 2,
@@ -760,6 +854,8 @@ impl ArtifactState {
                 },
                 attempt: AttemptRecord {
                     id: id.clone(),
+                    execution_id: identity.execution_id,
+                    attempt_id: identity.attempt_id,
                     timeout_secs: args.timeout_secs,
                     started_at_ms: now,
                     ended_at_ms: now,
@@ -1194,12 +1290,14 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_one(
     backend: Arc<dyn AgentBackend>,
     session: &SessionId,
     spec: &SessionSpec,
     observer: Arc<InMemoryDiagnosticObserver>,
     rich: Arc<SmokeRichSink>,
+    mut history: Option<&mut SmokeHistoryGuard>,
     deadline: tokio::time::Instant,
     fallback_cwd: Option<&crate::local_file::PinnedDirectory>,
 ) -> DrainResult {
@@ -1263,20 +1361,28 @@ async fn execute_one(
 
     let rich_dyn: Arc<dyn RichEventSink> = rich.clone();
     let diagnostic_dyn: Arc<dyn bridge_core::ports::DiagnosticObserver> = observer;
-    let stream = match deadline_first(
-        deadline,
-        backend.prompt_with_observers(
-            session,
-            vec![Part {
-                text: FIXED_PROMPT.to_owned(),
-            }],
-            BackendObservers::new(diagnostic_dyn, Some(rich_dyn)),
-        ),
-    )
-    .await
-    {
-        DeadlineFirst::TimedOut { future_polled } => {
-            turn.prompt_calls = u8::from(future_polled);
+    let provider_prompt_polled = std::sync::atomic::AtomicBool::new(false);
+    let prompt = async {
+        if let Some(history) = history.as_deref_mut() {
+            history.mark_prompt_dispatch().await?;
+        }
+        // This store occurs immediately before constructing and polling the
+        // provider future in the same async poll.
+        provider_prompt_polled.store(true, Ordering::Relaxed);
+        backend
+            .prompt_with_observers(
+                session,
+                vec![Part {
+                    text: FIXED_PROMPT.to_owned(),
+                }],
+                BackendObservers::new(diagnostic_dyn, Some(rich_dyn)),
+            )
+            .await
+    };
+    let stream = match deadline_first(deadline, prompt).await {
+        DeadlineFirst::TimedOut { .. } => {
+            let provider_polled = provider_prompt_polled.load(Ordering::Relaxed);
+            turn.prompt_calls = u8::from(provider_polled);
             turn.terminal_state = "timeout";
             return DrainResult {
                 turn,
@@ -1286,18 +1392,31 @@ async fn execute_one(
                 deadline_timeout: Some(DeadlineTimeoutContext {
                     failed_phase: DiagnosticPhase::PromptStart,
                     last_completed_phase: Some(DiagnosticPhase::ConfigApply),
-                    prompt_may_have_been_accepted: future_polled,
+                    prompt_may_have_been_accepted: provider_polled,
                 }),
             };
         }
         DeadlineFirst::Completed(Err(error)) => {
-            turn.prompt_calls = 1;
-            turn.terminal_state = "prompt_failed";
+            let provider_polled = provider_prompt_polled.load(Ordering::Relaxed);
+            turn.prompt_calls = u8::from(provider_polled);
+            turn.terminal_state = if provider_polled {
+                "prompt_failed"
+            } else {
+                "durable_evidence_failed"
+            };
             return DrainResult {
                 turn,
                 configure_calls,
                 error: Some(error),
-                static_failure: None,
+                static_failure: (!provider_polled).then(|| {
+                    static_failure(
+                        DiagnosticPhase::PromptStart,
+                        DiagnosticFailureClass::Persistence,
+                        "smoke.durable_evidence_unavailable",
+                        "Smoke prompt-dispatch evidence could not be persisted",
+                        false,
+                    )
+                }),
                 deadline_timeout: None,
             };
         }
@@ -1729,6 +1848,11 @@ fn apply_cleanup_outcome(state: &mut ArtifactState, primary_failed: bool, cleanu
 
 async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     let mut state = ArtifactState::new(args);
+    eprintln!(
+        "execution_id={}",
+        state.artifact.attempt.execution_id.as_str()
+    );
+    eprintln!("attempt_id={}", state.artifact.attempt.attempt_id.as_str());
 
     let config_file = match crate::local_file::read_regular_file_bounded(
         &args.config,
@@ -1797,6 +1921,82 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             return state.finalize(args.include_redacted_stderr).await;
         }
     };
+    let cfg = match crate::config::RegistryConfig::parse(raw) {
+        Ok(cfg) => cfg,
+        Err(_) => {
+            state.fail_static(
+                DiagnosticPhase::Resolve,
+                DiagnosticFailureClass::Config,
+                "smoke.config_load",
+                "Smoke config could not be loaded",
+                false,
+            );
+            return state.finalize(args.include_redacted_stderr).await;
+        }
+    };
+    let history_selection: bridge_coordinator::WorkflowHistorySelection = match cfg.store.as_ref() {
+        Some(store) => {
+            let base = config_path.parent().unwrap_or_else(|| Path::new("."));
+            let path = Path::new(&store.path);
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                base.join(path)
+            };
+            let opened = bridge_store::sqlite::SqliteStore::open_shared_history(&path)
+                .map(|store| Arc::new(store) as Arc<dyn WorkflowHistoryStore>)
+                .map_err(|error| error.reason);
+            #[cfg(test)]
+            crate::history_route_witness("Smoke", "ConfiguredShared");
+            opened
+        }
+        None => {
+            let opened = bridge_store::sqlite::select_platform_history()
+                .and_then(|selection| selection.open_concurrent())
+                .map(|store| Arc::new(store) as Arc<dyn WorkflowHistoryStore>)
+                .map_err(|error| error.reason);
+            #[cfg(test)]
+            crate::history_route_witness("Smoke", "SelectedConcurrent");
+            opened
+        }
+    };
+    let identity = bridge_core::ids::AttemptIdentity {
+        execution_id: state.artifact.attempt.execution_id.clone(),
+        attempt_id: state.artifact.attempt.attempt_id.clone(),
+        ordinal: 0,
+        parent_attempt_id: None,
+    };
+    let mut history_guard = match bridge_coordinator::admit_direct_attempt_with_history(
+        history_selection,
+        smoke_workflow_observer(),
+        identity,
+        bridge_core::workflow_history::ExecutionSurface::Smoke,
+        "smoke",
+        "direct",
+        "fixed_pong".into(),
+        false,
+        bridge_core::task_store::system_wall_now_ms(),
+        "smoke_aborted",
+    )
+    .await
+    {
+        Ok(history) => history,
+        Err(_) => {
+            state.fail_static(
+                DiagnosticPhase::Resolve,
+                DiagnosticFailureClass::Persistence,
+                "smoke.durable_evidence_unavailable",
+                "Smoke durable evidence admission was refused",
+                false,
+            );
+            tracing::warn!(
+                reason = "durable_evidence_unavailable",
+                "smoke durable evidence admission refused"
+            );
+            return state.finalize(args.include_redacted_stderr).await;
+        }
+    };
+
     let snapshot = match crate::validate_registry_config_contents(raw) {
         Ok(snapshot) => snapshot,
         Err(_) => {
@@ -1807,7 +2007,8 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
                 "Smoke config could not be loaded",
                 false,
             );
-            return state.finalize(args.include_redacted_stderr).await;
+            return finalize_smoke_with_history(history_guard, state, args.include_redacted_stderr)
+                .await;
         }
     };
 
@@ -1821,7 +2022,8 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
                 "Selected smoke agent is not configured",
                 false,
             );
-            return state.finalize(args.include_redacted_stderr).await;
+            return finalize_smoke_with_history(history_guard, state, args.include_redacted_stderr)
+                .await;
         }
     };
     // Once the selected entry is known, every later return must sanitize request fields with that
@@ -1845,7 +2047,8 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             "Fallback smoke target is no longer an eligible host ACP entry",
             false,
         );
-        return state.finalize(args.include_redacted_stderr).await;
+        return finalize_smoke_with_history(history_guard, state, args.include_redacted_stderr)
+            .await;
     }
     let session_cwd = match args.session_cwd.as_deref() {
         Some(path) => match canonical_session_cwd(path) {
@@ -1861,7 +2064,12 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
                     "Smoke session cwd is not an existing directory",
                     false,
                 );
-                return state.finalize(args.include_redacted_stderr).await;
+                return finalize_smoke_with_history(
+                    history_guard,
+                    state,
+                    args.include_redacted_stderr,
+                )
+                .await;
             }
         },
         None => None,
@@ -1876,7 +2084,8 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
                 "Fallback smoke cwd identity changed after planning",
                 false,
             );
-            return state.finalize(args.include_redacted_stderr).await;
+            return finalize_smoke_with_history(history_guard, state, args.include_redacted_stderr)
+                .await;
         }
         let pin = match crate::local_file::PinnedDirectory::open(
             Path::new(guard.expected_session_cwd.as_str()),
@@ -1893,7 +2102,12 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
                     "Fallback smoke cwd identity changed after planning",
                     false,
                 );
-                return state.finalize(args.include_redacted_stderr).await;
+                return finalize_smoke_with_history(
+                    history_guard,
+                    state,
+                    args.include_redacted_stderr,
+                )
+                .await;
             }
         };
         pinned_session_cwd = Some(pin);
@@ -1927,7 +2141,8 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
                 "Fallback smoke source mount identity or containment changed after planning",
                 false,
             );
-            return state.finalize(args.include_redacted_stderr).await;
+            return finalize_smoke_with_history(history_guard, state, args.include_redacted_stderr)
+                .await;
         }
     }
 
@@ -1956,7 +2171,8 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             "Claude OAuth credential is stale or lacks safe preflight runway",
             false,
         );
-        return state.finalize(args.include_redacted_stderr).await;
+        return finalize_smoke_with_history(history_guard, state, args.include_redacted_stderr)
+            .await;
     }
 
     let overrides = AgentOverride {
@@ -1990,7 +2206,8 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
                 "Smoke run lease could not be acquired",
                 false,
             );
-            return state.finalize(args.include_redacted_stderr).await;
+            return finalize_smoke_with_history(history_guard, state, args.include_redacted_stderr)
+                .await;
         }
     };
     let run = bridge_core::run_identity::RunHandle {
@@ -2029,7 +2246,8 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             }
             drop(run_guard);
             drop(lease);
-            return state.finalize(args.include_redacted_stderr).await;
+            return finalize_smoke_with_history(history_guard, state, args.include_redacted_stderr)
+                .await;
         }
     };
 
@@ -2047,7 +2265,8 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         drop(registry);
         drop(run_guard);
         drop(lease);
-        return state.finalize(args.include_redacted_stderr).await;
+        return finalize_smoke_with_history(history_guard, state, args.include_redacted_stderr)
+            .await;
     }
 
     // The absolute deadline already covers provenance and recovery. Cleanup has its own short bounded
@@ -2071,7 +2290,8 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             drop(registry);
             drop(run_guard);
             drop(lease);
-            return state.finalize(args.include_redacted_stderr).await;
+            return finalize_smoke_with_history(history_guard, state, args.include_redacted_stderr)
+                .await;
         }
         ResolveOnce::Failed(error) => {
             state.artifact.attempt.timed_out = is_timeout_failure(&error);
@@ -2082,12 +2302,13 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             drop(registry);
             drop(run_guard);
             drop(lease);
-            return state.finalize(args.include_redacted_stderr).await;
+            return finalize_smoke_with_history(history_guard, state, args.include_redacted_stderr)
+                .await;
         }
         ResolveOnce::Resolved(resolved) => resolved,
     };
 
-    let backend = Arc::clone(&resolved.backend);
+    let backend = smoke_resolved_backend(Arc::clone(&resolved.backend));
     let session = SessionId::parse(state.artifact.session.id.clone())
         .expect("generated non-empty smoke session id");
     let rich = Arc::new(SmokeRichSink::default());
@@ -2097,6 +2318,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
         &spec,
         Arc::clone(&state.observer),
         rich,
+        Some(&mut history_guard),
         deadline,
         pinned_session_cwd.as_ref(),
     )
@@ -2122,6 +2344,38 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     drop(registry);
     drop(run_guard);
     drop(lease);
+    let outcome = if state.artifact.success {
+        "completed"
+    } else {
+        "failed"
+    };
+    let cleanup_disposition = cleanup_disposition(&state.artifact.cleanup);
+    if let Err(error) = history_guard
+        .finish_with_completeness(
+            outcome,
+            state.artifact.turn.terminal_state,
+            !state.artifact.success,
+            cleanup_disposition,
+            false,
+        )
+        .await
+    {
+        state.artifact.success = false;
+        let accepted = state.artifact.attempt.prompt_may_have_been_accepted;
+        if state.failure.is_none() {
+            state.fail_static(
+                DiagnosticPhase::Teardown,
+                DiagnosticFailureClass::Persistence,
+                "smoke.durable_evidence_unavailable",
+                "Smoke terminal evidence could not be persisted",
+                accepted,
+            );
+        }
+        tracing::warn!(
+            reason = error.client_message(),
+            "smoke terminal evidence unavailable"
+        );
+    }
     state.finalize(args.include_redacted_stderr).await
 }
 
@@ -2605,6 +2859,32 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct WorkflowLifecycleObserver {
+        started: AtomicUsize,
+        finished: AtomicUsize,
+        stopped: AtomicUsize,
+    }
+
+    impl bridge_core::ports::Observer for WorkflowLifecycleObserver {
+        fn record(&self, _event: &bridge_core::ports::ObsEvent<'_>) {}
+
+        fn record_workflow(&self, event: &bridge_core::ports::WorkflowObsEvent<'_>) {
+            match event {
+                bridge_core::ports::WorkflowObsEvent::Started { .. } => {
+                    self.started.fetch_add(1, Ordering::SeqCst);
+                }
+                bridge_core::ports::WorkflowObsEvent::Finished { .. } => {
+                    self.finished.fetch_add(1, Ordering::SeqCst);
+                }
+                bridge_core::ports::WorkflowObsEvent::Stopped { .. } => {
+                    self.stopped.fetch_add(1, Ordering::SeqCst);
+                }
+                bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable { .. } => {}
+            }
+        }
+    }
+
     fn args() -> SmokeArgs {
         SmokeArgs {
             agent: AgentId::parse("test").unwrap(),
@@ -2717,11 +2997,244 @@ mod tests {
             &SessionSpec::from_config(EffectiveConfig::default()),
             observer(),
             Arc::new(SmokeRichSink::default()),
+            None,
             tokio::time::Instant::now() + timeout,
             None,
         )
         .await;
         (backend, result)
+    }
+
+    #[tokio::test]
+    async fn run_attempt_prompt_barrier_uses_real_registry_cleanup_and_finalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("history.sqlite");
+        let config_path = dir.path().join("bridge.toml");
+        drop(bridge_store::sqlite::SqliteStore::open_shared_history(&store_path).unwrap());
+
+        let fault = rusqlite::Connection::open(&store_path).unwrap();
+        fault
+            .execute_batch(
+                "CREATE TABLE smoke_barrier_audit (
+                     terminal_writes INTEGER NOT NULL
+                 );
+                 INSERT INTO smoke_barrier_audit VALUES (0);
+                 CREATE TRIGGER fail_smoke_prompt_barrier
+                 BEFORE UPDATE OF prompt_acceptance ON workflow_attempt_summaries
+                 WHEN NEW.prompt_acceptance = 'dispatch_uncertain'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected smoke prompt barrier failure');
+                 END;
+                 CREATE TRIGGER count_smoke_terminal_write
+                 AFTER UPDATE OF terminal_json ON workflow_attempt_summaries
+                 WHEN OLD.terminal_json IS NULL AND NEW.terminal_json IS NOT NULL
+                 BEGIN
+                     UPDATE smoke_barrier_audit
+                     SET terminal_writes = terminal_writes + 1;
+                 END;",
+            )
+            .unwrap();
+        drop(fault);
+
+        fs::write(
+            &config_path,
+            format!(
+                "default = \"test\"\nallowed_cwd_root = {:?}\n\n\
+                 [server]\naddr = \"127.0.0.1:0\"\n\n\
+                 [registry]\nallowed_cmds = []\n\n\
+                 [store]\npath = {:?}\n\n\
+                 [[agents]]\nid = \"test\"\nkind = \"api\"\n\
+                 base_url = \"http://127.0.0.1:9/v1\"\nmodel = \"fake-model\"\n",
+                dir.path(),
+                store_path,
+            ),
+        )
+        .unwrap();
+        crate::validate_registry_config_contents(&fs::read_to_string(&config_path).unwrap())
+            .expect("run_attempt prompt-barrier fixture must be valid");
+
+        let mut smoke_args = args();
+        smoke_args.config = config_path;
+        let lifecycle = Arc::new(WorkflowLifecycleObserver::default());
+        let lifecycle_dyn: Arc<dyn bridge_core::ports::Observer> = lifecycle.clone();
+        let artifact = TEST_WORKFLOW_OBSERVER
+            .scope(lifecycle_dyn, run_attempt(&smoke_args))
+            .await;
+
+        assert!(!artifact.success);
+        assert_eq!(artifact.turn.prompt_calls, 0);
+        assert!(!artifact.attempt.prompt_may_have_been_accepted);
+        assert_eq!(artifact.turn.terminal_state, "durable_evidence_failed");
+        assert_eq!(
+            artifact.diagnostics.failure.as_ref().unwrap()["code"],
+            "smoke.durable_evidence_unavailable",
+            "the real caller must preserve the prompt-barrier failure as primary"
+        );
+        assert_eq!(cleanup_disposition(&artifact.cleanup), "unknown");
+        assert_eq!(artifact.cleanup.cancel, "completed");
+        assert_eq!(artifact.cleanup.release, "completed");
+        assert_eq!(artifact.cleanup.retire, "completed");
+        assert_eq!(artifact.cleanup.run_scoped_backstop, "invoked_best_effort");
+
+        assert_eq!(lifecycle.started.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle.finished.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle.stopped.load(Ordering::SeqCst), 0);
+
+        let history =
+            bridge_store::sqlite::SqliteStore::open_history_read_only(&store_path).unwrap();
+        let row = history
+            .attempt(&artifact.attempt.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.reservation.surface,
+            bridge_core::workflow_history::ExecutionSurface::Smoke
+        );
+        let terminal = row.terminal.unwrap();
+        assert_eq!(terminal.terminal_reason, "prompt_barrier_failed");
+        assert_eq!(terminal.prompt_acceptance, "unknown");
+        assert_eq!(terminal.cleanup_disposition, "unknown");
+
+        let audit = rusqlite::Connection::open(&store_path).unwrap();
+        let terminal_writes: i64 = audit
+            .query_row(
+                "SELECT terminal_writes FROM smoke_barrier_audit",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let attempts: i64 = audit
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_attempt_summaries",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_writes, 1);
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn run_attempt_prompt_barrier_persists_failed_cleanup_from_real_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("history.sqlite");
+        let config_path = dir.path().join("bridge.toml");
+        drop(bridge_store::sqlite::SqliteStore::open_shared_history(&store_path).unwrap());
+
+        let fault = rusqlite::Connection::open(&store_path).unwrap();
+        fault
+            .execute_batch(
+                "CREATE TABLE smoke_barrier_audit (
+                     terminal_writes INTEGER NOT NULL
+                 );
+                 INSERT INTO smoke_barrier_audit VALUES (0);
+                 CREATE TRIGGER fail_smoke_prompt_barrier
+                 BEFORE UPDATE OF prompt_acceptance ON workflow_attempt_summaries
+                 WHEN NEW.prompt_acceptance = 'dispatch_uncertain'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected smoke prompt barrier failure');
+                 END;
+                 CREATE TRIGGER count_smoke_terminal_write
+                 AFTER UPDATE OF terminal_json ON workflow_attempt_summaries
+                 WHEN OLD.terminal_json IS NULL AND NEW.terminal_json IS NOT NULL
+                 BEGIN
+                     UPDATE smoke_barrier_audit
+                     SET terminal_writes = terminal_writes + 1;
+                 END;",
+            )
+            .unwrap();
+        drop(fault);
+
+        fs::write(
+            &config_path,
+            format!(
+                "default = \"test\"\nallowed_cwd_root = {:?}\n\n\
+                 [server]\naddr = \"127.0.0.1:0\"\n\n\
+                 [registry]\nallowed_cmds = []\n\n\
+                 [store]\npath = {:?}\n\n\
+                 [[agents]]\nid = \"test\"\nkind = \"api\"\n\
+                 base_url = \"http://127.0.0.1:9/v1\"\nmodel = \"fake-model\"\n",
+                dir.path(),
+                store_path,
+            ),
+        )
+        .unwrap();
+        crate::validate_registry_config_contents(&fs::read_to_string(&config_path).unwrap())
+            .expect("run_attempt prompt-barrier fixture must be valid");
+
+        let mut smoke_args = args();
+        smoke_args.config = config_path;
+        let lifecycle = Arc::new(WorkflowLifecycleObserver::default());
+        let lifecycle_dyn: Arc<dyn bridge_core::ports::Observer> = lifecycle.clone();
+        let backend = Arc::new(FakeBackend::new(Behavior::Exact).with_unaccepted_failing_release());
+        let backend_dyn: Arc<dyn AgentBackend> = backend.clone();
+        let artifact = TEST_WORKFLOW_OBSERVER
+            .scope(
+                lifecycle_dyn,
+                TEST_RESOLVED_BACKEND.scope(backend_dyn, run_attempt(&smoke_args)),
+            )
+            .await;
+
+        assert!(!artifact.success);
+        assert_eq!(artifact.turn.prompt_calls, 0);
+        assert!(!artifact.attempt.prompt_may_have_been_accepted);
+        assert_eq!(artifact.turn.terminal_state, "durable_evidence_failed");
+        assert_eq!(
+            artifact.diagnostics.failure.as_ref().unwrap()["code"],
+            "smoke.durable_evidence_unavailable",
+            "cleanup failure must remain secondary to the prompt barrier"
+        );
+        assert_eq!(cleanup_disposition(&artifact.cleanup), "failed");
+        assert_eq!(artifact.cleanup.cancel, "completed");
+        assert_eq!(artifact.cleanup.release, "failed");
+        assert_eq!(artifact.cleanup.retire, "completed");
+        assert_eq!(artifact.cleanup.run_scoped_backstop, "invoked_best_effort");
+        assert_eq!(backend.configure_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.prompt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.cancel_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.release_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.retire_calls.load(Ordering::SeqCst), 1);
+
+        assert_eq!(lifecycle.started.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle.finished.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle.stopped.load(Ordering::SeqCst), 0);
+
+        let history =
+            bridge_store::sqlite::SqliteStore::open_history_read_only(&store_path).unwrap();
+        let row = history
+            .attempt(&artifact.attempt.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.reservation.surface,
+            bridge_core::workflow_history::ExecutionSurface::Smoke
+        );
+        let terminal = row.terminal.unwrap();
+        assert_eq!(terminal.terminal_reason, "prompt_barrier_failed");
+        assert_eq!(terminal.prompt_acceptance, "unknown");
+        assert_eq!(terminal.cleanup_disposition, "failed");
+        assert!(terminal.degraded);
+        assert!(!terminal.telemetry_complete);
+
+        let audit = rusqlite::Connection::open(&store_path).unwrap();
+        let terminal_writes: i64 = audit
+            .query_row(
+                "SELECT terminal_writes FROM smoke_barrier_audit",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let attempts: i64 = audit
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_attempt_summaries",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_writes, 1);
+        assert_eq!(attempts, 1);
     }
 
     #[test]
@@ -3088,6 +3601,7 @@ mod tests {
             },
             observer(),
             Arc::new(SmokeRichSink::default()),
+            None,
             tokio::time::Instant::now() + Duration::from_secs(1),
             Some(&pin),
         )
@@ -3140,6 +3654,7 @@ mod tests {
             &spec,
             observer(),
             Arc::new(SmokeRichSink::default()),
+            None,
             tokio::time::Instant::now() - Duration::from_millis(1),
             None,
         )
@@ -3185,6 +3700,7 @@ mod tests {
             &spec,
             observer(),
             Arc::new(SmokeRichSink::default()),
+            None,
             tokio::time::Instant::now() + Duration::from_millis(100),
             None,
         )
@@ -3235,6 +3751,7 @@ mod tests {
             &spec,
             observer(),
             Arc::new(SmokeRichSink::default()),
+            None,
             tokio::time::Instant::now() + Duration::from_millis(100),
             None,
         )
@@ -3647,6 +4164,34 @@ mod tests {
 
     #[tokio::test]
     async fn early_failure_artifact_redacts_selected_entry_credentials_from_request() {
+        if std::env::var_os("A2A_BRIDGE_TEST_FRESH_SMOKE_HISTORY").is_none() {
+            let platform = tempfile::tempdir().unwrap();
+            let state_root = platform.path().join("missing").join("platform-state");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg(
+                    "smoke::tests::early_failure_artifact_redacts_selected_entry_credentials_from_request",
+                )
+                .arg("--exact")
+                .arg("--nocapture")
+                .env_remove("HOME")
+                .env_remove("XDG_STATE_HOME")
+                .env("A2A_BRIDGE_STATE_DIR", &state_root)
+                .env("A2A_BRIDGE_TEST_FRESH_SMOKE_HISTORY", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fresh-root smoke secrecy regression failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                state_root.join("workflow-history.sqlite").is_file(),
+                "the production no-store smoke path did not persist terminal evidence"
+            );
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("bridge.toml");
         let secret = "selected-entry-mcp-secret";
@@ -3681,6 +4226,25 @@ mod tests {
         assert!(
             !rendered.contains(secret),
             "early failure leaked selected-entry credential: {rendered}"
+        );
+        let history_path = bridge_store::sqlite::platform_history_path().unwrap();
+        let history =
+            bridge_store::sqlite::SqliteStore::open_history_read_only(&history_path).unwrap();
+        let row = history
+            .attempt(&artifact.attempt.attempt_id)
+            .await
+            .unwrap()
+            .expect("the terminal smoke attempt must be durable");
+        let terminal = row
+            .terminal
+            .as_ref()
+            .expect("the early session-cwd refusal must be terminal");
+        assert_eq!(terminal.outcome, "failed");
+        assert_eq!(terminal.terminal_reason, "pre_effect_refusal");
+        assert_eq!(terminal.prompt_acceptance, "not_dispatched");
+        assert!(
+            !serde_json::to_string(&row).unwrap().contains(secret),
+            "durable terminal evidence leaked the selected-entry credential"
         );
     }
 

@@ -36,6 +36,10 @@ use tower::ServiceExt;
 struct FanoutSkillRoute;
 
 impl RouteDecision for FanoutSkillRoute {
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        self.route(meta).map(Some)
+    }
+
     fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
         if meta.skill.as_deref() == Some("fan-out") {
             Ok(RouteTarget::Fanout)
@@ -254,7 +258,7 @@ fn build_fanout_server(peer_url: &str) -> axum::Router {
     ));
 
     let server = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             common::single_agent_registry("kiro", backend),
             store,
             policy,

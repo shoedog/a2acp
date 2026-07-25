@@ -9,7 +9,9 @@ pub mod session_manager;
 pub mod turn_parts;
 
 pub use batch::{is_settleable, summarize_batch, BatchDeps, BatchRuntime};
-pub use coordinator::Coordinator;
+pub use coordinator::{
+    admit_direct_attempt_with_history, Coordinator, DirectAttemptHandle, WorkflowHistorySelection,
+};
 pub use detached::{
     drain_workflow, now_ms, project_orch_frame, DetachedProgressSink, DetachedRichSink,
     DetachedRichSinkFactory, Finalizer, FrameKind, Phase, TaskProgressHub, TerminalOutcome,

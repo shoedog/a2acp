@@ -37,6 +37,10 @@ use tower::ServiceExt;
 struct DelegateSkillRoute;
 
 impl RouteDecision for DelegateSkillRoute {
+    fn route_before_default(&self, meta: &TaskMeta) -> Result<Option<RouteTarget>, BridgeError> {
+        self.route(meta).map(Some)
+    }
+
     fn route(&self, meta: &TaskMeta) -> Result<RouteTarget, BridgeError> {
         if meta.skill.as_deref() == Some("delegate") {
             Ok(RouteTarget::Delegate)
@@ -263,7 +267,7 @@ async fn delegate_skill_round_trips_through_peer() {
     let backend = Arc::new(PanicBackend);
 
     let server = Arc::new(InboundServer::from_coordinator(
-        bridge_a2a_inbound::server::coordinator_over(
+        bridge_a2a_inbound::server::test_coordinator_over_in_memory_history(
             common::single_agent_registry("kiro", backend),
             store,
             policy,
