@@ -11,7 +11,7 @@ HOW TO MERGE:
 - If a reviewer reported an error marker instead of a review (a node failed), note the lens is missing and synthesize from the lens that succeeded.
 
 OUTPUT FORMAT:
-A single prioritized list, **BLOCKER → MAJOR → MINOR**, each with location, the issue, and the fix. Then a one-line overall verdict (e.g. "ship after fixing the 2 BLOCKERs").
+A single prioritized list, **BLOCKER → MAJOR → MINOR**, each with location, the issue, and the fix. Then a one-line overall verdict (e.g. "ship after fixing the 2 BLOCKERs"). Only BLOCKER findings that name a concrete failing scenario may gate the verdict; MAJOR/MINOR are fix-along advice, never gates. If prior-round findings are included in the inputs, first adjudicate each as FIXED / PARTIAL / OPEN — do not re-report fixed items as new.
 
 === CORRECTNESS LENS (default: codex) ===
 {{correctness}}
