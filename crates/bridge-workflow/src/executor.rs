@@ -2,7 +2,7 @@
 //! → prompt → concatenate Update::Text into the node output. Cancel via token.
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::template::render;
-use bridge_core::domain::{effective_config, AgentEntry, Part, SessionSpec};
+use bridge_core::domain::{effective_config, AgentEntry, AgentOverride, Part, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{NodeId, SessionId};
 use bridge_core::orch::UsageSnapshot;
@@ -130,6 +130,22 @@ pub trait WorkflowNodeDispatcher: Send + Sync {
         _observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<NodeTurn, BridgeError> {
         self.checkout(wf_id, node, run_id, ctx).await
+    }
+
+    /// Checkout a warm node turn with executor-selected config overrides.
+    /// Dispatchers that configure model/effort/mode during checkout must forward
+    /// these overrides; the default preserves legacy dispatchers by dropping them.
+    async fn checkout_observed_with_overrides(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        run_id: &str,
+        ctx: &WorkflowRunContext,
+        _overrides: Option<AgentOverride>,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<NodeTurn, BridgeError> {
+        self.checkout_observed(wf_id, node, run_id, ctx, observer)
+            .await
     }
 }
 
@@ -864,14 +880,98 @@ impl WorkflowExecutor {
             let node_obs_ctx = node_turn_context(wf_id, node, run_id, ctx, None, None, None, 0);
             ctx.observer
                 .record(&ObsEvent::NodeStarted { ctx: &node_obs_ctx });
+            let entry_snapshot = self.registry.entry_snapshot(&node.agent);
+            let (checkout_overrides, obs_model, obs_effort, obs_mode) =
+                if let Some(entry) = entry_snapshot.as_ref().filter(|entry| entry.preflight) {
+                    let preflight_decision = match self
+                        .ensure_agent_preflight(
+                            wf_id,
+                            node,
+                            run_id,
+                            ctx,
+                            diagnostic_factory,
+                            cancel,
+                            entry.clone(),
+                            preflight_cache,
+                        )
+                        .await
+                    {
+                        Ok(decision) => decision,
+                        Err(PreflightFailure::Canceled) => {
+                            let outcome = TurnOutcome::Canceled;
+                            ctx.observer.record(&ObsEvent::NodeFinished {
+                                ctx: &node_obs_ctx,
+                                outcome: &outcome,
+                            });
+                            return (
+                                format!("[node {} canceled]", node.id.as_str()),
+                                false,
+                                None,
+                                NodeDisposition::Canceled,
+                            );
+                        }
+                        Err(PreflightFailure::Hard {
+                            message,
+                            failure_class,
+                        }) => {
+                            let outcome = TurnOutcome::Failed(failure_class);
+                            ctx.observer.record(&ObsEvent::NodeFinished {
+                                ctx: &node_obs_ctx,
+                                outcome: &outcome,
+                            });
+                            return (
+                                format!("[node {} failed: {message}]", node.id.as_str()),
+                                false,
+                                None,
+                                NodeDisposition::Failed,
+                            );
+                        }
+                    };
+                    let mut eff = effective_config(entry, None);
+                    eff.model = preflight_decision.selected_model.clone();
+                    let checkout_overrides =
+                        preflight_decision
+                            .substituted_from
+                            .as_ref()
+                            .map(|_| AgentOverride {
+                                model: preflight_decision.selected_model.clone(),
+                                effort: None,
+                                mode: None,
+                            });
+                    (
+                        checkout_overrides,
+                        eff.model.clone(),
+                        eff.effort
+                            .as_ref()
+                            .map(|e| format!("{e:?}").to_ascii_lowercase()),
+                        eff.mode.clone(),
+                    )
+                } else {
+                    (None, None, None, None)
+                };
             let mut attempt = 1_u32;
             let mut empty_final_retried = false;
             loop {
                 let diagnostic = diagnostic_factory.make(&node.id, attempt);
-                let obs_ctx =
-                    node_turn_context(wf_id, node, run_id, ctx, None, None, None, attempt);
+                let obs_ctx = node_turn_context(
+                    wf_id,
+                    node,
+                    run_id,
+                    ctx,
+                    obs_model.clone(),
+                    obs_effort.clone(),
+                    obs_mode.clone(),
+                    attempt,
+                );
                 let mut turn = match d
-                    .checkout_observed(wf_id, node, run_id, ctx, diagnostic.clone())
+                    .checkout_observed_with_overrides(
+                        wf_id,
+                        node,
+                        run_id,
+                        ctx,
+                        checkout_overrides.clone(),
+                        diagnostic.clone(),
+                    )
                     .await
                 {
                     Ok(t) => t,
@@ -3776,6 +3876,10 @@ mod tests {
             self.invalidates.fetch_add(1, Ordering::SeqCst);
         }
 
+        fn entry_snapshot(&self, _id: &AgentId) -> Option<Arc<AgentEntry>> {
+            Some(Arc::new(self.entry.clone()))
+        }
+
         fn list(&self) -> Vec<AgentId> {
             vec![]
         }
@@ -4022,6 +4126,52 @@ mod tests {
         }
     }
 
+    struct PreflightDispatcher {
+        backend: Arc<PreflightBackend>,
+        checkout_models: Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowNodeDispatcher for PreflightDispatcher {
+        async fn checkout(
+            &self,
+            _wf_id: &str,
+            _node: &WorkflowNode,
+            _run_id: &str,
+            _ctx: &WorkflowRunContext,
+        ) -> Result<NodeTurn, BridgeError> {
+            panic!("preflight dispatcher test must use observed override checkout")
+        }
+
+        async fn checkout_observed_with_overrides(
+            &self,
+            _wf_id: &str,
+            _node: &WorkflowNode,
+            _run_id: &str,
+            _ctx: &WorkflowRunContext,
+            overrides: Option<AgentOverride>,
+            _observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<NodeTurn, BridgeError> {
+            self.checkout_models
+                .lock()
+                .unwrap()
+                .push(overrides.and_then(|override_config| override_config.model));
+            Ok(NodeTurn {
+                backend: self.backend.clone(),
+                session: SessionId::parse("workflow-preflight-dispatcher").unwrap(),
+                seed: None,
+                cleanup: Box::new(CompositePathCleanup),
+            })
+        }
+    }
+
+    fn preflight_dispatcher(backend: Arc<PreflightBackend>) -> Arc<PreflightDispatcher> {
+        Arc::new(PreflightDispatcher {
+            backend,
+            checkout_models: Mutex::new(Vec::new()),
+        })
+    }
+
     fn preflight_entry(base: &str, fallbacks: &[&str]) -> bridge_core::domain::AgentEntry {
         let agent = AgentId::parse("codex").unwrap();
         let mut entry = minimal_entry(&agent);
@@ -4118,6 +4268,305 @@ mod tests {
         assert_eq!(
             rec.prompts.lock().unwrap().as_slice(),
             [WORKFLOW_PREFLIGHT_PROMPT, WORKFLOW_PREFLIGHT_PROMPT]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_preflight_runs_before_warm_checkout_when_enabled() {
+        let rec = Arc::new(PreflightRec::default());
+        let backend = Arc::new(PreflightBackend {
+            rec: rec.clone(),
+            pong_models: vec!["good".into()],
+        });
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: preflight_entry("good", &[]),
+            backend: backend.clone(),
+            invalidates: AtomicUsize::new(0),
+        });
+        let dispatcher = preflight_dispatcher(backend);
+
+        let events = WorkflowExecutor::new(registry)
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "dispatcher-preflight".into(),
+                CancellationToken::new(),
+                WorkflowRunContext::default(),
+                dispatcher.clone(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output, _) = node_finished(&events);
+        assert!(
+            *ok,
+            "warm dispatcher real turn should run after preflight: {output}"
+        );
+        assert_eq!(output, "REAL");
+        assert_eq!(
+            rec.prompts.lock().unwrap().clone(),
+            vec![
+                WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+                "echo DIFF".to_string()
+            ]
+        );
+        assert_eq!(
+            dispatcher.checkout_models.lock().unwrap().clone(),
+            vec![None]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_preflight_ladder_substitutes_fallback_and_records_progress() {
+        let rec = Arc::new(PreflightRec::default());
+        let backend = Arc::new(PreflightBackend {
+            rec: rec.clone(),
+            pong_models: vec!["good".into()],
+        });
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: preflight_entry("bad", &["good"]),
+            backend: backend.clone(),
+            invalidates: AtomicUsize::new(0),
+        });
+        let dispatcher = preflight_dispatcher(backend);
+        let rich = Arc::new(ProgressRichSink::default());
+        let ctx = WorkflowRunContext {
+            make_rich_sink: Some(Arc::new(ProgressRichFactory { sink: rich.clone() })),
+            ..WorkflowRunContext::default()
+        };
+
+        let events = WorkflowExecutor::new(registry.clone())
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "dispatcher-preflight-fallback".into(),
+                CancellationToken::new(),
+                ctx,
+                dispatcher.clone(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output, _) = node_finished(&events);
+        assert!(
+            *ok,
+            "fallback-selected warm model should run real turn: {output}"
+        );
+        assert_eq!(output, "REAL");
+        assert_eq!(
+            rec.configured_models.lock().unwrap().as_slice(),
+            [Some("bad".into()), Some("good".into())]
+        );
+        assert_eq!(
+            rec.prompts.lock().unwrap().clone(),
+            vec![
+                WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+                WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+                "echo DIFF".to_string(),
+            ]
+        );
+        assert_eq!(registry.invalidates.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            dispatcher.checkout_models.lock().unwrap().clone(),
+            vec![Some("good".to_string())]
+        );
+        assert!(
+            rich.progress
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|text| text.contains("bad -> good")),
+            "fallback substitution should be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_preflight_ladder_exhaustion_fails_before_checkout() {
+        let rec = Arc::new(PreflightRec::default());
+        let backend = Arc::new(PreflightBackend {
+            rec: rec.clone(),
+            pong_models: vec![],
+        });
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: preflight_entry("bad", &["worse"]),
+            backend: backend.clone(),
+            invalidates: AtomicUsize::new(0),
+        });
+        let dispatcher = preflight_dispatcher(backend);
+
+        let events = WorkflowExecutor::new(registry)
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "dispatcher-preflight-exhausted".into(),
+                CancellationToken::new(),
+                WorkflowRunContext::default(),
+                dispatcher.clone(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output, _) = node_finished(&events);
+        assert!(!*ok);
+        assert!(output.contains("preflight exhausted"), "{output}");
+        assert!(output.contains("model=bad"), "{output}");
+        assert!(output.contains("model=worse"), "{output}");
+        assert_eq!(
+            rec.prompts.lock().unwrap().clone(),
+            vec![
+                WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+                WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+            ]
+        );
+        assert_eq!(dispatcher.checkout_models.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn preflight_cache_is_shared_by_inline_and_dispatcher_paths() {
+        let rec = Arc::new(PreflightRec::default());
+        let backend = Arc::new(PreflightBackend {
+            rec: rec.clone(),
+            pong_models: vec!["good".into()],
+        });
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: preflight_entry("bad", &["good"]),
+            backend: backend.clone(),
+            invalidates: AtomicUsize::new(0),
+        });
+        let executor = WorkflowExecutor::new(registry);
+        let graph = one_node_graph();
+        let node = graph.nodes[0].clone();
+        let vars = HashMap::from([("input", "DIFF")]);
+        let run_id = "shared-preflight-cache";
+        let cancel = CancellationToken::new();
+        let ctx = WorkflowRunContext::default();
+        let diagnostic_factory: Arc<dyn DiagnosticObserverFactory> =
+            Arc::new(RecordingDiagnosticFactory::default());
+        let preflight_cache: PreflightCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let (inline_text, inline_ok, _, _) = executor
+            .run_node(
+                "w",
+                &node,
+                &vars,
+                run_id,
+                &cancel,
+                &ctx,
+                &diagnostic_factory,
+                None,
+                &preflight_cache,
+            )
+            .await;
+        assert!(
+            inline_ok,
+            "inline path should run after fallback preflight: {inline_text}"
+        );
+        assert_eq!(inline_text, "REAL");
+
+        let dispatcher = preflight_dispatcher(backend);
+        let dispatcher_dyn: Arc<dyn WorkflowNodeDispatcher> = dispatcher.clone();
+        let (dispatcher_text, dispatcher_ok, _, _) = executor
+            .run_node(
+                "w",
+                &node,
+                &vars,
+                run_id,
+                &cancel,
+                &ctx,
+                &diagnostic_factory,
+                Some(&dispatcher_dyn),
+                &preflight_cache,
+            )
+            .await;
+        assert!(
+            dispatcher_ok,
+            "dispatcher path should reuse cached preflight: {dispatcher_text}"
+        );
+        assert_eq!(dispatcher_text, "REAL");
+
+        let prompts = rec.prompts.lock().unwrap().clone();
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|prompt| prompt.as_str() == WORKFLOW_PREFLIGHT_PROMPT)
+                .count(),
+            2,
+            "dispatcher path must not run a second smoke ladder: {prompts:?}"
+        );
+        assert_eq!(
+            prompts,
+            vec![
+                WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+                WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+                "echo DIFF".to_string(),
+                "echo DIFF".to_string(),
+            ]
+        );
+        assert_eq!(
+            dispatcher.checkout_models.lock().unwrap().clone(),
+            vec![Some("good".to_string())],
+            "cached fallback decisions must still be forwarded as dispatcher model overrides"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_absent_preflight_config_runs_zero_smoke_turns() {
+        let rec = Arc::new(PreflightRec::default());
+        let backend = Arc::new(PreflightBackend {
+            rec: rec.clone(),
+            pong_models: vec!["good".into()],
+        });
+        let agent = AgentId::parse("codex").unwrap();
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: minimal_entry(&agent),
+            backend: backend.clone(),
+            invalidates: AtomicUsize::new(0),
+        });
+        let dispatcher = preflight_dispatcher(backend);
+
+        let events = WorkflowExecutor::new(registry)
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "dispatcher-no-preflight".into(),
+                CancellationToken::new(),
+                WorkflowRunContext::default(),
+                dispatcher.clone(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output, _) = node_finished(&events);
+        assert!(
+            *ok,
+            "warm dispatcher should preserve default-off behavior: {output}"
+        );
+        let prompts = rec.prompts.lock().unwrap().clone();
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|prompt| prompt.as_str() == WORKFLOW_PREFLIGHT_PROMPT)
+                .count(),
+            0,
+            "absent config must not run smoke turns: {prompts:?}"
+        );
+        assert_eq!(prompts, vec!["echo DIFF".to_string()]);
+        assert_eq!(rec.configured_models.lock().unwrap().len(), 0);
+        assert_eq!(
+            dispatcher.checkout_models.lock().unwrap().clone(),
+            vec![None]
         );
     }
 

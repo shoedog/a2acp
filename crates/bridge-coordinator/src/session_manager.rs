@@ -1306,9 +1306,24 @@ impl SessionManager {
         // checkout instead of missing it — closes the register-after-release leak window. Lock order is
         // children -> by_context (checkout_turn locks by_context internally); the sweeps use the same order.
         let mut children = self.children.lock().await;
-        let (turn, removed) = self
-            .checkout_turn_inner(child, agent, overrides, cwd, observer)
+        let (mut turn, mut removed) = self
+            .checkout_turn_inner(
+                child,
+                agent.clone(),
+                overrides.clone(),
+                cwd.clone(),
+                observer.clone(),
+            )
             .await;
+        if matches!(turn, Err(BridgeError::SessionExpired))
+            && self.expire_retired_idle_child(child).await
+        {
+            removed.push(child.clone());
+            Self::prune_child_registration_locked(&mut children, &removed);
+            (turn, removed) = self
+                .checkout_turn_inner(child, agent, overrides, cwd, observer)
+                .await;
+        }
         Self::prune_child_registration_locked(&mut children, &removed);
         let turn = turn?;
         children
@@ -1316,6 +1331,29 @@ impl SessionManager {
             .or_default()
             .insert(child.clone());
         Ok(turn)
+    }
+
+    async fn expire_retired_idle_child(&self, child: &ContextId) -> bool {
+        let release = {
+            let mut tab = self.by_context.lock().await;
+            let Some(h) = tab.get(child) else {
+                return false;
+            };
+            if h.state != SessionState::Idle || !h.lease.is_retired() {
+                return false;
+            }
+            let mut handle = tab
+                .remove(child)
+                .expect("retired idle child remained present");
+            fire_lingering_turn_abort(&mut handle);
+            Some((handle.backend.clone(), handle.backend_session.clone()))
+        };
+        if let Some((backend, backend_session)) = release {
+            backend.release_session(&backend_session).await;
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn expire_turn(&self, ctx: &ContextId) {
@@ -2582,7 +2620,7 @@ mod tests {
     struct FakeRegistry {
         entries: Vec<AgentEntry>,
         backend: Arc<FakeBackend>,
-        retired: Arc<AtomicBool>,
+        retired: StdMutex<Arc<AtomicBool>>,
         panic_next_lease_drop: AtomicBool,
         observed: StdMutex<Vec<Arc<dyn DiagnosticObserver>>>,
     }
@@ -2592,7 +2630,7 @@ mod tests {
             Self {
                 entries: vec![entry],
                 backend,
-                retired: Arc::new(AtomicBool::new(false)),
+                retired: StdMutex::new(Arc::new(AtomicBool::new(false))),
                 panic_next_lease_drop: AtomicBool::new(false),
                 observed: StdMutex::new(Vec::new()),
             }
@@ -2602,14 +2640,14 @@ mod tests {
             Self {
                 entries,
                 backend,
-                retired: Arc::new(AtomicBool::new(false)),
+                retired: StdMutex::new(Arc::new(AtomicBool::new(false))),
                 panic_next_lease_drop: AtomicBool::new(false),
                 observed: StdMutex::new(Vec::new()),
             }
         }
 
         fn retire(&self) {
-            self.retired.store(true, Ordering::SeqCst);
+            self.retired.lock().unwrap().store(true, Ordering::SeqCst);
         }
 
         fn panic_next_lease_drop(&self) {
@@ -2630,7 +2668,7 @@ mod tests {
                 Box::new(PanickingLease)
             } else {
                 Box::new(RetiringLease {
-                    retired: self.retired.clone(),
+                    retired: self.retired.lock().unwrap().clone(),
                 })
             };
             Ok(Resolved {
@@ -2655,6 +2693,12 @@ mod tests {
 
         async fn apply(&self, _snap: RegistrySnapshot) -> Result<(), BridgeError> {
             Ok(())
+        }
+
+        async fn invalidate(&self, _agent: &AgentId) {
+            let mut retired = self.retired.lock().unwrap();
+            retired.store(true, Ordering::SeqCst);
+            *retired = Arc::new(AtomicBool::new(false));
         }
 
         fn list(&self) -> Vec<AgentId> {
@@ -4778,6 +4822,48 @@ mod tests {
         assert_eq!(second.generation, SessionGeneration::new(0));
         assert_ne!(first.op, second.op);
         assert!(manager.child_registered(&parent, &child).await);
+    }
+
+    #[tokio::test]
+    async fn checkout_child_turn_remints_retired_idle_child_with_override() {
+        let backend = Arc::new(FakeBackend::new("ok"));
+        let registry = Arc::new(FakeRegistry::new(fake_entry("codex"), backend.clone()));
+        let manager = SessionManager::new(registry.clone(), Duration::from_secs(30));
+        let parent = ctx("retired-child-parent");
+        let child = ctx("retired-child");
+
+        let first = manager
+            .checkout_child_turn(&parent, &child, agent(), None, None)
+            .await
+            .unwrap();
+        manager
+            .finish_turn(&child, first.generation, &first.op)
+            .await;
+
+        registry.invalidate(&agent()).await;
+        let second = manager
+            .checkout_child_turn(
+                &parent,
+                &child,
+                agent(),
+                Some(model_override("fallback-good")),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(second.session.as_str(), "ctx-retired-child-g0");
+        assert_eq!(second.generation, SessionGeneration::new(0));
+        assert_eq!(second.model.as_deref(), Some("fallback-good"));
+        assert!(manager.child_registered(&parent, &child).await);
+        assert_eq!(backend.releases(), vec!["ctx-retired-child-g0".to_string()]);
+        assert_eq!(
+            backend.configured(),
+            vec![
+                "ctx-retired-child-g0".to_string(),
+                "ctx-retired-child-g0".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]

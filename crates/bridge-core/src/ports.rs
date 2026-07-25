@@ -489,6 +489,13 @@ pub trait AgentRegistry: Send + Sync {
     /// Drop the cached backend for `agent` so the next `resolve` RESPAWNS a fresh process (E6 retry
     /// reset). Best-effort + idempotent; unknown agent ⇒ no-op. Default: no-op (non-spawning registries).
     async fn invalidate(&self, _agent: &crate::ids::AgentId) {}
+    /// Return the current agent entry config without resolving or spawning a backend.
+    /// Registries that cannot provide a non-spawning snapshot return `None`;
+    /// workflow dispatcher preflight treats `None` as an explicit opt-out for
+    /// that agent because it must not resolve/spawn merely to discover config.
+    fn entry_snapshot(&self, _id: &crate::ids::AgentId) -> Option<std::sync::Arc<AgentEntry>> {
+        None
+    }
     /// List all registered agent ids.
     fn list(&self) -> Vec<crate::ids::AgentId>;
     /// Per-agent MCP server names, for agent-card advertisement (ADR-0028) — `(agent_id, [server

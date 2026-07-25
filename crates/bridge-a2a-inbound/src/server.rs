@@ -723,6 +723,19 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
         _ctx: &WorkflowRunContext,
         observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<NodeTurn, BridgeError> {
+        self.checkout_observed_with_overrides(wf_id, node, _run_id, _ctx, None, observer)
+            .await
+    }
+
+    async fn checkout_observed_with_overrides(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        _run_id: &str,
+        _ctx: &WorkflowRunContext,
+        overrides: Option<AgentOverride>,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<NodeTurn, BridgeError> {
         let child = ContextId::parse(format!(
             "{}::workflow::{}::node::{}",
             self.parent.as_str(),
@@ -736,7 +749,7 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
                 &self.parent,
                 &child,
                 node.agent.clone(),
-                None,
+                overrides,
                 self.cwd.clone(),
                 observer,
             )

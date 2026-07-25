@@ -566,6 +566,11 @@ impl AgentRegistry for Registry {
         Self::spawn_retirement(old_slot, INVALIDATE_RETIRE_GRACE);
     }
 
+    fn entry_snapshot(&self, id: &AgentId) -> Option<Arc<AgentEntry>> {
+        let st = self.state.load();
+        st.slots.get(id).map(|slot| slot.entry.load_full())
+    }
+
     fn list(&self) -> Vec<AgentId> {
         self.state.load().slots.keys().cloned().collect()
     }
