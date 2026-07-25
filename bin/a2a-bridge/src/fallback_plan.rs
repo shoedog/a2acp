@@ -36,7 +36,13 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_ID_BYTES: usize = 128;
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const SMOKE_SCHEMA_V2: u16 = 2;
+// Release fallback evidence keeps the production cap; debug/test-profile binaries
+// are unstripped and can exceed it in integration tests, matching the compatibility
+// runner's executable-size policy.
+#[cfg(not(debug_assertions))]
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(debug_assertions)]
+const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug)]
 struct FallbackArgs {

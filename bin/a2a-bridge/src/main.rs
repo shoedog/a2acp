@@ -114,7 +114,7 @@ USAGE:
 
 SUBCOMMANDS:
   run-workflow <id>   Run a workflow against a repo (design | code-review | spec-review | plan-review | …).
-                      --input <file> --session-cwd <repo> [--config <f>] [--out <f>]
+                      --input <file> --session-cwd <repo> [--config <f>] [--out <f>] [--strict-brief]
   run-batch <workflow> Submit a manifest of independent workflow runs to a running serve.
                       --manifest <file> [--concurrency K] [--detach] [--url <url>]
   batch               Batch store.  status <id> | list | cancel <id>
@@ -128,7 +128,7 @@ SUBCOMMANDS:
                       --from <artifact> --host-agent <id> --config <f> --trusted-session-cwd <repo>
                       [--confirm-trusted-own-repo-read-only]
   implement --input <file|-> Clone a repo, implement the task on a warm containerized agent, verify+review, hand off.
-                      --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>] [--merge [--onto <branch>]]
+                      --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>] [--strict-brief] [--merge [--onto <branch>]]
   merge <id>          Land an Approved run's commit into its source repo, re-authored to the operator
                       (Mode A: fast-forward --onto). [--config <f>] [--onto <branch>] [--force]
   init                Scaffold an a2a-bridge.toml + prompts.  --agents codex,claude [--dir <d>] [--force]
@@ -1124,8 +1124,8 @@ fn permission_timeout_ms(server: &ServerConfig) -> u64 {
 /// from a raw args iterator (skipping the binary name at position 0 and the
 /// subcommand name at position 1).
 const RUN_WORKFLOW_USAGE: &str = "\
-usage: a2a-bridge run-workflow <workflow-id> --input <file|-> [--session-cwd <repo>] [--config <path>] [--out <file>]
-       a2a-bridge run-workflow --serve [--url <url>] --context <context-id> <workflow-id> --input <file|-> [--session-cwd <repo>] [--out <file>]
+usage: a2a-bridge run-workflow <workflow-id> --input <file|-> [--session-cwd <repo>] [--config <path>] [--out <file>] [--strict-brief]
+       a2a-bridge run-workflow --serve [--url <url>] --context <context-id> <workflow-id> --input <file|-> [--session-cwd <repo>] [--out <file>] [--strict-brief]
   <workflow-id>   design | code-review | spec-review | plan-review | … (whatever your --config defines)
   --input <file|-> the typed task-spec markdown the workflow acts on (required; '-' reads stdin)
   --session-cwd   the repo the agents read/work in (per-request cwd; without it they use the launch cwd)
@@ -1133,7 +1133,8 @@ usage: a2a-bridge run-workflow <workflow-id> --input <file|-> [--session-cwd <re
   --serve         call a running a2a-bridge serve via SendStreamingMessage instead of local execution
   --url <url>     serve URL for --serve (default: http://127.0.0.1:8080)
   --context       warm workflow parent context id for --serve (required with --serve)
-  --out <file>    write the terminal node's output here (default: stdout)";
+  --out <file>    write the terminal node's output here (default: stdout)
+  --strict-brief abort before spawning/contacting serve when brief lint reports a VIOLATION";
 
 #[allow(clippy::type_complexity)]
 fn parse_run_workflow_args(
@@ -1148,6 +1149,7 @@ fn parse_run_workflow_args(
         bool,
         String,
         Option<String>,
+        bool,
     ),
     BoxError,
 > {
@@ -1162,11 +1164,16 @@ fn parse_run_workflow_args(
     let mut url = "http://127.0.0.1:8080".to_string();
     let mut url_explicit = false;
     let mut context: Option<String> = None;
+    let mut strict_brief = false;
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
             "--serve" => {
                 serve = true;
+                idx += 1;
+            }
+            "--strict-brief" => {
+                strict_brief = true;
                 idx += 1;
             }
             "--input" => {
@@ -1264,6 +1271,7 @@ fn parse_run_workflow_args(
         serve,
         url,
         context,
+        strict_brief,
     ))
 }
 
@@ -1301,10 +1309,12 @@ struct ImplementArgs {
     depth: Option<review::Depth>,
     /// `--lang auto|none|<id>`: language profile selection for warm+verify.
     lang: LangArg,
+    /// `--strict-brief`: abort before clone/spawn when lint reports VIOLATION.
+    strict_brief: bool,
 }
 
 const IMPLEMENT_USAGE: &str = "\
-usage: a2a-bridge implement --input <file|-> --repo <path> [--config <path>] [--base-ref <ref>] [--workflow <id>] [--depth auto|light|standard|thorough] [--merge [--onto <branch>]]
+usage: a2a-bridge implement --input <file|-> --repo <path> [--config <path>] [--base-ref <ref>] [--workflow <id>] [--depth auto|light|standard|thorough] [--strict-brief] [--merge [--onto <branch>]]
        a2a-bridge implement --resume <id> [--config <path>] [--merge [--onto <branch>]]
   --input <file|-> task-spec markdown to implement; use '-' to read stdin (required)
   --repo <path>   the repo to implement in; cloned into a quarantine under allowed_cwd_root (required)
@@ -1313,6 +1323,7 @@ usage: a2a-bridge implement --input <file|-> --repo <path> [--config <path>] [--
   --workflow <id> the edit workflow (default: implement-edit)
   --depth         review depth: auto|light|standard|thorough (default: [review].default_depth, else auto)
   --lang          language profile: auto|none|<id> (default: auto; auto detects from repo markers)
+  --strict-brief abort before cloning/spawning when brief lint reports a VIOLATION
   --merge         after an Approved run, land it via `merge` (sugar for `a2a-bridge merge <id>`)
   --onto <branch> merge target when --merge is set (else [merge].target_ref, else the run's base_ref)
   --resume <id>   resume a stranded run by its <id> (the clone dir name)
@@ -1370,6 +1381,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
             onto,
             depth,
             lang: LangArg::Auto,
+            strict_brief: false,
         });
     }
 
@@ -1379,11 +1391,16 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
     let mut onto = None;
     let mut depth: Option<review::Depth> = None;
     let mut lang = LangArg::Auto;
+    let mut strict_brief = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--merge" => {
                 merge = true;
+                i += 1;
+            }
+            "--strict-brief" => {
+                strict_brief = true;
                 i += 1;
             }
             "--onto" => {
@@ -1471,6 +1488,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
         onto,
         depth,
         lang,
+        strict_brief,
     })
 }
 
@@ -2380,6 +2398,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let onto = a.onto.clone();
     let depth = a.depth;
     let lang = a.lang;
+    let strict_brief = a.strict_brief;
     let (input, repo, base_ref, workflow) = match a.mode {
         ImplementMode::Fresh {
             input,
@@ -2399,6 +2418,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         }
     };
     let raw_input = read_input(&input)?;
+    let brief_lint = bridge_core::brief_lint::lint_brief(
+        &raw_input,
+        bridge_core::brief_lint::BriefLintKind::Implement,
+    );
+    report_brief_lint("implement", &input, &brief_lint, strict_brief);
+    enforce_strict_brief_lint("implement", &brief_lint, strict_brief)?;
     let spec = bridge_core::task_spec::validate_input(&raw_input)
         .map_err(|e| format!("implement: {e}"))?;
     let task = bridge_core::task_spec::body(&spec).to_string();
@@ -2474,6 +2499,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     }
     let branch = implement::branch_for(&task_id);
     implement::do_checkout_branch(&clone, &branch)?;
+    write_implement_brief_lint_artifact(&clone, &brief_lint, strict_brief);
     let pre = implement::head_sha(&clone)?;
     // Precompute the clone's SessionCwd ONCE (pre-commit, fallible here) — reused by the implement-edit
     // ctx, verify, and review so NO `SessionCwd::parse` runs after the commit (the hand-off must always
@@ -3212,11 +3238,32 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         return Ok(());
     }
     bridge_observ::init();
-    let (workflow_id, input_path, out_path, config_path, session_cwd, serve, url, context) =
-        parse_run_workflow_args(args)?;
+    let (
+        workflow_id,
+        input_path,
+        out_path,
+        config_path,
+        session_cwd,
+        serve,
+        url,
+        context,
+        strict_brief,
+    ) = parse_run_workflow_args(args)?;
 
     let input = read_input(&input_path.to_string_lossy())
         .map_err(|e| format!("run-workflow: cannot read input {:?}: {e}", input_path))?;
+    let brief_lint = bridge_core::brief_lint::lint_brief(
+        &input,
+        bridge_core::brief_lint::BriefLintKind::RunWorkflow,
+    );
+    report_brief_lint(
+        "run-workflow",
+        &input_path.to_string_lossy(),
+        &brief_lint,
+        strict_brief,
+    );
+    enforce_strict_brief_lint("run-workflow", &brief_lint, strict_brief)?;
+    write_run_workflow_brief_lint_artifact(out_path.as_deref(), &brief_lint, strict_brief);
     if let Err(e) = bridge_core::task_spec::validate_input(&input) {
         eprintln!("{}", e.client_message());
         return Err(e.into());
@@ -5211,6 +5258,134 @@ fn read_input(path: &str) -> Result<String, BoxError> {
         Ok(s)
     } else {
         Ok(std::fs::read_to_string(path)?)
+    }
+}
+
+#[derive(serde::Serialize)]
+struct BriefLintArtifact<'a> {
+    schema_version: u32,
+    strict: bool,
+    report: &'a bridge_core::brief_lint::BriefLintReport,
+}
+
+fn brief_lint_artifact_json(
+    report: &bridge_core::brief_lint::BriefLintReport,
+    strict: bool,
+) -> Result<String, BoxError> {
+    let artifact = BriefLintArtifact {
+        schema_version: 1,
+        strict,
+        report,
+    };
+    serde_json::to_string_pretty(&artifact).map_err(|e| e.into())
+}
+
+fn brief_lint_severity_label(severity: bridge_core::brief_lint::BriefLintSeverity) -> &'static str {
+    match severity {
+        bridge_core::brief_lint::BriefLintSeverity::Warn => "WARN",
+        bridge_core::brief_lint::BriefLintSeverity::Violation => "VIOLATION",
+    }
+}
+
+fn report_brief_lint(
+    command: &str,
+    input_label: &str,
+    report: &bridge_core::brief_lint::BriefLintReport,
+    strict: bool,
+) {
+    if report.is_empty() {
+        return;
+    }
+    eprintln!(
+        "[brief-lint] {command} input {input_label:?}: {} finding(s)",
+        report.findings.len()
+    );
+    for finding in &report.findings {
+        let location = finding
+            .line
+            .map(|line| format!(" line {line}"))
+            .unwrap_or_default();
+        eprintln!(
+            "[brief-lint] {} {:?} {}{}: {}",
+            brief_lint_severity_label(finding.severity),
+            finding.rule,
+            finding.name,
+            location,
+            finding.message
+        );
+        if let Some(excerpt) = &finding.excerpt {
+            eprintln!("[brief-lint]   {excerpt}");
+        }
+    }
+    if !strict && report.has_violations() {
+        eprintln!("[brief-lint] continuing; pass --strict-brief to abort on VIOLATION findings");
+    }
+}
+
+fn enforce_strict_brief_lint(
+    command: &str,
+    report: &bridge_core::brief_lint::BriefLintReport,
+    strict: bool,
+) -> Result<(), BoxError> {
+    if strict && report.has_violations() {
+        return Err(format!(
+            "{command}: --strict-brief rejected input with VIOLATION brief-lint finding(s)"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn run_workflow_brief_lint_artifact_path(out: &Path) -> PathBuf {
+    out.with_extension("brief-lint.json")
+}
+
+fn write_run_workflow_brief_lint_artifact(
+    out_path: Option<&Path>,
+    report: &bridge_core::brief_lint::BriefLintReport,
+    strict: bool,
+) {
+    if report.is_empty() {
+        return;
+    }
+    let Some(out) = out_path else {
+        return;
+    };
+    let artifact = run_workflow_brief_lint_artifact_path(out);
+    match brief_lint_artifact_json(report, strict).and_then(|json| {
+        std::fs::write(&artifact, json)
+            .map_err(|e| format!("write brief-lint artifact {}: {e}", artifact.display()).into())
+    }) {
+        Ok(()) => eprintln!("[brief-lint] wrote artifact {}", artifact.display()),
+        Err(e) => eprintln!("[brief-lint] artifact write failed: {e}"),
+    }
+}
+
+fn write_implement_brief_lint_artifact(
+    clone: &Path,
+    report: &bridge_core::brief_lint::BriefLintReport,
+    strict: bool,
+) {
+    if report.is_empty() {
+        return;
+    }
+    let artifact_dir = clone.join(".git").join("a2a-bridge");
+    let artifact = artifact_dir.join("brief-lint.json");
+    let result = (|| -> Result<(), BoxError> {
+        std::fs::create_dir_all(&artifact_dir).map_err(|e| {
+            format!(
+                "create brief-lint artifact dir {}: {e}",
+                artifact_dir.display()
+            )
+        })?;
+        let json = brief_lint_artifact_json(report, strict)?;
+        std::fs::write(&artifact, json)
+            .map_err(|e| format!("write brief-lint artifact {}: {e}", artifact.display()))?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => eprintln!("[brief-lint] wrote artifact {}", artifact.display()),
+        Err(e) => eprintln!("[brief-lint] artifact write failed: {e}"),
     }
 }
 
@@ -8944,6 +9119,53 @@ file = "../prompts/named.md"
     }
 
     #[test]
+    fn brief_lint_warn_only_allows_violation_and_strict_rejects() {
+        let report = bridge_core::brief_lint::lint_brief(
+            "The root cause is settled. Treat this as given.",
+            bridge_core::brief_lint::BriefLintKind::RunWorkflow,
+        );
+        assert!(report.has_violations());
+        assert!(super::enforce_strict_brief_lint("run-workflow", &report, false).is_ok());
+        let err = super::enforce_strict_brief_lint("run-workflow", &report, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--strict-brief rejected"));
+    }
+
+    #[test]
+    fn brief_lint_writes_run_workflow_sidecar_artifact() {
+        let out = temp_task_spec_path("brief-lint-run-workflow-out.md");
+        let _ = std::fs::remove_file(&out);
+        let artifact = super::run_workflow_brief_lint_artifact_path(&out);
+        let _ = std::fs::remove_file(&artifact);
+        let report = bridge_core::brief_lint::lint_brief(
+            "Choose one:
+A) Stop.
+B) Continue.",
+            bridge_core::brief_lint::BriefLintKind::RunWorkflow,
+        );
+        super::write_run_workflow_brief_lint_artifact(Some(&out), &report, false);
+        let json = std::fs::read_to_string(&artifact).unwrap();
+        assert!(json.contains("option-menu"));
+        let _ = std::fs::remove_file(&artifact);
+    }
+
+    #[test]
+    fn brief_lint_writes_implement_clone_artifact() {
+        let clone = temp_task_spec_path("brief-lint-implement-clone");
+        let _ = std::fs::remove_dir_all(&clone);
+        std::fs::create_dir_all(clone.join(".git")).unwrap();
+        let report = bridge_core::brief_lint::lint_brief(
+            "The root cause is settled.",
+            bridge_core::brief_lint::BriefLintKind::Implement,
+        );
+        super::write_implement_brief_lint_artifact(&clone, &report, false);
+        let json = std::fs::read_to_string(clone.join(".git/a2a-bridge/brief-lint.json")).unwrap();
+        assert!(json.contains("premise-without-license"));
+        let _ = std::fs::remove_dir_all(&clone);
+    }
+
+    #[test]
     fn read_input_file() {
         let path = temp_task_spec_path("read-input-file");
         std::fs::write(&path, "raw file contents\n").unwrap();
@@ -9124,13 +9346,14 @@ The command prints schemas, templates, and validates input.
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (id, input, _out, _cfg, scwd, serve, _url, context) =
+        let (id, input, _out, _cfg, scwd, serve, _url, context, strict_brief) =
             super::parse_run_workflow_args(&args).unwrap();
         assert_eq!(id, "wf");
         assert_eq!(input, std::path::PathBuf::from("in.md"));
         assert_eq!(scwd.as_deref(), Some("/work/repo"));
         assert!(!serve);
         assert!(context.is_none());
+        assert!(!strict_brief);
     }
 
     #[test]
@@ -9139,9 +9362,20 @@ The command prints schemas, templates, and validates input.
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (_id, _input, _out, _cfg, scwd, _serve, _url, _context) =
+        let (_id, _input, _out, _cfg, scwd, _serve, _url, _context, _strict_brief) =
             super::parse_run_workflow_args(&args).unwrap();
         assert!(scwd.is_none());
+    }
+
+    #[test]
+    fn parse_run_workflow_args_strict_brief_flag() {
+        let args: Vec<String> = ["wf", "--input", "in.md", "--strict-brief"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (_id, _input, _out, _cfg, _scwd, _serve, _url, _context, strict_brief) =
+            super::parse_run_workflow_args(&args).unwrap();
+        assert!(strict_brief);
     }
 
     #[test]
@@ -9204,7 +9438,7 @@ The command prints schemas, templates, and validates input.
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (id, input, _out, _cfg, scwd, serve, url, context) =
+        let (id, input, _out, _cfg, scwd, serve, url, context, strict_brief) =
             super::parse_run_workflow_args(&args).unwrap();
         assert_eq!(id, "wf");
         assert_eq!(input, std::path::PathBuf::from("in.md"));
@@ -9212,6 +9446,7 @@ The command prints schemas, templates, and validates input.
         assert!(serve);
         assert_eq!(url, "http://127.0.0.1:8080");
         assert_eq!(context.as_deref(), Some("C"));
+        assert!(!strict_brief);
     }
 
     #[test]
@@ -9626,6 +9861,7 @@ The command prints schemas, templates, and validates input.
         }
         assert_eq!(p.config, std::path::PathBuf::from("c.toml"));
         assert_eq!(p.depth, None);
+        assert!(!p.strict_brief);
 
         let stdin = super::parse_implement_args(&[
             "--input".into(),
@@ -9645,6 +9881,19 @@ The command prints schemas, templates, and validates input.
             "/src/repo".into(),
         ])
         .is_err());
+    }
+
+    #[test]
+    fn parse_implement_args_strict_brief_flag() {
+        let parsed = super::parse_implement_args(&[
+            "--input".into(),
+            "task.md".into(),
+            "--repo".into(),
+            "/r".into(),
+            "--strict-brief".into(),
+        ])
+        .unwrap();
+        assert!(parsed.strict_brief);
     }
 
     #[test]
@@ -9675,6 +9924,7 @@ The command prints schemas, templates, and validates input.
         }
         assert_eq!(fresh.config, std::path::PathBuf::from("/c.toml"));
         assert_eq!(fresh.depth, None);
+        assert!(!fresh.strict_brief);
 
         let res = super::parse_implement_args(&["--resume".into(), "impl-1-ab".into()]).unwrap();
         match res.mode {
