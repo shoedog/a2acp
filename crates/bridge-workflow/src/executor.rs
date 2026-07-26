@@ -2883,12 +2883,25 @@ impl WorkflowExecutor {
             registry: self.registry.clone(),
         };
         Box::pin(async_stream::stream! {
-            if !ctx.harvest_audit_store.retains_audit_records() {
+            // Off-mode audit exemption (§18-7, operator-adjudicated): audit
+            // rows are durable whenever the feature is enabled for at least
+            // one node that can still RUN in this invocation; workflows with
+            // zero runnable enabled nodes are audit-exempt. Seeded nodes are
+            // already-completed resume outputs — they are never re-sanitized
+            // (§15.2 criterion 17) and therefore need no audit durability, so
+            // a fully-seeded resume passes even with a non-retaining store.
+            let audit_required = graph.nodes.iter().any(|node| {
+                matches!(
+                    node.harvest_sanitization.unwrap_or_default(),
+                    HarvestSanitizationMode::AttestedPrefixV1
+                ) && !seed.contains_key(node.id.as_str())
+            });
+            if audit_required && !ctx.harvest_audit_store.retains_audit_records() {
                 if let Some(node) = graph.nodes.iter().find(|node| {
                     matches!(
                         node.harvest_sanitization.unwrap_or_default(),
                         HarvestSanitizationMode::AttestedPrefixV1
-                    )
+                    ) && !seed.contains_key(node.id.as_str())
                 }) {
                     yield Err(BridgeError::ConfigInvalid {
                         reason: format!(
@@ -3052,46 +3065,57 @@ impl WorkflowExecutor {
                     disposition,
                     harvest,
                 } = raw_output;
-                let committed = match commit_harvested_completion(
-                    &harvest.context,
-                    harvest.mode,
-                    &harvest.capability,
-                    &harvest.producer_id,
-                    harvest.origin,
-                    raw_text,
-                    harvest.status.clone(),
-                    ctx.harvest_audit_store.as_ref(),
-                )
-                .await
-                {
-                    Ok(committed) => committed,
-                    Err(error) => {
-                        yield Err(BridgeError::from(error));
-                        return;
+                // §18-7 Off-mode audit exemption: with zero runnable enabled
+                // nodes there is no audit commit at all — Off mode is the §7.1
+                // identity, so the raw body IS the effective body, and no
+                // KeptOff decision is minted only to be discarded by a noop
+                // store. When any runnable node enables the feature, EVERY
+                // completion of the run (enabled and Off nodes alike, §18-4
+                // regardless of `ok`) commits its bundle before release.
+                let text = if audit_required {
+                    let committed = match commit_harvested_completion(
+                        &harvest.context,
+                        harvest.mode,
+                        &harvest.capability,
+                        &harvest.producer_id,
+                        harvest.origin,
+                        raw_text,
+                        harvest.status.clone(),
+                        ctx.harvest_audit_store.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(committed) => committed,
+                        Err(error) => {
+                            yield Err(BridgeError::from(error));
+                            return;
+                        }
+                    };
+                    if let Some(factory) = &ctx.make_rich_sink {
+                        let sink = factory.make(&node_id);
+                        sink.record(bridge_core::orch::OrchEventKind::HarvestSanitizationDecision {
+                            audit_id: committed.audit_id.clone(),
+                            run_id: harvest.context.session_id.as_str().to_string(),
+                            node_id: node_id.as_str().to_string(),
+                            attempt_id: harvest.context.attempt,
+                            producer_id: harvest.producer_id.clone(),
+                            mode: committed.decision.mode,
+                            decision: committed.decision.decision,
+                            reason: committed.decision.reason.clone(),
+                        });
+                        if let Err(error) = sink.flush().await {
+                            tracing::warn!(
+                                node = node_id.as_str(),
+                                audit_id = committed.audit_id.as_str(),
+                                error = ?error,
+                                "harvest sanitization decision event flush failed"
+                            );
+                        }
                     }
+                    committed.effective_body
+                } else {
+                    raw_text
                 };
-                if let Some(factory) = &ctx.make_rich_sink {
-                    let sink = factory.make(&node_id);
-                    sink.record(bridge_core::orch::OrchEventKind::HarvestSanitizationDecision {
-                        audit_id: committed.audit_id.clone(),
-                        run_id: harvest.context.session_id.as_str().to_string(),
-                        node_id: node_id.as_str().to_string(),
-                        attempt_id: harvest.context.attempt,
-                        producer_id: harvest.producer_id.clone(),
-                        mode: committed.decision.mode,
-                        decision: committed.decision.decision,
-                        reason: committed.decision.reason.clone(),
-                    });
-                    if let Err(error) = sink.flush().await {
-                        tracing::warn!(
-                            node = node_id.as_str(),
-                            audit_id = committed.audit_id.as_str(),
-                            error = ?error,
-                            "harvest sanitization decision event flush failed"
-                        );
-                    }
-                }
-                let text = committed.effective_body;
                 yield Ok(WorkflowEvent::NodeFinished {
                     node: node_id.clone(),
                     ok,
@@ -7621,6 +7645,238 @@ mod tests {
             root_rec.prompts.lock().unwrap().clone(),
             vec!["DIFF".to_string()]
         );
+    }
+
+    fn retaining_memory_audit_store() -> Arc<dyn bridge_core::harvest::HarvestAuditStore> {
+        let task_store: Arc<dyn bridge_core::task_store::TaskStore> =
+            Arc::new(bridge_core::task_store::MemoryTaskStore::default());
+        Arc::new(bridge_core::task_store::TaskStoreHarvestAuditStore::new(
+            task_store,
+        ))
+    }
+
+    fn two_node_graph(
+        root_mode: Option<HarvestSanitizationMode>,
+        synth_mode: Option<HarvestSanitizationMode>,
+    ) -> Arc<WorkflowGraph> {
+        Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("w").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("root").unwrap(),
+                    agent: AgentId::parse("codex").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                    retry: None,
+                    harvest_sanitization: root_mode,
+                },
+                WorkflowNode {
+                    id: NodeId::parse("synth").unwrap(),
+                    agent: AgentId::parse("synth").unwrap(),
+                    prompt_template: "{{root}}".into(),
+                    inputs: vec![NodeId::parse("root").unwrap()],
+                    retry: None,
+                    harvest_sanitization: synth_mode,
+                },
+            ],
+            panel: None,
+        })
+    }
+
+    fn two_node_registry() -> Arc<FakeRegistry> {
+        Arc::new(FakeRegistry {
+            backends: [
+                (
+                    "codex".to_string(),
+                    ("ROOT_OUT".to_string(), Arc::new(Rec::default())),
+                ),
+                (
+                    "synth".to_string(),
+                    ("SYNTH_OUT".to_string(), Arc::new(Rec::default())),
+                ),
+            ]
+            .into(),
+        })
+    }
+
+    /// §18-7 Off-mode audit exemption (MAJOR 3): a workflow with zero enabled
+    /// nodes commits nothing to the audit store — no KeptOff rows minted and
+    /// discarded — and succeeds both with a retaining store (which must stay
+    /// empty) and with the noop store.
+    #[tokio::test]
+    async fn all_off_workflow_is_audit_exempt_and_emits_no_rows() {
+        let audit_store = retaining_memory_audit_store();
+        let ctx = WorkflowRunContext {
+            task_id: Some(bridge_core::ids::TaskId::parse("task-alloff").unwrap()),
+            harvest_audit_store: audit_store.clone(),
+            ..WorkflowRunContext::default()
+        };
+        let ex = WorkflowExecutor::new(two_node_registry());
+        let evs: Vec<_> = ex
+            .run_with_context(
+                two_node_graph(None, Some(HarvestSanitizationMode::Off)),
+                "DIFF".into(),
+                "run-alloff".into(),
+                CancellationToken::new(),
+                ctx,
+            )
+            .collect()
+            .await;
+        let last = evs.last().unwrap().as_ref().unwrap();
+        assert!(
+            matches!(last, WorkflowEvent::Terminal { outcome: WorkflowOutcome::Completed, output } if output == "SYNTH_OUT"),
+            "all-Off workflow must complete, got {last:?}"
+        );
+        let rows = bridge_core::harvest::HarvestAuditStore::list_by_task_id(
+            audit_store.as_ref(),
+            "task-alloff",
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(
+            rows.is_empty(),
+            "all-Off workflow must produce no durable audit rows, got {}",
+            rows.len()
+        );
+
+        // The same all-Off workflow also succeeds on the noop store: no
+        // commit is attempted, so nothing is silently discarded.
+        let ex = WorkflowExecutor::new(two_node_registry());
+        let evs: Vec<_> = ex
+            .run_with_context(
+                two_node_graph(None, None),
+                "DIFF".into(),
+                "run-alloff-noop".into(),
+                CancellationToken::new(),
+                WorkflowRunContext::default(),
+            )
+            .collect()
+            .await;
+        assert!(matches!(
+            evs.last().unwrap().as_ref().unwrap(),
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                ..
+            }
+        ));
+    }
+
+    /// §18-4/§18-7 (MAJOR 3) + MAJOR 4 audit distinction: when at least one
+    /// runnable node enables the feature, BOTH the enabled and the Off node's
+    /// completions commit durable bundles — the Off node as `kept_off`, the
+    /// enabled-but-incapable node as `kept_no_attestation` with the distinct
+    /// `backend_declared_incapable` reason (never `sanitization_not_requested`
+    /// and never silently mistaken for Off).
+    #[tokio::test]
+    async fn mixed_workflow_audits_both_enabled_and_off_completions() {
+        let audit_store = retaining_memory_audit_store();
+        let ctx = WorkflowRunContext {
+            task_id: Some(bridge_core::ids::TaskId::parse("task-mixed").unwrap()),
+            harvest_audit_store: audit_store.clone(),
+            ..WorkflowRunContext::default()
+        };
+        let ex = WorkflowExecutor::new(two_node_registry());
+        let evs: Vec<_> = ex
+            .run_with_context(
+                two_node_graph(Some(HarvestSanitizationMode::AttestedPrefixV1), None),
+                "DIFF".into(),
+                "run-mixed".into(),
+                CancellationToken::new(),
+                ctx,
+            )
+            .collect()
+            .await;
+        assert!(matches!(
+            evs.last().unwrap().as_ref().unwrap(),
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                ..
+            }
+        ));
+
+        let rows = bridge_core::harvest::HarvestAuditStore::list_by_task_id(
+            audit_store.as_ref(),
+            "task-mixed",
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "both completions must be audited");
+        let by_node = |node: &str| {
+            rows.iter()
+                .find(|bundle| bundle.raw.node_id == node)
+                .unwrap_or_else(|| panic!("bundle for {node}"))
+        };
+        let enabled = by_node("root");
+        assert_eq!(
+            enabled.decision.mode,
+            HarvestSanitizationMode::AttestedPrefixV1
+        );
+        assert_eq!(
+            enabled.decision.decision,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation
+        );
+        assert_eq!(
+            enabled.decision.reason.as_deref(),
+            Some("backend_declared_incapable"),
+            "enabled-but-incapable must carry its distinct reason code"
+        );
+        let off = by_node("synth");
+        assert_eq!(off.decision.mode, HarvestSanitizationMode::Off);
+        assert_eq!(
+            off.decision.decision,
+            bridge_core::harvest::HarvestDecision::KeptOff
+        );
+        assert_eq!(off.decision.reason, None);
+    }
+
+    /// MINOR 7 (verified per the MAJOR 3 adjudication): a fully-seeded resume
+    /// runs zero nodes, so even a graph with enabled nodes needs no audit
+    /// durability — the noop-store guard must not fire and the resume must
+    /// complete from the seed.
+    #[tokio::test]
+    async fn fully_seeded_resume_with_enabled_node_passes_noop_store_guard() {
+        let seed: HashMap<String, (String, bool, Option<UsageSnapshot>)> = [
+            ("root".to_string(), ("SEEDED_ROOT".to_string(), true, None)),
+            (
+                "synth".to_string(),
+                ("SEEDED_SYNTH".to_string(), true, None),
+            ),
+        ]
+        .into();
+        let reg = two_node_registry();
+        let root_rec = reg.backends.get("codex").unwrap().1.clone();
+        let synth_rec = reg.backends.get("synth").unwrap().1.clone();
+        let ex = WorkflowExecutor::new(reg);
+        let evs: Vec<_> = ex
+            .run_from_with_context(
+                two_node_graph(Some(HarvestSanitizationMode::AttestedPrefixV1), None),
+                "DIFF".into(),
+                "resume-full".into(),
+                CancellationToken::new(),
+                seed,
+                WorkflowRunContext::default(),
+            )
+            .collect()
+            .await;
+        assert!(
+            !evs.iter().any(|event| matches!(
+                event,
+                Err(BridgeError::ConfigInvalid { reason })
+                    if reason.contains("no retaining harvest audit store")
+            )),
+            "fully-seeded resume must not trip the noop-store guard: {evs:?}"
+        );
+        let last = evs.last().unwrap().as_ref().unwrap();
+        assert!(
+            matches!(last, WorkflowEvent::Terminal { outcome: WorkflowOutcome::Completed, output } if output == "SEEDED_SYNTH"),
+            "resume must complete from the seed, got {last:?}"
+        );
+        assert!(root_rec.prompts.lock().unwrap().is_empty());
+        assert!(synth_rec.prompts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
