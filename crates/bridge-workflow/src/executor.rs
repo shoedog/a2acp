@@ -1522,6 +1522,13 @@ impl WorkflowExecutor {
                 let empty_final_failure =
                     matches!(&exit, NodeTurnExit::Error(BridgeError::EmptyFinal));
                 let had_primary_failure = matches!(&exit, NodeTurnExit::Error(_));
+                // Capture the classification facts needed after `exit` is moved
+                // into `on_exit_observed` (origin classification below reads them).
+                let exit_was_normal = matches!(&exit, NodeTurnExit::Normal);
+                let exit_agent_crashed = matches!(
+                    &exit,
+                    NodeTurnExit::Error(BridgeError::AgentCrashed { .. })
+                );
                 let mut node_outcome = match &exit {
                     NodeTurnExit::Canceled => TurnOutcome::Canceled,
                     NodeTurnExit::Error(error) => TurnOutcome::Failed(classify_failure(error)),
@@ -1589,9 +1596,9 @@ impl WorkflowExecutor {
                     CompletionBodyOrigin::BridgeSyntheticMissingDone
                 } else if done_stop_cancelled {
                     CompletionBodyOrigin::BridgeSyntheticCancellation
-                } else if ok && matches!(&exit, NodeTurnExit::Normal) {
+                } else if ok && exit_was_normal {
                     CompletionBodyOrigin::ModelText
-                } else if matches!(&exit, NodeTurnExit::Error(BridgeError::AgentCrashed { .. })) {
+                } else if exit_agent_crashed {
                     CompletionBodyOrigin::BridgeSyntheticMissingDone
                 } else {
                     CompletionBodyOrigin::BridgeSyntheticStreamError
