@@ -572,6 +572,7 @@ dependencies = [
  "async-trait",
  "futures",
  "libc",
+ "ring",
  "serde",
  "serde_json",
  "syn",
