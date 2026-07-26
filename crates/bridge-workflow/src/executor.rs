@@ -588,7 +588,7 @@ impl WorkflowExecutor {
         let cell = {
             let mut cache = cache.lock().await;
             cache
-                .entry(cache_key)
+                .entry(cache_key.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
                 .clone()
         };
