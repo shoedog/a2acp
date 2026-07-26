@@ -212,6 +212,13 @@ pub enum NoAttestationReason {
     TurnEndedWithoutDeliverable,
     MultipleCommitMarkers,
     BackendProtocolViolation,
+    /// The bridge demanded a terminal status before the turn's control-frame
+    /// drain closed and the operational backstop elapsed. Distinct from
+    /// `BackendProtocolViolation` by review mandate: a wall-clock expiry while
+    /// a valid frame could still be in flight is an operational failure of the
+    /// bridge, not evidence of a malformed backend wire turn. (§5 lists the
+    /// absence reasons non-exhaustively; fix-round addition.)
+    ControlDrainTimeout,
     BridgeSyntheticStreamError,
     BridgeSyntheticMissingDone,
     BridgeSyntheticCancellation,

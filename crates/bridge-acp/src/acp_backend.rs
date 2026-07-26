@@ -1132,7 +1132,20 @@ struct PrefixTurnState {
     capability: PrefixAttestationCapability,
     observed: Arc<StdMutex<Option<PrefixAttestationStatus>>>,
     notify: Arc<Notify>,
+    /// Set once the turn's control channel is drained: the driver unregisters
+    /// the update route (under the registry lock, atomically with the last
+    /// possible `record_control`) and then closes this flag. After the close,
+    /// no control frame for the turn can be recorded, so a missing-control
+    /// classification is causal, not clock-based.
+    control_closed: Arc<AtomicBool>,
 }
+
+/// Operational liveness backstop for callers that demand a terminal status
+/// without having drained the control channel first (the production driver
+/// always closes the drain before classifying, so it never waits here). The
+/// bound's expiry is an operational failure and must NOT be audited as a
+/// backend protocol violation: a valid in-flight frame could still arrive.
+const PREFIX_CONTROL_DRAIN_BACKSTOP: Duration = Duration::from_millis(250);
 
 impl PrefixTurnState {
     fn new(
@@ -1148,6 +1161,7 @@ impl PrefixTurnState {
             capability,
             observed: Arc::new(StdMutex::new(None)),
             notify: Arc::new(Notify::new()),
+            control_closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1182,21 +1196,55 @@ impl PrefixTurnState {
             .and_then(|observed| observed.clone())
     }
 
+    /// Close the turn's control channel. Call only after the update route was
+    /// removed from the registry: route removal and `record_control` are
+    /// serialized on the registry lock, so once the route is gone no further
+    /// frame can be recorded and the observed state is final.
+    fn close_control(&self) {
+        self.control_closed.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn control_drained(&self) -> bool {
+        self.control_closed.load(Ordering::SeqCst)
+    }
+
+    /// Terminal classification, causally dependent on control-frame drain.
+    ///
+    /// The classification never turns a wall-clock expiry into
+    /// `BackendProtocolViolation`: that reason is produced only once the drain
+    /// is closed (no in-flight frame can still arrive). Until then the caller
+    /// waits for a recorded frame or the drain close; the bounded backstop
+    /// exists only so a mis-sequenced caller cannot hang forever, and its
+    /// expiry is audited as the operational `ControlDrainTimeout`, never as a
+    /// wire violation.
     async fn terminal_status_after_control_quiescence(
         &self,
         requested: bool,
     ) -> PrefixAttestationStatus {
-        if requested && self.observed_status().is_none() {
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.observed_status().is_none() {
-                // Bounded race backstop: control metadata normally arrives before
-                // terminal Done, but a valid late control frame can still exceed
-                // this window under load. In that case terminal_status() records
-                // BackendProtocolViolation as a timeout artifact, not definitive
-                // proof of a malformed wire turn.
-                let _ = tokio::time::timeout(Duration::from_millis(10), notified).await;
+        if requested && self.observed_status().is_none() && !self.control_drained() {
+            let wait = async {
+                loop {
+                    let notified = self.notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if self.observed_status().is_some() || self.control_drained() {
+                        return;
+                    }
+                    notified.await;
+                }
+            };
+            if tokio::time::timeout(PREFIX_CONTROL_DRAIN_BACKSTOP, wait)
+                .await
+                .is_err()
+                && self.observed_status().is_none()
+                && !self.control_drained()
+            {
+                return PrefixAttestationStatus::unavailable(
+                    self.producer_id.clone(),
+                    self.turn_id.clone(),
+                    NoAttestationReason::ControlDrainTimeout,
+                );
             }
         }
         self.terminal_status(requested)
@@ -2916,7 +2964,31 @@ impl AcpBackend {
                                 if let Some(status) =
                                     Self::parse_prefix_control_notification(&notif, state)
                                 {
-                                    state.record_control(status);
+                                    // Record atomically with route liveness: the
+                                    // driver removes the route (under this same
+                                    // lock) before closing the drain and
+                                    // classifying, so a record can only land
+                                    // while classification has not begun. A frame
+                                    // whose route is already gone arrived after
+                                    // the turn's terminal response (the dispatch
+                                    // loop is serial and FIFO) and is dropped as
+                                    // post-terminal.
+                                    if let Ok(map) = updates.lock() {
+                                        let live = map
+                                            .get(&session_id)
+                                            .and_then(|route| route.prefix_attestation.as_ref())
+                                            .is_some_and(|current| {
+                                                Arc::ptr_eq(&current.observed, &state.observed)
+                                            });
+                                        if live {
+                                            state.record_control(status);
+                                        } else {
+                                            tracing::warn!(
+                                                turn_id = state.turn_id.as_str(),
+                                                "dropped post-terminal attested-prefix control frame"
+                                            );
+                                        }
+                                    }
                                     return Ok(());
                                 }
                             }
@@ -5527,6 +5599,17 @@ impl AcpBackend {
             if let Ok(mut map) = registry_for_driver.lock() {
                 map.remove(&agent_id_for_driver);
             }
+            // Route removal is the control-frame drain barrier: `record_control`
+            // runs only under the registry lock while the route is live, and the
+            // dispatch loop is serial+FIFO, so every §4.4-conforming control
+            // frame (on the wire before the prompt response) was recorded before
+            // the response could resolve `prompt_fut`. Closing here makes the
+            // terminal classification below causal — a missing-control
+            // BackendProtocolViolation is claimed only once no valid in-flight
+            // frame can still arrive.
+            if let Some(state) = prefix_state.as_ref() {
+                state.close_control();
+            }
             drop(watchdog_done_tx);
             // Clear the kill switch slot now the turn is ending (next turn installs
             // its own); avoids a stale notify firing across turns.
@@ -7250,6 +7333,128 @@ mod tests {
         let terminal = state.terminal_status_after_control_quiescence(true).await;
         handle.await.unwrap();
         assert!(matches!(terminal, PrefixAttestationStatus::AttestedV1(_)));
+    }
+
+    /// Commit `status` for one enabled-mode completion into a retaining
+    /// memory store and return the durable bundle (what the audit row keeps).
+    async fn commit_prefix_terminal_status(
+        status: PrefixAttestationStatus,
+    ) -> bridge_core::harvest::HarvestAuditBundleV1 {
+        use bridge_core::attestation::HarvestSanitizationMode;
+        use bridge_core::harvest::{commit_harvested_completion, CompletionBodyOrigin};
+        use bridge_core::task_store::{MemoryTaskStore, TaskStoreHarvestAuditStore};
+
+        let store = TaskStoreHarvestAuditStore::new(Arc::new(MemoryTaskStore::default()));
+        let context = bridge_core::ports::TurnContext {
+            turn_id: bridge_core::ids::TurnId::parse(TEST_PREFIX_TURN).unwrap(),
+            session_id: bridge_core::ids::ContextId::parse("prefix-audit-ctx").unwrap(),
+            task_id: None,
+            workflow: None,
+            node: None,
+            attempt: 0,
+            agent: "codex".to_string(),
+            model: None,
+            effort: None,
+            mode: None,
+            prompt_id: None,
+            traceparent: None,
+        };
+        let committed = commit_harvested_completion(
+            &context,
+            HarvestSanitizationMode::AttestedPrefixV1,
+            &PrefixAttestationCapability::codex_commit_marker_v1(),
+            "producer",
+            CompletionBodyOrigin::ModelText,
+            "whole body".to_string(),
+            status,
+            &store,
+        )
+        .await
+        .expect("terminal status commits");
+        bridge_core::harvest::HarvestAuditStore::get_by_audit_id(&store, &committed.audit_id)
+            .await
+            .expect("bundle lookup")
+            .expect("bundle exists")
+    }
+
+    /// MAJOR-1 regression: classification is causally dependent on the
+    /// control-frame drain, not on a wall clock. A valid frame recorded well
+    /// after the old 10 ms window (here 30 ms) must still win because the
+    /// drain has not been closed. The pre-fix code returned
+    /// `BackendProtocolViolation` at 10 ms and lost the frame.
+    #[tokio::test(start_paused = true)]
+    async fn prefix_terminal_classification_waits_for_drain_not_wall_clock() {
+        let state = prefix_state();
+        let control = AcpBackend::parse_prefix_control_notification(
+            &prefix_control_notification(attested_prefix_meta()),
+            &state,
+        )
+        .expect("control");
+        let recorder = state.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            recorder.record_control(control);
+        });
+
+        let terminal = state.terminal_status_after_control_quiescence(true).await;
+        handle.await.unwrap();
+        assert!(matches!(terminal, PrefixAttestationStatus::AttestedV1(_)));
+    }
+
+    /// With the drain closed (route removed, no further record possible) and
+    /// no control frame observed, the missing-control classification is a
+    /// legitimate `backend_protocol_violation` — and that is exactly what the
+    /// committed audit bundle records.
+    #[tokio::test]
+    async fn prefix_closed_drain_missing_control_commits_protocol_violation_reason() {
+        let state = prefix_state();
+        state.close_control();
+        let terminal = state.terminal_status_after_control_quiescence(true).await;
+        assert!(matches!(
+            &terminal,
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::BackendProtocolViolation,
+                ..
+            })
+        ));
+
+        let bundle = commit_prefix_terminal_status(terminal).await;
+        assert_eq!(
+            bundle.decision.decision,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation
+        );
+        assert_eq!(
+            bundle.decision.reason.as_deref(),
+            Some("backend_protocol_violation")
+        );
+    }
+
+    /// Review-mandated timeout-expired-path test: when a mis-sequenced caller
+    /// demands the terminal status while the drain is still open and the
+    /// operational backstop elapses, the audit must NOT claim a backend
+    /// protocol violation (a valid in-flight frame could still arrive); the
+    /// committed bundle records the operational `control_drain_timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn prefix_undrained_backstop_expiry_commits_operational_timeout_reason() {
+        let state = prefix_state();
+        let terminal = state.terminal_status_after_control_quiescence(true).await;
+        assert!(matches!(
+            &terminal,
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::ControlDrainTimeout,
+                ..
+            })
+        ));
+
+        let bundle = commit_prefix_terminal_status(terminal).await;
+        assert_eq!(
+            bundle.decision.decision,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation
+        );
+        assert_eq!(
+            bundle.decision.reason.as_deref(),
+            Some("control_drain_timeout")
+        );
     }
 
     #[test]

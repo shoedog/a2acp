@@ -307,6 +307,7 @@ fn reason_for_no_attestation(reason: &NoAttestationReason) -> String {
         NoAttestationReason::TurnEndedWithoutDeliverable => "turn_ended_without_deliverable",
         NoAttestationReason::MultipleCommitMarkers => "multiple_commit_markers",
         NoAttestationReason::BackendProtocolViolation => "backend_protocol_violation",
+        NoAttestationReason::ControlDrainTimeout => "control_drain_timeout",
         NoAttestationReason::BridgeSyntheticStreamError => "bridge_synthetic_stream_error",
         NoAttestationReason::BridgeSyntheticMissingDone => "bridge_synthetic_missing_done",
         NoAttestationReason::BridgeSyntheticCancellation => "bridge_synthetic_cancellation",
