@@ -69,6 +69,8 @@ pub enum BridgeError {
     UpstreamA2aError,
     #[error("store failure")]
     StoreFailure,
+    #[error("harvest_audit_persist_failed")]
+    HarvestAuditPersistFailed { audit_id: String },
     #[error("invalid state transition")]
     InvalidStateTransition,
     #[error("unknown agent: {id}")]

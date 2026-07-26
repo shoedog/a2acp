@@ -3,6 +3,10 @@
 //! responsibility. Timestamps are passed IN — the core forbids `Date::now`.
 
 use crate::error::BridgeError;
+use crate::harvest::{
+    HarvestAuditBundleV1, HarvestAuditCommit, HarvestAuditStore, HarvestAuditStoreError,
+    HarvestRawRecordV1, HarvestSanitizationDecisionV1,
+};
 use crate::ids::{BatchId, ContextId, NodeId, OperationId, TaskId, TurnId};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -285,7 +289,7 @@ pub enum ResumeClaim {
 }
 
 #[async_trait::async_trait]
-pub trait TaskStore: Send + Sync {
+pub trait TaskStore: HarvestAuditStore + Send + Sync {
     /// Non-clobbering INSERT. A duplicate id MUST return an error (NOT upsert),
     /// so a resubmit/colliding id can never overwrite a terminal result.
     async fn create(&self, rec: &TaskRecord) -> Result<(), BridgeError>;
@@ -538,6 +542,58 @@ pub trait TaskStore: Send + Sync {
     async fn progress_snapshot(&self, task: &TaskId) -> Result<TaskProgressSnapshot, BridgeError>;
 }
 
+#[derive(Clone)]
+pub struct TaskStoreHarvestAuditStore {
+    inner: Arc<dyn TaskStore>,
+}
+
+impl TaskStoreHarvestAuditStore {
+    pub fn new(inner: Arc<dyn TaskStore>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl HarvestAuditStore for TaskStoreHarvestAuditStore {
+    async fn commit_bundle(
+        &self,
+        raw: HarvestRawRecordV1,
+        decision: HarvestSanitizationDecisionV1,
+    ) -> Result<HarvestAuditCommit, HarvestAuditStoreError> {
+        self.inner.commit_bundle(raw, decision).await
+    }
+
+    async fn get_by_audit_id(
+        &self,
+        audit_id: &str,
+    ) -> Result<Option<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+        self.inner.get_by_audit_id(audit_id).await
+    }
+
+    async fn get_by_attempt_key(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        attempt_id: u32,
+        turn_id: &str,
+    ) -> Result<Option<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+        self.inner
+            .get_by_attempt_key(run_id, node_id, attempt_id, turn_id)
+            .await
+    }
+
+    async fn list_by_task_id(
+        &self,
+        task_id: &str,
+        after_audit_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+        self.inner
+            .list_by_task_id(task_id, after_audit_id, limit)
+            .await
+    }
+}
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -606,7 +662,8 @@ pub fn fold_journal_to_snapshot(
             | crate::orch::OrchEventKind::Usage { .. }
             | crate::orch::OrchEventKind::Plan { .. }
             | crate::orch::OrchEventKind::ToolCall { .. }
-            | crate::orch::OrchEventKind::ToolCallUpdate { .. } => {}
+            | crate::orch::OrchEventKind::ToolCallUpdate { .. }
+            | crate::orch::OrchEventKind::HarvestSanitizationDecision { .. } => {}
         }
     }
 
@@ -628,6 +685,42 @@ pub fn fold_journal_to_snapshot(
 
 /// `(output, ok, ts, seq, usage)` stored per `(task_id, node_id)` checkpoint key.
 type CheckpointValue = (String, bool, i64, i64, Option<crate::orch::UsageSnapshot>);
+
+type HarvestAttemptKey = (String, String, u32, String);
+
+#[derive(Default)]
+struct HarvestMemoryState {
+    by_audit_id: HashMap<String, HarvestAuditBundleV1>,
+    by_attempt_key: HashMap<HarvestAttemptKey, String>,
+}
+
+fn harvest_attempt_key(raw: &HarvestRawRecordV1) -> HarvestAttemptKey {
+    (
+        raw.run_id.clone(),
+        raw.node_id.clone(),
+        raw.attempt_id,
+        raw.turn_id.clone(),
+    )
+}
+
+pub fn validate_harvest_bundle_shape(
+    raw: &HarvestRawRecordV1,
+    decision: &HarvestSanitizationDecisionV1,
+) -> Result<(), HarvestAuditStoreError> {
+    if raw.audit_id != decision.audit_id {
+        return Err(HarvestAuditStoreError::Encoding(
+            "raw and decision audit_id differ".to_string(),
+        ));
+    }
+    if raw.schema_version != crate::harvest::HARVEST_SCHEMA_VERSION
+        || decision.schema_version != crate::harvest::HARVEST_SCHEMA_VERSION
+    {
+        return Err(HarvestAuditStoreError::Encoding(
+            "unsupported harvest audit schema version".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// In-memory `TaskStore` (the default when no DB path is configured). Production
 /// use, not just a test fake — lives in `bridge-core` so `bridge-a2a-inbound`
@@ -652,6 +745,7 @@ pub struct MemoryTaskStore {
     turn_log: Mutex<HashMap<String, TurnLogRow>>,
     /// Per-task durable orchestration journal rows. Key: task_id.
     journals: Mutex<HashMap<String, Vec<(i64, crate::orch::OrchEvent)>>>,
+    harvest: Mutex<HarvestMemoryState>,
 }
 
 impl Default for MemoryTaskStore {
@@ -678,6 +772,7 @@ impl MemoryTaskStore {
             starts: Mutex::new(HashMap::new()),
             turn_log: Mutex::new(HashMap::new()),
             journals: Mutex::new(HashMap::new()),
+            harvest: Mutex::new(HarvestMemoryState::default()),
         }
     }
 
@@ -702,6 +797,106 @@ impl MemoryTaskStore {
         let seq = g.entry(task_id.to_string()).or_insert(0);
         *seq += 1;
         *seq
+    }
+}
+
+#[async_trait::async_trait]
+impl HarvestAuditStore for MemoryTaskStore {
+    async fn commit_bundle(
+        &self,
+        raw: HarvestRawRecordV1,
+        decision: HarvestSanitizationDecisionV1,
+    ) -> Result<HarvestAuditCommit, HarvestAuditStoreError> {
+        validate_harvest_bundle_shape(&raw, &decision)?;
+        let key = harvest_attempt_key(&raw);
+        let mut harvest = self.harvest.lock().unwrap();
+
+        if let Some(existing_id) = harvest.by_attempt_key.get(&key) {
+            if existing_id != &raw.audit_id {
+                return Err(HarvestAuditStoreError::IntegrityConflict {
+                    audit_id: raw.audit_id,
+                });
+            }
+        }
+        if let Some(existing) = harvest.by_audit_id.get(&raw.audit_id) {
+            if existing.raw == raw && existing.decision == decision {
+                return Ok(HarvestAuditCommit::AlreadyPresentIdentical);
+            }
+            return Err(HarvestAuditStoreError::IntegrityConflict {
+                audit_id: raw.audit_id,
+            });
+        }
+
+        let audit_id = raw.audit_id.clone();
+        harvest.by_attempt_key.insert(key, audit_id.clone());
+        harvest.by_audit_id.insert(
+            audit_id,
+            HarvestAuditBundleV1 {
+                raw,
+                decision,
+                created_at_ms: self.retention_now_ms(),
+            },
+        );
+        Ok(HarvestAuditCommit::Inserted)
+    }
+
+    async fn get_by_audit_id(
+        &self,
+        audit_id: &str,
+    ) -> Result<Option<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+        Ok(self.harvest.lock().unwrap().by_audit_id.get(audit_id).cloned())
+    }
+
+    async fn get_by_attempt_key(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        attempt_id: u32,
+        turn_id: &str,
+    ) -> Result<Option<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+        let harvest = self.harvest.lock().unwrap();
+        let key = (
+            run_id.to_string(),
+            node_id.to_string(),
+            attempt_id,
+            turn_id.to_string(),
+        );
+        Ok(harvest
+            .by_attempt_key
+            .get(&key)
+            .and_then(|audit_id| harvest.by_audit_id.get(audit_id))
+            .cloned())
+    }
+
+    async fn list_by_task_id(
+        &self,
+        task_id: &str,
+        after_audit_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+        let mut rows: Vec<_> = self
+            .harvest
+            .lock()
+            .unwrap()
+            .by_audit_id
+            .values()
+            .filter(|bundle| bundle.raw.task_id == task_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.raw.audit_id.cmp(&b.raw.audit_id))
+        });
+        if let Some(after) = after_audit_id {
+            if let Some(pos) = rows.iter().position(|bundle| bundle.raw.audit_id == after) {
+                rows = rows.split_off(pos + 1);
+            } else {
+                rows.clear();
+            }
+        }
+        rows.truncate(limit as usize);
+        Ok(rows)
     }
 }
 
@@ -1760,6 +1955,261 @@ mod tests {
             item_id: Some(item.to_string()),
             artifacts_purged_at: None,
         }
+    }
+
+    fn harvest_raw_record(
+        audit_id: &str,
+        task_id: &str,
+        run_id: &str,
+        node_id: &str,
+        attempt_id: u32,
+        turn_id: &str,
+        raw_body: &str,
+    ) -> crate::harvest::HarvestRawRecordV1 {
+        crate::harvest::HarvestRawRecordV1 {
+            schema_version: crate::harvest::HARVEST_SCHEMA_VERSION,
+            audit_id: audit_id.to_string(),
+            task_id: task_id.to_string(),
+            run_id: run_id.to_string(),
+            node_id: node_id.to_string(),
+            attempt_id,
+            turn_id: turn_id.to_string(),
+            backend_id: "codex".to_string(),
+            producer_id: "codex:model".to_string(),
+            declared_capability: crate::attestation::PrefixAttestationCapability::unsupported(
+                crate::attestation::CapabilityUnavailableReason::BackendDeclaredIncapable,
+            ),
+            raw_body: raw_body.to_string(),
+            raw_len_bytes: raw_body.len() as u64,
+            raw_body_sha256: [1_u8; 32],
+            prefix_attestation: crate::attestation::PrefixAttestationStatus::unavailable(
+                "codex:model",
+                turn_id,
+                crate::attestation::NoAttestationReason::BackendDeclaredIncapable,
+            ),
+            provenance_sha256: [2_u8; 32],
+        }
+    }
+
+    fn harvest_decision(
+        raw: &crate::harvest::HarvestRawRecordV1,
+        decision: crate::harvest::HarvestDecision,
+    ) -> crate::harvest::HarvestSanitizationDecisionV1 {
+        crate::harvest::HarvestSanitizationDecisionV1 {
+            schema_version: crate::harvest::HARVEST_SCHEMA_VERSION,
+            audit_id: raw.audit_id.clone(),
+            mode: crate::attestation::HarvestSanitizationMode::AttestedPrefixV1,
+            decision,
+            reason: None,
+            node_id: raw.node_id.clone(),
+            producer_id: raw.producer_id.clone(),
+            issuer_id: None,
+            raw_body_sha256: raw.raw_body_sha256,
+            effective_body_sha256: [3_u8; 32],
+            raw_len_bytes: raw.raw_len_bytes,
+            effective_len_bytes: raw.raw_len_bytes,
+            cut_byte_offset: None,
+            provenance_sha256: raw.provenance_sha256,
+            suspicious_threshold_percent: crate::harvest::SUSPICIOUS_THRESHOLD_PERCENT,
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_harvest_audit_retries_are_idempotent_and_queryable() {
+        let store = MemoryTaskStore::with_clock(Arc::new(|| 44));
+        let raw = harvest_raw_record(
+            "apc1_audit_001",
+            "task-harvest",
+            "run-harvest",
+            "node-a",
+            0,
+            "turn-harvest",
+            "deliverable",
+        );
+        let decision = harvest_decision(&raw, crate::harvest::HarvestDecision::KeptNoAttestation);
+
+        assert_eq!(
+            crate::harvest::HarvestAuditStore::commit_bundle(
+                &store,
+                raw.clone(),
+                decision.clone()
+            )
+            .await
+            .unwrap(),
+            crate::harvest::HarvestAuditCommit::Inserted
+        );
+        assert_eq!(
+            crate::harvest::HarvestAuditStore::commit_bundle(
+                &store,
+                raw.clone(),
+                decision.clone()
+            )
+            .await
+            .unwrap(),
+            crate::harvest::HarvestAuditCommit::AlreadyPresentIdentical
+        );
+
+        let by_id = crate::harvest::HarvestAuditStore::get_by_audit_id(
+            &store,
+            "apc1_audit_001",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(by_id.created_at_ms, 44);
+        assert_eq!(by_id.raw, raw);
+        assert_eq!(by_id.decision, decision);
+
+        let by_attempt = crate::harvest::HarvestAuditStore::get_by_attempt_key(
+            &store,
+            "run-harvest",
+            "node-a",
+            0,
+            "turn-harvest",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(by_attempt.raw.audit_id, "apc1_audit_001");
+    }
+
+    #[tokio::test]
+    async fn memory_harvest_audit_rejects_attempt_rewrite() {
+        let store = MemoryTaskStore::new();
+        let raw = harvest_raw_record(
+            "apc1_audit_001",
+            "task-harvest",
+            "run-harvest",
+            "node-a",
+            0,
+            "turn-harvest",
+            "deliverable",
+        );
+        let decision = harvest_decision(&raw, crate::harvest::HarvestDecision::KeptNoAttestation);
+        crate::harvest::HarvestAuditStore::commit_bundle(&store, raw, decision)
+            .await
+            .unwrap();
+
+        let rewritten = harvest_raw_record(
+            "apc1_audit_002",
+            "task-harvest",
+            "run-harvest",
+            "node-a",
+            0,
+            "turn-harvest",
+            "rewritten deliverable",
+        );
+        let rewritten_decision =
+            harvest_decision(&rewritten, crate::harvest::HarvestDecision::KeptNoAttestation);
+        let err = crate::harvest::HarvestAuditStore::commit_bundle(
+            &store,
+            rewritten,
+            rewritten_decision,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::harvest::HarvestAuditStoreError::IntegrityConflict { audit_id }
+                if audit_id == "apc1_audit_002"
+        ));
+    }
+
+    #[tokio::test]
+    async fn memory_harvest_audit_lists_by_task_with_cursor() {
+        let store = MemoryTaskStore::with_clock(Arc::new(|| 44));
+        for (audit_id, task_id, run_id) in [
+            ("apc1_audit_001", "task-harvest", "run-harvest-a"),
+            ("apc1_audit_002", "task-harvest", "run-harvest-b"),
+            ("apc1_audit_003", "other-task", "run-harvest-c"),
+        ] {
+            let raw = harvest_raw_record(
+                audit_id,
+                task_id,
+                run_id,
+                audit_id,
+                0,
+                audit_id,
+                "deliverable",
+            );
+            let decision =
+                harvest_decision(&raw, crate::harvest::HarvestDecision::KeptNoAttestation);
+            crate::harvest::HarvestAuditStore::commit_bundle(&store, raw, decision)
+                .await
+                .unwrap();
+        }
+
+        let rows = crate::harvest::HarvestAuditStore::list_by_task_id(
+            &store,
+            "task-harvest",
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|bundle| bundle.raw.audit_id.as_str())
+                .collect::<Vec<_>>(),
+            ["apc1_audit_001", "apc1_audit_002"]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|bundle| bundle.raw.run_id.as_str())
+                .collect::<Vec<_>>(),
+            ["run-harvest-a", "run-harvest-b"]
+        );
+
+        let rows = crate::harvest::HarvestAuditStore::list_by_task_id(
+            &store,
+            "task-harvest",
+            Some("apc1_audit_001"),
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|bundle| bundle.raw.audit_id.as_str())
+                .collect::<Vec<_>>(),
+            ["apc1_audit_002"]
+        );
+
+        let rows = crate::harvest::HarvestAuditStore::list_by_task_id(
+            &store,
+            "task-harvest",
+            Some("apc1_missing"),
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_harvest_audit_rejects_mismatched_bundle_ids() {
+        let store = MemoryTaskStore::new();
+        let raw = harvest_raw_record(
+            "apc1_audit_001",
+            "task-harvest",
+            "run-harvest",
+            "node-a",
+            0,
+            "turn-harvest",
+            "deliverable",
+        );
+        let mut decision = harvest_decision(&raw, crate::harvest::HarvestDecision::KeptNoAttestation);
+        decision.audit_id = "apc1_audit_002".to_string();
+
+        let err = crate::harvest::HarvestAuditStore::commit_bundle(&store, raw, decision)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::harvest::HarvestAuditStoreError::Encoding(message)
+                if message.contains("audit_id")
+        ));
     }
 
     #[tokio::test]

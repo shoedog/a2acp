@@ -586,6 +586,9 @@ impl Coordinator {
             .await;
 
         let translator = Translator::new();
+        let harvest_audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
+            bridge_core::task_store::TaskStoreHarvestAuditStore::new(self.task_store.clone()),
+        );
         let mut events = translator.run_observed(
             turn.backend.as_ref(),
             self.session_store.as_ref(),
@@ -594,6 +597,8 @@ impl Coordinator {
             &turn.session,
             parts,
             diagnostic,
+            obs_ctx.clone(),
+            harvest_audit_store,
         );
         let mut collected = Vec::new();
         let mut aborted = false;
@@ -1477,6 +1482,7 @@ mod tests {
                 prompt_template: "{{input}}".into(),
                 inputs: Vec::new(),
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         })

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use bridge_controller::merge::MergeConfig;
 use bridge_controller::verify::VerifyConfig;
+use bridge_core::attestation::HarvestSanitizationMode;
 use bridge_core::domain::{AgentEntry, AgentKind, Effort, RegistrySnapshot};
 use bridge_core::ids::AgentId;
 
@@ -377,6 +378,7 @@ pub struct RetryToml {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowNodeToml {
     pub id: String,
     pub agent: String,
@@ -392,6 +394,8 @@ pub struct WorkflowNodeToml {
     pub inputs: Vec<String>,
     #[serde(default)]
     pub retry: Option<RetryToml>,
+    #[serde(default)]
+    pub harvest_sanitization: Option<HarvestSanitizationMode>,
 }
 
 /// `[[prompts]]` registry entry (E8a). Exactly one of `file` / `text` is required (validated at load).
@@ -1365,6 +1369,7 @@ impl RegistryConfig {
                             backoff_ms: r.backoff_ms,
                             backoff_cap_ms: r.backoff_cap_ms,
                         }),
+                    harvest_sanitization: Some(n.harvest_sanitization.unwrap_or_default()),
                 });
             }
             let g = WorkflowGraph {
@@ -3172,6 +3177,63 @@ addr="127.0.0.1:8080"
             neither.prompt.is_none()
                 && neither.prompt_file.is_none()
                 && neither.prompt_text.is_none()
+        );
+    }
+
+    #[test]
+    fn node_parses_harvest_sanitization_and_rejects_unknown_fields() {
+        let with_mode: WorkflowNodeToml = toml::from_str(
+            "id=\"n\"\nagent=\"a\"\nprompt=\"rev\"\nharvest_sanitization=\"attested_prefix_v1\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            with_mode.harvest_sanitization,
+            Some(HarvestSanitizationMode::AttestedPrefixV1)
+        );
+
+        let unknown = toml::from_str::<WorkflowNodeToml>(
+            "id=\"n\"\nagent=\"a\"\nprompt=\"rev\"\nunexpected=1\n",
+        );
+        assert!(
+            unknown.is_err(),
+            "workflow node unknown fields must be rejected"
+        );
+    }
+
+    #[test]
+    fn load_workflows_snapshots_harvest_sanitization_modes() {
+        let toml = format!(
+            "{AGENTS_HEADER}
+\
+             [[workflows]]
+id=\"w\"
+\
+             [[workflows.nodes]]
+id=\"a\"
+agent=\"codex\"
+prompt_text=\"A {{input}}\"
+inputs=[]
+\
+             [[workflows.nodes]]
+id=\"b\"
+agent=\"codex\"
+prompt_text=\"B {{a}}\"
+inputs=[\"a\"]
+harvest_sanitization=\"attested_prefix_v1\"
+\
+             {SERVER_FOOTER}"
+        );
+        let cfg: RegistryConfig = toml::from_str(&toml).expect("parse");
+        let workflows = cfg.load_workflows(Path::new(".")).expect("load workflows");
+        let workflow_id = bridge_core::ids::WorkflowId::parse("w").unwrap();
+        let graph = workflows.get(&workflow_id).unwrap();
+        assert_eq!(
+            graph.nodes[0].harvest_sanitization,
+            Some(HarvestSanitizationMode::Off)
+        );
+        assert_eq!(
+            graph.nodes[1].harvest_sanitization,
+            Some(HarvestSanitizationMode::AttestedPrefixV1)
         );
     }
 

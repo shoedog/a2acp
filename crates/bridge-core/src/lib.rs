@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod diagnostics;
 pub mod domain;
 pub mod error;
+pub mod harvest;
 pub mod ids;
 pub mod liveness;
 pub mod mcp;

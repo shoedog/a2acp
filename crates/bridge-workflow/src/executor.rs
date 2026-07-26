@@ -4,9 +4,13 @@ use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::template::render;
 use bridge_core::attestation::{
     append_prompt_contract, prefix_attestation_request_for_capability, HarvestSanitizationMode,
+    PrefixAttestationCapability, PrefixAttestationStatus,
 };
 use bridge_core::domain::{effective_config, AgentEntry, AgentOverride, Part, SessionSpec};
 use bridge_core::error::BridgeError;
+use bridge_core::harvest::{
+    commit_harvested_completion, CompletionBodyOrigin, HarvestAuditStore, NoopHarvestAuditStore,
+};
 use bridge_core::ids::{NodeId, OperationId, SessionId};
 use bridge_core::orch::UsageSnapshot;
 use bridge_core::permission::TurnMeta;
@@ -33,6 +37,7 @@ pub struct WorkflowRunContext {
     pub parent_traceparent: Option<bridge_core::ports::TraceParent>,
     pub task_id: Option<bridge_core::ids::TaskId>,
     pub prompt_id: Option<String>,
+    pub harvest_audit_store: Arc<dyn HarvestAuditStore>,
 }
 
 impl Default for WorkflowRunContext {
@@ -44,6 +49,7 @@ impl Default for WorkflowRunContext {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         }
     }
 }
@@ -156,13 +162,96 @@ pub trait WorkflowNodeDispatcher: Send + Sync {
 /// Uniform future type used in the per-run `FuturesUnordered` pool.
 /// Each fan-out node is boxed to this type so `FuturesUnordered` can hold
 /// futures of different async-block monomorphisations in one collection.
-type NodeFut<'a> = std::pin::Pin<
-    Box<
-        dyn futures::Future<Output = (NodeId, String, bool, Option<UsageSnapshot>, NodeDisposition)>
-            + Send
-            + 'a,
-    >,
->;
+type NodeFut<'a> =
+    std::pin::Pin<Box<dyn futures::Future<Output = (NodeId, NodeRunOutput)> + Send + 'a>>;
+
+#[derive(Clone)]
+struct NodeHarvestMeta {
+    context: TurnContext,
+    mode: HarvestSanitizationMode,
+    capability: PrefixAttestationCapability,
+    producer_id: String,
+    status: PrefixAttestationStatus,
+    origin: CompletionBodyOrigin,
+}
+
+struct NodeRunOutput {
+    text: String,
+    ok: bool,
+    usage: Option<UsageSnapshot>,
+    disposition: NodeDisposition,
+    harvest: NodeHarvestMeta,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn node_harvest_meta_from_context(
+    context: TurnContext,
+    node: &WorkflowNode,
+    capability: PrefixAttestationCapability,
+    status: PrefixAttestationStatus,
+    origin: CompletionBodyOrigin,
+) -> NodeHarvestMeta {
+    NodeHarvestMeta {
+        context,
+        mode: node.harvest_sanitization.unwrap_or_default(),
+        capability,
+        producer_id: node.agent.as_str().to_string(),
+        status,
+        origin,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn node_harvest_meta(
+    wf_id: &str,
+    node: &WorkflowNode,
+    run_id: &str,
+    ctx: &WorkflowRunContext,
+    attempt: u32,
+    capability: PrefixAttestationCapability,
+    status: PrefixAttestationStatus,
+    origin: CompletionBodyOrigin,
+) -> NodeHarvestMeta {
+    node_harvest_meta_from_context(
+        node_turn_context(wf_id, node, run_id, ctx, None, None, None, attempt),
+        node,
+        capability,
+        status,
+        origin,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn node_run_output(
+    wf_id: &str,
+    node: &WorkflowNode,
+    run_id: &str,
+    ctx: &WorkflowRunContext,
+    text: String,
+    ok: bool,
+    usage: Option<UsageSnapshot>,
+    disposition: NodeDisposition,
+    origin: CompletionBodyOrigin,
+) -> NodeRunOutput {
+    NodeRunOutput {
+        text,
+        ok,
+        usage,
+        disposition,
+        // attempt=0 denotes a pre-attempt synthetic exit, not a real
+        // backend prompt attempt.
+        harvest: node_harvest_meta(
+            wf_id,
+            node,
+            run_id,
+            ctx,
+            0,
+            PrefixAttestationCapability::default(),
+            PrefixAttestationStatus::default(),
+            origin,
+        ),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NodeDisposition {
@@ -910,13 +999,18 @@ impl WorkflowExecutor {
         diagnostic_factory: &Arc<dyn DiagnosticObserverFactory>,
         dispatcher: Option<&Arc<dyn WorkflowNodeDispatcher>>,
         preflight_cache: &PreflightCache,
-    ) -> (String, bool, Option<UsageSnapshot>, NodeDisposition) {
+    ) -> NodeRunOutput {
         if cancel.is_cancelled() {
-            return (
+            return node_run_output(
+                wf_id,
+                node,
+                run_id,
+                ctx,
                 format!("[node {} canceled]", node.id.as_str()),
                 false,
                 None,
                 NodeDisposition::Canceled,
+                CompletionBodyOrigin::BridgeSyntheticCancellation,
             );
         }
         if let Some(d) = dispatcher {
@@ -947,11 +1041,16 @@ impl WorkflowExecutor {
                                 ctx: &node_obs_ctx,
                                 outcome: &outcome,
                             });
-                            return (
+                            return node_run_output(
+                                wf_id,
+                                node,
+                                run_id,
+                                ctx,
                                 format!("[node {} canceled]", node.id.as_str()),
                                 false,
                                 None,
                                 NodeDisposition::Canceled,
+                                CompletionBodyOrigin::BridgeSyntheticCancellation,
                             );
                         }
                         Err(PreflightFailure::Hard {
@@ -963,11 +1062,16 @@ impl WorkflowExecutor {
                                 ctx: &node_obs_ctx,
                                 outcome: &outcome,
                             });
-                            return (
+                            return node_run_output(
+                                wf_id,
+                                node,
+                                run_id,
+                                ctx,
                                 format!("[node {} failed: {message}]", node.id.as_str()),
                                 false,
                                 None,
                                 NodeDisposition::Failed,
+                                CompletionBodyOrigin::BridgeSyntheticStreamError,
                             );
                         }
                     };
@@ -1025,11 +1129,16 @@ impl WorkflowExecutor {
                             ctx: &node_obs_ctx,
                             outcome: &fail_out,
                         });
-                        return (
+                        return node_run_output(
+                            wf_id,
+                            node,
+                            run_id,
+                            ctx,
                             format!("[node {} failed: {:?}]", node.id.as_str(), e),
                             false,
                             None,
                             NodeDisposition::Failed,
+                            CompletionBodyOrigin::BridgeSyntheticStreamError,
                         );
                     }
                 };
@@ -1053,17 +1162,28 @@ impl WorkflowExecutor {
                         outcome: &outcome,
                     });
                     let disposition = NodeDisposition::from_turn(&outcome);
-                    return (text, false, None, disposition);
+                    let origin = if matches!(disposition, NodeDisposition::Canceled) {
+                        CompletionBodyOrigin::BridgeSyntheticCancellation
+                    } else {
+                        CompletionBodyOrigin::BridgeSyntheticStreamError
+                    };
+                    return node_run_output(
+                        wf_id,
+                        node,
+                        run_id,
+                        ctx,
+                        text,
+                        false,
+                        None,
+                        disposition,
+                        origin,
+                    );
                 }
 
                 let prefix_capability = turn.backend.prefix_attestation_capability();
-                // Task P: harvest sanitization has no configuration surface yet, so
-                // the node mode is structurally Off (design §6); Task F's per-node
-                // `harvest_sanitization` config replaces this literal. Off keeps the
-                // request Disabled — no prompt contract, no enabled beginTurn
-                // (§4.5, §15.1 acceptance criterion 16).
+                let node_harvest_mode = node.harvest_sanitization.unwrap_or_default();
                 let prefix_attestation_request = match prefix_attestation_request_for_capability(
-                    HarvestSanitizationMode::Off,
+                    node_harvest_mode,
                     &prefix_capability,
                 ) {
                     Ok(request) => request,
@@ -1087,7 +1207,17 @@ impl WorkflowExecutor {
                             ctx: &node_obs_ctx,
                             outcome: &outcome,
                         });
-                        return (text, false, None, NodeDisposition::Failed);
+                        return node_run_output(
+                            wf_id,
+                            node,
+                            run_id,
+                            ctx,
+                            text,
+                            false,
+                            None,
+                            NodeDisposition::Failed,
+                            CompletionBodyOrigin::BridgeSyntheticStreamError,
+                        );
                     }
                 };
                 turn.backend
@@ -1182,7 +1312,17 @@ impl WorkflowExecutor {
                                 ctx: &node_obs_ctx,
                                 outcome: &fail_out,
                             });
-                            return (text, false, None, NodeDisposition::Failed);
+                            return node_run_output(
+                                wf_id,
+                                node,
+                                run_id,
+                                ctx,
+                                text,
+                                false,
+                                None,
+                                NodeDisposition::Failed,
+                                CompletionBodyOrigin::BridgeSyntheticStreamError,
+                            );
                         }
                     },
                     _ = cancel.cancelled() => {
@@ -1226,12 +1366,29 @@ impl WorkflowExecutor {
                             outcome: &outcome,
                         });
                         let disposition = NodeDisposition::from_turn(&outcome);
-                        return (text, false, None, disposition);
+                        let origin = if matches!(disposition, NodeDisposition::Canceled) {
+                            CompletionBodyOrigin::BridgeSyntheticCancellation
+                        } else {
+                            CompletionBodyOrigin::BridgeSyntheticStreamError
+                        };
+                        return node_run_output(
+                            wf_id,
+                            node,
+                            run_id,
+                            ctx,
+                            text,
+                            false,
+                            None,
+                            disposition,
+                            origin,
+                        );
                     }
                 };
                 let mut text = String::new();
                 let mut ok = true;
                 let mut saw_done = false;
+                let mut done_stop_cancelled = false;
+                let mut prefix_attestation_status = PrefixAttestationStatus::default();
                 let mut last_usage: Option<UsageSnapshot> = None;
                 let mut exit = loop {
                     tokio::select! {
@@ -1271,9 +1428,11 @@ impl WorkflowExecutor {
                                     break NodeTurnExit::Canceled;
                                 }
                             }
-                            Some(Ok(Update::Done { stop_reason, .. })) => {
+                            Some(Ok(Update::Done { stop_reason, prefix_attestation })) => {
                                 saw_done = true;
+                                prefix_attestation_status = prefix_attestation;
                                 if stop_reason == STOP_REASON_CANCELLED {
+                                    done_stop_cancelled = true;
                                     ok = false;
                                 }
                                 break NodeTurnExit::Normal;
@@ -1420,7 +1579,36 @@ impl WorkflowExecutor {
                     outcome: &node_outcome,
                 });
                 let disposition = NodeDisposition::from_turn(&node_outcome);
-                return (text, ok, last_usage, disposition);
+                let origin = if matches!(node_outcome, TurnOutcome::Canceled) {
+                    CompletionBodyOrigin::BridgeSyntheticCancellation
+                } else if empty_final_failure && empty_final_retried {
+                    CompletionBodyOrigin::BridgeSyntheticTwinDeath
+                } else if empty_final_failure {
+                    CompletionBodyOrigin::BridgeSyntheticEmptyFinal
+                } else if !saw_done {
+                    CompletionBodyOrigin::BridgeSyntheticMissingDone
+                } else if done_stop_cancelled {
+                    CompletionBodyOrigin::BridgeSyntheticCancellation
+                } else if ok && matches!(&exit, NodeTurnExit::Normal) {
+                    CompletionBodyOrigin::ModelText
+                } else if matches!(&exit, NodeTurnExit::Error(BridgeError::AgentCrashed { .. })) {
+                    CompletionBodyOrigin::BridgeSyntheticMissingDone
+                } else {
+                    CompletionBodyOrigin::BridgeSyntheticStreamError
+                };
+                return NodeRunOutput {
+                    text,
+                    ok,
+                    usage: last_usage,
+                    disposition,
+                    harvest: node_harvest_meta_from_context(
+                        obs_ctx.clone(),
+                        node,
+                        prefix_capability.clone(),
+                        prefix_attestation_status,
+                        origin,
+                    ),
+                };
             }
         }
         let rendered = render(&node.prompt_template, vars);
@@ -1432,11 +1620,16 @@ impl WorkflowExecutor {
         )) {
             Ok(s) => s,
             Err(_) => {
-                return (
+                return node_run_output(
+                    wf_id,
+                    node,
+                    run_id,
+                    ctx,
                     format!("[node {} failed: bad session id]", node.id.as_str()),
                     false,
                     None,
                     NodeDisposition::Failed,
+                    CompletionBodyOrigin::BridgeSyntheticStreamError,
                 )
             }
         };
@@ -1474,7 +1667,7 @@ impl WorkflowExecutor {
         ctx.observer
             .record(&ObsEvent::NodeStarted { ctx: &node_obs_ctx });
 
-        let (final_text, final_ok, final_usage, final_node_outcome) = 'node_loop: {
+        let (final_text, final_ok, final_usage, final_node_outcome, final_harvest) = 'node_loop: {
             let mut attempt = 1_u32;
             let mut empty_final_retried = false;
             let mut force_fresh_empty_session = false;
@@ -1486,6 +1679,16 @@ impl WorkflowExecutor {
                         false,
                         None,
                         TurnOutcome::Canceled,
+                        node_harvest_meta(
+                            wf_id,
+                            node,
+                            run_id,
+                            ctx,
+                            attempt,
+                            PrefixAttestationCapability::default(),
+                            PrefixAttestationStatus::default(),
+                            CompletionBodyOrigin::BridgeSyntheticCancellation,
+                        ),
                     );
                 }
 
@@ -1510,6 +1713,16 @@ impl WorkflowExecutor {
                                 false,
                                 None,
                                 TurnOutcome::Failed(classify_failure(&error)),
+                                node_harvest_meta(
+                                    wf_id,
+                                    node,
+                                    run_id,
+                                    ctx,
+                                    attempt,
+                                    PrefixAttestationCapability::default(),
+                                    PrefixAttestationStatus::default(),
+                                    CompletionBodyOrigin::BridgeSyntheticStreamError,
+                                ),
                             );
                         }
                     }
@@ -1521,11 +1734,31 @@ impl WorkflowExecutor {
                 let mut turn_started: Option<std::time::Instant> = None;
                 let mut ttft_val: Option<std::time::Duration> = None;
                 let diagnostic = diagnostic_factory.make(&node.id, attempt);
+                let mut attempt_harvest = node_harvest_meta(
+                    wf_id,
+                    node,
+                    run_id,
+                    ctx,
+                    attempt,
+                    PrefixAttestationCapability::default(),
+                    PrefixAttestationStatus::default(),
+                    CompletionBodyOrigin::BridgeSyntheticStreamError,
+                );
                 let outcome = 'attempt: {
                     // resolve, with cancel
                     let mut resolved = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
+                            attempt_harvest = node_harvest_meta(
+                                wf_id,
+                                node,
+                                run_id,
+                                ctx,
+                                attempt,
+                                PrefixAttestationCapability::default(),
+                                PrefixAttestationStatus::default(),
+                                CompletionBodyOrigin::BridgeSyntheticCancellation,
+                            );
                             break 'attempt Attempt::Canceled {
                                 marker: format!("[node {} canceled]", node.id.as_str()),
                                 usage: None,
@@ -1564,6 +1797,16 @@ impl WorkflowExecutor {
                     {
                         Ok(decision) => decision,
                         Err(PreflightFailure::Canceled) => {
+                            attempt_harvest = node_harvest_meta(
+                                wf_id,
+                                node,
+                                run_id,
+                                ctx,
+                                attempt,
+                                PrefixAttestationCapability::default(),
+                                PrefixAttestationStatus::default(),
+                                CompletionBodyOrigin::BridgeSyntheticCancellation,
+                            );
                             break 'attempt Attempt::Canceled {
                                 marker: format!("[node {} canceled]", node.id.as_str()),
                                 usage: None,
@@ -1679,6 +1922,16 @@ impl WorkflowExecutor {
                         .await
                         {
                             Ok(()) => {
+                                attempt_harvest = node_harvest_meta(
+                                    wf_id,
+                                    node,
+                                    run_id,
+                                    ctx,
+                                    attempt,
+                                    PrefixAttestationCapability::default(),
+                                    PrefixAttestationStatus::default(),
+                                    CompletionBodyOrigin::BridgeSyntheticCancellation,
+                                );
                                 break 'attempt Attempt::Canceled {
                                     marker: format!("[node {} canceled]", node.id.as_str()),
                                     usage: None,
@@ -1699,10 +1952,9 @@ impl WorkflowExecutor {
                     }
                     // prompt, with cancel
                     let prefix_capability = resolved.backend.prefix_attestation_capability();
-                    // Task P: mode is structurally Off until Task F lands the
-                    // `harvest_sanitization` node config (§4.5/§6; AC 16).
+                    let node_harvest_mode = node.harvest_sanitization.unwrap_or_default();
                     let prefix_attestation_request = match prefix_attestation_request_for_capability(
-                        HarvestSanitizationMode::Off,
+                        node_harvest_mode,
                         &prefix_capability,
                     ) {
                         Ok(request) => request,
@@ -1825,6 +2077,13 @@ impl WorkflowExecutor {
                             .await
                             {
                                 Ok(()) => {
+                                    attempt_harvest = node_harvest_meta_from_context(
+                                        obs_ctx_ref.clone(),
+                                        node,
+                                        prefix_capability.clone(),
+                                        PrefixAttestationStatus::default(),
+                                        CompletionBodyOrigin::BridgeSyntheticCancellation,
+                                    );
                                     break 'attempt Attempt::Canceled {
                                         marker: format!("[node {} canceled]", node.id.as_str()),
                                         usage: None,
@@ -1848,6 +2107,8 @@ impl WorkflowExecutor {
                     let mut ok = true;
                     let mut canceled_during_drain = false;
                     let mut saw_done = false;
+                    let mut done_stop_cancelled = false;
+                    let mut prefix_attestation_status = PrefixAttestationStatus::default();
                     let mut last_usage: Option<UsageSnapshot> = None;
                     let mut err: Option<BridgeError> = None;
                     loop {
@@ -1888,9 +2149,13 @@ impl WorkflowExecutor {
                                         break;
                                     }
                                 }
-                                Some(Ok(Update::Done { stop_reason, .. })) => {
+                                Some(Ok(Update::Done { stop_reason, prefix_attestation })) => {
                                     saw_done = true;
-                                    if stop_reason == STOP_REASON_CANCELLED { ok = false; }
+                                    prefix_attestation_status = prefix_attestation;
+                                    if stop_reason == STOP_REASON_CANCELLED {
+                                        done_stop_cancelled = true;
+                                        ok = false;
+                                    }
                                     break;
                                 }
                                 Some(Err(e)) => {
@@ -1957,6 +2222,13 @@ impl WorkflowExecutor {
                                     ColdCleanupAction::Forget,
                                 )
                                 .await;
+                                attempt_harvest = node_harvest_meta_from_context(
+                                    obs_ctx_ref.clone(),
+                                    node,
+                                    prefix_capability.clone(),
+                                    prefix_attestation_status.clone(),
+                                    CompletionBodyOrigin::BridgeSyntheticStreamError,
+                                );
                                 break 'attempt Attempt::Fatal {
                                     text: format!(
                                         "[node {} rich-flush failed: {:?}]",
@@ -1980,6 +2252,13 @@ impl WorkflowExecutor {
                         .err();
                         match cancel_error.or(cleanup_error) {
                             Some(error) => {
+                                attempt_harvest = node_harvest_meta_from_context(
+                                    obs_ctx_ref.clone(),
+                                    node,
+                                    prefix_capability.clone(),
+                                    prefix_attestation_status.clone(),
+                                    CompletionBodyOrigin::BridgeSyntheticStreamError,
+                                );
                                 break 'attempt Attempt::Fatal {
                                     text: format!(
                                         "[node {} cleanup failed: {:?}]",
@@ -1991,6 +2270,13 @@ impl WorkflowExecutor {
                                 };
                             }
                             None => {
+                                attempt_harvest = node_harvest_meta_from_context(
+                                    obs_ctx_ref.clone(),
+                                    node,
+                                    prefix_capability.clone(),
+                                    prefix_attestation_status.clone(),
+                                    CompletionBodyOrigin::BridgeSyntheticCancellation,
+                                );
                                 break 'attempt Attempt::Canceled {
                                     marker: text,
                                     usage,
@@ -2044,6 +2330,13 @@ impl WorkflowExecutor {
                         if let Some(error) = &cleanup_error {
                             summary.reason = format!("empty final; cleanup failed: {error:?}");
                         }
+                        attempt_harvest = node_harvest_meta_from_context(
+                            obs_ctx_ref.clone(),
+                            node,
+                            prefix_capability.clone(),
+                            prefix_attestation_status.clone(),
+                            CompletionBodyOrigin::BridgeSyntheticEmptyFinal,
+                        );
                         break 'attempt Attempt::EmptyFinal { summary, usage };
                     }
                     if let Some(e) = err {
@@ -2075,6 +2368,18 @@ impl WorkflowExecutor {
                             ColdCleanupAction::Forget,
                         )
                         .await;
+                        let origin = if matches!(&e, BridgeError::AgentCrashed { .. }) {
+                            CompletionBodyOrigin::BridgeSyntheticMissingDone
+                        } else {
+                            CompletionBodyOrigin::BridgeSyntheticStreamError
+                        };
+                        attempt_harvest = node_harvest_meta_from_context(
+                            obs_ctx_ref.clone(),
+                            node,
+                            prefix_capability.clone(),
+                            prefix_attestation_status.clone(),
+                            origin,
+                        );
                         break 'attempt Attempt::Fatal {
                             text,
                             usage,
@@ -2090,18 +2395,48 @@ impl WorkflowExecutor {
                     .await;
                     if ok {
                         match cleanup {
-                            Ok(()) => Attempt::Ok { text, usage },
-                            Err(error) => Attempt::Fatal {
-                                text: format!(
-                                    "[node {} cleanup failed: {:?}]",
-                                    node.id.as_str(),
-                                    error
-                                ),
-                                usage,
-                                failure_class: classify_failure(&error),
-                            },
+                            Ok(()) => {
+                                attempt_harvest = node_harvest_meta_from_context(
+                                    obs_ctx_ref.clone(),
+                                    node,
+                                    prefix_capability.clone(),
+                                    prefix_attestation_status.clone(),
+                                    CompletionBodyOrigin::ModelText,
+                                );
+                                Attempt::Ok { text, usage }
+                            }
+                            Err(error) => {
+                                attempt_harvest = node_harvest_meta_from_context(
+                                    obs_ctx_ref.clone(),
+                                    node,
+                                    prefix_capability.clone(),
+                                    prefix_attestation_status.clone(),
+                                    CompletionBodyOrigin::BridgeSyntheticStreamError,
+                                );
+                                Attempt::Fatal {
+                                    text: format!(
+                                        "[node {} cleanup failed: {:?}]",
+                                        node.id.as_str(),
+                                        error
+                                    ),
+                                    usage,
+                                    failure_class: classify_failure(&error),
+                                }
+                            }
                         }
                     } else {
+                        let origin = if done_stop_cancelled {
+                            CompletionBodyOrigin::BridgeSyntheticCancellation
+                        } else {
+                            CompletionBodyOrigin::BridgeSyntheticStreamError
+                        };
+                        attempt_harvest = node_harvest_meta_from_context(
+                            obs_ctx_ref.clone(),
+                            node,
+                            prefix_capability.clone(),
+                            prefix_attestation_status.clone(),
+                            origin,
+                        );
                         Attempt::Fatal {
                             text,
                             usage,
@@ -2125,7 +2460,13 @@ impl WorkflowExecutor {
                                 fin: UsageFinalization::TurnFinal,
                             });
                         }
-                        break 'node_loop (marker, false, usage, TurnOutcome::Canceled);
+                        break 'node_loop (
+                            marker,
+                            false,
+                            usage,
+                            TurnOutcome::Canceled,
+                            attempt_harvest.clone(),
+                        );
                     }
                     Attempt::Ok { text, usage } => {
                         if let (Some(obs_ctx), Some(start)) = (obs_ctx_opt.as_ref(), turn_started) {
@@ -2141,7 +2482,13 @@ impl WorkflowExecutor {
                                 fin: UsageFinalization::TurnFinal,
                             });
                         }
-                        break 'node_loop (text, true, usage, TurnOutcome::Success);
+                        break 'node_loop (
+                            text,
+                            true,
+                            usage,
+                            TurnOutcome::Success,
+                            attempt_harvest.clone(),
+                        );
                     }
                     Attempt::Fatal {
                         text,
@@ -2162,7 +2509,7 @@ impl WorkflowExecutor {
                                 fin: UsageFinalization::TurnFinal,
                             });
                         }
-                        break 'node_loop (text, false, usage, fail_out);
+                        break 'node_loop (text, false, usage, fail_out, attempt_harvest.clone());
                     }
                     Attempt::EmptyFinal { summary, usage } => {
                         let fail_out =
@@ -2205,6 +2552,8 @@ impl WorkflowExecutor {
                                 );
                             }
                         }
+                        let mut twin_harvest = attempt_harvest.clone();
+                        twin_harvest.origin = CompletionBodyOrigin::BridgeSyntheticTwinDeath;
                         break 'node_loop (
                             format!(
                                 "[node {} failed: empty final retry also failed; {}]",
@@ -2214,6 +2563,7 @@ impl WorkflowExecutor {
                             false,
                             usage,
                             fail_out,
+                            twin_harvest,
                         );
                     }
                     Attempt::Transient {
@@ -2254,6 +2604,16 @@ impl WorkflowExecutor {
                                         false,
                                         None,
                                         TurnOutcome::Canceled,
+                                        node_harvest_meta(
+                                            wf_id,
+                                            node,
+                                            run_id,
+                                            ctx,
+                                            attempt,
+                                            PrefixAttestationCapability::default(),
+                                            PrefixAttestationStatus::default(),
+                                            CompletionBodyOrigin::BridgeSyntheticCancellation,
+                                        ),
                                     );
                                 }
                                 _ = tokio::time::sleep(retry.backoff_for(attempt)) => {}
@@ -2270,6 +2630,7 @@ impl WorkflowExecutor {
                                 false,
                                 usage,
                                 fail_out,
+                                attempt_harvest.clone(),
                             );
                         }
                         break 'node_loop (
@@ -2280,6 +2641,7 @@ impl WorkflowExecutor {
                             false,
                             usage,
                             fail_out,
+                            attempt_harvest.clone(),
                         );
                     }
                 }
@@ -2292,7 +2654,13 @@ impl WorkflowExecutor {
             outcome: &final_node_outcome,
         });
         let disposition = NodeDisposition::from_turn(&final_node_outcome);
-        (final_text, final_ok, final_usage, disposition)
+        NodeRunOutput {
+            text: final_text,
+            ok: final_ok,
+            usage: final_usage,
+            disposition,
+            harvest: final_harvest,
+        }
     }
 
     /// Run a workflow from scratch (no prior checkpoints).
@@ -2510,6 +2878,23 @@ impl WorkflowExecutor {
             registry: self.registry.clone(),
         };
         Box::pin(async_stream::stream! {
+            if !ctx.harvest_audit_store.retains_audit_records() {
+                if let Some(node) = graph.nodes.iter().find(|node| {
+                    matches!(
+                        node.harvest_sanitization.unwrap_or_default(),
+                        HarvestSanitizationMode::AttestedPrefixV1
+                    )
+                }) {
+                    yield Err(BridgeError::ConfigInvalid {
+                        reason: format!(
+                            "workflow node {} enables harvest_sanitization=attested_prefix_v1 but this workflow context has no retaining harvest audit store",
+                            node.id.as_str()
+                        ),
+                    });
+                    return;
+                }
+            }
+
             let base_render_vars = match render_vars_for_input(&input) {
                 Ok(vars) => vars,
                 Err(msg) => {
@@ -2631,7 +3016,7 @@ impl WorkflowExecutor {
                                 inflight.push(Box::pin(async move {
                                     let vars: HashMap<&str, &str> =
                                         owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                                    let (text, ok, usage, disposition) = this.run_node(
+                                    let output = this.run_node(
                                         &wf_id,
                                         &node,
                                         &vars,
@@ -2642,7 +3027,7 @@ impl WorkflowExecutor {
                                         dispatcher.as_ref(),
                                         &preflight_cache,
                                     ).await;
-                                    (node.id.clone(), text, ok, usage, disposition)
+                                    (node.id.clone(), output)
                                 }) as NodeFut);
                             }
                         }
@@ -2654,8 +3039,60 @@ impl WorkflowExecutor {
             for node in schedule_ready!() {
                 yield Ok(WorkflowEvent::NodeStarted { node });
             }
-            while let Some((node_id, text, ok, usage, disposition)) = inflight.next().await {
-                yield Ok(WorkflowEvent::NodeFinished { node: node_id.clone(), ok, output: text.clone(), usage: usage.clone() });
+            while let Some((node_id, raw_output)) = inflight.next().await {
+                let NodeRunOutput {
+                    text: raw_text,
+                    ok,
+                    usage,
+                    disposition,
+                    harvest,
+                } = raw_output;
+                let committed = match commit_harvested_completion(
+                    &harvest.context,
+                    harvest.mode,
+                    &harvest.capability,
+                    &harvest.producer_id,
+                    harvest.origin,
+                    raw_text,
+                    harvest.status.clone(),
+                    ctx.harvest_audit_store.as_ref(),
+                )
+                .await
+                {
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        yield Err(BridgeError::from(error));
+                        return;
+                    }
+                };
+                if let Some(factory) = &ctx.make_rich_sink {
+                    let sink = factory.make(&node_id);
+                    sink.record(bridge_core::orch::OrchEventKind::HarvestSanitizationDecision {
+                        audit_id: committed.audit_id.clone(),
+                        run_id: harvest.context.session_id.as_str().to_string(),
+                        node_id: node_id.as_str().to_string(),
+                        attempt_id: harvest.context.attempt,
+                        producer_id: harvest.producer_id.clone(),
+                        mode: committed.decision.mode,
+                        decision: committed.decision.decision,
+                        reason: committed.decision.reason.clone(),
+                    });
+                    if let Err(error) = sink.flush().await {
+                        tracing::warn!(
+                            node = node_id.as_str(),
+                            audit_id = committed.audit_id.as_str(),
+                            error = ?error,
+                            "harvest sanitization decision event flush failed"
+                        );
+                    }
+                }
+                let text = committed.effective_body;
+                yield Ok(WorkflowEvent::NodeFinished {
+                    node: node_id.clone(),
+                    ok,
+                    output: text.clone(),
+                    usage: usage.clone(),
+                });
                 done.insert(node_id.as_str().to_string());
                 dispositions.insert(node_id.as_str().to_string(), disposition);
                 outputs.insert(node_id.as_str().to_string(), (text, ok, usage));
@@ -2697,6 +3134,7 @@ mod tests {
     };
     use bridge_core::domain::{Part, PermissionRequest, RegistrySnapshot, SessionSpec};
     use bridge_core::error::BridgeError;
+    use bridge_core::harvest::NoopHarvestAuditStore;
     use bridge_core::ids::{AgentId, NodeId, SessionId, WorkflowId};
     use bridge_core::ports::{AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, Update};
     use futures::StreamExt;
@@ -3130,6 +3568,7 @@ mod tests {
                 prompt_template: prompt_template.into(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         })
@@ -3144,6 +3583,7 @@ mod tests {
                 prompt_template: "echo {{input}}".into(),
                 inputs: vec![],
                 retry,
+                harvest_sanitization: None,
             }],
             panel: None,
         })
@@ -4734,7 +5174,7 @@ mod tests {
             Arc::new(RecordingDiagnosticFactory::default());
         let preflight_cache: PreflightCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-        let (inline_text, inline_ok, _, _) = executor
+        let inline_output = executor
             .run_node(
                 "w",
                 &node,
@@ -4748,14 +5188,15 @@ mod tests {
             )
             .await;
         assert!(
-            inline_ok,
-            "inline path should run after fallback preflight: {inline_text}"
+            inline_output.ok,
+            "inline path should run after fallback preflight: {}",
+            inline_output.text
         );
-        assert_eq!(inline_text, "REAL");
+        assert_eq!(inline_output.text, "REAL");
 
         let dispatcher = preflight_dispatcher(backend);
         let dispatcher_dyn: Arc<dyn WorkflowNodeDispatcher> = dispatcher.clone();
-        let (dispatcher_text, dispatcher_ok, _, _) = executor
+        let dispatcher_output = executor
             .run_node(
                 "w",
                 &node,
@@ -4769,10 +5210,11 @@ mod tests {
             )
             .await;
         assert!(
-            dispatcher_ok,
-            "dispatcher path should reuse cached preflight: {dispatcher_text}"
+            dispatcher_output.ok,
+            "dispatcher path should reuse cached preflight: {}",
+            dispatcher_output.text
         );
-        assert_eq!(dispatcher_text, "REAL");
+        assert_eq!(dispatcher_output.text, "REAL");
 
         let prompts = rec.prompts.lock().unwrap().clone();
         assert_eq!(
@@ -4870,11 +5312,19 @@ mod tests {
 
         let first_result = first.await;
         let second_result = second.await;
-        let (first_text, first_ok, _, _) = first_result.unwrap();
-        let (second_text, second_ok, _, _) = second_result;
+        let first_output = first_result.unwrap();
+        let second_output = second_result;
 
-        assert!(first_ok, "first real turn should run: {first_text}");
-        assert!(second_ok, "second real turn should run: {second_text}");
+        assert!(
+            first_output.ok,
+            "first real turn should run: {}",
+            first_output.text
+        );
+        assert!(
+            second_output.ok,
+            "second real turn should run: {}",
+            second_output.text
+        );
         let prompts = rec.prompts.lock().unwrap().clone();
         assert_eq!(
             prompts
@@ -6467,6 +6917,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
@@ -6474,6 +6925,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("t").unwrap(),
@@ -6481,6 +6933,7 @@ mod tests {
                     prompt_template: "{{a}}{{b}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -6901,6 +7354,7 @@ mod tests {
             prompt_template: tpl.into(),
             inputs: ins.iter().map(|i| NodeId::parse(*i).unwrap()).collect(),
             retry: None,
+            harvest_sanitization: None,
         };
         Arc::new(WorkflowGraph {
             id: WorkflowId::parse("code-review").unwrap(),
@@ -6931,6 +7385,7 @@ mod tests {
                     prompt_template: "draft {{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("refinenode").unwrap(),
@@ -6938,6 +7393,7 @@ mod tests {
                     prompt_template: "refine against {{draft}} for {{input}}".into(),
                     inputs: vec![NodeId::parse("draftnode").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -6993,6 +7449,372 @@ mod tests {
         assert!(
             p.contains("CODEX_REVIEW") && p.contains("CLAUDE_REVIEW") && p.contains("DIFF"),
             "synth got both reviews + {{input}}: {p}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_harvest_requires_retaining_audit_store_before_node_start() {
+        let rec = Arc::new(Rec::default());
+        let reg = Arc::new(FakeRegistry {
+            backends: [(
+                "codex".to_string(),
+                ("SHOULD_NOT_RUN".to_string(), rec.clone()),
+            )]
+            .into(),
+        });
+        let graph = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("w").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: NodeId::parse("only").unwrap(),
+                agent: AgentId::parse("codex").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+                retry: None,
+                harvest_sanitization: Some(HarvestSanitizationMode::AttestedPrefixV1),
+            }],
+            panel: None,
+        });
+        let ex = WorkflowExecutor::new(reg);
+        let evs: Vec<_> = ex
+            .run(graph, "DIFF".into(), "r".into(), CancellationToken::new())
+            .collect()
+            .await;
+
+        assert!(matches!(
+            &evs[0],
+            Err(BridgeError::ConfigInvalid { reason })
+                if reason.contains("no retaining harvest audit store")
+        ));
+        assert!(rec.prompts.lock().unwrap().is_empty());
+    }
+
+    struct FailingHarvestAuditStore;
+
+    #[async_trait::async_trait]
+    impl bridge_core::harvest::HarvestAuditStore for FailingHarvestAuditStore {
+        async fn commit_bundle(
+            &self,
+            _raw: bridge_core::harvest::HarvestRawRecordV1,
+            _decision: bridge_core::harvest::HarvestSanitizationDecisionV1,
+        ) -> Result<
+            bridge_core::harvest::HarvestAuditCommit,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            Err(bridge_core::harvest::HarvestAuditStoreError::Persistence(
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "intentional harvest audit failure",
+                )),
+            ))
+        }
+
+        async fn get_by_audit_id(
+            &self,
+            _audit_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            Ok(None)
+        }
+
+        async fn get_by_attempt_key(
+            &self,
+            _run_id: &str,
+            _node_id: &str,
+            _attempt_id: u32,
+            _turn_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            Ok(None)
+        }
+
+        async fn list_by_task_id(
+            &self,
+            _task_id: &str,
+            _after_audit_id: Option<&str>,
+            _limit: u32,
+        ) -> Result<
+            Vec<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn harvest_audit_failure_releases_no_node_finished_or_fanin() {
+        let root_rec = Arc::new(Rec::default());
+        let synth_rec = Arc::new(Rec::default());
+        let reg = Arc::new(FakeRegistry {
+            backends: [
+                (
+                    "codex".to_string(),
+                    ("RAW_BODY".to_string(), root_rec.clone()),
+                ),
+                (
+                    "synth".to_string(),
+                    ("SHOULD_NOT_RUN".to_string(), synth_rec.clone()),
+                ),
+            ]
+            .into(),
+        });
+        let graph = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("w").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("root").unwrap(),
+                    agent: AgentId::parse("codex").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                    retry: None,
+                    harvest_sanitization: Some(HarvestSanitizationMode::AttestedPrefixV1),
+                },
+                WorkflowNode {
+                    id: NodeId::parse("synth").unwrap(),
+                    agent: AgentId::parse("synth").unwrap(),
+                    prompt_template: "{{root}}".into(),
+                    inputs: vec![NodeId::parse("root").unwrap()],
+                    retry: None,
+                    harvest_sanitization: None,
+                },
+            ],
+            panel: None,
+        });
+        let ctx = WorkflowRunContext {
+            task_id: Some(bridge_core::ids::TaskId::parse("task-harvest-fail").unwrap()),
+            harvest_audit_store: Arc::new(FailingHarvestAuditStore),
+            ..WorkflowRunContext::default()
+        };
+        let ex = WorkflowExecutor::new(reg);
+        let evs: Vec<_> = ex
+            .run_with_context(
+                graph,
+                "DIFF".into(),
+                "run-harvest-fail".into(),
+                CancellationToken::new(),
+                ctx,
+            )
+            .collect()
+            .await;
+
+        assert!(evs.iter().any(|event| matches!(
+            event,
+            Err(BridgeError::HarvestAuditPersistFailed { .. })
+        )));
+        assert!(
+            evs.iter()
+                .all(|event| !matches!(event, Ok(WorkflowEvent::NodeFinished { .. }))),
+            "audit failure must not release NodeFinished: {evs:?}"
+        );
+        assert!(
+            synth_rec.prompts.lock().unwrap().is_empty(),
+            "audit failure must not release root output into fan-in"
+        );
+        assert_eq!(
+            root_rec.prompts.lock().unwrap().clone(),
+            vec!["DIFF".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_harvest_cuts_two_fan_in_inputs_before_synth_render() {
+        fn fixture_sha256(body: &str) -> [u8; 32] {
+            match body {
+                "process-a\nalpha" => [
+                    92, 114, 212, 225, 97, 190, 129, 251, 240, 113, 14, 174, 183, 110, 27, 21, 249,
+                    101, 252, 239, 17, 71, 115, 27, 47, 24, 163, 41, 226, 183, 144, 175,
+                ],
+                "process-b\nbeta" => [
+                    240, 166, 40, 223, 12, 152, 188, 43, 168, 170, 32, 54, 148, 141, 7, 139, 161,
+                    32, 99, 48, 12, 190, 101, 74, 8, 154, 227, 100, 66, 158, 235, 190,
+                ],
+                other => panic!("unexpected fixture body for sha256: {other}"),
+            }
+        }
+
+        fn attested(
+            producer_id: &str,
+            turn_id: &str,
+            body: &str,
+            prefix_len: usize,
+        ) -> bridge_core::attestation::PrefixAttestationStatus {
+            bridge_core::attestation::PrefixAttestationStatus::AttestedV1(
+                bridge_core::attestation::AttestedPrefixV1 {
+                    issuer_id: bridge_core::attestation::ATTESTED_PREFIX_ISSUER_V1.to_string(),
+                    producer_id: producer_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    body_len_bytes: body.len() as u64,
+                    body_sha256: fixture_sha256(body),
+                    process_prefix_bytes: prefix_len as u64,
+                },
+            )
+        }
+
+        #[derive(Default)]
+        struct AttestedFanInBackend {
+            turns: Mutex<std::collections::HashMap<String, bridge_core::permission::TurnMeta>>,
+            synth_prompts: Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentBackend for AttestedFanInBackend {
+            async fn prompt(
+                &self,
+                session: &SessionId,
+                parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                let prompt: String = parts.iter().map(|part| part.text.as_str()).collect();
+                let meta = self
+                    .turns
+                    .lock()
+                    .unwrap()
+                    .remove(session.as_str())
+                    .ok_or(BridgeError::StoreFailure)?;
+                let (producer_id, body, prefix_len) = if prompt.contains("root-a") {
+                    ("a", "process-a\nalpha", "process-a\n".len())
+                } else if prompt.contains("root-b") {
+                    ("b", "process-b\nbeta", "process-b\n".len())
+                } else {
+                    self.synth_prompts.lock().unwrap().push(prompt);
+                    ("synth", "FINAL", 0)
+                };
+                let prefix_attestation = if producer_id == "synth" {
+                    Default::default()
+                } else {
+                    attested(producer_id, meta.turn_id.as_str(), body, prefix_len)
+                };
+                Ok(Box::pin(tokio_stream::iter(vec![
+                    Ok(Update::Text(body.to_string())),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".into(),
+                        prefix_attestation,
+                    }),
+                ])))
+            }
+
+            async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+
+            fn prefix_attestation_capability(
+                &self,
+            ) -> bridge_core::attestation::PrefixAttestationCapability {
+                bridge_core::attestation::PrefixAttestationCapability::codex_commit_marker_v1()
+            }
+
+            async fn configure_turn(
+                &self,
+                session: &SessionId,
+                meta: bridge_core::permission::TurnMeta,
+            ) {
+                self.turns
+                    .lock()
+                    .unwrap()
+                    .insert(session.as_str().to_string(), meta);
+            }
+        }
+
+        let backend = Arc::new(AttestedFanInBackend::default());
+        let graph = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("w").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("a").unwrap(),
+                    agent: AgentId::parse("a").unwrap(),
+                    prompt_template: "root-a {{input}}".into(),
+                    inputs: vec![],
+                    retry: None,
+                    harvest_sanitization: Some(HarvestSanitizationMode::AttestedPrefixV1),
+                },
+                WorkflowNode {
+                    id: NodeId::parse("b").unwrap(),
+                    agent: AgentId::parse("b").unwrap(),
+                    prompt_template: "root-b {{input}}".into(),
+                    inputs: vec![],
+                    retry: None,
+                    harvest_sanitization: Some(HarvestSanitizationMode::AttestedPrefixV1),
+                },
+                WorkflowNode {
+                    id: NodeId::parse("synth").unwrap(),
+                    agent: AgentId::parse("synth").unwrap(),
+                    prompt_template: "{{a}}|{{b}}".into(),
+                    inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
+                    retry: None,
+                    harvest_sanitization: None,
+                },
+            ],
+            panel: None,
+        });
+        let audit_store = Arc::new(bridge_core::task_store::MemoryTaskStore::with_clock(
+            Arc::new(|| 100),
+        ));
+        let ctx = WorkflowRunContext {
+            task_id: Some(bridge_core::ids::TaskId::parse("task-harvest-fanin").unwrap()),
+            harvest_audit_store: audit_store.clone(),
+            ..WorkflowRunContext::default()
+        };
+        let ex = WorkflowExecutor::new(Arc::new(SingleBackendRegistry {
+            backend: backend.clone(),
+        }));
+        let evs: Vec<_> = ex
+            .run_with_context(
+                graph,
+                "DIFF".into(),
+                "run-harvest-fanin".into(),
+                CancellationToken::new(),
+                ctx,
+            )
+            .collect()
+            .await;
+        for event in &evs {
+            if let Err(error) = event {
+                panic!("workflow failed unexpectedly: {error:?}");
+            }
+        }
+        assert!(matches!(
+            evs.last().unwrap().as_ref().unwrap(),
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                output,
+            } if output == "FINAL"
+        ));
+        assert_eq!(
+            backend.synth_prompts.lock().unwrap().clone(),
+            vec!["alpha|beta".to_string()]
+        );
+
+        let bundles = bridge_core::harvest::HarvestAuditStore::list_by_task_id(
+            audit_store.as_ref(),
+            "task-harvest-fanin",
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        let mut cut_nodes = bundles
+            .iter()
+            .filter(|bundle| {
+                bundle.decision.decision == bridge_core::harvest::HarvestDecision::CutAttested
+            })
+            .map(|bundle| {
+                (
+                    bundle.raw.node_id.as_str(),
+                    bundle.raw.raw_body.as_str(),
+                    bundle.decision.cut_byte_offset,
+                    bundle.decision.effective_len_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        cut_nodes.sort_by_key(|(node, ..)| *node);
+        assert_eq!(
+            cut_nodes,
+            vec![
+                ("a", "process-a\nalpha", Some("process-a\n".len() as u64), 5),
+                ("b", "process-b\nbeta", Some("process-b\n".len() as u64), 4),
+            ]
         );
     }
 
@@ -7073,6 +7895,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
@@ -7080,6 +7903,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("t").unwrap(),
@@ -7087,6 +7911,7 @@ mod tests {
                     prompt_template: "{{a}}{{b}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -7131,6 +7956,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
@@ -7138,6 +7964,7 @@ mod tests {
                     prompt_template: "got {{a}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("c").unwrap(),
@@ -7145,6 +7972,7 @@ mod tests {
                     prompt_template: "got {{b}}".into(),
                     inputs: vec![NodeId::parse("b").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -7228,6 +8056,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("member_b").unwrap(),
@@ -7235,6 +8064,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("synth").unwrap(),
@@ -7245,6 +8075,7 @@ mod tests {
                         NodeId::parse("member_b").unwrap(),
                     ],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -7420,6 +8251,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
@@ -7427,6 +8259,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("t").unwrap(),
@@ -7434,6 +8267,7 @@ mod tests {
                     prompt_template: "{{a}}{{b}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -7580,6 +8414,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
@@ -7587,6 +8422,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("t").unwrap(),
@@ -7594,6 +8430,7 @@ mod tests {
                     prompt_template: "{{a}}{{b}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -8096,6 +8933,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
@@ -8103,6 +8941,7 @@ mod tests {
                     prompt_template: "got {{a}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("c").unwrap(),
@@ -8110,6 +8949,7 @@ mod tests {
                     prompt_template: "got {{b}}".into(),
                     inputs: vec![NodeId::parse("b").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -8140,6 +8980,7 @@ mod observability_tests {
     use crate::graph::{RetryPolicy, WorkflowGraph, WorkflowNode};
     use bridge_core::domain::Part;
     use bridge_core::error::BridgeError;
+    use bridge_core::harvest::NoopHarvestAuditStore;
     use bridge_core::ids::{AgentId, SessionId};
     use bridge_core::orch::UsageSnapshot;
     use bridge_core::ports::{
@@ -8261,6 +9102,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: Some("prompt/workflow".to_string()),
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let graph = Arc::new(WorkflowGraph {
             id: bridge_core::ids::WorkflowId::parse("wf").unwrap(),
@@ -8270,6 +9112,7 @@ mod observability_tests {
                 prompt_template: "{{input}}".to_string(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         });
@@ -8376,6 +9219,7 @@ mod observability_tests {
                 prompt_template: "{{input}}".to_string(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         })
@@ -8390,6 +9234,7 @@ mod observability_tests {
                 prompt_template: "{{input}}".to_string(),
                 inputs: vec![],
                 retry: Some(policy),
+                harvest_sanitization: None,
             }],
             panel: None,
         })
@@ -8428,6 +9273,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
         let mut stream = exec.run_with_context_and_dispatcher(
@@ -8545,6 +9391,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let dispatcher = Arc::new(EmptyThenTextDispatcher::default());
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
@@ -8643,6 +9490,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(TextRegistry));
         let mut stream = exec.run_with_context(
@@ -8746,6 +9594,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         // No retry → AgentTimedOut is fatal on the only attempt.
         let exec = WorkflowExecutor::new(Arc::new(TimedOutRegistry));
@@ -8869,6 +9718,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(FailOnceThenTextRegistry { calls }));
         // 2 attempts, 0ms backoff so the test doesn't sleep.
@@ -9042,6 +9892,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(TextRegistry));
         let mut stream = exec.run_with_context(
@@ -9067,6 +9918,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(TimedOutRegistry));
         let mut stream = exec.run_with_context(
@@ -9092,6 +9944,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let token = CancellationToken::new();
         let exec = WorkflowExecutor::new(Arc::new(NoUsageIdleRegistry));
@@ -9128,6 +9981,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
         let mut stream = exec.run_with_context(
@@ -9175,6 +10029,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
         let mut stream = exec.run_with_context_and_dispatcher(
@@ -9301,6 +10156,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
 
@@ -9372,6 +10228,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
 

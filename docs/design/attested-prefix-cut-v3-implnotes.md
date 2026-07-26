@@ -79,3 +79,22 @@ byte-preserving proxy. Task F's `harvest_sanitization` config is what will activ
 Task P still does not add the Task F sanitizer, audit side-store, config wiring, or fan-in output
 cutting. Until Task F lands, every harvest resolves to KEEP and task output is byte-identical to the
 pre-Task-P bridge.
+
+
+## Task F implementation note: audit commit seam and direct translator wrapper
+
+Task F activates the per-node `harvest_sanitization` switch. The workflow executor now carries raw node output plus typed prefix-attestation metadata until the fan-in drain; immediately before `NodeFinished`, checkpointing, `outputs.insert(...)`, or downstream prompt rendering, it calls `commit_harvested_completion(...)` and inserts the committed effective body. The best-effort `HarvestSanitizationDecision` journal event is emitted only after the authoritative audit commit returns.
+
+The legacy `Translator::run()` wrapper remains source-compatible by using compile-time null defaults: a synthetic direct `TurnContext`, mode `Off`, and `NoopHarvestAuditStore`. Production observed call sites use `run_observed(...)` with an explicit `TurnContext` and `Arc<dyn HarvestAuditStore>`; this keeps direct/non-workflow translation byte-compatible while workflow nodes get durable audit storage through the task-store adapter.
+
+The Task P capability handshake location remains unchanged: `AcpBackend::connect_observed_after()` probes the private wrapper capability once per resolved backend, before node execution, and `configure_turn` supplies per-turn begin metadata only when the Task F node mode is `attested_prefix_v1`.
+
+Task F's `#[serde(deny_unknown_fields)]` on `[[workflows.nodes]]` is a breaking config migration: any pre-Task-F node table with unrecognized keys now fails startup and must remove or rename those keys before upgrading.
+
+The ACP terminal-status race fix registers the `Notify` waiter before the second observed-status check, then uses a bounded 10 ms control-frame quiescence wait. A valid control frame that arrives after that window can still be audited as `BackendProtocolViolation`; operators should treat that reason as either a real protocol violation or timeout expiry unless accompanying frame timing proves the wire was malformed.
+
+The standalone `run-workflow` CLI now supplies a retaining audit store whenever the selected graph enables `harvest_sanitization = "attested_prefix_v1"`. If `[store].path` is configured, audit bundles are written to that config-relative SQLite task store; otherwise the CLI creates a per-run SQLite audit artifact at `.git/a2a-bridge/run-workflow/<run-id>/harvest-audit.sqlite` when a git artifact surface exists, falling back to the OS temp directory. The CLI logs the audit-store path and task id on stderr so operators can inspect the rows after the run.
+
+Invalid attestation records intentionally persist the bridge-constructed `Rejected` status in `HarvestRawRecordV1.prefix_attestation`, not the original untrusted claim. This follows the byte-blind bridge design but means forensic inspection cannot recover a malicious issuer/hash from the audit row unless the adapter captured the wire frame elsewhere.
+
+`HarvestAuditStore::list_by_task_id` defines missing cursors as an empty page. The SQLite implementation uses a cursor lookup plus keyset query; the in-memory twin keeps the simpler full in-memory scan because it is test/local state only.

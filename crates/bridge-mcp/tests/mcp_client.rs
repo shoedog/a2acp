@@ -230,6 +230,7 @@ fn workflow(id: &str) -> Arc<WorkflowGraph> {
             prompt_template: "{{input}}".into(),
             inputs: Vec::new(),
             retry: None,
+            harvest_sanitization: None,
         }],
         panel: None,
     })

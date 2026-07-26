@@ -198,6 +198,17 @@ pub enum OrchEventKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<ContentSummary>,
     },
+    HarvestSanitizationDecision {
+        audit_id: String,
+        run_id: String,
+        node_id: String,
+        attempt_id: u32,
+        producer_id: String,
+        mode: crate::attestation::HarvestSanitizationMode,
+        decision: crate::harvest::HarvestDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

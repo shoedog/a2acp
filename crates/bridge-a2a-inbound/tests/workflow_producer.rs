@@ -21,6 +21,7 @@ use bridge_core::domain::{
     SessionSpec, TaskMeta,
 };
 use bridge_core::error::BridgeError;
+use bridge_core::harvest::HarvestAuditStore;
 use bridge_core::ids::{AgentId, CallerId, NodeId, SessionId, TaskId, WorkflowId};
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, AuthMiddleware, BackendStream, Delegation, DelegationPort, Lease,
@@ -225,6 +226,7 @@ fn review_graph() -> Arc<WorkflowGraph> {
         prompt_template: tpl.into(),
         inputs: ins.iter().map(|i| NodeId::parse(*i).unwrap()).collect(),
         retry: None,
+        harvest_sanitization: None,
     };
     Arc::new(WorkflowGraph {
         id: WorkflowId::parse("code-review").unwrap(),
@@ -551,6 +553,7 @@ async fn write_ahead_barrier() {
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             },
             WorkflowNode {
                 id: NodeId::parse("b").unwrap(),
@@ -558,6 +561,7 @@ async fn write_ahead_barrier() {
                 prompt_template: "got {{a}}".into(),
                 inputs: vec![NodeId::parse("a").unwrap()],
                 retry: None,
+                harvest_sanitization: None,
             },
         ],
         panel: None,
@@ -2622,6 +2626,59 @@ impl FailingCheckpointStore {
         Self {
             inner: MemoryTaskStore::new(),
         }
+    }
+}
+
+#[async_trait]
+impl bridge_core::harvest::HarvestAuditStore for FailingCheckpointStore {
+    async fn commit_bundle(
+        &self,
+        raw: bridge_core::harvest::HarvestRawRecordV1,
+        decision: bridge_core::harvest::HarvestSanitizationDecisionV1,
+    ) -> Result<
+        bridge_core::harvest::HarvestAuditCommit,
+        bridge_core::harvest::HarvestAuditStoreError,
+    > {
+        self.inner.commit_bundle(raw, decision).await
+    }
+
+    async fn get_by_audit_id(
+        &self,
+        audit_id: &str,
+    ) -> Result<
+        Option<bridge_core::harvest::HarvestAuditBundleV1>,
+        bridge_core::harvest::HarvestAuditStoreError,
+    > {
+        self.inner.get_by_audit_id(audit_id).await
+    }
+
+    async fn get_by_attempt_key(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        attempt_id: u32,
+        turn_id: &str,
+    ) -> Result<
+        Option<bridge_core::harvest::HarvestAuditBundleV1>,
+        bridge_core::harvest::HarvestAuditStoreError,
+    > {
+        self.inner
+            .get_by_attempt_key(run_id, node_id, attempt_id, turn_id)
+            .await
+    }
+
+    async fn list_by_task_id(
+        &self,
+        task_id: &str,
+        after_audit_id: Option<&str>,
+        limit: u32,
+    ) -> Result<
+        Vec<bridge_core::harvest::HarvestAuditBundleV1>,
+        bridge_core::harvest::HarvestAuditStoreError,
+    > {
+        self.inner
+            .list_by_task_id(task_id, after_audit_id, limit)
+            .await
     }
 }
 

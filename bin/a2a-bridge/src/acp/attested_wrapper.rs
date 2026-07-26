@@ -4,7 +4,9 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader as StdBufReader, Seek, SeekFrom, Write};
+use std::io::{
+    BufRead, BufReader as StdBufReader, Error as IoError, ErrorKind, Seek, SeekFrom, Write,
+};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -35,7 +37,7 @@ struct PromptBuffer {
     request_id: Value,
     session_id: String,
     turn: TurnConfig,
-    frames: FrameBuffer,
+    frames: Arc<Mutex<FrameBuffer>>,
 }
 
 /// Buffer of exact wire lines (§4.2 narrow proxy: frames the wrapper does not
@@ -100,6 +102,30 @@ impl FrameBuffer {
             Ok(self.lines)
         }
     }
+}
+
+async fn push_frame_line_blocking(
+    frames: Arc<Mutex<FrameBuffer>>,
+    line: String,
+) -> Result<(), DynError> {
+    tokio::task::spawn_blocking(move || {
+        let mut frames = frames.blocking_lock();
+        frames.push_line(line)
+    })
+    .await
+    .map_err(|error| {
+        IoError::new(
+            ErrorKind::Other,
+            format!("attested-prefix frame spool task failed: {error}"),
+        )
+    })?
+}
+
+async fn drain_frame_lines(frames: &Arc<Mutex<FrameBuffer>>) -> Result<Vec<String>, DynError> {
+    let mut guard = frames.lock().await;
+    let frames = std::mem::replace(&mut *guard, FrameBuffer::new());
+    drop(guard);
+    frames.into_lines()
 }
 
 impl SpoolFile {
@@ -365,7 +391,7 @@ where
                 if is_successful_prompt_terminal(&value, &prompt.request_id) {
                     flush_prompt_buffer(bridge_stdout, &mut prompt, &raw).await?;
                 } else {
-                    for buffered in prompt.frames.into_lines()? {
+                    for buffered in drain_frame_lines(&prompt.frames).await? {
                         write_raw_line(bridge_stdout, &buffered).await?;
                     }
                     write_raw_line(bridge_stdout, &raw).await?;
@@ -383,7 +409,9 @@ where
                 .and_then(|session| session.prompt.as_mut())
             {
                 if should_buffer_prompt_frame(&value) {
-                    prompt.frames.push_line(raw)?;
+                    let frames = Arc::clone(&prompt.frames);
+                    drop(guard);
+                    push_frame_line_blocking(frames, raw).await?;
                 } else {
                     drop(guard);
                     write_raw_line(bridge_stdout, &raw).await?;
@@ -468,7 +496,7 @@ async fn maybe_start_prompt_buffer(state: &Arc<Mutex<WrapperState>>, value: &Val
                     request_id: id,
                     session_id,
                     turn,
-                    frames: FrameBuffer::new(),
+                    frames: Arc::new(Mutex::new(FrameBuffer::new())),
                 });
             } else {
                 session.active_turn = Some(turn);
@@ -489,7 +517,7 @@ async fn flush_prompt_buffer<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let lines = std::mem::replace(&mut prompt.frames, FrameBuffer::new()).into_lines()?;
+    let lines = drain_frame_lines(&prompt.frames).await?;
     // Buffered lines are valid JSON by construction (only parsed frames are
     // buffered); a parse failure here is spool corruption and aborts the turn
     // rather than releasing a partially transformed completion (§3.5).
@@ -1245,6 +1273,41 @@ mod tests {
         assert_eq!(buffer.into_lines().unwrap(), lines);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_flush_waits_for_inflight_spool_push() {
+        let mut prompt = prompt_with_lines(vec![]);
+        let big = format!(
+            "{{ \"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"s\",\"update\":{{\"sessionUpdate\":\"tool_call\",\"pad\":\"{}\",\"n\":1.50}}}}}}",
+            "x".repeat(FRAME_MEMORY_LIMIT_BYTES + 1)
+        );
+        let frames = Arc::clone(&prompt.frames);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let line = big.clone();
+        let writer = std::sync::Arc::new(Mutex::new(BufWriter::new(Vec::<u8>::new())));
+        let handle = tokio::task::spawn_blocking(move || {
+            let mut guard = frames.blocking_lock();
+            guard.push_line(line).unwrap();
+            assert!(guard.spool.is_some(), "test must exercise the spool path");
+            entered_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        });
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(1))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        flush_prompt_buffer(&writer, &mut prompt, TERMINAL_RAW)
+            .await
+            .unwrap();
+        handle.await.unwrap();
+        let raw = String::from_utf8(writer.lock().await.get_ref().clone()).unwrap();
+        let lines = raw.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
+        assert_eq!(lines.first(), Some(&big));
+        assert_eq!(lines.last().map(String::as_str), Some(TERMINAL_RAW));
+    }
+
     fn text_frame(message_id: &str, text: impl Into<String>) -> Value {
         json!({
             "jsonrpc": "2.0",
@@ -1299,7 +1362,7 @@ mod tests {
                 marker: marker(),
                 enabled: true,
             },
-            frames: buffer,
+            frames: Arc::new(Mutex::new(buffer)),
         }
     }
 
@@ -1471,7 +1534,7 @@ mod tests {
                 marker: marker(),
                 enabled: true,
             },
-            frames: FrameBuffer::new(),
+            frames: Arc::new(Mutex::new(FrameBuffer::new())),
         };
         let frame = control_frame(
             &prompt,

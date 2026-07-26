@@ -25,6 +25,43 @@ pub enum PrefixAttestationCapability {
     },
 }
 
+impl<'de> serde::Deserialize<'de> for PrefixAttestationCapability {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Wire {
+            SupportedV1 {
+                issuer_id: String,
+                boundary_scheme: PrefixBoundaryScheme,
+            },
+            Unsupported {
+                reason: CapabilityUnavailableReason,
+            },
+        }
+
+        match <Wire as serde::Deserialize>::deserialize(deserializer)? {
+            Wire::SupportedV1 {
+                issuer_id,
+                boundary_scheme,
+            } => {
+                if issuer_id != ATTESTED_PREFIX_ISSUER_V1 {
+                    return Err(serde::de::Error::custom(
+                        "unsupported prefix attestation issuer_id",
+                    ));
+                }
+                Ok(Self::SupportedV1 {
+                    issuer_id: ATTESTED_PREFIX_ISSUER_V1,
+                    boundary_scheme,
+                })
+            }
+            Wire::Unsupported { reason } => Ok(Self::Unsupported { reason }),
+        }
+    }
+}
+
 impl PrefixAttestationCapability {
     #[must_use]
     pub fn codex_commit_marker_v1() -> Self {

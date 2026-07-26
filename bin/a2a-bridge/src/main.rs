@@ -3419,6 +3419,36 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         .cloned()
         .ok_or_else(|| format!("run-workflow: unknown workflow {workflow_id:?}"))?;
 
+    let harvest_enabled = graph.nodes.iter().any(|node| {
+        matches!(
+            node.harvest_sanitization.unwrap_or_default(),
+            bridge_core::attestation::HarvestSanitizationMode::AttestedPrefixV1
+        )
+    });
+    let (harvest_audit_store, harvest_audit_path) = run_workflow_harvest_audit_store(
+        &cfg,
+        &base,
+        &run_artifact_root,
+        &run_id,
+        harvest_enabled,
+    )?;
+    if let Some(path) = harvest_audit_path.as_ref() {
+        eprintln!(
+            "[run-workflow] harvest audit store {} task_id {}",
+            path.display(),
+            run_id
+        );
+    }
+    let task_id = if harvest_enabled {
+        Some(
+            bridge_core::ids::TaskId::parse(run_id.clone()).map_err(|e| {
+                format!("run-workflow: invalid generated task id {run_id:?}: {e:?}")
+            })?,
+        )
+    } else {
+        None
+    };
+
     // #1d: warm the in-container LSP dep cache up front for container_rw agents. run-workflow targets ONE
     // repo (the stamped --session-cwd), so the profile + warm are resolved once and applied to every
     // container_rw entry. Best-effort: any failure degrades to no in-container nav (Part A reports it).
@@ -3535,12 +3565,12 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             .map_err(|e| format!("run-workflow: registry init error: {e:?}"))?,
     );
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
-        Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
+        Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>,
     );
 
     // Per-request session cwd: thread it into the context so EVERY node's agent works in the target
     // dir (a container_rw :rw target, or the repo a reader reads) — not the launch cwd.
-    let ctx = match session_cwd {
+    let mut ctx = match session_cwd {
         Some(dir) => {
             let cwd = bridge_core::SessionCwd::parse(&dir)
                 .map_err(|e| format!("run-workflow: invalid --session-cwd {dir:?}: {e:?}"))?;
@@ -3552,6 +3582,8 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         }
         None => bridge_workflow::executor::WorkflowRunContext::default(),
     };
+    ctx.task_id = task_id;
+    ctx.harvest_audit_store = harvest_audit_store;
 
     // Run the workflow.
     use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
@@ -5478,6 +5510,63 @@ fn run_workflow_brief_lint_run_artifact_path(root: &Path, run_id: &str) -> Optio
             .join(run_id)
             .join("brief-lint.json"),
     )
+}
+
+fn run_workflow_harvest_audit_artifact_path(root: &Path, run_id: &str) -> Option<PathBuf> {
+    Some(
+        repo_git_dir(root)?
+            .join("a2a-bridge")
+            .join("run-workflow")
+            .join(run_id)
+            .join("harvest-audit.sqlite"),
+    )
+}
+
+fn run_workflow_harvest_audit_store(
+    cfg: &RegistryConfig,
+    config_base: &Path,
+    run_artifact_root: &Path,
+    run_id: &str,
+    enabled: bool,
+) -> Result<
+    (
+        Arc<dyn bridge_core::harvest::HarvestAuditStore>,
+        Option<PathBuf>,
+    ),
+    BoxError,
+> {
+    if !enabled {
+        return Ok((Arc::new(bridge_core::harvest::NoopHarvestAuditStore), None));
+    }
+
+    let store_path = match cfg.store.as_ref() {
+        Some(store) => {
+            let path = Path::new(&store.path);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                config_base.join(path)
+            }
+        }
+        None => run_workflow_harvest_audit_artifact_path(run_artifact_root, run_id)
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!(
+                    "a2a-bridge-{run_id}-harvest-audit.sqlite"
+                ))
+            }),
+    };
+
+    let sqlite = Arc::new(SqliteStore::open(&store_path).map_err(|e| {
+        format!(
+            "run-workflow: cannot open harvest audit store {:?}: {e:?}",
+            store_path
+        )
+    })?);
+    let task_store: Arc<dyn bridge_core::task_store::TaskStore> = sqlite;
+    let audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
+        bridge_core::task_store::TaskStoreHarvestAuditStore::new(task_store),
+    );
+    Ok((audit_store, Some(store_path)))
 }
 
 fn write_brief_lint_json_artifact(
@@ -7449,6 +7538,7 @@ mod cli_tests {
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             })
             .collect();
         WorkflowGraph {
@@ -9376,6 +9466,37 @@ file = "../prompts/named.md"
             .unwrap_err()
             .to_string();
         assert!(err.contains("--strict-brief rejected"));
+    }
+
+    #[test]
+    fn run_workflow_harvest_audit_store_uses_git_artifact_without_configured_store() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let cfg = RegistryConfig::parse(
+            "default=\"k\"\n[[agents]]\nid=\"k\"\ncmd=\"k\"\n[server]\n",
+        )
+        .unwrap();
+        let (store, path) = super::run_workflow_harvest_audit_store(
+            &cfg,
+            dir.path(),
+            dir.path(),
+            "run-1",
+            true,
+        )
+        .unwrap();
+
+        let path = path.expect("enabled harvest should expose an audit store path");
+        assert!(store.retains_audit_records());
+        assert_eq!(
+            path,
+            dir.path()
+                .join(".git")
+                .join("a2a-bridge")
+                .join("run-workflow")
+                .join("run-1")
+                .join("harvest-audit.sqlite")
+        );
+        assert!(path.exists(), "SQLite audit store should be materialized");
     }
 
     #[test]

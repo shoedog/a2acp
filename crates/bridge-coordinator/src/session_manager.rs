@@ -743,6 +743,7 @@ impl SessionManager {
             prune_children: true,
             handle: Some(handle),
             retry: None,
+            harvest_sanitization: None,
         }
     }
 
@@ -1525,6 +1526,7 @@ impl SessionManager {
                 prune_children,
                 handle: None,
                 retry: Some(retry),
+                harvest_sanitization: None,
             });
         }
         if let Some(handle) = tab.get_mut(ctx) {
@@ -1566,6 +1568,7 @@ impl SessionManager {
             prune_children,
             handle: Some(handle),
             retry: None,
+            harvest_sanitization: None,
         })
     }
 
@@ -1764,6 +1767,7 @@ impl SessionManager {
                             prune_children,
                             handle: Some(handle),
                             retry: None,
+                            harvest_sanitization: None,
                         });
                     }
                 } else {
@@ -2297,6 +2301,7 @@ impl SessionManager {
                             prune_children: true,
                             handle: Some(handle),
                             retry: None,
+                            harvest_sanitization: None,
                         });
                     }
                 }

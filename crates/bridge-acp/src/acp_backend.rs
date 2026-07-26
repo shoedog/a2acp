@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, CancelNotification,
@@ -35,7 +35,7 @@ use agent_client_protocol::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, OwnedMutexGuard};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify, OnceCell, OwnedMutexGuard};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::model_effort::{
@@ -1131,6 +1131,7 @@ struct PrefixTurnState {
     marker_nonce_hex: String,
     capability: PrefixAttestationCapability,
     observed: Arc<StdMutex<Option<PrefixAttestationStatus>>>,
+    notify: Arc<Notify>,
 }
 
 impl PrefixTurnState {
@@ -1146,6 +1147,7 @@ impl PrefixTurnState {
             marker_nonce_hex,
             capability,
             observed: Arc::new(StdMutex::new(None)),
+            notify: Arc::new(Notify::new()),
         }
     }
 
@@ -1170,13 +1172,39 @@ impl PrefixTurnState {
                 *observed = Some(status);
             }
         }
+        self.notify.notify_waiters();
+    }
+
+    fn observed_status(&self) -> Option<PrefixAttestationStatus> {
+        self.observed
+            .lock()
+            .ok()
+            .and_then(|observed| observed.clone())
+    }
+
+    async fn terminal_status_after_control_quiescence(
+        &self,
+        requested: bool,
+    ) -> PrefixAttestationStatus {
+        if requested && self.observed_status().is_none() {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.observed_status().is_none() {
+                // Bounded race backstop: control metadata normally arrives before
+                // terminal Done, but a valid late control frame can still exceed
+                // this window under load. In that case terminal_status() records
+                // BackendProtocolViolation as a timeout artifact, not definitive
+                // proof of a malformed wire turn.
+                let _ = tokio::time::timeout(Duration::from_millis(10), notified).await;
+            }
+        }
+        self.terminal_status(requested)
     }
 
     fn terminal_status(&self, requested: bool) -> PrefixAttestationStatus {
-        if let Ok(observed) = self.observed.lock() {
-            if let Some(status) = observed.clone() {
-                return status;
-            }
+        if let Some(status) = self.observed_status() {
+            return status;
         }
         if requested {
             let reason = match &self.capability {
@@ -5549,10 +5577,16 @@ impl AcpBackend {
                             .await
                         {
                             Ok(()) => {
-                                let prefix_attestation = prefix_state
-                                    .as_ref()
-                                    .map(|state| state.terminal_status(prefix_requested))
-                                    .unwrap_or_default();
+                                let prefix_attestation = match prefix_state.as_ref() {
+                                    Some(state) => {
+                                        state
+                                            .terminal_status_after_control_quiescence(
+                                                prefix_requested,
+                                            )
+                                            .await
+                                    }
+                                    None => PrefixAttestationStatus::default(),
+                                };
                                 TurnEvent::Done(Update::done_with_attestation(
                                     stop_reason,
                                     prefix_attestation,
@@ -7197,6 +7231,27 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn prefix_terminal_status_waits_for_racing_control_notification() {
+        let state = prefix_state();
+        let control = AcpBackend::parse_prefix_control_notification(
+            &prefix_control_notification(attested_prefix_meta()),
+            &state,
+        )
+        .expect("control");
+        let recorder = state.clone();
+        let handle = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            recorder.record_control(control);
+        });
+
+        let terminal = state
+            .terminal_status_after_control_quiescence(true)
+            .await;
+        handle.await.unwrap();
+        assert!(matches!(terminal, PrefixAttestationStatus::AttestedV1(_)));
     }
 
     #[test]

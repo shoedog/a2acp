@@ -16,6 +16,10 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ### Changed
 
+- Workflow node TOML parsing now rejects unknown keys. Pre-Task-F configs with stray keys under
+  `[[workflows.nodes]]` must remove or rename them before startup; use only `id`, `agent`, one prompt
+  source, `inputs`, `retry`, and `harvest_sanitization`.
+
 - The reader image build pins and asserts the nested Codex 0.144.1 and Claude SDK 0.3.198 package
   resolutions and publishes their non-secret exact identities as bounded-inspection image labels.
 

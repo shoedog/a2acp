@@ -2213,6 +2213,9 @@ fn spawn_local_producer(
     let store = srv.store.clone();
     let policy = srv.policy().clone();
     let observer = srv.coordinator().observer();
+    let harvest_audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
+        bridge_core::task_store::TaskStoreHarvestAuditStore::new(srv.task_store().clone()),
+    );
     let task = routed.task;
     let session = dispatch.session.clone();
     let mut parts = assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
@@ -2256,6 +2259,8 @@ fn spawn_local_producer(
             &session,
             parts,
             diagnostic,
+            obs_ctx.clone(),
+            harvest_audit_store.clone(),
         );
         let mut errored = false;
         // Whether the translator already emitted its own terminal frame (a
@@ -2595,9 +2600,26 @@ fn local_kiro_source(
     parts: Vec<Part>,
     diagnostic: Arc<dyn DiagnosticObserver>,
 ) -> Source {
+    let source_label = label.clone();
     // Build the stream by cloning Arc refs into a `'static + Send` stream.
     let stream: crate::fanout::EventStream = Box::pin(async_stream::stream! {
         let translator = Translator::new();
+        let turn_context = bridge_core::ports::TurnContext {
+            turn_id: mint_turn_id(),
+            session_id: ContextId::parse(session.as_str()).unwrap_or_else(|_| {
+                ContextId::parse("fanout-local").expect("fallback context id is valid")
+            }),
+            task_id: Some(task.clone()),
+            workflow: None,
+            node: Some(source_label.clone()),
+            attempt: 0,
+            agent: source_label.clone(),
+            model: None,
+            effort: None,
+            mode: None,
+            prompt_id: None,
+            traceparent: None,
+        };
         let mut events = translator.run_observed(
             backend.as_ref(),
             store.as_ref(),
@@ -2606,6 +2628,8 @@ fn local_kiro_source(
             &session,
             parts,
             diagnostic,
+            turn_context,
+            Arc::new(bridge_core::harvest::NoopHarvestAuditStore),
         );
         while let Some(ev) = events.next().await {
             // A fan-out SOURCE must never emit a terminal frame — the fan-out
@@ -2927,6 +2951,9 @@ fn spawn_workflow_producer(
             if srv.store.cancel_requested(&task).await.unwrap_or(false) {
                 token.cancel();
             }
+            let harvest_audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
+                bridge_core::task_store::TaskStoreHarvestAuditStore::new(srv.task_store().clone()),
+            );
             let wf_ctx = bridge_workflow::executor::WorkflowRunContext {
                 session_cwd: routed.session_cwd.clone(),
                 make_rich_sink: None,
@@ -2934,6 +2961,7 @@ fn spawn_workflow_producer(
                 parent_traceparent: routed.traceparent.clone(),
                 task_id: Some(routed.task.clone()),
                 prompt_id: routed.prompt_id.clone(),
+                harvest_audit_store,
             };
             let diagnostic_ctx = WorkflowDiagnosticContext::new(
                 wf_ctx,
@@ -3312,6 +3340,9 @@ async fn unary_message(
                 &prefix_capability,
                 &prefix_attestation_request,
             );
+            let harvest_audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
+                bridge_core::task_store::TaskStoreHarvestAuditStore::new(srv.task_store().clone()),
+            );
             let translator = Translator::new();
             let mut events = translator.run_observed(
                 dispatch.backend.as_ref(),
@@ -3321,6 +3352,8 @@ async fn unary_message(
                 &dispatch.session,
                 parts,
                 diagnostic,
+                dispatch.obs_ctx.clone(),
+                harvest_audit_store.clone(),
             );
             let mut collected: Vec<Result<Event, BridgeError>> = Vec::new();
             loop {
@@ -4647,6 +4680,7 @@ mod tests {
         SessionContext,
     };
     use bridge_core::error::BridgeError;
+    use bridge_core::harvest::HarvestAuditStore;
     use bridge_core::ids::{AgentId, CallerId};
     use bridge_core::orch::UsageSnapshot;
     use bridge_core::ports::*;
@@ -5750,6 +5784,7 @@ mod tests {
                         prompt_template: "{{input}}".into(),
                         inputs: Vec::new(),
                         retry: None,
+                        harvest_sanitization: None,
                     },
                     WorkflowNode {
                         id: NodeId::parse("synth").unwrap(),
@@ -5757,6 +5792,7 @@ mod tests {
                         prompt_template: "{{reviewer}}".into(),
                         inputs: vec![NodeId::parse("reviewer").unwrap()],
                         retry: None,
+                        harvest_sanitization: None,
                     },
                 ],
                 panel: None,
@@ -9817,6 +9853,7 @@ mod tests {
             prompt_template: "go".into(),
             inputs: vec![],
             retry: None,
+            harvest_sanitization: None,
         };
         let ctx = WorkflowRunContext {
             session_cwd: Some(cwd.clone()),
@@ -9929,6 +9966,7 @@ mod tests {
             prompt_template: "go".into(),
             inputs: vec![],
             retry: None,
+            harvest_sanitization: None,
         };
 
         for (index, class) in [
@@ -10080,6 +10118,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 }],
                 panel: None,
             });
@@ -10348,6 +10387,7 @@ mod tests {
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         });
@@ -13145,6 +13185,59 @@ mod tests {
 
     struct LegacyFallbackStore {
         inner: std::sync::Arc<bridge_core::task_store::MemoryTaskStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl bridge_core::harvest::HarvestAuditStore for LegacyFallbackStore {
+        async fn commit_bundle(
+            &self,
+            raw: bridge_core::harvest::HarvestRawRecordV1,
+            decision: bridge_core::harvest::HarvestSanitizationDecisionV1,
+        ) -> Result<
+            bridge_core::harvest::HarvestAuditCommit,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            self.inner.commit_bundle(raw, decision).await
+        }
+
+        async fn get_by_audit_id(
+            &self,
+            audit_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            self.inner.get_by_audit_id(audit_id).await
+        }
+
+        async fn get_by_attempt_key(
+            &self,
+            run_id: &str,
+            node_id: &str,
+            attempt_id: u32,
+            turn_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            self.inner
+                .get_by_attempt_key(run_id, node_id, attempt_id, turn_id)
+                .await
+        }
+
+        async fn list_by_task_id(
+            &self,
+            task_id: &str,
+            after_audit_id: Option<&str>,
+            limit: u32,
+        ) -> Result<
+            Vec<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            self.inner
+                .list_by_task_id(task_id, after_audit_id, limit)
+                .await
+        }
     }
 
     #[async_trait::async_trait]

@@ -1240,6 +1240,7 @@ mod tests {
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         })
