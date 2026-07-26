@@ -99,7 +99,7 @@ async fn successful_first_send_records_complete_post_barrier_lifecycle() {
     let (updates, error, observer) = observed_turn(&backend, "success").await;
 
     assert!(error.is_none(), "successful turn returned {error:?}");
-    assert!(matches!(updates.last(), Some(Update::Done { stop_reason }) if stop_reason == "stop"));
+    assert!(matches!(updates.last(), Some(Update::Done { stop_reason, .. }) if stop_reason == "stop"));
     assert_eq!(
         transition_sequence(&observer.snapshot().await),
         vec![
@@ -280,7 +280,7 @@ async fn clean_sse_eof_after_finish_reason_remains_successful_without_done_senti
         .any(|update| matches!(update, Update::Text(text) if text == "complete")));
     assert!(matches!(
         updates.last(),
-        Some(Update::Done { stop_reason }) if stop_reason == "stop"
+        Some(Update::Done { stop_reason, .. }) if stop_reason == "stop"
     ));
 }
 

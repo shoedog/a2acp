@@ -94,6 +94,7 @@ mod tests {
             Ok(Box::pin(futures::stream::once(async {
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 })
             })))
         }

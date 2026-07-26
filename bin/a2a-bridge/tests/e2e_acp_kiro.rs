@@ -138,7 +138,7 @@ async fn run_round_trip() -> (Vec<String>, String) {
                 // backend auto-approves by default, so we just note and continue.
                 eprintln!("(note) agent issued a permission request during a plain text prompt");
             }
-            Some(Ok(Update::Done { stop_reason })) => {
+            Some(Ok(Update::Done { stop_reason, .. })) => {
                 // Clean up the temp dir best-effort; ignore errors.
                 let _ = std::fs::remove_dir_all(&cwd);
                 return (texts, stop_reason);

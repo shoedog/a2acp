@@ -1165,6 +1165,7 @@ mod tests {
                 Ok(Update::Text("ok".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ])))
         }

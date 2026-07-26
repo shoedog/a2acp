@@ -523,6 +523,7 @@ impl ContainerRwBackend {
             auth_method: self.cfg.auth_method.clone(),
             pre_authenticated: self.cfg.pre_authenticated,
             watchdog: self.cfg.watchdog.clone(),
+            prefix_attestation_transport: bridge_acp::acp_backend::PrefixAttestationTransport::Unsupported,
             handshake_timeout: self.cfg.handshake_timeout,
             cancel_grace: self.cfg.cancel_grace,
             diagnostic_redactor: bridge_core::diagnostics::DiagnosticRedactor::new(
@@ -1598,6 +1599,7 @@ mod tests {
             Ok(Box::pin(tokio_stream::iter(vec![Ok(
                 bridge_core::ports::Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 },
             )])))
         }
@@ -1992,6 +1994,8 @@ mod tests {
             context_id: ContextId::parse(ctx).unwrap(),
             generation,
             op: OperationId::parse(op).unwrap(),
+            turn_id: bridge_core::ids::TurnId::parse(format!("turn_{generation:032x}")).unwrap(),
+            prefix_attestation_request: bridge_core::attestation::PrefixAttestationRequest::Disabled,
         }
     }
     /// `prompt` returns `Result<BackendStream, _>`; BackendStream isn't `Debug`, so we can't

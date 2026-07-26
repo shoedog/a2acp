@@ -1420,7 +1420,7 @@ async fn drain_stream(
                 }
                 usage = Some(next);
             }
-            Ok(Update::Done { stop_reason }) => {
+            Ok(Update::Done { stop_reason, .. }) => {
                 let safe_reason = safe_stop_reason(&stop_reason);
                 turn.stop_reason = Some(safe_reason);
                 turn.terminal_state = if safe_reason == "cancelled" {
@@ -2405,12 +2405,14 @@ mod tests {
                     Ok(Update::Text("PONG".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::Whitespace => Box::pin(futures::stream::iter(vec![
                     Ok(Update::Text("  PONG\n".into())),
                     Ok(Update::Done {
                         stop_reason: "stop".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::NoTerminal => {
@@ -2420,6 +2422,7 @@ mod tests {
                     Ok(Update::Text("not pong".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::Tool => {
@@ -2438,6 +2441,7 @@ mod tests {
                         Ok(Update::Text("PONG".into())),
                         Ok(Update::Done {
                             stop_reason: "end_turn".into(),
+                            prefix_attestation: Default::default(),
                         }),
                     ]))
                 }
@@ -2446,18 +2450,21 @@ mod tests {
                     Ok(Update::Text("PONG".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::Cancelled => Box::pin(futures::stream::iter(vec![
                     Ok(Update::Text("PONG".into())),
                     Ok(Update::Done {
                         stop_reason: "cancelled".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::Refusal => Box::pin(futures::stream::iter(vec![
                     Ok(Update::Text("PONG".into())),
                     Ok(Update::Done {
                         stop_reason: "refusal".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::Empty => Box::pin(futures::stream::empty()),
@@ -2480,6 +2487,7 @@ mod tests {
                     Ok(Update::Text("PONG".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::ValidThenInvalidUsage => Box::pin(futures::stream::iter(vec![
@@ -2500,6 +2508,7 @@ mod tests {
                     Ok(Update::Text("PONG".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::InvalidThenValidUsageThenBackendError => {

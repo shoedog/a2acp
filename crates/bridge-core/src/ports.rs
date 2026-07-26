@@ -1,7 +1,7 @@
 // ports.rs — port traits for bridge-core (spec §4.2).
 // All traits live here so adapter crates depend on core, never the reverse.
 
-use crate::{domain::*, error::BridgeError, ids::*};
+use crate::{attestation::*, domain::*, error::BridgeError, ids::*};
 use futures::Stream;
 use std::pin::Pin;
 use std::time::Duration;
@@ -25,11 +25,35 @@ pub enum Update {
     Text(String),
     Permission(PermissionRequest),
     Usage(crate::orch::UsageSnapshot),
-    Done { stop_reason: String },
+    Done {
+        stop_reason: String,
+        prefix_attestation: PrefixAttestationStatus,
+    },
 }
 
 /// A pinned, boxed stream of `Result<Update, BridgeError>` items. Send-safe.
 pub type BackendStream = Pin<Box<dyn Stream<Item = Result<Update, BridgeError>> + Send>>;
+
+impl Update {
+    #[must_use]
+    pub fn done(stop_reason: impl Into<String>) -> Self {
+        Self::Done {
+            stop_reason: stop_reason.into(),
+            prefix_attestation: PrefixAttestationStatus::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn done_with_attestation(
+        stop_reason: impl Into<String>,
+        prefix_attestation: PrefixAttestationStatus,
+    ) -> Self {
+        Self::Done {
+            stop_reason: stop_reason.into(),
+            prefix_attestation,
+        }
+    }
+}
 
 #[async_trait::async_trait]
 pub trait RichEventSink: Send + Sync {
@@ -119,6 +143,12 @@ pub trait AgentBackend: Send + Sync {
         _observer: std::sync::Arc<dyn DiagnosticObserver>,
     ) -> Result<(), BridgeError> {
         self.cancel(session).await
+    }
+
+    /// Prefix-attestation capability for this resolved backend instance. The default is
+    /// conservative: unsupported backends keep all text once sanitization is enabled.
+    fn prefix_attestation_capability(&self) -> PrefixAttestationCapability {
+        PrefixAttestationCapability::default()
     }
 
     /// Stash per-turn metadata for the NEXT prompt on this session (Slice 9 — lets the reverse permission
@@ -642,6 +672,7 @@ mod tests {
                 Ok(Update::Text("hi".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -689,7 +720,7 @@ mod tests {
             .unwrap();
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "hi"));
         assert!(
-            matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+            matches!(s.next().await, Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn")
         );
         assert!(s.next().await.is_none());
     }
@@ -711,7 +742,7 @@ mod tests {
         ));
         assert!(matches!(
             stream.next().await,
-            Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn"
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn"
         ));
         assert!(stream.next().await.is_none());
         assert_eq!(sink.count(), 0);

@@ -161,6 +161,7 @@ mod tests {
     fn done_stream() -> BackendStream {
         Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
             stop_reason: "end_turn".into(),
+            prefix_attestation: Default::default(),
         })]))
     }
 

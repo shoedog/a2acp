@@ -34,6 +34,10 @@ use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{json, Value};
 
 use a2a::{methods, SVC_PARAM_VERSION};
+use bridge_core::attestation::{
+    append_prompt_contract, generate_turn_id, prefix_attestation_request_for_capability,
+    PrefixAttestationRequest,
+};
 use bridge_core::domain::{
     effective_config, AgentOverride, AuthContext, InboundRequest, Part, PeerTaskId, RouteTarget,
     SessionSpec, TaskMeta,
@@ -77,6 +81,17 @@ const JSONRPC_INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC 2.0 internal error.
 const JSONRPC_INTERNAL: i32 = -32603;
 const DIRECT_DIAGNOSTIC_CAPACITY: usize = 64;
+
+fn append_attestation_contract_to_last_part(
+    parts: &mut [Part],
+    capability: &bridge_core::attestation::PrefixAttestationCapability,
+    request: &PrefixAttestationRequest,
+) {
+    if let Some(last) = parts.last_mut() {
+        let text = std::mem::take(&mut last.text);
+        last.text = append_prompt_contract(text, capability, request);
+    }
+}
 
 fn direct_diagnostic_observer() -> Arc<dyn DiagnosticObserver> {
     Arc::new(
@@ -582,8 +597,7 @@ async fn resolve_configure_bind(
 }
 
 fn mint_turn_id() -> bridge_core::ids::TurnId {
-    bridge_core::ids::TurnId::parse(format!("turn-{}", a2a::new_task_id()))
-        .expect("a2a task id is non-empty")
+    generate_turn_id().expect("secure turn id generation succeeds")
 }
 
 fn effort_to_string(effort: bridge_core::domain::Effort) -> String {
@@ -650,6 +664,20 @@ async fn warm_local_dispatch(
         .await
     {
         Ok(turn) => {
+            let obs_ctx = obs_ctx_for_dispatch(
+                routed,
+                &turn.agent,
+                turn.model.clone(),
+                turn.effort.clone(),
+                turn.mode.clone(),
+            );
+            let turn_id = obs_ctx.turn_id.clone();
+            let prefix_capability = turn.backend.prefix_attestation_capability();
+            let prefix_attestation_request =
+                match prefix_attestation_request_for_capability(&prefix_capability) {
+                    Ok(request) => request,
+                    Err(error) => return Some(Err(error)),
+                };
             if let Some(w) = &turn.usage_warning {
                 tracing::warn!(target: "a2a_bridge::usage", ctx = %ctx.as_str(),
                     used = w.used, size = w.size, fraction = w.fraction, threshold = w.threshold,
@@ -664,6 +692,8 @@ async fn warm_local_dispatch(
                     context_id: ctx.clone(),
                     generation: turn.generation.get(),
                     op: turn.op.clone(),
+                    turn_id,
+                    prefix_attestation_request: prefix_attestation_request.clone(),
                 }),
                 guard: None,
                 warm_guard: Some(WarmCompletionGuard::finish_owner(
@@ -676,13 +706,7 @@ async fn warm_local_dispatch(
                 )),
                 // Warm: the handle's per-turn abort token — a force-reset cancels it (cancel-tokens F2).
                 abort: turn.abort,
-                obs_ctx: obs_ctx_for_dispatch(
-                    routed,
-                    &turn.agent,
-                    turn.model.clone(),
-                    turn.effort.clone(),
-                    turn.mode.clone(),
-                ),
+                obs_ctx,
             }))
         }
         Err(e) => Some(Err(e)),
@@ -2185,9 +2209,19 @@ fn spawn_local_producer(
     let observer = srv.coordinator().observer();
     let task = routed.task;
     let session = dispatch.session.clone();
-    let parts = assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
+    let mut parts = assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
     let backend = dispatch.backend;
     let turn_meta = dispatch.turn_meta;
+    let prefix_capability = backend.prefix_attestation_capability();
+    let prefix_attestation_request = turn_meta
+        .as_ref()
+        .map(|meta| meta.prefix_attestation_request.clone())
+        .unwrap_or_default();
+    append_attestation_contract_to_last_part(
+        &mut parts,
+        &prefix_capability,
+        &prefix_attestation_request,
+    );
     // Moved into the task: its Drop evicts the binding/lease/stash on ANY exit.
     let guard = dispatch.guard;
     let warm = dispatch.warm_guard;
@@ -3259,8 +3293,19 @@ async fn unary_message(
             }
             // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
             let abort = dispatch.abort;
-            let parts =
+            let mut parts =
                 assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
+            let prefix_capability = dispatch.backend.prefix_attestation_capability();
+            let prefix_attestation_request = dispatch
+                .turn_meta
+                .as_ref()
+                .map(|meta| meta.prefix_attestation_request.clone())
+                .unwrap_or_default();
+            append_attestation_contract_to_last_part(
+                &mut parts,
+                &prefix_capability,
+                &prefix_attestation_request,
+            );
             let translator = Translator::new();
             let mut events = translator.run_observed(
                 dispatch.backend.as_ref(),
@@ -4887,6 +4932,7 @@ mod tests {
                 Ok(Update::Text("PONG".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -4912,6 +4958,7 @@ mod tests {
                 Ok(Update::Text("PARTIAL".into())),
                 Ok(Update::Done {
                     stop_reason: STOP_REASON_CANCELLED.into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -4947,6 +4994,7 @@ mod tests {
                 .collect();
             updates.push(Ok(Update::Done {
                 stop_reason: self.stop_reason.clone(),
+                prefix_attestation: Default::default(),
             }));
             Ok(Box::pin(tokio_stream::iter(updates)))
         }
@@ -5285,6 +5333,7 @@ mod tests {
                 Ok(Update::Text("observed".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ])))
         }
@@ -8261,6 +8310,7 @@ mod tests {
                 Ok(Update::Text("status-chunk".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -8343,6 +8393,7 @@ mod tests {
                     Ok(Update::Text("KA".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ];
                 Ok(Box::pin(tokio_stream::iter(updates)))
@@ -8801,6 +8852,7 @@ mod tests {
                 Ok(Update::Text("KDONE".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -9100,6 +9152,7 @@ mod tests {
         ) -> Result<BackendStream, BridgeError> {
             Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             })])))
         }
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
@@ -9184,6 +9237,7 @@ mod tests {
                 Ok(Update::Text(self.id.clone())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -9397,6 +9451,7 @@ mod tests {
                     Ok(Update::Text(id)),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ];
                 Ok(Box::pin(tokio_stream::iter(updates)))
@@ -9504,6 +9559,7 @@ mod tests {
                 Ok(Update::Text("warm".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -10633,7 +10689,7 @@ mod tests {
                 for i in 0..count {
                     yield Ok(Update::Text(format!("chunk-{i}")));
                 }
-                yield Ok(Update::Done { stop_reason: "end_turn".into() });
+                yield Ok(Update::Done { stop_reason: "end_turn".into() , prefix_attestation: Default::default()});
             }))
         }
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
@@ -10920,6 +10976,7 @@ mod tests {
                 Ok(Update::Text("ok".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))

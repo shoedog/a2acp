@@ -2533,6 +2533,7 @@ mod tests {
                 Ok(Update::Text(self.reply.clone())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))

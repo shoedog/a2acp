@@ -214,7 +214,7 @@ impl Translator {
                     Ok(Update::Usage(snap)) => {
                         yield Event::usage(snap);
                     }
-                    Ok(Update::Done { stop_reason }) => {
+                    Ok(Update::Done { stop_reason, .. }) => {
                         // Flush any pending coalesced text first.
                         if !acc.is_empty() {
                             let chunk = std::mem::take(&mut acc);
@@ -363,6 +363,7 @@ mod tests {
                 .push(Arc::downgrade(&observers.diagnostic));
             Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             })])))
         }
 
@@ -453,6 +454,7 @@ mod tests {
             Ok(Update::Text("PONG".into())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -521,6 +523,7 @@ mod tests {
             Ok(Update::Text("body".into())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -557,6 +560,7 @@ mod tests {
             Ok(Update::Text("A".into())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -584,6 +588,7 @@ mod tests {
             Ok(Update::Text(String::new())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -614,6 +619,7 @@ mod tests {
             (0..50).map(|_| Ok(Update::Text("x".repeat(40)))).collect();
         v.push(Ok(Update::Done {
             stop_reason: "end_turn".into(),
+            prefix_attestation: Default::default(),
         }));
         let be = FakeBackend::new(v);
         let st = FakeStore::default();
@@ -654,6 +660,7 @@ mod tests {
             Ok(Update::Text(expected.clone())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -714,6 +721,7 @@ mod tests {
             Ok(Update::Text("after".into())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -775,6 +783,7 @@ mod tests {
         // artifact (no terminal frame); the producer maps clean-end -> Completed.
         let be = FakeBackend::new(vec![Ok(Update::Done {
             stop_reason: "ran_out_of_turns".into(),
+            prefix_attestation: Default::default(),
         })]);
         let st = FakeStore::default();
         let pol = AutoApprove;
@@ -800,6 +809,7 @@ mod tests {
             Ok(Update::Text("partial".into())),
             Ok(Update::Done {
                 stop_reason: "cancelled".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -830,6 +840,7 @@ mod tests {
             Ok(Update::Text("TIAL".into())),
             Ok(Update::Done {
                 stop_reason: STOP_REASON_CANCELLED.into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -861,6 +872,7 @@ mod tests {
             Ok(Update::Text("done".into())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();

@@ -1205,6 +1205,7 @@ mod sink_tests {
                     Ok(Update::Text("done".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])))
             }
@@ -2081,6 +2082,7 @@ mod resume_tests {
                 Ok(Update::Text("FINAL".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ])))
         }
@@ -2437,6 +2439,7 @@ mod resume_tests {
                         Ok(Update::Text("checkpoint complete".into())),
                         Ok(Update::Done {
                             stop_reason: "end_turn".into(),
+                            prefix_attestation: Default::default(),
                         }),
                     ])))
                 }

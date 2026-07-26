@@ -43,6 +43,13 @@ use crate::model_effort::{
     is_unsupported_effort_error, model_id_effort, model_values, resolve_effort, resolve_model,
     resolve_model_state, EffortDecision, ModelDecision, ModelResolutionError, EFFORT_ORDER,
 };
+use bridge_core::attestation::{
+    AttestedPrefixV1, CapabilityUnavailableReason, InvalidAttestationReason,
+    NoAttestationReason, PrefixAttestationCapability, PrefixAttestationRequest,
+    nonce_hex, PrefixAttestationStatus, ATTESTED_PREFIX_BEGIN_TURN_METHOD,
+    ATTESTED_PREFIX_CAPABILITIES_METHOD, ATTESTED_PREFIX_ISSUER_V1,
+    ATTESTED_PREFIX_META_KEY,
+};
 use bridge_core::catalog::AgentCaps;
 use bridge_core::diagnostics::{
     diagnostic_timestamp_ms, AuthenticationEvidenceInput, DiagnosticFailureClass,
@@ -95,6 +102,114 @@ const CONTAINER_START_POLL_INTERVAL: std::time::Duration = std::time::Duration::
 
 const SESSION_NEW_METHOD: &str = "session/new";
 const SESSION_SET_MODEL_METHOD: &str = "session/set_model";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrefixAttestationTransport {
+    #[default]
+    Unsupported,
+    PackagedCodexAcpAttested,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PrefixCapabilitiesRequest {}
+
+impl JsonRpcMessage for PrefixCapabilitiesRequest {
+    fn matches_method(method: &str) -> bool {
+        method == ATTESTED_PREFIX_CAPABILITIES_METHOD
+    }
+
+    fn method(&self) -> &str {
+        ATTESTED_PREFIX_CAPABILITIES_METHOD
+    }
+
+    fn to_untyped_message(&self) -> Result<UntypedMessage, AcpError> {
+        UntypedMessage::new(ATTESTED_PREFIX_CAPABILITIES_METHOD, self)
+    }
+
+    fn parse_message(method: &str, params: &impl Serialize) -> Result<Self, AcpError> {
+        if method != ATTESTED_PREFIX_CAPABILITIES_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast_params(params)
+    }
+}
+
+impl JsonRpcRequest for PrefixCapabilitiesRequest {
+    type Response = PrefixCapabilitiesResponse;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PrefixCapabilitiesResponse {
+    protocol_version: u64,
+    issuer_id: String,
+}
+
+impl JsonRpcResponse for PrefixCapabilitiesResponse {
+    fn into_json(self, _method: &str) -> Result<serde_json::Value, AcpError> {
+        serde_json::to_value(self).map_err(AcpError::into_internal_error)
+    }
+
+    fn from_value(method: &str, value: serde_json::Value) -> Result<Self, AcpError> {
+        if method != ATTESTED_PREFIX_CAPABILITIES_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast(&value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PrefixBeginTurnRequest {
+    schema_version: u64,
+    session_id: String,
+    turn_id: String,
+    enabled: bool,
+    marker_nonce: String,
+}
+
+impl JsonRpcMessage for PrefixBeginTurnRequest {
+    fn matches_method(method: &str) -> bool {
+        method == ATTESTED_PREFIX_BEGIN_TURN_METHOD
+    }
+
+    fn method(&self) -> &str {
+        ATTESTED_PREFIX_BEGIN_TURN_METHOD
+    }
+
+    fn to_untyped_message(&self) -> Result<UntypedMessage, AcpError> {
+        UntypedMessage::new(ATTESTED_PREFIX_BEGIN_TURN_METHOD, self)
+    }
+
+    fn parse_message(method: &str, params: &impl Serialize) -> Result<Self, AcpError> {
+        if method != ATTESTED_PREFIX_BEGIN_TURN_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast_params(params)
+    }
+}
+
+impl JsonRpcRequest for PrefixBeginTurnRequest {
+    type Response = PrefixBeginTurnResponse;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PrefixBeginTurnResponse {
+    schema_version: u64,
+    turn_id: String,
+    accepted: bool,
+}
+
+impl JsonRpcResponse for PrefixBeginTurnResponse {
+    fn into_json(self, _method: &str) -> Result<serde_json::Value, AcpError> {
+        serde_json::to_value(self).map_err(AcpError::into_internal_error)
+    }
+
+    fn from_value(method: &str, value: serde_json::Value) -> Result<Self, AcpError> {
+        if method != ATTESTED_PREFIX_BEGIN_TURN_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast(&value)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -809,6 +924,7 @@ pub struct AcpConfig {
     /// from lifecycle causes and process stderr before either is retained.
     /// `Debug` reports only a count; values are never rendered.
     pub diagnostic_redactor: DiagnosticRedactor,
+    pub prefix_attestation_transport: PrefixAttestationTransport,
 }
 
 /// Reaper configuration for a containerized (`:ro` sandbox) agent. The public
@@ -887,6 +1003,7 @@ impl Default for AcpConfig {
             mcp: Vec::new(),
             watchdog: None,
             diagnostic_redactor: DiagnosticRedactor::default(),
+            prefix_attestation_transport: PrefixAttestationTransport::Unsupported,
         }
     }
 }
@@ -943,6 +1060,38 @@ macro_rules! reject_unsupported {
     }};
 }
 
+fn parse_canonical_u64(raw: &str) -> Option<u64> {
+    if raw.is_empty() || (raw.len() > 1 && raw.starts_with('0')) {
+        return None;
+    }
+    if !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
+}
+
+fn parse_sha256_hex(raw: &str) -> Option<[u8; 32]> {
+    if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        return None;
+    }
+    let mut out = [0_u8; 32];
+    for (idx, slot) in out.iter_mut().enumerate() {
+        let start = idx * 2;
+        *slot = u8::from_str_radix(&raw[start..start + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn no_attestation_reason_from_wire(raw: &str) -> Option<NoAttestationReason> {
+    Some(match raw {
+        "sanitization_not_requested" => NoAttestationReason::SanitizationNotRequested,
+        "turn_missing_deliverable_boundary" => NoAttestationReason::TurnMissingDeliverableBoundary,
+        "turn_ended_without_deliverable" => NoAttestationReason::TurnEndedWithoutDeliverable,
+        "multiple_commit_markers" => NoAttestationReason::MultipleCommitMarkers,
+        _ => return None,
+    })
+}
+
 // ── Streaming routing registry ───────────────────────────────────────────────
 //
 // `session/update` notifications are delivered by the SDK on its event-loop
@@ -969,6 +1118,88 @@ struct TurnRoute {
     /// The terminal driver and cancel watcher race on this bit so a slow
     /// post-response observer cannot be mistaken for live agent work.
     active: Arc<AtomicBool>,
+    prefix_attestation: Option<PrefixTurnState>,
+}
+
+#[derive(Clone)]
+struct PrefixTurnState {
+    producer_id: String,
+    turn_id: String,
+    marker_nonce_hex: String,
+    capability: PrefixAttestationCapability,
+    observed: Arc<StdMutex<Option<PrefixAttestationStatus>>>,
+}
+
+impl PrefixTurnState {
+    fn new(
+        producer_id: String,
+        turn_id: String,
+        marker_nonce_hex: String,
+        capability: PrefixAttestationCapability,
+    ) -> Self {
+        Self {
+            producer_id,
+            turn_id,
+            marker_nonce_hex,
+            capability,
+            observed: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    fn disabled(producer_id: String, turn_id: String) -> Self {
+        Self::new(
+            producer_id,
+            turn_id,
+            String::new(),
+            PrefixAttestationCapability::default(),
+        )
+    }
+
+    fn record_control(&self, status: PrefixAttestationStatus) {
+        if let Ok(mut observed) = self.observed.lock() {
+            if observed.is_some() {
+                *observed = Some(PrefixAttestationStatus::rejected(
+                    self.producer_id.clone(),
+                    self.turn_id.clone(),
+                    InvalidAttestationReason::DuplicateControlMetadata,
+                ));
+            } else {
+                *observed = Some(status);
+            }
+        }
+    }
+
+    fn terminal_status(&self, requested: bool) -> PrefixAttestationStatus {
+        if let Ok(observed) = self.observed.lock() {
+            if let Some(status) = observed.clone() {
+                return status;
+            }
+        }
+        if requested {
+            let reason = match &self.capability {
+                PrefixAttestationCapability::SupportedV1 { .. } => {
+                    NoAttestationReason::BackendProtocolViolation
+                }
+                PrefixAttestationCapability::Unsupported {
+                    reason: CapabilityUnavailableReason::ProtocolDowngrade,
+                } => NoAttestationReason::ProtocolDowngrade,
+                PrefixAttestationCapability::Unsupported { .. } => {
+                    NoAttestationReason::BackendDeclaredIncapable
+                }
+            };
+            PrefixAttestationStatus::unavailable(
+                self.producer_id.clone(),
+                self.turn_id.clone(),
+                reason,
+            )
+        } else {
+            PrefixAttestationStatus::unavailable(
+                self.producer_id.clone(),
+                self.turn_id.clone(),
+                NoAttestationReason::SanitizationNotRequested,
+            )
+        }
+    }
 }
 
 struct TurnWatch {
@@ -1334,6 +1565,7 @@ pub struct AcpBackend {
     /// prompt. `prompt_inner` takes it at entry, before lazy session minting, so
     /// early setup errors cannot leave stale metadata for a later turn.
     pending_turn_meta: StdMutex<HashMap<SessionId, TurnMeta>>,
+    prefix_attestation_capability: PrefixAttestationCapability,
     /// Policy engine that decides reverse `session/request_permission` requests.
     /// Defaults to an internal auto-approve impl (the deployed 3a policy); a
     /// caller (Task 6's `main`) threads a concrete engine via [`Self::with_policy`].
@@ -2639,11 +2871,20 @@ impl AcpBackend {
                         let updates = Arc::clone(&updates_handler);
                         async move {
                             let session_id = notif.session_id.clone();
+                            let mut prefix_state = None;
                             if let Ok(map) = updates.lock() {
                                 if let Some(route) = map.get(&session_id) {
                                     if let Some(w) = &route.watch {
                                         bump_activity(w);
                                     }
+                                    prefix_state = route.prefix_attestation.clone();
+                                }
+                            }
+
+                            if let Some(state) = &prefix_state {
+                                if let Some(status) = Self::parse_prefix_control_notification(&notif, state) {
+                                    state.record_control(status);
+                                    return Ok(());
                                 }
                             }
 
@@ -2986,6 +3227,30 @@ impl AcpBackend {
                 .await?;
         }
 
+        let prefix_attestation_capability = match config.prefix_attestation_transport {
+            PrefixAttestationTransport::PackagedCodexAcpAttested => {
+                match tokio::time::timeout_at(
+                    deadline,
+                    cx.send_request(PrefixCapabilitiesRequest {}).block_task(),
+                )
+                .await
+                {
+                    Ok(Ok(resp))
+                        if resp.protocol_version == 1
+                            && resp.issuer_id == ATTESTED_PREFIX_ISSUER_V1 =>
+                    {
+                        PrefixAttestationCapability::codex_commit_marker_v1()
+                    }
+                    _ => PrefixAttestationCapability::unsupported(
+                        CapabilityUnavailableReason::ProtocolDowngrade,
+                    ),
+                }
+            }
+            PrefixAttestationTransport::Unsupported => PrefixAttestationCapability::unsupported(
+                CapabilityUnavailableReason::BackendDeclaredIncapable,
+            ),
+        };
+
         let container_reap = container_controller.or_else(|| {
             config
                 .container
@@ -3011,6 +3276,7 @@ impl AcpBackend {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            prefix_attestation_capability,
             policy,
             permission_registry,
             perm_timeout_ms,
@@ -4479,6 +4745,180 @@ impl AcpBackend {
         }
     }
 
+    fn parse_prefix_control_notification(
+        notif: &SessionNotification,
+        state: &PrefixTurnState,
+    ) -> Option<PrefixAttestationStatus> {
+        let value = serde_json::to_value(notif).ok()?;
+        let update = value.get("update")?;
+        if update.get("sessionUpdate").and_then(serde_json::Value::as_str)
+            != Some("agent_message_chunk")
+        {
+            return None;
+        }
+        let message_id = update
+            .get("messageId")
+            .and_then(serde_json::Value::as_str);
+        let content_text = update
+            .get("content")
+            .and_then(|content| content.get("text"))
+            .and_then(serde_json::Value::as_str);
+        let meta = update.get("_meta").and_then(serde_json::Value::as_object);
+        let expected_message_id = format!("_b2a_apc_control/{}", state.turn_id);
+        let has_reserved_meta =
+            meta.is_some_and(|object| object.contains_key(ATTESTED_PREFIX_META_KEY));
+        if message_id != Some(expected_message_id.as_str()) {
+            return None;
+        }
+        if !has_reserved_meta {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            ));
+        }
+        if !state.capability.is_supported_v1() {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::BackendCapabilityMismatch,
+            ));
+        }
+        if content_text != Some("") {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            ));
+        }
+        let Some(meta) = meta else {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            ));
+        };
+        if meta.len() != 1 || !meta.contains_key(ATTESTED_PREFIX_META_KEY) {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            ));
+        }
+        let Some(obj) = meta
+            .get(ATTESTED_PREFIX_META_KEY)
+            .and_then(serde_json::Value::as_object)
+        else {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            ));
+        };
+        if obj.get("schema_version").and_then(serde_json::Value::as_u64) != Some(1) {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::UnsupportedVersion,
+            ));
+        }
+        if obj.get("issuer_id").and_then(serde_json::Value::as_str)
+            != Some(ATTESTED_PREFIX_ISSUER_V1)
+        {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::UntrustedIssuer,
+            ));
+        }
+        if obj.get("turn_id").and_then(serde_json::Value::as_str)
+            != Some(state.turn_id.as_str())
+        {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::TurnMismatch,
+            ));
+        }
+        if obj.get("marker_nonce").and_then(serde_json::Value::as_str)
+            != Some(state.marker_nonce_hex.as_str())
+        {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::NonceMismatch,
+            ));
+        }
+        match obj.get("kind").and_then(serde_json::Value::as_str) {
+            Some("attested") => {
+                let Some(process_prefix_bytes) = obj
+                    .get("process_prefix_bytes")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(parse_canonical_u64)
+                else {
+                    return Some(PrefixAttestationStatus::rejected(
+                        state.producer_id.clone(),
+                        state.turn_id.clone(),
+                        InvalidAttestationReason::MalformedMetadata,
+                    ));
+                };
+                let Some(body_len_bytes) = obj
+                    .get("body_len_bytes")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(parse_canonical_u64)
+                else {
+                    return Some(PrefixAttestationStatus::rejected(
+                        state.producer_id.clone(),
+                        state.turn_id.clone(),
+                        InvalidAttestationReason::MalformedMetadata,
+                    ));
+                };
+                let Some(body_sha256) = obj
+                    .get("body_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(parse_sha256_hex)
+                else {
+                    return Some(PrefixAttestationStatus::rejected(
+                        state.producer_id.clone(),
+                        state.turn_id.clone(),
+                        InvalidAttestationReason::MalformedMetadata,
+                    ));
+                };
+                Some(PrefixAttestationStatus::AttestedV1(AttestedPrefixV1 {
+                    issuer_id: ATTESTED_PREFIX_ISSUER_V1.to_string(),
+                    producer_id: state.producer_id.clone(),
+                    turn_id: state.turn_id.clone(),
+                    body_len_bytes,
+                    body_sha256,
+                    process_prefix_bytes,
+                }))
+            }
+            Some("unavailable") => {
+                let Some(reason) = obj
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(no_attestation_reason_from_wire)
+                else {
+                    return Some(PrefixAttestationStatus::rejected(
+                        state.producer_id.clone(),
+                        state.turn_id.clone(),
+                        InvalidAttestationReason::MalformedMetadata,
+                    ));
+                };
+                Some(PrefixAttestationStatus::unavailable(
+                    state.producer_id.clone(),
+                    state.turn_id.clone(),
+                    reason,
+                ))
+            }
+            _ => Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            )),
+        }
+    }
+
     #[must_use]
     pub fn map_session_update(notif: SessionNotification) -> Option<Update> {
         match notif.update {
@@ -4527,7 +4967,7 @@ impl AcpBackend {
 
     /// Map an ACP `StopReason` to the bridge's `Update::Done` stop_reason string.
     /// We use the ACP wire spelling (snake_case) so it matches the protocol and
-    /// the existing `Update::Done { stop_reason: String }` convention (e.g.
+    /// the existing `Update::Done` stop-reason string convention (e.g.
     /// `end_turn`, `max_tokens`, `cancelled`). The enum is `#[non_exhaustive]`,
     /// so an unknown future variant maps to `"unknown"` rather than failing.
     fn stop_reason_str(stop: StopReason) -> String {
@@ -4586,7 +5026,7 @@ impl AcpBackend {
     /// 4. On the response, the driver unregisters the `Sender` and pushes a
     ///    terminal event, then releases the turn lock (by dropping the guard it
     ///    owns). A completed turn (incl. a real `StopReason::Cancelled`) pushes
-    ///    `TurnEvent::Done` → stream yields `Ok(Update::Done{stop_reason})`. A
+    ///    `TurnEvent::Done` → stream yields `Ok(Update::Done{stop_reason, ..})`. A
     ///    `session/prompt` `Err` (agent crash / transport failure) pushes
     ///    `TurnEvent::Failed` → stream yields a terminal `Err` so downstream
     ///    reports the A2A caller `Failed` (NOT a silent `Done{"unknown"}` that
@@ -4627,6 +5067,29 @@ impl AcpBackend {
         let stderr_cursor: Option<ProcessStderrCursor> =
             self.stderr_ring.as_ref().map(ProcessStderrRing::cursor);
         let turn_meta = self.take_pending_turn_meta(session);
+        let producer_id = self
+            .config
+            .as_ref()
+            .map(|config| config.agent_id.clone())
+            .unwrap_or_default();
+        let prefix_requested = turn_meta.as_ref().is_some_and(|meta| {
+            matches!(
+                meta.prefix_attestation_request,
+                PrefixAttestationRequest::CodexCommitMarkerV1 { .. }
+            )
+        });
+        let prefix_state = turn_meta.as_ref().map(|meta| match &meta.prefix_attestation_request {
+            PrefixAttestationRequest::CodexCommitMarkerV1 { marker_nonce } => PrefixTurnState::new(
+                producer_id.clone(),
+                meta.turn_id.as_str().to_string(),
+                nonce_hex(marker_nonce),
+                self.prefix_attestation_capability.clone(),
+            ),
+            PrefixAttestationRequest::Disabled => PrefixTurnState::disabled(
+                producer_id.clone(),
+                meta.turn_id.as_str().to_string(),
+            ),
+        });
 
         // (1) Mint/get the agent session id. Done OUTSIDE the turn lock so a
         // first-prompt's `session/new` doesn't hold the lock while awaiting.
@@ -4679,6 +5142,39 @@ impl AcpBackend {
                     .await)
             }
         };
+        if let Some(meta) = &turn_meta {
+            if let PrefixAttestationRequest::CodexCommitMarkerV1 { marker_nonce } =
+                &meta.prefix_attestation_request
+            {
+                if !self.prefix_attestation_capability.is_supported_v1() {
+                    // No private method is sent to an incapable backend; the terminal status
+                    // remains an unavailable protocol downgrade if the caller requested it.
+                } else {
+                    let nonce = nonce_hex(marker_nonce);
+                    let req = PrefixBeginTurnRequest {
+                        schema_version: 1,
+                        session_id: agent_id.0.to_string(),
+                        turn_id: meta.turn_id.as_str().to_string(),
+                        enabled: true,
+                        marker_nonce: nonce,
+                    };
+                    let resp = cx.send_request(req).block_task().await.map_err(|error| {
+                        BridgeError::agent_crashed(format!(
+                            "attested-prefix beginTurn request failed: {error}"
+                        ))
+                    })?;
+                    if resp.schema_version != 1
+                        || !resp.accepted
+                        || resp.turn_id != meta.turn_id.as_str()
+                    {
+                        return Err(BridgeError::agent_crashed(
+                            "attested-prefix beginTurn acknowledgement mismatch",
+                        ));
+                    }
+                }
+            }
+        }
+
         let watch = if self
             .config
             .as_ref()
@@ -4725,6 +5221,7 @@ impl AcpBackend {
                     turn_meta,
                     cancelled: Arc::new(AtomicBool::new(false)),
                     active: Arc::clone(&turn_active),
+                    prefix_attestation: prefix_state.clone(),
                 },
             );
         }
@@ -5040,7 +5537,16 @@ impl AcpBackend {
                             )
                             .await
                         {
-                            Ok(()) => TurnEvent::Done(Update::Done { stop_reason }),
+                            Ok(()) => {
+                                let prefix_attestation = prefix_state
+                                    .as_ref()
+                                    .map(|state| state.terminal_status(prefix_requested))
+                                    .unwrap_or_else(PrefixAttestationStatus::default);
+                                TurnEvent::Done(Update::done_with_attestation(
+                                    stop_reason,
+                                    prefix_attestation,
+                                ))
+                            }
                             Err(error) => TurnEvent::Failed(error),
                         }
                     }
@@ -5204,6 +5710,10 @@ impl AgentBackend for AcpBackend {
     ) -> Result<BackendStream, BridgeError> {
         self.prompt_inner(session, parts, observers.rich, observers.diagnostic)
             .await
+    }
+
+    fn prefix_attestation_capability(&self) -> PrefixAttestationCapability {
+        self.prefix_attestation_capability.clone()
     }
 
     async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
@@ -6356,6 +6866,324 @@ mod tests {
         }
     }
 
+    const TEST_PREFIX_NONCE: &str = "00112233445566778899aabbccddeeff";
+    const TEST_PREFIX_TURN: &str = "turn_00112233445566778899aabbccddeeff";
+
+    fn prefix_state() -> PrefixTurnState {
+        PrefixTurnState::new(
+            "producer".to_string(),
+            TEST_PREFIX_TURN.to_string(),
+            TEST_PREFIX_NONCE.to_string(),
+            PrefixAttestationCapability::codex_commit_marker_v1(),
+        )
+    }
+
+    fn prefix_meta(inner: serde_json::Value) -> serde_json::Value {
+        let mut meta = serde_json::Map::new();
+        meta.insert(ATTESTED_PREFIX_META_KEY.to_string(), inner);
+        serde_json::Value::Object(meta)
+    }
+
+    fn attested_prefix_meta() -> serde_json::Value {
+        prefix_meta(serde_json::json!({
+            "schema_version": 1,
+            "kind": "attested",
+            "issuer_id": ATTESTED_PREFIX_ISSUER_V1,
+            "turn_id": TEST_PREFIX_TURN,
+            "marker_nonce": TEST_PREFIX_NONCE,
+            "process_prefix_bytes": "3",
+            "body_len_bytes": "4",
+            "body_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        }))
+    }
+
+    fn unavailable_prefix_meta(reason: &str) -> serde_json::Value {
+        prefix_meta(serde_json::json!({
+            "schema_version": 1,
+            "kind": "unavailable",
+            "issuer_id": ATTESTED_PREFIX_ISSUER_V1,
+            "turn_id": TEST_PREFIX_TURN,
+            "marker_nonce": TEST_PREFIX_NONCE,
+            "reason": reason,
+        }))
+    }
+
+    fn prefix_notification(update: serde_json::Value) -> SessionNotification {
+        serde_json::from_value(serde_json::json!({
+            "sessionId": "agent-session",
+            "update": update,
+        }))
+        .expect("prefix control notification deserializes through the ACP SDK")
+    }
+
+    fn prefix_control_notification(meta: serde_json::Value) -> SessionNotification {
+        prefix_notification(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": format!("_b2a_apc_control/{TEST_PREFIX_TURN}"),
+            "content": {"type": "text", "text": ""},
+            "_meta": meta,
+        }))
+    }
+
+    #[test]
+    fn prefix_control_parser_accepts_valid_attested_metadata() {
+        let state = prefix_state();
+        let status = AcpBackend::parse_prefix_control_notification(
+            &prefix_control_notification(attested_prefix_meta()),
+            &state,
+        )
+        .expect("control status");
+        match status {
+            PrefixAttestationStatus::AttestedV1(attested) => {
+                assert_eq!(attested.issuer_id, ATTESTED_PREFIX_ISSUER_V1);
+                assert_eq!(attested.producer_id, "producer");
+                assert_eq!(attested.turn_id, TEST_PREFIX_TURN);
+                assert_eq!(attested.process_prefix_bytes, 3);
+                assert_eq!(attested.body_len_bytes, 4);
+                assert_eq!(attested.body_sha256, [0_u8; 32]);
+            }
+            other => panic!("expected AttestedV1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefix_control_parser_accepts_valid_unavailable_metadata() {
+        let state = prefix_state();
+        let status = AcpBackend::parse_prefix_control_notification(
+            &prefix_control_notification(unavailable_prefix_meta("multiple_commit_markers")),
+            &state,
+        )
+        .expect("control status");
+        match status {
+            PrefixAttestationStatus::UnavailableV1(no_attestation) => {
+                assert_eq!(no_attestation.producer_id, "producer");
+                assert_eq!(no_attestation.turn_id, TEST_PREFIX_TURN);
+                assert_eq!(no_attestation.reason, NoAttestationReason::MultipleCommitMarkers);
+            }
+            other => panic!("expected UnavailableV1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefix_control_parser_ignores_reserved_meta_without_control_message_id() {
+        let state = prefix_state();
+        let notif = prefix_notification(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "ordinary-message",
+            "content": {"type": "text", "text": ""},
+            "_meta": unavailable_prefix_meta("multiple_commit_markers"),
+        }));
+        assert!(AcpBackend::parse_prefix_control_notification(&notif, &state).is_none());
+    }
+
+    #[test]
+    fn prefix_control_parser_rejects_bridge_internal_unavailable_reason() {
+        let state = prefix_state();
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(
+                &prefix_control_notification(unavailable_prefix_meta(
+                    "bridge_synthetic_cancellation",
+                )),
+                &state,
+            ),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::MalformedMetadata,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn prefix_control_parser_rejects_wrong_turn_nonce_version_and_meta_shape() {
+        let state = prefix_state();
+
+        let wrong_turn = prefix_meta(serde_json::json!({
+            "schema_version": 1,
+            "kind": "attested",
+            "issuer_id": ATTESTED_PREFIX_ISSUER_V1,
+            "turn_id": "turn_ffffffffffffffffffffffffffffffff",
+            "marker_nonce": TEST_PREFIX_NONCE,
+            "process_prefix_bytes": "3",
+            "body_len_bytes": "4",
+            "body_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        }));
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(
+                &prefix_control_notification(wrong_turn),
+                &state,
+            ),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::TurnMismatch,
+                ..
+            }))
+        ));
+
+        let wrong_nonce = prefix_meta(serde_json::json!({
+            "schema_version": 1,
+            "kind": "attested",
+            "issuer_id": ATTESTED_PREFIX_ISSUER_V1,
+            "turn_id": TEST_PREFIX_TURN,
+            "marker_nonce": "ffffffffffffffffffffffffffffffff",
+            "process_prefix_bytes": "3",
+            "body_len_bytes": "4",
+            "body_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        }));
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(
+                &prefix_control_notification(wrong_nonce),
+                &state,
+            ),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::NonceMismatch,
+                ..
+            }))
+        ));
+
+        let wrong_version = prefix_meta(serde_json::json!({
+            "schema_version": 2,
+            "kind": "unavailable",
+            "issuer_id": ATTESTED_PREFIX_ISSUER_V1,
+            "turn_id": TEST_PREFIX_TURN,
+            "marker_nonce": TEST_PREFIX_NONCE,
+            "reason": "multiple_commit_markers",
+        }));
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(
+                &prefix_control_notification(wrong_version),
+                &state,
+            ),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::UnsupportedVersion,
+                ..
+            }))
+        ));
+
+        let missing_meta = prefix_notification(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": format!("_b2a_apc_control/{TEST_PREFIX_TURN}"),
+            "content": {"type": "text", "text": ""},
+        }));
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(&missing_meta, &state),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::MalformedMetadata,
+                ..
+            }))
+        ));
+
+        let mut extra_meta = attested_prefix_meta();
+        extra_meta
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".to_string(), serde_json::json!(true));
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(
+                &prefix_control_notification(extra_meta),
+                &state,
+            ),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::MalformedMetadata,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn prefix_control_parser_rejects_control_when_capability_downgraded() {
+        let state = PrefixTurnState::new(
+            "producer".to_string(),
+            TEST_PREFIX_TURN.to_string(),
+            TEST_PREFIX_NONCE.to_string(),
+            PrefixAttestationCapability::unsupported(
+                CapabilityUnavailableReason::ProtocolDowngrade,
+            ),
+        );
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(
+                &prefix_control_notification(attested_prefix_meta()),
+                &state,
+            ),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::BackendCapabilityMismatch,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn prefix_terminal_status_distinguishes_incapable_downgrade_and_supported_missing_control() {
+        let incapable = PrefixTurnState::new(
+            "producer".to_string(),
+            TEST_PREFIX_TURN.to_string(),
+            TEST_PREFIX_NONCE.to_string(),
+            PrefixAttestationCapability::unsupported(
+                CapabilityUnavailableReason::BackendDeclaredIncapable,
+            ),
+        );
+        assert!(matches!(
+            incapable.terminal_status(true),
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::BackendDeclaredIncapable,
+                ..
+            })
+        ));
+
+        let downgraded = PrefixTurnState::new(
+            "producer".to_string(),
+            TEST_PREFIX_TURN.to_string(),
+            TEST_PREFIX_NONCE.to_string(),
+            PrefixAttestationCapability::unsupported(
+                CapabilityUnavailableReason::ProtocolDowngrade,
+            ),
+        );
+        assert!(matches!(
+            downgraded.terminal_status(true),
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::ProtocolDowngrade,
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            prefix_state().terminal_status(true),
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::BackendProtocolViolation,
+                ..
+            })
+        ));
+        assert!(matches!(
+            prefix_state().terminal_status(false),
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::SanitizationNotRequested,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn prefix_control_parser_records_duplicate_control_as_rejected() {
+        let state = prefix_state();
+        let first = AcpBackend::parse_prefix_control_notification(
+            &prefix_control_notification(attested_prefix_meta()),
+            &state,
+        )
+        .expect("first control");
+        let second = AcpBackend::parse_prefix_control_notification(
+            &prefix_control_notification(unavailable_prefix_meta("multiple_commit_markers")),
+            &state,
+        )
+        .expect("second control");
+        state.record_control(first);
+        state.record_control(second);
+        assert!(matches!(
+            state.terminal_status(true),
+            PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::DuplicateControlMetadata,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn map_rich_plan_toolcall_update() {
         use agent_client_protocol::schema::v1::{
@@ -7321,6 +8149,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefix_capability_handshake_missing_private_response_downgrades() {
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_fake_agent(
+            agent_side,
+            InitializeResponse::new(ProtocolVersion::V1)
+                .agent_capabilities(AgentCapabilities::default()),
+        );
+        let mut config = test_config();
+        config.prefix_attestation_transport = PrefixAttestationTransport::PackagedCodexAcpAttested;
+        let be = AcpBackend::connect_observed(
+            client_side,
+            config,
+            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            be.prefix_attestation_capability(),
+            PrefixAttestationCapability::unsupported(CapabilityUnavailableReason::ProtocolDowngrade)
+        );
+    }
+
+    #[tokio::test]
     async fn capabilities_maps_agent_session_capabilities() {
         let (client_side, agent_side) = Channel::duplex();
         let agent_caps = AgentCapabilities::new()
@@ -7653,6 +8504,7 @@ mod tests {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            prefix_attestation_capability: PrefixAttestationCapability::default(),
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),
@@ -8834,6 +9686,8 @@ mod tests {
             context_id: bridge_core::ids::ContextId::parse(ctx).unwrap(),
             generation,
             op: bridge_core::ids::OperationId::parse(op).unwrap(),
+            turn_id: bridge_core::ids::TurnId::parse(format!("turn_{generation:032x}")).unwrap(),
+            prefix_attestation_request: bridge_core::attestation::PrefixAttestationRequest::Disabled,
         }
     }
 
@@ -9991,7 +10845,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             stream.next().await,
-            Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn"
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn"
         ));
         assert!(stream.next().await.is_none());
 
@@ -10079,6 +10933,7 @@ mod tests {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            prefix_attestation_capability: PrefixAttestationCapability::default(),
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),
@@ -10201,7 +11056,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), stream.next())
                 .await
                 .expect("completion observer release must finish the stream"),
-            Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn"
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn"
         ));
     }
 
@@ -10264,7 +11119,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), stream.next())
                 .await
                 .expect("completion observer release must finish the stream"),
-            Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn"
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn"
         ));
         tokio::task::yield_now().await;
         assert!(
@@ -10322,7 +11177,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), stream.next())
                 .await
                 .expect("completion persistence release must finish the stream"),
-            Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn"
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn"
         ));
     }
 
@@ -10507,7 +11362,7 @@ mod tests {
 
         rec.prompt_gate.notify_one();
         assert!(
-            matches!(stream.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+            matches!(stream.next().await, Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn")
         );
     }
 
@@ -11014,7 +11869,7 @@ mod tests {
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "hello "));
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "world"));
         assert!(
-            matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+            matches!(s.next().await, Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn")
         );
         assert!(s.next().await.is_none(), "stream terminates after Done");
     }
@@ -11041,7 +11896,7 @@ mod tests {
         assert_eq!(sink.records(), 1, "tool call routed to rich sink");
         assert_eq!(items.len(), 2, "stream yields only text + terminal done");
         assert!(matches!(&items[0], Ok(Update::Text(t)) if t == "visible"));
-        assert!(matches!(&items[1], Ok(Update::Done { stop_reason }) if stop_reason == "end_turn"));
+        assert!(matches!(&items[1], Ok(Update::Done { stop_reason, .. }) if stop_reason == "end_turn"));
         assert!(
             items
                 .iter()
@@ -11136,7 +11991,7 @@ mod tests {
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "A"));
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "B"));
         assert!(
-            matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+            matches!(s.next().await, Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn")
         );
         assert!(s.next().await.is_none());
     }
@@ -11161,7 +12016,7 @@ mod tests {
             let mut s = be.prompt(&key, vec![]).await.unwrap();
             let last = loop {
                 match s.next().await {
-                    Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                    Some(Ok(Update::Done { stop_reason, .. })) => break stop_reason,
                     Some(_) => continue,
                     None => panic!("stream ended without a Done"),
                 }
@@ -11275,7 +12130,7 @@ mod tests {
             .await
             .expect("stream must complete after the cancelled result")
         {
-            Some(Ok(Update::Done { stop_reason })) => {
+            Some(Ok(Update::Done { stop_reason, .. })) => {
                 assert_eq!(
                     stop_reason, "cancelled",
                     "completion is the Cancelled RESULT"
@@ -11340,7 +12195,7 @@ mod tests {
             .expect("the racing-cancel turn must complete, not hang")
             .unwrap();
         match last {
-            Some(Ok(Update::Done { stop_reason })) => {
+            Some(Ok(Update::Done { stop_reason, .. })) => {
                 assert_eq!(
                     stop_reason, "cancelled",
                     "racing cancel completes the turn cancelled"
@@ -11535,7 +12390,7 @@ mod tests {
                 .await
                 .expect("fresh turn must complete")
             {
-                Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                Some(Ok(Update::Done { stop_reason, .. })) => break stop_reason,
                 Some(_) => continue,
                 None => panic!("fresh turn ended without Done"),
             }
@@ -11636,7 +12491,7 @@ mod tests {
                     .await
                     .expect("active turn must complete without watchdog timeout")
                 {
-                    Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                    Some(Ok(Update::Done { stop_reason, .. })) => break stop_reason,
                     Some(Ok(_)) => continue,
                     Some(Err(err)) => panic!("active turn must not fail: {err:?}"),
                     None => panic!("stream ended without Done"),
@@ -11687,7 +12542,7 @@ mod tests {
             .await
             .expect("released no-watchdog turn should complete")
         {
-            Some(Ok(Update::Done { stop_reason })) => assert_eq!(stop_reason, "end_turn"),
+            Some(Ok(Update::Done { stop_reason, .. })) => assert_eq!(stop_reason, "end_turn"),
             other => panic!("expected natural Done after releasing the fake agent, got {other:?}"),
         }
         assert!(s.next().await.is_none());
@@ -11819,7 +12674,7 @@ mod tests {
                 .await
                 .expect("turn must complete (permission auto-approved)")
             {
-                Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                Some(Ok(Update::Done { stop_reason, .. })) => break stop_reason,
                 Some(_) => continue,
                 None => panic!("stream ended without Done"),
             }
@@ -11866,7 +12721,7 @@ mod tests {
             );
             let done = loop {
                 match s.next().await {
-                    Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                    Some(Ok(Update::Done { stop_reason, .. })) => break stop_reason,
                     Some(_) => continue,
                     None => panic!("stream ended without Done"),
                 }
@@ -11907,7 +12762,7 @@ mod tests {
                 .await
                 .expect("turn must complete (permission denied)")
             {
-                Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                Some(Ok(Update::Done { stop_reason, .. })) => break stop_reason,
                 Some(_) => continue,
                 None => panic!("stream ended without Done"),
             }
@@ -12151,7 +13006,7 @@ mod tests {
             );
             let done = loop {
                 match s.next().await {
-                    Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                    Some(Ok(Update::Done { stop_reason, .. })) => break stop_reason,
                     Some(_) => continue,
                     None => panic!("stream ended without Done"),
                 }
@@ -13162,6 +14017,7 @@ mod tests {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            prefix_attestation_capability: PrefixAttestationCapability::default(),
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),
@@ -13282,7 +14138,7 @@ mod tests {
         let mut s = be.prompt(&key, vec![]).await.unwrap();
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "ok"));
         assert!(
-            matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+            matches!(s.next().await, Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn")
         );
     }
 
@@ -14354,6 +15210,7 @@ mod tests {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            prefix_attestation_capability: PrefixAttestationCapability::default(),
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),

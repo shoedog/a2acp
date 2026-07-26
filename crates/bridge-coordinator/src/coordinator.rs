@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use a2a;
+use bridge_core::attestation::{
+    append_prompt_contract, prefix_attestation_request_for_capability,
+};
 use bridge_core::domain::{InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
 #[cfg(test)]
@@ -36,6 +38,17 @@ use crate::turn_parts::assemble_turn_parts;
 
 static PROMPT_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 const DIRECT_DIAGNOSTIC_CAPACITY: usize = 64;
+
+fn append_attestation_contract_to_last_part(
+    parts: &mut [Part],
+    capability: &bridge_core::attestation::PrefixAttestationCapability,
+    request: &bridge_core::attestation::PrefixAttestationRequest,
+) {
+    if let Some(last) = parts.last_mut() {
+        let text = std::mem::take(&mut last.text);
+        last.text = append_prompt_contract(text, capability, request);
+    }
+}
 
 fn direct_diagnostic_observer() -> Arc<dyn DiagnosticObserver> {
     Arc::new(
@@ -462,8 +475,7 @@ impl Coordinator {
     }
 
     fn new_turn_id() -> bridge_core::ids::TurnId {
-        bridge_core::ids::TurnId::parse(format!("turn-{}", a2a::new_task_id()))
-            .expect("a2a task id is non-empty")
+        bridge_core::attestation::generate_turn_id().expect("secure turn id generation succeeds")
     }
 
     fn turn_context_for_warm(
@@ -541,10 +553,18 @@ impl Coordinator {
             completion: Some(completion),
         };
 
-        let parts = assemble_turn_parts(
+        let prefix_capability = turn.backend.prefix_attestation_capability();
+        let prefix_attestation_request =
+            prefix_attestation_request_for_capability(&prefix_capability)?;
+        let mut parts = assemble_turn_parts(
             turn.seed.as_deref(),
             &turn.injects,
             vec![Part { text: input }],
+        );
+        append_attestation_contract_to_last_part(
+            &mut parts,
+            &prefix_capability,
+            &prefix_attestation_request,
         );
 
         turn.backend
@@ -554,6 +574,8 @@ impl Coordinator {
                     context_id: ctx.clone(),
                     generation: turn.generation.get(),
                     op: turn.op.clone(),
+                    turn_id: obs_ctx.turn_id.clone(),
+                    prefix_attestation_request: prefix_attestation_request.clone(),
                 },
             )
             .await;
@@ -1058,6 +1080,7 @@ mod tests {
             }
             let updates = vec![Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             })];
             Ok(Box::pin(tokio_stream::iter(updates)))
         }
@@ -1156,6 +1179,7 @@ mod tests {
             }
             updates.push(Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }));
             Ok(Box::pin(tokio_stream::iter(updates)))
         }
@@ -1185,6 +1209,7 @@ mod tests {
                 .collect();
             updates.push(Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }));
             Ok(Box::pin(tokio_stream::iter(updates)))
         }
@@ -1614,6 +1639,7 @@ mod tests {
             self.prompts.lock().unwrap().push(observers.diagnostic);
             Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             })])))
         }
 
@@ -2241,6 +2267,7 @@ mod tests {
                     Ok(bridge_core::ports::Update::Text("hello".to_string())),
                     Ok(bridge_core::ports::Update::Done {
                         stop_reason: "end_turn".to_string(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])))
             }

@@ -10,6 +10,11 @@ repository = "https://github.com/shoedog/a2acp"
 name = "a2a-bridge"
 path = "src/main.rs"
 
+
+[[bin]]
+name = "codex-acp-attested"
+path = "src/bin/codex-acp-attested.rs"
+
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
 pkg-fmt = "tgz"

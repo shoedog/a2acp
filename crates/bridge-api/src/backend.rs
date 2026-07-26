@@ -346,7 +346,7 @@ impl ApiBackend {
                 };
                 if *cancel_rx.borrow() {
                     complete_prompt_lifecycle(&lifecycle).await?;
-                    yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() }; return;
+                    yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() , prefix_attestation: Default::default()}; return;
                 }
                 let resp = match send.await {
                     Ok(response) => response,
@@ -428,7 +428,7 @@ impl ApiBackend {
                         let Some(chunk) = chunk else {
                             if *cancel_rx.borrow() {
                                 complete_prompt_lifecycle(&lifecycle).await?;
-                                yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() };
+                                yield Update::Done { stop_reason: STOP_REASON_CANCELLED.into() , prefix_attestation: Default::default()};
                                 return;
                             }
                             break 'read;
@@ -544,7 +544,7 @@ impl ApiBackend {
                 };
                 if parsed.tool_calls.is_empty() {
                     complete_prompt_lifecycle(&lifecycle).await?;
-                    yield Update::Done { stop_reason: "stop".into() }; return;
+                    yield Update::Done { stop_reason: "stop".into() , prefix_attestation: Default::default()}; return;
                 }
                 // Rich observers need to know that the provider requested a tool so callers such as
                 // `smoke` can fail closed. Keep the event metadata-only: provider-controlled ids,
@@ -581,7 +581,7 @@ impl ApiBackend {
                     .await?;
             }
             complete_prompt_lifecycle(&lifecycle).await?;
-            yield Update::Done { stop_reason: "max_tool_rounds".into() };
+            yield Update::Done { stop_reason: "max_tool_rounds".into() , prefix_attestation: Default::default()};
         };
         Ok(Box::pin(stream))
     }

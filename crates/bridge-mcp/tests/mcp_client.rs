@@ -58,6 +58,7 @@ impl AgentBackend for FakeBackend {
             Ok(Update::Text(self.text.clone())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))

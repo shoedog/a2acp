@@ -97,6 +97,7 @@ mod tests {
             Update::Text("PHA".into()),
             Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             },
         ]));
         let s = super::summarize_collect(b, SessionId::parse("s").unwrap())
@@ -112,6 +113,7 @@ mod tests {
             Update::Text(big),
             Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             },
         ]));
         let err = super::summarize_collect(b, SessionId::parse("s").unwrap())

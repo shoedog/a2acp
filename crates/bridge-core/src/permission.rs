@@ -1,5 +1,6 @@
+use crate::attestation::PrefixAttestationRequest;
 use crate::domain::PermitDecision;
-use crate::ids::{ContextId, OperationId};
+use crate::ids::{ContextId, OperationId, TurnId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,6 +12,8 @@ pub struct TurnMeta {
     pub context_id: ContextId,
     pub generation: u64,
     pub op: OperationId,
+    pub turn_id: TurnId,
+    pub prefix_attestation_request: PrefixAttestationRequest,
 }
 
 /// Gen+op-keyed identity of one pending permission rendezvous.

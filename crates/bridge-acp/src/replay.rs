@@ -50,6 +50,7 @@ pub(crate) fn frame_to_update(v: serde_json::Value) -> Option<Update> {
     if let Some(stop) = v.pointer("/result/stopReason").and_then(|s| s.as_str()) {
         return Some(Update::Done {
             stop_reason: stop.to_string(),
+            prefix_attestation: Default::default(),
         });
     }
     None
@@ -109,7 +110,7 @@ mod tests {
             .unwrap();
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "hi"));
         assert!(
-            matches!(s.next().await, Some(Ok(Update::Done{stop_reason})) if stop_reason == "end_turn")
+            matches!(s.next().await, Some(Ok(Update::Done{stop_reason, ..})) if stop_reason == "end_turn")
         );
         assert!(s.next().await.is_none());
     }

@@ -2,10 +2,12 @@
 //! → prompt → concatenate Update::Text into the node output. Cancel via token.
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::template::render;
+use bridge_core::attestation::{append_prompt_contract, prefix_attestation_request_for_capability};
 use bridge_core::domain::{effective_config, AgentEntry, AgentOverride, Part, SessionSpec};
 use bridge_core::error::BridgeError;
-use bridge_core::ids::{NodeId, SessionId};
+use bridge_core::ids::{NodeId, OperationId, SessionId};
 use bridge_core::orch::UsageSnapshot;
+use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
     classify_failure, AgentBackend, AgentRegistry, BackendObservers, DiagnosticObserver,
     DiagnosticObserverFactory, FailureClass, ObsEvent, Observer, RichEventSinkFactory, TurnContext,
@@ -531,13 +533,8 @@ fn node_turn_context(
     attempt: u32,
 ) -> TurnContext {
     TurnContext {
-        turn_id: bridge_core::ids::TurnId::parse(format!(
-            "turn-{run_id}-{node_id}-{attempt}",
-            node_id = node.id.as_str()
-        ))
-        .unwrap_or_else(|_| {
-            bridge_core::ids::TurnId::parse("turn-fallback").expect("fallback is valid")
-        }),
+        turn_id: bridge_core::attestation::generate_turn_id()
+            .expect("secure workflow turn id generation succeeds"),
         session_id: bridge_core::ids::ContextId::parse(run_id).unwrap_or_else(|_| {
             bridge_core::ids::ContextId::parse("workflow-fallback").expect("fallback is valid")
         }),
@@ -785,7 +782,7 @@ impl WorkflowExecutor {
                             usage = Some(next_usage);
                         }
                         Some(Ok(Update::Permission(_))) => {}
-                        Some(Ok(Update::Done { stop_reason })) => {
+                        Some(Ok(Update::Done { stop_reason, .. })) => {
                             saw_done = true;
                             if stop_reason != STOP_REASON_CANCELLED {
                                 break;
@@ -1057,8 +1054,54 @@ impl WorkflowExecutor {
                     return (text, false, None, disposition);
                 }
 
+                let prefix_capability = turn.backend.prefix_attestation_capability();
+                let prefix_attestation_request =
+                    match prefix_attestation_request_for_capability(&prefix_capability) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            let cleanup = turn
+                                .cleanup
+                                .on_exit_observed(NodeTurnExit::Normal, diagnostic.clone())
+                                .await;
+                            let text = match cleanup {
+                                Ok(()) => format!(
+                                    "[node {} failed: {:?}]",
+                                    node.id.as_str(),
+                                    error
+                                ),
+                                Err(cleanup_error) => format!(
+                                    "[node {} cleanup failed after prefix setup error: {:?}]",
+                                    node.id.as_str(),
+                                    cleanup_error
+                                ),
+                            };
+                            let outcome = TurnOutcome::Failed(classify_failure(&error));
+                            ctx.observer.record(&ObsEvent::NodeFinished {
+                                ctx: &node_obs_ctx,
+                                outcome: &outcome,
+                            });
+                            return (text, false, None, NodeDisposition::Failed);
+                        }
+                    };
+                turn.backend
+                    .configure_turn(
+                        &turn.session,
+                        TurnMeta {
+                            context_id: obs_ctx.session_id.clone(),
+                            generation: turn.generation.get(),
+                            op: turn.op.clone(),
+                            turn_id: obs_ctx.turn_id.clone(),
+                            prefix_attestation_request: prefix_attestation_request.clone(),
+                        },
+                    )
+                    .await;
+                let rendered_with_contract = append_prompt_contract(
+                    rendered.clone(),
+                    &prefix_capability,
+                    &prefix_attestation_request,
+                );
                 let mut parts = vec![Part {
-                    text: rendered.clone(),
+                    text: rendered_with_contract,
                 }];
                 if let Some(seed) = turn.seed {
                     parts.insert(
@@ -1214,7 +1257,7 @@ impl WorkflowExecutor {
                                     break NodeTurnExit::Canceled;
                                 }
                             }
-                            Some(Ok(Update::Done { stop_reason })) => {
+                            Some(Ok(Update::Done { stop_reason, .. })) => {
                                 saw_done = true;
                                 if stop_reason == STOP_REASON_CANCELLED {
                                     ok = false;
@@ -1641,6 +1684,53 @@ impl WorkflowExecutor {
                         }
                     }
                     // prompt, with cancel
+                    let prefix_capability = resolved.backend.prefix_attestation_capability();
+                    let prefix_attestation_request =
+                        match prefix_attestation_request_for_capability(&prefix_capability) {
+                            Ok(request) => request,
+                            Err(e) => {
+                                let _ = cleanup_cold_session(
+                                    &resolved.backend,
+                                    &session,
+                                    &diagnostic,
+                                    ColdCleanupAction::Forget,
+                                )
+                                .await;
+                                break 'attempt Attempt::Fatal {
+                                    text: format!(
+                                        "[node {} failed: {:?}]",
+                                        node.id.as_str(),
+                                        e
+                                    ),
+                                    usage: None,
+                                    failure_class: classify_failure(&e),
+                                };
+                            }
+                        };
+                    resolved
+                        .backend
+                        .configure_turn(
+                            &session,
+                            TurnMeta {
+                                context_id: obs_ctx_here.session_id.clone(),
+                                generation: u64::from(attempt),
+                                op: OperationId::parse(format!(
+                                    "workflow-{}-{attempt}",
+                                    node.id.as_str()
+                                ))
+                                .expect("workflow operation id is nonempty"),
+                                turn_id: obs_ctx_here.turn_id.clone(),
+                                prefix_attestation_request: prefix_attestation_request.clone(),
+                            },
+                        )
+                        .await;
+                    let prompt_parts = vec![Part {
+                        text: append_prompt_contract(
+                            rendered.clone(),
+                            &prefix_capability,
+                            &prefix_attestation_request,
+                        ),
+                    }];
                     let rich_sink = ctx
                         .make_rich_sink
                         .as_ref()
@@ -1649,7 +1739,7 @@ impl WorkflowExecutor {
                         biased;
                         s = resolved.backend.prompt_with_observers(
                             &session,
-                            vec![Part { text: rendered.clone() }],
+                            prompt_parts,
                             BackendObservers::new(diagnostic.clone(), rich_sink.clone()),
                         ) => match s {
                             Ok(s) => s,
@@ -1779,7 +1869,7 @@ impl WorkflowExecutor {
                                         break;
                                     }
                                 }
-                                Some(Ok(Update::Done { stop_reason })) => {
+                                Some(Ok(Update::Done { stop_reason, .. })) => {
                                     saw_done = true;
                                     if stop_reason == STOP_REASON_CANCELLED { ok = false; }
                                     break;
@@ -2626,6 +2716,7 @@ mod tests {
                 Ok(Update::Text(self.reply.clone())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -2872,6 +2963,7 @@ mod tests {
                 Ok(Update::Text("OK".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ])))
         }
@@ -3490,6 +3582,7 @@ mod tests {
                             Ok(Update::Text("OK".into())),
                             Ok(Update::Done {
                                 stop_reason: "end_turn".into(),
+                                prefix_attestation: Default::default(),
                             }),
                         ])))
                     }
@@ -3970,6 +4063,7 @@ mod tests {
     fn done_only() -> Vec<Result<Update, BridgeError>> {
         vec![Ok(Update::Done {
             stop_reason: "end_turn".into(),
+            prefix_attestation: Default::default(),
         })]
     }
 
@@ -3978,6 +4072,7 @@ mod tests {
             Ok(Update::Text(text.into())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]
     }
@@ -4873,6 +4968,7 @@ mod tests {
                     })),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])))
             }
@@ -5371,6 +5467,7 @@ mod tests {
                     Ok(Update::Text("OK".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".to_owned(),
+                        prefix_attestation: Default::default(),
                     }),
                 ],
             };
@@ -5479,6 +5576,7 @@ mod tests {
                     Ok(Update::Text("OK".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".to_owned(),
+                        prefix_attestation: Default::default(),
                     }),
                 ]))),
             }
@@ -5989,6 +6087,7 @@ mod tests {
                     Ok(Update::Text("OK".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".to_owned(),
+                        prefix_attestation: Default::default(),
                     }),
                 ],
             };
@@ -6434,6 +6533,7 @@ mod tests {
                 self.rec.prompt_parts.lock().unwrap().push(parts);
                 Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
                     stop_reason: STOP_REASON_CANCELLED.into(),
+                    prefix_attestation: Default::default(),
                 })])))
             }
             async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
@@ -6898,6 +6998,7 @@ mod tests {
                     Ok(Update::Text(self.reply.clone())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])))
             }
@@ -7400,6 +7501,7 @@ mod tests {
                     Ok(Update::Text(self.reply.clone())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])))
             }
@@ -7809,6 +7911,7 @@ mod tests {
                 Ok(Update::Text(self.reply.clone())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -8066,6 +8169,7 @@ mod observability_tests {
                 Ok(Update::Text("usage-only-text".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -8231,6 +8335,7 @@ mod observability_tests {
                 Ok(Update::Text(t)),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -8353,6 +8458,7 @@ mod observability_tests {
             }
             updates.push(Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }));
             Ok(Box::pin(tokio_stream::iter(updates)))
         }
@@ -8670,6 +8776,7 @@ mod observability_tests {
                 Ok(Update::Text("ok".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))

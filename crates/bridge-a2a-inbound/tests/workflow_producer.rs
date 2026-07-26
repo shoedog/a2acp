@@ -78,6 +78,7 @@ impl AgentBackend for FakeBackend {
             Ok(Update::Text(self.reply.clone())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -480,6 +481,7 @@ impl AgentBackend for BarrierRecordingBackend {
             Ok(Update::Text(self.reply.clone())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -608,6 +610,7 @@ impl AgentBackend for RecordingFakeBackend {
             Ok(Update::Text(self.reply.clone())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -807,6 +810,7 @@ impl AgentBackend for BlockingCountBackend {
             Ok(Update::Text(reply)),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -1590,6 +1594,7 @@ impl AgentBackend for WarmCancelProbeBackend {
             Ok(Update::Text("WARM_DONE".to_string())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -1960,6 +1965,7 @@ impl AgentBackend for GatedBackend {
             Ok(Update::Text(reply)),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -3168,6 +3174,7 @@ impl AgentBackend for ResumeRecordingBackend {
             Ok(Update::Text(self.reply.clone())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -3966,6 +3973,7 @@ impl AgentBackend for CwdCapBackend {
             Ok(Update::Text(self.reply.clone())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))

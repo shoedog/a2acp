@@ -51,6 +51,8 @@ mod compatibility_schedule_state;
 mod compatibility_schedule_status;
 mod compatibility_schedule_supervisor;
 mod compatibility_schedule_transaction;
+#[path = "acp/attested_wrapper.rs"]
+mod attested_wrapper;
 mod config;
 mod containers;
 mod doctor;
@@ -324,6 +326,82 @@ fn resolve_static_session_cwd(session_cwd: Option<&str>, cwd: Option<&str>) -> S
 /// agent runs the runtime (docker) wrapping the agent cli; a raw agent runs `cmd`+`args` directly
 /// (Slice A compat). BOTH `SpawnFn` closures (run-workflow + serve) call this, so the two paths can't
 /// diverge. Unit-tested below; the Docker acceptance gate then proves it end-to-end.
+
+const CODEX_ACP_ATTESTED_INTERNAL_ARG: &str = "__a2a-codex-acp-attested";
+const CODEX_ACP_CHILD_ENV: &str = "A2A_BRIDGE_CODEX_ACP_PATH";
+
+fn is_packaged_codex_wrapper_candidate(cmd: &str) -> bool {
+    cmd == "codex-acp"
+}
+
+fn packaged_codex_attested_wrapper() -> Result<String, BridgeError> {
+    std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| BridgeError::ConfigInvalid {
+            reason: format!("resolve a2a-bridge wrapper executable: {error}"),
+        })
+}
+
+fn resolve_codex_acp_child() -> Result<String, BridgeError> {
+    if let Some(raw) = std::env::var_os(CODEX_ACP_CHILD_ENV) {
+        return canonical_codex_acp_child(PathBuf::from(raw));
+    }
+    let expected = format!("codex-acp{}", std::env::consts::EXE_SUFFIX);
+    let path = std::env::var_os("PATH").ok_or_else(|| BridgeError::ConfigInvalid {
+        reason: "codex-acp wrapper requires PATH or A2A_BRIDGE_CODEX_ACP_PATH".into(),
+    })?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(&expected);
+        if candidate.is_absolute() && candidate.is_file() {
+            return canonical_codex_acp_child(candidate);
+        }
+    }
+    Err(BridgeError::ConfigInvalid {
+        reason: format!("codex-acp wrapper could not resolve {expected:?} on PATH"),
+    })
+}
+
+fn canonical_codex_acp_child(path: PathBuf) -> Result<String, BridgeError> {
+    let expected = format!("codex-acp{}", std::env::consts::EXE_SUFFIX);
+    if !path.is_absolute() {
+        return Err(BridgeError::ConfigInvalid {
+            reason: format!("codex-acp child path must be absolute and name {expected}"),
+        });
+    }
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+        return Err(BridgeError::ConfigInvalid {
+            reason: format!("codex-acp child must name {expected}, got {}", path.display()),
+        });
+    }
+    let canonical = std::fs::canonicalize(&path).map_err(|error| BridgeError::ConfigInvalid {
+        reason: format!("resolve codex-acp child {}: {error}", path.display()),
+    })?;
+    let metadata = std::fs::metadata(&canonical).map_err(|error| BridgeError::ConfigInvalid {
+        reason: format!("stat codex-acp child {}: {error}", canonical.display()),
+    })?;
+    if !metadata.is_file() {
+        return Err(BridgeError::ConfigInvalid {
+            reason: format!("codex-acp child {} is not a file", canonical.display()),
+        });
+    }
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
+fn acp_prefix_attestation_transport(
+    entry: &AgentEntry,
+) -> bridge_acp::acp_backend::PrefixAttestationTransport {
+    if entry.sandbox.is_none()
+        && entry
+            .cmd
+            .as_deref()
+            .is_some_and(is_packaged_codex_wrapper_candidate)
+    {
+        bridge_acp::acp_backend::PrefixAttestationTransport::PackagedCodexAcpAttested
+    } else {
+        bridge_acp::acp_backend::PrefixAttestationTransport::Unsupported
+    }
+}
+
 fn acp_program_argv(
     entry: &AgentEntry,
     container_name: Option<&str>,
@@ -363,6 +441,17 @@ fn acp_program_argv(
             bridge_core::sandbox::compose_sandbox_named(sb, name, cmd, &args, labels)
         }
         (Some(sb), None) => bridge_core::sandbox::compose_sandbox(sb, cmd, &args, labels),
+        (None, _) if is_packaged_codex_wrapper_candidate(cmd) => {
+            let child = resolve_codex_acp_child()?;
+            let mut wrapper_args = vec![
+                CODEX_ACP_ATTESTED_INTERNAL_ARG.to_string(),
+                "--codex-acp".to_string(),
+                child,
+                "--".to_string(),
+            ];
+            wrapper_args.extend(args);
+            (packaged_codex_attested_wrapper()?, wrapper_args)
+        }
         (None, _) => (cmd.to_string(), args),
     })
 }
@@ -494,6 +583,7 @@ fn acp_spawn_inputs_with_cwd_binding(
         container,
         watchdog: entry.watchdog.clone(),
         diagnostic_redactor,
+        prefix_attestation_transport: acp_prefix_attestation_transport(entry),
         // ACP-param MCP delivery (claude): the entry's MCP servers ride `session/new`. Codex/kiro
         // native delivery leaves this empty (they get MCP via their native channel, not the param).
         mcp: if matches!(entry.mcp_delivery, bridge_core::mcp::McpDelivery::Acp) {
@@ -6476,6 +6566,12 @@ async fn main() -> Result<(), BoxError> {
     let process_entry = std::time::Instant::now();
     // Dispatch subcommands BEFORE the server path touches the filesystem.
     let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args
+        .get(1)
+        .is_some_and(|arg| arg == CODEX_ACP_ATTESTED_INTERNAL_ARG)
+    {
+        return attested_wrapper::run_from_args(raw_args[2..].to_vec()).await;
+    }
     let sub = parse_top_subcommand(&raw_args);
     // Dispatcher-level `--help`/`-h` for the subcommands whose own parser doesn't (yet) check
     // it: see `dispatcher_help`'s doc comment for why `init` in particular needs this BEFORE
@@ -7042,6 +7138,7 @@ mod cli_tests {
         let done = |sr: &str| {
             Ok(Update::Done {
                 stop_reason: sr.into(),
+                prefix_attestation: Default::default(),
             })
         };
         // end_turn → complete
@@ -7780,12 +7877,72 @@ mod cli_tests {
     }
 
     #[test]
+    fn prefix_attestation_transport_classifies_wrapper_only_for_unsandboxed_bare_codex() {
+        use bridge_core::domain::{EgressPolicy, MountAccess, SandboxConfig};
+
+        let mut bare = acp_entry("codex");
+        bare.cmd = Some("codex-acp".into());
+        assert_eq!(
+            acp_prefix_attestation_transport(&bare),
+            bridge_acp::acp_backend::PrefixAttestationTransport::PackagedCodexAcpAttested
+        );
+
+        let mut sandboxed = bare.clone();
+        sandboxed.sandbox = Some(SandboxConfig {
+            runtime: None,
+            image: "img".into(),
+            mount: "/work".into(),
+            access: MountAccess::Ro,
+            egress: EgressPolicy::Open,
+            volumes: vec![],
+        });
+        assert_eq!(
+            acp_prefix_attestation_transport(&sandboxed),
+            bridge_acp::acp_backend::PrefixAttestationTransport::Unsupported
+        );
+
+        let mut absolute = acp_entry("codex-absolute");
+        absolute.cmd = Some("/usr/local/bin/codex-acp".into());
+        assert_eq!(
+            acp_prefix_attestation_transport(&absolute),
+            bridge_acp::acp_backend::PrefixAttestationTransport::Unsupported
+        );
+    }
+
+    #[test]
+    fn canonical_codex_child_requires_absolute_codex_acp_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp
+            .path()
+            .join(format!("codex-acp{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&child, "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            canonical_codex_acp_child(child.clone()).unwrap(),
+            std::fs::canonicalize(&child)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert!(canonical_codex_acp_child(PathBuf::from("codex-acp")).is_err());
+        assert!(canonical_codex_acp_child(temp.path().join("not-codex-acp")).is_err());
+    }
+
+    #[test]
     fn acp_program_argv_appends_codex_native_mcp_args() {
+        use bridge_core::domain::{EgressPolicy, MountAccess, SandboxConfig};
         use bridge_core::mcp::{McpDelivery, McpServerSpec};
         // A CodexNative-delivery agent gets `-c mcp_servers.*` args appended ({cwd}-substituted);
         // an Acp-delivery agent (claude) does NOT (it gets MCP via the session/new param).
         let mut codex = acp_entry("codex");
         codex.cmd = Some("codex-acp".into());
+        codex.sandbox = Some(SandboxConfig {
+            runtime: None,
+            image: "img".into(),
+            mount: "/work".into(),
+            access: MountAccess::Ro,
+            egress: EgressPolicy::Open,
+            volumes: vec![],
+        });
         codex.mcp_delivery = McpDelivery::CodexNative;
         codex.mcp = vec![McpServerSpec {
             name: "prism".into(),
@@ -7854,6 +8011,14 @@ mod cli_tests {
         // A codex CodexNative agent whose mcp server args carry the `{cwd}` placeholder.
         let mut codex = acp_entry("codex");
         codex.cmd = Some("codex-acp".into());
+        codex.sandbox = Some(bridge_core::domain::SandboxConfig {
+            runtime: None,
+            image: "img".into(),
+            mount: "/work".into(),
+            access: bridge_core::domain::MountAccess::Ro,
+            egress: bridge_core::domain::EgressPolicy::Open,
+            volumes: vec![],
+        });
         codex.mcp_delivery = McpDelivery::CodexNative;
         codex.mcp = vec![McpServerSpec {
             name: "lsp".into(),

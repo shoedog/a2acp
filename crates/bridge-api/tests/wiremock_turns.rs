@@ -59,7 +59,7 @@ async fn text_round_trip_yields_text_then_done_no_permission() {
         })
         .collect();
     assert_eq!(text, "Hello world");
-    assert!(matches!(updates.last(), Some(Update::Done { stop_reason }) if stop_reason == "stop"));
+    assert!(matches!(updates.last(), Some(Update::Done { stop_reason, .. }) if stop_reason == "stop"));
     assert!(
         !updates.iter().any(|u| matches!(u, Update::Permission(_))),
         "API backend NEVER yields Permission"
@@ -99,7 +99,7 @@ async fn tool_approve_path_executes_and_feeds_result() {
         })
         .collect();
     assert_eq!(text, "It is 2026.");
-    assert!(matches!(updates.last(), Some(Update::Done { stop_reason }) if stop_reason == "stop"));
+    assert!(matches!(updates.last(), Some(Update::Done { stop_reason, .. }) if stop_reason == "stop"));
     assert!(!updates.iter().any(|u| matches!(u, Update::Permission(_))));
 
     // EXACTLY two requests; the follow-up carries the PRECISE assistant + tool messages.
@@ -278,7 +278,7 @@ async fn cancel_during_inflight_ends_with_cancelled_and_preempts() {
         updates.push(item.unwrap());
     }
     assert!(
-        matches!(updates.last(), Some(Update::Done { stop_reason }) if stop_reason == "cancelled")
+        matches!(updates.last(), Some(Update::Done { stop_reason, .. }) if stop_reason == "cancelled")
     );
     assert!(
         !updates.iter().any(|u| matches!(u, Update::Text(_))),
@@ -516,7 +516,7 @@ async fn nonstream_mode_text_round_trip() {
         })
         .collect();
     assert_eq!(text, "plain text");
-    assert!(matches!(updates.last(), Some(Update::Done{stop_reason}) if stop_reason=="stop"));
+    assert!(matches!(updates.last(), Some(Update::Done{stop_reason, ..}) if stop_reason=="stop"));
 }
 
 #[tokio::test]
@@ -533,7 +533,7 @@ async fn max_tool_rounds_terminates() {
     let be = ApiBackend::new(cfg);
     let updates = drain(&be, &SessionId::parse("sm").unwrap()).await;
     assert!(
-        matches!(updates.last(), Some(Update::Done { stop_reason }) if stop_reason == "max_tool_rounds")
+        matches!(updates.last(), Some(Update::Done { stop_reason, .. }) if stop_reason == "max_tool_rounds")
     );
     assert_eq!(
         server.received_requests().await.unwrap().len(),
