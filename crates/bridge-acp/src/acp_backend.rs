@@ -5552,7 +5552,7 @@ impl AcpBackend {
                                 let prefix_attestation = prefix_state
                                     .as_ref()
                                     .map(|state| state.terminal_status(prefix_requested))
-                                    .unwrap_or_else(PrefixAttestationStatus::default);
+                                    .unwrap_or_default();
                                 TurnEvent::Done(Update::done_with_attestation(
                                     stop_reason,
                                     prefix_attestation,
@@ -6083,6 +6083,7 @@ impl Drop for AcpBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bridge_core::attestation::{NoAttestationV1, RejectedAttestation};
     use bridge_core::diagnostics::{
         DiagnosticFailureClass, DiagnosticPhase, FailureDisposition, InMemoryDiagnosticObserver,
         PhaseStatus,

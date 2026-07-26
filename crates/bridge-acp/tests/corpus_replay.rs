@@ -201,7 +201,7 @@ fn kiro_real_capture_replays_through_backend() {
     assert_eq!(
         done.as_deref(),
         Some("end_turn"),
-        "the real kiro prompt result must replay to Update::Done{{end_turn}, prefix_attestation: Default::default()}"
+        "the real kiro prompt result must replay to Update::Done{{end_turn, prefix_attestation: Default::default()}}"
     );
     assert!(
         modeled >= 2,
@@ -273,7 +273,7 @@ fn codex_real_capture_replays_pong_and_drops_unmodeled() {
     assert_eq!(
         done.as_deref(),
         Some("end_turn"),
-        "the real codex prompt result must replay to Update::Done{{end_turn}, prefix_attestation: Default::default()}"
+        "the real codex prompt result must replay to Update::Done{{end_turn, prefix_attestation: Default::default()}}"
     );
     // Exactly the two text chunks + the result are counted as text/done outcomes;
     // usage is surfaced and tracked separately from that legacy modeled count.

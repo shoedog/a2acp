@@ -174,10 +174,6 @@ struct WrapperState {
     sessions: HashMap<String, PerSessionState>,
 }
 
-pub async fn run_from_env() -> Result<(), DynError> {
-    run_from_args(std::env::args().skip(1).collect()).await
-}
-
 pub async fn run_from_args(argv: Vec<String>) -> Result<(), DynError> {
     let (cmd, args) = parse_args(argv)?;
     run(cmd, args).await
@@ -752,6 +748,9 @@ enum Piece {
     Candidate(Vec<usize>),
 }
 
+/// Single-chunk convenience over [`resolve_marker_chunks`], used by the marker
+/// grammar test table (production flush always goes through the chunked path).
+#[cfg(test)]
 fn resolve_marker_text(input: &str, marker: &str) -> MarkerResolution {
     let resolved = resolve_marker_chunks(&[input], marker);
     MarkerResolution {

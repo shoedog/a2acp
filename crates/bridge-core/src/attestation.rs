@@ -90,16 +90,13 @@ pub enum HarvestSanitizationMode {
     AttestedPrefixV1,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum PrefixAttestationRequest {
+    #[default]
     Disabled,
-    CodexCommitMarkerV1 { marker_nonce: [u8; 16] },
-}
-
-impl Default for PrefixAttestationRequest {
-    fn default() -> Self {
-        Self::Disabled
-    }
+    CodexCommitMarkerV1 {
+        marker_nonce: [u8; 16],
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

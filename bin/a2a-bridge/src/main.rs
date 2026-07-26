@@ -322,11 +322,6 @@ fn resolve_static_session_cwd(session_cwd: Option<&str>, cwd: Option<&str>) -> S
 // `run-workflow` subcommand
 // ---------------------------------------------------------------------------
 
-/// Compose-or-raw: the `(runtime program, argv)` for spawning a `kind="acp"` agent. A `[sandbox]`
-/// agent runs the runtime (docker) wrapping the agent cli; a raw agent runs `cmd`+`args` directly
-/// (Slice A compat). BOTH `SpawnFn` closures (run-workflow + serve) call this, so the two paths can't
-/// diverge. Unit-tested below; the Docker acceptance gate then proves it end-to-end.
-
 const CODEX_ACP_ATTESTED_INTERNAL_ARG: &str = "__a2a-codex-acp-attested";
 const CODEX_ACP_CHILD_ENV: &str = "A2A_BRIDGE_CODEX_ACP_PATH";
 
@@ -405,6 +400,10 @@ fn acp_prefix_attestation_transport(
     }
 }
 
+/// Compose-or-raw: the `(runtime program, argv)` for spawning a `kind="acp"` agent. A `[sandbox]`
+/// agent runs the runtime (docker) wrapping the agent cli; a raw agent runs `cmd`+`args` directly
+/// (Slice A compat). BOTH `SpawnFn` closures (run-workflow + serve) call this, so the two paths can't
+/// diverge. Unit-tested below; the Docker acceptance gate then proves it end-to-end.
 fn acp_program_argv(
     entry: &AgentEntry,
     container_name: Option<&str>,
