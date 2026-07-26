@@ -3262,8 +3262,29 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         &brief_lint,
         strict_brief,
     );
+
+    // Unique local CLI run id for workflow diagnostics and artifact paths.
+    let run_id = format!(
+        "cli-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let run_artifact_root = session_cwd
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    write_run_workflow_brief_lint_artifact(
+        out_path.as_deref(),
+        Some(&run_artifact_root),
+        Some(&run_id),
+        &brief_lint,
+        strict_brief,
+    );
+
     enforce_strict_brief_lint("run-workflow", &brief_lint, strict_brief)?;
-    write_run_workflow_brief_lint_artifact(out_path.as_deref(), &brief_lint, strict_brief);
     if let Err(e) = bridge_core::task_spec::validate_input(&input) {
         eprintln!("{}", e.client_message());
         return Err(e.into());
@@ -3423,16 +3444,6 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     );
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
         Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
-    );
-
-    // Unique run id.
-    let run_id = format!(
-        "cli-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
     );
 
     // Per-request session cwd: thread it into the context so EVERY node's agent works in the target
@@ -5340,24 +5351,92 @@ fn run_workflow_brief_lint_artifact_path(out: &Path) -> PathBuf {
     out.with_extension("brief-lint.json")
 }
 
+/// Returns the git directory used as the run artifact surface.
+///
+/// Linked worktrees have a `.git` file that points at the worktree-specific git
+/// directory; artifacts intentionally follow that pointer so concurrent
+/// worktrees keep isolated run surfaces instead of coalescing under the common
+/// repository git dir.
+fn repo_git_dir(root: &Path) -> Option<PathBuf> {
+    let git = root.join(".git");
+    if git.is_dir() {
+        return Some(git);
+    }
+    if git.is_file() {
+        let raw = std::fs::read_to_string(&git).ok()?;
+        let gitdir = raw.strip_prefix("gitdir:")?.trim();
+        if gitdir.is_empty() {
+            return None;
+        }
+        let gitdir = PathBuf::from(gitdir);
+        return Some(if gitdir.is_absolute() {
+            gitdir
+        } else {
+            root.join(gitdir)
+        });
+    }
+    None
+}
+
+fn run_workflow_brief_lint_run_artifact_path(root: &Path, run_id: &str) -> Option<PathBuf> {
+    Some(
+        repo_git_dir(root)?
+            .join("a2a-bridge")
+            .join("run-workflow")
+            .join(run_id)
+            .join("brief-lint.json"),
+    )
+}
+
+fn write_brief_lint_json_artifact(
+    path: &Path,
+    json: &str,
+    create_parent: bool,
+) -> Result<(), BoxError> {
+    if create_parent {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create brief-lint artifact dir {}: {e}", parent.display()))?;
+        }
+    }
+    std::fs::write(path, json)
+        .map_err(|e| format!("write brief-lint artifact {}: {e}", path.display()).into())
+}
+
 fn write_run_workflow_brief_lint_artifact(
     out_path: Option<&Path>,
+    run_artifact_root: Option<&Path>,
+    run_id: Option<&str>,
     report: &bridge_core::brief_lint::BriefLintReport,
     strict: bool,
 ) {
-    if report.is_empty() {
-        return;
-    }
-    let Some(out) = out_path else {
-        return;
+    let json = match brief_lint_artifact_json(report, strict) {
+        Ok(json) => json,
+        Err(e) => {
+            eprintln!("[brief-lint] artifact write failed: {e}");
+            return;
+        }
     };
-    let artifact = run_workflow_brief_lint_artifact_path(out);
-    match brief_lint_artifact_json(report, strict).and_then(|json| {
-        std::fs::write(&artifact, json)
-            .map_err(|e| format!("write brief-lint artifact {}: {e}", artifact.display()).into())
-    }) {
-        Ok(()) => eprintln!("[brief-lint] wrote artifact {}", artifact.display()),
-        Err(e) => eprintln!("[brief-lint] artifact write failed: {e}"),
+
+    if let (Some(root), Some(run_id)) = (run_artifact_root, run_id) {
+        match run_workflow_brief_lint_run_artifact_path(root, run_id) {
+            Some(artifact) => match write_brief_lint_json_artifact(&artifact, &json, true) {
+                Ok(()) => eprintln!("[brief-lint] wrote artifact {}", artifact.display()),
+                Err(e) => eprintln!("[brief-lint] artifact write failed: {e}"),
+            },
+            None => eprintln!(
+                "[brief-lint] artifact write skipped: no git artifact surface under {}",
+                root.display()
+            ),
+        }
+    }
+
+    if let Some(out) = out_path {
+        let artifact = run_workflow_brief_lint_artifact_path(out);
+        match write_brief_lint_json_artifact(&artifact, &json, false) {
+            Ok(()) => eprintln!("[brief-lint] wrote artifact {}", artifact.display()),
+            Err(e) => eprintln!("[brief-lint] artifact write failed: {e}"),
+        }
     }
 }
 
@@ -9144,10 +9223,87 @@ A) Stop.
 B) Continue.",
             bridge_core::brief_lint::BriefLintKind::RunWorkflow,
         );
-        super::write_run_workflow_brief_lint_artifact(Some(&out), &report, false);
+        super::write_run_workflow_brief_lint_artifact(Some(&out), None, None, &report, false);
         let json = std::fs::read_to_string(&artifact).unwrap();
         assert!(json.contains("option-menu"));
         let _ = std::fs::remove_file(&artifact);
+    }
+
+    #[test]
+    fn brief_lint_writes_run_workflow_git_artifact_and_sidecar_with_out() {
+        let root = temp_task_spec_path("brief-lint-run-workflow-out-root");
+        let out = temp_task_spec_path("brief-lint-run-workflow-out.md");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&out);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let run_artifact =
+            super::run_workflow_brief_lint_run_artifact_path(&root, "run-1").unwrap();
+        let sidecar = super::run_workflow_brief_lint_artifact_path(&out);
+        let _ = std::fs::remove_file(&sidecar);
+        let report = bridge_core::brief_lint::lint_brief(
+            "Choose one:
+A) Stop.
+B) Continue.",
+            bridge_core::brief_lint::BriefLintKind::RunWorkflow,
+        );
+        super::write_run_workflow_brief_lint_artifact(
+            Some(&out),
+            Some(&root),
+            Some("run-1"),
+            &report,
+            false,
+        );
+        let run_json = std::fs::read_to_string(&run_artifact).unwrap();
+        let sidecar_json = std::fs::read_to_string(&sidecar).unwrap();
+        assert!(run_json.contains("option-menu"));
+        assert!(sidecar_json.contains("option-menu"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    #[test]
+    fn brief_lint_writes_run_workflow_git_artifact_without_out() {
+        let root = temp_task_spec_path("brief-lint-run-workflow-root");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let artifact = super::run_workflow_brief_lint_run_artifact_path(&root, "run-1").unwrap();
+        let report = bridge_core::brief_lint::lint_brief(
+            "Choose one:\nA) Stop.\nB) Continue.",
+            bridge_core::brief_lint::BriefLintKind::RunWorkflow,
+        );
+        super::write_run_workflow_brief_lint_artifact(
+            None,
+            Some(&root),
+            Some("run-1"),
+            &report,
+            false,
+        );
+        let json = std::fs::read_to_string(&artifact).unwrap();
+        assert!(json.contains("option-menu"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn brief_lint_writes_clean_run_workflow_git_artifact_without_out() {
+        let root = temp_task_spec_path("brief-lint-run-workflow-clean-root");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let artifact = super::run_workflow_brief_lint_run_artifact_path(&root, "clean").unwrap();
+        let report = bridge_core::brief_lint::lint_brief(
+            "Review the implementation and report any findings.",
+            bridge_core::brief_lint::BriefLintKind::RunWorkflow,
+        );
+        assert!(report.is_empty());
+        super::write_run_workflow_brief_lint_artifact(
+            None,
+            Some(&root),
+            Some("clean"),
+            &report,
+            false,
+        );
+        let json = std::fs::read_to_string(&artifact).unwrap();
+        assert!(json.contains("\"findings\": []"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

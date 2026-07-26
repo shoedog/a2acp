@@ -337,6 +337,10 @@ pub fn caps_from_config_options(opts: &[SessionConfigOption]) -> AgentCaps {
 
 pub const EFFORT_ORDER: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
+pub fn is_model_effort_level(level: &str) -> bool {
+    rank(level).is_some()
+}
+
 fn rank(level: &str) -> Option<usize> {
     EFFORT_ORDER
         .iter()

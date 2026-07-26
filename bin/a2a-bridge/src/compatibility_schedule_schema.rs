@@ -19,7 +19,6 @@ const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 128;
 const MAX_TEXT_BYTES: usize = 4096;
 const MAX_ITEMS: usize = 256;
-const MAX_CANDIDATE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SUPERVISOR_DEADLINE_MS: u64 = 24 * 60 * 60 * 1_000;
 const CLAIMED_SUPPORT_READER_CASE_IDS: [&str; 2] =
     ["claude-reader-055-fable", "codex-reader-bridge-gpt56-sol"];
@@ -2356,7 +2355,7 @@ impl ValidateRecord for CaseExecutionFingerprintRecordV1 {
             &self.input.candidate.build_provenance_sha256,
         )?;
         if self.input.candidate.length_bytes == 0
-            || self.input.candidate.length_bytes > MAX_CANDIDATE_BYTES
+            || self.input.candidate.length_bytes > compatibility::MAX_EXECUTABLE_BYTES
         {
             return Err("schedule schema: candidate length is outside the bounded range".into());
         }

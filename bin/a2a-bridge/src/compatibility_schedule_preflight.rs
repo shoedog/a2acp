@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::compatibility::MAX_EXECUTABLE_BYTES;
 use crate::compatibility_process_group::{self, ProcessIdentityV1};
 use crate::{local_file, BoxError};
 
@@ -861,7 +862,7 @@ fn executable_identity(
             value: local_file::read_regular_file_bounded(
                 &canonical,
                 "legacy process executable",
-                512 * 1024 * 1024,
+                MAX_EXECUTABLE_BYTES,
             )?
             .sha256,
         }

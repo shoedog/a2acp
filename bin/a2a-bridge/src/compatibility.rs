@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use bridge_acp::is_model_effort_level;
 use bridge_core::diagnostics::diagnostic_timestamp_ms;
 use bridge_core::domain::Effort;
 use serde::{Deserialize, Serialize};
@@ -2694,19 +2695,21 @@ fn catalog_strings<'a>(
         .collect()
 }
 
-fn catalog_model_id_effort(id: &str) -> Option<&str> {
-    const EFFORT_SUFFIXES: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+fn is_catalog_model_effort_suffix(suffix: &str) -> bool {
+    is_model_effort_level(suffix)
+}
 
+fn catalog_model_id_effort(id: &str) -> Option<&str> {
     if let Some(without_close) = id.strip_suffix(']') {
         if let Some((_, suffix)) = without_close.rsplit_once('[') {
-            if EFFORT_SUFFIXES.contains(&suffix) {
+            if is_catalog_model_effort_suffix(suffix) {
                 return Some(suffix);
             }
         }
     }
 
     id.rsplit_once('/')
-        .and_then(|(_, suffix)| EFFORT_SUFFIXES.contains(&suffix).then_some(suffix))
+        .and_then(|(_, suffix)| is_catalog_model_effort_suffix(suffix).then_some(suffix))
 }
 
 fn catalog_model_id_base(id: &str) -> &str {
@@ -6681,6 +6684,14 @@ agent_cli = "@openai/codex=0.144.1"
             );
             assert!(!aggregate.success);
         }
+    }
+
+    #[test]
+    fn catalog_model_effort_suffixes_follow_acp_rank_invariants() {
+        assert!(is_catalog_model_effort_suffix("xhigh"));
+        assert!(is_catalog_model_effort_suffix("max"));
+        assert!(!is_catalog_model_effort_suffix("minimal"));
+        assert!(!is_catalog_model_effort_suffix("XHIGH"));
     }
 
     #[test]

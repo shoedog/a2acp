@@ -641,6 +641,9 @@ enum AcpTraceEvent {
         advertised_count: u16,
     },
     EffortOptionMissing,
+    MintEffortDropped {
+        advertised_count: u16,
+    },
     ConfigResolved {
         effort_applied: bool,
         fell_back: bool,
@@ -687,6 +690,11 @@ impl AcpTraceEvent {
             ),
             Self::EffortOptionMissing => tracing::warn!(
                 event = "acp.effort_option_missing",
+                "ACP lifecycle metadata"
+            ),
+            Self::MintEffortDropped { advertised_count } => tracing::warn!(
+                event = "acp.mint_effort_dropped",
+                advertised_count,
                 "ACP lifecycle metadata"
             ),
             Self::ConfigResolved {
@@ -2192,6 +2200,23 @@ impl AcpBackend {
                 }
             }
         };
+        if matches!(purpose, ApplyPurpose::Mint)
+            && effort.is_some()
+            && surface.supports_effort_model_ids()
+            && matches!(effort_outcome, EffortDecision::Skip)
+        {
+            AcpTraceEvent::MintEffortDropped {
+                advertised_count: AcpTraceEvent::bounded_count(
+                    surface
+                        .models
+                        .as_ref()
+                        .map(|models| models.available_models.len())
+                        .unwrap_or_default(),
+                ),
+            }
+            .emit();
+        }
+
         let model_current_for_log = model_current.as_deref().unwrap_or("unknown");
         AcpTraceEvent::ConfigResolved {
             effort_applied: matches!(effort_outcome, EffortDecision::Apply { .. }),
@@ -5927,6 +5952,9 @@ mod tests {
                     advertised_count: AcpTraceEvent::bounded_count(known_secret.len()),
                 },
                 AcpTraceEvent::EffortOptionMissing,
+                AcpTraceEvent::MintEffortDropped {
+                    advertised_count: AcpTraceEvent::bounded_count(known_secret.len()),
+                },
                 AcpTraceEvent::ConfigResolved {
                     effort_applied: true,
                     fell_back: false,
@@ -12326,6 +12354,133 @@ mod tests {
                 "gpt-5.6-sol[xhigh]"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn models_field_set_model_rejection_maps_informative_error() {
+        let rec = Recorder::new("agent-sess-MODELS-REJECT");
+        rec.advertise_session_models(
+            "gpt-5.6-sol[medium]",
+            &[
+                "gpt-5.6-sol[medium]",
+                "gpt-5.6-sol[high]",
+                "gpt-5.6-sol[xhigh]",
+            ],
+        )
+        .await;
+        rec.reject_set_model.store(true, Ordering::SeqCst);
+        let cfg = AcpConfig {
+            agent_id: "recorder".to_string(),
+            ..test_config()
+        };
+        let be = connect_recording_with(rec.clone(), cfg).await;
+        let key = bkey("bridge-MODELS-REJECT");
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: Some("gpt-5.6-sol".to_string()),
+                effort: Some(Effort::Xhigh),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        match be.ensure_session(&key).await {
+            Err(error) => {
+                let diagnostic = assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::ConfigApply,
+                    DiagnosticFailureClass::Model,
+                    false,
+                );
+                assert_eq!(diagnostic.code().as_str(), "acp.config.model_rejected");
+                let cause = diagnostic.causes().join(" ");
+                assert!(
+                    cause.contains("session/set_model rejected modelId=gpt-5.6-sol[xhigh]"),
+                    "{cause}"
+                );
+                assert!(cause.contains("unknown model id"), "{cause}");
+            }
+            other => panic!("a rejected set_model must fail session setup, got {other:?}"),
+        }
+        assert_eq!(
+            rec.set_models.lock().await.as_slice(),
+            &["gpt-5.6-sol[xhigh]".to_string()]
+        );
+        assert!(rec.set_config_options.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn models_field_effort_only_uses_current_model_base_at_mint() {
+        let rec = Recorder::new("agent-sess-MODELS-EFFORT-ONLY");
+        rec.advertise_session_models(
+            "gpt-5.6-sol[medium]",
+            &[
+                "gpt-5.6-sol[medium]",
+                "gpt-5.6-sol[high]",
+                "gpt-5.6-sol[xhigh]",
+            ],
+        )
+        .await;
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-MODELS-EFFORT-ONLY");
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: None,
+                effort: Some(Effort::Xhigh),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        be.ensure_session(&key).await.unwrap();
+
+        assert_eq!(
+            rec.set_models.lock().await.as_slice(),
+            &["gpt-5.6-sol[xhigh]".to_string()],
+            "effort-only models-field selection must use the current model base"
+        );
+        assert!(
+            rec.set_config_options.lock().await.is_empty(),
+            "models field effort selection must not fall through to config options"
+        );
+        let catalog = be.session_catalog(&key).expect("catalog retained");
+        assert_eq!(catalog.current_model.as_deref(), Some("gpt-5.6-sol[xhigh]"));
+    }
+
+    #[tokio::test]
+    async fn mixed_models_field_effort_only_nonmatching_base_warn_skips_at_mint() {
+        let rec = Recorder::new("agent-sess-MODELS-EFFORT-DROP");
+        rec.advertise_session_models(
+            "haiku",
+            &["haiku", "gpt-5.6-sol[medium]", "gpt-5.6-sol[xhigh]"],
+        )
+        .await;
+        rec.advertise_effort_config.store(false, Ordering::SeqCst);
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-MODELS-EFFORT-DROP");
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: None,
+                effort: Some(Effort::Xhigh),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        be.ensure_session(&key)
+            .await
+            .expect("mint keeps legacy best-effort semantics after warning");
+
+        assert!(rec.set_models.lock().await.is_empty());
+        assert!(rec.set_config_options.lock().await.is_empty());
+        let catalog = be.session_catalog(&key).expect("catalog retained");
+        assert_eq!(catalog.current_model.as_deref(), Some("haiku"));
     }
 
     #[tokio::test]

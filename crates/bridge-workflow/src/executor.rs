@@ -188,7 +188,8 @@ impl NodeDisposition {
 const WORKFLOW_PREFLIGHT_PROMPT: &str = "Reply with exactly PONG and nothing else.";
 const PREFLIGHT_OBSERVER_ATTEMPT_BASE: u32 = 10_000;
 
-type PreflightCache = Arc<tokio::sync::Mutex<HashMap<String, PreflightDecision>>>;
+type PreflightCacheEntry = Arc<tokio::sync::OnceCell<Result<PreflightDecision, PreflightFailure>>>;
+type PreflightCache = Arc<tokio::sync::Mutex<HashMap<String, PreflightCacheEntry>>>;
 
 #[derive(Clone, Debug)]
 struct PreflightDecision {
@@ -196,7 +197,7 @@ struct PreflightDecision {
     substituted_from: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum PreflightFailure {
     Canceled,
     Hard {
@@ -584,10 +585,55 @@ impl WorkflowExecutor {
         }
 
         let cache_key = entry.id.as_str().to_string();
-        if let Some(decision) = cache.lock().await.get(&cache_key).cloned() {
-            return Ok(decision);
-        }
+        let cell = {
+            let mut cache = cache.lock().await;
+            cache
+                .entry(cache_key)
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
+        };
 
+        // The cell single-flights concurrent first misses. Only successful
+        // decisions remain in the run cache; failures are evicted below so a
+        // cancellation or setup error cannot poison later nodes.
+        let result = cell
+            .get_or_init(|| async {
+                self.run_agent_preflight_uncached(
+                    wf_id,
+                    node,
+                    run_id,
+                    ctx,
+                    diagnostic_factory,
+                    cancel,
+                    entry.clone(),
+                )
+                .await
+            })
+            .await
+            .clone();
+        if result.is_err() {
+            let mut cache = cache.lock().await;
+            if cache
+                .get(&cache_key)
+                .is_some_and(|cached| Arc::ptr_eq(cached, &cell))
+            {
+                cache.remove(&cache_key);
+            }
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_agent_preflight_uncached(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        run_id: &str,
+        ctx: &WorkflowRunContext,
+        diagnostic_factory: &Arc<dyn DiagnosticObserverFactory>,
+        cancel: &CancellationToken,
+        entry: Arc<AgentEntry>,
+    ) -> Result<PreflightDecision, PreflightFailure> {
         let candidates = Self::preflight_candidates(&entry);
         let mut attempts = Vec::new();
         for (idx, model) in candidates.iter().enumerate() {
@@ -807,7 +853,6 @@ impl WorkflowExecutor {
                     selected_model: model.clone(),
                     substituted_from,
                 };
-                cache.lock().await.insert(cache_key, decision.clone());
                 return Ok(decision);
             }
 
@@ -2538,12 +2583,15 @@ impl WorkflowExecutor {
 mod tests {
     use super::*;
     use crate::graph::{RetryPolicy, WorkflowGraph, WorkflowNode};
+    use bridge_core::diagnostics::{
+        DiagnosticEvent, DiagnosticFailureClass, DiagnosticPhase, PhaseStatus,
+    };
     use bridge_core::domain::{Part, PermissionRequest, RegistrySnapshot, SessionSpec};
     use bridge_core::error::BridgeError;
     use bridge_core::ids::{AgentId, NodeId, SessionId, WorkflowId};
     use bridge_core::ports::{AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, Update};
     use futures::StreamExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
 
@@ -2665,11 +2713,45 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DiagnosticObserver for MarkerDiagnostic {
-        async fn record(
-            &self,
-            _event: bridge_core::diagnostics::DiagnosticEvent,
-        ) -> Result<(), BridgeError> {
+        async fn record(&self, _event: DiagnosticEvent) -> Result<(), BridgeError> {
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingDiagnostic {
+        events: Mutex<Vec<DiagnosticEvent>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DiagnosticObserver for CapturingDiagnostic {
+        async fn record(&self, event: DiagnosticEvent) -> Result<(), BridgeError> {
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingDiagnosticFactory {
+        observers: Mutex<Vec<Arc<CapturingDiagnostic>>>,
+    }
+
+    impl CapturingDiagnosticFactory {
+        fn events(&self) -> Vec<DiagnosticEvent> {
+            self.observers
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|observer| observer.events.lock().unwrap().clone())
+                .collect()
+        }
+    }
+
+    impl DiagnosticObserverFactory for CapturingDiagnosticFactory {
+        fn make(&self, _node: &NodeId, _attempt: u32) -> Arc<dyn DiagnosticObserver> {
+            let observer = Arc::new(CapturingDiagnostic::default());
+            self.observers.lock().unwrap().push(observer.clone());
+            observer
         }
     }
 
@@ -3953,6 +4035,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_final_records_prompt_finish_protocol_diagnostic() {
+        let rec = Arc::new(Rec::default());
+        let backend = Arc::new(SequenceBackend {
+            replies: Mutex::new(std::collections::VecDeque::from(vec![
+                done_only(),
+                text_done("OK"),
+            ])),
+            rec,
+        });
+        let agent = AgentId::parse("codex").unwrap();
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: minimal_entry(&agent),
+            backend,
+            invalidates: AtomicUsize::new(0),
+        });
+        let diagnostic_factory = Arc::new(CapturingDiagnosticFactory::default());
+
+        let events = WorkflowExecutor::new(registry)
+            .run_with_diagnostic_context(
+                one_node_graph(),
+                "DIFF".into(),
+                "empty-diagnostic".into(),
+                CancellationToken::new(),
+                WorkflowDiagnosticContext::new(
+                    WorkflowRunContext::default(),
+                    diagnostic_factory.clone(),
+                ),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(Result::is_ok));
+
+        let diagnostics = diagnostic_factory.events();
+        let event = diagnostics
+            .iter()
+            .find(|event| {
+                event.transition().phase() == DiagnosticPhase::PromptFinish
+                    && event.transition().status() == PhaseStatus::Failed
+            })
+            .expect("empty final should emit a PromptFinish failure diagnostic");
+        let failure = event.failure().expect("failed event carries diagnostic");
+        assert_eq!(failure.failed_phase(), DiagnosticPhase::PromptFinish);
+        assert_eq!(failure.code().as_str(), "workflow.empty_final");
+        assert_eq!(failure.class(), DiagnosticFailureClass::Protocol);
+        assert!(
+            failure
+                .summary()
+                .contains("completed with an empty final agent message"),
+            "{}",
+            failure.summary()
+        );
+    }
+
+    #[tokio::test]
     async fn twin_empty_final_is_permanent_failure_naming_both_attempts() {
         let rec = Arc::new(Rec::default());
         let backend = Arc::new(SequenceBackend {
@@ -4033,9 +4169,26 @@ mod tests {
         session_models: Mutex<HashMap<String, Option<String>>>,
     }
 
+    struct PreflightConfigureGate {
+        paused_first: AtomicBool,
+        entered: tokio::sync::Barrier,
+        release: tokio::sync::Notify,
+    }
+
+    impl PreflightConfigureGate {
+        fn new() -> Self {
+            Self {
+                paused_first: AtomicBool::new(false),
+                entered: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
     struct PreflightBackend {
         rec: Arc<PreflightRec>,
         pong_models: Vec<String>,
+        configure_gate: Option<Arc<PreflightConfigureGate>>,
     }
 
     #[async_trait::async_trait]
@@ -4081,6 +4234,14 @@ mod tests {
             session: &SessionId,
             spec: &SessionSpec,
         ) -> Result<(), BridgeError> {
+            if let Some(gate) = &self.configure_gate {
+                if session.as_str().starts_with("workflow-preflight-")
+                    && !gate.paused_first.swap(true, Ordering::SeqCst)
+                {
+                    gate.entered.wait().await;
+                    gate.release.notified().await;
+                }
+            }
             self.rec
                 .configured_models
                 .lock()
@@ -4187,6 +4348,7 @@ mod tests {
         let backend = Arc::new(PreflightBackend {
             rec: rec.clone(),
             pong_models: vec!["good".into()],
+            configure_gate: None,
         });
         let registry = Arc::new(SharedBackendRegistry {
             entry: preflight_entry("bad", &["good"]),
@@ -4240,6 +4402,7 @@ mod tests {
         let backend = Arc::new(PreflightBackend {
             rec: rec.clone(),
             pong_models: vec![],
+            configure_gate: None,
         });
         let registry = Arc::new(SharedBackendRegistry {
             entry: preflight_entry("bad", &["worse"]),
@@ -4277,6 +4440,7 @@ mod tests {
         let backend = Arc::new(PreflightBackend {
             rec: rec.clone(),
             pong_models: vec!["good".into()],
+            configure_gate: None,
         });
         let registry = Arc::new(SharedBackendRegistry {
             entry: preflight_entry("good", &[]),
@@ -4325,6 +4489,7 @@ mod tests {
         let backend = Arc::new(PreflightBackend {
             rec: rec.clone(),
             pong_models: vec!["good".into()],
+            configure_gate: None,
         });
         let registry = Arc::new(SharedBackendRegistry {
             entry: preflight_entry("bad", &["good"]),
@@ -4392,6 +4557,7 @@ mod tests {
         let backend = Arc::new(PreflightBackend {
             rec: rec.clone(),
             pong_models: vec![],
+            configure_gate: None,
         });
         let registry = Arc::new(SharedBackendRegistry {
             entry: preflight_entry("bad", &["worse"]),
@@ -4436,6 +4602,7 @@ mod tests {
         let backend = Arc::new(PreflightBackend {
             rec: rec.clone(),
             pong_models: vec!["good".into()],
+            configure_gate: None,
         });
         let registry = Arc::new(SharedBackendRegistry {
             entry: preflight_entry("bad", &["good"]),
@@ -4518,12 +4685,113 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_preflight_first_miss_single_flights_per_agent() {
+        let rec = Arc::new(PreflightRec::default());
+        let gate = Arc::new(PreflightConfigureGate::new());
+        let backend = Arc::new(PreflightBackend {
+            rec: rec.clone(),
+            pong_models: vec!["good".into()],
+            configure_gate: Some(gate.clone()),
+        });
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: preflight_entry("bad", &["good"]),
+            backend,
+            invalidates: AtomicUsize::new(0),
+        });
+        let executor = Arc::new(WorkflowExecutor::new(registry.clone()));
+        let graph = one_node_graph();
+        let node = graph.nodes[0].clone();
+        let diagnostic_factory: Arc<dyn DiagnosticObserverFactory> =
+            Arc::new(RecordingDiagnosticFactory::default());
+        let preflight_cache: PreflightCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let first_executor = executor.clone();
+        let first_node = node.clone();
+        let first_diagnostic_factory = diagnostic_factory.clone();
+        let first_cache = preflight_cache.clone();
+        let first = tokio::spawn(async move {
+            let vars = HashMap::from([("input", "DIFF")]);
+            let cancel = CancellationToken::new();
+            let ctx = WorkflowRunContext::default();
+            first_executor
+                .run_node(
+                    "w",
+                    &first_node,
+                    &vars,
+                    "concurrent-preflight-a",
+                    &cancel,
+                    &ctx,
+                    &first_diagnostic_factory,
+                    None,
+                    &first_cache,
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.entered.wait())
+            .await
+            .expect("first preflight configure should reach the concurrency gate");
+
+        let second_vars = HashMap::from([("input", "DIFF")]);
+        let second_cancel = CancellationToken::new();
+        let second_ctx = WorkflowRunContext::default();
+        let second = executor.run_node(
+            "w",
+            &node,
+            &second_vars,
+            "concurrent-preflight-b",
+            &second_cancel,
+            &second_ctx,
+            &diagnostic_factory,
+            None,
+            &preflight_cache,
+        );
+        tokio::pin!(second);
+        if !matches!(futures::poll!(&mut second), std::task::Poll::Pending) {
+            gate.release.notify_waiters();
+            panic!("second concurrent first miss should wait on the in-flight preflight cell");
+        }
+        gate.release.notify_waiters();
+
+        let first_result = first.await;
+        let second_result = second.await;
+        let (first_text, first_ok, _, _) = first_result.unwrap();
+        let (second_text, second_ok, _, _) = second_result;
+
+        assert!(first_ok, "first real turn should run: {first_text}");
+        assert!(second_ok, "second real turn should run: {second_text}");
+        let prompts = rec.prompts.lock().unwrap().clone();
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|prompt| prompt.as_str() == WORKFLOW_PREFLIGHT_PROMPT)
+                .count(),
+            2,
+            "one bad+good smoke ladder should be shared by concurrent first miss: {prompts:?}"
+        );
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|prompt| prompt.as_str() == "echo DIFF")
+                .count(),
+            2,
+            "both real turns still run after the shared preflight: {prompts:?}"
+        );
+        assert_eq!(
+            registry.invalidates.load(Ordering::SeqCst),
+            1,
+            "fallback invalidation should happen once for the shared ladder"
+        );
+    }
+
     #[tokio::test]
     async fn dispatcher_absent_preflight_config_runs_zero_smoke_turns() {
         let rec = Arc::new(PreflightRec::default());
         let backend = Arc::new(PreflightBackend {
             rec: rec.clone(),
             pong_models: vec!["good".into()],
+            configure_gate: None,
         });
         let agent = AgentId::parse("codex").unwrap();
         let registry = Arc::new(SharedBackendRegistry {

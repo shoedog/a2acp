@@ -388,6 +388,7 @@ mod tests {
             CancelTimeout,
             FrameError,
             MessageTooLarge,
+            EmptyFinal,
             UpstreamA2aError,
             StoreFailure,
             InvalidStateTransition,

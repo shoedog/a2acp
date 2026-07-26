@@ -249,7 +249,7 @@ fn has_open_option_marker(lower: &str) -> bool {
 fn first_line_anchor(raw: &str) -> Option<(usize, String)> {
     for (line_idx, line) in raw.lines().enumerate() {
         for token in line.split_whitespace() {
-            let token = token.trim_matches(|c: char| "`[](){}<>,;".contains(c));
+            let token = trim_lint_token(token);
             if is_line_anchor_token(token) {
                 return Some((line_idx + 1, excerpt(line)));
             }
@@ -317,7 +317,7 @@ fn has_probe_ref(line: &str) -> bool {
 }
 
 fn has_artifact_path_token(token: &str) -> bool {
-    let token = token.trim_matches(|c: char| "`[](){}<>,;:".contains(c));
+    let token = trim_lint_token(token);
     let lower = token.to_lowercase();
     const EXTENSIONS: &[&str] = &[
         ".log", ".txt", ".md", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".xml", ".html",
@@ -325,6 +325,19 @@ fn has_artifact_path_token(token: &str) -> bool {
         ".jsx", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".sh",
     ];
     EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+}
+
+fn trim_lint_token(mut token: &str) -> &str {
+    loop {
+        let trimmed = token
+            .trim_matches(|c: char| "`[](){}<>".contains(c))
+            .trim_end_matches(|c: char| ",.;:!?".contains(c))
+            .trim_matches(|c: char| "`[](){}<>".contains(c));
+        if trimmed.len() == token.len() {
+            return trimmed;
+        }
+        token = trimmed;
+    }
 }
 
 fn first_line_matching(
@@ -416,6 +429,28 @@ Change bin/a2a-bridge/src/main.rs:2371 and crates/bridge-core/src/task_spec.rs:1
         let raw = r#"
 Use the observed facts as established.
 Captured at artifacts/run-17.json with exit code 0.
+"#;
+        assert_eq!(rules(raw, BriefLintKind::RunWorkflow), vec![]);
+    }
+
+    #[test]
+    fn parity_fixture_impl_line_anchor_accepts_trailing_sentence_punctuation() {
+        let raw = r#"
+# Edit exact lines
+
+Change `src/lib.rs:42.` and (crates/bridge-core/src/task_spec.rs:141).
+"#;
+        assert_eq!(
+            rules(raw, BriefLintKind::Implement),
+            vec![BriefLintRuleId::R3]
+        );
+    }
+
+    #[test]
+    fn parity_fixture_artifact_probe_accepts_trailing_sentence_punctuation() {
+        let raw = r#"
+Use the observed facts as established.
+See artifacts/run-17.json.
 "#;
         assert_eq!(rules(raw, BriefLintKind::RunWorkflow), vec![]);
     }
