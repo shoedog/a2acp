@@ -673,10 +673,7 @@ async fn warm_local_dispatch(
             );
             let turn_id = obs_ctx.turn_id.clone();
             let prefix_capability = turn.backend.prefix_attestation_capability();
-            // Task P: mode is structurally Off until Task F lands the
-            // `harvest_sanitization` node config (§4.5/§6; AC 16) — the
-            // request stays Disabled, so no prompt contract and no enabled
-            // beginTurn.
+            // Inbound direct dispatch has no per-node config surface (§6): harvest sanitization is permanently Off here.
             let prefix_attestation_request = match prefix_attestation_request_for_capability(
                 HarvestSanitizationMode::Off,
                 &prefix_capability,
