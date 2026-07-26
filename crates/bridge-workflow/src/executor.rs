@@ -7531,10 +7531,7 @@ mod tests {
             bridge_core::harvest::HarvestAuditStoreError,
         > {
             Err(bridge_core::harvest::HarvestAuditStoreError::Persistence(
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "intentional harvest audit failure",
-                )),
+                Box::new(std::io::Error::other("intentional harvest audit failure")),
             ))
         }
 

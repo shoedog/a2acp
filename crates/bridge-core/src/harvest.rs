@@ -568,8 +568,9 @@ pub async fn commit_harvested_completion(
         &raw_body,
         status,
     );
-    let raw_len_bytes = raw_body.as_bytes().len() as u64;
-    let effective_len_bytes = outcome.effective_body.as_bytes().len() as u64;
+    // `String::len` is already the byte length (clippy: needless_as_bytes).
+    let raw_len_bytes = raw_body.len() as u64;
+    let effective_len_bytes = outcome.effective_body.len() as u64;
     let raw_body_sha256 = sha256(raw_body.as_bytes());
     let effective_body_sha256 = sha256(outcome.effective_body.as_bytes());
     let provenance_sha256 =

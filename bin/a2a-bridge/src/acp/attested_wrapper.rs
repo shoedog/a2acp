@@ -4,9 +4,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
-use std::io::{
-    BufRead, BufReader as StdBufReader, Error as IoError, ErrorKind, Seek, SeekFrom, Write,
-};
+use std::io::{BufRead, BufReader as StdBufReader, Error as IoError, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -113,12 +111,7 @@ async fn push_frame_line_blocking(
         frames.push_line(line)
     })
     .await
-    .map_err(|error| {
-        IoError::new(
-            ErrorKind::Other,
-            format!("attested-prefix frame spool task failed: {error}"),
-        )
-    })?
+    .map_err(|error| IoError::other(format!("attested-prefix frame spool task failed: {error}")))?
 }
 
 async fn drain_frame_lines(frames: &Arc<Mutex<FrameBuffer>>) -> Result<Vec<String>, DynError> {
@@ -131,10 +124,7 @@ async fn drain_frame_lines(frames: &Arc<Mutex<FrameBuffer>>) -> Result<Vec<Strin
     tokio::task::spawn_blocking(move || frames.into_lines())
         .await
         .map_err(|error| {
-            IoError::new(
-                ErrorKind::Other,
-                format!("attested-prefix frame drain task failed: {error}"),
-            )
+            IoError::other(format!("attested-prefix frame drain task failed: {error}"))
         })?
 }
 
