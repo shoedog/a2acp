@@ -844,7 +844,13 @@ impl HarvestAuditStore for MemoryTaskStore {
         &self,
         audit_id: &str,
     ) -> Result<Option<HarvestAuditBundleV1>, HarvestAuditStoreError> {
-        Ok(self.harvest.lock().unwrap().by_audit_id.get(audit_id).cloned())
+        Ok(self
+            .harvest
+            .lock()
+            .unwrap()
+            .by_audit_id
+            .get(audit_id)
+            .cloned())
     }
 
     async fn get_by_attempt_key(
@@ -2029,33 +2035,22 @@ mod tests {
         let decision = harvest_decision(&raw, crate::harvest::HarvestDecision::KeptNoAttestation);
 
         assert_eq!(
-            crate::harvest::HarvestAuditStore::commit_bundle(
-                &store,
-                raw.clone(),
-                decision.clone()
-            )
-            .await
-            .unwrap(),
+            crate::harvest::HarvestAuditStore::commit_bundle(&store, raw.clone(), decision.clone())
+                .await
+                .unwrap(),
             crate::harvest::HarvestAuditCommit::Inserted
         );
         assert_eq!(
-            crate::harvest::HarvestAuditStore::commit_bundle(
-                &store,
-                raw.clone(),
-                decision.clone()
-            )
-            .await
-            .unwrap(),
+            crate::harvest::HarvestAuditStore::commit_bundle(&store, raw.clone(), decision.clone())
+                .await
+                .unwrap(),
             crate::harvest::HarvestAuditCommit::AlreadyPresentIdentical
         );
 
-        let by_id = crate::harvest::HarvestAuditStore::get_by_audit_id(
-            &store,
-            "apc1_audit_001",
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let by_id = crate::harvest::HarvestAuditStore::get_by_audit_id(&store, "apc1_audit_001")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(by_id.created_at_ms, 44);
         assert_eq!(by_id.raw, raw);
         assert_eq!(by_id.decision, decision);
@@ -2099,15 +2094,14 @@ mod tests {
             "turn-harvest",
             "rewritten deliverable",
         );
-        let rewritten_decision =
-            harvest_decision(&rewritten, crate::harvest::HarvestDecision::KeptNoAttestation);
-        let err = crate::harvest::HarvestAuditStore::commit_bundle(
-            &store,
-            rewritten,
-            rewritten_decision,
-        )
-        .await
-        .unwrap_err();
+        let rewritten_decision = harvest_decision(
+            &rewritten,
+            crate::harvest::HarvestDecision::KeptNoAttestation,
+        );
+        let err =
+            crate::harvest::HarvestAuditStore::commit_bundle(&store, rewritten, rewritten_decision)
+                .await
+                .unwrap_err();
 
         assert!(matches!(
             err,
@@ -2140,14 +2134,10 @@ mod tests {
                 .unwrap();
         }
 
-        let rows = crate::harvest::HarvestAuditStore::list_by_task_id(
-            &store,
-            "task-harvest",
-            None,
-            10,
-        )
-        .await
-        .unwrap();
+        let rows =
+            crate::harvest::HarvestAuditStore::list_by_task_id(&store, "task-harvest", None, 10)
+                .await
+                .unwrap();
         assert_eq!(
             rows.iter()
                 .map(|bundle| bundle.raw.audit_id.as_str())
@@ -2199,7 +2189,8 @@ mod tests {
             "turn-harvest",
             "deliverable",
         );
-        let mut decision = harvest_decision(&raw, crate::harvest::HarvestDecision::KeptNoAttestation);
+        let mut decision =
+            harvest_decision(&raw, crate::harvest::HarvestDecision::KeptNoAttestation);
         decision.audit_id = "apc1_audit_002".to_string();
 
         let err = crate::harvest::HarvestAuditStore::commit_bundle(&store, raw, decision)

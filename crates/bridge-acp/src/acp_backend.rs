@@ -7247,9 +7247,7 @@ mod tests {
             recorder.record_control(control);
         });
 
-        let terminal = state
-            .terminal_status_after_control_quiescence(true)
-            .await;
+        let terminal = state.terminal_status_after_control_quiescence(true).await;
         handle.await.unwrap();
         assert!(matches!(terminal, PrefixAttestationStatus::AttestedV1(_)));
     }

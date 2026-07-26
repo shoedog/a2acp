@@ -1329,7 +1329,9 @@ mod sink_tests {
                 OrchEventKind::ToolCall { .. } => "tool_call",
                 OrchEventKind::NodeFinished { .. } => "node_finished",
                 OrchEventKind::Terminal { .. } => "terminal",
-                OrchEventKind::HarvestSanitizationDecision { .. } => "harvest_sanitization_decision",
+                OrchEventKind::HarvestSanitizationDecision { .. } => {
+                    "harvest_sanitization_decision"
+                }
                 _ => "other",
             }
         }
@@ -2024,13 +2026,13 @@ pub async fn resume_working_tasks(deps: &DetachedDeps, cap: u32) {
 #[cfg(test)]
 mod resume_tests {
     use super::*;
-    use bridge_core::harvest::HarvestAuditStore;
     use crate::clock::ManualClock;
     use bridge_core::diagnostics::{
         DiagnosticEvent, DiagnosticPhase, DiagnosticRedactor, PersistedPhaseTransition,
         PersistedPhaseTransitionInput, PhaseStatus,
     };
     use bridge_core::domain::{AgentEntry, AgentKind, Part, RegistrySnapshot};
+    use bridge_core::harvest::HarvestAuditStore;
     use bridge_core::ids::{AgentId, NodeId, OperationId, SessionId, WorkflowId};
     use bridge_core::orch::UsageSnapshot;
     use bridge_core::ports::{

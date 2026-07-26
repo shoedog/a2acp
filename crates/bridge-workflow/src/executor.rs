@@ -1525,10 +1525,8 @@ impl WorkflowExecutor {
                 // Capture the classification facts needed after `exit` is moved
                 // into `on_exit_observed` (origin classification below reads them).
                 let exit_was_normal = matches!(&exit, NodeTurnExit::Normal);
-                let exit_agent_crashed = matches!(
-                    &exit,
-                    NodeTurnExit::Error(BridgeError::AgentCrashed { .. })
-                );
+                let exit_agent_crashed =
+                    matches!(&exit, NodeTurnExit::Error(BridgeError::AgentCrashed { .. }));
                 let mut node_outcome = match &exit {
                     NodeTurnExit::Canceled => TurnOutcome::Canceled,
                     NodeTurnExit::Error(error) => TurnOutcome::Failed(classify_failure(error)),
@@ -7607,10 +7605,9 @@ mod tests {
             .collect()
             .await;
 
-        assert!(evs.iter().any(|event| matches!(
-            event,
-            Err(BridgeError::HarvestAuditPersistFailed { .. })
-        )));
+        assert!(evs
+            .iter()
+            .any(|event| matches!(event, Err(BridgeError::HarvestAuditPersistFailed { .. }))));
         assert!(
             evs.iter()
                 .all(|event| !matches!(event, Ok(WorkflowEvent::NodeFinished { .. }))),

@@ -3565,7 +3565,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             .map_err(|e| format!("run-workflow: registry init error: {e:?}"))?,
     );
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
-        Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>,
+        Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
     );
 
     // Per-request session cwd: thread it into the context so EVERY node's agent works in the target
@@ -5548,12 +5548,9 @@ fn run_workflow_harvest_audit_store(
                 config_base.join(path)
             }
         }
-        None => run_workflow_harvest_audit_artifact_path(run_artifact_root, run_id)
-            .unwrap_or_else(|| {
-                std::env::temp_dir().join(format!(
-                    "a2a-bridge-{run_id}-harvest-audit.sqlite"
-                ))
-            }),
+        None => run_workflow_harvest_audit_artifact_path(run_artifact_root, run_id).unwrap_or_else(
+            || std::env::temp_dir().join(format!("a2a-bridge-{run_id}-harvest-audit.sqlite")),
+        ),
     };
 
     let sqlite = Arc::new(SqliteStore::open(&store_path).map_err(|e| {
@@ -9472,18 +9469,12 @@ file = "../prompts/named.md"
     fn run_workflow_harvest_audit_store_uses_git_artifact_without_configured_store() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".git")).unwrap();
-        let cfg = RegistryConfig::parse(
-            "default=\"k\"\n[[agents]]\nid=\"k\"\ncmd=\"k\"\n[server]\n",
-        )
-        .unwrap();
-        let (store, path) = super::run_workflow_harvest_audit_store(
-            &cfg,
-            dir.path(),
-            dir.path(),
-            "run-1",
-            true,
-        )
-        .unwrap();
+        let cfg =
+            RegistryConfig::parse("default=\"k\"\n[[agents]]\nid=\"k\"\ncmd=\"k\"\n[server]\n")
+                .unwrap();
+        let (store, path) =
+            super::run_workflow_harvest_audit_store(&cfg, dir.path(), dir.path(), "run-1", true)
+                .unwrap();
 
         let path = path.expect("enabled harvest should expose an audit store path");
         assert!(store.retains_audit_records());

@@ -3,11 +3,11 @@
 use bridge_core::{
     domain::{PeerTaskId, PendingKind, PendingRequest},
     error::BridgeError,
-    ids::{NodeId, OperationId, SessionId, TaskId},
     harvest::{
         HarvestAuditBundleV1, HarvestAuditCommit, HarvestAuditStore, HarvestAuditStoreError,
         HarvestDecision, HarvestRawRecordV1, HarvestSanitizationDecisionV1,
     },
+    ids::{NodeId, OperationId, SessionId, TaskId},
     ports::SessionStore,
     task_store::{durable_retention_ms, system_wall_now_ms, PersistenceClock},
 };

@@ -17,15 +17,14 @@ use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
 
+use crate::attestation::HarvestSanitizationMode;
 use crate::domain::{Part, PendingKind, PendingRequest, SessionContext};
 use crate::error::BridgeError;
 use crate::harvest::{
-    commit_harvested_completion, CompletionBodyOrigin, HarvestAuditStore,
-    NoopHarvestAuditStore,
+    commit_harvested_completion, CompletionBodyOrigin, HarvestAuditStore, NoopHarvestAuditStore,
 };
 use crate::ids::{ContextId, SessionId, TaskId, TurnId};
 use crate::orch::UsageSnapshot;
-use crate::attestation::HarvestSanitizationMode;
 use crate::ports::{
     AgentBackend, BackendObservers, DiagnosticObserver, PolicyEngine, SessionStore, Update,
     STOP_REASON_CANCELLED,

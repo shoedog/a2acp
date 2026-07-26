@@ -6,9 +6,9 @@
 //! the effective body.
 
 use crate::attestation::{
-    AttestedPrefixV1, HarvestSanitizationMode,
-    InvalidAttestationReason, NoAttestationReason, PrefixAttestationCapability,
-    PrefixAttestationStatus, PrefixBoundaryScheme, ATTESTED_PREFIX_ISSUER_V1,
+    AttestedPrefixV1, HarvestSanitizationMode, InvalidAttestationReason, NoAttestationReason,
+    PrefixAttestationCapability, PrefixAttestationStatus, PrefixBoundaryScheme,
+    ATTESTED_PREFIX_ISSUER_V1,
 };
 use crate::error::BridgeError;
 use crate::ports::TurnContext;
@@ -303,9 +303,7 @@ fn reason_for_no_attestation(reason: &NoAttestationReason) -> String {
         NoAttestationReason::BackendDeclaredIncapable => "backend_declared_incapable",
         NoAttestationReason::ProtocolDowngrade => "protocol_downgrade",
         NoAttestationReason::SanitizationNotRequested => "sanitization_not_requested",
-        NoAttestationReason::TurnMissingDeliverableBoundary => {
-            "turn_missing_deliverable_boundary"
-        }
+        NoAttestationReason::TurnMissingDeliverableBoundary => "turn_missing_deliverable_boundary",
         NoAttestationReason::TurnEndedWithoutDeliverable => "turn_ended_without_deliverable",
         NoAttestationReason::MultipleCommitMarkers => "multiple_commit_markers",
         NoAttestationReason::BackendProtocolViolation => "backend_protocol_violation",
@@ -426,14 +424,7 @@ fn validate_attested(
     raw_body: &str,
     attested: AttestedPrefixV1,
 ) -> SanitizationOutcome {
-    let invalid = |reason| {
-        invalid_status(
-            raw_body,
-            expected_producer_id,
-            expected_turn_id,
-            reason,
-        )
-    };
+    let invalid = |reason| invalid_status(raw_body, expected_producer_id, expected_turn_id, reason);
 
     if !matches!(
         capability,
@@ -527,8 +518,8 @@ fn provenance_sha256(
         "producer_id": producer_id,
         "prompt_id": context.prompt_id.as_deref(),
     });
-    let bytes = serde_json::to_vec(&value)
-        .map_err(|e| HarvestAuditStoreError::Encoding(e.to_string()))?;
+    let bytes =
+        serde_json::to_vec(&value).map_err(|e| HarvestAuditStoreError::Encoding(e.to_string()))?;
     Ok(sha256(&bytes))
 }
 
@@ -541,10 +532,7 @@ fn context_task_id(context: &TurnContext) -> String {
 }
 
 fn context_node_id(context: &TurnContext) -> String {
-    context
-        .node
-        .clone()
-        .unwrap_or_else(|| "direct".to_string())
+    context.node.clone().unwrap_or_else(|| "direct".to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -562,12 +550,13 @@ pub async fn commit_harvested_completion(
     let run_id = context.session_id.as_str().to_string();
     let node_id = context_node_id(context);
     let turn_id = context.turn_id.as_str().to_string();
-    let audit_id = audit_id_for(&run_id, &node_id, context.attempt, &turn_id).map_err(|source| {
-        CompletionCommitError::HarvestAuditPersistFailed {
-            audit_id: "apc1_encoding_failed".to_string(),
-            source,
-        }
-    })?;
+    let audit_id =
+        audit_id_for(&run_id, &node_id, context.attempt, &turn_id).map_err(|source| {
+            CompletionCommitError::HarvestAuditPersistFailed {
+                audit_id: "apc1_encoding_failed".to_string(),
+                source,
+            }
+        })?;
 
     let outcome = sanitize_harvest(
         mode,
@@ -767,12 +756,11 @@ mod tests {
 
     #[test]
     fn unavailable_rejected_and_synthetic_origins_keep() {
-        let unavailable =
-            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
-                producer_id: "producer".to_string(),
-                turn_id: "turn_00000000000000000000000000000000".to_string(),
-                reason: NoAttestationReason::TurnMissingDeliverableBoundary,
-            });
+        let unavailable = PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+            producer_id: "producer".to_string(),
+            turn_id: "turn_00000000000000000000000000000000".to_string(),
+            reason: NoAttestationReason::TurnMissingDeliverableBoundary,
+        });
         let out = decide("full", unavailable);
         assert_eq!(out.effective_body, "full");
         assert_eq!(out.decision, HarvestDecision::KeptNoAttestation);
