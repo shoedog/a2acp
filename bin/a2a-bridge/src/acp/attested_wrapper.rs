@@ -125,7 +125,17 @@ async fn drain_frame_lines(frames: &Arc<Mutex<FrameBuffer>>) -> Result<Vec<Strin
     let mut guard = frames.lock().await;
     let frames = std::mem::replace(&mut *guard, FrameBuffer::new());
     drop(guard);
-    frames.into_lines()
+    // A spooled buffer reads its temp file back here; like the write path
+    // (`push_frame_line_blocking`), keep that file I/O off the async executor
+    // thread.
+    tokio::task::spawn_blocking(move || frames.into_lines())
+        .await
+        .map_err(|error| {
+            IoError::new(
+                ErrorKind::Other,
+                format!("attested-prefix frame drain task failed: {error}"),
+            )
+        })?
 }
 
 impl SpoolFile {
