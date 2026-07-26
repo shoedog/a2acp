@@ -34,6 +34,8 @@
 //             --config <path> --trusted-session-cwd <repo>
 //                                                       — emit a local-only host fallback plan
 
+#[path = "acp/attested_wrapper.rs"]
+mod attested_wrapper;
 mod catalog_probe;
 mod compatibility;
 mod compatibility_process_group;
@@ -51,8 +53,6 @@ mod compatibility_schedule_state;
 mod compatibility_schedule_status;
 mod compatibility_schedule_supervisor;
 mod compatibility_schedule_transaction;
-#[path = "acp/attested_wrapper.rs"]
-mod attested_wrapper;
 mod config;
 mod containers;
 mod doctor;
@@ -370,7 +370,10 @@ fn canonical_codex_acp_child(path: PathBuf) -> Result<String, BridgeError> {
     }
     if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
         return Err(BridgeError::ConfigInvalid {
-            reason: format!("codex-acp child must name {expected}, got {}", path.display()),
+            reason: format!(
+                "codex-acp child must name {expected}, got {}",
+                path.display()
+            ),
         });
     }
     let canonical = std::fs::canonicalize(&path).map_err(|error| BridgeError::ConfigInvalid {

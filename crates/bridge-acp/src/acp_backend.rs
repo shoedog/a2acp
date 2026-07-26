@@ -44,11 +44,10 @@ use crate::model_effort::{
     resolve_model_state, EffortDecision, ModelDecision, ModelResolutionError, EFFORT_ORDER,
 };
 use bridge_core::attestation::{
-    AttestedPrefixV1, CapabilityUnavailableReason, InvalidAttestationReason,
+    nonce_hex, AttestedPrefixV1, CapabilityUnavailableReason, InvalidAttestationReason,
     NoAttestationReason, PrefixAttestationCapability, PrefixAttestationRequest,
-    nonce_hex, PrefixAttestationStatus, ATTESTED_PREFIX_BEGIN_TURN_METHOD,
-    ATTESTED_PREFIX_CAPABILITIES_METHOD, ATTESTED_PREFIX_ISSUER_V1,
-    ATTESTED_PREFIX_META_KEY,
+    PrefixAttestationStatus, ATTESTED_PREFIX_BEGIN_TURN_METHOD,
+    ATTESTED_PREFIX_CAPABILITIES_METHOD, ATTESTED_PREFIX_ISSUER_V1, ATTESTED_PREFIX_META_KEY,
 };
 use bridge_core::catalog::AgentCaps;
 use bridge_core::diagnostics::{
@@ -1071,7 +1070,11 @@ fn parse_canonical_u64(raw: &str) -> Option<u64> {
 }
 
 fn parse_sha256_hex(raw: &str) -> Option<[u8; 32]> {
-    if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+    if raw.len() != 64
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
         return None;
     }
     let mut out = [0_u8; 32];
@@ -2882,7 +2885,9 @@ impl AcpBackend {
                             }
 
                             if let Some(state) = &prefix_state {
-                                if let Some(status) = Self::parse_prefix_control_notification(&notif, state) {
+                                if let Some(status) =
+                                    Self::parse_prefix_control_notification(&notif, state)
+                                {
                                     state.record_control(status);
                                     return Ok(());
                                 }
@@ -4751,14 +4756,14 @@ impl AcpBackend {
     ) -> Option<PrefixAttestationStatus> {
         let value = serde_json::to_value(notif).ok()?;
         let update = value.get("update")?;
-        if update.get("sessionUpdate").and_then(serde_json::Value::as_str)
+        if update
+            .get("sessionUpdate")
+            .and_then(serde_json::Value::as_str)
             != Some("agent_message_chunk")
         {
             return None;
         }
-        let message_id = update
-            .get("messageId")
-            .and_then(serde_json::Value::as_str);
+        let message_id = update.get("messageId").and_then(serde_json::Value::as_str);
         let content_text = update
             .get("content")
             .and_then(|content| content.get("text"))
@@ -4815,7 +4820,11 @@ impl AcpBackend {
                 InvalidAttestationReason::MalformedMetadata,
             ));
         };
-        if obj.get("schema_version").and_then(serde_json::Value::as_u64) != Some(1) {
+        if obj
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        {
             return Some(PrefixAttestationStatus::rejected(
                 state.producer_id.clone(),
                 state.turn_id.clone(),
@@ -4831,9 +4840,7 @@ impl AcpBackend {
                 InvalidAttestationReason::UntrustedIssuer,
             ));
         }
-        if obj.get("turn_id").and_then(serde_json::Value::as_str)
-            != Some(state.turn_id.as_str())
-        {
+        if obj.get("turn_id").and_then(serde_json::Value::as_str) != Some(state.turn_id.as_str()) {
             return Some(PrefixAttestationStatus::rejected(
                 state.producer_id.clone(),
                 state.turn_id.clone(),
@@ -5078,18 +5085,22 @@ impl AcpBackend {
                 PrefixAttestationRequest::CodexCommitMarkerV1 { .. }
             )
         });
-        let prefix_state = turn_meta.as_ref().map(|meta| match &meta.prefix_attestation_request {
-            PrefixAttestationRequest::CodexCommitMarkerV1 { marker_nonce } => PrefixTurnState::new(
-                producer_id.clone(),
-                meta.turn_id.as_str().to_string(),
-                nonce_hex(marker_nonce),
-                self.prefix_attestation_capability.clone(),
-            ),
-            PrefixAttestationRequest::Disabled => PrefixTurnState::disabled(
-                producer_id.clone(),
-                meta.turn_id.as_str().to_string(),
-            ),
-        });
+        let prefix_state = turn_meta
+            .as_ref()
+            .map(|meta| match &meta.prefix_attestation_request {
+                PrefixAttestationRequest::CodexCommitMarkerV1 { marker_nonce } => {
+                    PrefixTurnState::new(
+                        producer_id.clone(),
+                        meta.turn_id.as_str().to_string(),
+                        nonce_hex(marker_nonce),
+                        self.prefix_attestation_capability.clone(),
+                    )
+                }
+                PrefixAttestationRequest::Disabled => PrefixTurnState::disabled(
+                    producer_id.clone(),
+                    meta.turn_id.as_str().to_string(),
+                ),
+            });
 
         // (1) Mint/get the agent session id. Done OUTSIDE the turn lock so a
         // first-prompt's `session/new` doesn't hold the lock while awaiting.
@@ -6958,7 +6969,10 @@ mod tests {
             PrefixAttestationStatus::UnavailableV1(no_attestation) => {
                 assert_eq!(no_attestation.producer_id, "producer");
                 assert_eq!(no_attestation.turn_id, TEST_PREFIX_TURN);
-                assert_eq!(no_attestation.reason, NoAttestationReason::MultipleCommitMarkers);
+                assert_eq!(
+                    no_attestation.reason,
+                    NoAttestationReason::MultipleCommitMarkers
+                );
             }
             other => panic!("expected UnavailableV1, got {other:?}"),
         }
@@ -8167,7 +8181,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             be.prefix_attestation_capability(),
-            PrefixAttestationCapability::unsupported(CapabilityUnavailableReason::ProtocolDowngrade)
+            PrefixAttestationCapability::unsupported(
+                CapabilityUnavailableReason::ProtocolDowngrade
+            )
         );
     }
 
@@ -9687,7 +9703,8 @@ mod tests {
             generation,
             op: bridge_core::ids::OperationId::parse(op).unwrap(),
             turn_id: bridge_core::ids::TurnId::parse(format!("turn_{generation:032x}")).unwrap(),
-            prefix_attestation_request: bridge_core::attestation::PrefixAttestationRequest::Disabled,
+            prefix_attestation_request:
+                bridge_core::attestation::PrefixAttestationRequest::Disabled,
         }
     }
 
@@ -11896,7 +11913,9 @@ mod tests {
         assert_eq!(sink.records(), 1, "tool call routed to rich sink");
         assert_eq!(items.len(), 2, "stream yields only text + terminal done");
         assert!(matches!(&items[0], Ok(Update::Text(t)) if t == "visible"));
-        assert!(matches!(&items[1], Ok(Update::Done { stop_reason, .. }) if stop_reason == "end_turn"));
+        assert!(
+            matches!(&items[1], Ok(Update::Done { stop_reason, .. }) if stop_reason == "end_turn")
+        );
         assert!(
             items
                 .iter()

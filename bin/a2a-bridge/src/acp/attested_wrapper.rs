@@ -879,7 +879,10 @@ mod tests {
                 "gpt".into(),
             ])
             .unwrap(),
-            (absolute.to_string(), vec!["--model".to_string(), "gpt".to_string()])
+            (
+                absolute.to_string(),
+                vec!["--model".to_string(), "gpt".to_string()]
+            )
         );
     }
 
@@ -994,12 +997,12 @@ mod tests {
         ]);
         let frames = flush_values(&mut prompt).await;
         assert_eq!(agent_text_chunk(&frames[0]), Some("pre"));
-        assert_eq!(
-            frames[1]["params"]["update"]["sessionUpdate"],
-            "tool_call"
-        );
+        assert_eq!(frames[1]["params"]["update"]["sessionUpdate"], "tool_call");
         assert_eq!(agent_text_chunk(&frames[2]), Some("post"));
-        assert_eq!(frames[3]["params"]["update"]["_meta"][META_KEY]["kind"], "attested");
+        assert_eq!(
+            frames[3]["params"]["update"]["_meta"][META_KEY]["kind"],
+            "attested"
+        );
     }
 
     fn text_frame(message_id: &str, text: impl Into<String>) -> Value {
@@ -1225,7 +1228,10 @@ mod tests {
             },
         );
         let meta = &frame["params"]["update"]["_meta"];
-        assert!(meta.get(META_KEY).is_some(), "reserved key missing: {meta:?}");
+        assert!(
+            meta.get(META_KEY).is_some(),
+            "reserved key missing: {meta:?}"
+        );
         assert_eq!(meta[META_KEY]["kind"], "attested");
         assert_eq!(meta[META_KEY]["process_prefix_bytes"], "3");
     }
@@ -1245,7 +1251,9 @@ mod tests {
         strip_reserved_meta(&mut frame);
         assert!(frame["params"]["update"]["_meta"].get(META_KEY).is_none());
         assert_eq!(frame["params"]["update"]["_meta"]["keep"], true);
-        assert!(frame["params"]["update"]["nested"]["_meta"].get(META_KEY).is_none());
+        assert!(frame["params"]["update"]["nested"]["_meta"]
+            .get(META_KEY)
+            .is_none());
     }
 
     trait BodyExt {

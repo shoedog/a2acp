@@ -59,7 +59,9 @@ async fn text_round_trip_yields_text_then_done_no_permission() {
         })
         .collect();
     assert_eq!(text, "Hello world");
-    assert!(matches!(updates.last(), Some(Update::Done { stop_reason, .. }) if stop_reason == "stop"));
+    assert!(
+        matches!(updates.last(), Some(Update::Done { stop_reason, .. }) if stop_reason == "stop")
+    );
     assert!(
         !updates.iter().any(|u| matches!(u, Update::Permission(_))),
         "API backend NEVER yields Permission"
@@ -99,7 +101,9 @@ async fn tool_approve_path_executes_and_feeds_result() {
         })
         .collect();
     assert_eq!(text, "It is 2026.");
-    assert!(matches!(updates.last(), Some(Update::Done { stop_reason, .. }) if stop_reason == "stop"));
+    assert!(
+        matches!(updates.last(), Some(Update::Done { stop_reason, .. }) if stop_reason == "stop")
+    );
     assert!(!updates.iter().any(|u| matches!(u, Update::Permission(_))));
 
     // EXACTLY two requests; the follow-up carries the PRECISE assistant + tool messages.

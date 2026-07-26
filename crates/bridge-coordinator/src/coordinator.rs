@@ -3,9 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use bridge_core::attestation::{
-    append_prompt_contract, prefix_attestation_request_for_capability,
-};
+use bridge_core::attestation::{append_prompt_contract, prefix_attestation_request_for_capability};
 use bridge_core::domain::{InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
 #[cfg(test)]

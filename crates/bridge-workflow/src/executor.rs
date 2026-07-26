@@ -1064,11 +1064,9 @@ impl WorkflowExecutor {
                                 .on_exit_observed(NodeTurnExit::Normal, diagnostic.clone())
                                 .await;
                             let text = match cleanup {
-                                Ok(()) => format!(
-                                    "[node {} failed: {:?}]",
-                                    node.id.as_str(),
-                                    error
-                                ),
+                                Ok(()) => {
+                                    format!("[node {} failed: {:?}]", node.id.as_str(), error)
+                                }
                                 Err(cleanup_error) => format!(
                                     "[node {} cleanup failed after prefix setup error: {:?}]",
                                     node.id.as_str(),
@@ -1697,11 +1695,7 @@ impl WorkflowExecutor {
                                 )
                                 .await;
                                 break 'attempt Attempt::Fatal {
-                                    text: format!(
-                                        "[node {} failed: {:?}]",
-                                        node.id.as_str(),
-                                        e
-                                    ),
+                                    text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
                                     usage: None,
                                     failure_class: classify_failure(&e),
                                 };
