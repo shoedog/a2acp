@@ -784,6 +784,9 @@ enum AcpTraceEvent {
     PromptFailed,
     WarmConfigNotAdvertised,
     WarmConfigRejected,
+    /// An attested-prefix control frame arrived after its turn's drain barrier
+    /// (route already unregistered) and was dropped as post-terminal.
+    PostTerminalControlFrameDropped,
 }
 
 impl AcpTraceEvent {
@@ -869,6 +872,10 @@ impl AcpTraceEvent {
             Self::WarmConfigRejected => {
                 tracing::warn!(event = "acp.warm_config_rejected", "ACP lifecycle metadata")
             }
+            Self::PostTerminalControlFrameDropped => tracing::warn!(
+                event = "acp.post_terminal_control_frame_dropped",
+                "ACP lifecycle metadata"
+            ),
         }
     }
 }
@@ -3003,10 +3010,7 @@ impl AcpBackend {
                                         if live {
                                             state.record_control(status);
                                         } else {
-                                            tracing::warn!(
-                                                turn_id = state.turn_id.as_str(),
-                                                "dropped post-terminal attested-prefix control frame"
-                                            );
+                                            AcpTraceEvent::PostTerminalControlFrameDropped.emit();
                                         }
                                     }
                                     return Ok(());
