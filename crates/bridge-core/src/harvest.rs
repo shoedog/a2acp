@@ -803,4 +803,61 @@ mod tests {
             "apc1_e860b2f7825b41eddf22faaf9ba00edfdf80e542e286757fd66cd4a84db7c89f"
         );
     }
+
+    /// §15.2 pure-sanitizer gaps (MINOR 6): empty body, `k = len`
+    /// (empty deliverable), out-of-range offsets, declared-length mismatch,
+    /// and wrong producer/turn identities — every case keeps the full body
+    /// with `kept_invalid_attestation` and the §7.4 reason.
+    #[test]
+    fn empty_body_k_len_out_of_range_and_identity_mismatches_keep() {
+        // Empty body: k == n == 0 is an empty deliverable, not a cut.
+        let empty = decide("", attested("", 0));
+        assert_eq!(empty.effective_body, "");
+        assert_eq!(empty.decision, HarvestDecision::KeptInvalidAttestation);
+        assert_eq!(empty.reason.as_deref(), Some("empty_deliverable"));
+
+        // k == len: nothing would remain after the cut.
+        let body = "abc";
+        let k_len = decide(body, attested(body, 3));
+        assert_eq!(k_len.effective_body, body);
+        assert_eq!(k_len.reason.as_deref(), Some("empty_deliverable"));
+
+        // k > len: out of range.
+        let out_of_range = decide(body, attested(body, 4));
+        assert_eq!(out_of_range.effective_body, body);
+        assert_eq!(out_of_range.reason.as_deref(), Some("offset_out_of_bounds"));
+        let far_out = decide(body, attested(body, u64::MAX));
+        assert_eq!(far_out.effective_body, body);
+        assert_eq!(far_out.reason.as_deref(), Some("offset_out_of_bounds"));
+
+        // Declared length disagrees with the bridge-visible body.
+        let mut wrong_len = match attested(body, 1) {
+            PrefixAttestationStatus::AttestedV1(a) => a,
+            _ => unreachable!(),
+        };
+        wrong_len.body_len_bytes = u64::MAX;
+        let length = decide(body, PrefixAttestationStatus::AttestedV1(wrong_len));
+        assert_eq!(length.effective_body, body);
+        assert_eq!(length.reason.as_deref(), Some("length_mismatch"));
+
+        // Wrong producer identity.
+        let mut wrong_producer = match attested(body, 1) {
+            PrefixAttestationStatus::AttestedV1(a) => a,
+            _ => unreachable!(),
+        };
+        wrong_producer.producer_id = "someone-else".to_string();
+        let producer = decide(body, PrefixAttestationStatus::AttestedV1(wrong_producer));
+        assert_eq!(producer.effective_body, body);
+        assert_eq!(producer.reason.as_deref(), Some("producer_mismatch"));
+
+        // Wrong turn identity.
+        let mut wrong_turn = match attested(body, 1) {
+            PrefixAttestationStatus::AttestedV1(a) => a,
+            _ => unreachable!(),
+        };
+        wrong_turn.turn_id = "turn_ffffffffffffffffffffffffffffffff".to_string();
+        let turn = decide(body, PrefixAttestationStatus::AttestedV1(wrong_turn));
+        assert_eq!(turn.effective_body, body);
+        assert_eq!(turn.reason.as_deref(), Some("turn_mismatch"));
+    }
 }

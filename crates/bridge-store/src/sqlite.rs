@@ -2730,6 +2730,195 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    /// §9.4 / §15.2 "checked SQLite integer conversion" (MINOR 6): a u64
+    /// above i64::MAX must be a checked persistence failure — never a wrap —
+    /// and the failed commit must leave no rows behind (the completion-facing
+    /// error then blocks the node per §9.6).
+    #[tokio::test]
+    async fn sqlite_harvest_u64_above_i64_max_is_persistence_error_and_inserts_nothing() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 55)).unwrap();
+        let mut raw = sqlite_harvest_raw_record(
+            "apc1_overflow",
+            "task-overflow",
+            "run-overflow",
+            "node-a",
+            0,
+            "turn-overflow",
+            "deliverable",
+        );
+        raw.raw_len_bytes = u64::MAX;
+        let decision = sqlite_harvest_decision(
+            &raw,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation,
+        );
+
+        let err = bridge_core::harvest::HarvestAuditStore::commit_bundle(&store, raw, decision)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                bridge_core::harvest::HarvestAuditStoreError::Encoding(message)
+                    if message.contains("exceeds SQLite INTEGER range")
+            ),
+            "expected checked-conversion encoding failure, got {err:?}"
+        );
+        assert!(
+            bridge_core::harvest::HarvestAuditStore::get_by_audit_id(&store, "apc1_overflow")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Same checked conversion on the decision-only u64 field.
+        let mut raw = sqlite_harvest_raw_record(
+            "apc1_overflow_cut",
+            "task-overflow",
+            "run-overflow",
+            "node-b",
+            0,
+            "turn-overflow-b",
+            "deliverable",
+        );
+        raw.prefix_attestation = bridge_core::attestation::PrefixAttestationStatus::unavailable(
+            "codex:model",
+            "turn-overflow-b",
+            bridge_core::attestation::NoAttestationReason::BackendDeclaredIncapable,
+        );
+        let mut decision =
+            sqlite_harvest_decision(&raw, bridge_core::harvest::HarvestDecision::CutAttested);
+        decision.cut_byte_offset = Some(u64::MAX);
+        let err = bridge_core::harvest::HarvestAuditStore::commit_bundle(&store, raw, decision)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            bridge_core::harvest::HarvestAuditStoreError::Encoding(_)
+        ));
+        assert!(bridge_core::harvest::HarvestAuditStore::get_by_audit_id(
+            &store,
+            "apc1_overflow_cut"
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    /// §9.3 "commit_bundle is one transaction" / §15.2 "raw/decision
+    /// atomicity" (MINOR 6): a decision-row failure AFTER the raw insert must
+    /// roll the raw row back — no half bundle survives.
+    #[tokio::test]
+    async fn sqlite_harvest_commit_is_atomic_no_raw_row_survives_decision_failure() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 55)).unwrap();
+        let raw = sqlite_harvest_raw_record(
+            "apc1_atomic",
+            "task-atomic",
+            "run-atomic",
+            "node-a",
+            0,
+            "turn-atomic",
+            "deliverable",
+        );
+        let mut decision = sqlite_harvest_decision(
+            &raw,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation,
+        );
+        // Passes shape validation and the raw insert; violates the decision
+        // table's CHECK (suspicious_threshold_percent = 90) at insert time.
+        decision.suspicious_threshold_percent = 89;
+
+        let err = bridge_core::harvest::HarvestAuditStore::commit_bundle(&store, raw, decision)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            bridge_core::harvest::HarvestAuditStoreError::Persistence(_)
+        ));
+
+        let raw_rows: i64 = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM harvest_raw_records_v1 WHERE audit_id='apc1_atomic'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            raw_rows, 0,
+            "failed decision insert must roll back the raw row"
+        );
+        assert!(
+            bridge_core::harvest::HarvestAuditStore::get_by_audit_id(&store, "apc1_atomic")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// §9.4 DDL / §15.2 "foreign-key and uniqueness constraints" (MINOR 6):
+    /// the schema itself must enforce decision→raw referential integrity
+    /// (with PRAGMA foreign_keys actually ON) and the attempt-key uniqueness.
+    #[tokio::test]
+    async fn sqlite_harvest_ddl_enforces_foreign_key_and_attempt_uniqueness() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 55)).unwrap();
+        assert!(store.foreign_keys_on().unwrap());
+
+        let raw = sqlite_harvest_raw_record(
+            "apc1_ddl",
+            "task-ddl",
+            "run-ddl",
+            "node-a",
+            0,
+            "turn-ddl",
+            "deliverable",
+        );
+        let decision = sqlite_harvest_decision(
+            &raw,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation,
+        );
+        bridge_core::harvest::HarvestAuditStore::commit_bundle(&store, raw, decision)
+            .await
+            .unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        // Decision row whose audit_id has no raw row: FK violation.
+        let fk_err = conn
+            .execute(
+                "INSERT INTO harvest_sanitization_decisions_v1(
+                    audit_id, mode, decision, reason, node_id, producer_id, issuer_id,
+                    raw_body_sha256, effective_body_sha256, raw_len_bytes,
+                    effective_len_bytes, cut_byte_offset, provenance_sha256,
+                    suspicious_threshold_percent, created_at_ms
+                 ) VALUES('apc1_orphan', 'off', 'kept_off', NULL, 'node-a', 'p', NULL,
+                          zeroblob(32), zeroblob(32), 1, 1, NULL, zeroblob(32), 90, 55)",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            fk_err.to_string().to_lowercase().contains("foreign key"),
+            "orphan decision insert must fail the FK constraint, got {fk_err}"
+        );
+
+        // Second raw row reusing the (run_id, node_id, attempt_id, turn_id)
+        // attempt key under a different audit_id: UNIQUE violation.
+        let unique_err = conn
+            .execute(
+                "INSERT INTO harvest_raw_records_v1(
+                    audit_id, task_id, run_id, node_id, attempt_id, turn_id, backend_id,
+                    producer_id, declared_capability_json, raw_body, raw_len_bytes,
+                    raw_body_sha256, prefix_attestation_json, provenance_sha256, created_at_ms
+                 ) VALUES('apc1_ddl_dup', 'task-ddl', 'run-ddl', 'node-a', 0, 'turn-ddl',
+                          'codex', 'p', '{}', 'body', 4, zeroblob(32), '{}', zeroblob(32), 55)",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            unique_err.to_string().to_lowercase().contains("unique"),
+            "duplicate attempt key must fail the UNIQUE constraint, got {unique_err}"
+        );
+    }
+
     fn sqlite_usage(input: u64, output: u64, at_ms: i64) -> UsageSnapshot {
         UsageSnapshot {
             used: None,
