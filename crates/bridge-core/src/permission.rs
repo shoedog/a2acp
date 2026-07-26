@@ -1,4 +1,4 @@
-use crate::attestation::PrefixAttestationRequest;
+use crate::attestation::{HarvestSanitizationMode, PrefixAttestationRequest};
 use crate::domain::PermitDecision;
 use crate::ids::{ContextId, OperationId, TurnId};
 use std::collections::HashMap;
@@ -13,6 +13,15 @@ pub struct TurnMeta {
     pub generation: u64,
     pub op: OperationId,
     pub turn_id: TurnId,
+    /// The node's ORIGINAL §6 sanitization mode. Kept alongside the collapsed
+    /// transport request so the terminal audit can distinguish "operator asked
+    /// for sanitization but the backend is incapable" (audited with the
+    /// backend's incapability reason, e.g. `backend_declared_incapable`) from
+    /// "sanitization was never requested" (`sanitization_not_requested`).
+    pub requested_mode: HarvestSanitizationMode,
+    /// The per-turn transport request. Collapses to `Disabled` when the
+    /// backend cannot honor an enabled mode; consult `requested_mode` for the
+    /// operator's intent.
     pub prefix_attestation_request: PrefixAttestationRequest,
 }
 

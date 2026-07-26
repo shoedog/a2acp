@@ -580,6 +580,9 @@ impl Coordinator {
                     generation: turn.generation.get(),
                     op: turn.op.clone(),
                     turn_id: obs_ctx.turn_id.clone(),
+                    // Direct prompts have no per-node config surface (§6):
+                    // sanitization is permanently Off here.
+                    requested_mode: HarvestSanitizationMode::Off,
                     prefix_attestation_request: prefix_attestation_request.clone(),
                 },
             )

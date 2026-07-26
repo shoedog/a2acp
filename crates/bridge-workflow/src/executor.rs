@@ -1235,6 +1235,7 @@ impl WorkflowExecutor {
                             ))
                             .expect("workflow operation id is nonempty"),
                             turn_id: obs_ctx.turn_id.clone(),
+                            requested_mode: node_harvest_mode,
                             prefix_attestation_request: prefix_attestation_request.clone(),
                         },
                     )
@@ -1996,6 +1997,7 @@ impl WorkflowExecutor {
                                 ))
                                 .expect("workflow operation id is nonempty"),
                                 turn_id: obs_ctx_ref.turn_id.clone(),
+                                requested_mode: node_harvest_mode,
                                 prefix_attestation_request: prefix_attestation_request.clone(),
                             },
                         )

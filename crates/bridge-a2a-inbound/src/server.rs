@@ -699,6 +699,9 @@ async fn warm_local_dispatch(
                     generation: turn.generation.get(),
                     op: turn.op.clone(),
                     turn_id,
+                    // Inbound direct dispatch has no per-node config surface
+                    // (§6): sanitization is permanently Off here.
+                    requested_mode: HarvestSanitizationMode::Off,
                     prefix_attestation_request: prefix_attestation_request.clone(),
                 }),
                 guard: None,

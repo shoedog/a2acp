@@ -1996,6 +1996,7 @@ mod tests {
             generation,
             op: OperationId::parse(op).unwrap(),
             turn_id: bridge_core::ids::TurnId::parse(format!("turn_{generation:032x}")).unwrap(),
+            requested_mode: bridge_core::attestation::HarvestSanitizationMode::Off,
             prefix_attestation_request:
                 bridge_core::attestation::PrefixAttestationRequest::Disabled,
         }

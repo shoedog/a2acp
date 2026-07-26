@@ -44,9 +44,9 @@ use crate::model_effort::{
     resolve_model_state, EffortDecision, ModelDecision, ModelResolutionError, EFFORT_ORDER,
 };
 use bridge_core::attestation::{
-    nonce_hex, AttestedPrefixV1, CapabilityUnavailableReason, InvalidAttestationReason,
-    NoAttestationReason, PrefixAttestationCapability, PrefixAttestationRequest,
-    PrefixAttestationStatus, ATTESTED_PREFIX_BEGIN_TURN_METHOD,
+    nonce_hex, AttestedPrefixV1, CapabilityUnavailableReason, HarvestSanitizationMode,
+    InvalidAttestationReason, NoAttestationReason, PrefixAttestationCapability,
+    PrefixAttestationRequest, PrefixAttestationStatus, ATTESTED_PREFIX_BEGIN_TURN_METHOD,
     ATTESTED_PREFIX_CAPABILITIES_METHOD, ATTESTED_PREFIX_ISSUER_V1, ATTESTED_PREFIX_META_KEY,
 };
 use bridge_core::catalog::AgentCaps;
@@ -1165,15 +1165,6 @@ impl PrefixTurnState {
         }
     }
 
-    fn disabled(producer_id: String, turn_id: String) -> Self {
-        Self::new(
-            producer_id,
-            turn_id,
-            String::new(),
-            PrefixAttestationCapability::default(),
-        )
-    }
-
     fn record_control(&self, status: PrefixAttestationStatus) {
         if let Ok(mut observed) = self.observed.lock() {
             if observed.is_some() {
@@ -1279,6 +1270,35 @@ impl PrefixTurnState {
             )
         }
     }
+}
+
+/// Derive the terminal-audit `requested` flag and the per-turn prefix state
+/// from the configured turn metadata (MAJOR 4 fix): `requested` follows the
+/// node's ORIGINAL §6 mode, never the collapsed transport request, so an
+/// enabled node on an incapable backend audits with the backend's real
+/// incapability reason (`backend_declared_incapable` / `protocol_downgrade`)
+/// instead of masquerading as `sanitization_not_requested`. Both request arms
+/// carry the backend's RESOLVED capability for the same reason. An enabled
+/// mode with a supported capability always mints an enabled request upstream
+/// (`prefix_attestation_request_for_capability`), so `Disabled` + enabled mode
+/// implies the backend could not honor the request.
+fn prefix_turn_state_for_meta(
+    meta: &TurnMeta,
+    producer_id: &str,
+    capability: &PrefixAttestationCapability,
+) -> (bool, PrefixTurnState) {
+    let requested = meta.requested_mode == HarvestSanitizationMode::AttestedPrefixV1;
+    let marker_nonce_hex = match &meta.prefix_attestation_request {
+        PrefixAttestationRequest::CodexCommitMarkerV1 { marker_nonce } => nonce_hex(marker_nonce),
+        PrefixAttestationRequest::Disabled => String::new(),
+    };
+    let state = PrefixTurnState::new(
+        producer_id.to_string(),
+        meta.turn_id.as_str().to_string(),
+        marker_nonce_hex,
+        capability.clone(),
+    );
+    (requested, state)
 }
 
 struct TurnWatch {
@@ -5179,28 +5199,13 @@ impl AcpBackend {
             .as_ref()
             .map(|config| config.agent_id.clone())
             .unwrap_or_default();
-        let prefix_requested = turn_meta.as_ref().is_some_and(|meta| {
-            matches!(
-                meta.prefix_attestation_request,
-                PrefixAttestationRequest::CodexCommitMarkerV1 { .. }
-            )
+        let prefix_meta = turn_meta.as_ref().map(|meta| {
+            prefix_turn_state_for_meta(meta, &producer_id, &self.prefix_attestation_capability)
         });
-        let prefix_state = turn_meta
+        let prefix_requested = prefix_meta
             .as_ref()
-            .map(|meta| match &meta.prefix_attestation_request {
-                PrefixAttestationRequest::CodexCommitMarkerV1 { marker_nonce } => {
-                    PrefixTurnState::new(
-                        producer_id.clone(),
-                        meta.turn_id.as_str().to_string(),
-                        nonce_hex(marker_nonce),
-                        self.prefix_attestation_capability.clone(),
-                    )
-                }
-                PrefixAttestationRequest::Disabled => PrefixTurnState::disabled(
-                    producer_id.clone(),
-                    meta.turn_id.as_str().to_string(),
-                ),
-            });
+            .is_some_and(|(requested, _)| *requested);
+        let prefix_state = prefix_meta.map(|(_, state)| state);
 
         // (1) Mint/get the agent session id. Done OUTSIDE the turn lock so a
         // first-prompt's `session/new` doesn't hold the lock while awaiting.
@@ -5258,8 +5263,9 @@ impl AcpBackend {
                 &meta.prefix_attestation_request
             {
                 if !self.prefix_attestation_capability.is_supported_v1() {
-                    // No private method is sent to an incapable backend; the terminal status
-                    // remains an unavailable protocol downgrade if the caller requested it.
+                    // No private method is sent to an incapable backend; with the mode
+                    // enabled the terminal status audits the backend's real incapability
+                    // reason (backend_declared_incapable / protocol_downgrade).
                 } else {
                     let nonce = nonce_hex(marker_nonce);
                     let req = PrefixBeginTurnRequest {
@@ -7427,6 +7433,86 @@ mod tests {
             bundle.decision.reason.as_deref(),
             Some("backend_protocol_violation")
         );
+    }
+
+    /// MAJOR-4 regression: the terminal-audit `requested` flag follows the
+    /// node's ORIGINAL mode, not the collapsed transport request, and the
+    /// per-turn state carries the backend's resolved capability — so the
+    /// audit record distinguishes Off (`sanitization_not_requested`) from
+    /// enabled-but-incapable (`backend_declared_incapable`, and
+    /// `protocol_downgrade` for a failed wrapper handshake).
+    #[tokio::test]
+    async fn enabled_mode_on_incapable_backend_audits_incapability_not_unrequested() {
+        let meta = |mode| bridge_core::permission::TurnMeta {
+            context_id: bridge_core::ids::ContextId::parse("ctx-major4").unwrap(),
+            generation: 1,
+            op: bridge_core::ids::OperationId::parse("op-major4").unwrap(),
+            turn_id: bridge_core::ids::TurnId::parse(TEST_PREFIX_TURN).unwrap(),
+            requested_mode: mode,
+            // Both modes collapse to a Disabled transport request on an
+            // incapable backend — the pre-fix code could not tell them apart.
+            prefix_attestation_request: PrefixAttestationRequest::Disabled,
+        };
+        let incapable = PrefixAttestationCapability::unsupported(
+            CapabilityUnavailableReason::BackendDeclaredIncapable,
+        );
+
+        let (requested, state) = prefix_turn_state_for_meta(
+            &meta(HarvestSanitizationMode::AttestedPrefixV1),
+            "producer",
+            &incapable,
+        );
+        assert!(requested, "enabled mode must stay requested for the audit");
+        state.close_control();
+        let enabled_incapable = state
+            .terminal_status_after_control_quiescence(requested)
+            .await;
+        assert!(matches!(
+            &enabled_incapable,
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::BackendDeclaredIncapable,
+                ..
+            })
+        ));
+        let bundle = commit_prefix_terminal_status(enabled_incapable).await;
+        assert_eq!(
+            bundle.decision.reason.as_deref(),
+            Some("backend_declared_incapable"),
+            "enabled-but-incapable must audit its distinct reason code"
+        );
+
+        let (requested, state) =
+            prefix_turn_state_for_meta(&meta(HarvestSanitizationMode::Off), "producer", &incapable);
+        assert!(!requested, "off mode is not a sanitization request");
+        state.close_control();
+        assert!(matches!(
+            state
+                .terminal_status_after_control_quiescence(requested)
+                .await,
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::SanitizationNotRequested,
+                ..
+            })
+        ));
+
+        let downgraded = PrefixAttestationCapability::unsupported(
+            CapabilityUnavailableReason::ProtocolDowngrade,
+        );
+        let (requested, state) = prefix_turn_state_for_meta(
+            &meta(HarvestSanitizationMode::AttestedPrefixV1),
+            "producer",
+            &downgraded,
+        );
+        state.close_control();
+        assert!(matches!(
+            state
+                .terminal_status_after_control_quiescence(requested)
+                .await,
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::ProtocolDowngrade,
+                ..
+            })
+        ));
     }
 
     /// Review-mandated timeout-expired-path test: when a mis-sequenced caller
@@ -9962,6 +10048,7 @@ mod tests {
             generation,
             op: bridge_core::ids::OperationId::parse(op).unwrap(),
             turn_id: bridge_core::ids::TurnId::parse(format!("turn_{generation:032x}")).unwrap(),
+            requested_mode: HarvestSanitizationMode::Off,
             prefix_attestation_request:
                 bridge_core::attestation::PrefixAttestationRequest::Disabled,
         }
