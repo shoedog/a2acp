@@ -991,7 +991,45 @@ mod tests {
     }
 
     #[test]
+    fn backslash_runs_zero_through_nine_follow_parity_table() {
+        // §3.3 grammar over the full spec test-plan range (§15.1: "Backslash
+        // runs of length 0 through at least 9"): even runs of length 2r decode
+        // to r literal backslashes plus a committing marker; odd runs of
+        // length 2r+1 decode to r literal backslashes plus the literal marker
+        // as data (no candidate).
+        let m = marker();
+        for run in 0..=9_usize {
+            let wire = format!("p {}{m}d", "\\".repeat(run));
+            let out = resolve(&wire);
+            if run % 2 == 0 {
+                let expected_prefix = format!("p {}", "\\".repeat(run / 2));
+                assert_eq!(out.status, WrapperStatus::Attested, "run {run}");
+                assert_eq!(out.prefix_bytes, expected_prefix.len() as u64, "run {run}");
+                assert_eq!(
+                    String::from_utf8(out.body).unwrap(),
+                    format!("{expected_prefix}d"),
+                    "run {run}"
+                );
+            } else {
+                assert_eq!(
+                    out.status,
+                    WrapperStatus::Unavailable("turn_missing_deliverable_boundary"),
+                    "run {run}"
+                );
+                assert_eq!(
+                    String::from_utf8(out.body).unwrap(),
+                    format!("p {}{m}d", "\\".repeat((run - 1) / 2)),
+                    "run {run}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn marker_inside_code_fence_attests_because_fences_have_no_authority() {
+        // §13 + §17 condition 16: fence/Markdown context carries no authority
+        // and is never consulted — a unique unescaped marker commits even
+        // inside backtick or tilde fences.
         let m = marker();
         let input = format!("before\n```\n{m}\n```\nafter");
         let out = resolve(&input);
@@ -1000,6 +1038,44 @@ mod tests {
         assert_eq!(
             String::from_utf8(out.body).unwrap(),
             "before\n```\n\n```\nafter"
+        );
+
+        let tilde = format!("~~~rust\n{m}deliverable\n~~~");
+        let out = resolve(&tilde);
+        assert_eq!(out.status, WrapperStatus::Attested);
+        assert_eq!(out.prefix_bytes, "~~~rust\n".len() as u64);
+        assert_eq!(
+            String::from_utf8(out.body).unwrap(),
+            "~~~rust\ndeliverable\n~~~"
+        );
+    }
+
+    #[test]
+    fn escaped_marker_is_data_everywhere_including_fences() {
+        // The other direction of §17.16: backslash parity is the ONLY way to
+        // quote a marker as data. An escaped marker stays literal data whether
+        // or not it sits inside a code fence, and its presence never blocks or
+        // moves a genuine unescaped commit elsewhere in the stream.
+        let m = marker();
+        let fenced = format!("process\n```text\n\\{m}\n```\ntail");
+        let out = resolve(&fenced);
+        assert_eq!(
+            out.status,
+            WrapperStatus::Unavailable("turn_missing_deliverable_boundary")
+        );
+        assert_eq!(
+            String::from_utf8(out.body).unwrap(),
+            format!("process\n```text\n{m}\n```\ntail")
+        );
+
+        let mixed = format!("doc:\n```\n\\{m}\n```\n{m}deliverable body");
+        let out = resolve(&mixed);
+        assert_eq!(out.status, WrapperStatus::Attested);
+        let expected_prefix = format!("doc:\n```\n{m}\n```\n");
+        assert_eq!(out.prefix_bytes, expected_prefix.len() as u64);
+        assert_eq!(
+            String::from_utf8(out.body).unwrap(),
+            format!("{expected_prefix}deliverable body")
         );
     }
 

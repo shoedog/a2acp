@@ -50,6 +50,23 @@ it to the codex-acp child (§4.3), so nothing model-visible flows from it. Likew
 still carries the bridge-issued `turn_id` with a `Disabled` request; that produces zero private wire
 traffic for the turn.
 
+## Fix-round decision: no fence/Markdown consultation (§13, §17.16)
+
+An early Task P revision tracked Markdown code fences in `resolve_marker_text` and treated a fenced
+marker as literal (KEEP), following a task-spec line later identified as a spec-authorship error
+(task spec correction of 2026-07-26). Per design §13 ("Fences have no authority") and §17 condition
+16 (no implementation may choose or modify `k` based on fences or any Markdown context), that fence
+machinery (`in_fence` state, `is_fence_delimiter_line`) was removed before the final Task P commit;
+the marker resolver consults only byte-exact marker matching and backslash parity, with no lexical
+or Markdown context of any kind.
+
+The fix round locks both directions with tests: a unique UNESCAPED marker inside a backtick or tilde
+fence STRIPs (`marker_inside_code_fence_attests_because_fences_have_no_authority`); an ESCAPED
+marker anywhere, including inside fences, stays data and never blocks a genuine commit elsewhere
+(`escaped_marker_is_data_everywhere_including_fences`). Escaping is the only quoting mechanism. The
+escaping table is exercised for backslash runs 0 through 9 per the §15.1 test plan
+(`backslash_runs_zero_through_nine_follow_parity_table`).
+
 ## Scope note
 
 Task P activates the wrapper prerequisite path for capable Codex ACP turns: the bridge generates a per-turn `turn_<32-lower-hex>` ID plus nonce, passes the request through `configure_turn`, sends private `beginTurn` at prompt entry, and appends the nonce-specific prompt contract for the same request.
