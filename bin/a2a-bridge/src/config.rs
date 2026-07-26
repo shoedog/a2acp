@@ -196,7 +196,13 @@ fn expand_env(s: &str) -> Result<String, ConfigError> {
 // ---------------------------------------------------------------------------
 
 /// Top-level TOML structure for the multi-agent bridge config.
+///
+/// `deny_unknown_fields` (spec §6/§15.2-16): a misplaced or misspelled root
+/// key — `harvest_sanitization` above all — must fail loudly instead of being
+/// silently discarded. This is the spec's declared breaking config migration:
+/// operators must remove, correct, or relocate unknown keys before upgrade.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegistryConfig {
     pub default: String,
     #[serde(default)]
@@ -354,7 +360,11 @@ fn canonicalize_lenient_session_cwd(path: &Path) -> Result<bridge_core::SessionC
         .map_err(|e| ConfigError::Registry(format!("[worktrees] canonical path {out:?}: {e:?}")))
 }
 
+/// `deny_unknown_fields` (spec §6/§15.2-16): `harvest_sanitization` is a NODE
+/// key; placed on `[[workflows]]` it must be a hard parse error, not silently
+/// ignored. Same breaking-migration stance as `RegistryConfig`.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowToml {
     pub id: String,
     #[serde(default)]
@@ -1076,7 +1086,8 @@ impl ImplementToml {
 }
 
 /// `[merge]` (ADR-0027) raw TOML: target branch + optional operator identity override. No env expansion
-/// (merge takes literal strings); unknown keys ignored (matching the rest of `RegistryConfig`).
+/// (merge takes literal strings); unknown keys inside `[merge]` are ignored (the root
+/// `RegistryConfig` itself rejects unknown keys since the §6 breaking migration).
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct MergeToml {
     pub target_ref: Option<String>,
@@ -3234,6 +3245,45 @@ harvest_sanitization=\"attested_prefix_v1\"
         assert_eq!(
             graph.nodes[1].harvest_sanitization,
             Some(HarvestSanitizationMode::AttestedPrefixV1)
+        );
+    }
+
+    /// §6/§15.2-16 (MAJOR 2): `harvest_sanitization` is a NODE key. Misplaced
+    /// at the config root or on a `[[workflows]]` table it must be a hard
+    /// unknown-field parse error, never silently ignored.
+    #[test]
+    fn misplaced_harvest_sanitization_is_a_parse_error_at_root_and_workflow_level() {
+        // Root-level bare keys must precede any table header to sit at the
+        // TOML document root (after `[[agents]]` they would belong to the
+        // agent entry instead).
+        let root_level =
+            format!("harvest_sanitization=\"attested_prefix_v1\"\n{AGENTS_HEADER}{SERVER_FOOTER}");
+        let err = toml::from_str::<RegistryConfig>(&root_level)
+            .expect_err("root-level harvest_sanitization must fail loudly");
+        assert!(
+            err.to_string().contains("harvest_sanitization"),
+            "error must name the offending key, got: {err}"
+        );
+
+        let workflow_level = format!(
+            "{AGENTS_HEADER}\
+             [[workflows]]
+id=\"w\"
+harvest_sanitization=\"attested_prefix_v1\"
+\
+             [[workflows.nodes]]
+id=\"a\"
+agent=\"codex\"
+prompt_text=\"A {{input}}\"
+inputs=[]
+\
+             {SERVER_FOOTER}"
+        );
+        let err = toml::from_str::<RegistryConfig>(&workflow_level)
+            .expect_err("workflow-level harvest_sanitization must fail loudly");
+        assert!(
+            err.to_string().contains("harvest_sanitization"),
+            "error must name the offending key, got: {err}"
         );
     }
 
