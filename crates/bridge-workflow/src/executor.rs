@@ -2,7 +2,9 @@
 //! → prompt → concatenate Update::Text into the node output. Cancel via token.
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::template::render;
-use bridge_core::attestation::{append_prompt_contract, prefix_attestation_request_for_capability};
+use bridge_core::attestation::{
+    append_prompt_contract, prefix_attestation_request_for_capability, HarvestSanitizationMode,
+};
 use bridge_core::domain::{effective_config, AgentEntry, AgentOverride, Part, SessionSpec};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::{NodeId, OperationId, SessionId};
@@ -1055,39 +1057,53 @@ impl WorkflowExecutor {
                 }
 
                 let prefix_capability = turn.backend.prefix_attestation_capability();
-                let prefix_attestation_request =
-                    match prefix_attestation_request_for_capability(&prefix_capability) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            let cleanup = turn
-                                .cleanup
-                                .on_exit_observed(NodeTurnExit::Normal, diagnostic.clone())
-                                .await;
-                            let text = match cleanup {
-                                Ok(()) => {
-                                    format!("[node {} failed: {:?}]", node.id.as_str(), error)
-                                }
-                                Err(cleanup_error) => format!(
-                                    "[node {} cleanup failed after prefix setup error: {:?}]",
-                                    node.id.as_str(),
-                                    cleanup_error
-                                ),
-                            };
-                            let outcome = TurnOutcome::Failed(classify_failure(&error));
-                            ctx.observer.record(&ObsEvent::NodeFinished {
-                                ctx: &node_obs_ctx,
-                                outcome: &outcome,
-                            });
-                            return (text, false, None, NodeDisposition::Failed);
-                        }
-                    };
+                // Task P: harvest sanitization has no configuration surface yet, so
+                // the node mode is structurally Off (design §6); Task F's per-node
+                // `harvest_sanitization` config replaces this literal. Off keeps the
+                // request Disabled — no prompt contract, no enabled beginTurn
+                // (§4.5, §15.1 acceptance criterion 16).
+                let prefix_attestation_request = match prefix_attestation_request_for_capability(
+                    HarvestSanitizationMode::Off,
+                    &prefix_capability,
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let cleanup = turn
+                            .cleanup
+                            .on_exit_observed(NodeTurnExit::Normal, diagnostic.clone())
+                            .await;
+                        let text = match cleanup {
+                            Ok(()) => {
+                                format!("[node {} failed: {:?}]", node.id.as_str(), error)
+                            }
+                            Err(cleanup_error) => format!(
+                                "[node {} cleanup failed after prefix setup error: {:?}]",
+                                node.id.as_str(),
+                                cleanup_error
+                            ),
+                        };
+                        let outcome = TurnOutcome::Failed(classify_failure(&error));
+                        ctx.observer.record(&ObsEvent::NodeFinished {
+                            ctx: &node_obs_ctx,
+                            outcome: &outcome,
+                        });
+                        return (text, false, None, NodeDisposition::Failed);
+                    }
+                };
                 turn.backend
                     .configure_turn(
                         &turn.session,
                         TurnMeta {
                             context_id: obs_ctx.session_id.clone(),
-                            generation: turn.generation.get(),
-                            op: turn.op.clone(),
+                            // NodeTurn carries no session-manager generation/op;
+                            // mirror the cold-path convention: attempt-scoped
+                            // generation and a synthesized workflow operation id.
+                            generation: u64::from(attempt),
+                            op: OperationId::parse(format!(
+                                "workflow-{}-{attempt}",
+                                node.id.as_str()
+                            ))
+                            .expect("workflow operation id is nonempty"),
                             turn_id: obs_ctx.turn_id.clone(),
                             prefix_attestation_request: prefix_attestation_request.clone(),
                         },
@@ -1683,37 +1699,46 @@ impl WorkflowExecutor {
                     }
                     // prompt, with cancel
                     let prefix_capability = resolved.backend.prefix_attestation_capability();
-                    let prefix_attestation_request =
-                        match prefix_attestation_request_for_capability(&prefix_capability) {
-                            Ok(request) => request,
-                            Err(e) => {
-                                let _ = cleanup_cold_session(
-                                    &resolved.backend,
-                                    &session,
-                                    &diagnostic,
-                                    ColdCleanupAction::Forget,
-                                )
-                                .await;
-                                break 'attempt Attempt::Fatal {
-                                    text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
-                                    usage: None,
-                                    failure_class: classify_failure(&e),
-                                };
-                            }
-                        };
+                    // Task P: mode is structurally Off until Task F lands the
+                    // `harvest_sanitization` node config (§4.5/§6; AC 16).
+                    let prefix_attestation_request = match prefix_attestation_request_for_capability(
+                        HarvestSanitizationMode::Off,
+                        &prefix_capability,
+                    ) {
+                        Ok(request) => request,
+                        Err(e) => {
+                            let _ = cleanup_cold_session(
+                                &resolved.backend,
+                                &session,
+                                &diagnostic,
+                                ColdCleanupAction::Forget,
+                            )
+                            .await;
+                            break 'attempt Attempt::Fatal {
+                                text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
+                                usage: None,
+                                failure_class: classify_failure(&e),
+                            };
+                        }
+                    };
+                    // The per-attempt context was stashed into `obs_ctx_opt`
+                    // just above; borrow it back for the turn identifiers.
+                    let obs_ctx_ref = obs_ctx_opt
+                        .as_ref()
+                        .expect("turn context is stashed before the prompt is dispatched");
                     resolved
                         .backend
                         .configure_turn(
                             &session,
                             TurnMeta {
-                                context_id: obs_ctx_here.session_id.clone(),
+                                context_id: obs_ctx_ref.session_id.clone(),
                                 generation: u64::from(attempt),
                                 op: OperationId::parse(format!(
                                     "workflow-{}-{attempt}",
                                     node.id.as_str()
                                 ))
                                 .expect("workflow operation id is nonempty"),
-                                turn_id: obs_ctx_here.turn_id.clone(),
+                                turn_id: obs_ctx_ref.turn_id.clone(),
                                 prefix_attestation_request: prefix_attestation_request.clone(),
                             },
                         )

@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 use a2a::{methods, SVC_PARAM_VERSION};
 use bridge_core::attestation::{
     append_prompt_contract, generate_turn_id, prefix_attestation_request_for_capability,
-    PrefixAttestationRequest,
+    HarvestSanitizationMode, PrefixAttestationRequest,
 };
 use bridge_core::domain::{
     effective_config, AgentOverride, AuthContext, InboundRequest, Part, PeerTaskId, RouteTarget,
@@ -673,11 +673,17 @@ async fn warm_local_dispatch(
             );
             let turn_id = obs_ctx.turn_id.clone();
             let prefix_capability = turn.backend.prefix_attestation_capability();
-            let prefix_attestation_request =
-                match prefix_attestation_request_for_capability(&prefix_capability) {
-                    Ok(request) => request,
-                    Err(error) => return Some(Err(error)),
-                };
+            // Task P: mode is structurally Off until Task F lands the
+            // `harvest_sanitization` node config (§4.5/§6; AC 16) — the
+            // request stays Disabled, so no prompt contract and no enabled
+            // beginTurn.
+            let prefix_attestation_request = match prefix_attestation_request_for_capability(
+                HarvestSanitizationMode::Off,
+                &prefix_capability,
+            ) {
+                Ok(request) => request,
+                Err(error) => return Some(Err(error)),
+            };
             if let Some(w) = &turn.usage_warning {
                 tracing::warn!(target: "a2a_bridge::usage", ctx = %ctx.as_str(),
                     used = w.used, size = w.size, fraction = w.fraction, threshold = w.threshold,

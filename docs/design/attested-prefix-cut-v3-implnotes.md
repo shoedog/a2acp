@@ -22,6 +22,34 @@ Rationale: this follows the existing `pending_turn_meta` pattern: metadata is co
 
 Task P changes newly issued bridge turn IDs from the older `turn-<uuid>` display shape to `turn_<32-lower-hex>` so the private wrapper can validate a compact nonce-like identifier. Existing persisted/logged historical turn IDs are not rewritten; external queries that pattern-match the old hyphenated shape must account for both formats during mixed-version observation windows.
 
+## Fix-round decision: default-OFF mode gate for the prompt contract
+
+The prompt contract was initially injected for every capable turn, which violated §4.5 (whose first
+condition is node mode `attested_prefix_v1`) and §15.1 acceptance criterion 16 (with sanitization
+absent/OFF, Task P causes no semantic task-output change). The fix adds the §6 mode as an input:
+`bridge_core::attestation::HarvestSanitizationMode { Off, AttestedPrefixV1 }` (serde wire names
+`"off"` / `"attested_prefix_v1"`, default `Off`) and threads it through
+`prefix_attestation_request_for_capability(mode, capability)`, the sole production constructor of an
+enabled `PrefixAttestationRequest::CodexCommitMarkerV1`.
+
+Task P ships no configuration surface for the mode. Every production call site (workflow executor
+warm and cold paths, coordinator direct prompt, inbound warm dispatch) passes a literal
+`HarvestSanitizationMode::Off`, so the enabled path is unreachable today: the request is always
+`Disabled`, `append_prompt_contract` is a no-op, `AcpBackend::prompt_inner` sends no
+`_b2a/apc-prefix/beginTurn` (it only sends one for a `CodexCommitMarkerV1` request), and the wrapper
+never activates a turn, so it performs no marker recognition and rewrites no text. Task F's per-node
+`harvest_sanitization` config becomes the only switch that can select `AttestedPrefixV1`; the enum is
+placed in bridge-core so Task F can serialize exactly this type into `WorkflowNode` per §6.
+
+The connect-time capability handshake (`_b2a/apc-prefix/capabilities`) intentionally remains
+unconditional. §4.6 requires the declaration "immediately after backend resolution and private
+negotiation, before node execution", stored on the resolved backend and stable for the run — it
+cannot depend on any node's mode, because a single backend may serve a mix of off and (post-Task F)
+enabled nodes. It is transport-internal: the wrapper consumes the private method and never forwards
+it to the codex-acp child (§4.3), so nothing model-visible flows from it. Likewise `configure_turn`
+still carries the bridge-issued `turn_id` with a `Disabled` request; that produces zero private wire
+traffic for the turn.
+
 ## Scope note
 
 Task P activates the wrapper prerequisite path for capable Codex ACP turns: the bridge generates a per-turn `turn_<32-lower-hex>` ID plus nonce, passes the request through `configure_turn`, sends private `beginTurn` at prompt entry, and appends the nonce-specific prompt contract for the same request.

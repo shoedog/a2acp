@@ -70,6 +70,26 @@ pub enum CapabilityUnavailableReason {
     ProtocolDowngrade,
 }
 
+/// Node-scoped harvest sanitization mode (design §6: `"off"` /
+/// `"attested_prefix_v1"`).
+///
+/// This is the §4.5 injection gate: every model-visible attested-prefix
+/// surface (prompt-contract block, enabled `beginTurn`, wrapper marker
+/// recognition) is reachable only through an enabled request, and an enabled
+/// request is minted only for `AttestedPrefixV1` mode. Task P ships no
+/// configuration surface for this mode — every production caller passes
+/// `Off` — so with only Task P landed no model-visible behavior changes
+/// (§15.1 acceptance criterion 16, §17 condition 5). Task F's per-node
+/// `harvest_sanitization` TOML field becomes the only switch that can select
+/// `AttestedPrefixV1`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarvestSanitizationMode {
+    #[default]
+    Off,
+    AttestedPrefixV1,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrefixAttestationRequest {
     Disabled,
@@ -255,10 +275,20 @@ pub fn append_prompt_contract(
     rendered_prompt
 }
 
+/// Mint the per-turn attestation request.
+///
+/// Enabled (`CodexCommitMarkerV1`) requires BOTH the §4.5 conditions that
+/// exist at Task P time: node mode `attested_prefix_v1` AND a resolved
+/// `SupportedV1` wrapper capability. `Off` mode always yields `Disabled`
+/// regardless of capability, which in turn suppresses the prompt-contract
+/// append, the private `beginTurn`, and wrapper marker recognition for the
+/// turn. This function is the only production constructor of an enabled
+/// request.
 pub fn prefix_attestation_request_for_capability(
+    mode: HarvestSanitizationMode,
     capability: &PrefixAttestationCapability,
 ) -> Result<PrefixAttestationRequest, BridgeError> {
-    if capability.is_supported_v1() {
+    if mode == HarvestSanitizationMode::AttestedPrefixV1 && capability.is_supported_v1() {
         Ok(PrefixAttestationRequest::CodexCommitMarkerV1 {
             marker_nonce: generate_nonce()?,
         })
@@ -333,8 +363,9 @@ marker.";
     }
 
     #[test]
-    fn prefix_attestation_request_matches_capability() {
+    fn enabled_mode_request_matches_capability() {
         let supported = prefix_attestation_request_for_capability(
+            HarvestSanitizationMode::AttestedPrefixV1,
             &PrefixAttestationCapability::codex_commit_marker_v1(),
         )
         .unwrap();
@@ -343,11 +374,54 @@ marker.";
             PrefixAttestationRequest::CodexCommitMarkerV1 { .. }
         ));
         assert_eq!(
-            prefix_attestation_request_for_capability(&PrefixAttestationCapability::unsupported(
-                CapabilityUnavailableReason::BackendDeclaredIncapable,
-            ))
+            prefix_attestation_request_for_capability(
+                HarvestSanitizationMode::AttestedPrefixV1,
+                &PrefixAttestationCapability::unsupported(
+                    CapabilityUnavailableReason::BackendDeclaredIncapable,
+                ),
+            )
             .unwrap(),
             PrefixAttestationRequest::Disabled
+        );
+    }
+
+    #[test]
+    fn off_mode_disables_request_even_for_supported_capability() {
+        // §4.5 gate / §15.1 acceptance criterion 16: with sanitization OFF
+        // (the only mode reachable while Task F's config is absent), a fully
+        // capable wrapper backend still gets a Disabled request, so no prompt
+        // contract is appended and no enabled beginTurn is sent.
+        let request = prefix_attestation_request_for_capability(
+            HarvestSanitizationMode::Off,
+            &PrefixAttestationCapability::codex_commit_marker_v1(),
+        )
+        .unwrap();
+        assert_eq!(request, PrefixAttestationRequest::Disabled);
+        assert_eq!(
+            append_prompt_contract(
+                "ordinary prompt".to_string(),
+                &PrefixAttestationCapability::codex_commit_marker_v1(),
+                &request,
+            ),
+            "ordinary prompt"
+        );
+    }
+
+    #[test]
+    fn harvest_sanitization_mode_defaults_off_and_uses_spec_wire_names() {
+        // §6: allowed values are exactly "off" and "attested_prefix_v1";
+        // absent configuration means Off.
+        assert_eq!(
+            HarvestSanitizationMode::default(),
+            HarvestSanitizationMode::Off
+        );
+        assert_eq!(
+            serde_json::to_string(&HarvestSanitizationMode::Off).unwrap(),
+            "\"off\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HarvestSanitizationMode::AttestedPrefixV1).unwrap(),
+            "\"attested_prefix_v1\""
         );
     }
 

@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use bridge_core::attestation::{append_prompt_contract, prefix_attestation_request_for_capability};
+use bridge_core::attestation::{
+    append_prompt_contract, prefix_attestation_request_for_capability, HarvestSanitizationMode,
+};
 use bridge_core::domain::{InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
 #[cfg(test)]
@@ -552,8 +554,13 @@ impl Coordinator {
         };
 
         let prefix_capability = turn.backend.prefix_attestation_capability();
-        let prefix_attestation_request =
-            prefix_attestation_request_for_capability(&prefix_capability)?;
+        // Task P: mode is structurally Off until Task F lands the
+        // `harvest_sanitization` node config (§4.5/§6; AC 16) — the request
+        // stays Disabled, so no prompt contract and no enabled beginTurn.
+        let prefix_attestation_request = prefix_attestation_request_for_capability(
+            HarvestSanitizationMode::Off,
+            &prefix_capability,
+        )?;
         let mut parts = assemble_turn_parts(
             turn.seed.as_deref(),
             &turn.injects,
