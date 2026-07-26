@@ -4683,7 +4683,6 @@ mod tests {
         SessionContext,
     };
     use bridge_core::error::BridgeError;
-    use bridge_core::harvest::HarvestAuditStore;
     use bridge_core::ids::{AgentId, CallerId};
     use bridge_core::orch::UsageSnapshot;
     use bridge_core::ports::*;

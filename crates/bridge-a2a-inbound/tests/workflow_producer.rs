@@ -21,7 +21,6 @@ use bridge_core::domain::{
     SessionSpec, TaskMeta,
 };
 use bridge_core::error::BridgeError;
-use bridge_core::harvest::HarvestAuditStore;
 use bridge_core::ids::{AgentId, CallerId, NodeId, SessionId, TaskId, WorkflowId};
 use bridge_core::ports::{
     AgentBackend, AgentRegistry, AuthMiddleware, BackendStream, Delegation, DelegationPort, Lease,

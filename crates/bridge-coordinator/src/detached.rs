@@ -564,7 +564,6 @@ impl Drop for Finalizer {
 #[cfg(test)]
 mod sink_tests {
     use super::*;
-    use bridge_core::harvest::HarvestAuditStore;
 
     /// Sink whose `terminal` always returns an error — used to verify that
     /// `drain_workflow` aborts and propagates the error.
@@ -2032,7 +2031,6 @@ mod resume_tests {
         PersistedPhaseTransitionInput, PhaseStatus,
     };
     use bridge_core::domain::{AgentEntry, AgentKind, Part, RegistrySnapshot};
-    use bridge_core::harvest::HarvestAuditStore;
     use bridge_core::ids::{AgentId, NodeId, OperationId, SessionId, WorkflowId};
     use bridge_core::orch::UsageSnapshot;
     use bridge_core::ports::{

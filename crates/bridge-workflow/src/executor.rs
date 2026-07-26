@@ -3165,7 +3165,6 @@ mod tests {
     };
     use bridge_core::domain::{Part, PermissionRequest, RegistrySnapshot, SessionSpec};
     use bridge_core::error::BridgeError;
-    use bridge_core::harvest::NoopHarvestAuditStore;
     use bridge_core::ids::{AgentId, NodeId, SessionId, WorkflowId};
     use bridge_core::ports::{AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, Update};
     use futures::StreamExt;

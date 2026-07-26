@@ -210,6 +210,7 @@ mod tests {
             BridgeError::HandleBusy => "HandleBusy",
             BridgeError::TaskSpecInvalid { .. } => "TaskSpecInvalid",
             BridgeError::EmptyFinal => "EmptyFinal",
+            BridgeError::HarvestAuditPersistFailed { .. } => "HarvestAuditPersistFailed",
         }
     }
 

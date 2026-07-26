@@ -331,7 +331,7 @@ mod tests {
     use super::*;
     use crate::domain::*;
     use crate::error::BridgeError;
-    use crate::ids::{ContextId, SessionId, TaskId};
+    use crate::ids::{SessionId, TaskId};
     use crate::ports::*;
     use futures::StreamExt;
     use std::collections::HashMap;
