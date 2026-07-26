@@ -69,6 +69,13 @@ escaping table is exercised for backslash runs 0 through 9 per the §15.1 test p
 
 ## Scope note
 
-Task P activates the wrapper prerequisite path for capable Codex ACP turns: the bridge generates a per-turn `turn_<32-lower-hex>` ID plus nonce, passes the request through `configure_turn`, sends private `beginTurn` at prompt entry, and appends the nonce-specific prompt contract for the same request.
+Task P builds the wrapper prerequisite machinery for capable Codex ACP turns — packaged wrapper with
+marker grammar, private capability handshake at connect, bridge-issued `turn_<32-lower-hex>` IDs on
+`configure_turn`, and the prompt-contract/beginTurn plumbing — but, per the default-OFF mode gate
+above, none of the per-turn enabled path runs: with every production mode literal `Off`, no nonce
+request is minted, no `beginTurn` is sent, no prompt contract is appended, and the wrapper acts as a
+byte-preserving proxy. Task F's `harvest_sanitization` config is what will activate enabled turns.
 
-Task P still does not add the Task F sanitizer, audit side-store, config enum, or fan-in output cutting. Until Task F enables sanitization decisions, harvested task output remains semantically kept even though capable wrapper turns can now surface typed prefix-attestation status.
+Task P still does not add the Task F sanitizer, audit side-store, config wiring, or fan-in output
+cutting. Until Task F lands, every harvest resolves to KEEP and task output is byte-identical to the
+pre-Task-P bridge.
