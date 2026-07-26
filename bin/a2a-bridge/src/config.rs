@@ -46,6 +46,7 @@ impl From<toml::de::Error> for ConfigError {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default = "default_addr")]
     pub addr: String,
@@ -63,6 +64,7 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoreConfig {
     pub path: String,
     #[serde(default)]
@@ -70,6 +72,7 @@ pub struct StoreConfig {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationConfig {
     pub peer_url: String,
     pub auth: String,
@@ -98,6 +101,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsToml {
     #[serde(default)]
     pub enabled: bool,
@@ -134,6 +138,7 @@ fn default_max_task_turns() -> usize {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TracesToml {
     #[serde(default)]
     pub enabled: bool,
@@ -257,6 +262,7 @@ pub struct RegistryConfig {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatchToml {
     pub max_concurrent: u32,
     #[serde(default)]
@@ -279,6 +285,7 @@ pub struct MetricsConfig {
 /// Host worktree isolation config. Changes require a serve restart because the spawn
 /// factory captures `[worktrees]` once at startup; hot-reload does not re-read it.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorktreesToml {
     #[serde(default)]
     pub enabled: bool,
@@ -374,12 +381,14 @@ pub struct WorkflowToml {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PanelTomlSection {
     #[serde(default)]
     pub weights: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetryToml {
     pub max_attempts: u32,
     pub backoff_ms: u64,
@@ -517,6 +526,7 @@ pub(crate) fn parse_prompts_only(toml_str: &str) -> Result<Vec<PromptEntryToml>,
 
 /// `[registry]` section — optional; controls which cmds are allowed.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegistrySection {
     #[serde(default)]
     pub allowed_cmds: Vec<String>,
@@ -525,6 +535,7 @@ pub struct RegistrySection {
 /// One entry in the `[[agents]]` array, as parsed from TOML.
 /// String fields are converted to typed domain values in `into_snapshot`.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentEntryToml {
     pub id: String,
     /// Required for `kind="acp"`; absent for non-process kinds (e.g. `Api`).
@@ -751,6 +762,7 @@ fn resolve_mcp_delivery(
 /// `[agents.sandbox]` TOML mirror. Flat for ergonomics; converted to the typed (data-carrying)
 /// `EgressPolicy` in `into_snapshot` (which rejects `locked` without `network`+`proxy`).
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxToml {
     #[serde(default)]
     pub runtime: Option<String>,
@@ -771,6 +783,7 @@ pub struct SandboxToml {
 /// `[agents.watchdog]` TOML mirror. Durations are positive seconds and are converted to
 /// [`bridge_core::domain::WatchdogConfig`] in `into_snapshot`.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WatchdogToml {
     pub idle_timeout_secs: u64,
     pub hard_wall_clock_secs: u64,
@@ -781,6 +794,7 @@ fn default_gate() -> bool {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LanguageVerifyToml {
     pub name: String,
     pub cmd: String,
@@ -789,6 +803,7 @@ pub struct LanguageVerifyToml {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LanguageToml {
     pub id: String,
     pub fetch: String,
@@ -806,6 +821,7 @@ pub struct LanguageToml {
 /// `[verify]` (Slice B2b-2): the build+test verify the `implement` subcommand runs after the commit.
 /// Egress reuses the shared `parse_egress_fields` invariant (locked ⇒ network+proxy).
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifyToml {
     #[serde(default)]
     pub runtime: Option<String>,
@@ -818,8 +834,9 @@ pub struct VerifyToml {
     pub proxy: Option<String>,
     #[serde(default)]
     pub no_proxy: Option<String>,
-    /// REMOVED — moved to `[[languages.verify]]`. Kept ONLY to reject legacy configs loudly
-    /// (no deny_unknown_fields). `Option<toml::Value>` detects PRESENCE without reading any fields.
+    /// REMOVED — moved to `[[languages.verify]]`. Kept ONLY to reject legacy configs loudly:
+    /// even with deny_unknown_fields, an explicit field gives a clearer rejection than the
+    /// generic unknown-field message. `Option<toml::Value>` detects PRESENCE without reading any fields.
     pub commands: Option<toml::Value>,
 }
 
@@ -909,6 +926,7 @@ fn default_depth_str() -> String {
 /// `[review]` (Slice B2b-3a): the review-the-diff workflow run after `implement` commits + verifies.
 /// Only NAMES a workflow id (model is an agent-level property); absent → review skipped.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewToml {
     #[serde(default = "default_review_workflow")]
     pub workflow: String,
@@ -1008,6 +1026,7 @@ impl ReviewToml {
 
 /// `[implement]` (Slice B2b-3b): bounds + names the fix workflow for the review→tweak loop.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImplementToml {
     #[serde(default)]
     pub max_attempts: Option<u32>,
@@ -1086,9 +1105,10 @@ impl ImplementToml {
 }
 
 /// `[merge]` (ADR-0027) raw TOML: target branch + optional operator identity override. No env expansion
-/// (merge takes literal strings); unknown keys inside `[merge]` are ignored (the root
-/// `RegistryConfig` itself rejects unknown keys since the §6 breaking migration).
+/// (merge takes literal strings); unknown keys inside `[merge]` are rejected so misplaced
+/// bridge-wide controls fail loudly instead of being silently ignored.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MergeToml {
     pub target_ref: Option<String>,
     pub author_name: Option<String>,
@@ -3253,37 +3273,108 @@ harvest_sanitization=\"attested_prefix_v1\"
     /// unknown-field parse error, never silently ignored.
     #[test]
     fn misplaced_harvest_sanitization_is_a_parse_error_at_root_and_workflow_level() {
+        fn assert_rejected(label: &str, raw: String) {
+            let err = match toml::from_str::<RegistryConfig>(&raw) {
+                Ok(_) => panic!("{label} harvest_sanitization must fail loudly"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("harvest_sanitization"),
+                "{label} error must name the offending key, got: {err}"
+            );
+        }
+
         // Root-level bare keys must precede any table header to sit at the
         // TOML document root (after `[[agents]]` they would belong to the
         // agent entry instead).
-        let root_level =
-            format!("harvest_sanitization=\"attested_prefix_v1\"\n{AGENTS_HEADER}{SERVER_FOOTER}");
-        let err = toml::from_str::<RegistryConfig>(&root_level)
-            .expect_err("root-level harvest_sanitization must fail loudly");
-        assert!(
-            err.to_string().contains("harvest_sanitization"),
-            "error must name the offending key, got: {err}"
+        assert_rejected(
+            "root-level",
+            format!("harvest_sanitization=\"attested_prefix_v1\"\n{AGENTS_HEADER}{SERVER_FOOTER}"),
         );
 
-        let workflow_level = format!(
-            "{AGENTS_HEADER}\
-             [[workflows]]
+        assert_rejected(
+            "agent-level",
+            format!(
+                "default = \"codex\"\n[[agents]]\nid = \"codex\"\ncmd = \"codex-acp\"\nharvest_sanitization=\"attested_prefix_v1\"\n{SERVER_FOOTER}"
+            ),
+        );
+
+        assert_rejected(
+            "workflow-level",
+            format!(
+                "{AGENTS_HEADER}\
+                 [[workflows]]
 id=\"w\"
 harvest_sanitization=\"attested_prefix_v1\"
 \
-             [[workflows.nodes]]
+                 [[workflows.nodes]]
 id=\"a\"
 agent=\"codex\"
 prompt_text=\"A {{input}}\"
 inputs=[]
 \
-             {SERVER_FOOTER}"
+                 {SERVER_FOOTER}"
+            ),
         );
-        let err = toml::from_str::<RegistryConfig>(&workflow_level)
-            .expect_err("workflow-level harvest_sanitization must fail loudly");
-        assert!(
-            err.to_string().contains("harvest_sanitization"),
-            "error must name the offending key, got: {err}"
+    }
+
+    #[test]
+    fn misplaced_harvest_sanitization_is_rejected_in_remaining_config_containers() {
+        fn assert_rejected(label: &str, raw: String) {
+            let err = match toml::from_str::<RegistryConfig>(&raw) {
+                Ok(_) => panic!("{label} harvest_sanitization must fail loudly"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains("harvest_sanitization"),
+                "{label} error must name the offending key, got: {err}"
+            );
+        }
+
+        assert_rejected(
+            "batch",
+            format!(
+                "{AGENTS_HEADER}{SERVER_FOOTER}[batch]\nmax_concurrent=2\nharvest_sanitization=\"attested_prefix_v1\"\n"
+            ),
+        );
+        assert_rejected(
+            "workflow retry",
+            format!(
+                "{AGENTS_HEADER}\
+                 [[workflows]]
+id=\"w\"
+\
+                 [[workflows.nodes]]
+id=\"a\"
+agent=\"codex\"
+prompt_text=\"A {{input}}\"
+inputs=[]
+\
+                 [workflows.nodes.retry]
+max_attempts=2
+backoff_ms=1
+harvest_sanitization=\"attested_prefix_v1\"
+\
+                 {SERVER_FOOTER}"
+            ),
+        );
+        assert_rejected(
+            "server",
+            format!(
+                "{AGENTS_HEADER}[server]\naddr = \"127.0.0.1:8080\"\nharvest_sanitization=\"attested_prefix_v1\"\n"
+            ),
+        );
+        assert_rejected(
+            "store",
+            format!(
+                "{AGENTS_HEADER}{SERVER_FOOTER}[store]\npath=\"/tmp/tasks.jsonl\"\nharvest_sanitization=\"attested_prefix_v1\"\n"
+            ),
+        );
+        assert_rejected(
+            "merge",
+            format!(
+                "{AGENTS_HEADER}{SERVER_FOOTER}[merge]\ntarget_ref=\"main\"\nharvest_sanitization=\"attested_prefix_v1\"\n"
+            ),
         );
     }
 

@@ -581,6 +581,32 @@ pub async fn commit_harvested_completion(
             }
         })?;
 
+    let decision = HarvestSanitizationDecisionV1 {
+        schema_version: HARVEST_SCHEMA_VERSION,
+        audit_id: audit_id.clone(),
+        mode,
+        decision: outcome.decision,
+        reason: outcome.reason,
+        node_id: node_id.clone(),
+        producer_id: producer_id.to_string(),
+        issuer_id: outcome.issuer_id,
+        raw_body_sha256,
+        effective_body_sha256,
+        raw_len_bytes,
+        effective_len_bytes,
+        cut_byte_offset: outcome.cut_byte_offset,
+        provenance_sha256,
+        suspicious_threshold_percent: SUSPICIOUS_THRESHOLD_PERCENT,
+    };
+
+    if mode == HarvestSanitizationMode::Off && !store.retains_audit_records() {
+        return Ok(CommittedHarvest {
+            audit_id,
+            effective_body: outcome.effective_body,
+            decision,
+        });
+    }
+
     let raw = HarvestRawRecordV1 {
         schema_version: HARVEST_SCHEMA_VERSION,
         audit_id: audit_id.clone(),
@@ -598,24 +624,6 @@ pub async fn commit_harvested_completion(
         prefix_attestation: outcome.status.clone(),
         provenance_sha256,
     };
-    let decision = HarvestSanitizationDecisionV1 {
-        schema_version: HARVEST_SCHEMA_VERSION,
-        audit_id: audit_id.clone(),
-        mode,
-        decision: outcome.decision,
-        reason: outcome.reason,
-        node_id,
-        producer_id: producer_id.to_string(),
-        issuer_id: outcome.issuer_id,
-        raw_body_sha256,
-        effective_body_sha256,
-        raw_len_bytes,
-        effective_len_bytes,
-        cut_byte_offset: outcome.cut_byte_offset,
-        provenance_sha256,
-        suspicious_threshold_percent: SUSPICIOUS_THRESHOLD_PERCENT,
-    };
-
     store
         .commit_bundle(raw, decision.clone())
         .await
@@ -686,6 +694,19 @@ mod tests {
         assert_eq!(zero.effective_body, "DELIVER");
         assert_eq!(zero.decision, HarvestDecision::KeptZeroPrefix);
         assert_eq!(zero.cut_byte_offset, Some(0));
+    }
+
+    /// Review-gap mapping: the old "discard post-commit narration" row was stale;
+    /// the surviving requirement is exact suffix preservation after the attested
+    /// process prefix, so this single case covers that substituted row directly.
+    #[test]
+    fn narration_after_commitment_is_cut_from_deliverable_suffix() {
+        let body = "scratch analysis\nDELIVERABLE\npost-commit narration";
+        let prefix_len = "scratch analysis\n".len();
+        let out = decide(body, attested(body, prefix_len as u64));
+        assert_eq!(out.decision, HarvestDecision::CutAttested);
+        assert_eq!(out.cut_byte_offset, Some(prefix_len as u64));
+        assert_eq!(out.effective_body, "DELIVERABLE\npost-commit narration");
     }
 
     #[test]
@@ -794,6 +815,98 @@ mod tests {
         assert_eq!(
             synthetic.reason.as_deref(),
             Some("bridge_synthetic_cancellation")
+        );
+    }
+
+    struct CountingNonRetainingStore {
+        commits: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl HarvestAuditStore for CountingNonRetainingStore {
+        fn retains_audit_records(&self) -> bool {
+            false
+        }
+
+        async fn commit_bundle(
+            &self,
+            _raw: HarvestRawRecordV1,
+            _decision: HarvestSanitizationDecisionV1,
+        ) -> Result<HarvestAuditCommit, HarvestAuditStoreError> {
+            self.commits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(HarvestAuditCommit::Inserted)
+        }
+
+        async fn get_by_audit_id(
+            &self,
+            _audit_id: &str,
+        ) -> Result<Option<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+            Ok(None)
+        }
+
+        async fn get_by_attempt_key(
+            &self,
+            _run_id: &str,
+            _node_id: &str,
+            _attempt_id: u32,
+            _turn_id: &str,
+        ) -> Result<Option<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+            Ok(None)
+        }
+
+        async fn list_by_task_id(
+            &self,
+            _task_id: &str,
+            _after_audit_id: Option<&str>,
+            _limit: u32,
+        ) -> Result<Vec<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn context() -> TurnContext {
+        TurnContext {
+            turn_id: crate::ids::TurnId::parse("turn_00000000000000000000000000000000").unwrap(),
+            session_id: crate::ids::ContextId::parse("run").unwrap(),
+            task_id: Some(crate::ids::TaskId::parse("task").unwrap()),
+            workflow: Some("workflow".to_string()),
+            node: Some("node".to_string()),
+            attempt: 1,
+            agent: "producer".to_string(),
+            model: None,
+            effort: None,
+            mode: None,
+            prompt_id: None,
+            traceparent: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn off_mode_non_retaining_store_does_not_commit_a_noop_bundle() {
+        let store = CountingNonRetainingStore {
+            commits: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let committed = commit_harvested_completion(
+            &context(),
+            HarvestSanitizationMode::Off,
+            &PrefixAttestationCapability::default(),
+            "producer",
+            CompletionBodyOrigin::ModelText,
+            "body".to_string(),
+            PrefixAttestationStatus::default(),
+            &store,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(committed.effective_body, "body");
+        assert_eq!(committed.decision.decision, HarvestDecision::KeptOff);
+        assert_eq!(
+            store.commits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Off-mode Noop paths must not write a discarded audit bundle"
         );
     }
 

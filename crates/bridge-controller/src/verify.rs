@@ -18,7 +18,22 @@ pub struct VerifyResult {
     pub name: String,
     pub gate: bool,
     pub ok: bool,
+    pub reach: VerifyReach,
+    pub failure_class: Option<VerifyFailureClass>,
     pub output: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyReach {
+    Reached { exit_status: i32 },
+    NotReached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyFailureClass {
+    Command,
+    Runner,
+    LockSync,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,12 +68,15 @@ pub fn truncate_output(s: &str, max: usize) -> String {
     format!("{}\n…[truncated {} bytes]…\n{}", &s[..h], t - h, &s[t..])
 }
 
-/// PURE. The fix-turn digest: ONLY the GATE failures (the ones that fail the verdict + drive `actionable`),
-/// in order, each `### <name>` + its (truncated) output. Non-gate failures are reported in the hand-off but
-/// never re-prompted. Empty when no gate failed. `run_verify` stops at the first gate failure, so this is
-/// normally one entry; the per-result budget splits `max_bytes` across however many there are.
+/// PURE. The fix-turn digest: reached GATE failures that fail the verdict + drive `actionable`, each
+/// `### <name>` + its truncated output, followed by an explicit list of later gates that were not reached.
+/// Non-gate failures are reported in the hand-off but never re-prompted. Empty when no reached gate failed.
 pub fn failure_digest(v: &VerifyVerdict, max_bytes: usize) -> String {
-    let failed: Vec<&VerifyResult> = v.results.iter().filter(|r| r.gate && !r.ok).collect();
+    let failed: Vec<&VerifyResult> = v
+        .results
+        .iter()
+        .filter(|r| r.gate && !r.ok && matches!(r.reach, VerifyReach::Reached { .. }))
+        .collect();
     if failed.is_empty() {
         return String::new();
     }
@@ -67,6 +85,14 @@ pub fn failure_digest(v: &VerifyVerdict, max_bytes: usize) -> String {
     for r in failed {
         s.push_str("### ");
         s.push_str(&r.name);
+        if let VerifyReach::Reached { exit_status } = r.reach {
+            s.push_str(&format!(" (reached, exit={exit_status}"));
+            if let Some(class) = r.failure_class {
+                s.push_str(", ");
+                s.push_str(failure_class_label(class));
+            }
+            s.push(')');
+        }
         s.push('\n');
         let body = if r.output.trim().is_empty() {
             "(no output)"
@@ -76,28 +102,95 @@ pub fn failure_digest(v: &VerifyVerdict, max_bytes: usize) -> String {
         s.push_str(&truncate_output(body, per));
         s.push('\n');
     }
+    let not_reached: Vec<&str> = v
+        .results
+        .iter()
+        .filter(|r| r.gate && matches!(r.reach, VerifyReach::NotReached))
+        .map(|r| r.name.as_str())
+        .collect();
+    if !not_reached.is_empty() {
+        s.push_str("### Not reached gates\n");
+        s.push_str(&not_reached.join(", "));
+        s.push('\n');
+    }
     s
 }
 
 /// PURE. The one-line verdict for the operator hand-off (stdout). Failing-command OUTPUT goes to
 /// stderr separately; this is the summary line.
 pub fn verdict_line(v: &VerifyVerdict) -> String {
-    let marks: Vec<String> = v
-        .results
-        .iter()
-        .map(|r| format!("{} {}", r.name, if r.ok { "✓" } else { "✗" }))
-        .collect();
+    let marks: Vec<String> = v.results.iter().map(result_mark).collect();
     if v.passed {
         format!("verify: PASS  ({})", marks.join(" · "))
     } else {
         let failed = v
             .results
             .iter()
-            .find(|r| r.gate && !r.ok)
-            .map(|r| r.name.as_str())
-            .unwrap_or("?");
+            .find(|r| r.gate && !r.ok && matches!(r.reach, VerifyReach::Reached { .. }))
+            .or_else(|| v.results.iter().find(|r| r.gate && !r.ok))
+            .map(|r| {
+                if r.failure_class == Some(VerifyFailureClass::LockSync) {
+                    format!("lock-sync before {}", r.name)
+                } else {
+                    r.name.clone()
+                }
+            })
+            .unwrap_or_else(|| "?".to_string());
         format!("verify: FAIL at {}  ({})", failed, marks.join(" · "))
     }
+}
+
+fn result_mark(r: &VerifyResult) -> String {
+    match r.reach {
+        VerifyReach::Reached { exit_status } => {
+            let mut mark = format!(
+                "{} reached exit={} {}",
+                r.name,
+                exit_status,
+                if r.ok { "✓" } else { "✗" }
+            );
+            if let Some(class) = r.failure_class {
+                mark.push(' ');
+                mark.push_str(failure_class_label(class));
+            }
+            mark
+        }
+        VerifyReach::NotReached => format!("{} not-reached", r.name),
+    }
+}
+
+fn failure_class_label(class: VerifyFailureClass) -> &'static str {
+    match class {
+        VerifyFailureClass::Command => "command",
+        VerifyFailureClass::Runner => "runner",
+        VerifyFailureClass::LockSync => "lock-sync",
+    }
+}
+
+fn classify_verify_failure(
+    exit_status: i32,
+    output: &str,
+    runner_error: bool,
+) -> Option<VerifyFailureClass> {
+    if exit_status == 0 {
+        return None;
+    }
+    if runner_error {
+        return Some(VerifyFailureClass::Runner);
+    }
+    if is_lock_sync_failure(output) {
+        return Some(VerifyFailureClass::LockSync);
+    }
+    Some(VerifyFailureClass::Command)
+}
+
+fn is_lock_sync_failure(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("--locked")
+        && (lower.contains("cargo.lock")
+            || lower.contains("lock file")
+            || lower.contains("lockfile")
+            || lower.contains("needs to be updated"))
 }
 
 /// The three terminal states of the verify step (the riskiest classification — extracted pure so the
@@ -168,7 +261,19 @@ pub fn run_verify(
     let mut results = Vec::new();
     let binding = profile.cache_binding(bridge_core::profile::CacheCtx::Verify, "", cache_vol);
     let image = profile.image.as_deref().unwrap_or(&cfg.image);
+    let mut stopped_after_gate_failure = false;
     for c in &profile.verify_commands {
+        if stopped_after_gate_failure {
+            results.push(VerifyResult {
+                name: c.name.clone(),
+                gate: c.gate,
+                ok: false,
+                reach: VerifyReach::NotReached,
+                failure_class: None,
+                output: "verify: not reached because an earlier gate failed".into(),
+            });
+            continue;
+        }
         let (prog, argv) = bridge_core::sandbox::compose_verify(
             cfg.runtime.as_deref(),
             image,
@@ -177,19 +282,22 @@ pub fn run_verify(
             &binding,
             &c.cmd,
         );
-        let (exit, out) = match runner(&prog, &argv) {
-            Ok((e, o)) => (e, o),
-            Err(e) => (-1, format!("verify: runner error: {e}")),
+        let (exit, out, runner_error) = match runner(&prog, &argv) {
+            Ok((e, o)) => (e, o, false),
+            Err(e) => (-1, format!("verify: runner error: {e}"), true),
         };
         let ok = exit == 0;
+        let failure_class = classify_verify_failure(exit, &out, runner_error);
         results.push(VerifyResult {
             name: c.name.clone(),
             gate: c.gate,
             ok,
+            reach: VerifyReach::Reached { exit_status: exit },
+            failure_class,
             output: truncate_output(&out, max_bytes),
         });
         if c.gate && !ok {
-            break; // stop at the first gate failure
+            stopped_after_gate_failure = true;
         }
     }
     VerifyOutcome::Ran(aggregate(results))
@@ -204,6 +312,10 @@ mod tests {
             name: name.into(),
             gate,
             ok,
+            reach: VerifyReach::Reached {
+                exit_status: if ok { 0 } else { 1 },
+            },
+            failure_class: (!ok).then_some(VerifyFailureClass::Command),
             output: String::new(),
         }
     }
@@ -239,11 +351,14 @@ mod tests {
     #[test]
     fn verdict_line_pass_and_fail() {
         let pass = aggregate(vec![r("fmt", true, true), r("test", true, true)]);
-        assert_eq!(verdict_line(&pass), "verify: PASS  (fmt ✓ · test ✓)");
+        assert_eq!(
+            verdict_line(&pass),
+            "verify: PASS  (fmt reached exit=0 ✓ · test reached exit=0 ✓)"
+        );
         let fail = aggregate(vec![r("fmt", true, true), r("clippy", true, false)]);
         assert_eq!(
             verdict_line(&fail),
-            "verify: FAIL at clippy  (fmt ✓ · clippy ✗)"
+            "verify: FAIL at clippy  (fmt reached exit=0 ✓ · clippy reached exit=1 ✗ command)"
         );
     }
 
@@ -292,12 +407,16 @@ mod tests {
                 name: "fmt".into(),
                 gate: true,
                 ok: true,
+                reach: VerifyReach::Reached { exit_status: 0 },
+                failure_class: None,
                 output: "ok".into(),
             },
             VerifyResult {
                 name: "clippy".into(),
                 gate: true,
                 ok: false,
+                reach: VerifyReach::Reached { exit_status: 1 },
+                failure_class: Some(VerifyFailureClass::Command),
                 output: "E".repeat(50),
             },
         ]);
@@ -314,12 +433,16 @@ mod tests {
                 name: "test".into(),
                 gate: true,
                 ok: true,
+                reach: VerifyReach::Reached { exit_status: 0 },
+                failure_class: None,
                 output: "ok".into(),
             },
             VerifyResult {
                 name: "cov".into(),
                 gate: false,
                 ok: false,
+                reach: VerifyReach::Reached { exit_status: 1 },
+                failure_class: Some(VerifyFailureClass::Command),
                 output: "x".into(),
             },
         ]);
@@ -332,9 +455,50 @@ mod tests {
             name: "build".into(),
             gate: true,
             ok: false,
+            reach: VerifyReach::Reached { exit_status: 1 },
+            failure_class: Some(VerifyFailureClass::Command),
             output: "   ".into(),
         }]);
         assert!(failure_digest(&v, 4096).contains("(no output)"));
+    }
+
+    #[test]
+    fn verdict_reports_reached_exit_and_not_reached_gates() {
+        let v = aggregate(vec![
+            VerifyResult {
+                name: "fmt".into(),
+                gate: true,
+                ok: true,
+                reach: VerifyReach::Reached { exit_status: 0 },
+                failure_class: None,
+                output: "ok".into(),
+            },
+            VerifyResult {
+                name: "build".into(),
+                gate: true,
+                ok: false,
+                reach: VerifyReach::Reached { exit_status: 101 },
+                failure_class: Some(VerifyFailureClass::LockSync),
+                output:
+                    "error: the lock file Cargo.lock needs to be updated but --locked was passed"
+                        .into(),
+            },
+            VerifyResult {
+                name: "test".into(),
+                gate: true,
+                ok: false,
+                reach: VerifyReach::NotReached,
+                failure_class: None,
+                output: String::new(),
+            },
+        ]);
+        assert_eq!(
+            verdict_line(&v),
+            "verify: FAIL at lock-sync before build  (fmt reached exit=0 ✓ · build reached exit=101 ✗ lock-sync · test not-reached)"
+        );
+        let digest = failure_digest(&v, 4096);
+        assert!(digest.contains("### build (reached, exit=101, lock-sync)"));
+        assert!(digest.contains("### Not reached gates\ntest"));
     }
 
     fn cfg() -> VerifyConfig {
@@ -409,9 +573,11 @@ mod tests {
             4096,
         ));
         assert!(!v.passed);
-        assert_eq!(v.results.len(), 2); // stopped after clippy
+        assert_eq!(v.results.len(), 4); // stopped after clippy, reported later gates as not reached
         assert_eq!(v.results[1].name, "clippy");
         assert!(!v.results[1].ok);
+        assert!(matches!(v.results[2].reach, VerifyReach::NotReached));
+        assert!(matches!(v.results[3].reach, VerifyReach::NotReached));
     }
 
     #[test]
@@ -457,6 +623,32 @@ mod tests {
         ));
         assert!(!v.passed);
         assert!(v.results[0].output.contains("docker missing"));
+        assert_eq!(v.results[0].failure_class, Some(VerifyFailureClass::Runner));
+    }
+
+    #[test]
+    fn run_verify_classifies_locked_precompile_death() {
+        let clone = bridge_core::SessionCwd::parse("/repo/clone").unwrap();
+        let runner = |_p: &str, _argv: &[String]| -> std::io::Result<(i32, String)> {
+            Ok((
+                101,
+                "error: the lock file Cargo.lock needs to be updated but --locked was passed"
+                    .into(),
+            ))
+        };
+        let v = unwrap_ran(run_verify(
+            &cfg(),
+            Some(&profile(&[("build", true), ("test", true)], None)),
+            &clone,
+            "cache-x",
+            &runner,
+            4096,
+        ));
+        assert_eq!(
+            v.results[0].failure_class,
+            Some(VerifyFailureClass::LockSync)
+        );
+        assert!(matches!(v.results[1].reach, VerifyReach::NotReached));
     }
 
     #[test]

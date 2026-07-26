@@ -841,7 +841,27 @@ impl ArtifactState {
         summary: &'static str,
         accepted: bool,
     ) {
-        self.failure = Some(static_failure(phase, class, code, summary, accepted));
+        self.fail_static_with_causes(phase, class, code, summary, Vec::new(), accepted);
+    }
+
+    fn fail_static_with_causes(
+        &mut self,
+        phase: DiagnosticPhase,
+        class: DiagnosticFailureClass,
+        code: &'static str,
+        summary: &'static str,
+        causes: Vec<String>,
+        accepted: bool,
+    ) {
+        self.failure = Some(static_failure_with_causes(
+            phase,
+            last_completed_for_smoke_failure(phase, accepted),
+            class,
+            code,
+            summary,
+            causes,
+            accepted,
+        ));
         self.artifact.attempt.prompt_may_have_been_accepted = accepted;
     }
 
@@ -864,8 +884,8 @@ impl ArtifactState {
             self.failure = Some((**diagnostic).clone());
             return;
         }
-        let (class, code, summary) = safe_error_category(error);
-        self.fail_static(fallback_phase, class, code, summary, accepted);
+        let (class, code, summary, causes) = safe_error_category(error);
+        self.fail_static_with_causes(fallback_phase, class, code, summary, causes, accepted);
     }
 
     fn fail_turn_error(
@@ -953,6 +973,22 @@ fn build_git_commit() -> Option<&'static str> {
         .filter(|value| !value.is_empty())
 }
 
+fn last_completed_for_smoke_failure(
+    phase: DiagnosticPhase,
+    accepted: bool,
+) -> Option<DiagnosticPhase> {
+    if !accepted {
+        return None;
+    }
+    match phase {
+        DiagnosticPhase::PromptStart => Some(DiagnosticPhase::ConfigApply),
+        DiagnosticPhase::PromptStream => Some(DiagnosticPhase::PromptStart),
+        DiagnosticPhase::PromptFinish => Some(DiagnosticPhase::PromptStream),
+        DiagnosticPhase::Teardown => Some(DiagnosticPhase::PromptFinish),
+        _ => None,
+    }
+}
+
 fn static_failure(
     phase: DiagnosticPhase,
     class: DiagnosticFailureClass,
@@ -960,18 +996,14 @@ fn static_failure(
     summary: &'static str,
     accepted: bool,
 ) -> FailureDiagnostic {
-    let last_completed_phase = if accepted {
-        match phase {
-            DiagnosticPhase::PromptStart => Some(DiagnosticPhase::ConfigApply),
-            DiagnosticPhase::PromptStream => Some(DiagnosticPhase::PromptStart),
-            DiagnosticPhase::PromptFinish => Some(DiagnosticPhase::PromptStream),
-            DiagnosticPhase::Teardown => Some(DiagnosticPhase::PromptFinish),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    static_failure_with_context(phase, last_completed_phase, class, code, summary, accepted)
+    static_failure_with_context(
+        phase,
+        last_completed_for_smoke_failure(phase, accepted),
+        class,
+        code,
+        summary,
+        accepted,
+    )
 }
 
 fn static_failure_with_context(
@@ -982,6 +1014,26 @@ fn static_failure_with_context(
     summary: &'static str,
     accepted: bool,
 ) -> FailureDiagnostic {
+    static_failure_with_causes(
+        phase,
+        last_completed_phase,
+        class,
+        code,
+        summary,
+        Vec::new(),
+        accepted,
+    )
+}
+
+fn static_failure_with_causes(
+    phase: DiagnosticPhase,
+    last_completed_phase: Option<DiagnosticPhase>,
+    class: DiagnosticFailureClass,
+    code: &'static str,
+    summary: &'static str,
+    causes: Vec<String>,
+    accepted: bool,
+) -> FailureDiagnostic {
     FailureDiagnostic::build_static_code(
         FailureDiagnosticInput {
             failed_phase: phase,
@@ -990,7 +1042,7 @@ fn static_failure_with_context(
             disposition: FailureDisposition::Fatal,
             code: String::new(),
             summary: summary.to_owned(),
-            causes: Vec::new(),
+            causes,
             stderr_observed: false,
             stderr_line_count: 0,
             stderr_scope: None,
@@ -1008,9 +1060,21 @@ fn static_failure_with_context(
 
 fn safe_error_category(
     error: &BridgeError,
-) -> (DiagnosticFailureClass, &'static str, &'static str) {
+) -> (
+    DiagnosticFailureClass,
+    &'static str,
+    &'static str,
+    Vec<String>,
+) {
     use DiagnosticFailureClass as Class;
-    match error {
+    let causes = match error {
+        BridgeError::ConfigInvalid { .. }
+        | BridgeError::ConfigMismatch { .. }
+        | BridgeError::ConfigReseedRequired { .. }
+        | BridgeError::InvalidRequest { .. } => vec![error.to_string()],
+        _ => Vec::new(),
+    };
+    let (class, code, summary) = match error {
         BridgeError::ModelNotAvailable => (Class::Model, "smoke.model", "Model unavailable"),
         BridgeError::AgentNotAuthenticated | BridgeError::AuthRequired { .. } => (
             Class::Authentication,
@@ -1047,7 +1111,8 @@ fn safe_error_category(
             "Agent response did not satisfy the smoke terminal contract",
         ),
         _ => (Class::Unknown, "smoke.failure", "Smoke attempt failed"),
-    }
+    };
+    (class, code, summary, causes)
 }
 
 fn is_timeout_failure(error: &BridgeError) -> bool {
@@ -1803,12 +1868,13 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
     };
     let snapshot = match crate::validate_registry_config_contents(raw) {
         Ok(snapshot) => snapshot,
-        Err(_) => {
-            state.fail_static(
+        Err(error) => {
+            state.fail_static_with_causes(
                 DiagnosticPhase::Resolve,
                 DiagnosticFailureClass::Config,
                 "smoke.config_load",
                 "Smoke config could not be loaded",
+                vec![error.to_string()],
                 false,
             );
             return state.finalize(args.include_redacted_stderr).await;
@@ -3748,6 +3814,32 @@ mod tests {
         assert_eq!(value["diagnostics"]["failure"]["retry_after_ms"], 1234);
         assert_eq!(value["diagnostics"]["failure"]["reset_at_ms"], now + 5000);
         assert_eq!(value["success"], false);
+    }
+
+    #[tokio::test]
+    async fn smoke_config_failure_preserves_underlying_message() {
+        let mut state = ArtifactState::new(&args());
+        state.fail_error(
+            &BridgeError::ConfigInvalid {
+                reason: "container agent rejected model override at prompt_start".into(),
+            },
+            DiagnosticPhase::PromptStart,
+            true,
+        );
+
+        let artifact = state.finalize(false).await;
+        let failure = artifact.diagnostics.failure.expect("failure JSON");
+        assert_eq!(failure["code"], "smoke.config");
+        assert!(
+            failure["causes"]
+                .as_array()
+                .expect("causes")
+                .iter()
+                .any(|cause| cause
+                    .as_str()
+                    .is_some_and(|text| text.contains("container agent rejected model override"))),
+            "config failure should preserve the underlying message: {failure:?}"
+        );
     }
 
     #[test]

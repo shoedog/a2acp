@@ -456,6 +456,10 @@ fn parse_begin_turn_params(params: &Map<String, Value>) -> Option<TurnConfig> {
     if params.get("schema_version").and_then(Value::as_u64) != Some(1) {
         return None;
     }
+    // §4.3: `session_id` is the ACP agent-session id that appears later as
+    // `sessionId` on session/update frames. It is not the bridge ContextId or
+    // public A2A session id; the wrapper uses it only to bind beginTurn state to
+    // the child stream it observes.
     let session_id = params
         .get("session_id")
         .or_else(|| params.get("sessionId"))?
@@ -670,7 +674,9 @@ fn should_buffer_prompt_frame(value: &Value) -> bool {
         && value.get("id").is_none()
 }
 
-/// Removes every child-supplied reserved `_meta` key (§4.2). Returns whether
+/// Removes every child-supplied reserved `_meta` key (§4.2). This is not a
+/// general metadata sanitizer: non-reserved child metadata remains byte-for-byte
+/// unless this one reserved-key removal forces reserialization. Returns whether
 /// anything was removed so the caller knows the original wire line no longer
 /// matches the value.
 fn strip_reserved_meta(value: &mut Value) -> bool {
@@ -1002,6 +1008,18 @@ mod tests {
     }
 
     #[test]
+    fn three_commit_markers_keep_all_candidate_text() {
+        let m = marker();
+        let original = format!("a {m}b {m}c {m}d");
+        let out = resolve(&original);
+        assert_eq!(
+            out.status,
+            WrapperStatus::Unavailable("multiple_commit_markers")
+        );
+        assert_eq!(String::from_utf8(out.body).unwrap(), original);
+    }
+
+    #[test]
     fn backslash_parity_decodes_literal_and_commit_forms() {
         let m = marker();
         assert_eq!(
@@ -1256,6 +1274,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_flush_orders_control_before_terminal_after_buffered_updates() {
+        let before = serde_json::to_string(&text_frame("before", "before marker")).unwrap();
+        let committed =
+            serde_json::to_string(&text_frame("commit", format!("{}deliver", marker()))).unwrap();
+        let tool = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s",
+                "update": { "sessionUpdate": "tool_call", "id": "after-commit" }
+            }
+        }))
+        .unwrap();
+        let mut prompt = prompt_with_lines(vec![before.clone(), committed, tool.clone()]);
+
+        let lines = flush_lines(&mut prompt).await;
+        assert_eq!(
+            lines.len(),
+            5,
+            "expected three buffered updates, control, terminal: {lines:?}"
+        );
+        assert_eq!(lines[0], before);
+        assert_eq!(lines[2], tool);
+        let rewritten: Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(agent_text_chunk(&rewritten), Some("deliver"));
+        let control: Value = serde_json::from_str(&lines[3]).unwrap();
+        assert_eq!(
+            control["params"]["update"]["_meta"][META_KEY]["kind"],
+            "attested"
+        );
+        assert_eq!(lines[4], TERMINAL_RAW);
+    }
+
+    #[tokio::test]
     async fn spool_overflow_preserves_buffered_frame_bytes() {
         // Push enough oversized lines to cross FRAME_MEMORY_LIMIT_BYTES so the
         // buffer migrates to the spool file, then confirm the round-trip
@@ -1271,6 +1323,35 @@ mod tests {
         }
         assert!(buffer.spool.is_some(), "test must exercise the spool path");
         assert_eq!(buffer.into_lines().unwrap(), lines);
+    }
+
+    #[test]
+    fn spool_read_rejects_frame_count_mismatch() {
+        let mut spool = SpoolFile::create().unwrap();
+        spool.write_line("one").unwrap();
+        spool.count = 2;
+        let err = spool.read_lines().unwrap_err();
+        assert!(
+            err.to_string().contains("frame count mismatch"),
+            "unexpected spool error: {err}"
+        );
+    }
+
+    #[test]
+    fn spool_write_io_failure_is_propagated() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let readonly = File::open(&path).unwrap();
+        let mut spool = SpoolFile {
+            path,
+            file: readonly,
+            count: 0,
+        };
+        let err = spool.write_line("one").unwrap_err();
+        assert!(
+            err.downcast_ref::<std::io::Error>().is_some(),
+            "write failure should preserve its I/O error type: {err}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1549,7 +1630,15 @@ mod tests {
             meta.get(META_KEY).is_some(),
             "reserved key missing: {meta:?}"
         );
+        assert_eq!(meta.as_object().expect("outer meta object").len(), 1);
         assert_eq!(meta[META_KEY]["kind"], "attested");
+        assert_eq!(
+            meta[META_KEY]
+                .as_object()
+                .expect("inner reserved meta object")
+                .len(),
+            8
+        );
         assert_eq!(meta[META_KEY]["process_prefix_bytes"], "3");
     }
 

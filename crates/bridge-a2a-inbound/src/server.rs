@@ -35,8 +35,8 @@ use serde_json::{json, Value};
 
 use a2a::{methods, SVC_PARAM_VERSION};
 use bridge_core::attestation::{
-    append_prompt_contract, generate_turn_id, prefix_attestation_request_for_capability,
-    HarvestSanitizationMode, PrefixAttestationRequest,
+    append_attestation_contract_to_last_part, generate_turn_id,
+    prefix_attestation_request_for_capability, HarvestSanitizationMode,
 };
 use bridge_core::domain::{
     effective_config, AgentOverride, AuthContext, InboundRequest, Part, PeerTaskId, RouteTarget,
@@ -81,17 +81,6 @@ const JSONRPC_INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC 2.0 internal error.
 const JSONRPC_INTERNAL: i32 = -32603;
 const DIRECT_DIAGNOSTIC_CAPACITY: usize = 64;
-
-fn append_attestation_contract_to_last_part(
-    parts: &mut [Part],
-    capability: &bridge_core::attestation::PrefixAttestationCapability,
-    request: &PrefixAttestationRequest,
-) {
-    if let Some(last) = parts.last_mut() {
-        let text = std::mem::take(&mut last.text);
-        last.text = append_prompt_contract(text, capability, request);
-    }
-}
 
 fn direct_diagnostic_observer() -> Arc<dyn DiagnosticObserver> {
     Arc::new(
@@ -541,7 +530,7 @@ async fn resolve_configure_bind(
                     eff.model.clone(),
                     eff.effort.map(effort_to_string),
                     eff.mode.clone(),
-                ),
+                )?,
             });
         }
     }
@@ -590,14 +579,14 @@ async fn resolve_configure_bind(
             obs_model,
             obs_effort.map(effort_to_string),
             obs_mode,
-        ),
+        )?,
         // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
         abort: tokio_util::sync::CancellationToken::new(),
     })
 }
 
-fn mint_turn_id() -> bridge_core::ids::TurnId {
-    generate_turn_id().expect("secure turn id generation succeeds")
+fn mint_turn_id() -> Result<bridge_core::ids::TurnId, BridgeError> {
+    generate_turn_id()
 }
 
 fn effort_to_string(effort: bridge_core::domain::Effort) -> String {
@@ -624,9 +613,9 @@ fn obs_ctx_for_dispatch(
     model: Option<String>,
     effort: Option<String>,
     mode: Option<String>,
-) -> bridge_core::ports::TurnContext {
-    bridge_core::ports::TurnContext {
-        turn_id: mint_turn_id(),
+) -> Result<bridge_core::ports::TurnContext, BridgeError> {
+    Ok(bridge_core::ports::TurnContext {
+        turn_id: mint_turn_id()?,
         session_id: routed_session_context_id(routed),
         task_id: Some(routed.task.clone()),
         workflow: None,
@@ -638,7 +627,7 @@ fn obs_ctx_for_dispatch(
         mode,
         prompt_id: routed.prompt_id.clone(),
         traceparent: routed.traceparent.clone(),
-    }
+    })
 }
 
 /// Slice 0 warm path. Returns None when the request carries no contextId (caller uses
@@ -664,13 +653,16 @@ async fn warm_local_dispatch(
         .await
     {
         Ok(turn) => {
-            let obs_ctx = obs_ctx_for_dispatch(
+            let obs_ctx = match obs_ctx_for_dispatch(
                 routed,
                 &turn.agent,
                 turn.model.clone(),
                 turn.effort.clone(),
                 turn.mode.clone(),
-            );
+            ) {
+                Ok(ctx) => ctx,
+                Err(error) => return Some(Err(error)),
+            };
             let turn_id = obs_ctx.turn_id.clone();
             let prefix_capability = turn.backend.prefix_attestation_capability();
             // Inbound direct dispatch has no per-node config surface (§6): harvest sanitization is permanently Off here.
@@ -2604,8 +2596,15 @@ fn local_kiro_source(
     // Build the stream by cloning Arc refs into a `'static + Send` stream.
     let stream: crate::fanout::EventStream = Box::pin(async_stream::stream! {
         let translator = Translator::new();
+        let turn_id = match mint_turn_id() {
+            Ok(turn_id) => turn_id,
+            Err(error) => {
+                yield Err(error);
+                return;
+            }
+        };
         let turn_context = bridge_core::ports::TurnContext {
-            turn_id: mint_turn_id(),
+            turn_id,
             session_id: ContextId::parse(session.as_str()).unwrap_or_else(|_| {
                 ContextId::parse("fanout-local").expect("fallback context id is valid")
             }),

@@ -149,7 +149,12 @@ pub fn loop_outcome_suffix(rep: &LoopReport) -> String {
 #[async_trait::async_trait]
 pub trait TweakEffects {
     async fn verify(&mut self, attempt: u32) -> VerifyOutcome;
-    async fn review(&mut self, attempt: u32, head_sha: &str) -> (ReviewOutcome, String);
+    async fn review(
+        &mut self,
+        attempt: u32,
+        head_sha: &str,
+        verify: &VerifyOutcome,
+    ) -> (ReviewOutcome, String);
     /// Run a fix turn with `input`; returns whether the workflow COMPLETED. May mutate the clone.
     async fn fix(&mut self, attempt: u32, input: &str) -> bool;
 }
@@ -200,7 +205,7 @@ pub async fn run_tweak_loop(
             };
         }
         last_verify = eff.verify(attempt).await;
-        let (rev, synth) = eff.review(attempt, &sha).await;
+        let (rev, synth) = eff.review(attempt, &sha, &last_verify).await;
         last_review = rev;
         match classify(attempt, max_attempts, &last_verify, &last_review) {
             LoopStep::Stop(reason) => {
@@ -308,13 +313,17 @@ pub async fn run_tweak_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verify::{aggregate, VerifyResult};
+    use crate::verify::{aggregate, VerifyFailureClass, VerifyReach, VerifyResult};
 
     fn ran(passed: bool) -> VerifyOutcome {
         VerifyOutcome::Ran(aggregate(vec![VerifyResult {
             name: "t".into(),
             gate: true,
             ok: passed,
+            reach: VerifyReach::Reached {
+                exit_status: if passed { 0 } else { 1 },
+            },
+            failure_class: (!passed).then_some(VerifyFailureClass::Command),
             output: String::new(),
         }]))
     }
@@ -549,7 +558,12 @@ mod tests {
         async fn verify(&mut self, attempt: u32) -> VerifyOutcome {
             at(&self.verify, attempt)
         }
-        async fn review(&mut self, attempt: u32, _head: &str) -> (ReviewOutcome, String) {
+        async fn review(
+            &mut self,
+            attempt: u32,
+            _head: &str,
+            _verify: &VerifyOutcome,
+        ) -> (ReviewOutcome, String) {
             (at(&self.review, attempt), "BLOCKER: synth body".into())
         }
         async fn fix(&mut self, attempt: u32, _input: &str) -> bool {

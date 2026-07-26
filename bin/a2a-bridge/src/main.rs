@@ -1970,6 +1970,7 @@ async fn run_review_step(
     clone_cwd: &bridge_core::SessionCwd,
     task_id: &str,
     attempt: u32,
+    verify_outcome: &verify::VerifyOutcome,
     depth: review::Depth,
     slice: &dyn slice::SliceRunner,
 ) -> (review::ReviewOutcome, String) {
@@ -2049,7 +2050,13 @@ async fn run_review_step(
     let Some(graph) = wf_map.get(&graph_id).cloned() else {
         return (review::ReviewOutcome::NotLoaded, String::new());
     };
-    let input = review::build_review_input(task, base_sha, head_sha, slice_ref.as_deref());
+    let input = review::build_review_input(
+        task,
+        base_sha,
+        head_sha,
+        slice_ref.as_deref(),
+        verify_outcome,
+    );
     let ctx = bridge_workflow::executor::WorkflowRunContext {
         session_cwd: Some(clone_cwd.clone()),
         make_rich_sink: None,
@@ -2140,7 +2147,12 @@ impl tweak::TweakEffects for ProdEffects<'_> {
     async fn verify(&mut self, _attempt: u32) -> verify::VerifyOutcome {
         run_verify_step(self.verify_cfg, self.profile, self.clone_cwd, self.repo)
     }
-    async fn review(&mut self, attempt: u32, head_sha: &str) -> (review::ReviewOutcome, String) {
+    async fn review(
+        &mut self,
+        attempt: u32,
+        head_sha: &str,
+        verify_outcome: &verify::VerifyOutcome,
+    ) -> (review::ReviewOutcome, String) {
         run_review_step(
             self.review_cfg,
             self.wf_map,
@@ -2151,6 +2163,7 @@ impl tweak::TweakEffects for ProdEffects<'_> {
             self.clone_cwd,
             self.task_id,
             attempt,
+            verify_outcome,
             self.depth,
             &slice::ProdSliceRunner,
         )
@@ -3383,6 +3396,11 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     }
 
     if serve {
+        if !input.is_empty() {
+            eprintln!(
+                "run-workflow: WARNING: --serve cannot inspect the remote workflow graph; ensure workflow {workflow_id:?} has a node prompt containing {{{{input}}}} or the supplied --input may be ignored"
+            );
+        }
         let context = context.expect("parse_run_workflow_args requires --context with --serve");
         return run_workflow_serve_client(
             &workflow_id,
@@ -3418,6 +3436,11 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         .get(&wf_id)
         .cloned()
         .ok_or_else(|| format!("run-workflow: unknown workflow {workflow_id:?}"))?;
+
+    if let Some(error) = bridge_workflow::executor::input_consumption_error(&graph, &input) {
+        eprintln!("run-workflow: ERROR: {error}");
+        return Err(format!("run-workflow: {error}").into());
+    }
 
     let harvest_enabled = graph.nodes.iter().any(|node| {
         matches!(
@@ -8056,6 +8079,70 @@ mod cli_tests {
         claude.mcp = codex.mcp.clone();
         let (_p, argv) = acp_program_argv(&claude, None, &[], "/repo/z").unwrap();
         assert!(!argv.iter().any(|a| a == "-c"), "no -c for Acp: {argv:?}");
+    }
+
+    #[test]
+    fn acp_program_argv_wraps_unsandboxed_codex_and_preserves_mcp_args() {
+        use bridge_core::mcp::{McpDelivery, McpServerSpec};
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp
+            .path()
+            .join(format!("codex-acp{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&child, "#!/bin/sh\n").unwrap();
+        let previous = std::env::var_os(CODEX_ACP_CHILD_ENV);
+        std::env::set_var(CODEX_ACP_CHILD_ENV, &child);
+
+        let mut codex = acp_entry("codex");
+        codex.cmd = Some("codex-acp".into());
+        codex.sandbox = None;
+        codex.mcp_delivery = McpDelivery::CodexNative;
+        codex.mcp = vec![McpServerSpec {
+            name: "prism".into(),
+            command: "/opt/prism".into(),
+            args: vec!["--repo".into(), "{cwd}".into()],
+            env: vec![],
+        }];
+
+        let result = acp_program_argv(&codex, None, &[], "/repo/z");
+        match previous {
+            Some(value) => std::env::set_var(CODEX_ACP_CHILD_ENV, value),
+            None => std::env::remove_var(CODEX_ACP_CHILD_ENV),
+        }
+
+        let (program, argv) = result.unwrap();
+        assert_eq!(program, packaged_codex_attested_wrapper().unwrap());
+        assert_eq!(argv[0], CODEX_ACP_ATTESTED_INTERNAL_ARG);
+        assert_eq!(argv[1], "--codex-acp");
+        assert_eq!(
+            argv[2],
+            std::fs::canonicalize(&child)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+        let separator = argv
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("wrapper separator");
+        assert!(
+            argv[separator + 1..].iter().any(|arg| arg == "-c"),
+            "Codex-native MCP args must pass through the wrapper after --: {argv:?}"
+        );
+        assert!(
+            argv[separator + 1..]
+                .iter()
+                .any(|arg| arg == r#"mcp_servers.prism.command="/opt/prism""#),
+            "MCP command override missing after wrapper separator: {argv:?}"
+        );
+        assert!(
+            argv[separator + 1..]
+                .iter()
+                .any(|arg| arg.contains("/repo/z")),
+            "MCP cwd substitution missing after wrapper separator: {argv:?}"
+        );
     }
 
     #[test]

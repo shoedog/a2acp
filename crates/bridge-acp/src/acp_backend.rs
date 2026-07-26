@@ -3379,6 +3379,35 @@ impl AcpBackend {
                 CapabilityUnavailableReason::BackendDeclaredIncapable,
             ),
         };
+        if let PrefixAttestationCapability::Unsupported { reason } = &prefix_attestation_capability
+        {
+            let code = match reason {
+                CapabilityUnavailableReason::BackendDeclaredIncapable => {
+                    "acp.prefix_attestation.backend_declared_incapable"
+                }
+                CapabilityUnavailableReason::ProtocolDowngrade => {
+                    "acp.prefix_attestation.protocol_downgrade"
+                }
+            };
+            lifecycle
+                .record(
+                    DiagnosticPhase::Initialize,
+                    PhaseStatus::Started,
+                    None,
+                    Some("acp.prefix_attestation.capability_probe"),
+                    None,
+                )
+                .await?;
+            lifecycle
+                .record(
+                    DiagnosticPhase::Initialize,
+                    PhaseStatus::Skipped,
+                    None,
+                    Some(code),
+                    None,
+                )
+                .await?;
+        }
 
         let container_reap = container_controller.or_else(|| {
             config
@@ -4944,6 +4973,31 @@ impl AcpBackend {
                 InvalidAttestationReason::MalformedMetadata,
             ));
         };
+        let Some(kind) = obj.get("kind").and_then(serde_json::Value::as_str) else {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            ));
+        };
+        let expected_fields = match kind {
+            "attested" => 8,
+            "unavailable" => 6,
+            _ => {
+                return Some(PrefixAttestationStatus::rejected(
+                    state.producer_id.clone(),
+                    state.turn_id.clone(),
+                    InvalidAttestationReason::MalformedMetadata,
+                ));
+            }
+        };
+        if obj.len() != expected_fields {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            ));
+        }
         if obj
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
@@ -4980,8 +5034,8 @@ impl AcpBackend {
                 InvalidAttestationReason::NonceMismatch,
             ));
         }
-        match obj.get("kind").and_then(serde_json::Value::as_str) {
-            Some("attested") => {
+        match kind {
+            "attested" => {
                 let Some(process_prefix_bytes) = obj
                     .get("process_prefix_bytes")
                     .and_then(serde_json::Value::as_str)
@@ -5024,7 +5078,7 @@ impl AcpBackend {
                     process_prefix_bytes,
                 }))
             }
-            Some("unavailable") => {
+            "unavailable" => {
                 let Some(reason) = obj
                     .get("reason")
                     .and_then(serde_json::Value::as_str)
@@ -7228,6 +7282,26 @@ mod tests {
                 ..
             }))
         ));
+
+        let mut extra_inner = attested_prefix_meta();
+        extra_inner
+            .as_object_mut()
+            .unwrap()
+            .get_mut(ATTESTED_PREFIX_META_KEY)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("extra_inner".to_string(), serde_json::json!(true));
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(
+                &prefix_control_notification(extra_inner),
+                &state,
+            ),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::MalformedMetadata,
+                ..
+            }))
+        ));
     }
 
     #[test]
@@ -8512,6 +8586,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_records_backend_declared_incapable_prefix_diagnostic() {
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_fake_agent(
+            agent_side,
+            InitializeResponse::new(ProtocolVersion::V1)
+                .agent_capabilities(AgentCapabilities::default()),
+        );
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+        let be = AcpBackend::connect_observed(client_side, test_config(), observer.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            be.prefix_attestation_capability(),
+            PrefixAttestationCapability::unsupported(
+                CapabilityUnavailableReason::BackendDeclaredIncapable
+            )
+        );
+        let events = observer.snapshot().await;
+        assert!(
+            events.iter().any(|event| {
+                event.transition().phase() == DiagnosticPhase::Initialize
+                    && event.transition().status() == PhaseStatus::Skipped
+                    && event.transition().code().map(|code| code.as_str())
+                        == Some("acp.prefix_attestation.backend_declared_incapable")
+            }),
+            "connect must record the incapable prefix diagnostic, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn prefix_capability_handshake_missing_private_response_downgrades() {
         let (client_side, agent_side) = Channel::duplex();
         spawn_fake_agent(
@@ -8521,18 +8625,25 @@ mod tests {
         );
         let mut config = test_config();
         config.prefix_attestation_transport = PrefixAttestationTransport::PackagedCodexAcpAttested;
-        let be = AcpBackend::connect_observed(
-            client_side,
-            config,
-            Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
-        )
-        .await
-        .unwrap();
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+        let be = AcpBackend::connect_observed(client_side, config, observer.clone())
+            .await
+            .unwrap();
         assert_eq!(
             be.prefix_attestation_capability(),
             PrefixAttestationCapability::unsupported(
                 CapabilityUnavailableReason::ProtocolDowngrade
             )
+        );
+        let events = observer.snapshot().await;
+        assert!(
+            events.iter().any(|event| {
+                event.transition().phase() == DiagnosticPhase::Initialize
+                    && event.transition().status() == PhaseStatus::Skipped
+                    && event.transition().code().map(|code| code.as_str())
+                        == Some("acp.prefix_attestation.protocol_downgrade")
+            }),
+            "connect must record the protocol downgrade prefix diagnostic, got {events:?}"
         );
     }
 

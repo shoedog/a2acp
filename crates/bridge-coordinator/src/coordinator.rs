@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bridge_core::attestation::{
-    append_prompt_contract, prefix_attestation_request_for_capability, HarvestSanitizationMode,
+    append_attestation_contract_to_last_part, prefix_attestation_request_for_capability,
+    HarvestSanitizationMode,
 };
 use bridge_core::domain::{InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
@@ -38,17 +39,6 @@ use crate::turn_parts::assemble_turn_parts;
 
 static PROMPT_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 const DIRECT_DIAGNOSTIC_CAPACITY: usize = 64;
-
-fn append_attestation_contract_to_last_part(
-    parts: &mut [Part],
-    capability: &bridge_core::attestation::PrefixAttestationCapability,
-    request: &bridge_core::attestation::PrefixAttestationRequest,
-) {
-    if let Some(last) = parts.last_mut() {
-        let text = std::mem::take(&mut last.text);
-        last.text = append_prompt_contract(text, capability, request);
-    }
-}
 
 fn direct_diagnostic_observer() -> Arc<dyn DiagnosticObserver> {
     Arc::new(
@@ -474,17 +464,17 @@ impl Coordinator {
             .unwrap_or(false))
     }
 
-    fn new_turn_id() -> bridge_core::ids::TurnId {
-        bridge_core::attestation::generate_turn_id().expect("secure turn id generation succeeds")
+    fn new_turn_id() -> Result<bridge_core::ids::TurnId, BridgeError> {
+        bridge_core::attestation::generate_turn_id()
     }
 
     fn turn_context_for_warm(
         ctx: &ContextId,
         task: Option<TaskId>,
         turn: &crate::session_manager::WarmTurn,
-    ) -> TurnContext {
-        TurnContext {
-            turn_id: Self::new_turn_id(),
+    ) -> Result<TurnContext, BridgeError> {
+        Ok(TurnContext {
+            turn_id: Self::new_turn_id()?,
             session_id: ctx.clone(),
             task_id: task,
             workflow: None,
@@ -496,7 +486,7 @@ impl Coordinator {
             mode: turn.mode.clone(),
             prompt_id: None,
             traceparent: None,
-        }
+        })
     }
 
     /// Drive ONE warm turn to completion and collect it into a `TurnOutput`. Records usage as a side
@@ -528,7 +518,7 @@ impl Coordinator {
         diagnostic: Arc<dyn DiagnosticObserver>,
     ) -> Result<TurnOutput, BridgeError> {
         let task = self.mint_prompt_task_id();
-        let obs_ctx = Self::turn_context_for_warm(&ctx, Some(task.clone()), &turn);
+        let obs_ctx = Self::turn_context_for_warm(&ctx, Some(task.clone()), &turn)?;
         let started = Instant::now();
         let mut ttft = None;
         let mut last_usage: Option<UsageSnapshot> = None;

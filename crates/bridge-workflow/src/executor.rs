@@ -64,6 +64,27 @@ pub struct WorkflowDiagnosticContext {
     factory: Arc<dyn DiagnosticObserverFactory>,
 }
 
+/// True when at least one node explicitly renders the run-workflow input variable.
+pub fn graph_consumes_input(graph: &WorkflowGraph) -> bool {
+    graph
+        .nodes
+        .iter()
+        .any(|node| node.prompt_template.contains("{{input}}"))
+}
+
+/// Error text for the local CLI guard that prevents a non-empty `--input` brief
+/// from being silently ignored by a workflow whose prompts never reference it.
+pub fn input_consumption_error(graph: &WorkflowGraph, input: &str) -> Option<String> {
+    if input.is_empty() || graph_consumes_input(graph) {
+        None
+    } else {
+        Some(format!(
+            "workflow {:?} has no node prompt containing {{{{input}}}}, so the supplied --input would be ignored",
+            graph.id.as_str()
+        ))
+    }
+}
+
 impl WorkflowDiagnosticContext {
     pub fn new(request: WorkflowRunContext, factory: Arc<dyn DiagnosticObserverFactory>) -> Self {
         Self { request, factory }
@@ -162,8 +183,9 @@ pub trait WorkflowNodeDispatcher: Send + Sync {
 /// Uniform future type used in the per-run `FuturesUnordered` pool.
 /// Each fan-out node is boxed to this type so `FuturesUnordered` can hold
 /// futures of different async-block monomorphisations in one collection.
-type NodeFut<'a> =
-    std::pin::Pin<Box<dyn futures::Future<Output = (NodeId, NodeRunOutput)> + Send + 'a>>;
+type NodeFut<'a> = std::pin::Pin<
+    Box<dyn futures::Future<Output = (NodeId, Result<NodeRunOutput, BridgeError>)> + Send + 'a>,
+>;
 
 #[derive(Clone)]
 struct NodeHarvestMeta {
@@ -211,14 +233,14 @@ fn node_harvest_meta(
     capability: PrefixAttestationCapability,
     status: PrefixAttestationStatus,
     origin: CompletionBodyOrigin,
-) -> NodeHarvestMeta {
-    node_harvest_meta_from_context(
-        node_turn_context(wf_id, node, run_id, ctx, None, None, None, attempt),
+) -> Result<NodeHarvestMeta, BridgeError> {
+    Ok(node_harvest_meta_from_context(
+        node_turn_context(wf_id, node, run_id, ctx, None, None, None, attempt)?,
         node,
         capability,
         status,
         origin,
-    )
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -232,8 +254,8 @@ fn node_run_output(
     usage: Option<UsageSnapshot>,
     disposition: NodeDisposition,
     origin: CompletionBodyOrigin,
-) -> NodeRunOutput {
-    NodeRunOutput {
+) -> Result<NodeRunOutput, BridgeError> {
+    Ok(NodeRunOutput {
         text,
         ok,
         usage,
@@ -249,8 +271,8 @@ fn node_run_output(
             PrefixAttestationCapability::default(),
             PrefixAttestationStatus::default(),
             origin,
-        ),
-    }
+        )?,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -622,10 +644,9 @@ fn node_turn_context(
     effort: Option<String>,
     mode: Option<String>,
     attempt: u32,
-) -> TurnContext {
-    TurnContext {
-        turn_id: bridge_core::attestation::generate_turn_id()
-            .expect("secure workflow turn id generation succeeds"),
+) -> Result<TurnContext, BridgeError> {
+    Ok(TurnContext {
+        turn_id: bridge_core::attestation::generate_turn_id()?,
         session_id: bridge_core::ids::ContextId::parse(run_id).unwrap_or_else(|_| {
             bridge_core::ids::ContextId::parse("workflow-fallback").expect("fallback is valid")
         }),
@@ -639,7 +660,7 @@ fn node_turn_context(
         mode,
         prompt_id: ctx.prompt_id.clone(),
         traceparent: ctx.parent_traceparent.clone(),
-    }
+    })
 }
 
 impl WorkflowExecutor {
@@ -999,7 +1020,7 @@ impl WorkflowExecutor {
         diagnostic_factory: &Arc<dyn DiagnosticObserverFactory>,
         dispatcher: Option<&Arc<dyn WorkflowNodeDispatcher>>,
         preflight_cache: &PreflightCache,
-    ) -> NodeRunOutput {
+    ) -> Result<NodeRunOutput, BridgeError> {
         if cancel.is_cancelled() {
             return node_run_output(
                 wf_id,
@@ -1015,7 +1036,7 @@ impl WorkflowExecutor {
         }
         if let Some(d) = dispatcher {
             let rendered = render(&node.prompt_template, vars);
-            let node_obs_ctx = node_turn_context(wf_id, node, run_id, ctx, None, None, None, 0);
+            let node_obs_ctx = node_turn_context(wf_id, node, run_id, ctx, None, None, None, 0)?;
             ctx.observer
                 .record(&ObsEvent::NodeStarted { ctx: &node_obs_ctx });
             let entry_snapshot = self.registry.entry_snapshot(&node.agent);
@@ -1110,7 +1131,7 @@ impl WorkflowExecutor {
                     obs_effort.clone(),
                     obs_mode.clone(),
                     attempt,
-                );
+                )?;
                 let mut turn = match d
                     .checkout_observed_with_overrides(
                         wf_id,
@@ -1602,7 +1623,7 @@ impl WorkflowExecutor {
                 } else {
                     CompletionBodyOrigin::BridgeSyntheticStreamError
                 };
-                return NodeRunOutput {
+                return Ok(NodeRunOutput {
                     text,
                     ok,
                     usage: last_usage,
@@ -1614,7 +1635,7 @@ impl WorkflowExecutor {
                         prefix_attestation_status,
                         origin,
                     ),
-                };
+                });
             }
         }
         let rendered = render(&node.prompt_template, vars);
@@ -1669,7 +1690,7 @@ impl WorkflowExecutor {
         let retry_enabled = node.retry.is_some();
 
         // Emit NodeStarted exactly once before the retry loop.
-        let node_obs_ctx = node_turn_context(wf_id, node, run_id, ctx, None, None, None, 0);
+        let node_obs_ctx = node_turn_context(wf_id, node, run_id, ctx, None, None, None, 0)?;
         ctx.observer
             .record(&ObsEvent::NodeStarted { ctx: &node_obs_ctx });
 
@@ -1694,7 +1715,7 @@ impl WorkflowExecutor {
                             PrefixAttestationCapability::default(),
                             PrefixAttestationStatus::default(),
                             CompletionBodyOrigin::BridgeSyntheticCancellation,
-                        ),
+                        )?,
                     );
                 }
 
@@ -1728,7 +1749,7 @@ impl WorkflowExecutor {
                                     PrefixAttestationCapability::default(),
                                     PrefixAttestationStatus::default(),
                                     CompletionBodyOrigin::BridgeSyntheticStreamError,
-                                ),
+                                )?,
                             );
                         }
                     }
@@ -1749,7 +1770,7 @@ impl WorkflowExecutor {
                     PrefixAttestationCapability::default(),
                     PrefixAttestationStatus::default(),
                     CompletionBodyOrigin::BridgeSyntheticStreamError,
-                );
+                )?;
                 let outcome = 'attempt: {
                     // resolve, with cancel
                     let mut resolved = tokio::select! {
@@ -1764,7 +1785,7 @@ impl WorkflowExecutor {
                                 PrefixAttestationCapability::default(),
                                 PrefixAttestationStatus::default(),
                                 CompletionBodyOrigin::BridgeSyntheticCancellation,
-                            );
+                            )?;
                             break 'attempt Attempt::Canceled {
                                 marker: format!("[node {} canceled]", node.id.as_str()),
                                 usage: None,
@@ -1812,7 +1833,7 @@ impl WorkflowExecutor {
                                 PrefixAttestationCapability::default(),
                                 PrefixAttestationStatus::default(),
                                 CompletionBodyOrigin::BridgeSyntheticCancellation,
-                            );
+                            )?;
                             break 'attempt Attempt::Canceled {
                                 marker: format!("[node {} canceled]", node.id.as_str()),
                                 usage: None,
@@ -1859,7 +1880,7 @@ impl WorkflowExecutor {
                     let obs_mode = eff.mode.clone();
                     let obs_ctx_here = node_turn_context(
                         wf_id, node, run_id, ctx, obs_model, obs_effort, obs_mode, attempt,
-                    );
+                    )?;
                     // NodeStarted was emitted before the loop; only emit TurnStarted here.
                     ctx.observer
                         .record(&ObsEvent::TurnStarted { ctx: &obs_ctx_here });
@@ -1937,7 +1958,7 @@ impl WorkflowExecutor {
                                     PrefixAttestationCapability::default(),
                                     PrefixAttestationStatus::default(),
                                     CompletionBodyOrigin::BridgeSyntheticCancellation,
-                                );
+                                )?;
                                 break 'attempt Attempt::Canceled {
                                     marker: format!("[node {} canceled]", node.id.as_str()),
                                     usage: None,
@@ -2620,7 +2641,7 @@ impl WorkflowExecutor {
                                             PrefixAttestationCapability::default(),
                                             PrefixAttestationStatus::default(),
                                             CompletionBodyOrigin::BridgeSyntheticCancellation,
-                                        ),
+                                        )?,
                                     );
                                 }
                                 _ = tokio::time::sleep(retry.backoff_for(attempt)) => {}
@@ -2661,13 +2682,13 @@ impl WorkflowExecutor {
             outcome: &final_node_outcome,
         });
         let disposition = NodeDisposition::from_turn(&final_node_outcome);
-        NodeRunOutput {
+        Ok(NodeRunOutput {
             text: final_text,
             ok: final_ok,
             usage: final_usage,
             disposition,
             harvest: final_harvest,
-        }
+        })
     }
 
     /// Run a workflow from scratch (no prior checkpoints).
@@ -3060,6 +3081,13 @@ impl WorkflowExecutor {
                 yield Ok(WorkflowEvent::NodeStarted { node });
             }
             while let Some((node_id, raw_output)) = inflight.next().await {
+                let raw_output = match raw_output {
+                    Ok(output) => output,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
                 let NodeRunOutput {
                     text: raw_text,
                     ok,
@@ -3602,6 +3630,22 @@ mod tests {
             }],
             panel: None,
         })
+    }
+
+    #[test]
+    fn input_consumption_guard_detects_templates_that_use_input() {
+        let graph = one_node_graph_with_template("please review {{input}}");
+        assert!(graph_consumes_input(&graph));
+        assert_eq!(input_consumption_error(&graph, "brief"), None);
+    }
+
+    #[test]
+    fn input_consumption_guard_flags_nonempty_dropped_input() {
+        let graph = one_node_graph_with_template("static prompt");
+        let error = input_consumption_error(&graph, "brief").expect("dropped input error");
+        assert!(error.contains("{{input}}"));
+        assert!(error.contains("ignored"));
+        assert_eq!(input_consumption_error(&graph, ""), None);
     }
 
     fn retry_graph(retry: Option<RetryPolicy>) -> Arc<WorkflowGraph> {
@@ -5216,7 +5260,8 @@ mod tests {
                 None,
                 &preflight_cache,
             )
-            .await;
+            .await
+            .unwrap();
         assert!(
             inline_output.ok,
             "inline path should run after fallback preflight: {}",
@@ -5238,7 +5283,8 @@ mod tests {
                 Some(&dispatcher_dyn),
                 &preflight_cache,
             )
-            .await;
+            .await
+            .unwrap();
         assert!(
             dispatcher_output.ok,
             "dispatcher path should reuse cached preflight: {}",
@@ -5342,8 +5388,8 @@ mod tests {
 
         let first_result = first.await;
         let second_result = second.await;
-        let first_output = first_result.unwrap();
-        let second_output = second_result;
+        let first_output = first_result.unwrap().unwrap();
+        let second_output = second_result.unwrap();
 
         assert!(
             first_output.ok,
@@ -7645,6 +7691,65 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct CountingNonRetainingHarvestStore {
+        commits: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl bridge_core::harvest::HarvestAuditStore for CountingNonRetainingHarvestStore {
+        fn retains_audit_records(&self) -> bool {
+            false
+        }
+
+        async fn commit_bundle(
+            &self,
+            _raw: bridge_core::harvest::HarvestRawRecordV1,
+            _decision: bridge_core::harvest::HarvestSanitizationDecisionV1,
+        ) -> Result<
+            bridge_core::harvest::HarvestAuditCommit,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            self.commits.fetch_add(1, Ordering::SeqCst);
+            Ok(bridge_core::harvest::HarvestAuditCommit::Inserted)
+        }
+
+        async fn get_by_audit_id(
+            &self,
+            _audit_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            Ok(None)
+        }
+
+        async fn get_by_attempt_key(
+            &self,
+            _run_id: &str,
+            _node_id: &str,
+            _attempt_id: u32,
+            _turn_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            Ok(None)
+        }
+
+        async fn list_by_task_id(
+            &self,
+            _task_id: &str,
+            _after_audit_id: Option<&str>,
+            _limit: u32,
+        ) -> Result<
+            Vec<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            Ok(Vec::new())
+        }
+    }
+
     fn retaining_memory_audit_store() -> Arc<dyn bridge_core::harvest::HarvestAuditStore> {
         let task_store: Arc<dyn bridge_core::task_store::TaskStore> =
             Arc::new(bridge_core::task_store::MemoryTaskStore::default());
@@ -7739,8 +7844,11 @@ mod tests {
             rows.len()
         );
 
-        // The same all-Off workflow also succeeds on the noop store: no
-        // commit is attempted, so nothing is silently discarded.
+        // The same all-Off workflow also succeeds on a non-retaining store:
+        // no commit is attempted, so nothing is silently discarded. This counted
+        // variant discriminates the production Noop path from a pre-fix
+        // mint-and-discard KeptOff bundle.
+        let counted_store = Arc::new(CountingNonRetainingHarvestStore::default());
         let ex = WorkflowExecutor::new(two_node_registry());
         let evs: Vec<_> = ex
             .run_with_context(
@@ -7748,7 +7856,10 @@ mod tests {
                 "DIFF".into(),
                 "run-alloff-noop".into(),
                 CancellationToken::new(),
-                WorkflowRunContext::default(),
+                WorkflowRunContext {
+                    harvest_audit_store: counted_store.clone(),
+                    ..WorkflowRunContext::default()
+                },
             )
             .collect()
             .await;
@@ -7759,6 +7870,11 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            counted_store.commits.load(Ordering::SeqCst),
+            0,
+            "all-Off workflow must not commit KeptOff bundles to a non-retaining store"
+        );
     }
 
     /// §18-4/§18-7 (MAJOR 3) + MAJOR 4 audit distinction: when at least one
@@ -7767,6 +7883,12 @@ mod tests {
     /// enabled-but-incapable node as `kept_no_attestation` with the distinct
     /// `backend_declared_incapable` reason (never `sanitization_not_requested`
     /// and never silently mistaken for Off).
+    ///
+    /// A non-retaining-store variant cannot exercise this mixed graph: the enabled
+    /// runnable node makes audit durability required for the whole invocation, so
+    /// the executor fails before either node runs. The all-Off counted-store test
+    /// above covers the only non-retaining path that may legitimately execute and
+    /// proves Off completions do not mint discarded KeptOff bundles there.
     #[tokio::test]
     async fn mixed_workflow_audits_both_enabled_and_off_completions() {
         let audit_store = retaining_memory_audit_store();

@@ -316,6 +316,19 @@ pub fn append_prompt_contract(
     rendered_prompt
 }
 
+/// Append the attestation prompt contract to the last message part when the
+/// resolved backend capability and per-turn request enable the protocol.
+pub fn append_attestation_contract_to_last_part(
+    parts: &mut [crate::domain::Part],
+    capability: &PrefixAttestationCapability,
+    request: &PrefixAttestationRequest,
+) {
+    if let Some(last) = parts.last_mut() {
+        let text = std::mem::take(&mut last.text);
+        last.text = append_prompt_contract(text, capability, request);
+    }
+}
+
 /// Mint the per-turn attestation request.
 ///
 /// Enabled (`CodexCommitMarkerV1`) requires BOTH the §4.5 conditions that
@@ -468,7 +481,10 @@ marker.";
 
     #[test]
     fn generated_turn_id_uses_wire_format_turn_underscore_lower_hex() {
-        let turn_id = generate_turn_id().expect("turn id generates");
+        let turn_id = match generate_turn_id() {
+            Ok(turn_id) => turn_id,
+            Err(error) => panic!("turn id generates: {error:?}"),
+        };
         let raw = turn_id.as_str();
         assert_eq!(raw.len(), 37);
         assert!(raw.starts_with("turn_"));
