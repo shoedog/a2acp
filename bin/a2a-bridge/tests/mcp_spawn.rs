@@ -15,7 +15,7 @@ async fn mcp_subcommand_handshake_and_tool_call_over_real_pipes() {
             "default = \"codex\"\n\n\
              [server]\naddr = \"127.0.0.1:0\"\n\n\
              [store]\npath = {store:?}\n\n\
-             [[agents]]\nid = \"codex\"\ncmd = \"codex\"\nkind = \"acp\"\ndefault = true\n",
+             [[agents]]\nid = \"codex\"\ncmd = \"codex\"\nkind = \"acp\"\n",
             store = store_path,
         ),
     )
