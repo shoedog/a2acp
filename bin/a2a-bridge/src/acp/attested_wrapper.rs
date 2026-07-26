@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader as StdBufReader, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::Mutex;
 
@@ -38,8 +38,11 @@ struct PromptBuffer {
     frames: FrameBuffer,
 }
 
+/// Buffer of exact wire lines (§4.2 narrow proxy: frames the wrapper does not
+/// transform must reach the bridge byte-for-byte, so the buffer stores the raw
+/// serialized line of every frame, never a re-serialization of a parsed value).
 struct FrameBuffer {
-    frames: Vec<Value>,
+    lines: Vec<String>,
     memory_bytes: usize,
     spool: Option<SpoolFile>,
 }
@@ -53,15 +56,14 @@ struct SpoolFile {
 impl FrameBuffer {
     fn new() -> Self {
         Self {
-            frames: Vec::new(),
+            lines: Vec::new(),
             memory_bytes: 0,
             spool: None,
         }
     }
 
-    fn push(&mut self, value: Value) -> Result<(), DynError> {
-        let encoded = serde_json::to_vec(&value)?;
-        let entry_bytes = encoded
+    fn push_line(&mut self, line: String) -> Result<(), DynError> {
+        let entry_bytes = line
             .len()
             .checked_add(1)
             .ok_or("attested-prefix frame buffer size overflow")?;
@@ -72,30 +74,30 @@ impl FrameBuffer {
                 .is_some_and(|bytes| bytes <= FRAME_MEMORY_LIMIT_BYTES)
         {
             self.memory_bytes += entry_bytes;
-            self.frames.push(value);
+            self.lines.push(line);
             return Ok(());
         }
 
         if self.spool.is_none() {
             let mut spool = SpoolFile::create()?;
-            for frame in self.frames.drain(..) {
-                spool.write_value(&frame)?;
+            for buffered in self.lines.drain(..) {
+                spool.write_line(&buffered)?;
             }
             self.memory_bytes = 0;
             self.spool = Some(spool);
         }
 
         if let Some(spool) = &mut self.spool {
-            spool.write_encoded(&encoded)?;
+            spool.write_line(&line)?;
         }
         Ok(())
     }
 
-    fn into_frames(mut self) -> Result<Vec<Value>, DynError> {
+    fn into_lines(mut self) -> Result<Vec<String>, DynError> {
         if let Some(spool) = self.spool.take() {
-            spool.read_values()
+            spool.read_lines()
         } else {
-            Ok(self.frames)
+            Ok(self.lines)
         }
     }
 }
@@ -127,33 +129,31 @@ impl SpoolFile {
         })
     }
 
-    fn write_value(&mut self, value: &Value) -> Result<(), DynError> {
-        let encoded = serde_json::to_vec(value)?;
-        self.write_encoded(&encoded)
-    }
-
-    fn write_encoded(&mut self, encoded: &[u8]) -> Result<(), DynError> {
-        self.file.write_all(encoded)?;
+    fn write_line(&mut self, line: &str) -> Result<(), DynError> {
+        // Buffered lines come from a line reader, so they contain no newline;
+        // the spool round-trip therefore reproduces the exact wire bytes.
+        self.file.write_all(line.as_bytes())?;
         self.file.write_all(b"\n")?;
         self.count += 1;
         Ok(())
     }
 
-    fn read_values(mut self) -> Result<Vec<Value>, DynError> {
+    fn read_lines(mut self) -> Result<Vec<String>, DynError> {
         self.file.flush()?;
         self.file.seek(SeekFrom::Start(0))?;
         let mut reader = StdBufReader::new(&mut self.file);
-        let mut values = Vec::with_capacity(self.count);
+        let mut lines = Vec::with_capacity(self.count);
         let mut line = String::new();
         while reader.read_line(&mut line)? != 0 {
-            let value = serde_json::from_str(line.trim_end_matches('\n'))?;
-            values.push(value);
-            line.clear();
+            if line.ends_with('\n') {
+                line.pop();
+            }
+            lines.push(std::mem::take(&mut line));
         }
-        if values.len() != self.count {
+        if lines.len() != self.count {
             return Err("attested-prefix spool frame count mismatch".into());
         }
-        Ok(values)
+        Ok(lines)
     }
 }
 
@@ -312,13 +312,40 @@ async fn proxy_child_to_bridge(
     bridge_stdout: Arc<Mutex<BufWriter<tokio::io::Stdout>>>,
     child_stdout: tokio::process::ChildStdout,
 ) -> Result<(), DynError> {
-    let mut lines = BufReader::new(child_stdout).lines();
+    proxy_child_lines(state, &bridge_stdout, BufReader::new(child_stdout)).await
+}
+
+/// Child-to-bridge proxy loop over already-line-framed input.
+///
+/// §4.2 narrow-proxy contract: ordinary ACP frames pass through byte-for-byte.
+/// The only permitted rewrites are reserved-metadata removal and the targeted
+/// assistant text transformation at prompt flush, so every frame carries its
+/// exact wire line forward and is re-serialized only when one of those two
+/// transformations actually changed it.
+async fn proxy_child_lines<R, W>(
+    state: Arc<Mutex<WrapperState>>,
+    bridge_stdout: &Arc<Mutex<BufWriter<W>>>,
+    reader: R,
+) -> Result<(), DynError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut lines = reader.lines();
     while let Some(line) = lines.next_line().await? {
         let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
-            write_raw_line(&bridge_stdout, &line).await?;
+            write_raw_line(bridge_stdout, &line).await?;
             continue;
         };
-        strip_reserved_meta(&mut value);
+        // Reserved-metadata filtering (§4.2) is the only unconditional
+        // transformation. When nothing was removed, `line` is still the exact
+        // wire form of `value`; otherwise the stripped value is re-serialized
+        // once and that becomes the frame's wire form from here on.
+        let raw = if strip_reserved_meta(&mut value) {
+            serde_json::to_string(&value)?
+        } else {
+            line
+        };
 
         let terminal_session = {
             let guard = state.lock().await;
@@ -340,12 +367,12 @@ async fn proxy_child_to_bridge(
                 .and_then(|session| session.prompt.take());
             if let Some(mut prompt) = prompt {
                 if is_successful_prompt_terminal(&value, &prompt.request_id) {
-                    flush_prompt_buffer(&bridge_stdout, &mut prompt, value).await?;
+                    flush_prompt_buffer(bridge_stdout, &mut prompt, &raw).await?;
                 } else {
-                    for frame in prompt.frames.into_frames()? {
-                        write_json_line(&bridge_stdout, frame).await?;
+                    for buffered in prompt.frames.into_lines()? {
+                        write_raw_line(bridge_stdout, &buffered).await?;
                     }
-                    write_json_line(&bridge_stdout, value).await?;
+                    write_raw_line(bridge_stdout, &raw).await?;
                 }
             }
             continue;
@@ -360,18 +387,18 @@ async fn proxy_child_to_bridge(
                 .and_then(|session| session.prompt.as_mut())
             {
                 if should_buffer_prompt_frame(&value) {
-                    prompt.frames.push(value)?;
+                    prompt.frames.push_line(raw)?;
                 } else {
                     drop(guard);
-                    write_json_line(&bridge_stdout, value).await?;
+                    write_raw_line(bridge_stdout, &raw).await?;
                 }
             } else {
                 drop(guard);
-                write_json_line(&bridge_stdout, value).await?;
+                write_raw_line(bridge_stdout, &raw).await?;
             }
         } else {
             drop(guard);
-            write_json_line(&bridge_stdout, value).await?;
+            write_raw_line(bridge_stdout, &raw).await?;
         }
     }
     Ok(())
@@ -461,15 +488,26 @@ fn frame_session_id(value: &Value) -> Option<&str> {
 async fn flush_prompt_buffer<W>(
     bridge_stdout: &Arc<Mutex<BufWriter<W>>>,
     prompt: &mut PromptBuffer,
-    terminal: Value,
+    terminal_raw: &str,
 ) -> Result<(), DynError>
 where
-    W: tokio::io::AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin,
 {
-    let mut frames = std::mem::replace(&mut prompt.frames, FrameBuffer::new()).into_frames()?;
+    let lines = std::mem::replace(&mut prompt.frames, FrameBuffer::new()).into_lines()?;
+    // Buffered lines are valid JSON by construction (only parsed frames are
+    // buffered); a parse failure here is spool corruption and aborts the turn
+    // rather than releasing a partially transformed completion (§3.5).
+    let mut frames = lines
+        .into_iter()
+        .map(|raw| {
+            let value = serde_json::from_str::<Value>(&raw)
+                .map_err(|error| format!("attested-prefix buffered frame corrupted: {error}"))?;
+            Ok((raw, value))
+        })
+        .collect::<Result<Vec<(String, Value)>, DynError>>()?;
     let mut text_positions = Vec::new();
     let mut text_chunks = Vec::new();
-    for (idx, frame) in frames.iter().enumerate() {
+    for (idx, (_, frame)) in frames.iter().enumerate() {
         if let Some(chunk) = agent_text_chunk(frame) {
             text_positions.push(idx);
             text_chunks.push(chunk.to_string());
@@ -485,6 +523,8 @@ where
     } = if prompt.turn.enabled {
         resolve_marker_chunks(&chunk_refs, &prompt.turn.marker)
     } else {
+        // §4.3: with `enabled: false` the wrapper performs no marker
+        // recognition; every frame replays untouched below.
         let chunks = text_chunks
             .iter()
             .map(|chunk| chunk.as_bytes().to_vec())
@@ -498,8 +538,17 @@ where
         }
     };
 
-    for (frame_idx, chunk) in text_positions.iter().zip(chunks) {
-        set_agent_text_chunk(&mut frames[*frame_idx], String::from_utf8(chunk)?);
+    for ((frame_idx, resolved), original) in
+        text_positions.iter().zip(chunks).zip(text_chunks.iter())
+    {
+        // Targeted text transformation (§4.2): rewrite and re-serialize a
+        // frame only when marker resolution actually changed its text bytes;
+        // an untouched frame keeps its exact wire line.
+        if resolved != original.as_bytes() {
+            let (raw, value) = &mut frames[*frame_idx];
+            set_agent_text_chunk(value, String::from_utf8(resolved)?);
+            *raw = serde_json::to_string(value)?;
+        }
     }
 
     let resolution = MarkerResolution {
@@ -507,11 +556,11 @@ where
         status,
         prefix_bytes,
     };
-    for frame in frames {
-        write_json_line(bridge_stdout, frame).await?;
+    for (raw, _) in &frames {
+        write_raw_line(bridge_stdout, raw).await?;
     }
     write_json_line(bridge_stdout, control_frame(prompt, &resolution)).await?;
-    write_json_line(bridge_stdout, terminal).await?;
+    write_raw_line(bridge_stdout, terminal_raw).await?;
     Ok(())
 }
 
@@ -597,23 +646,28 @@ fn should_buffer_prompt_frame(value: &Value) -> bool {
         && value.get("id").is_none()
 }
 
-fn strip_reserved_meta(value: &mut Value) {
+/// Removes every child-supplied reserved `_meta` key (§4.2). Returns whether
+/// anything was removed so the caller knows the original wire line no longer
+/// matches the value.
+fn strip_reserved_meta(value: &mut Value) -> bool {
+    let mut removed = false;
     match value {
         Value::Object(object) => {
             if let Some(Value::Object(meta)) = object.get_mut("_meta") {
-                meta.remove(META_KEY);
+                removed |= meta.remove(META_KEY).is_some();
             }
             for child in object.values_mut() {
-                strip_reserved_meta(child);
+                removed |= strip_reserved_meta(child);
             }
         }
         Value::Array(items) => {
             for item in items {
-                strip_reserved_meta(item);
+                removed |= strip_reserved_meta(item);
             }
         }
         _ => {}
     }
+    removed
 }
 
 async fn write_json_line<W>(writer: &Arc<Mutex<BufWriter<W>>>, value: Value) -> Result<(), DynError>
@@ -1005,6 +1059,117 @@ mod tests {
         );
     }
 
+    /// Runs the child-to-bridge proxy loop over raw input lines and returns
+    /// the exact emitted output lines.
+    async fn proxy_output_for(state: Arc<Mutex<WrapperState>>, input: &str) -> Vec<String> {
+        let writer = std::sync::Arc::new(Mutex::new(BufWriter::new(Vec::<u8>::new())));
+        proxy_child_lines(state, &writer, BufReader::new(input.as_bytes()))
+            .await
+            .unwrap();
+        let bytes = writer.lock().await.get_ref().clone();
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn passthrough_preserves_exact_bytes_for_untouched_frames() {
+        // §4.2 golden: with no active prompt buffer, every parseable frame the
+        // wrapper does not transform must be forwarded byte-for-byte — odd
+        // whitespace, member order, non-canonical numbers (1.50, 1e3), unicode
+        // escapes, and u64-boundary integers must all survive; a serde_json
+        // round-trip would rewrite each of them.
+        let untouched = [
+            "{ \"jsonrpc\" : \"2.0\",\t\"method\":\"session/update\" , \"params\":{\"update\":{\"progress\":1.50,\"count\":1e3},\"sessionId\":\"s\"}}",
+            r#"{"method":"session/update","jsonrpc":"2.0","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","big":18446744073709551615,"name":"A"}}}"#,
+            r#"{"jsonrpc":"2.0","id":41,"result":{"ok":true,"elapsed":0.100}}"#,
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"no turn active"}}}}"#,
+            "not json at all",
+        ];
+        let output = proxy_output_for(
+            Arc::new(Mutex::new(WrapperState::default())),
+            &format!("{}\n", untouched.join("\n")),
+        )
+        .await;
+        assert_eq!(output, untouched, "narrow proxy must not re-serialize");
+    }
+
+    #[tokio::test]
+    async fn passthrough_reserialization_is_limited_to_reserved_meta_removal() {
+        let forged = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"s\",\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{{\"type\":\"text\",\"text\":\"x\"}},\"_meta\":{{\"{META_KEY}\":{{\"kind\":\"attested\"}},\"keep\":1.50}}}}}}}}",
+        );
+        let plain = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","weird":  1e2}}}"#;
+        let output = proxy_output_for(
+            Arc::new(Mutex::new(WrapperState::default())),
+            &format!("{forged}\n{plain}\n"),
+        )
+        .await;
+        let stripped: Value = serde_json::from_str(&output[0]).unwrap();
+        assert!(
+            stripped["params"]["update"]["_meta"]
+                .get(META_KEY)
+                .is_none(),
+            "child-supplied reserved metadata must be removed"
+        );
+        assert!(
+            stripped["params"]["update"]["_meta"].get("keep").is_some(),
+            "non-reserved metadata survives the strip"
+        );
+        // The frame that needed no strip is still byte-exact.
+        assert_eq!(output[1], plain);
+    }
+
+    #[tokio::test]
+    async fn flush_replays_untouched_buffered_frames_byte_for_byte() {
+        // Golden: buffered frames the marker transformation does not touch —
+        // non-text session updates and text frames without marker bytes —
+        // replay with their exact original bytes (odd whitespace and
+        // non-canonical numbers included); only the frame whose text actually
+        // changed is re-serialized.
+        let odd_tool_call = "{ \"jsonrpc\":\"2.0\" ,\"method\":\"session/update\",\"params\":{\"sessionId\":\"s\",\"update\":{\"sessionUpdate\":\"tool_call\",\"progress\":1.50,\"count\":1e3}}}".to_string();
+        let untouched_text = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{ "type":"text","text":"pre"}}}}"#.to_string();
+        let marked_text =
+            serde_json::to_string(&text_frame("after", format!("{}post", marker()))).unwrap();
+        let mut prompt = prompt_with_lines(vec![
+            untouched_text.clone(),
+            odd_tool_call.clone(),
+            marked_text.clone(),
+        ]);
+        let lines = flush_lines(&mut prompt).await;
+        assert_eq!(lines[0], untouched_text, "untouched text frame replays raw");
+        assert_eq!(lines[1], odd_tool_call, "non-text frame replays raw");
+        assert_ne!(lines[2], marked_text, "marker frame is rewritten");
+        let rewritten: Value = serde_json::from_str(&lines[2]).unwrap();
+        assert_eq!(agent_text_chunk(&rewritten), Some("post"));
+        let control: Value = serde_json::from_str(&lines[3]).unwrap();
+        assert_eq!(
+            control["params"]["update"]["_meta"][META_KEY]["kind"], "attested",
+            "wrapper-owned control frame follows the buffered frames"
+        );
+        assert_eq!(lines[4], TERMINAL_RAW, "terminal frame replays raw");
+    }
+
+    #[tokio::test]
+    async fn spool_overflow_preserves_buffered_frame_bytes() {
+        // Push enough oversized lines to cross FRAME_MEMORY_LIMIT_BYTES so the
+        // buffer migrates to the spool file, then confirm the round-trip
+        // returns the exact original lines.
+        let mut buffer = FrameBuffer::new();
+        let big = format!(
+            "{{ \"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"s\",\"update\":{{\"sessionUpdate\":\"tool_call\",\"pad\":\"{}\",\"n\":1.50}}}}}}",
+            "x".repeat(300 * 1024)
+        );
+        let lines = vec![big.clone(), big.clone(), big.clone(), big.clone(), big];
+        for line in &lines {
+            buffer.push_line(line.clone()).unwrap();
+        }
+        assert!(buffer.spool.is_some(), "test must exercise the spool path");
+        assert_eq!(buffer.into_lines().unwrap(), lines);
+    }
+
     fn text_frame(message_id: &str, text: impl Into<String>) -> Value {
         json!({
             "jsonrpc": "2.0",
@@ -1036,9 +1201,18 @@ mod tests {
     }
 
     fn prompt_with_frames(frames: Vec<Value>) -> PromptBuffer {
+        prompt_with_lines(
+            frames
+                .into_iter()
+                .map(|frame| serde_json::to_string(&frame).unwrap())
+                .collect(),
+        )
+    }
+
+    fn prompt_with_lines(lines: Vec<String>) -> PromptBuffer {
         let mut buffer = FrameBuffer::new();
-        for frame in frames {
-            buffer.push(frame).unwrap();
+        for line in lines {
+            buffer.push_line(line).unwrap();
         }
         PromptBuffer {
             request_id: json!(7),
@@ -1054,18 +1228,23 @@ mod tests {
         }
     }
 
-    async fn flush_values(prompt: &mut PromptBuffer) -> Vec<Value> {
+    const TERMINAL_RAW: &str =
+        r#"{"jsonrpc": "2.0", "id": 7, "result": {"stopReason": "end_turn"}}"#;
+
+    async fn flush_lines(prompt: &mut PromptBuffer) -> Vec<String> {
         let writer = std::sync::Arc::new(Mutex::new(BufWriter::new(Vec::<u8>::new())));
-        flush_prompt_buffer(
-            &writer,
-            prompt,
-            json!({"jsonrpc": "2.0", "id": 7, "result": {"stopReason": "end_turn"}}),
-        )
-        .await
-        .unwrap();
+        flush_prompt_buffer(&writer, prompt, TERMINAL_RAW)
+            .await
+            .unwrap();
         let bytes = writer.lock().await.get_ref().clone();
         let raw = String::from_utf8(bytes).unwrap();
-        raw.lines()
+        raw.lines().map(ToOwned::to_owned).collect()
+    }
+
+    async fn flush_values(prompt: &mut PromptBuffer) -> Vec<Value> {
+        flush_lines(prompt)
+            .await
+            .iter()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect()
     }
@@ -1248,12 +1427,16 @@ mod tests {
                 }
             }
         });
-        strip_reserved_meta(&mut frame);
+        assert!(strip_reserved_meta(&mut frame));
         assert!(frame["params"]["update"]["_meta"].get(META_KEY).is_none());
         assert_eq!(frame["params"]["update"]["_meta"]["keep"], true);
         assert!(frame["params"]["update"]["nested"]["_meta"]
             .get(META_KEY)
             .is_none());
+        assert!(
+            !strip_reserved_meta(&mut frame),
+            "second pass must report nothing removed"
+        );
     }
 
     trait BodyExt {
