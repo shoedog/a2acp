@@ -11,6 +11,7 @@ prompts/design-executability.md
 prompts/design-structure-refine.md
 prompts/design-structure.md
 prompts/design-synth.md
+prompts/dispatch-brief-contract.md
 prompts/impl-smoke.md
 prompts/implement-edit.md
 prompts/implement-fix.md

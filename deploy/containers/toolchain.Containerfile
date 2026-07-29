@@ -63,25 +63,25 @@ RUN ln -sf /usr/local/go/bin/go /usr/local/bin/go \
  && ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt \
  && ln -sf /root/go/bin/gopls /usr/local/bin/gopls
 
-# Python (LSP-MCP polyglot slice): mise-provisioned python + uv + ruff + basedpyright. The REAL binaries are
-# SYMLINKED into /usr/local/bin (already on every PATH incl. codex's stripped MCP-subprocess PATH) — NEVER
-# mise shims/activation: a shim resolves the tool version from mise's env, which the stripped env drops →
-# the exact #1d trap (see docs/containerized-mcp-env-trap.md). mise installs to
-# ~/.local/share/mise/installs/.../bin (real, absolute-path executables); node (image base) backs the
-# node-based basedpyright-langserver.
+# Python (LSP-MCP polyglot slice): mise-provisioned python + uv + ruff. The REAL binaries are SYMLINKED
+# into /usr/local/bin (already on every PATH incl. codex's stripped MCP-subprocess PATH) — NEVER mise
+# shims/activation: a shim resolves the tool version from mise's env, which the stripped env drops → the
+# exact #1d trap (see docs/containerized-mcp-env-trap.md). basedpyright is installed globally with npm in
+# the JS/TS layer below: mise 2026.7.15 changed npm tools to location-dependent aube shims, which break when
+# relocated through /usr/local/bin. node (the image base) backs basedpyright-langserver.
 RUN curl -fsSL https://mise.run | sh
 ENV PATH=/root/.local/bin:$PATH
-RUN /root/.local/bin/mise use -g -y python@3.12.13 uv@0.11.21 ruff@0.15.17 "npm:basedpyright@1.39.8"
-# Symlink the RESOLVED real binaries (NOT the shims dir). basedpyright ships both `basedpyright` (answers
-# --version) and `basedpyright-langserver` (stdio); python install exposes `python`+`python3`.
-RUN set -eux; for t in python python3 uv ruff basedpyright basedpyright-langserver; do \
+RUN /root/.local/bin/mise use -g -y python@3.12.13 uv@0.11.21 ruff@0.15.17
+# Symlink the RESOLVED real binaries (NOT the shims dir). Python exposes `python`+`python3`.
+RUN set -eux; for t in python python3 uv ruff; do \
       ln -sf "$(/root/.local/bin/mise which "$t")" "/usr/local/bin/$t"; \
     done
 
-# JS/TS (LSP-MCP polyglot slice): typescript-language-server + typescript via `npm install -g` — NOT mise.
+# Node LSP CLIs (LSP-MCP polyglot slice): basedpyright + typescript-language-server + typescript via
+# `npm install -g` — NOT mise.
 # mise installs each npm package in an ISOLATED dir, so typescript-language-server cannot find `typescript`
 # as a sibling (tsserver discovery fails). `npm install -g` co-locates them in /usr/local/lib/node_modules
 # (siblings → tsls auto-discovers tsserver) AND puts REAL binaries on /usr/local/bin (env-trap compliant,
 # no shims — validated: tsls --stdio responds to `initialize` under a fully stripped env with no
 # tsserver.path needed). Pinned for reproducibility. node/npm are the image base.
-RUN npm install -g typescript-language-server@5.3.0 typescript@6.0.3
+RUN npm install -g basedpyright@1.39.8 typescript-language-server@5.3.0 typescript@6.0.3

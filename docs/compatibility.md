@@ -15,6 +15,68 @@ Status meanings:
 - **STALE** — it passed previously, but a relevant component has changed or the evidence is too old for
   a release decision.
 
+## Dependency release verification — 2026-07-27–28
+
+The mise-owned host package trees and one isolated immutable Linux/arm64 reader candidate passed the
+four minimal host-versus-reader bridge lanes below before promotion. Every lane used release-mode
+`a2a-bridge` 0.2.1 from
+source head `eb79133c85b6360ca52cc34e9daaa45de28a8e1f`, executable SHA-256
+`8464af20d18e66e5491ba0f5c2e775a05ee011fe4ad8680545b77eac8e089356`, one fixed
+`Reply exactly PONG. Do not use tools.` prompt, and no retry or fallback. All four artifacts are schema v2,
+mode `0600` under one mode-`0700` evidence directory, report one configure and one prompt call, terminal
+exact `PONG`, zero tool or permission-update events, no timeout or dropped diagnostic, completed
+release/retirement, and excluded opaque stderr text.
+
+| Candidate path | Exact resolved components | Model / effort / mode | Status | Live evidence |
+|---|---|---|---|---|
+| Codex host bridge | `@agentclientprotocol/codex-acp` 1.1.7; ACP SDK 1.3.0; nested `@openai/codex` 0.145.0 | raw `gpt-5.6-luna` / `low` / `read-only` | **PASS** | Completed in 4.010 s with 25,492 observed tokens and no cost observation. Artifact `/private/tmp/a2a-bridge-upgrade-smoke.LAiglL/01-codex-host-luna.json`, SHA-256 `9b0a62be8a836085230b3e694e1082d96407f3a2835c14e7be4d570dff219b17`. |
+| Claude host bridge | `@agentclientprotocol/claude-agent-acp` 0.63.0; ACP SDK 1.3.0; `@anthropic-ai/claude-agent-sdk` 0.3.220; bundled Claude Code 2.1.220 | raw `sonnet` (Sonnet 5) / `low` / adapter default mode | **PASS** | Completed in 3.626 s with 45,951 observed tokens and USD 0.1407462 observed cost. Artifact `/private/tmp/a2a-bridge-upgrade-smoke.LAiglL/02-claude-host-sonnet5.json`, SHA-256 `a5c295f2932f2c5dca349b854f42ebcf6e7eb13bafc996cd00f946d3f974d357`. |
+| Codex reader bridge | immutable image `sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f`; `codex-acp` 1.1.7; Codex 0.145.0 | raw `gpt-5.6-luna` / `low` / container boundary | **PASS** | Completed in 4.185 s with 18,160 observed tokens and no cost observation; the exact named container was absent after cleanup. Artifact `/private/tmp/a2a-bridge-upgrade-smoke.LAiglL/03-codex-reader-luna.json`, SHA-256 `f66ced2bccedc67f8c290f3491a4f59bd7252a468546bdd8e8888c42f18217f2`. |
+| Claude reader bridge | same immutable image; `claude-agent-acp` 0.63.0; Agent SDK 0.3.220; bundled Claude Code 2.1.220 | raw `sonnet` (Sonnet 5) / `low` / container boundary | **PASS** | Completed in 3.239 s with 32,617 observed tokens and USD 0.0613392 observed cost; the exact named container was absent after cleanup. Artifact `/private/tmp/a2a-bridge-upgrade-smoke.LAiglL/04-claude-reader-sonnet5.json`, SHA-256 `ebc3d4bf1ad8d21961368237f1eadf304c30886f627d07b4cc6dd1f44146afd6`. |
+
+The host rows used the unchanged operator config at SHA-256
+`b9b224168455db56626fdad3541f5dd7d5c272f1a29210cf6481f67876709eb7`. The reader rows used a
+disposable config at SHA-256 `efeb373820fcec1dd67c426e8bde7913f9c8339ef715365fcfd98079d0e54483`
+and a unique non-shared image tag. At this stage neither `a2a-agent-reader:latest` nor the long-lived
+operator had been replaced or restarted. Exact package materialization, raw ACP
+`initialize`/`session/new`, bridge catalog
+probing, both host doctors, and both reader doctors also passed before billing; those preflights made zero
+prompt calls.
+
+These four passes close the minimal live compatibility boundary for both changed dependency trees across
+host and read-only container execution. A separately authorized promotion then covered the remaining
+release surfaces without retrying any prompt:
+
+| Promotion surface | Exact promoted identity | Status | Evidence |
+|---|---|---|---|
+| Reader publication | Linux/arm64 image `sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f`; Codex ACP 1.1.7 / Codex 0.145.0; Claude ACP 0.63.0 / Agent SDK 0.3.220 / bundled Claude Code 2.1.220 | **PASS** | Exact image labels and package trees were verified before the immutable image was tagged `a2a-agent-reader:release-eb79133c85b6360c` and `a2a-agent-reader:latest`. |
+| Writable toolchain path | Linux/arm64 image `sha256:c4be66eb232809a1ab411d37fea6f660418db3e42b5b53b8be796329f998cb00`; Codex ACP 1.1.7 / Codex 0.145.0 | **PASS** | One `container_rw` Luna/low/agent smoke returned exact `PONG` with 12,687 observed tokens, zero tool/permission events, and completed release/retirement/reap. Artifact SHA-256 `d1b841933e6b0785bf576c47bfcd5c57a8d8de41595d9426d1a7cd804b0a8a4c`. The image was tagged `a2a-toolchain:release-eb79133c85b6360c` and `a2a-toolchain:latest`; rollback image `sha256:367f9f924e5728c3dc755b832a855f1b09d6725dcf047649630c1b0fce909c2e` remains retained. |
+| Representative workflow | Host Codex Luna/low/read-only review plus Claude Sonnet/low/plan review and Claude synthesis | **PASS** | All three nodes completed and the terminal synthesis returned `APPROVE`. Result SHA-256 `b36e523d381ef3a0004814edfb5c1d002037cda260662560e60f686606fe67af`. |
+| Served operator | Source `eb79133c85b6360ca52cc34e9daaa45de28a8e1f`; installed executable SHA-256 `177f7706100a5bffbc8b32b11bc3e8eb1dbe03ea249440c1ab02d49faebd97d0`; config SHA-256 `b9b224168455db56626fdad3541f5dd7d5c272f1a29210cf6481f67876709eb7` | **PASS** | After replacement, unique served contexts returned exact `PONG` for Codex Luna/low/read-only and Claude Sonnet/low/plan. Both sessions were idle with no pending permissions, explicitly released, and absent afterward. Evidence SHA-256 `d56985a2382a1c6b8e6433d2c02835f02958dbbdad134f6bbcbf321894159d78`. |
+
+The first toolchain candidate, image
+`sha256:e3837d27f0e7a5d0e6c1deed8a8561cb2dc842f6244b62392554d874d33f50d3`, was rejected before billing:
+mise 2026.7.15 materialized npm tools through a location-dependent `aube-bin-shim`, so relocating the
+resolved `basedpyright` entry through `/usr/local/bin` broke module resolution. The prior toolchain image
+passed the same stripped-environment control. Installing pinned `basedpyright@1.39.8` globally with npm
+fixed the candidate; two regression tests enforce that pin and reject the mise relocation pattern.
+
+The release evidence is retained privately with the installed operator release. The pinned compatibility
+manifest, baseline, and historical rows below retain the older artifacts they describe; this promotion did
+not rewrite those historical baselines. Fable and Kiro were not newly billed in this dependency release.
+
+Deterministic gates on the pinned release source passed format, diff, `cargo deny`, workspace check,
+strict clippy, repository hygiene (38 artifacts), compatibility-manifest validation, release build, and
+2,699 tests with 0 failed and 12 ignored. After adding the reader and toolchain pin regression tests and
+reconciling this handoff, the full working-checkout suite passed 2,703 tests with 0 failed and 12 ignored.
+The ignored tests retain their explicit live/authenticated or local-service prerequisites; the authorized
+live release checks are the separately bounded evidence above.
+
+Upstream `codex-acp` 1.1.7 includes the 1.1.6 move to Codex 0.145.0, then adds the plan-content and
+end-to-end fixes in 1.1.7. The 0.144.6 fallback was not selected because the 0.145.0 tree passed the
+provider-free and live host/reader compatibility layers. Claude ACP 0.63.0 updates the Agent SDK to
+0.3.220 and includes the release's denied-tool, tool-progress, and Bash terminal-metadata fixes.
+
 ## Snapshot — 2026-07-15
 
 | Path | Exact observed components | Model / effort | Status | Evidence |
@@ -148,8 +210,10 @@ R1 is dispositioned as **supported with explicit prerequisites**:
 3. For the isolated reader, mount both the credential copy and the pinned minimal
    [`claude-fable-settings.json`](../deploy/containers/claude-fable-settings.json). Do not mount the full
    host Claude config/state.
-4. Keep 0.55.0 pinned in the reader image. Both 0.44.0 and 0.55.0 passed on the host, so the pin is a
-   known-good baseline rather than the root-cause fix.
+4. Preserve the exact 0.55.0 image and rows as the historical Fable known-good baseline. The active
+   0.63.0 candidate now has the separately authorized Sonnet host/reader **PASS** evidence above, but that
+   does not replace a Fable-specific 0.63.0 live row. The matched 0.44.0 and 0.55.0 Fable controls still
+   prove that the R1 root-cause fix was not an adapter-version change.
 
 The original `AgentCrashed` was a no-DNS execution-environment failure. Matched Fable and Sonnet
 controls ruled out model-specific access, adapter-version drift, and bridge sequencing. The full

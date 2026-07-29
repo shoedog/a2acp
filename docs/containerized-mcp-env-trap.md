@@ -70,7 +70,7 @@ forwards exactly like `CARGO_HOME` already did). No image rebuild, no code chang
 |---|---|---|---|
 | gopls (Go) | yes | `GOMODCACHE`, `GOFLAGS` | symlinked `/usr/local/bin/gopls` |
 | rust-analyzer (Rust) | **no** (rustup proxy) | `CARGO_HOME`, `CARGO_NET_OFFLINE`, **`RUSTUP_HOME`** | rustup proxy on PATH (`/usr/local/cargo/bin`) |
-| basedpyright (Python) | node CLI | **`LSP_MCP_PYTHON_PATH`** (→ the warmed venv interpreter), `PYTHONDONTWRITEBYTECODE` | symlink `basedpyright`/`-langserver`; node already at `/usr/local/bin` |
+| basedpyright (Python) | node CLI | **`LSP_MCP_PYTHON_PATH`** (→ the warmed venv interpreter), `PYTHONDONTWRITEBYTECODE` | **`npm install -g`** (NOT mise); npm-global places the package and launchers at stable locations under `/usr/local` |
 | typescript-language-server (JS/TS) | node CLI | **none** (`lsp_env={}`) — deps resolve positionally via `/node_modules`; swap the server via `LSP_MCP_TS_SERVER` in `lsp_env` | **`npm install -g`** (NOT mise): mise isolates each pkg so tsls can't find `typescript` as a sibling; npm-global co-locates them in `/usr/local/lib/node_modules` + puts real `typescript-language-server`/`tsc`/`tsserver` on `/usr/local/bin`. Also LAZY → lsp-mcp bootstrap-`didOpen`s a file. |
 
 **When adding a language, ask:** (1) Is the server a proxy/shim or a direct binary? A proxy/shim needs its
@@ -81,12 +81,18 @@ above **before** assuming a deeper bug.
 
 ## mise specifically
 
-mise is fine as an **installer** (it places real executables at
-`~/.local/share/mise/installs/<tool>/<version>/bin/<bin>`, absolute-path reachable without activation).
-But mise **shims** (`~/.local/share/mise/shims/*` → the mise binary) resolve the tool version at runtime
-**from mise's environment/config** — which the stripped MCP-subprocess env doesn't carry. So a shim is the
-rustup-proxy trap all over again. **Install with mise; expose the real binary (symlink to `/usr/local/bin`);
-never put a mise shim on the runtime path.**
+mise is fine as an **installer** only when `mise which` identifies a location-independent real executable
+(as it does for the pinned Python, uv, and ruff installs). mise **shims**
+(`~/.local/share/mise/shims/*` → the mise binary) resolve the tool version at runtime **from mise's
+environment/config** — which the stripped MCP-subprocess env doesn't carry. A shim is therefore the
+rustup-proxy trap all over again.
+
+Do not assume every mise backend returns a relocatable executable. With mise 2026.7.15,
+`npm:basedpyright@1.39.8` resolved through a location-dependent `aube-bin-shim`; symlinking that entry into
+`/usr/local/bin` made its relative module lookup fail. The matching previous-image control passed, and
+installing the same pinned package with `npm install -g` restored both `basedpyright --version` and
+`basedpyright-langserver` under the stripped PATH. **Use mise only for verified real executables; install
+Node CLIs globally with npm when their package layout must remain positional.**
 
 ## References
 
