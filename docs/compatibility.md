@@ -15,6 +15,132 @@ Status meanings:
 - **STALE** — it passed previously, but a relevant component has changed or the evidence is too old for
   a release decision.
 
+## v0.3.0 exact-candidate release verification — 2026-07-29
+
+The release-mode v0.3.0 candidate at
+`/private/tmp/a2a-bridge-main-merge.vwanDC/main/target/release/a2a-bridge`, SHA-256
+`6179cdb7d7327158e7d1a39fc6a343776a1b234e9117c0ee2f421ab981fec044`, 29,621,632 bytes, ran the
+four current support cases from manifest
+`aee0476dae4ed1956d2b1bc9f1b76008c75ad1c40e2fea64dfcdd00ec01daf33`. The owner-only aggregate is
+mode `0600`, 25,786 bytes, at
+`/private/tmp/a2a-bridge-v030-final-live.Dhcrhn/v0.3.0-final-four-lane-aggregate.json`, SHA-256
+`610bf25c3339e4e398d2669e01d416bc5458fbd9cb0f746e2a4168091867dfa9`. It completed in 25.425 seconds
+with success true, cancellation and budget exhaustion false, 121,510 observed tokens, and USD 0.2013024
+observed cost. Codex did not expose a cost observation; every case exposed a token observation.
+
+Each selected case ran exactly one fixed `Reply exactly PONG. Do not use tools.` prompt with retry and
+fallback caps zero. Every schema-v2 child recorded bridge version 0.3.0, one configure and one prompt call,
+terminal completed/end-turn, byte-exact four-byte `PONG`, zero tool or permission-update events, no timeout,
+no dropped diagnostics, strict stderr exclusion, no drift or budget violation, and completed release and
+retirement. No managed container remained afterward.
+
+| Current support case | Exact path and components | Effective model / effort / mode | Status | Live evidence |
+|---|---|---|---|---|
+| `codex-host-bridge-gpt56-luna` | Host `@agentclientprotocol/codex-acp` 1.1.7 with nested `@openai/codex` 0.145.0; config `968697a6…c7b` | `gpt-5.6-luna` / `low` / `read-only` | **PASS** | 3.607 s; 24,813 tokens; no cost observation. |
+| `codex-reader-bridge-gpt56-luna` | Read-only container image `sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f`; Codex ACP 1.1.7 / Codex 0.145.0; config `3ef69ed7…865` | `gpt-5.6-luna` / `low` / adapter `agent` mode inside the read-only container boundary | **PASS** | 5.313 s; 18,160 tokens; no cost observation. |
+| `claude-host-acp-063-sonnet5` | Host `@agentclientprotocol/claude-agent-acp` 0.63.0 with Agent SDK 0.3.220 and bundled Claude Code 2.1.220; config `edd39868…a5e` | `sonnet` (Sonnet 5) / `low` / `auto` | **PASS** | 9.069 s; 46,005 tokens; USD 0.1410702. |
+| `claude-reader-063-sonnet5` | Same immutable read-only image; Claude ACP 0.63.0 / Agent SDK 0.3.220; isolated credential-only mount; config `f4d5582f…fcd0` | `sonnet` (Sonnet 5) / `low` / `default` | **PASS** | 7.430 s; 32,532 tokens; USD 0.0602322. |
+
+The checked-in baseline now contains these four projected summaries and compares equal to the aggregate;
+variable timestamps, token counts, and costs are deliberately excluded while terminal, capability,
+provenance, authentication, cleanup, diagnostic, and budget-observation state remain pinned. The former
+Sol/Fable support rows remain under their original IDs as explicit `non_goal` historical controls. The
+other five historical controls were not selected. No mutable reader/toolchain tag or long-lived served
+operator was replaced or restarted by this release verification.
+
+Deterministic release gates passed format and diff checks, workspace check, warnings-denied all-target Clippy,
+repository hygiene (38 artifacts / 7 example configs), the 13-case pinned manifest, and the release bridge
+build. The complete workspace suite passed 2,973 tests with 0 failed and 12 ignored across 77 harnesses. The
+ignored tests retain their explicit live/authenticated or local-service prerequisites; the four authorized
+live cases are the separate bounded evidence above.
+
+## Dependency release verification — 2026-07-27–28
+
+The mise-owned host package trees and one isolated immutable Linux/arm64 reader candidate passed the
+four minimal host-versus-reader bridge lanes below before promotion. Every lane used release-mode
+`a2a-bridge` 0.2.1 from
+source head `eb79133c85b6360ca52cc34e9daaa45de28a8e1f`, executable SHA-256
+`8464af20d18e66e5491ba0f5c2e775a05ee011fe4ad8680545b77eac8e089356`, one fixed
+`Reply exactly PONG. Do not use tools.` prompt, and no retry or fallback. All four artifacts are schema v2,
+mode `0600` under one mode-`0700` evidence directory, report one configure and one prompt call, terminal
+exact `PONG`, zero tool or permission-update events, no timeout or dropped diagnostic, completed
+release/retirement, and excluded opaque stderr text.
+
+| Candidate path | Exact resolved components | Model / effort / mode | Status | Live evidence |
+|---|---|---|---|---|
+| Codex host bridge | `@agentclientprotocol/codex-acp` 1.1.7; ACP SDK 1.3.0; nested `@openai/codex` 0.145.0 | raw `gpt-5.6-luna` / `low` / `read-only` | **PASS** | Completed in 4.010 s with 25,492 observed tokens and no cost observation. Artifact `/private/tmp/a2a-bridge-upgrade-smoke.LAiglL/01-codex-host-luna.json`, SHA-256 `9b0a62be8a836085230b3e694e1082d96407f3a2835c14e7be4d570dff219b17`. |
+| Claude host bridge | `@agentclientprotocol/claude-agent-acp` 0.63.0; ACP SDK 1.3.0; `@anthropic-ai/claude-agent-sdk` 0.3.220; bundled Claude Code 2.1.220 | raw `sonnet` (Sonnet 5) / `low` / adapter default mode | **PASS** | Completed in 3.626 s with 45,951 observed tokens and USD 0.1407462 observed cost. Artifact `/private/tmp/a2a-bridge-upgrade-smoke.LAiglL/02-claude-host-sonnet5.json`, SHA-256 `a5c295f2932f2c5dca349b854f42ebcf6e7eb13bafc996cd00f946d3f974d357`. |
+| Codex reader bridge | immutable image `sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f`; `codex-acp` 1.1.7; Codex 0.145.0 | raw `gpt-5.6-luna` / `low` / container boundary | **PASS** | Completed in 4.185 s with 18,160 observed tokens and no cost observation; the exact named container was absent after cleanup. Artifact `/private/tmp/a2a-bridge-upgrade-smoke.LAiglL/03-codex-reader-luna.json`, SHA-256 `f66ced2bccedc67f8c290f3491a4f59bd7252a468546bdd8e8888c42f18217f2`. |
+| Claude reader bridge | same immutable image; `claude-agent-acp` 0.63.0; Agent SDK 0.3.220; bundled Claude Code 2.1.220 | raw `sonnet` (Sonnet 5) / `low` / container boundary | **PASS** | Completed in 3.239 s with 32,617 observed tokens and USD 0.0613392 observed cost; the exact named container was absent after cleanup. Artifact `/private/tmp/a2a-bridge-upgrade-smoke.LAiglL/04-claude-reader-sonnet5.json`, SHA-256 `ebc3d4bf1ad8d21961368237f1eadf304c30886f627d07b4cc6dd1f44146afd6`. |
+
+The host rows used the unchanged operator config at SHA-256
+`b9b224168455db56626fdad3541f5dd7d5c272f1a29210cf6481f67876709eb7`. The reader rows used a
+disposable config at SHA-256 `efeb373820fcec1dd67c426e8bde7913f9c8339ef715365fcfd98079d0e54483`
+and a unique non-shared image tag. At this stage neither `a2a-agent-reader:latest` nor the long-lived
+operator had been replaced or restarted. Exact package materialization, raw ACP
+`initialize`/`session/new`, bridge catalog
+probing, both host doctors, and both reader doctors also passed before billing; those preflights made zero
+prompt calls.
+
+These four passes close the minimal live compatibility boundary for both changed dependency trees across
+host and read-only container execution. A separately authorized promotion then covered the remaining
+release surfaces without retrying any prompt:
+
+| Promotion surface | Exact promoted identity | Status | Evidence |
+|---|---|---|---|
+| Reader publication | Linux/arm64 image `sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f`; Codex ACP 1.1.7 / Codex 0.145.0; Claude ACP 0.63.0 / Agent SDK 0.3.220 / bundled Claude Code 2.1.220 | **PASS** | Exact image labels and package trees were verified before the immutable image was tagged `a2a-agent-reader:release-eb79133c85b6360c` and `a2a-agent-reader:latest`. |
+| Writable toolchain path | Linux/arm64 image `sha256:c4be66eb232809a1ab411d37fea6f660418db3e42b5b53b8be796329f998cb00`; Codex ACP 1.1.7 / Codex 0.145.0 | **PASS** | One `container_rw` Luna/low/agent smoke returned exact `PONG` with 12,687 observed tokens, zero tool/permission events, and completed release/retirement/reap. Artifact SHA-256 `d1b841933e6b0785bf576c47bfcd5c57a8d8de41595d9426d1a7cd804b0a8a4c`. The image was tagged `a2a-toolchain:release-eb79133c85b6360c` and `a2a-toolchain:latest`; rollback image `sha256:367f9f924e5728c3dc755b832a855f1b09d6725dcf047649630c1b0fce909c2e` remains retained. |
+| Representative workflow | Host Codex Luna/low/read-only review plus Claude Sonnet/low/plan review and Claude synthesis | **PASS** | All three nodes completed and the terminal synthesis returned `APPROVE`. Result SHA-256 `b36e523d381ef3a0004814edfb5c1d002037cda260662560e60f686606fe67af`. |
+| Served operator | Source `eb79133c85b6360ca52cc34e9daaa45de28a8e1f`; installed executable SHA-256 `177f7706100a5bffbc8b32b11bc3e8eb1dbe03ea249440c1ab02d49faebd97d0`; config SHA-256 `b9b224168455db56626fdad3541f5dd7d5c272f1a29210cf6481f67876709eb7` | **PASS** | After replacement, unique served contexts returned exact `PONG` for Codex Luna/low/read-only and Claude Sonnet/low/plan. Both sessions were idle with no pending permissions, explicitly released, and absent afterward. Evidence SHA-256 `d56985a2382a1c6b8e6433d2c02835f02958dbbdad134f6bbcbf321894159d78`. |
+
+### Reader-image rollback target
+
+The retained reader rollback target for the v0.3.0 bridge release is
+`a2a-agent-reader:release-eb79133c85b6360c`, immutable image
+`sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f`. This is the exact reader
+used by the green 0.2.1 served operator and the four dependency-promotion lanes above; v0.3.0 does not
+publish a different reader image. If a mutable reader tag is changed independently and must be restored,
+first require the retained release tag to resolve to that exact ID, then retag it:
+
+```bash
+docker image inspect a2a-agent-reader:release-eb79133c85b6360c --format '{{.Id}}'
+# expect exactly sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f
+docker tag a2a-agent-reader:release-eb79133c85b6360c a2a-agent-reader:latest
+docker image inspect a2a-agent-reader:latest --format \
+  '{{.Id}}|{{index .Config.Labels "io.a2a-bridge.provenance.codex.adapter"}}|{{index .Config.Labels "io.a2a-bridge.provenance.claude.adapter"}}'
+# expect the exact ID above plus codex-acp=1.1.7 and claude-agent-acp=0.63.0 labels
+```
+
+After retagging, validate the exact served config, run `doctor --json`, and probe `models --json` for
+each reader agent before resuming service. A provider prompt remains billable and requires a new explicit
+authorization; if authorized, use one fixed-PONG `smoke` per affected reader with no retry. Configs that
+already name the immutable digest need no tag rollback. If the retained release tag is absent or its ID or
+labels differ, stop rather than rebuilding: the older historical `b154…` image is not retained locally, and
+a bounded rebuild did not reproduce that immutable identity.
+
+The first toolchain candidate, image
+`sha256:e3837d27f0e7a5d0e6c1deed8a8561cb2dc842f6244b62392554d874d33f50d3`, was rejected before billing:
+mise 2026.7.15 materialized npm tools through a location-dependent `aube-bin-shim`, so relocating the
+resolved `basedpyright` entry through `/usr/local/bin` broke module resolution. The prior toolchain image
+passed the same stripped-environment control. Installing pinned `basedpyright@1.39.8` globally with npm
+fixed the candidate; two regression tests enforce that pin and reject the mise relocation pattern.
+
+The release evidence is retained privately with the installed operator release. The pinned compatibility
+manifest, baseline, and historical rows below retain the older artifacts they describe; this promotion did
+not rewrite those historical baselines. Fable and Kiro were not newly billed in this dependency release.
+
+Deterministic gates on the pinned release source passed format, diff, `cargo deny`, workspace check,
+strict clippy, repository hygiene (38 artifacts), compatibility-manifest validation, release build, and
+2,699 tests with 0 failed and 12 ignored. After adding the reader and toolchain pin regression tests and
+reconciling this handoff, the full working-checkout suite passed 2,703 tests with 0 failed and 12 ignored.
+The ignored tests retain their explicit live/authenticated or local-service prerequisites; the authorized
+live release checks are the separately bounded evidence above.
+
+Upstream `codex-acp` 1.1.7 includes the 1.1.6 move to Codex 0.145.0, then adds the plan-content and
+end-to-end fixes in 1.1.7. The 0.144.6 fallback was not selected because the 0.145.0 tree passed the
+provider-free and live host/reader compatibility layers. Claude ACP 0.63.0 updates the Agent SDK to
+0.3.220 and includes the release's denied-tool, tool-progress, and Bash terminal-metadata fixes.
+
 ## Snapshot — 2026-07-15
 
 | Path | Exact observed components | Model / effort | Status | Evidence |
@@ -148,8 +274,10 @@ R1 is dispositioned as **supported with explicit prerequisites**:
 3. For the isolated reader, mount both the credential copy and the pinned minimal
    [`claude-fable-settings.json`](../deploy/containers/claude-fable-settings.json). Do not mount the full
    host Claude config/state.
-4. Keep 0.55.0 pinned in the reader image. Both 0.44.0 and 0.55.0 passed on the host, so the pin is a
-   known-good baseline rather than the root-cause fix.
+4. Preserve the exact 0.55.0 image and rows as the historical Fable known-good baseline. The active
+   0.63.0 candidate now has the separately authorized Sonnet host/reader **PASS** evidence above, but that
+   does not replace a Fable-specific 0.63.0 live row. The matched 0.44.0 and 0.55.0 Fable controls still
+   prove that the R1 root-cause fix was not an adapter-version change.
 
 The original `AgentCrashed` was a no-DNS execution-environment failure. Matched Fable and Sonnet
 controls ruled out model-specific access, adapter-version drift, and bridge sequencing. The full
@@ -162,12 +290,13 @@ retention remains R2.
 
 ## Evidence required for an update
 
-R3a provides `a2a-bridge compatibility validate|run|compare`; R3b adds nine reviewed pinned case
-contracts. The checked-in baseline carries the current manifest identity but intentionally has no
-promoted case summaries until the four eligible cases produce separately authorized exact-candidate
-artifacts and those artifacts are reviewed. Do not add a baseline entry or PASS row merely to exercise
-the runner: deterministic controls prove orchestration without spending a provider turn, while support
-evidence still requires the exact candidate binary and environment named below.
+R3a provides `a2a-bridge compatibility validate|run|compare`; R3b originally added nine reviewed pinned
+case contracts. The v0.3.0 manifest now has 13 rows: four current release-blocking support cases, four
+former support rows retained explicitly as historical `non_goal` controls, and five other historical
+controls. The checked-in baseline carries the four reviewed exact-candidate summaries from the 2026-07-29
+aggregate above. Do not add or refresh a baseline entry or PASS row merely to exercise the runner:
+deterministic controls prove orchestration without spending a provider turn, while support evidence still
+requires a separately authorized exact candidate and named environment.
 
 Pinned adapter and CLI identities use one complete semantic version. Remote API support rows must pin
 provider, API, and API-version identities rather than a generic execution row. A raw advertised model ID

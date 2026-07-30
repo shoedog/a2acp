@@ -2319,14 +2319,14 @@ mod tests {
             .to_string()
             .contains("rederived checked-in foundation"));
 
-        let claimed_binding = &foundation.claimed_support_profiles["codex-host-bridge-gpt56-sol"];
+        let claimed_binding = &foundation.claimed_support_profiles["codex-host-bridge-gpt56-luna"];
         let claimed_execution =
             execution_for(claimed_binding, claimed_binding.maximum_caps.clone());
         let claimed_authority = one_shot_authority_for_source();
         let claimed_admission = admission_for(&claimed_execution, claimed_authority.clone());
         let claimed = generate_claimed_support_characterization_source(
             &root,
-            "codex-host-bridge-gpt56-sol",
+            "codex-host-bridge-gpt56-luna",
             claimed_execution,
             claimed_admission,
             claimed_authority,

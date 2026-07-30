@@ -1,4 +1,5 @@
 //! Workflow DAG types + validation. Edges are implicit from each node's `inputs`.
+use bridge_core::attestation::HarvestSanitizationMode;
 use bridge_core::domain::{EffectiveConfig, Effort};
 use bridge_core::ids::{AgentId, NodeId, WorkflowId};
 use bridge_core::ports::AgentRegistry;
@@ -56,6 +57,8 @@ pub struct WorkflowNode {
     pub inputs: Vec<NodeId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harvest_sanitization: Option<HarvestSanitizationMode>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -253,6 +256,7 @@ mod tests {
             prompt_template: format!("{{{{input}}}} {}", id),
             inputs: inputs.iter().map(|i| NodeId::parse(*i).unwrap()).collect(),
             retry: None,
+            harvest_sanitization: None,
         }
     }
 
@@ -323,6 +327,7 @@ mod tests {
                 prompt_template: "t {{input}}".into(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         };
@@ -345,6 +350,7 @@ mod tests {
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: Some(PanelConfig { weights }),
         };
@@ -372,6 +378,7 @@ mod tests {
                 backoff_ms: 500,
                 backoff_cap_ms: Some(30_000),
             }),
+            harvest_sanitization: None,
         };
 
         let json = serde_json::to_string(&node).unwrap();

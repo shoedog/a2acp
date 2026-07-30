@@ -33,6 +33,10 @@ use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 
 use a2a::{methods, SVC_PARAM_VERSION};
+use bridge_core::attestation::{
+    append_attestation_contract_to_last_part, generate_turn_id,
+    prefix_attestation_request_for_capability, HarvestSanitizationMode,
+};
 use bridge_core::domain::{
     effective_config, AgentOverride, AuthContext, InboundRequest, Part, PeerTaskId, RouteTarget,
     SessionSpec, TaskMeta,
@@ -558,7 +562,7 @@ async fn resolve_configure_bind(
                     eff.model.clone(),
                     eff.effort.map(effort_to_string),
                     eff.mode.clone(),
-                ),
+                )?,
             });
         }
     }
@@ -607,15 +611,14 @@ async fn resolve_configure_bind(
             obs_model,
             obs_effort.map(effort_to_string),
             obs_mode,
-        ),
+        )?,
         // Cold-bind: no warm handle to race a force-reset → a fresh, never-cancelled token.
         abort: tokio_util::sync::CancellationToken::new(),
     })
 }
 
-fn mint_turn_id() -> bridge_core::ids::TurnId {
-    bridge_core::ids::TurnId::parse(format!("turn-{}", a2a::new_task_id()))
-        .expect("a2a task id is non-empty")
+fn mint_turn_id() -> Result<bridge_core::ids::TurnId, BridgeError> {
+    generate_turn_id()
 }
 
 fn effort_to_string(effort: bridge_core::domain::Effort) -> String {
@@ -642,9 +645,27 @@ fn obs_ctx_for_dispatch(
     model: Option<String>,
     effort: Option<String>,
     mode: Option<String>,
+) -> Result<bridge_core::ports::TurnContext, BridgeError> {
+    Ok(obs_ctx_for_dispatch_with_turn_id(
+        routed,
+        agent,
+        model,
+        effort,
+        mode,
+        mint_turn_id()?,
+    ))
+}
+
+fn obs_ctx_for_dispatch_with_turn_id(
+    routed: &RoutedCall,
+    agent: &AgentId,
+    model: Option<String>,
+    effort: Option<String>,
+    mode: Option<String>,
+    turn_id: bridge_core::ids::TurnId,
 ) -> bridge_core::ports::TurnContext {
     bridge_core::ports::TurnContext {
-        turn_id: mint_turn_id(),
+        turn_id,
         session_id: routed_session_context_id(routed),
         task_id: Some(routed.task.clone()),
         workflow: None,
@@ -668,6 +689,19 @@ async fn warm_local_dispatch(
     routed: &RoutedCall,
     observer: Arc<dyn DiagnosticObserver>,
 ) -> Option<Result<LocalDispatch, BridgeError>> {
+    warm_local_dispatch_with_turn_id_minter(srv, agent_id, routed, observer, mint_turn_id).await
+}
+
+async fn warm_local_dispatch_with_turn_id_minter<F>(
+    srv: &Arc<InboundServer>,
+    agent_id: &AgentId,
+    routed: &RoutedCall,
+    observer: Arc<dyn DiagnosticObserver>,
+    turn_id_minter: F,
+) -> Option<Result<LocalDispatch, BridgeError>>
+where
+    F: FnOnce() -> Result<bridge_core::ids::TurnId, BridgeError>,
+{
     let ctx = routed.context_id.clone()?;
     let sm = srv.session_manager().clone();
     let completion_observer = observer.clone();
@@ -682,6 +716,39 @@ async fn warm_local_dispatch(
         .await
     {
         Ok(turn) => {
+            // Checkout has already transitioned this exact generation/operation
+            // to Running. Arm its sole completion owner before identity minting
+            // or any other fallible setup so every early return settles it.
+            let warm_guard = WarmCompletionGuard::finish_owner(
+                sm,
+                ctx.clone(),
+                turn.generation,
+                turn.op.clone(),
+                turn.expiry_intent.clone(),
+                completion_observer,
+            );
+            let turn_id = match turn_id_minter() {
+                Ok(turn_id) => turn_id,
+                Err(error) => return Some(Err(error)),
+            };
+            let obs_ctx = obs_ctx_for_dispatch_with_turn_id(
+                routed,
+                &turn.agent,
+                turn.model.clone(),
+                turn.effort.clone(),
+                turn.mode.clone(),
+                turn_id,
+            );
+            let turn_id = obs_ctx.turn_id.clone();
+            let prefix_capability = turn.backend.prefix_attestation_capability();
+            // Inbound direct dispatch has no per-node config surface (§6): harvest sanitization is permanently Off here.
+            let prefix_attestation_request = match prefix_attestation_request_for_capability(
+                HarvestSanitizationMode::Off,
+                &prefix_capability,
+            ) {
+                Ok(request) => request,
+                Err(error) => return Some(Err(error)),
+            };
             if let Some(w) = &turn.usage_warning {
                 tracing::warn!(target: "a2a_bridge::usage", ctx = %ctx.as_str(),
                     used = w.used, size = w.size, fraction = w.fraction, threshold = w.threshold,
@@ -696,25 +763,17 @@ async fn warm_local_dispatch(
                     context_id: ctx.clone(),
                     generation: turn.generation.get(),
                     op: turn.op.clone(),
+                    turn_id,
+                    // Inbound direct dispatch has no per-node config surface
+                    // (§6): sanitization is permanently Off here.
+                    requested_mode: HarvestSanitizationMode::Off,
+                    prefix_attestation_request: prefix_attestation_request.clone(),
                 }),
                 guard: None,
-                warm_guard: Some(WarmCompletionGuard::finish_owner(
-                    sm,
-                    ctx,
-                    turn.generation,
-                    turn.op.clone(),
-                    turn.expiry_intent,
-                    completion_observer,
-                )),
+                warm_guard: Some(warm_guard),
                 // Warm: the handle's per-turn abort token — a force-reset cancels it (cancel-tokens F2).
                 abort: turn.abort,
-                obs_ctx: obs_ctx_for_dispatch(
-                    routed,
-                    &turn.agent,
-                    turn.model.clone(),
-                    turn.effort.clone(),
-                    turn.mode.clone(),
-                ),
+                obs_ctx,
             }))
         }
         Err(e) => Some(Err(e)),
@@ -756,6 +815,19 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
         _ctx: &WorkflowRunContext,
         observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<NodeTurn, BridgeError> {
+        self.checkout_observed_with_overrides(wf_id, node, _run_id, _ctx, None, observer)
+            .await
+    }
+
+    async fn checkout_observed_with_overrides(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        _run_id: &str,
+        _ctx: &WorkflowRunContext,
+        overrides: Option<AgentOverride>,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<NodeTurn, BridgeError> {
         let child = ContextId::parse(format!(
             "{}::workflow::{}::node::{}",
             self.parent.as_str(),
@@ -769,7 +841,7 @@ impl WorkflowNodeDispatcher for WarmWorkflowNodeDispatcher {
                 &self.parent,
                 &child,
                 node.agent.clone(),
-                None,
+                overrides,
                 self.cwd.clone(),
                 observer,
             )
@@ -2486,11 +2558,24 @@ fn spawn_local_producer(
     let store = srv.store.clone();
     let policy = srv.policy().clone();
     let observer = srv.coordinator().observer();
+    let harvest_audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
+        bridge_core::task_store::TaskStoreHarvestAuditStore::new(srv.task_store().clone()),
+    );
     let task = routed.task;
     let session = dispatch.session.clone();
-    let parts = assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
+    let mut parts = assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
     let backend = dispatch.backend;
     let turn_meta = dispatch.turn_meta;
+    let prefix_capability = backend.prefix_attestation_capability();
+    let prefix_attestation_request = turn_meta
+        .as_ref()
+        .map(|meta| meta.prefix_attestation_request.clone())
+        .unwrap_or_default();
+    append_attestation_contract_to_last_part(
+        &mut parts,
+        &prefix_capability,
+        &prefix_attestation_request,
+    );
     // Moved into the task: its Drop evicts the binding/lease/stash on ANY exit.
     let guard = dispatch.guard;
     let warm = dispatch.warm_guard;
@@ -2519,6 +2604,8 @@ fn spawn_local_producer(
             &session,
             parts,
             diagnostic,
+            obs_ctx.clone(),
+            harvest_audit_store.clone(),
         );
         let mut errored = false;
         // Whether the translator already emitted its own terminal frame (a
@@ -2858,9 +2945,33 @@ fn local_kiro_source(
     parts: Vec<Part>,
     diagnostic: Arc<dyn DiagnosticObserver>,
 ) -> Source {
+    let source_label = label.clone();
     // Build the stream by cloning Arc refs into a `'static + Send` stream.
     let stream: crate::fanout::EventStream = Box::pin(async_stream::stream! {
         let translator = Translator::new();
+        let turn_id = match mint_turn_id() {
+            Ok(turn_id) => turn_id,
+            Err(error) => {
+                yield Err(error);
+                return;
+            }
+        };
+        let turn_context = bridge_core::ports::TurnContext {
+            turn_id,
+            session_id: ContextId::parse(session.as_str()).unwrap_or_else(|_| {
+                ContextId::parse("fanout-local").expect("fallback context id is valid")
+            }),
+            task_id: Some(task.clone()),
+            workflow: None,
+            node: Some(source_label.clone()),
+            attempt: 0,
+            agent: source_label.clone(),
+            model: None,
+            effort: None,
+            mode: None,
+            prompt_id: None,
+            traceparent: None,
+        };
         let mut events = translator.run_observed(
             backend.as_ref(),
             store.as_ref(),
@@ -2869,6 +2980,8 @@ fn local_kiro_source(
             &session,
             parts,
             diagnostic,
+            turn_context,
+            Arc::new(bridge_core::harvest::NoopHarvestAuditStore),
         );
         while let Some(ev) = events.next().await {
             // A fan-out SOURCE must never emit a terminal frame — the fan-out
@@ -3624,8 +3737,22 @@ async fn unary_message(
             }
             // cancel-tokens F2: the per-turn abort token (a force-reset cancels it).
             let abort = dispatch.abort;
-            let parts =
+            let mut parts =
                 assemble_turn_parts(dispatch.seed.as_deref(), &dispatch.injects, routed.parts);
+            let prefix_capability = dispatch.backend.prefix_attestation_capability();
+            let prefix_attestation_request = dispatch
+                .turn_meta
+                .as_ref()
+                .map(|meta| meta.prefix_attestation_request.clone())
+                .unwrap_or_default();
+            append_attestation_contract_to_last_part(
+                &mut parts,
+                &prefix_capability,
+                &prefix_attestation_request,
+            );
+            let harvest_audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
+                bridge_core::task_store::TaskStoreHarvestAuditStore::new(srv.task_store().clone()),
+            );
             let translator = Translator::new();
             let mut events = translator.run_observed(
                 dispatch.backend.as_ref(),
@@ -3635,6 +3762,8 @@ async fn unary_message(
                 &dispatch.session,
                 parts,
                 diagnostic,
+                dispatch.obs_ctx.clone(),
+                harvest_audit_store.clone(),
             );
             let mut collected: Vec<Result<Event, BridgeError>> = Vec::new();
             let mut prompt_polled = false;
@@ -5251,6 +5380,8 @@ mod tests {
             model: None,
             effort: None,
             mode: None,
+            preflight: false,
+            fallback_models: vec![],
             cwd: None,
             session_cwd: None,
             sandbox: None,
@@ -5432,6 +5563,7 @@ mod tests {
                 Ok(Update::Text("PONG".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -5457,6 +5589,7 @@ mod tests {
                 Ok(Update::Text("PARTIAL".into())),
                 Ok(Update::Done {
                     stop_reason: STOP_REASON_CANCELLED.into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -5492,6 +5625,7 @@ mod tests {
                 .collect();
             updates.push(Ok(Update::Done {
                 stop_reason: self.stop_reason.clone(),
+                prefix_attestation: Default::default(),
             }));
             Ok(Box::pin(tokio_stream::iter(updates)))
         }
@@ -5942,6 +6076,7 @@ mod tests {
                 Ok(Update::Text("observed".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ])))
         }
@@ -6458,6 +6593,7 @@ mod tests {
                         prompt_template: "{{input}}".into(),
                         inputs: Vec::new(),
                         retry: None,
+                        harvest_sanitization: None,
                     },
                     WorkflowNode {
                         id: NodeId::parse("synth").unwrap(),
@@ -6465,6 +6601,7 @@ mod tests {
                         prompt_template: "{{reviewer}}".into(),
                         inputs: vec![NodeId::parse("reviewer").unwrap()],
                         retry: None,
+                        harvest_sanitization: None,
                     },
                 ],
                 panel: None,
@@ -9441,6 +9578,7 @@ mod tests {
                 Ok(Update::Text("status-chunk".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -9523,6 +9661,7 @@ mod tests {
                     Ok(Update::Text("KA".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ];
                 Ok(Box::pin(tokio_stream::iter(updates)))
@@ -10375,6 +10514,7 @@ mod tests {
                 Ok(Update::Text("KDONE".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -10674,6 +10814,7 @@ mod tests {
         ) -> Result<BackendStream, BridgeError> {
             Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             })])))
         }
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
@@ -10758,6 +10899,7 @@ mod tests {
                 Ok(Update::Text(self.id.clone())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -10971,6 +11113,7 @@ mod tests {
                     Ok(Update::Text(id)),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ];
                 Ok(Box::pin(tokio_stream::iter(updates)))
@@ -11078,6 +11221,7 @@ mod tests {
                 Ok(Update::Text("warm".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -11329,6 +11473,7 @@ mod tests {
             prompt_template: "go".into(),
             inputs: vec![],
             retry: None,
+            harvest_sanitization: None,
         };
         let ctx = WorkflowRunContext {
             session_cwd: Some(cwd.clone()),
@@ -11441,6 +11586,7 @@ mod tests {
             prompt_template: "go".into(),
             inputs: vec![],
             retry: None,
+            harvest_sanitization: None,
         };
 
         for (index, class) in [
@@ -11592,6 +11738,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 }],
                 panel: None,
             });
@@ -11716,6 +11863,53 @@ mod tests {
         }
         assert_eq!(backend.releases.load(Ordering::SeqCst), 1);
         assert!(sm.status(&context).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn warm_dispatch_turn_id_failure_returns_session_to_idle_before_backend_prompt() {
+        let backend = Arc::new(InboundObserverBackend::default());
+        let srv = build(backend.clone(), Arc::new(AlwaysGrant));
+        let context = ContextId::parse("ctx-turn-id-failure").unwrap();
+        let routed = RoutedCall {
+            task: TaskId::parse("task-turn-id-failure").unwrap(),
+            session: SessionId::parse("session-turn-id-failure").unwrap(),
+            parts: vec![Part { text: "go".into() }],
+            target: RouteTarget::Local(AgentId::parse("kiro").unwrap()),
+            default_route_deferred: false,
+            auth: AuthContext::new(CallerId::parse("anon").unwrap()),
+            overrides: None,
+            traceparent: None,
+            prompt_id: None,
+            context_id: Some(context.clone()),
+            session_cwd: None,
+        };
+
+        let result = warm_local_dispatch_with_turn_id_minter(
+            &srv,
+            &AgentId::parse("kiro").unwrap(),
+            &routed,
+            direct_diagnostic_observer(),
+            || Err(BridgeError::IdentityUnavailable),
+        )
+        .await
+        .expect("warm context selects warm path");
+        assert!(matches!(result, Err(BridgeError::IdentityUnavailable)));
+        assert!(backend.prompts.lock().unwrap().is_empty());
+
+        let sm = srv.session_manager().clone();
+        for _ in 0..100 {
+            if sm
+                .status(&context)
+                .await
+                .is_some_and(|status| status.state == "idle")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sm.status(&context).await.unwrap().state, "idle");
+        let turn = sm.checkout_existing_turn(&context).await.unwrap();
+        sm.finish_turn(&context, turn.generation, &turn.op).await;
     }
 
     #[tokio::test]
@@ -11862,6 +12056,7 @@ mod tests {
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         });
@@ -12153,7 +12348,7 @@ mod tests {
                 for i in 0..count {
                     yield Ok(Update::Text(format!("chunk-{i}")));
                 }
-                yield Ok(Update::Done { stop_reason: "end_turn".into() });
+                yield Ok(Update::Done { stop_reason: "end_turn".into() , prefix_attestation: Default::default()});
             }))
         }
         async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
@@ -12441,6 +12636,7 @@ mod tests {
                 Ok(Update::Text("ok".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -14779,6 +14975,59 @@ mod tests {
     }
 
     #[async_trait::async_trait]
+    impl bridge_core::harvest::HarvestAuditStore for LegacyFallbackStore {
+        async fn commit_bundle(
+            &self,
+            raw: bridge_core::harvest::HarvestRawRecordV1,
+            decision: bridge_core::harvest::HarvestSanitizationDecisionV1,
+        ) -> Result<
+            bridge_core::harvest::HarvestAuditCommit,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            self.inner.commit_bundle(raw, decision).await
+        }
+
+        async fn get_by_audit_id(
+            &self,
+            audit_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            self.inner.get_by_audit_id(audit_id).await
+        }
+
+        async fn get_by_attempt_key(
+            &self,
+            run_id: &str,
+            node_id: &str,
+            attempt_id: u32,
+            turn_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            self.inner
+                .get_by_attempt_key(run_id, node_id, attempt_id, turn_id)
+                .await
+        }
+
+        async fn list_by_task_id(
+            &self,
+            task_id: &str,
+            after_audit_id: Option<&str>,
+            limit: u32,
+        ) -> Result<
+            Vec<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            self.inner
+                .list_by_task_id(task_id, after_audit_id, limit)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
     impl bridge_core::task_store::TaskStore for LegacyFallbackStore {
         async fn create(
             &self,
@@ -15118,6 +15367,7 @@ mod tests {
                 prompt_template: "{{input}}".into(),
                 inputs: Vec::new(),
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         };

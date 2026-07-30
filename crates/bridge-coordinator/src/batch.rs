@@ -1461,6 +1461,7 @@ mod tests {
                 Ok(Update::Text("ok".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ])))
         }
@@ -1489,6 +1490,8 @@ mod tests {
                     model: None,
                     effort: None,
                     mode: None,
+                    preflight: false,
+                    fallback_models: vec![],
                     cwd: None,
                     session_cwd: None,
                     sandbox: None,
@@ -1533,6 +1536,7 @@ mod tests {
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         })

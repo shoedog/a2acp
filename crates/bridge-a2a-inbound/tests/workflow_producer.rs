@@ -47,6 +47,8 @@ fn minimal_entry(id: &AgentId) -> AgentEntry {
         model: None,
         effort: None,
         mode: None,
+        preflight: false,
+        fallback_models: vec![],
         cwd: None,
         session_cwd: None,
         sandbox: None,
@@ -76,6 +78,7 @@ impl AgentBackend for FakeBackend {
             Ok(Update::Text(self.reply.clone())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -226,6 +229,7 @@ fn review_graph() -> Arc<WorkflowGraph> {
         prompt_template: tpl.into(),
         inputs: ins.iter().map(|i| NodeId::parse(*i).unwrap()).collect(),
         retry: None,
+        harvest_sanitization: None,
     };
     Arc::new(WorkflowGraph {
         id: WorkflowId::parse("code-review").unwrap(),
@@ -529,6 +533,7 @@ impl AgentBackend for BarrierRecordingBackend {
             Ok(Update::Text(self.reply.clone())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -598,6 +603,7 @@ async fn write_ahead_barrier() {
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             },
             WorkflowNode {
                 id: NodeId::parse("b").unwrap(),
@@ -605,6 +611,7 @@ async fn write_ahead_barrier() {
                 prompt_template: "got {{a}}".into(),
                 inputs: vec![NodeId::parse("a").unwrap()],
                 retry: None,
+                harvest_sanitization: None,
             },
         ],
         panel: None,
@@ -657,6 +664,7 @@ impl AgentBackend for RecordingFakeBackend {
             Ok(Update::Text(self.reply.clone())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -875,6 +883,7 @@ impl AgentBackend for BlockingCountBackend {
             Ok(Update::Text(reply)),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -1938,6 +1947,7 @@ impl AgentBackend for WarmCancelProbeBackend {
             Ok(Update::Text("WARM_DONE".to_string())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -2317,6 +2327,7 @@ impl AgentBackend for GatedBackend {
             Ok(Update::Text(reply)),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -2977,6 +2988,59 @@ impl FailingCheckpointStore {
 }
 
 #[async_trait]
+impl bridge_core::harvest::HarvestAuditStore for FailingCheckpointStore {
+    async fn commit_bundle(
+        &self,
+        raw: bridge_core::harvest::HarvestRawRecordV1,
+        decision: bridge_core::harvest::HarvestSanitizationDecisionV1,
+    ) -> Result<
+        bridge_core::harvest::HarvestAuditCommit,
+        bridge_core::harvest::HarvestAuditStoreError,
+    > {
+        self.inner.commit_bundle(raw, decision).await
+    }
+
+    async fn get_by_audit_id(
+        &self,
+        audit_id: &str,
+    ) -> Result<
+        Option<bridge_core::harvest::HarvestAuditBundleV1>,
+        bridge_core::harvest::HarvestAuditStoreError,
+    > {
+        self.inner.get_by_audit_id(audit_id).await
+    }
+
+    async fn get_by_attempt_key(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        attempt_id: u32,
+        turn_id: &str,
+    ) -> Result<
+        Option<bridge_core::harvest::HarvestAuditBundleV1>,
+        bridge_core::harvest::HarvestAuditStoreError,
+    > {
+        self.inner
+            .get_by_attempt_key(run_id, node_id, attempt_id, turn_id)
+            .await
+    }
+
+    async fn list_by_task_id(
+        &self,
+        task_id: &str,
+        after_audit_id: Option<&str>,
+        limit: u32,
+    ) -> Result<
+        Vec<bridge_core::harvest::HarvestAuditBundleV1>,
+        bridge_core::harvest::HarvestAuditStoreError,
+    > {
+        self.inner
+            .list_by_task_id(task_id, after_audit_id, limit)
+            .await
+    }
+}
+
+#[async_trait]
 impl bridge_core::task_store::TaskStore for FailingCheckpointStore {
     async fn create(&self, rec: &bridge_core::task_store::TaskRecord) -> Result<(), BridgeError> {
         self.inner.create(rec).await
@@ -3539,6 +3603,7 @@ impl AgentBackend for ResumeRecordingBackend {
             Ok(Update::Text(self.reply.clone())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -4412,6 +4477,7 @@ impl AgentBackend for CwdCapBackend {
             Ok(Update::Text(self.reply.clone())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))

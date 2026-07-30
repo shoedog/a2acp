@@ -263,8 +263,8 @@ fn write_recipes(dir: &Path) -> PathBuf {
     fs::write(dir.join("manifest.toml"), manifest).unwrap();
     fs::create_dir(dir.join("configs")).unwrap();
     fs::copy(
-        compatibility.join("configs/codex-host.toml"),
-        dir.join("configs/codex-host.toml"),
+        compatibility.join("configs/codex-luna-host.toml"),
+        dir.join("configs/codex-luna-host.toml"),
     )
     .unwrap();
     let recipes = dir.join("floating-current.toml");
@@ -293,7 +293,7 @@ agent_cli = "@openai/codex"
 
 [[cases]]
 id = "codex-host-floating-current"
-baseline_case = "codex-host-bridge-gpt56-sol"
+baseline_case = "codex-host-bridge-gpt56-luna"
 package_set = "codex-current"
 target = "host-package-tree"
 config_template = "codex-host-read-only-v1"
@@ -315,7 +315,7 @@ fn write_bound_host_resolution(dir: &Path) -> (PathBuf, PathBuf) {
         .unwrap()
         .iter()
         .find(|case| {
-            case.get("id").and_then(toml::Value::as_str) == Some("codex-host-bridge-gpt56-sol")
+            case.get("id").and_then(toml::Value::as_str) == Some("codex-host-bridge-gpt56-luna")
         })
         .unwrap()
         .as_table()
@@ -358,7 +358,7 @@ fn write_bound_host_resolution(dir: &Path) -> (PathBuf, PathBuf) {
     );
     generated.insert(
         "baseline_case".into(),
-        toml::Value::String("codex-host-bridge-gpt56-sol".into()),
+        toml::Value::String("codex-host-bridge-gpt56-luna".into()),
     );
     generated.insert(
         "config".into(),
@@ -486,7 +486,7 @@ fn write_bound_host_resolution(dir: &Path) -> (PathBuf, PathBuf) {
         "images": [],
         "cases": [{
             "id": "codex-host-floating-current",
-            "baseline_case": "codex-host-bridge-gpt56-sol",
+            "baseline_case": "codex-host-bridge-gpt56-luna",
             "package_set": "codex-current",
             "model": baseline.get("model").and_then(toml::Value::as_str).unwrap(),
             "effort": baseline.get("effort").and_then(toml::Value::as_str),
@@ -638,8 +638,8 @@ fn validate_rejects_recipe_mapping_to_a_pinned_non_support_control() {
     let dir = tempfile::tempdir().unwrap();
     let recipes = write_recipes(dir.path());
     let raw = fs::read_to_string(&recipes).unwrap().replace(
+        "baseline_case = \"codex-host-bridge-gpt56-luna\"",
         "baseline_case = \"codex-host-bridge-gpt56-sol\"",
-        "baseline_case = \"claude-direct-host-cli-fable\"",
     );
     fs::write(&recipes, raw).unwrap();
 

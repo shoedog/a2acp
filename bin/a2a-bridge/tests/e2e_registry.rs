@@ -237,6 +237,8 @@ fn entry(
         model: model.map(str::to_string),
         effort: None,
         mode: mode.map(str::to_string),
+        preflight: false,
+        fallback_models: vec![],
         cwd: None,
         session_cwd: None,
         sandbox: None,
@@ -307,7 +309,7 @@ async fn route_and_prompt(
                     eprintln!("(note) {id} issued a permission request on a plain text prompt");
                 }
                 Some(Ok(Update::Usage(_))) => {}
-                Some(Ok(Update::Done { stop_reason })) => {
+                Some(Ok(Update::Done { stop_reason, .. })) => {
                     // Hold the lease until Done so retirement can't drain us mid-turn.
                     drop(resolved);
                     return (texts.join(""), stop_reason);
@@ -497,7 +499,7 @@ async fn drain_one_turn(
                 Some(Ok(Update::Text(t))) => texts.push(t),
                 Some(Ok(Update::Permission(_))) => {}
                 Some(Ok(Update::Usage(_))) => {}
-                Some(Ok(Update::Done { stop_reason })) => return (texts.join(""), stop_reason),
+                Some(Ok(Update::Done { stop_reason, .. })) => return (texts.join(""), stop_reason),
                 Some(Err(e)) => panic!("turn surfaced a terminal error before Done: {e:?}"),
                 None => panic!("stream ended WITHOUT a terminal Update::Done"),
             }
@@ -578,6 +580,8 @@ async fn api_entry_resolves_and_serves_through_registry() {
         model: None,
         effort: None,
         mode: None,
+        preflight: false,
+        fallback_models: vec![],
         cwd: None,
         session_cwd: None,
         sandbox: None,
@@ -640,6 +644,8 @@ async fn registry_rejects_api_entry_with_cmd() {
         model: None,
         effort: None,
         mode: None,
+        preflight: false,
+        fallback_models: vec![],
         cwd: None,
         session_cwd: None,
         sandbox: None,

@@ -5,10 +5,16 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository = "https://github.com/shoedog/a2acp"
+default-run = "a2a-bridge"
 
 [[bin]]
 name = "a2a-bridge"
 path = "src/main.rs"
+
+
+[[bin]]
+name = "codex-acp-attested"
+path = "src/bin/codex-acp-attested.rs"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"

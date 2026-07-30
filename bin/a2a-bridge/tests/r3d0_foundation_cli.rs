@@ -543,7 +543,7 @@ fn r3d0_execution_only_pins_do_not_change_profile_policy_bundle() {
 
     let image_temp = tempfile::tempdir().unwrap();
     copy_foundation(image_temp.path());
-    let config_path = image_temp.path().join("configs/codex-luna-reader.toml");
+    let config_path = image_temp.path().join("configs/claude-haiku-reader.toml");
     let original = fs::read_to_string(&config_path).unwrap();
     let config = original.replace(
         "sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1",
@@ -574,7 +574,7 @@ fn r3d0_semantic_bundle_ignores_comments_but_validates_recipe_constraints() {
         "scheduled-cases.toml",
         "manifest.toml",
         "floating-current.toml",
-        "configs/codex-luna-host.toml",
+        "configs/claude-haiku-host.toml",
     ] {
         let path = comment_temp.path().join(relative);
         let original = fs::read_to_string(&path).unwrap();
@@ -698,7 +698,7 @@ fn r3d0_support_expected_status_changes_the_profile_identity() {
 fn r3d0_claimed_support_config_bytes_must_match_the_manifest_pin() {
     let temp = tempfile::tempdir().unwrap();
     copy_foundation(temp.path());
-    let config_path = temp.path().join("configs/codex-host.toml");
+    let config_path = temp.path().join("configs/codex-luna-host.toml");
     let config = fs::read_to_string(&config_path).unwrap();
     fs::write(config_path, format!("# changed execution bytes\n{config}")).unwrap();
     let changed = validate_foundation(temp.path());
@@ -714,7 +714,7 @@ fn r3d0_claimed_support_config_bytes_must_match_the_manifest_pin() {
 fn r3d0_claimed_support_pin_update_cannot_bypass_reviewed_effect_semantics() {
     let temp = tempfile::tempdir().unwrap();
     copy_foundation(temp.path());
-    let config_path = temp.path().join("configs/codex-host.toml");
+    let config_path = temp.path().join("configs/codex-luna-host.toml");
     let original = fs::read(&config_path).unwrap();
     let original_text = std::str::from_utf8(&original).unwrap();
     let changed_text = original_text.replacen(
@@ -738,6 +738,43 @@ fn r3d0_claimed_support_pin_update_cannot_bypass_reviewed_effect_semantics() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("command arguments contradict"), "{stderr}");
+}
+
+#[test]
+fn r3d0_sonnet_support_rejects_fable_settings_even_after_exact_config_repin() {
+    let temp = tempfile::tempdir().unwrap();
+    copy_foundation(temp.path());
+    let config_path = temp.path().join("configs/claude-sonnet-low-reader.toml");
+    let original = fs::read(&config_path).unwrap();
+    let original_text = std::str::from_utf8(&original).unwrap();
+    let credential = "/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json";
+    let changed_text = original_text.replacen(
+        &format!("volumes = [\"{credential}\"]"),
+        &format!(
+            "volumes = [\n  \"{credential}\",\n  \"/Users/wesleyjinks/code/a2a-bridge-operator-main/deploy/containers/claude-fable-settings.json:/root/.claude/settings.json:ro\",\n]"
+        ),
+        1,
+    );
+    assert_ne!(changed_text, original_text);
+    fs::write(&config_path, changed_text.as_bytes()).unwrap();
+
+    let manifest_path = temp.path().join("manifest.toml");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    let manifest = manifest.replacen(
+        &sha256_hex(&original),
+        &sha256_hex(changed_text.as_bytes()),
+        1,
+    );
+    fs::write(manifest_path, manifest).unwrap();
+
+    let output = validate_foundation(temp.path());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("sandbox/mount/egress/proxy/credential-volume contract drifted"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("fingerprint mismatch"), "{stderr}");
 }
 
 #[test]
@@ -1037,21 +1074,17 @@ fn r3d0_profile_field_change_invalidates_the_checked_in_inventory() {
     let registry_path = temp.path().join("scheduled-cases.toml");
     let registry = fs::read_to_string(&registry_path)
         .unwrap()
+        .replacen("model = \"haiku\"", "model = \"haiku-new\"", 1)
         .replacen(
-            "model = \"gpt-5.6-luna\"",
-            "model = \"gpt-5.6-luna-new\"",
-            1,
-        )
-        .replacen(
-            "expected_effective_model = \"gpt-5.6-luna\"",
-            "expected_effective_model = \"gpt-5.6-luna-new\"",
+            "expected_effective_model = \"haiku\"",
+            "expected_effective_model = \"haiku-new\"",
             1,
         );
     fs::write(&registry_path, registry).unwrap();
-    let config_path = temp.path().join("configs/codex-luna-host.toml");
+    let config_path = temp.path().join("configs/claude-haiku-host.toml");
     let config = fs::read_to_string(&config_path)
         .unwrap()
-        .replace("model = \"gpt-5.6-luna\"", "model = \"gpt-5.6-luna-new\"");
+        .replace("model = \"haiku\"", "model = \"haiku-new\"");
     fs::write(config_path, config).unwrap();
 
     let output = validate_foundation(temp.path());

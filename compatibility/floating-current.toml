@@ -37,14 +37,14 @@ package_sets = ["codex-current", "claude-current"]
 
 [[cases]]
 id = "codex-host-floating-current"
-baseline_case = "codex-host-bridge-gpt56-sol"
+baseline_case = "codex-host-bridge-gpt56-luna"
 package_set = "codex-current"
 target = "host-package-tree"
 config_template = "codex-host-read-only-v1"
 
 [[cases]]
 id = "codex-reader-floating-current"
-baseline_case = "codex-reader-bridge-gpt56-sol"
+baseline_case = "codex-reader-bridge-gpt56-luna"
 package_set = "codex-current"
 target = "container-ro-image"
 config_template = "codex-reader-read-only-v1"
@@ -52,14 +52,14 @@ image = "reader-current"
 
 [[cases]]
 id = "claude-host-floating-current"
-baseline_case = "claude-host-acp-044-fable"
+baseline_case = "claude-host-acp-063-sonnet5"
 package_set = "claude-current"
 target = "host-package-tree"
 config_template = "claude-host-read-only-v1"
 
 [[cases]]
 id = "claude-reader-floating-current"
-baseline_case = "claude-reader-055-fable"
+baseline_case = "claude-reader-063-sonnet5"
 package_set = "claude-current"
 target = "container-ro-image"
 config_template = "claude-reader-read-only-v1"

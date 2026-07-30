@@ -3,6 +3,10 @@
 use bridge_core::{
     domain::{PeerTaskId, PendingKind, PendingRequest},
     error::BridgeError,
+    harvest::{
+        HarvestAuditBundleV1, HarvestAuditCommit, HarvestAuditStore, HarvestAuditStoreError,
+        HarvestDecision, HarvestRawRecordV1, HarvestSanitizationDecisionV1,
+    },
     ids::{NodeId, OperationId, SessionId, TaskId},
     ports::SessionStore,
     task_store::{durable_retention_ms, system_wall_now_ms, PersistenceClock},
@@ -2278,6 +2282,59 @@ impl SqliteStore {
                 ON workflow_attempt_summaries(execution_id, ordinal);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_attempt_parent
                 ON workflow_attempt_summaries(parent_attempt_id) WHERE parent_attempt_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS harvest_raw_records_v1 (
+                audit_id                 TEXT PRIMARY KEY NOT NULL,
+                task_id                  TEXT NOT NULL,
+                run_id                   TEXT NOT NULL,
+                node_id                  TEXT NOT NULL,
+                attempt_id               INTEGER NOT NULL
+                                             CHECK (attempt_id >= 0 AND attempt_id <= 4294967295),
+                turn_id                  TEXT NOT NULL,
+                backend_id               TEXT NOT NULL,
+                producer_id              TEXT NOT NULL,
+                declared_capability_json TEXT NOT NULL,
+                raw_body                 TEXT NOT NULL,
+                raw_len_bytes            INTEGER NOT NULL CHECK (raw_len_bytes >= 0),
+                raw_body_sha256          BLOB NOT NULL CHECK (length(raw_body_sha256) = 32),
+                prefix_attestation_json  TEXT NOT NULL,
+                provenance_sha256        BLOB NOT NULL CHECK (length(provenance_sha256) = 32),
+                created_at_ms            INTEGER NOT NULL,
+                UNIQUE (run_id, node_id, attempt_id, turn_id)
+            );
+            CREATE TABLE IF NOT EXISTS harvest_sanitization_decisions_v1 (
+                audit_id                     TEXT PRIMARY KEY NOT NULL,
+                mode                         TEXT NOT NULL
+                                                 CHECK (mode IN ('off', 'attested_prefix_v1')),
+                decision                     TEXT NOT NULL
+                                                 CHECK (decision IN (
+                                                     'kept_off',
+                                                     'kept_no_attestation',
+                                                     'kept_invalid_attestation',
+                                                     'kept_suspicious_attestation',
+                                                     'kept_zero_prefix',
+                                                     'cut_attested'
+                                                 )),
+                reason                       TEXT,
+                node_id                      TEXT NOT NULL,
+                producer_id                  TEXT NOT NULL,
+                issuer_id                    TEXT,
+                raw_body_sha256              BLOB NOT NULL CHECK (length(raw_body_sha256) = 32),
+                effective_body_sha256        BLOB NOT NULL CHECK (length(effective_body_sha256) = 32),
+                raw_len_bytes                INTEGER NOT NULL CHECK (raw_len_bytes >= 0),
+                effective_len_bytes          INTEGER NOT NULL CHECK (effective_len_bytes >= 0),
+                cut_byte_offset              INTEGER CHECK (cut_byte_offset >= 0),
+                provenance_sha256            BLOB NOT NULL CHECK (length(provenance_sha256) = 32),
+                suspicious_threshold_percent INTEGER NOT NULL
+                                                 CHECK (suspicious_threshold_percent = 90),
+                created_at_ms                INTEGER NOT NULL,
+                FOREIGN KEY (audit_id)
+                    REFERENCES harvest_raw_records_v1(audit_id)
+                    ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS harvest_raw_records_v1_task_idx
+                ON harvest_raw_records_v1(task_id, created_at_ms, audit_id);
+            CREATE INDEX IF NOT EXISTS harvest_raw_records_v1_attempt_idx
+                ON harvest_raw_records_v1(run_id, node_id, attempt_id, turn_id);
             ",
         )?;
         migrate_tasks_columns(&tx)?;
@@ -3027,6 +3084,141 @@ fn parse_batch_status(s: &str) -> Option<bridge_core::task_store::BatchStatus> {
     }
 }
 
+fn harvest_mode_as_str(mode: bridge_core::attestation::HarvestSanitizationMode) -> &'static str {
+    match mode {
+        bridge_core::attestation::HarvestSanitizationMode::Off => "off",
+        bridge_core::attestation::HarvestSanitizationMode::AttestedPrefixV1 => "attested_prefix_v1",
+    }
+}
+
+fn parse_harvest_mode(
+    raw: &str,
+) -> rusqlite::Result<bridge_core::attestation::HarvestSanitizationMode> {
+    match raw {
+        "off" => Ok(bridge_core::attestation::HarvestSanitizationMode::Off),
+        "attested_prefix_v1" => {
+            Ok(bridge_core::attestation::HarvestSanitizationMode::AttestedPrefixV1)
+        }
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn harvest_decision_as_str(decision: HarvestDecision) -> &'static str {
+    match decision {
+        HarvestDecision::KeptOff => "kept_off",
+        HarvestDecision::KeptNoAttestation => "kept_no_attestation",
+        HarvestDecision::KeptInvalidAttestation => "kept_invalid_attestation",
+        HarvestDecision::KeptSuspiciousAttestation => "kept_suspicious_attestation",
+        HarvestDecision::KeptZeroPrefix => "kept_zero_prefix",
+        HarvestDecision::CutAttested => "cut_attested",
+    }
+}
+
+fn parse_harvest_decision(raw: &str) -> rusqlite::Result<HarvestDecision> {
+    match raw {
+        "kept_off" => Ok(HarvestDecision::KeptOff),
+        "kept_no_attestation" => Ok(HarvestDecision::KeptNoAttestation),
+        "kept_invalid_attestation" => Ok(HarvestDecision::KeptInvalidAttestation),
+        "kept_suspicious_attestation" => Ok(HarvestDecision::KeptSuspiciousAttestation),
+        "kept_zero_prefix" => Ok(HarvestDecision::KeptZeroPrefix),
+        "cut_attested" => Ok(HarvestDecision::CutAttested),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn u64_to_i64_harvest(value: u64, field: &str) -> Result<i64, HarvestAuditStoreError> {
+    i64::try_from(value).map_err(|_| {
+        HarvestAuditStoreError::Encoding(format!("{field} exceeds SQLite INTEGER range"))
+    })
+}
+
+fn nonnegative_i64_to_u64(value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|_| rusqlite::Error::InvalidQuery)
+}
+
+fn nonnegative_i64_to_u32(value: i64) -> rusqlite::Result<u32> {
+    u32::try_from(value).map_err(|_| rusqlite::Error::InvalidQuery)
+}
+
+fn blob32(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<[u8; 32]> {
+    let bytes: Vec<u8> = row.get(idx)?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    Ok(arr)
+}
+
+fn json_from_sql<T: serde::de::DeserializeOwned>(raw: String) -> rusqlite::Result<T> {
+    serde_json::from_str(&raw).map_err(|_| rusqlite::Error::InvalidQuery)
+}
+
+const HARVEST_BUNDLE_SELECT: &str = "SELECT
+    r.audit_id, r.task_id, r.run_id, r.node_id, r.attempt_id, r.turn_id,
+    r.backend_id, r.producer_id, r.declared_capability_json, r.raw_body,
+    r.raw_len_bytes, r.raw_body_sha256, r.prefix_attestation_json,
+    r.provenance_sha256, r.created_at_ms,
+    d.mode, d.decision, d.reason, d.node_id, d.producer_id, d.issuer_id,
+    d.raw_body_sha256, d.effective_body_sha256, d.raw_len_bytes,
+    d.effective_len_bytes, d.cut_byte_offset, d.provenance_sha256,
+    d.suspicious_threshold_percent, d.created_at_ms
+ FROM harvest_raw_records_v1 r
+ JOIN harvest_sanitization_decisions_v1 d ON d.audit_id = r.audit_id";
+
+fn row_to_harvest_bundle(row: &rusqlite::Row<'_>) -> rusqlite::Result<HarvestAuditBundleV1> {
+    let declared_capability_json: String = row.get(8)?;
+    let prefix_attestation_json: String = row.get(12)?;
+    let raw = HarvestRawRecordV1 {
+        schema_version: bridge_core::harvest::HARVEST_SCHEMA_VERSION,
+        audit_id: row.get(0)?,
+        task_id: row.get(1)?,
+        run_id: row.get(2)?,
+        node_id: row.get(3)?,
+        attempt_id: nonnegative_i64_to_u32(row.get(4)?)?,
+        turn_id: row.get(5)?,
+        backend_id: row.get(6)?,
+        producer_id: row.get(7)?,
+        declared_capability: json_from_sql(declared_capability_json)?,
+        raw_body: row.get(9)?,
+        raw_len_bytes: nonnegative_i64_to_u64(row.get(10)?)?,
+        raw_body_sha256: blob32(row, 11)?,
+        prefix_attestation: json_from_sql(prefix_attestation_json)?,
+        provenance_sha256: blob32(row, 13)?,
+    };
+    let cut_i64: Option<i64> = row.get(25)?;
+    let decision = HarvestSanitizationDecisionV1 {
+        schema_version: bridge_core::harvest::HARVEST_SCHEMA_VERSION,
+        audit_id: raw.audit_id.clone(),
+        mode: parse_harvest_mode(&row.get::<_, String>(15)?)?,
+        decision: parse_harvest_decision(&row.get::<_, String>(16)?)?,
+        reason: row.get(17)?,
+        node_id: row.get(18)?,
+        producer_id: row.get(19)?,
+        issuer_id: row.get(20)?,
+        raw_body_sha256: blob32(row, 21)?,
+        effective_body_sha256: blob32(row, 22)?,
+        raw_len_bytes: nonnegative_i64_to_u64(row.get(23)?)?,
+        effective_len_bytes: nonnegative_i64_to_u64(row.get(24)?)?,
+        cut_byte_offset: cut_i64.map(nonnegative_i64_to_u64).transpose()?,
+        provenance_sha256: blob32(row, 26)?,
+        suspicious_threshold_percent: u8::try_from(row.get::<_, i64>(27)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+    };
+    Ok(HarvestAuditBundleV1 {
+        raw,
+        decision,
+        created_at_ms: row.get(14)?,
+    })
+}
+
+fn harvest_attempt_key(raw: &HarvestRawRecordV1) -> (&str, &str, i64, &str) {
+    (
+        raw.run_id.as_str(),
+        raw.node_id.as_str(),
+        i64::from(raw.attempt_id),
+        raw.turn_id.as_str(),
+    )
+}
+
 #[async_trait::async_trait]
 impl SessionStore for SqliteStore {
     async fn put(&self, task: &TaskId, session: &SessionId) -> Result<(), BridgeError> {
@@ -3201,6 +3393,238 @@ impl SessionStore for SqliteStore {
                 Ok(flag != 0)
             }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl HarvestAuditStore for SqliteStore {
+    async fn commit_bundle(
+        &self,
+        raw: HarvestRawRecordV1,
+        decision: HarvestSanitizationDecisionV1,
+    ) -> Result<HarvestAuditCommit, HarvestAuditStoreError> {
+        bridge_core::task_store::validate_harvest_bundle_shape(&raw, &decision)?;
+        let raw_len_i64 = u64_to_i64_harvest(raw.raw_len_bytes, "raw_len_bytes")?;
+        let effective_len_i64 =
+            u64_to_i64_harvest(decision.effective_len_bytes, "effective_len_bytes")?;
+        let decision_raw_len_i64 =
+            u64_to_i64_harvest(decision.raw_len_bytes, "decision.raw_len_bytes")?;
+        let cut_i64 = decision
+            .cut_byte_offset
+            .map(|v| u64_to_i64_harvest(v, "cut_byte_offset"))
+            .transpose()?;
+        let declared_capability_json = serde_json::to_string(&raw.declared_capability)
+            .map_err(|e| HarvestAuditStoreError::Encoding(e.to_string()))?;
+        let prefix_attestation_json = serde_json::to_string(&raw.prefix_attestation)
+            .map_err(|e| HarvestAuditStoreError::Encoding(e.to_string()))?;
+
+        let conn = self.conn.lock().unwrap();
+        let tx = immediate_transaction(&conn)
+            .map_err(|e| HarvestAuditStoreError::Persistence(Box::new(e)))?;
+        let existing_by_audit = tx
+            .query_row(
+                &format!("{HARVEST_BUNDLE_SELECT} WHERE r.audit_id=?1"),
+                rusqlite::params![raw.audit_id.as_str()],
+                row_to_harvest_bundle,
+            )
+            .optional()
+            .map_err(|e| HarvestAuditStoreError::Lookup(Box::new(e)))?;
+        if let Some(existing) = existing_by_audit {
+            if existing.raw == raw && existing.decision == decision {
+                tx.commit()
+                    .map_err(|e| HarvestAuditStoreError::Persistence(Box::new(e)))?;
+                return Ok(HarvestAuditCommit::AlreadyPresentIdentical);
+            }
+            return Err(HarvestAuditStoreError::IntegrityConflict {
+                audit_id: raw.audit_id,
+            });
+        }
+
+        let (run_id, node_id, attempt_id, turn_id) = harvest_attempt_key(&raw);
+        let existing_attempt: Option<String> = tx
+            .query_row(
+                "SELECT audit_id FROM harvest_raw_records_v1
+                 WHERE run_id=?1 AND node_id=?2 AND attempt_id=?3 AND turn_id=?4",
+                rusqlite::params![run_id, node_id, attempt_id, turn_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| HarvestAuditStoreError::Lookup(Box::new(e)))?;
+        if existing_attempt.is_some() {
+            return Err(HarvestAuditStoreError::IntegrityConflict {
+                audit_id: raw.audit_id,
+            });
+        }
+
+        let created_at_ms = durable_retention_ms((self.now_ms)());
+        tx.execute(
+            "INSERT INTO harvest_raw_records_v1(
+                audit_id, task_id, run_id, node_id, attempt_id, turn_id, backend_id,
+                producer_id, declared_capability_json, raw_body, raw_len_bytes,
+                raw_body_sha256, prefix_attestation_json, provenance_sha256, created_at_ms
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            rusqlite::params![
+                raw.audit_id.as_str(),
+                raw.task_id.as_str(),
+                raw.run_id.as_str(),
+                raw.node_id.as_str(),
+                i64::from(raw.attempt_id),
+                raw.turn_id.as_str(),
+                raw.backend_id.as_str(),
+                raw.producer_id.as_str(),
+                declared_capability_json,
+                raw.raw_body.as_str(),
+                raw_len_i64,
+                raw.raw_body_sha256.as_slice(),
+                prefix_attestation_json,
+                raw.provenance_sha256.as_slice(),
+                created_at_ms,
+            ],
+        )
+        .map_err(|e| HarvestAuditStoreError::Persistence(Box::new(e)))?;
+        tx.execute(
+            "INSERT INTO harvest_sanitization_decisions_v1(
+                audit_id, mode, decision, reason, node_id, producer_id, issuer_id,
+                raw_body_sha256, effective_body_sha256, raw_len_bytes, effective_len_bytes,
+                cut_byte_offset, provenance_sha256, suspicious_threshold_percent, created_at_ms
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            rusqlite::params![
+                decision.audit_id.as_str(),
+                harvest_mode_as_str(decision.mode),
+                harvest_decision_as_str(decision.decision),
+                decision.reason.as_deref(),
+                decision.node_id.as_str(),
+                decision.producer_id.as_str(),
+                decision.issuer_id.as_deref(),
+                decision.raw_body_sha256.as_slice(),
+                decision.effective_body_sha256.as_slice(),
+                decision_raw_len_i64,
+                effective_len_i64,
+                cut_i64,
+                decision.provenance_sha256.as_slice(),
+                i64::from(decision.suspicious_threshold_percent),
+                created_at_ms,
+            ],
+        )
+        .map_err(|e| HarvestAuditStoreError::Persistence(Box::new(e)))?;
+        tx.commit()
+            .map_err(|e| HarvestAuditStoreError::Persistence(Box::new(e)))?;
+        Ok(HarvestAuditCommit::Inserted)
+    }
+
+    async fn get_by_audit_id(
+        &self,
+        audit_id: &str,
+    ) -> Result<Option<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!("{HARVEST_BUNDLE_SELECT} WHERE r.audit_id=?1"),
+            rusqlite::params![audit_id],
+            row_to_harvest_bundle,
+        )
+        .optional()
+        .map_err(|e| HarvestAuditStoreError::Lookup(Box::new(e)))
+    }
+
+    async fn get_by_attempt_key(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        attempt_id: u32,
+        turn_id: &str,
+    ) -> Result<Option<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!(
+                "{HARVEST_BUNDLE_SELECT}
+                 WHERE r.run_id=?1 AND r.node_id=?2 AND r.attempt_id=?3 AND r.turn_id=?4"
+            ),
+            rusqlite::params![run_id, node_id, i64::from(attempt_id), turn_id],
+            row_to_harvest_bundle,
+        )
+        .optional()
+        .map_err(|e| HarvestAuditStoreError::Lookup(Box::new(e)))
+    }
+
+    async fn list_by_task_id(
+        &self,
+        task_id: &str,
+        after_audit_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<HarvestAuditBundleV1>, HarvestAuditStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let cursor = match after_audit_id {
+            Some(after) => conn
+                .query_row(
+                    "SELECT created_at_ms, audit_id
+                     FROM harvest_raw_records_v1
+                     WHERE task_id=?1 AND audit_id=?2",
+                    rusqlite::params![task_id, after],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(|e| HarvestAuditStoreError::Lookup(Box::new(e)))?,
+            None => None,
+        };
+        if after_audit_id.is_some() && cursor.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        match cursor {
+            Some((created_at_ms, audit_id)) => {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "{HARVEST_BUNDLE_SELECT}
+                         WHERE r.task_id=?1
+                           AND (r.created_at_ms > ?2
+                                OR (r.created_at_ms = ?2 AND r.audit_id > ?3))
+                         ORDER BY r.created_at_ms ASC, r.audit_id ASC
+                         LIMIT ?4"
+                    ))
+                    .map_err(|e| HarvestAuditStoreError::Lookup(Box::new(e)))?;
+                let mut rows = stmt
+                    .query(rusqlite::params![
+                        task_id,
+                        created_at_ms,
+                        audit_id,
+                        i64::from(limit)
+                    ])
+                    .map_err(|e| HarvestAuditStoreError::Lookup(Box::new(e)))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(|e| HarvestAuditStoreError::Lookup(Box::new(e)))?
+                {
+                    out.push(
+                        row_to_harvest_bundle(row)
+                            .map_err(|e| HarvestAuditStoreError::Lookup(Box::new(e)))?,
+                    );
+                }
+            }
+            None => {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "{HARVEST_BUNDLE_SELECT}
+                         WHERE r.task_id=?1
+                         ORDER BY r.created_at_ms ASC, r.audit_id ASC
+                         LIMIT ?2"
+                    ))
+                    .map_err(|e| HarvestAuditStoreError::Lookup(Box::new(e)))?;
+                let mut rows = stmt
+                    .query(rusqlite::params![task_id, i64::from(limit)])
+                    .map_err(|e| HarvestAuditStoreError::Lookup(Box::new(e)))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(|e| HarvestAuditStoreError::Lookup(Box::new(e)))?
+                {
+                    out.push(
+                        row_to_harvest_bundle(row)
+                            .map_err(|e| HarvestAuditStoreError::Lookup(Box::new(e)))?,
+                    );
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -9791,6 +10215,419 @@ mod tests {
                 "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
             ),
         }
+    }
+
+    fn sqlite_harvest_raw_record(
+        audit_id: &str,
+        task_id: &str,
+        run_id: &str,
+        node_id: &str,
+        attempt_id: u32,
+        turn_id: &str,
+        raw_body: &str,
+    ) -> bridge_core::harvest::HarvestRawRecordV1 {
+        bridge_core::harvest::HarvestRawRecordV1 {
+            schema_version: bridge_core::harvest::HARVEST_SCHEMA_VERSION,
+            audit_id: audit_id.to_string(),
+            task_id: task_id.to_string(),
+            run_id: run_id.to_string(),
+            node_id: node_id.to_string(),
+            attempt_id,
+            turn_id: turn_id.to_string(),
+            backend_id: "codex".to_string(),
+            producer_id: "codex:model".to_string(),
+            declared_capability: bridge_core::attestation::PrefixAttestationCapability::unsupported(
+                bridge_core::attestation::CapabilityUnavailableReason::BackendDeclaredIncapable,
+            ),
+            raw_body: raw_body.to_string(),
+            raw_len_bytes: raw_body.len() as u64,
+            raw_body_sha256: [1_u8; 32],
+            prefix_attestation: bridge_core::attestation::PrefixAttestationStatus::unavailable(
+                "codex:model",
+                turn_id,
+                bridge_core::attestation::NoAttestationReason::BackendDeclaredIncapable,
+            ),
+            provenance_sha256: [2_u8; 32],
+        }
+    }
+
+    fn sqlite_harvest_decision(
+        raw: &bridge_core::harvest::HarvestRawRecordV1,
+        decision: bridge_core::harvest::HarvestDecision,
+    ) -> bridge_core::harvest::HarvestSanitizationDecisionV1 {
+        bridge_core::harvest::HarvestSanitizationDecisionV1 {
+            schema_version: bridge_core::harvest::HARVEST_SCHEMA_VERSION,
+            audit_id: raw.audit_id.clone(),
+            mode: bridge_core::attestation::HarvestSanitizationMode::AttestedPrefixV1,
+            decision,
+            reason: None,
+            node_id: raw.node_id.clone(),
+            producer_id: raw.producer_id.clone(),
+            issuer_id: None,
+            raw_body_sha256: raw.raw_body_sha256,
+            effective_body_sha256: [3_u8; 32],
+            raw_len_bytes: raw.raw_len_bytes,
+            effective_len_bytes: raw.raw_len_bytes,
+            cut_byte_offset: None,
+            provenance_sha256: raw.provenance_sha256,
+            suspicious_threshold_percent: bridge_core::harvest::SUSPICIOUS_THRESHOLD_PERCENT,
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_harvest_audit_retries_are_idempotent_and_queryable() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 55)).unwrap();
+        let raw = sqlite_harvest_raw_record(
+            "apc1_sqlite_001",
+            "task-harvest",
+            "run-harvest",
+            "node-a",
+            0,
+            "turn-harvest",
+            "deliverable",
+        );
+        let decision = sqlite_harvest_decision(
+            &raw,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation,
+        );
+
+        assert_eq!(
+            bridge_core::harvest::HarvestAuditStore::commit_bundle(
+                &store,
+                raw.clone(),
+                decision.clone()
+            )
+            .await
+            .unwrap(),
+            bridge_core::harvest::HarvestAuditCommit::Inserted
+        );
+        assert_eq!(
+            bridge_core::harvest::HarvestAuditStore::commit_bundle(
+                &store,
+                raw.clone(),
+                decision.clone()
+            )
+            .await
+            .unwrap(),
+            bridge_core::harvest::HarvestAuditCommit::AlreadyPresentIdentical
+        );
+
+        let by_id =
+            bridge_core::harvest::HarvestAuditStore::get_by_audit_id(&store, "apc1_sqlite_001")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(by_id.created_at_ms, 55);
+        assert_eq!(by_id.raw, raw);
+        assert_eq!(by_id.decision, decision);
+
+        let by_attempt = bridge_core::harvest::HarvestAuditStore::get_by_attempt_key(
+            &store,
+            "run-harvest",
+            "node-a",
+            0,
+            "turn-harvest",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(by_attempt.raw.audit_id, "apc1_sqlite_001");
+    }
+
+    #[tokio::test]
+    async fn sqlite_harvest_audit_rejects_attempt_rewrite_and_lists_by_task() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 55)).unwrap();
+        let raw = sqlite_harvest_raw_record(
+            "apc1_sqlite_001",
+            "task-harvest",
+            "run-harvest",
+            "node-a",
+            0,
+            "turn-harvest",
+            "deliverable",
+        );
+        let decision = sqlite_harvest_decision(
+            &raw,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation,
+        );
+        bridge_core::harvest::HarvestAuditStore::commit_bundle(&store, raw, decision)
+            .await
+            .unwrap();
+
+        let second = sqlite_harvest_raw_record(
+            "apc1_sqlite_002",
+            "task-harvest",
+            "run-harvest-resume",
+            "node-b",
+            0,
+            "turn-harvest-b",
+            "second deliverable",
+        );
+        let second_decision = sqlite_harvest_decision(
+            &second,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation,
+        );
+        bridge_core::harvest::HarvestAuditStore::commit_bundle(&store, second, second_decision)
+            .await
+            .unwrap();
+
+        let rewritten = sqlite_harvest_raw_record(
+            "apc1_sqlite_003",
+            "task-harvest",
+            "run-harvest",
+            "node-a",
+            0,
+            "turn-harvest",
+            "rewritten deliverable",
+        );
+        let rewritten_decision = sqlite_harvest_decision(
+            &rewritten,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation,
+        );
+        let err = bridge_core::harvest::HarvestAuditStore::commit_bundle(
+            &store,
+            rewritten,
+            rewritten_decision,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            bridge_core::harvest::HarvestAuditStoreError::IntegrityConflict { audit_id }
+                if audit_id == "apc1_sqlite_003"
+        ));
+
+        let rows = bridge_core::harvest::HarvestAuditStore::list_by_task_id(
+            &store,
+            "task-harvest",
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|bundle| (bundle.raw.audit_id.as_str(), bundle.raw.run_id.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("apc1_sqlite_001", "run-harvest"),
+                ("apc1_sqlite_002", "run-harvest-resume"),
+            ]
+        );
+
+        let rows = bridge_core::harvest::HarvestAuditStore::list_by_task_id(
+            &store,
+            "task-harvest",
+            Some("apc1_sqlite_001"),
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|bundle| bundle.raw.audit_id.as_str())
+                .collect::<Vec<_>>(),
+            ["apc1_sqlite_002"]
+        );
+
+        let rows = bridge_core::harvest::HarvestAuditStore::list_by_task_id(
+            &store,
+            "task-harvest",
+            Some("apc1_missing"),
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    /// §9.4 / §15.2 "checked SQLite integer conversion" (MINOR 6): a u64
+    /// above i64::MAX must be a checked persistence failure — never a wrap —
+    /// and the failed commit must leave no rows behind (the completion-facing
+    /// error then blocks the node per §9.6).
+    #[tokio::test]
+    async fn sqlite_harvest_u64_above_i64_max_is_persistence_error_and_inserts_nothing() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 55)).unwrap();
+        let mut raw = sqlite_harvest_raw_record(
+            "apc1_overflow",
+            "task-overflow",
+            "run-overflow",
+            "node-a",
+            0,
+            "turn-overflow",
+            "deliverable",
+        );
+        raw.raw_len_bytes = u64::MAX;
+        let decision = sqlite_harvest_decision(
+            &raw,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation,
+        );
+
+        let err = bridge_core::harvest::HarvestAuditStore::commit_bundle(&store, raw, decision)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                bridge_core::harvest::HarvestAuditStoreError::Encoding(message)
+                    if message.contains("exceeds SQLite INTEGER range")
+            ),
+            "expected checked-conversion encoding failure, got {err:?}"
+        );
+        assert!(
+            bridge_core::harvest::HarvestAuditStore::get_by_audit_id(&store, "apc1_overflow")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Same checked conversion on the decision-only u64 field.
+        let mut raw = sqlite_harvest_raw_record(
+            "apc1_overflow_cut",
+            "task-overflow",
+            "run-overflow",
+            "node-b",
+            0,
+            "turn-overflow-b",
+            "deliverable",
+        );
+        raw.prefix_attestation = bridge_core::attestation::PrefixAttestationStatus::unavailable(
+            "codex:model",
+            "turn-overflow-b",
+            bridge_core::attestation::NoAttestationReason::BackendDeclaredIncapable,
+        );
+        let mut decision =
+            sqlite_harvest_decision(&raw, bridge_core::harvest::HarvestDecision::CutAttested);
+        decision.cut_byte_offset = Some(u64::MAX);
+        let err = bridge_core::harvest::HarvestAuditStore::commit_bundle(&store, raw, decision)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            bridge_core::harvest::HarvestAuditStoreError::Encoding(_)
+        ));
+        assert!(bridge_core::harvest::HarvestAuditStore::get_by_audit_id(
+            &store,
+            "apc1_overflow_cut"
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    /// §9.3 "commit_bundle is one transaction" / §15.2 "raw/decision
+    /// atomicity" (MINOR 6): a decision-row failure AFTER the raw insert must
+    /// roll the raw row back — no half bundle survives.
+    #[tokio::test]
+    async fn sqlite_harvest_commit_is_atomic_no_raw_row_survives_decision_failure() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 55)).unwrap();
+        let raw = sqlite_harvest_raw_record(
+            "apc1_atomic",
+            "task-atomic",
+            "run-atomic",
+            "node-a",
+            0,
+            "turn-atomic",
+            "deliverable",
+        );
+        let mut decision = sqlite_harvest_decision(
+            &raw,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation,
+        );
+        // Passes shape validation and the raw insert; violates the decision
+        // table's CHECK (suspicious_threshold_percent = 90) at insert time.
+        decision.suspicious_threshold_percent = 89;
+
+        let err = bridge_core::harvest::HarvestAuditStore::commit_bundle(&store, raw, decision)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            bridge_core::harvest::HarvestAuditStoreError::Persistence(_)
+        ));
+
+        let raw_rows: i64 = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM harvest_raw_records_v1 WHERE audit_id='apc1_atomic'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            raw_rows, 0,
+            "failed decision insert must roll back the raw row"
+        );
+        assert!(
+            bridge_core::harvest::HarvestAuditStore::get_by_audit_id(&store, "apc1_atomic")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// §9.4 DDL / §15.2 "foreign-key and uniqueness constraints" (MINOR 6):
+    /// the schema itself must enforce decision→raw referential integrity
+    /// (with PRAGMA foreign_keys actually ON) and the attempt-key uniqueness.
+    #[tokio::test]
+    async fn sqlite_harvest_ddl_enforces_foreign_key_and_attempt_uniqueness() {
+        let store = SqliteStore::open_in_memory_with_clock(Arc::new(|| 55)).unwrap();
+        assert!(store.foreign_keys_on().unwrap());
+
+        let raw = sqlite_harvest_raw_record(
+            "apc1_ddl",
+            "task-ddl",
+            "run-ddl",
+            "node-a",
+            0,
+            "turn-ddl",
+            "deliverable",
+        );
+        let decision = sqlite_harvest_decision(
+            &raw,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation,
+        );
+        bridge_core::harvest::HarvestAuditStore::commit_bundle(&store, raw, decision)
+            .await
+            .unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        // Decision row whose audit_id has no raw row: FK violation.
+        let fk_err = conn
+            .execute(
+                "INSERT INTO harvest_sanitization_decisions_v1(
+                    audit_id, mode, decision, reason, node_id, producer_id, issuer_id,
+                    raw_body_sha256, effective_body_sha256, raw_len_bytes,
+                    effective_len_bytes, cut_byte_offset, provenance_sha256,
+                    suspicious_threshold_percent, created_at_ms
+                 ) VALUES('apc1_orphan', 'off', 'kept_off', NULL, 'node-a', 'p', NULL,
+                          zeroblob(32), zeroblob(32), 1, 1, NULL, zeroblob(32), 90, 55)",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            fk_err.to_string().to_lowercase().contains("foreign key"),
+            "orphan decision insert must fail the FK constraint, got {fk_err}"
+        );
+
+        // Second raw row reusing the (run_id, node_id, attempt_id, turn_id)
+        // attempt key under a different audit_id: UNIQUE violation.
+        let unique_err = conn
+            .execute(
+                "INSERT INTO harvest_raw_records_v1(
+                    audit_id, task_id, run_id, node_id, attempt_id, turn_id, backend_id,
+                    producer_id, declared_capability_json, raw_body, raw_len_bytes,
+                    raw_body_sha256, prefix_attestation_json, provenance_sha256, created_at_ms
+                 ) VALUES('apc1_ddl_dup', 'task-ddl', 'run-ddl', 'node-a', 0, 'turn-ddl',
+                          'codex', 'p', '{}', 'body', 4, zeroblob(32), '{}', zeroblob(32), 55)",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            unique_err.to_string().to_lowercase().contains("unique"),
+            "duplicate attempt key must fail the UNIQUE constraint, got {unique_err}"
+        );
     }
 
     fn sqlite_usage(input: u64, output: u64, at_ms: i64) -> UsageSnapshot {

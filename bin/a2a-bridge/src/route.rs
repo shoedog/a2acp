@@ -97,6 +97,7 @@ mod tests {
             Ok(Box::pin(futures::stream::once(async {
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 })
             })))
         }
@@ -120,6 +121,8 @@ mod tests {
                     model: None,
                     effort: None::<Effort>,
                     mode: None,
+                    preflight: false,
+                    fallback_models: vec![],
                     cwd: None,
                     session_cwd: None,
                     sandbox: None,

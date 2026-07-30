@@ -131,7 +131,9 @@ pub fn project_orch_frame(
             },
             output: output.clone(),
         },
-        OrchEventKind::Progress { .. } | OrchEventKind::Usage { .. } => return None,
+        OrchEventKind::Progress { .. }
+        | OrchEventKind::Usage { .. }
+        | OrchEventKind::HarvestSanitizationDecision { .. } => return None,
         OrchEventKind::Plan { entries } => FrameKind::Plan {
             entries: entries.clone(),
         },
@@ -1758,6 +1760,59 @@ mod sink_tests {
         }
 
         #[async_trait::async_trait]
+        impl bridge_core::harvest::HarvestAuditStore for FailingCheckpointStore {
+            async fn commit_bundle(
+                &self,
+                raw: bridge_core::harvest::HarvestRawRecordV1,
+                decision: bridge_core::harvest::HarvestSanitizationDecisionV1,
+            ) -> Result<
+                bridge_core::harvest::HarvestAuditCommit,
+                bridge_core::harvest::HarvestAuditStoreError,
+            > {
+                self.inner.commit_bundle(raw, decision).await
+            }
+
+            async fn get_by_audit_id(
+                &self,
+                audit_id: &str,
+            ) -> Result<
+                Option<bridge_core::harvest::HarvestAuditBundleV1>,
+                bridge_core::harvest::HarvestAuditStoreError,
+            > {
+                self.inner.get_by_audit_id(audit_id).await
+            }
+
+            async fn get_by_attempt_key(
+                &self,
+                run_id: &str,
+                node_id: &str,
+                attempt_id: u32,
+                turn_id: &str,
+            ) -> Result<
+                Option<bridge_core::harvest::HarvestAuditBundleV1>,
+                bridge_core::harvest::HarvestAuditStoreError,
+            > {
+                self.inner
+                    .get_by_attempt_key(run_id, node_id, attempt_id, turn_id)
+                    .await
+            }
+
+            async fn list_by_task_id(
+                &self,
+                task_id: &str,
+                after_audit_id: Option<&str>,
+                limit: u32,
+            ) -> Result<
+                Vec<bridge_core::harvest::HarvestAuditBundleV1>,
+                bridge_core::harvest::HarvestAuditStoreError,
+            > {
+                self.inner
+                    .list_by_task_id(task_id, after_audit_id, limit)
+                    .await
+            }
+        }
+
+        #[async_trait::async_trait]
         impl TaskStore for FailingCheckpointStore {
             async fn create(&self, rec: &TaskRecord) -> Result<(), BridgeError> {
                 self.inner.create(rec).await
@@ -2036,6 +2091,7 @@ mod sink_tests {
                     Ok(Update::Text("done".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])))
             }
@@ -2062,6 +2118,8 @@ mod sink_tests {
                         model: None,
                         effort: None,
                         mode: None,
+                        preflight: false,
+                        fallback_models: vec![],
                         cwd: None,
                         session_cwd: None,
                         sandbox: None,
@@ -2101,6 +2159,9 @@ mod sink_tests {
                 OrchEventKind::ToolCall { .. } => "tool_call",
                 OrchEventKind::NodeFinished { .. } => "node_finished",
                 OrchEventKind::Terminal { .. } => "terminal",
+                OrchEventKind::HarvestSanitizationDecision { .. } => {
+                    "harvest_sanitization_decision"
+                }
                 _ => "other",
             }
         }
@@ -2118,6 +2179,7 @@ mod sink_tests {
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         });
@@ -2760,6 +2822,10 @@ pub fn spawn_detached_workflow_with_attempt_barriers(
 ) -> tokio::task::JoinHandle<bool> {
     let deps = deps.clone();
     tokio::spawn(async move {
+        let harvest_audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
+            bridge_core::task_store::TaskStoreHarvestAuditStore::new(deps.task_store.clone()),
+        );
+        ctx.harvest_audit_store = harvest_audit_store;
         let mut fin = Finalizer {
             store: deps.task_store.clone(),
             task: task.clone(),
@@ -3887,6 +3953,7 @@ mod resume_tests {
                 Ok(Update::Text("FINAL".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ])))
         }
@@ -3920,6 +3987,8 @@ mod resume_tests {
                     model: None,
                     effort: None,
                     mode: None,
+                    preflight: false,
+                    fallback_models: vec![],
                     cwd: None,
                     session_cwd: None,
                     sandbox: None,
@@ -3983,6 +4052,59 @@ mod resume_tests {
         pub(super) fail_primary_terminal: bool,
         pub(super) fail_marker: bool,
         pub(super) fail_projection_ready: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl bridge_core::harvest::HarvestAuditStore for SelectiveFailureStore {
+        async fn commit_bundle(
+            &self,
+            raw: bridge_core::harvest::HarvestRawRecordV1,
+            decision: bridge_core::harvest::HarvestSanitizationDecisionV1,
+        ) -> Result<
+            bridge_core::harvest::HarvestAuditCommit,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            self.inner.commit_bundle(raw, decision).await
+        }
+
+        async fn get_by_audit_id(
+            &self,
+            audit_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            self.inner.get_by_audit_id(audit_id).await
+        }
+
+        async fn get_by_attempt_key(
+            &self,
+            run_id: &str,
+            node_id: &str,
+            attempt_id: u32,
+            turn_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            self.inner
+                .get_by_attempt_key(run_id, node_id, attempt_id, turn_id)
+                .await
+        }
+
+        async fn list_by_task_id(
+            &self,
+            task_id: &str,
+            after_audit_id: Option<&str>,
+            limit: u32,
+        ) -> Result<
+            Vec<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            self.inner
+                .list_by_task_id(task_id, after_audit_id, limit)
+                .await
+        }
     }
 
     #[async_trait::async_trait]
@@ -4226,6 +4348,7 @@ mod resume_tests {
                 .map(|input| NodeId::parse(*input).unwrap())
                 .collect(),
             retry: None,
+            harvest_sanitization: None,
         };
         Arc::new(WorkflowGraph {
             id: WorkflowId::parse("panel").unwrap(),
@@ -4258,6 +4381,7 @@ mod resume_tests {
                     backoff_ms: 60_000,
                     backoff_cap_ms: None,
                 }),
+                harvest_sanitization: None,
             }],
             panel: None,
         })
@@ -4315,9 +4439,17 @@ mod resume_tests {
             match self.role {
                 RichRaceRole::CheckpointOwner => {
                     self.sibling_recorded.notified().await;
-                    Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
-                        stop_reason: "end_turn".into(),
-                    })])))
+                    // A non-empty final message: since the empty-final-turn policy,
+                    // a bare `Done` with no text is a node *failure* (fresh-session
+                    // retry), which would never reach the checkpoint write this
+                    // test exists to fail.
+                    Ok(Box::pin(tokio_stream::iter(vec![
+                        Ok(Update::Text("checkpoint complete".into())),
+                        Ok(Update::Done {
+                            stop_reason: "end_turn".into(),
+                            prefix_attestation: Default::default(),
+                        }),
+                    ])))
                 }
                 RichRaceRole::PendingRichSibling => {
                     observers
@@ -4356,6 +4488,8 @@ mod resume_tests {
                 model: None,
                 effort: None,
                 mode: None,
+                preflight: false,
+                fallback_models: vec![],
                 cwd: None,
                 session_cwd: None,
                 sandbox: None,
@@ -4450,6 +4584,7 @@ mod resume_tests {
                 .map(|input| NodeId::parse(*input).unwrap())
                 .collect(),
             retry: None,
+            harvest_sanitization: None,
         };
         Arc::new(WorkflowGraph {
             id: WorkflowId::parse("rich-race").unwrap(),
@@ -4929,6 +5064,7 @@ mod frame_tests {
                 prompt_template: "{{input}}".into(),
                 inputs: Vec::new(),
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         };
@@ -4951,6 +5087,7 @@ mod frame_tests {
                     prompt_template: "{{input}}".into(),
                     inputs: Vec::new(),
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: bridge_core::ids::NodeId::parse("synth").unwrap(),
@@ -4958,6 +5095,7 @@ mod frame_tests {
                     prompt_template: "{{reviewer}}".into(),
                     inputs: vec![bridge_core::ids::NodeId::parse("reviewer").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,

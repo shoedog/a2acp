@@ -59,6 +59,8 @@ pub enum BridgeError {
     FrameError,
     #[error("message too large")]
     MessageTooLarge,
+    #[error("empty final agent message")]
+    EmptyFinal,
     #[error("agent crashed: {reason}")]
     AgentCrashed { reason: String },
     #[error("agent crashed")]
@@ -71,6 +73,8 @@ pub enum BridgeError {
     UpstreamA2aError,
     #[error("store failure")]
     StoreFailure,
+    #[error("harvest_audit_persist_failed")]
+    HarvestAuditPersistFailed { audit_id: String },
     #[error("invalid state transition")]
     InvalidStateTransition,
     #[error("unknown agent: {id}")]
@@ -117,6 +121,7 @@ pub fn warm_session_survivability(error: &BridgeError) -> WarmSessionSurvivabili
             | DiagnosticFailureClass::Canceled
             | DiagnosticFailureClass::Unknown => WarmSessionSurvivability::Expire,
         },
+        BridgeError::EmptyFinal => WarmSessionSurvivability::Expire,
         _ => WarmSessionSurvivability::PreserveOwnerBehavior,
     }
 }
@@ -391,6 +396,7 @@ mod tests {
             CancelTimeout,
             FrameError,
             MessageTooLarge,
+            EmptyFinal,
             UpstreamA2aError,
             StoreFailure,
             InvalidStateTransition,

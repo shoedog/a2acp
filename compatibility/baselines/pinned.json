@@ -1,13 +1,1223 @@
 {
   "schema_version": 1,
   "manifest_schema_version": 1,
-  "manifest_sha256": "5d18cefef00972ead51dd7ad60da6e99cdc7d1c97a9b2f23cc17a5f5c235d828",
+  "manifest_sha256": "aee0476dae4ed1956d2b1bc9f1b76008c75ad1c40e2fea64dfcdd00ec01daf33",
   "aggregate": {
     "success": true,
     "cancelled": false,
     "budget_exhausted": false,
     "token_observation_missing_cases": 0,
-    "cost_observation_missing_cases": 0
+    "cost_observation_missing_cases": 2
   },
-  "cases": []
+  "cases": [
+    {
+      "case_id": "claude-host-acp-063-sonnet5",
+      "outcome": {
+        "execution": "completed",
+        "expectation_met": true,
+        "not_run_reason": null,
+        "runner_error_code": null,
+        "drift": [],
+        "budget_violations": []
+      },
+      "status": "PASS",
+      "execution_mode": "host",
+      "provenance": [
+        {
+          "check": "provenance:claude-sonnet-low-host:execution",
+          "status": "ok",
+          "detail": "kind=acp execution=host configured_cmd=claude-agent-acp executable=\"~/.local/share/mise/installs/node/24.15.0/lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js\"",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:claude-sonnet-low-host:adapter",
+          "status": "ok",
+          "detail": "executable=\"~/.local/share/mise/installs/node/24.15.0/lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js\" package=@agentclientprotocol/claude-agent-acp version=0.63.0 manifest=\"~/.local/share/mise/installs/node/24.15.0/lib/node_modules/@agentclientprotocol/claude-agent-acp/package.json\"",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:claude-sonnet-low-host:agent-cli",
+          "status": "ok",
+          "detail": "package=@anthropic-ai/claude-agent-sdk version=0.3.220 manifest=\"~/.local/share/mise/installs/node/24.15.0/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk/package.json\" bundled_cli_version=2.1.220",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:claude-sonnet-low-host:auth",
+          "status": "ok",
+          "detail": "authentication path recorded in target.authentication",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:claude-sonnet-low-host:oauth-credential",
+          "status": "ok",
+          "detail": "Claude OAuth access [REDACTED]",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:claude-sonnet-low-host:model",
+          "status": "ok",
+          "detail": "model=sonnet effort=low mode=default",
+          "remedy": ""
+        }
+      ],
+      "capability": {
+        "request": {
+          "model": "sonnet",
+          "effort": "low",
+          "mode": null
+        },
+        "effective": {
+          "model": "sonnet",
+          "effort": "low"
+        },
+        "model_catalog": {
+          "state": "available",
+          "current_model": "sonnet",
+          "models": [
+            "default",
+            "opus[1m]",
+            "sonnet",
+            "haiku",
+            "opus"
+          ],
+          "model_configurable": true,
+          "effort_levels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "modes": [
+            "auto",
+            "default",
+            "acceptEdits",
+            "plan",
+            "dontAsk",
+            "bypassPermissions"
+          ],
+          "current_mode": "auto"
+        }
+      },
+      "authentication": {
+        "path": "automatic"
+      },
+      "phase": null,
+      "terminal": {
+        "attempt": {
+          "timeout_secs": 180,
+          "timed_out": false,
+          "prompt_may_have_been_accepted": true
+        },
+        "turn": {
+          "prompt": "Reply exactly PONG. Do not use tools.",
+          "prompt_calls": 1,
+          "terminal_state": "completed",
+          "stop_reason": "end_turn",
+          "exact_pong": true,
+          "text_bytes": 4,
+          "tool_event_count": 0,
+          "permission_update_count": 0
+        },
+        "cleanup": {
+          "grace_timeout_secs": 10,
+          "cancel": "not_needed",
+          "release": "completed",
+          "retire": "completed",
+          "run_scoped_backstop": "invoked_best_effort"
+        }
+      },
+      "diagnostic": {
+        "lifecycle": [
+          {
+            "transition": {
+              "phase": "resolve",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "spawn",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "spawn",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "initialize",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "initialize",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "authenticate",
+              "status": "started",
+              "auth": {
+                "kind": "no_methods_advertised"
+              }
+            }
+          },
+          {
+            "transition": {
+              "phase": "authenticate",
+              "status": "skipped",
+              "code": "acp.auth.no_methods_advertised",
+              "auth": {
+                "kind": "no_methods_advertised"
+              }
+            }
+          },
+          {
+            "transition": {
+              "phase": "initialize",
+              "status": "started",
+              "code": "acp.prefix_attestation.capability_probe"
+            }
+          },
+          {
+            "transition": {
+              "phase": "initialize",
+              "status": "skipped",
+              "code": "acp.prefix_attestation.backend_declared_incapable"
+            }
+          },
+          {
+            "transition": {
+              "phase": "resolve",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "session_create",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "session_create",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "config_apply",
+              "status": "started",
+              "operation": "model"
+            }
+          },
+          {
+            "transition": {
+              "phase": "config_apply",
+              "status": "completed",
+              "operation": "model"
+            }
+          },
+          {
+            "transition": {
+              "phase": "config_apply",
+              "status": "started",
+              "operation": "effort"
+            }
+          },
+          {
+            "transition": {
+              "phase": "config_apply",
+              "status": "completed",
+              "operation": "effort",
+              "code": "acp.config.effort_settled"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_start",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_start",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_stream",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_stream",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_finish",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_finish",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "teardown",
+              "status": "started",
+              "code": "acp.teardown.release"
+            }
+          },
+          {
+            "transition": {
+              "phase": "teardown",
+              "status": "completed",
+              "code": "acp.teardown.released"
+            }
+          }
+        ],
+        "dropped_events": 0,
+        "failure": null,
+        "stderr_text": "excluded"
+      }
+    },
+    {
+      "case_id": "claude-reader-063-sonnet5",
+      "outcome": {
+        "execution": "completed",
+        "expectation_met": true,
+        "not_run_reason": null,
+        "runner_error_code": null,
+        "drift": [],
+        "budget_violations": []
+      },
+      "status": "PASS",
+      "execution_mode": "container_ro",
+      "provenance": [
+        {
+          "check": "provenance:claude-sonnet-low-reader:execution",
+          "status": "ok",
+          "detail": "kind=acp execution=container runtime=docker inner_cmd=claude-agent-acp runtime_executable=\"/Applications/OrbStack.app/Contents/MacOS/xbin/docker-tools\"",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:claude-sonnet-low-reader:adapter",
+          "status": "ok",
+          "detail": "source=immutable-image-label package=@agentclientprotocol/claude-agent-acp version=0.63.0",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:claude-sonnet-low-reader:agent-cli",
+          "status": "ok",
+          "detail": "source=immutable-image-label package=@anthropic-ai/claude-agent-sdk version=0.3.220",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:claude-sonnet-low-reader:image",
+          "status": "ok",
+          "detail": "runtime=docker image=sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f immutable_id=sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:claude-sonnet-low-reader:auth",
+          "status": "ok",
+          "detail": "authentication path recorded in target.authentication",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:claude-sonnet-low-reader:oauth-credential",
+          "status": "ok",
+          "detail": "Claude OAuth access [REDACTED]",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:claude-sonnet-low-reader:model",
+          "status": "ok",
+          "detail": "model=sonnet effort=low mode=default",
+          "remedy": ""
+        }
+      ],
+      "capability": {
+        "request": {
+          "model": "sonnet",
+          "effort": "low",
+          "mode": null
+        },
+        "effective": {
+          "model": "sonnet",
+          "effort": "low"
+        },
+        "model_catalog": {
+          "state": "available",
+          "current_model": "sonnet",
+          "models": [
+            "default",
+            "opus[1m]",
+            "sonnet",
+            "haiku"
+          ],
+          "model_configurable": true,
+          "effort_levels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "modes": [
+            "auto",
+            "default",
+            "acceptEdits",
+            "plan",
+            "dontAsk"
+          ],
+          "current_mode": "default"
+        }
+      },
+      "authentication": {
+        "path": "pre_authenticated"
+      },
+      "phase": null,
+      "terminal": {
+        "attempt": {
+          "timeout_secs": 600,
+          "timed_out": false,
+          "prompt_may_have_been_accepted": true
+        },
+        "turn": {
+          "prompt": "Reply exactly PONG. Do not use tools.",
+          "prompt_calls": 1,
+          "terminal_state": "completed",
+          "stop_reason": "end_turn",
+          "exact_pong": true,
+          "text_bytes": 4,
+          "tool_event_count": 0,
+          "permission_update_count": 0
+        },
+        "cleanup": {
+          "grace_timeout_secs": 10,
+          "cancel": "not_needed",
+          "release": "completed",
+          "retire": "completed",
+          "run_scoped_backstop": "invoked_best_effort"
+        }
+      },
+      "diagnostic": {
+        "lifecycle": [
+          {
+            "transition": {
+              "phase": "resolve",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "spawn",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "spawn",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "initialize",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "initialize",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "authenticate",
+              "status": "started",
+              "auth": {
+                "kind": "pre_authenticated",
+                "advertised_method_ids": [],
+                "advertised_method_count": 0
+              }
+            }
+          },
+          {
+            "transition": {
+              "phase": "authenticate",
+              "status": "skipped",
+              "code": "acp.auth.pre_authenticated",
+              "auth": {
+                "kind": "pre_authenticated",
+                "advertised_method_ids": [],
+                "advertised_method_count": 0
+              }
+            }
+          },
+          {
+            "transition": {
+              "phase": "initialize",
+              "status": "started",
+              "code": "acp.prefix_attestation.capability_probe"
+            }
+          },
+          {
+            "transition": {
+              "phase": "initialize",
+              "status": "skipped",
+              "code": "acp.prefix_attestation.backend_declared_incapable"
+            }
+          },
+          {
+            "transition": {
+              "phase": "resolve",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "session_create",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "session_create",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "config_apply",
+              "status": "started",
+              "operation": "model"
+            }
+          },
+          {
+            "transition": {
+              "phase": "config_apply",
+              "status": "completed",
+              "operation": "model"
+            }
+          },
+          {
+            "transition": {
+              "phase": "config_apply",
+              "status": "started",
+              "operation": "effort"
+            }
+          },
+          {
+            "transition": {
+              "phase": "config_apply",
+              "status": "completed",
+              "operation": "effort",
+              "code": "acp.config.effort_settled"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_start",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_start",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_stream",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_stream",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_finish",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_finish",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "teardown",
+              "status": "started",
+              "code": "acp.teardown.release"
+            }
+          },
+          {
+            "transition": {
+              "phase": "teardown",
+              "status": "completed",
+              "code": "acp.teardown.released"
+            }
+          }
+        ],
+        "dropped_events": 0,
+        "failure": null,
+        "stderr_text": "excluded"
+      }
+    },
+    {
+      "case_id": "codex-host-bridge-gpt56-luna",
+      "outcome": {
+        "execution": "completed",
+        "expectation_met": true,
+        "not_run_reason": null,
+        "runner_error_code": null,
+        "drift": [],
+        "budget_violations": []
+      },
+      "status": "PASS",
+      "execution_mode": "host",
+      "provenance": [
+        {
+          "check": "provenance:codex-luna-host:execution",
+          "status": "ok",
+          "detail": "kind=acp execution=host configured_cmd=codex-acp executable=\"~/.local/share/mise/installs/node/24.15.0/lib/node_modules/@agentclientprotocol/codex-acp/dist/index.js\"",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:codex-luna-host:adapter",
+          "status": "ok",
+          "detail": "executable=\"~/.local/share/mise/installs/node/24.15.0/lib/node_modules/@agentclientprotocol/codex-acp/dist/index.js\" package=@agentclientprotocol/codex-acp version=1.1.7 manifest=\"~/.local/share/mise/installs/node/24.15.0/lib/node_modules/@agentclientprotocol/codex-acp/package.json\"",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:codex-luna-host:agent-cli",
+          "status": "ok",
+          "detail": "package=@openai/codex version=0.145.0 manifest=\"~/.local/share/mise/installs/node/24.15.0/lib/node_modules/@agentclientprotocol/codex-acp/node_modules/@openai/codex/package.json\"",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:codex-luna-host:auth",
+          "status": "ok",
+          "detail": "authentication path recorded in target.authentication",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:codex-luna-host:model",
+          "status": "ok",
+          "detail": "model=gpt-5.6-luna effort=low mode=read-only",
+          "remedy": ""
+        }
+      ],
+      "capability": {
+        "request": {
+          "model": "gpt-5.6-luna",
+          "effort": "low",
+          "mode": "read-only"
+        },
+        "effective": {
+          "model": "gpt-5.6-luna",
+          "effort": "low",
+          "mode": "read-only"
+        },
+        "model_catalog": {
+          "state": "available",
+          "current_model": "gpt-5.6-luna[low]",
+          "models": [
+            "gpt-5.6-sol[low]",
+            "gpt-5.6-sol[medium]",
+            "gpt-5.6-sol[high]",
+            "gpt-5.6-sol[xhigh]",
+            "gpt-5.6-sol[max]",
+            "gpt-5.6-sol[ultra]",
+            "gpt-5.6-terra[low]",
+            "gpt-5.6-terra[medium]",
+            "gpt-5.6-terra[high]",
+            "gpt-5.6-terra[xhigh]",
+            "gpt-5.6-terra[max]",
+            "gpt-5.6-terra[ultra]",
+            "gpt-5.6-luna[low]",
+            "gpt-5.6-luna[medium]",
+            "gpt-5.6-luna[high]",
+            "gpt-5.6-luna[xhigh]",
+            "gpt-5.6-luna[max]",
+            "gpt-5.5[low]",
+            "gpt-5.5[medium]",
+            "gpt-5.5[high]",
+            "gpt-5.5[xhigh]",
+            "gpt-5.4[low]",
+            "gpt-5.4[medium]",
+            "gpt-5.4[high]",
+            "gpt-5.4[xhigh]",
+            "gpt-5.4-mini[low]",
+            "gpt-5.4-mini[medium]",
+            "gpt-5.4-mini[high]",
+            "gpt-5.4-mini[xhigh]",
+            "gpt-5.3-codex-spark[low]",
+            "gpt-5.3-codex-spark[medium]",
+            "gpt-5.3-codex-spark[high]",
+            "gpt-5.3-codex-spark[xhigh]"
+          ],
+          "model_configurable": true,
+          "effort_levels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "modes": [
+            "read-only",
+            "agent",
+            "agent-full-access"
+          ],
+          "current_mode": "read-only"
+        }
+      },
+      "authentication": {
+        "path": "pre_authenticated"
+      },
+      "phase": null,
+      "terminal": {
+        "attempt": {
+          "timeout_secs": 180,
+          "timed_out": false,
+          "prompt_may_have_been_accepted": true
+        },
+        "turn": {
+          "prompt": "Reply exactly PONG. Do not use tools.",
+          "prompt_calls": 1,
+          "terminal_state": "completed",
+          "stop_reason": "end_turn",
+          "exact_pong": true,
+          "text_bytes": 4,
+          "tool_event_count": 0,
+          "permission_update_count": 0
+        },
+        "cleanup": {
+          "grace_timeout_secs": 10,
+          "cancel": "not_needed",
+          "release": "completed",
+          "retire": "completed",
+          "run_scoped_backstop": "invoked_best_effort"
+        }
+      },
+      "diagnostic": {
+        "lifecycle": [
+          {
+            "transition": {
+              "phase": "resolve",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "spawn",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "spawn",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "initialize",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "initialize",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "authenticate",
+              "status": "started",
+              "auth": {
+                "kind": "pre_authenticated",
+                "advertised_method_ids": [
+                  {
+                    "state": "value",
+                    "value": "api-key"
+                  },
+                  {
+                    "state": "value",
+                    "value": "chat-gpt"
+                  }
+                ],
+                "advertised_method_count": 2
+              }
+            }
+          },
+          {
+            "transition": {
+              "phase": "authenticate",
+              "status": "skipped",
+              "code": "acp.auth.pre_authenticated",
+              "auth": {
+                "kind": "pre_authenticated",
+                "advertised_method_ids": [
+                  {
+                    "state": "value",
+                    "value": "api-key"
+                  },
+                  {
+                    "state": "value",
+                    "value": "chat-gpt"
+                  }
+                ],
+                "advertised_method_count": 2
+              }
+            }
+          },
+          {
+            "transition": {
+              "phase": "resolve",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "session_create",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "session_create",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "config_apply",
+              "status": "started",
+              "operation": "mode"
+            }
+          },
+          {
+            "transition": {
+              "phase": "config_apply",
+              "status": "completed",
+              "operation": "mode"
+            }
+          },
+          {
+            "transition": {
+              "phase": "config_apply",
+              "status": "started",
+              "operation": "model"
+            }
+          },
+          {
+            "transition": {
+              "phase": "config_apply",
+              "status": "completed",
+              "operation": "model"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_start",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_start",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_stream",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_stream",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_finish",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_finish",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "teardown",
+              "status": "started",
+              "code": "acp.teardown.release"
+            }
+          },
+          {
+            "transition": {
+              "phase": "teardown",
+              "status": "completed",
+              "code": "acp.teardown.released"
+            }
+          }
+        ],
+        "dropped_events": 0,
+        "failure": null,
+        "stderr_text": "excluded"
+      }
+    },
+    {
+      "case_id": "codex-reader-bridge-gpt56-luna",
+      "outcome": {
+        "execution": "completed",
+        "expectation_met": true,
+        "not_run_reason": null,
+        "runner_error_code": null,
+        "drift": [],
+        "budget_violations": []
+      },
+      "status": "PASS",
+      "execution_mode": "container_ro",
+      "provenance": [
+        {
+          "check": "provenance:codex-luna-reader:execution",
+          "status": "ok",
+          "detail": "kind=acp execution=container runtime=docker inner_cmd=codex-acp runtime_executable=\"/Applications/OrbStack.app/Contents/MacOS/xbin/docker-tools\"",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:codex-luna-reader:adapter",
+          "status": "ok",
+          "detail": "source=immutable-image-label package=@agentclientprotocol/codex-acp version=1.1.7",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:codex-luna-reader:agent-cli",
+          "status": "ok",
+          "detail": "source=immutable-image-label package=@openai/codex version=0.145.0",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:codex-luna-reader:image",
+          "status": "ok",
+          "detail": "runtime=docker image=sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f immutable_id=sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:codex-luna-reader:auth",
+          "status": "ok",
+          "detail": "authentication path recorded in target.authentication",
+          "remedy": ""
+        },
+        {
+          "check": "provenance:codex-luna-reader:model",
+          "status": "ok",
+          "detail": "model=gpt-5.6-luna effort=low mode=default",
+          "remedy": ""
+        }
+      ],
+      "capability": {
+        "request": {
+          "model": "gpt-5.6-luna",
+          "effort": "low",
+          "mode": null
+        },
+        "effective": {
+          "model": "gpt-5.6-luna",
+          "effort": "low"
+        },
+        "model_catalog": {
+          "state": "available",
+          "current_model": "gpt-5.6-luna[low]",
+          "models": [
+            "gpt-5.6-sol[low]",
+            "gpt-5.6-sol[medium]",
+            "gpt-5.6-sol[high]",
+            "gpt-5.6-sol[xhigh]",
+            "gpt-5.6-sol[max]",
+            "gpt-5.6-sol[ultra]",
+            "gpt-5.6-terra[low]",
+            "gpt-5.6-terra[medium]",
+            "gpt-5.6-terra[high]",
+            "gpt-5.6-terra[xhigh]",
+            "gpt-5.6-terra[max]",
+            "gpt-5.6-terra[ultra]",
+            "gpt-5.6-luna[low]",
+            "gpt-5.6-luna[medium]",
+            "gpt-5.6-luna[high]",
+            "gpt-5.6-luna[xhigh]",
+            "gpt-5.6-luna[max]",
+            "gpt-5.5[low]",
+            "gpt-5.5[medium]",
+            "gpt-5.5[high]",
+            "gpt-5.5[xhigh]",
+            "gpt-5.4[low]",
+            "gpt-5.4[medium]",
+            "gpt-5.4[high]",
+            "gpt-5.4[xhigh]",
+            "gpt-5.4-mini[low]",
+            "gpt-5.4-mini[medium]",
+            "gpt-5.4-mini[high]",
+            "gpt-5.4-mini[xhigh]",
+            "gpt-5.3-codex-spark[low]",
+            "gpt-5.3-codex-spark[medium]",
+            "gpt-5.3-codex-spark[high]",
+            "gpt-5.3-codex-spark[xhigh]"
+          ],
+          "model_configurable": true,
+          "effort_levels": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "modes": [
+            "read-only",
+            "agent",
+            "agent-full-access"
+          ],
+          "current_mode": "agent"
+        }
+      },
+      "authentication": {
+        "path": "pre_authenticated"
+      },
+      "phase": null,
+      "terminal": {
+        "attempt": {
+          "timeout_secs": 300,
+          "timed_out": false,
+          "prompt_may_have_been_accepted": true
+        },
+        "turn": {
+          "prompt": "Reply exactly PONG. Do not use tools.",
+          "prompt_calls": 1,
+          "terminal_state": "completed",
+          "stop_reason": "end_turn",
+          "exact_pong": true,
+          "text_bytes": 4,
+          "tool_event_count": 0,
+          "permission_update_count": 0
+        },
+        "cleanup": {
+          "grace_timeout_secs": 10,
+          "cancel": "not_needed",
+          "release": "completed",
+          "retire": "completed",
+          "run_scoped_backstop": "invoked_best_effort"
+        }
+      },
+      "diagnostic": {
+        "lifecycle": [
+          {
+            "transition": {
+              "phase": "resolve",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "spawn",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "spawn",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "initialize",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "initialize",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "authenticate",
+              "status": "started",
+              "auth": {
+                "kind": "pre_authenticated",
+                "advertised_method_ids": [
+                  {
+                    "state": "value",
+                    "value": "api-key"
+                  },
+                  {
+                    "state": "value",
+                    "value": "chat-gpt"
+                  }
+                ],
+                "advertised_method_count": 2
+              }
+            }
+          },
+          {
+            "transition": {
+              "phase": "authenticate",
+              "status": "skipped",
+              "code": "acp.auth.pre_authenticated",
+              "auth": {
+                "kind": "pre_authenticated",
+                "advertised_method_ids": [
+                  {
+                    "state": "value",
+                    "value": "api-key"
+                  },
+                  {
+                    "state": "value",
+                    "value": "chat-gpt"
+                  }
+                ],
+                "advertised_method_count": 2
+              }
+            }
+          },
+          {
+            "transition": {
+              "phase": "initialize",
+              "status": "started",
+              "code": "acp.prefix_attestation.capability_probe"
+            }
+          },
+          {
+            "transition": {
+              "phase": "initialize",
+              "status": "skipped",
+              "code": "acp.prefix_attestation.backend_declared_incapable"
+            }
+          },
+          {
+            "transition": {
+              "phase": "resolve",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "session_create",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "session_create",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "config_apply",
+              "status": "started",
+              "operation": "model"
+            }
+          },
+          {
+            "transition": {
+              "phase": "config_apply",
+              "status": "completed",
+              "operation": "model"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_start",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_start",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_stream",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_stream",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_finish",
+              "status": "started"
+            }
+          },
+          {
+            "transition": {
+              "phase": "prompt_finish",
+              "status": "completed"
+            }
+          },
+          {
+            "transition": {
+              "phase": "teardown",
+              "status": "started",
+              "code": "acp.teardown.release"
+            }
+          },
+          {
+            "transition": {
+              "phase": "teardown",
+              "status": "completed",
+              "code": "acp.teardown.released"
+            }
+          }
+        ],
+        "dropped_events": 0,
+        "failure": null,
+        "stderr_text": "excluded"
+      }
+    }
+  ]
 }

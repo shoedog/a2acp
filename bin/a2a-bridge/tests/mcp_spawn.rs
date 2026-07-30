@@ -16,7 +16,7 @@ async fn mcp_subcommand_handshake_and_tool_call_over_real_pipes() {
             "default = \"codex\"\n\n\
              [server]\naddr = \"127.0.0.1:0\"\n\n\
              [store]\npath = {store:?}\n\n\
-             [[agents]]\nid = \"codex\"\ncmd = \"codex\"\nkind = \"acp\"\ndefault = true\n",
+             [[agents]]\nid = \"codex\"\ncmd = \"codex\"\nkind = \"acp\"\n",
             store = store_path,
         ),
     )
@@ -114,7 +114,7 @@ async fn framed_mcp_prompt_barrier_refuses_provider_and_terminalizes_once() {
              [server]\naddr = \"127.0.0.1:0\"\n\n\
              [store]\npath = {store:?}\n\n\
              [[agents]]\nid = \"api\"\nkind = \"api\"\nbase_url = {base_url:?}\n\
-             api_key_env = \"A2A_BRIDGE_TEST_API_KEY\"\nmodel = \"fake-model\"\ndefault = true\n",
+             api_key_env = \"A2A_BRIDGE_TEST_API_KEY\"\nmodel = \"fake-model\"\n",
             store = store_path,
             base_url = format!("{}/v1", provider.uri()),
         ),
@@ -288,7 +288,7 @@ async fn workflow_stats_get_reads_live_mcp_owner_active_and_terminal_wal_rows() 
              [server]\naddr = \"127.0.0.1:0\"\n\n\
              [store]\npath = {store:?}\n\n\
              [[agents]]\nid = \"api\"\nkind = \"api\"\nbase_url = {base_url:?}\n\
-             api_key_env = \"A2A_BRIDGE_TEST_API_KEY\"\nmodel = \"fake-model\"\ndefault = true\n",
+             api_key_env = \"A2A_BRIDGE_TEST_API_KEY\"\nmodel = \"fake-model\"\n",
             store = configured_store,
             base_url = format!("{}/v1", provider.uri()),
         ),

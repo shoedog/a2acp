@@ -10,8 +10,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::compatibility_process_group::{ProcessIdentityV1, ProcessStartMarkerV1};
 use crate::compatibility_schedule::{
-    EffectCapsV1, EffectClassV1, EvidencePurposeV1, ReplicationModeV1, TriggerKindV1,
-    EXPECTED_SUPPORT_PROFILES,
+    expected_support_profile_ids, expected_support_reader_case_ids, EffectCapsV1, EffectClassV1,
+    EvidencePurposeV1, ReplicationModeV1, TriggerKindV1,
 };
 use crate::{compatibility, local_file, BoxError};
 
@@ -19,10 +19,7 @@ const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 128;
 const MAX_TEXT_BYTES: usize = 4096;
 const MAX_ITEMS: usize = 256;
-const MAX_CANDIDATE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SUPERVISOR_DEADLINE_MS: u64 = 24 * 60 * 60 * 1_000;
-const CLAIMED_SUPPORT_READER_CASE_IDS: [&str; 2] =
-    ["claude-reader-055-fable", "codex-reader-bridge-gpt56-sol"];
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -2356,7 +2353,7 @@ impl ValidateRecord for CaseExecutionFingerprintRecordV1 {
             &self.input.candidate.build_provenance_sha256,
         )?;
         if self.input.candidate.length_bytes == 0
-            || self.input.candidate.length_bytes > MAX_CANDIDATE_BYTES
+            || self.input.candidate.length_bytes > compatibility::MAX_EXECUTABLE_BYTES
         {
             return Err("schedule schema: candidate length is outside the bounded range".into());
         }
@@ -3033,12 +3030,8 @@ impl ValidateRecord for ImpactRecordV1 {
             .iter()
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
-        let claimed_support = EXPECTED_SUPPORT_PROFILES
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let readers = CLAIMED_SUPPORT_READER_CASE_IDS
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+        let claimed_support = expected_support_profile_ids();
+        let readers = expected_support_reader_case_ids();
         if !due.is_subset(&claimed_support) {
             return Err(
                 "schedule schema: due cases must be exact inventoried claimed-support profiles"
@@ -5240,7 +5233,10 @@ mod tests {
         assert!(record.validate().is_err());
 
         record.classes = vec![ImpactClassV1::TestsOnly, ImpactClassV1::CompatibilityCore];
-        record.due_case_ids = EXPECTED_SUPPORT_PROFILES.map(str::to_owned).to_vec();
+        record.due_case_ids = expected_support_profile_ids()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         record.no_impact_proved = false;
         record.validate().unwrap();
 
@@ -5255,6 +5251,12 @@ mod tests {
         assert!(record.validate().is_err());
 
         record.classes = vec![ImpactClassV1::ContainerRuntime];
+        record.due_case_ids = vec![
+            "claude-reader-063-sonnet5".into(),
+            "codex-reader-bridge-gpt56-luna".into(),
+        ];
+        record.validate().unwrap();
+
         record.due_case_ids = vec![
             "claude-reader-055-fable".into(),
             "codex-reader-bridge-gpt56-sol".into(),

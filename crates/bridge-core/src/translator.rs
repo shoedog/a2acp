@@ -17,9 +17,13 @@ use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
 
+use crate::attestation::HarvestSanitizationMode;
 use crate::domain::{Part, PendingKind, PendingRequest, SessionContext};
 use crate::error::BridgeError;
-use crate::ids::{SessionId, TaskId};
+use crate::harvest::{
+    commit_harvested_completion, CompletionBodyOrigin, HarvestAuditStore, NoopHarvestAuditStore,
+};
+use crate::ids::{ContextId, SessionId, TaskId, TurnId};
 use crate::orch::UsageSnapshot;
 use crate::ports::{
     AgentBackend, BackendObservers, DiagnosticObserver, PolicyEngine, SessionStore, Update,
@@ -116,6 +120,25 @@ pub struct Translator {
     max_chunk: usize,
 }
 
+fn default_turn_context(task: &TaskId, session: &SessionId) -> crate::ports::TurnContext {
+    crate::ports::TurnContext {
+        turn_id: TurnId::parse("translator-run").expect("fallback turn id is valid"),
+        session_id: ContextId::parse(session.as_str()).unwrap_or_else(|_| {
+            ContextId::parse("translator-run").expect("fallback context id is valid")
+        }),
+        task_id: Some(task.clone()),
+        workflow: None,
+        node: None,
+        attempt: 0,
+        agent: "translator".to_string(),
+        model: None,
+        effort: None,
+        mode: None,
+        prompt_id: None,
+        traceparent: None,
+    }
+}
+
 impl Translator {
     pub fn new() -> Self {
         Self { max_chunk: 1200 }
@@ -140,6 +163,8 @@ impl Translator {
             session,
             parts,
             Arc::new(crate::diagnostics::NoopDiagnosticObserver::default()),
+            default_turn_context(task, session),
+            Arc::new(NoopHarvestAuditStore),
         )
     }
 
@@ -158,6 +183,8 @@ impl Translator {
         session: &'a SessionId,
         parts: Vec<Part>,
         diagnostic: Arc<dyn DiagnosticObserver>,
+        turn_context: crate::ports::TurnContext,
+        harvest_audit_store: Arc<dyn HarvestAuditStore>,
     ) -> Pin<Box<dyn Stream<Item = Result<Event, BridgeError>> + Send + 'a>> {
         let max_chunk = self.max_chunk;
         Box::pin(async_stream::try_stream! {
@@ -214,7 +241,7 @@ impl Translator {
                     Ok(Update::Usage(snap)) => {
                         yield Event::usage(snap);
                     }
-                    Ok(Update::Done { stop_reason }) => {
+                    Ok(Update::Done { stop_reason, prefix_attestation }) => {
                         // Flush any pending coalesced text first.
                         if !acc.is_empty() {
                             let chunk = std::mem::take(&mut acc);
@@ -225,13 +252,26 @@ impl Translator {
                         // BEFORE moving `stop_reason` into the artifact payload, so we
                         // can emit a terminal Canceled signal after the artifact.
                         let cancelled = stop_reason == STOP_REASON_CANCELLED;
-                        // Final artifact carries the complete text or stop_reason.
-                        let payload = if saw_text_delta {
-                            artifact_text
+                        // Final artifact carries the committed effective body. The
+                        // `saw_text_delta == false` branch audits `stop_reason` as
+                        // bridge-synthetic and never submits it to cut validation.
+                        let (payload, origin) = if saw_text_delta {
+                            (artifact_text, CompletionBodyOrigin::ModelText)
                         } else {
-                            stop_reason
+                            (stop_reason, CompletionBodyOrigin::BridgeStopReasonWithoutText)
                         };
-                        yield Event::artifact(payload);
+                        let committed = commit_harvested_completion(
+                            &turn_context,
+                            HarvestSanitizationMode::Off,
+                            &backend.prefix_attestation_capability(),
+                            &turn_context.agent,
+                            origin,
+                            payload,
+                            prefix_attestation,
+                            harvest_audit_store.as_ref(),
+                        )
+                        .await?;
+                        yield Event::artifact(committed.effective_body);
                         // A cancelled Done drives a terminal Canceled outcome so the
                         // local-backend producer reports Canceled (not Completed) to the
                         // A2A caller. A normal end_turn emits no terminal here, leaving
@@ -363,6 +403,7 @@ mod tests {
                 .push(Arc::downgrade(&observers.diagnostic));
             Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             })])))
         }
 
@@ -453,6 +494,7 @@ mod tests {
             Ok(Update::Text("PONG".into())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -485,6 +527,8 @@ mod tests {
                 &session,
                 vec![],
                 observer.clone(),
+                default_turn_context(&task, &session),
+                Arc::new(NoopHarvestAuditStore),
             )
             .collect::<Vec<_>>()
             .await;
@@ -521,6 +565,7 @@ mod tests {
             Ok(Update::Text("body".into())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -557,6 +602,7 @@ mod tests {
             Ok(Update::Text("A".into())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -584,6 +630,7 @@ mod tests {
             Ok(Update::Text(String::new())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -614,6 +661,7 @@ mod tests {
             (0..50).map(|_| Ok(Update::Text("x".repeat(40)))).collect();
         v.push(Ok(Update::Done {
             stop_reason: "end_turn".into(),
+            prefix_attestation: Default::default(),
         }));
         let be = FakeBackend::new(v);
         let st = FakeStore::default();
@@ -654,6 +702,7 @@ mod tests {
             Ok(Update::Text(expected.clone())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -714,6 +763,7 @@ mod tests {
             Ok(Update::Text("after".into())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -775,6 +825,7 @@ mod tests {
         // artifact (no terminal frame); the producer maps clean-end -> Completed.
         let be = FakeBackend::new(vec![Ok(Update::Done {
             stop_reason: "ran_out_of_turns".into(),
+            prefix_attestation: Default::default(),
         })]);
         let st = FakeStore::default();
         let pol = AutoApprove;
@@ -800,6 +851,7 @@ mod tests {
             Ok(Update::Text("partial".into())),
             Ok(Update::Done {
                 stop_reason: "cancelled".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -830,6 +882,7 @@ mod tests {
             Ok(Update::Text("TIAL".into())),
             Ok(Update::Done {
                 stop_reason: STOP_REASON_CANCELLED.into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();
@@ -861,6 +914,7 @@ mod tests {
             Ok(Update::Text("done".into())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ]);
         let st = FakeStore::default();

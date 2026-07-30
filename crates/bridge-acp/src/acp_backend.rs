@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, CancelNotification,
@@ -30,17 +30,24 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
-    Agent, Client, ConnectTo, ConnectionTo, Error as AcpError, ErrorCode, Lines,
+    Agent, Client, ConnectTo, ConnectionTo, Error as AcpError, ErrorCode, JsonRpcMessage,
+    JsonRpcRequest, JsonRpcResponse, Lines, UntypedMessage,
 };
 use async_trait::async_trait;
-use serde::Deserialize;
-use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, OwnedMutexGuard};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify, OnceCell, OwnedMutexGuard};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::model_effort::{
-    caps_from_config_options, effort_opt, is_blocked_model, is_unsupported_effort_error,
-    model_values, resolve_effort, resolve_model, EffortDecision, ModelDecision,
-    ModelResolutionError, EFFORT_ORDER,
+    caps_from_config_options, effort_level_name, effort_opt, is_blocked_model,
+    is_unsupported_effort_error, model_id_effort, model_values, resolve_effort, resolve_model,
+    resolve_model_state, EffortDecision, ModelDecision, ModelResolutionError, EFFORT_ORDER,
+};
+use bridge_core::attestation::{
+    nonce_hex, AttestedPrefixV1, CapabilityUnavailableReason, HarvestSanitizationMode,
+    InvalidAttestationReason, NoAttestationReason, PrefixAttestationCapability,
+    PrefixAttestationRequest, PrefixAttestationStatus, ATTESTED_PREFIX_BEGIN_TURN_METHOD,
+    ATTESTED_PREFIX_CAPABILITIES_METHOD, ATTESTED_PREFIX_ISSUER_V1, ATTESTED_PREFIX_META_KEY,
 };
 use bridge_core::catalog::AgentCaps;
 use bridge_core::diagnostics::{
@@ -91,6 +98,327 @@ const DEFAULT_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// escalation when we nuke the agent process on a cancel/drop timeout.
 const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 const CONTAINER_START_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+const SESSION_NEW_METHOD: &str = "session/new";
+const SESSION_SET_MODEL_METHOD: &str = "session/set_model";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrefixAttestationTransport {
+    #[default]
+    Unsupported,
+    PackagedCodexAcpAttested,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PrefixCapabilitiesRequest {}
+
+impl JsonRpcMessage for PrefixCapabilitiesRequest {
+    fn matches_method(method: &str) -> bool {
+        method == ATTESTED_PREFIX_CAPABILITIES_METHOD
+    }
+
+    fn method(&self) -> &str {
+        ATTESTED_PREFIX_CAPABILITIES_METHOD
+    }
+
+    fn to_untyped_message(&self) -> Result<UntypedMessage, AcpError> {
+        UntypedMessage::new(ATTESTED_PREFIX_CAPABILITIES_METHOD, self)
+    }
+
+    fn parse_message(method: &str, params: &impl Serialize) -> Result<Self, AcpError> {
+        if method != ATTESTED_PREFIX_CAPABILITIES_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast_params(params)
+    }
+}
+
+impl JsonRpcRequest for PrefixCapabilitiesRequest {
+    type Response = PrefixCapabilitiesResponse;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PrefixCapabilitiesResponse {
+    protocol_version: u64,
+    issuer_id: String,
+}
+
+impl JsonRpcResponse for PrefixCapabilitiesResponse {
+    fn into_json(self, _method: &str) -> Result<serde_json::Value, AcpError> {
+        serde_json::to_value(self).map_err(AcpError::into_internal_error)
+    }
+
+    fn from_value(method: &str, value: serde_json::Value) -> Result<Self, AcpError> {
+        if method != ATTESTED_PREFIX_CAPABILITIES_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast(&value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PrefixBeginTurnRequest {
+    schema_version: u64,
+    session_id: String,
+    turn_id: String,
+    enabled: bool,
+    marker_nonce: String,
+}
+
+impl JsonRpcMessage for PrefixBeginTurnRequest {
+    fn matches_method(method: &str) -> bool {
+        method == ATTESTED_PREFIX_BEGIN_TURN_METHOD
+    }
+
+    fn method(&self) -> &str {
+        ATTESTED_PREFIX_BEGIN_TURN_METHOD
+    }
+
+    fn to_untyped_message(&self) -> Result<UntypedMessage, AcpError> {
+        UntypedMessage::new(ATTESTED_PREFIX_BEGIN_TURN_METHOD, self)
+    }
+
+    fn parse_message(method: &str, params: &impl Serialize) -> Result<Self, AcpError> {
+        if method != ATTESTED_PREFIX_BEGIN_TURN_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast_params(params)
+    }
+}
+
+impl JsonRpcRequest for PrefixBeginTurnRequest {
+    type Response = PrefixBeginTurnResponse;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PrefixBeginTurnResponse {
+    schema_version: u64,
+    turn_id: String,
+    accepted: bool,
+}
+
+impl JsonRpcResponse for PrefixBeginTurnResponse {
+    fn into_json(self, _method: &str) -> Result<serde_json::Value, AcpError> {
+        serde_json::to_value(self).map_err(AcpError::into_internal_error)
+    }
+
+    fn from_value(method: &str, value: serde_json::Value) -> Result<Self, AcpError> {
+        if method != ATTESTED_PREFIX_BEGIN_TURN_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast(&value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+struct ModelAwareNewSessionRequest(NewSessionRequest);
+
+impl ModelAwareNewSessionRequest {
+    fn new(inner: NewSessionRequest) -> Self {
+        Self(inner)
+    }
+}
+
+impl JsonRpcMessage for ModelAwareNewSessionRequest {
+    fn matches_method(method: &str) -> bool {
+        method == SESSION_NEW_METHOD
+    }
+
+    fn method(&self) -> &str {
+        SESSION_NEW_METHOD
+    }
+
+    fn to_untyped_message(&self) -> Result<UntypedMessage, AcpError> {
+        UntypedMessage::new(SESSION_NEW_METHOD, &self.0)
+    }
+
+    fn parse_message(method: &str, params: &impl Serialize) -> Result<Self, AcpError> {
+        if method != SESSION_NEW_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast_params(params).map(Self)
+    }
+}
+
+impl JsonRpcRequest for ModelAwareNewSessionRequest {
+    type Response = ModelAwareNewSessionResponse;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ModelAwareNewSessionResponse {
+    session_id: AgentSessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modes: Option<SessionModeState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    config_options: Option<Vec<SessionConfigOption>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    models: Option<SessionModelState>,
+}
+
+#[cfg(test)]
+impl ModelAwareNewSessionResponse {
+    fn new(session_id: impl Into<AgentSessionId>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            modes: None,
+            config_options: None,
+            models: None,
+        }
+    }
+
+    fn modes(mut self, modes: Option<SessionModeState>) -> Self {
+        self.modes = modes;
+        self
+    }
+
+    fn config_options(mut self, config_options: Vec<SessionConfigOption>) -> Self {
+        self.config_options = Some(config_options);
+        self
+    }
+
+    fn models(mut self, models: Option<SessionModelState>) -> Self {
+        self.models = models;
+        self
+    }
+}
+
+impl JsonRpcResponse for ModelAwareNewSessionResponse {
+    fn into_json(self, _method: &str) -> Result<serde_json::Value, AcpError> {
+        serde_json::to_value(self).map_err(AcpError::into_internal_error)
+    }
+
+    fn from_value(method: &str, value: serde_json::Value) -> Result<Self, AcpError> {
+        if method != SESSION_NEW_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast(&value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SessionModelState {
+    #[serde(default)]
+    current_model_id: String,
+    #[serde(default)]
+    available_models: Vec<SessionModel>,
+}
+
+impl SessionModelState {
+    #[cfg(test)]
+    fn new(current_model_id: impl Into<String>, model_ids: Vec<String>) -> Self {
+        Self {
+            current_model_id: current_model_id.into(),
+            available_models: model_ids.into_iter().map(SessionModel::new).collect(),
+        }
+    }
+
+    fn values(&self) -> Vec<String> {
+        self.available_models
+            .iter()
+            .map(|model| model.model_id.clone())
+            .collect()
+    }
+
+    fn supports_effort_suffix(&self) -> bool {
+        self.available_models
+            .iter()
+            .any(|model| model_id_effort(&model.model_id).is_some())
+    }
+
+    fn with_current(mut self, current_model_id: impl Into<String>) -> Self {
+        self.current_model_id = current_model_id.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SessionModel {
+    model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+#[cfg(test)]
+impl SessionModel {
+    fn new(model_id: impl Into<String>) -> Self {
+        let model_id = model_id.into();
+        Self {
+            name: Some(model_id.clone()),
+            model_id,
+            description: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionModelRequest {
+    session_id: AgentSessionId,
+    model_id: String,
+}
+
+impl SetSessionModelRequest {
+    fn new(session_id: AgentSessionId, model_id: impl Into<String>) -> Self {
+        Self {
+            session_id,
+            model_id: model_id.into(),
+        }
+    }
+}
+
+impl JsonRpcMessage for SetSessionModelRequest {
+    fn matches_method(method: &str) -> bool {
+        method == SESSION_SET_MODEL_METHOD
+    }
+
+    fn method(&self) -> &str {
+        SESSION_SET_MODEL_METHOD
+    }
+
+    fn to_untyped_message(&self) -> Result<UntypedMessage, AcpError> {
+        UntypedMessage::new(SESSION_SET_MODEL_METHOD, self)
+    }
+
+    fn parse_message(method: &str, params: &impl Serialize) -> Result<Self, AcpError> {
+        if method != SESSION_SET_MODEL_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast_params(params)
+    }
+}
+
+impl JsonRpcRequest for SetSessionModelRequest {
+    type Response = SetSessionModelResponse;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SetSessionModelResponse {}
+
+#[cfg(test)]
+impl SetSessionModelResponse {
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+impl JsonRpcResponse for SetSessionModelResponse {
+    fn into_json(self, _method: &str) -> Result<serde_json::Value, AcpError> {
+        serde_json::to_value(self).map_err(AcpError::into_internal_error)
+    }
+
+    fn from_value(method: &str, value: serde_json::Value) -> Result<Self, AcpError> {
+        if method != SESSION_SET_MODEL_METHOD {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast(&value)
+    }
+}
 
 const RICH_CONTENT_CAP: usize = 2048;
 const RICH_VEC_CAP: usize = 64;
@@ -427,6 +755,9 @@ enum AcpTraceEvent {
         advertised_count: u16,
     },
     EffortOptionMissing,
+    MintEffortDropped {
+        advertised_count: u16,
+    },
     ConfigResolved {
         effort_applied: bool,
         fell_back: bool,
@@ -453,6 +784,9 @@ enum AcpTraceEvent {
     PromptFailed,
     WarmConfigNotAdvertised,
     WarmConfigRejected,
+    /// An attested-prefix control frame arrived after its turn's drain barrier
+    /// (route already unregistered) and was dropped as post-terminal.
+    PostTerminalControlFrameDropped,
 }
 
 impl AcpTraceEvent {
@@ -473,6 +807,11 @@ impl AcpTraceEvent {
             ),
             Self::EffortOptionMissing => tracing::warn!(
                 event = "acp.effort_option_missing",
+                "ACP lifecycle metadata"
+            ),
+            Self::MintEffortDropped { advertised_count } => tracing::warn!(
+                event = "acp.mint_effort_dropped",
+                advertised_count,
                 "ACP lifecycle metadata"
             ),
             Self::ConfigResolved {
@@ -533,6 +872,10 @@ impl AcpTraceEvent {
             Self::WarmConfigRejected => {
                 tracing::warn!(event = "acp.warm_config_rejected", "ACP lifecycle metadata")
             }
+            Self::PostTerminalControlFrameDropped => tracing::warn!(
+                event = "acp.post_terminal_control_frame_dropped",
+                "ACP lifecycle metadata"
+            ),
         }
     }
 }
@@ -587,6 +930,7 @@ pub struct AcpConfig {
     /// from lifecycle causes and process stderr before either is retained.
     /// `Debug` reports only a count; values are never rendered.
     pub diagnostic_redactor: DiagnosticRedactor,
+    pub prefix_attestation_transport: PrefixAttestationTransport,
 }
 
 /// Reaper configuration for a containerized (`:ro` sandbox) agent. The public
@@ -665,6 +1009,7 @@ impl Default for AcpConfig {
             mcp: Vec::new(),
             watchdog: None,
             diagnostic_redactor: DiagnosticRedactor::default(),
+            prefix_attestation_transport: PrefixAttestationTransport::Unsupported,
         }
     }
 }
@@ -721,6 +1066,42 @@ macro_rules! reject_unsupported {
     }};
 }
 
+fn parse_canonical_u64(raw: &str) -> Option<u64> {
+    if raw.is_empty() || (raw.len() > 1 && raw.starts_with('0')) {
+        return None;
+    }
+    if !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
+}
+
+fn parse_sha256_hex(raw: &str) -> Option<[u8; 32]> {
+    if raw.len() != 64
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let mut out = [0_u8; 32];
+    for (idx, slot) in out.iter_mut().enumerate() {
+        let start = idx * 2;
+        *slot = u8::from_str_radix(&raw[start..start + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn no_attestation_reason_from_wire(raw: &str) -> Option<NoAttestationReason> {
+    Some(match raw {
+        "sanitization_not_requested" => NoAttestationReason::SanitizationNotRequested,
+        "turn_missing_deliverable_boundary" => NoAttestationReason::TurnMissingDeliverableBoundary,
+        "turn_ended_without_deliverable" => NoAttestationReason::TurnEndedWithoutDeliverable,
+        "multiple_commit_markers" => NoAttestationReason::MultipleCommitMarkers,
+        _ => return None,
+    })
+}
+
 // ── Streaming routing registry ───────────────────────────────────────────────
 //
 // `session/update` notifications are delivered by the SDK on its event-loop
@@ -747,6 +1128,184 @@ struct TurnRoute {
     /// The terminal driver and cancel watcher race on this bit so a slow
     /// post-response observer cannot be mistaken for live agent work.
     active: Arc<AtomicBool>,
+    prefix_attestation: Option<PrefixTurnState>,
+}
+
+#[derive(Clone)]
+struct PrefixTurnState {
+    producer_id: String,
+    turn_id: String,
+    marker_nonce_hex: String,
+    capability: PrefixAttestationCapability,
+    observed: Arc<StdMutex<Option<PrefixAttestationStatus>>>,
+    notify: Arc<Notify>,
+    /// Set once the turn's control channel is drained: the driver unregisters
+    /// the update route (under the registry lock, atomically with the last
+    /// possible `record_control`) and then closes this flag. After the close,
+    /// no control frame for the turn can be recorded, so a missing-control
+    /// classification is causal, not clock-based.
+    control_closed: Arc<AtomicBool>,
+}
+
+/// Operational liveness backstop for callers that demand a terminal status
+/// without having drained the control channel first (the production driver
+/// always closes the drain before classifying, so it never waits here). The
+/// bound's expiry is an operational failure and must NOT be audited as a
+/// backend protocol violation: a valid in-flight frame could still arrive.
+const PREFIX_CONTROL_DRAIN_BACKSTOP: Duration = Duration::from_millis(250);
+
+impl PrefixTurnState {
+    fn new(
+        producer_id: String,
+        turn_id: String,
+        marker_nonce_hex: String,
+        capability: PrefixAttestationCapability,
+    ) -> Self {
+        Self {
+            producer_id,
+            turn_id,
+            marker_nonce_hex,
+            capability,
+            observed: Arc::new(StdMutex::new(None)),
+            notify: Arc::new(Notify::new()),
+            control_closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn record_control(&self, status: PrefixAttestationStatus) {
+        if let Ok(mut observed) = self.observed.lock() {
+            if observed.is_some() {
+                *observed = Some(PrefixAttestationStatus::rejected(
+                    self.producer_id.clone(),
+                    self.turn_id.clone(),
+                    InvalidAttestationReason::DuplicateControlMetadata,
+                ));
+            } else {
+                *observed = Some(status);
+            }
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn observed_status(&self) -> Option<PrefixAttestationStatus> {
+        self.observed
+            .lock()
+            .ok()
+            .and_then(|observed| observed.clone())
+    }
+
+    /// Close the turn's control channel. Call only after the update route was
+    /// removed from the registry: route removal and `record_control` are
+    /// serialized on the registry lock, so once the route is gone no further
+    /// frame can be recorded and the observed state is final.
+    fn close_control(&self) {
+        self.control_closed.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn control_drained(&self) -> bool {
+        self.control_closed.load(Ordering::SeqCst)
+    }
+
+    /// Terminal classification, causally dependent on control-frame drain.
+    ///
+    /// The classification never turns a wall-clock expiry into
+    /// `BackendProtocolViolation`: that reason is produced only once the drain
+    /// is closed (no in-flight frame can still arrive). Until then the caller
+    /// waits for a recorded frame or the drain close; the bounded backstop
+    /// exists only so a mis-sequenced caller cannot hang forever, and its
+    /// expiry is audited as the operational `ControlDrainTimeout`, never as a
+    /// wire violation.
+    async fn terminal_status_after_control_quiescence(
+        &self,
+        requested: bool,
+    ) -> PrefixAttestationStatus {
+        if requested && self.observed_status().is_none() && !self.control_drained() {
+            let wait = async {
+                loop {
+                    let notified = self.notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if self.observed_status().is_some() || self.control_drained() {
+                        return;
+                    }
+                    notified.await;
+                }
+            };
+            if tokio::time::timeout(PREFIX_CONTROL_DRAIN_BACKSTOP, wait)
+                .await
+                .is_err()
+                && self.observed_status().is_none()
+                && !self.control_drained()
+            {
+                return PrefixAttestationStatus::unavailable(
+                    self.producer_id.clone(),
+                    self.turn_id.clone(),
+                    NoAttestationReason::ControlDrainTimeout,
+                );
+            }
+        }
+        self.terminal_status(requested)
+    }
+
+    fn terminal_status(&self, requested: bool) -> PrefixAttestationStatus {
+        if let Some(status) = self.observed_status() {
+            return status;
+        }
+        if requested {
+            let reason = match &self.capability {
+                PrefixAttestationCapability::SupportedV1 { .. } => {
+                    NoAttestationReason::BackendProtocolViolation
+                }
+                PrefixAttestationCapability::Unsupported {
+                    reason: CapabilityUnavailableReason::ProtocolDowngrade,
+                } => NoAttestationReason::ProtocolDowngrade,
+                PrefixAttestationCapability::Unsupported { .. } => {
+                    NoAttestationReason::BackendDeclaredIncapable
+                }
+            };
+            PrefixAttestationStatus::unavailable(
+                self.producer_id.clone(),
+                self.turn_id.clone(),
+                reason,
+            )
+        } else {
+            PrefixAttestationStatus::unavailable(
+                self.producer_id.clone(),
+                self.turn_id.clone(),
+                NoAttestationReason::SanitizationNotRequested,
+            )
+        }
+    }
+}
+
+/// Derive the terminal-audit `requested` flag and the per-turn prefix state
+/// from the configured turn metadata (MAJOR 4 fix): `requested` follows the
+/// node's ORIGINAL §6 mode, never the collapsed transport request, so an
+/// enabled node on an incapable backend audits with the backend's real
+/// incapability reason (`backend_declared_incapable` / `protocol_downgrade`)
+/// instead of masquerading as `sanitization_not_requested`. Both request arms
+/// carry the backend's RESOLVED capability for the same reason. An enabled
+/// mode with a supported capability always mints an enabled request upstream
+/// (`prefix_attestation_request_for_capability`), so `Disabled` + enabled mode
+/// implies the backend could not honor the request.
+fn prefix_turn_state_for_meta(
+    meta: &TurnMeta,
+    producer_id: &str,
+    capability: &PrefixAttestationCapability,
+) -> (bool, PrefixTurnState) {
+    let requested = meta.requested_mode == HarvestSanitizationMode::AttestedPrefixV1;
+    let marker_nonce_hex = match &meta.prefix_attestation_request {
+        PrefixAttestationRequest::CodexCommitMarkerV1 { marker_nonce } => nonce_hex(marker_nonce),
+        PrefixAttestationRequest::Disabled => String::new(),
+    };
+    let state = PrefixTurnState::new(
+        producer_id.to_string(),
+        meta.turn_id.as_str().to_string(),
+        marker_nonce_hex,
+        capability.clone(),
+    );
+    (requested, state)
 }
 
 struct TurnWatch {
@@ -1000,6 +1559,19 @@ impl Drop for TurnAcceptanceGuard {
 #[derive(Clone, Default)]
 struct ConfigSurface {
     opts: Vec<SessionConfigOption>,
+    models: Option<SessionModelState>,
+}
+
+impl ConfigSurface {
+    fn new(opts: Vec<SessionConfigOption>, models: Option<SessionModelState>) -> Self {
+        Self { opts, models }
+    }
+
+    fn supports_effort_model_ids(&self) -> bool {
+        self.models
+            .as_ref()
+            .is_some_and(SessionModelState::supports_effort_suffix)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1099,6 +1671,7 @@ pub struct AcpBackend {
     /// prompt. `prompt_inner` takes it at entry, before lazy session minting, so
     /// early setup errors cannot leave stale metadata for a later turn.
     pending_turn_meta: StdMutex<HashMap<SessionId, TurnMeta>>,
+    prefix_attestation_capability: PrefixAttestationCapability,
     /// Policy engine that decides reverse `session/request_permission` requests.
     /// Defaults to an internal auto-approve impl (the deployed 3a policy); a
     /// caller (Task 6's `main`) threads a concrete engine via [`Self::with_policy`].
@@ -1582,6 +2155,13 @@ impl AcpBackend {
         NewSessionRequest::new(cwd).mcp_servers(servers)
     }
 
+    fn model_aware_new_session_request(
+        cwd: impl Into<PathBuf>,
+        mcp: &[bridge_core::mcp::McpServerSpec],
+    ) -> ModelAwareNewSessionRequest {
+        ModelAwareNewSessionRequest::new(Self::new_session_request(cwd, mcp))
+    }
+
     /// Build the `session/prompt` request the backend sends for a turn: the
     /// agent session id plus each bridge `Part` mapped to a tagged text
     /// `ContentBlock`. ACP §11A: the wire field is `prompt` (an array of tagged
@@ -1642,6 +2222,28 @@ impl AcpBackend {
             SessionConfigId::new(config_id.into()),
             SessionConfigValueId::new(value.into()),
         )
+    }
+
+    #[must_use]
+    pub fn set_model_request(
+        agent_id: AgentSessionId,
+        model_id: impl Into<String>,
+    ) -> SetSessionModelRequest {
+        SetSessionModelRequest::new(agent_id, model_id)
+    }
+
+    async fn set_model(
+        cx: &ConnectionTo<Agent>,
+        agent_id: &AgentSessionId,
+        model_id: &str,
+    ) -> Result<(), agent_client_protocol::Error> {
+        cx.send_request::<SetSessionModelRequest>(Self::set_model_request(
+            agent_id.clone(),
+            model_id,
+        ))
+        .block_task()
+        .await?;
+        Ok(())
     }
 
     async fn set_config_option(
@@ -1735,6 +2337,43 @@ impl AcpBackend {
         Ok((opts0.to_vec(), Some("unadvertised".to_string()), None))
     }
 
+    async fn configure_model_state(
+        cx: &ConnectionTo<Agent>,
+        agent_session_id: &AgentSessionId,
+        agent_id: &str,
+        models0: &SessionModelState,
+        model: Option<&str>,
+        effort: Option<Effort>,
+    ) -> Result<(SessionModelState, Option<String>, Option<String>, bool), BridgeError> {
+        let values = models0.values();
+        let current = models0.current_model_id.clone();
+        if model.is_none() && is_blocked_model(&current) {
+            return Err(BridgeError::config_invalid(format!(
+                "agent {agent_id} current model={current} is blocked by this bridge; configure a non-blocked model"
+            )));
+        }
+
+        match Self::resolve_model_state_or_invalid(agent_id, model, effort, &current, &values)? {
+            ModelDecision::Default => Ok((models0.clone(), Some(current), None, false)),
+            ModelDecision::Apply(value) => {
+                Self::set_model(cx, agent_session_id, &value)
+                    .await
+                    .map_err(|e| {
+                        BridgeError::agent_crashed(format!(
+                            "session/set_model rejected modelId={value}: {e}"
+                        ))
+                    })?;
+                let effort_folded = effort.is_some() && model_id_effort(&value).is_some();
+                Ok((
+                    models0.clone().with_current(value.clone()),
+                    Some(value.clone()),
+                    Some(value),
+                    effort_folded,
+                ))
+            }
+        }
+    }
+
     /// Validate a configured model against the advertised values, mapping a miss to
     /// a fatal `config_invalid` that lists them (logged/CLI; redacted on the wire).
     fn resolve_model_or_invalid(
@@ -1743,6 +2382,26 @@ impl AcpBackend {
         values: &[String],
     ) -> Result<ModelDecision, BridgeError> {
         resolve_model(model, values).map_err(|err| match err {
+            ModelResolutionError::Blocked { want, valid } => BridgeError::config_invalid(format!(
+                "agent {agent_id} model={want} is blocked by this bridge; valid models: {}",
+                valid.join(", ")
+            )),
+            ModelResolutionError::NotAdvertised(err) => BridgeError::config_invalid(format!(
+                "agent {agent_id} model={} is not advertised; valid models: {}",
+                err.want,
+                err.valid.join(", ")
+            )),
+        })
+    }
+
+    fn resolve_model_state_or_invalid(
+        agent_id: &str,
+        model: Option<&str>,
+        effort: Option<Effort>,
+        current: &str,
+        values: &[String],
+    ) -> Result<ModelDecision, BridgeError> {
+        resolve_model_state(model, effort, current, values).map_err(|err| match err {
             ModelResolutionError::Blocked { want, valid } => BridgeError::config_invalid(format!(
                 "agent {agent_id} model={want} is blocked by this bridge; valid models: {}",
                 valid.join(", ")
@@ -1768,19 +2427,49 @@ impl AcpBackend {
         effort: Option<Effort>,
         purpose: ApplyPurpose,
     ) -> Result<(ConfigSurface, String), ApplyConfigError> {
-        let (mut refreshed_opts, model_current, applied_model) =
-            Self::configure_model_option(cx, agent_session_id, agent_id, &surface.opts, model)
+        let (mut refreshed_opts, mut refreshed_models, model_current, applied_model, effort_folded) =
+            if let Some(models) = surface.models.as_ref() {
+                let (models, current, applied, folded) = Self::configure_model_state(
+                    cx,
+                    agent_session_id,
+                    agent_id,
+                    models,
+                    model,
+                    effort,
+                )
                 .await
                 .map_err(|err| match err {
                     err @ BridgeError::ConfigInvalid { .. } => ApplyConfigError::NotAdvertised(err),
                     err @ BridgeError::AgentCrashed { .. } => ApplyConfigError::Rejected(err),
                     err => ApplyConfigError::Rejected(err),
                 })?;
+                (
+                    surface.opts.clone(),
+                    Some(models),
+                    current,
+                    applied,
+                    folded.then_some(effort).flatten(),
+                )
+            } else {
+                let (opts, current, applied) = Self::configure_model_option(
+                    cx,
+                    agent_session_id,
+                    agent_id,
+                    &surface.opts,
+                    model,
+                )
+                .await
+                .map_err(|err| match err {
+                    err @ BridgeError::ConfigInvalid { .. } => ApplyConfigError::NotAdvertised(err),
+                    err @ BridgeError::AgentCrashed { .. } => ApplyConfigError::Rejected(err),
+                    err => ApplyConfigError::Rejected(err),
+                })?;
+                (opts, None, current, applied, None)
+            };
 
-        // PF-9: a WARM reconcile must apply the requested model EXACTLY. `configure_model_option`
-        // can return Ok with a stale/unchanged `current` (e.g. empty refreshed opts) — at Warm
-        // that is NOT an exact apply, so fail rather than let the fingerprint advance to a model
-        // the live session may not be using. (Mint keeps today's lenient behavior.)
+        // PF-9: a WARM reconcile must apply the requested model EXACTLY. The
+        // config-option surface can return Ok with stale/unchanged `current`
+        // (e.g. empty refreshed opts); at Warm that is NOT an exact apply.
         if matches!(purpose, ApplyPurpose::Warm) {
             if let Some(want) = applied_model.as_deref() {
                 if model_current.as_deref() != Some(want) {
@@ -1794,51 +2483,78 @@ impl AcpBackend {
             }
         }
 
-        let effort_outcome = match effort_opt(&refreshed_opts) {
-            Some(advertised) => {
-                let decision = resolve_effort(effort, &advertised);
-                match decision {
-                    EffortDecision::Unsupported { from } => {
-                        AcpTraceEvent::EffortBelowMinimum {
-                            advertised_count: AcpTraceEvent::bounded_count(advertised.levels.len()),
-                        }
-                        .emit();
-                        EffortDecision::Unsupported { from }
-                    }
-                    EffortDecision::Skip => EffortDecision::Skip,
-                    decision @ (EffortDecision::Apply { .. } | EffortDecision::FellBack { .. }) => {
-                        match Self::apply_effort_walkdown(
-                            cx,
-                            agent_session_id,
-                            agent_id,
-                            decision,
-                            &advertised.levels,
-                        )
-                        .await
-                        {
-                            Ok((decision, refreshed)) => {
-                                if let Some(opts) = refreshed {
-                                    refreshed_opts = opts;
-                                }
-                                decision
-                            }
-                            Err(err) => {
-                                if matches!(purpose, ApplyPurpose::Warm) {
-                                    return Err(ApplyConfigError::Rejected(err));
-                                }
-                                EffortDecision::Skip
-                            }
-                        }
-                    }
-                }
+        let effort_outcome = if let Some(effort) = effort_folded {
+            EffortDecision::Apply {
+                config_id: "models".to_string(),
+                level: effort_level_name(effort).to_string(),
             }
-            None => {
-                if effort.is_some() {
-                    AcpTraceEvent::EffortOptionMissing.emit();
+        } else {
+            match effort_opt(&refreshed_opts) {
+                Some(advertised) => {
+                    let decision = resolve_effort(effort, &advertised);
+                    match decision {
+                        EffortDecision::Unsupported { from } => {
+                            AcpTraceEvent::EffortBelowMinimum {
+                                advertised_count: AcpTraceEvent::bounded_count(
+                                    advertised.levels.len(),
+                                ),
+                            }
+                            .emit();
+                            EffortDecision::Unsupported { from }
+                        }
+                        EffortDecision::Skip => EffortDecision::Skip,
+                        decision @ (EffortDecision::Apply { .. }
+                        | EffortDecision::FellBack { .. }) => {
+                            match Self::apply_effort_walkdown(
+                                cx,
+                                agent_session_id,
+                                agent_id,
+                                decision,
+                                &advertised.levels,
+                            )
+                            .await
+                            {
+                                Ok((decision, refreshed)) => {
+                                    if let Some(opts) = refreshed {
+                                        refreshed_opts = opts;
+                                    }
+                                    decision
+                                }
+                                Err(err) => {
+                                    if matches!(purpose, ApplyPurpose::Warm) {
+                                        return Err(ApplyConfigError::Rejected(err));
+                                    }
+                                    EffortDecision::Skip
+                                }
+                            }
+                        }
+                    }
                 }
-                EffortDecision::Skip
+                None => {
+                    if effort.is_some() {
+                        AcpTraceEvent::EffortOptionMissing.emit();
+                    }
+                    EffortDecision::Skip
+                }
             }
         };
+        if matches!(purpose, ApplyPurpose::Mint)
+            && effort.is_some()
+            && surface.supports_effort_model_ids()
+            && matches!(effort_outcome, EffortDecision::Skip)
+        {
+            AcpTraceEvent::MintEffortDropped {
+                advertised_count: AcpTraceEvent::bounded_count(
+                    surface
+                        .models
+                        .as_ref()
+                        .map(|models| models.available_models.len())
+                        .unwrap_or_default(),
+                ),
+            }
+            .emit();
+        }
+
         let model_current_for_log = model_current.as_deref().unwrap_or("unknown");
         AcpTraceEvent::ConfigResolved {
             effort_applied: matches!(effort_outcome, EffortDecision::Apply { .. }),
@@ -1862,9 +2578,7 @@ impl AcpBackend {
         }
 
         Ok((
-            ConfigSurface {
-                opts: refreshed_opts,
-            },
+            ConfigSurface::new(refreshed_opts, refreshed_models.take()),
             model_current_for_log.to_string(),
         ))
     }
@@ -2263,11 +2977,43 @@ impl AcpBackend {
                         let updates = Arc::clone(&updates_handler);
                         async move {
                             let session_id = notif.session_id.clone();
+                            let mut prefix_state = None;
                             if let Ok(map) = updates.lock() {
                                 if let Some(route) = map.get(&session_id) {
                                     if let Some(w) = &route.watch {
                                         bump_activity(w);
                                     }
+                                    prefix_state = route.prefix_attestation.clone();
+                                }
+                            }
+
+                            if let Some(state) = &prefix_state {
+                                if let Some(status) =
+                                    Self::parse_prefix_control_notification(&notif, state)
+                                {
+                                    // Record atomically with route liveness: the
+                                    // driver removes the route (under this same
+                                    // lock) before closing the drain and
+                                    // classifying, so a record can only land
+                                    // while classification has not begun. A frame
+                                    // whose route is already gone arrived after
+                                    // the turn's terminal response (the dispatch
+                                    // loop is serial and FIFO) and is dropped as
+                                    // post-terminal.
+                                    if let Ok(map) = updates.lock() {
+                                        let live = map
+                                            .get(&session_id)
+                                            .and_then(|route| route.prefix_attestation.as_ref())
+                                            .is_some_and(|current| {
+                                                Arc::ptr_eq(&current.observed, &state.observed)
+                                            });
+                                        if live {
+                                            state.record_control(status);
+                                        } else {
+                                            AcpTraceEvent::PostTerminalControlFrameDropped.emit();
+                                        }
+                                    }
+                                    return Ok(());
                                 }
                             }
 
@@ -2610,6 +3356,59 @@ impl AcpBackend {
                 .await?;
         }
 
+        let prefix_attestation_capability = match config.prefix_attestation_transport {
+            PrefixAttestationTransport::PackagedCodexAcpAttested => {
+                match tokio::time::timeout_at(
+                    deadline,
+                    cx.send_request(PrefixCapabilitiesRequest {}).block_task(),
+                )
+                .await
+                {
+                    Ok(Ok(resp))
+                        if resp.protocol_version == 1
+                            && resp.issuer_id == ATTESTED_PREFIX_ISSUER_V1 =>
+                    {
+                        PrefixAttestationCapability::codex_commit_marker_v1()
+                    }
+                    _ => PrefixAttestationCapability::unsupported(
+                        CapabilityUnavailableReason::ProtocolDowngrade,
+                    ),
+                }
+            }
+            PrefixAttestationTransport::Unsupported => PrefixAttestationCapability::unsupported(
+                CapabilityUnavailableReason::BackendDeclaredIncapable,
+            ),
+        };
+        if let PrefixAttestationCapability::Unsupported { reason } = &prefix_attestation_capability
+        {
+            let code = match reason {
+                CapabilityUnavailableReason::BackendDeclaredIncapable => {
+                    "acp.prefix_attestation.backend_declared_incapable"
+                }
+                CapabilityUnavailableReason::ProtocolDowngrade => {
+                    "acp.prefix_attestation.protocol_downgrade"
+                }
+            };
+            lifecycle
+                .record(
+                    DiagnosticPhase::Initialize,
+                    PhaseStatus::Started,
+                    None,
+                    Some("acp.prefix_attestation.capability_probe"),
+                    None,
+                )
+                .await?;
+            lifecycle
+                .record(
+                    DiagnosticPhase::Initialize,
+                    PhaseStatus::Skipped,
+                    None,
+                    Some(code),
+                    None,
+                )
+                .await?;
+        }
+
         let container_reap = container_controller.or_else(|| {
             config
                 .container
@@ -2635,6 +3434,7 @@ impl AcpBackend {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            prefix_attestation_capability,
             policy,
             permission_registry,
             perm_timeout_ms,
@@ -2656,6 +3456,17 @@ impl AcpBackend {
         advertised: &[AuthMethod],
     ) -> Option<AuthMethodId> {
         if let Some(method) = configured {
+            // `auth_method = "none"`: operator opt-out — skip client-driven
+            // `authenticate` entirely. For an agent that is ALREADY authenticated
+            // out-of-band (codex with a valid ~/.codex/auth.json), codex-acp's
+            // `chat-gpt` authenticate is redundant-but-not-idempotent: when its
+            // accountRead/refresh doesn't confirm the login it falls into an
+            // INTERACTIVE browser OAuth flow and hangs headless runs until the
+            // handshake timeout ("initialize handshake timed out"). This is the
+            // softer policy the note below anticipated.
+            if method == "none" {
+                return None;
+            }
             return Some(AuthMethodId::new(method));
         }
         if advertised.is_empty() {
@@ -3162,8 +3973,10 @@ impl AcpBackend {
                                 None,
                             )
                             .await?;
-                        let req =
-                            Self::new_session_request(PathBuf::from(&cwd_for_mint), &mcp_for_mint);
+                        let req = Self::model_aware_new_session_request(
+                            PathBuf::from(&cwd_for_mint),
+                            &mcp_for_mint,
+                        );
                         // From request installation until durable minted-cwd
                         // publication, the process may have consumed a
                         // cwd-expanded credential that a later bounded policy
@@ -3194,6 +4007,7 @@ impl AcpBackend {
                         let id = resp.session_id;
                         let opts0 = resp.config_options.unwrap_or_default();
                         let modes0 = resp.modes;
+                        let models0 = resp.models;
                         lifecycle
                             .record(
                                 DiagnosticPhase::SessionCreate,
@@ -3257,7 +4071,11 @@ impl AcpBackend {
 
                         // (3) model remains hard. (4) effort remains best-effort, but is
                         // observed as its own typed operation after model settles.
-                        let mut refreshed_surface = ConfigSurface { opts: opts0 };
+                        let mut refreshed_surface = ConfigSurface::new(opts0, models0);
+                        let fold_model_effort = refreshed_surface.supports_effort_model_ids()
+                            && model.is_some()
+                            && effort.is_some();
+                        let model_phase_effort = if fold_model_effort { effort } else { None };
                         // Always validate the advertised/current model surface. With no
                         // pin this still rejects a bridge-blocked current model, matching
                         // the pre-observation safety contract.
@@ -3276,7 +4094,7 @@ impl AcpBackend {
                             &agent_id_for_mint,
                             &refreshed_surface,
                             model.as_deref(),
-                            None,
+                            model_phase_effort,
                             ApplyPurpose::Mint,
                         )
                         .await
@@ -3312,7 +4130,7 @@ impl AcpBackend {
                                 None,
                             )
                             .await?;
-                        if effort.is_some() {
+                        if effort.is_some() && !fold_model_effort {
                             lifecycle
                                 .record(
                                     DiagnosticPhase::ConfigApply,
@@ -3368,15 +4186,15 @@ impl AcpBackend {
                         *entry.config_surface.lock().expect("config_surface lock") =
                             Some(refreshed_surface);
 
-                        let mut session_catalog = caps_from_config_options(
-                            &entry
-                                .config_surface
-                                .lock()
-                                .expect("config_surface lock")
-                                .as_ref()
-                                .expect("mint stored its config surface")
-                                .opts,
-                        );
+                        let stored_surface = entry
+                            .config_surface
+                            .lock()
+                            .expect("config_surface lock")
+                            .as_ref()
+                            .expect("mint stored its config surface")
+                            .clone();
+                        let mut session_catalog = caps_from_config_options(&stored_surface.opts);
+                        Self::merge_session_models(&mut session_catalog, stored_surface.models);
                         Self::merge_session_modes(&mut session_catalog, modes0);
                         if let Some(mode) = mode.as_ref() {
                             session_catalog.current_mode = Some(mode.clone());
@@ -3713,7 +4531,7 @@ impl AcpBackend {
             }
         };
         // session/new with NO MCP servers — discovery configures nothing.
-        let req = Self::new_session_request(cwd.to_path_buf(), &[]);
+        let req = Self::model_aware_new_session_request(cwd.to_path_buf(), &[]);
         let resp = match cx.send_request(req).block_task().await {
             Ok(resp) => resp,
             Err(error) => {
@@ -3750,6 +4568,7 @@ impl AcpBackend {
         } else {
             AgentCaps::default()
         };
+        Self::merge_session_models(&mut caps, resp.models);
         Self::merge_session_modes(&mut caps, resp.modes);
         Ok(caps)
     }
@@ -3766,6 +4585,33 @@ impl AcpBackend {
             .into_iter()
             .map(|mode| mode.id.0.to_string())
             .collect();
+    }
+
+    fn caps_from_model_state(models: &SessionModelState) -> AgentCaps {
+        let mut values = models
+            .values()
+            .into_iter()
+            .filter(|model| !is_blocked_model(model))
+            .collect::<Vec<_>>();
+        values.dedup();
+        let current =
+            (!is_blocked_model(&models.current_model_id)).then(|| models.current_model_id.clone());
+        AgentCaps {
+            current_model: current,
+            model_configurable: !values.is_empty(),
+            models: values,
+            ..AgentCaps::default()
+        }
+    }
+
+    fn merge_session_models(caps: &mut AgentCaps, models: Option<SessionModelState>) {
+        let Some(models) = models else {
+            return;
+        };
+        let model_caps = Self::caps_from_model_state(&models);
+        caps.current_model = model_caps.current_model;
+        caps.models = model_caps.models;
+        caps.model_configurable = model_caps.model_configurable;
     }
 
     /// The configured cancel grace (see [`AcpConfig::cancel_grace`]). Falls back
@@ -4057,6 +4903,207 @@ impl AcpBackend {
         }
     }
 
+    fn parse_prefix_control_notification(
+        notif: &SessionNotification,
+        state: &PrefixTurnState,
+    ) -> Option<PrefixAttestationStatus> {
+        let value = serde_json::to_value(notif).ok()?;
+        let update = value.get("update")?;
+        if update
+            .get("sessionUpdate")
+            .and_then(serde_json::Value::as_str)
+            != Some("agent_message_chunk")
+        {
+            return None;
+        }
+        let message_id = update.get("messageId").and_then(serde_json::Value::as_str);
+        let content_text = update
+            .get("content")
+            .and_then(|content| content.get("text"))
+            .and_then(serde_json::Value::as_str);
+        let meta = update.get("_meta").and_then(serde_json::Value::as_object);
+        let expected_message_id = format!("_b2a_apc_control/{}", state.turn_id);
+        let has_reserved_meta =
+            meta.is_some_and(|object| object.contains_key(ATTESTED_PREFIX_META_KEY));
+        if message_id != Some(expected_message_id.as_str()) {
+            return None;
+        }
+        if !has_reserved_meta {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            ));
+        }
+        if !state.capability.is_supported_v1() {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::BackendCapabilityMismatch,
+            ));
+        }
+        if content_text != Some("") {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            ));
+        }
+        let Some(meta) = meta else {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            ));
+        };
+        if meta.len() != 1 || !meta.contains_key(ATTESTED_PREFIX_META_KEY) {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            ));
+        }
+        let Some(obj) = meta
+            .get(ATTESTED_PREFIX_META_KEY)
+            .and_then(serde_json::Value::as_object)
+        else {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            ));
+        };
+        let Some(kind) = obj.get("kind").and_then(serde_json::Value::as_str) else {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            ));
+        };
+        let expected_fields = match kind {
+            "attested" => 8,
+            "unavailable" => 6,
+            _ => {
+                return Some(PrefixAttestationStatus::rejected(
+                    state.producer_id.clone(),
+                    state.turn_id.clone(),
+                    InvalidAttestationReason::MalformedMetadata,
+                ));
+            }
+        };
+        if obj.len() != expected_fields {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            ));
+        }
+        if obj
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::UnsupportedVersion,
+            ));
+        }
+        if obj.get("issuer_id").and_then(serde_json::Value::as_str)
+            != Some(ATTESTED_PREFIX_ISSUER_V1)
+        {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::UntrustedIssuer,
+            ));
+        }
+        if obj.get("turn_id").and_then(serde_json::Value::as_str) != Some(state.turn_id.as_str()) {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::TurnMismatch,
+            ));
+        }
+        if obj.get("marker_nonce").and_then(serde_json::Value::as_str)
+            != Some(state.marker_nonce_hex.as_str())
+        {
+            return Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::NonceMismatch,
+            ));
+        }
+        match kind {
+            "attested" => {
+                let Some(process_prefix_bytes) = obj
+                    .get("process_prefix_bytes")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(parse_canonical_u64)
+                else {
+                    return Some(PrefixAttestationStatus::rejected(
+                        state.producer_id.clone(),
+                        state.turn_id.clone(),
+                        InvalidAttestationReason::MalformedMetadata,
+                    ));
+                };
+                let Some(body_len_bytes) = obj
+                    .get("body_len_bytes")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(parse_canonical_u64)
+                else {
+                    return Some(PrefixAttestationStatus::rejected(
+                        state.producer_id.clone(),
+                        state.turn_id.clone(),
+                        InvalidAttestationReason::MalformedMetadata,
+                    ));
+                };
+                let Some(body_sha256) = obj
+                    .get("body_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(parse_sha256_hex)
+                else {
+                    return Some(PrefixAttestationStatus::rejected(
+                        state.producer_id.clone(),
+                        state.turn_id.clone(),
+                        InvalidAttestationReason::MalformedMetadata,
+                    ));
+                };
+                Some(PrefixAttestationStatus::AttestedV1(AttestedPrefixV1 {
+                    issuer_id: ATTESTED_PREFIX_ISSUER_V1.to_string(),
+                    producer_id: state.producer_id.clone(),
+                    turn_id: state.turn_id.clone(),
+                    body_len_bytes,
+                    body_sha256,
+                    process_prefix_bytes,
+                }))
+            }
+            "unavailable" => {
+                let Some(reason) = obj
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(no_attestation_reason_from_wire)
+                else {
+                    return Some(PrefixAttestationStatus::rejected(
+                        state.producer_id.clone(),
+                        state.turn_id.clone(),
+                        InvalidAttestationReason::MalformedMetadata,
+                    ));
+                };
+                Some(PrefixAttestationStatus::unavailable(
+                    state.producer_id.clone(),
+                    state.turn_id.clone(),
+                    reason,
+                ))
+            }
+            _ => Some(PrefixAttestationStatus::rejected(
+                state.producer_id.clone(),
+                state.turn_id.clone(),
+                InvalidAttestationReason::MalformedMetadata,
+            )),
+        }
+    }
+
     #[must_use]
     pub fn map_session_update(notif: SessionNotification) -> Option<Update> {
         match notif.update {
@@ -4105,7 +5152,7 @@ impl AcpBackend {
 
     /// Map an ACP `StopReason` to the bridge's `Update::Done` stop_reason string.
     /// We use the ACP wire spelling (snake_case) so it matches the protocol and
-    /// the existing `Update::Done { stop_reason: String }` convention (e.g.
+    /// the existing `Update::Done` stop-reason string convention (e.g.
     /// `end_turn`, `max_tokens`, `cancelled`). The enum is `#[non_exhaustive]`,
     /// so an unknown future variant maps to `"unknown"` rather than failing.
     fn stop_reason_str(stop: StopReason) -> String {
@@ -4164,7 +5211,7 @@ impl AcpBackend {
     /// 4. On the response, the driver unregisters the `Sender` and pushes a
     ///    terminal event, then releases the turn lock (by dropping the guard it
     ///    owns). A completed turn (incl. a real `StopReason::Cancelled`) pushes
-    ///    `TurnEvent::Done` → stream yields `Ok(Update::Done{stop_reason})`. A
+    ///    `TurnEvent::Done` → stream yields `Ok(Update::Done{stop_reason, ..})`. A
     ///    `session/prompt` `Err` (agent crash / transport failure) pushes
     ///    `TurnEvent::Failed` → stream yields a terminal `Err` so downstream
     ///    reports the A2A caller `Failed` (NOT a silent `Done{"unknown"}` that
@@ -4205,6 +5252,18 @@ impl AcpBackend {
         let stderr_cursor: Option<ProcessStderrCursor> =
             self.stderr_ring.as_ref().map(ProcessStderrRing::cursor);
         let turn_meta = self.take_pending_turn_meta(session);
+        let producer_id = self
+            .config
+            .as_ref()
+            .map(|config| config.agent_id.clone())
+            .unwrap_or_default();
+        let prefix_meta = turn_meta.as_ref().map(|meta| {
+            prefix_turn_state_for_meta(meta, &producer_id, &self.prefix_attestation_capability)
+        });
+        let prefix_requested = prefix_meta
+            .as_ref()
+            .is_some_and(|(requested, _)| *requested);
+        let prefix_state = prefix_meta.map(|(_, state)| state);
 
         // (1) Mint/get the agent session id. Done OUTSIDE the turn lock so a
         // first-prompt's `session/new` doesn't hold the lock while awaiting.
@@ -4257,6 +5316,40 @@ impl AcpBackend {
                     .await)
             }
         };
+        if let Some(meta) = &turn_meta {
+            if let PrefixAttestationRequest::CodexCommitMarkerV1 { marker_nonce } =
+                &meta.prefix_attestation_request
+            {
+                if !self.prefix_attestation_capability.is_supported_v1() {
+                    // No private method is sent to an incapable backend; with the mode
+                    // enabled the terminal status audits the backend's real incapability
+                    // reason (backend_declared_incapable / protocol_downgrade).
+                } else {
+                    let nonce = nonce_hex(marker_nonce);
+                    let req = PrefixBeginTurnRequest {
+                        schema_version: 1,
+                        session_id: agent_id.0.to_string(),
+                        turn_id: meta.turn_id.as_str().to_string(),
+                        enabled: true,
+                        marker_nonce: nonce,
+                    };
+                    let resp = cx.send_request(req).block_task().await.map_err(|error| {
+                        BridgeError::agent_crashed(format!(
+                            "attested-prefix beginTurn request failed: {error}"
+                        ))
+                    })?;
+                    if resp.schema_version != 1
+                        || !resp.accepted
+                        || resp.turn_id != meta.turn_id.as_str()
+                    {
+                        return Err(BridgeError::agent_crashed(
+                            "attested-prefix beginTurn acknowledgement mismatch",
+                        ));
+                    }
+                }
+            }
+        }
+
         let watch = if self
             .config
             .as_ref()
@@ -4303,6 +5396,7 @@ impl AcpBackend {
                     turn_meta,
                     cancelled: Arc::new(AtomicBool::new(false)),
                     active: Arc::clone(&turn_active),
+                    prefix_attestation: prefix_state.clone(),
                 },
             );
         }
@@ -4569,6 +5663,17 @@ impl AcpBackend {
             if let Ok(mut map) = registry_for_driver.lock() {
                 map.remove(&agent_id_for_driver);
             }
+            // Route removal is the control-frame drain barrier: `record_control`
+            // runs only under the registry lock while the route is live, and the
+            // dispatch loop is serial+FIFO, so every §4.4-conforming control
+            // frame (on the wire before the prompt response) was recorded before
+            // the response could resolve `prompt_fut`. Closing here makes the
+            // terminal classification below causal — a missing-control
+            // BackendProtocolViolation is claimed only once no valid in-flight
+            // frame can still arrive.
+            if let Some(state) = prefix_state.as_ref() {
+                state.close_control();
+            }
             drop(watchdog_done_tx);
             // Clear the kill switch slot now the turn is ending (next turn installs
             // its own); avoids a stale notify firing across turns.
@@ -4618,7 +5723,22 @@ impl AcpBackend {
                             )
                             .await
                         {
-                            Ok(()) => TurnEvent::Done(Update::Done { stop_reason }),
+                            Ok(()) => {
+                                let prefix_attestation = match prefix_state.as_ref() {
+                                    Some(state) => {
+                                        state
+                                            .terminal_status_after_control_quiescence(
+                                                prefix_requested,
+                                            )
+                                            .await
+                                    }
+                                    None => PrefixAttestationStatus::default(),
+                                };
+                                TurnEvent::Done(Update::done_with_attestation(
+                                    stop_reason,
+                                    prefix_attestation,
+                                ))
+                            }
                             Err(error) => TurnEvent::Failed(error),
                         }
                     }
@@ -4782,6 +5902,10 @@ impl AgentBackend for AcpBackend {
     ) -> Result<BackendStream, BridgeError> {
         self.prompt_inner(session, parts, observers.rich, observers.diagnostic)
             .await
+    }
+
+    fn prefix_attestation_capability(&self) -> PrefixAttestationCapability {
+        self.prefix_attestation_capability.clone()
     }
 
     async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
@@ -4998,6 +6122,7 @@ impl AgentBackend for AcpBackend {
         {
             Ok((refreshed, _)) => {
                 let mut catalog = caps_from_config_options(&refreshed.opts);
+                Self::merge_session_models(&mut catalog, refreshed.models.clone());
                 let mut catalogs = self
                     .session_catalogs
                     .lock()
@@ -5139,6 +6264,7 @@ impl Drop for AcpBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bridge_core::attestation::{NoAttestationV1, RejectedAttestation};
     use bridge_core::diagnostics::{
         DiagnosticFailureClass, DiagnosticPhase, FailureDisposition, InMemoryDiagnosticObserver,
         PhaseStatus,
@@ -5529,6 +6655,9 @@ mod tests {
                     advertised_count: AcpTraceEvent::bounded_count(known_secret.len()),
                 },
                 AcpTraceEvent::EffortOptionMissing,
+                AcpTraceEvent::MintEffortDropped {
+                    advertised_count: AcpTraceEvent::bounded_count(known_secret.len()),
+                },
                 AcpTraceEvent::ConfigResolved {
                     effort_applied: true,
                     fell_back: false,
@@ -5928,6 +7057,568 @@ mod tests {
             }
             other => panic!("expected Update::Usage, got {other:?}"),
         }
+    }
+
+    const TEST_PREFIX_NONCE: &str = "00112233445566778899aabbccddeeff";
+    const TEST_PREFIX_TURN: &str = "turn_00112233445566778899aabbccddeeff";
+
+    fn prefix_state() -> PrefixTurnState {
+        PrefixTurnState::new(
+            "producer".to_string(),
+            TEST_PREFIX_TURN.to_string(),
+            TEST_PREFIX_NONCE.to_string(),
+            PrefixAttestationCapability::codex_commit_marker_v1(),
+        )
+    }
+
+    fn prefix_meta(inner: serde_json::Value) -> serde_json::Value {
+        let mut meta = serde_json::Map::new();
+        meta.insert(ATTESTED_PREFIX_META_KEY.to_string(), inner);
+        serde_json::Value::Object(meta)
+    }
+
+    fn attested_prefix_meta() -> serde_json::Value {
+        prefix_meta(serde_json::json!({
+            "schema_version": 1,
+            "kind": "attested",
+            "issuer_id": ATTESTED_PREFIX_ISSUER_V1,
+            "turn_id": TEST_PREFIX_TURN,
+            "marker_nonce": TEST_PREFIX_NONCE,
+            "process_prefix_bytes": "3",
+            "body_len_bytes": "4",
+            "body_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        }))
+    }
+
+    fn unavailable_prefix_meta(reason: &str) -> serde_json::Value {
+        prefix_meta(serde_json::json!({
+            "schema_version": 1,
+            "kind": "unavailable",
+            "issuer_id": ATTESTED_PREFIX_ISSUER_V1,
+            "turn_id": TEST_PREFIX_TURN,
+            "marker_nonce": TEST_PREFIX_NONCE,
+            "reason": reason,
+        }))
+    }
+
+    fn prefix_notification(update: serde_json::Value) -> SessionNotification {
+        serde_json::from_value(serde_json::json!({
+            "sessionId": "agent-session",
+            "update": update,
+        }))
+        .expect("prefix control notification deserializes through the ACP SDK")
+    }
+
+    fn prefix_control_notification(meta: serde_json::Value) -> SessionNotification {
+        prefix_notification(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": format!("_b2a_apc_control/{TEST_PREFIX_TURN}"),
+            "content": {"type": "text", "text": ""},
+            "_meta": meta,
+        }))
+    }
+
+    #[test]
+    fn prefix_control_parser_accepts_valid_attested_metadata() {
+        let state = prefix_state();
+        let status = AcpBackend::parse_prefix_control_notification(
+            &prefix_control_notification(attested_prefix_meta()),
+            &state,
+        )
+        .expect("control status");
+        match status {
+            PrefixAttestationStatus::AttestedV1(attested) => {
+                assert_eq!(attested.issuer_id, ATTESTED_PREFIX_ISSUER_V1);
+                assert_eq!(attested.producer_id, "producer");
+                assert_eq!(attested.turn_id, TEST_PREFIX_TURN);
+                assert_eq!(attested.process_prefix_bytes, 3);
+                assert_eq!(attested.body_len_bytes, 4);
+                assert_eq!(attested.body_sha256, [0_u8; 32]);
+            }
+            other => panic!("expected AttestedV1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefix_control_parser_accepts_valid_unavailable_metadata() {
+        let state = prefix_state();
+        let status = AcpBackend::parse_prefix_control_notification(
+            &prefix_control_notification(unavailable_prefix_meta("multiple_commit_markers")),
+            &state,
+        )
+        .expect("control status");
+        match status {
+            PrefixAttestationStatus::UnavailableV1(no_attestation) => {
+                assert_eq!(no_attestation.producer_id, "producer");
+                assert_eq!(no_attestation.turn_id, TEST_PREFIX_TURN);
+                assert_eq!(
+                    no_attestation.reason,
+                    NoAttestationReason::MultipleCommitMarkers
+                );
+            }
+            other => panic!("expected UnavailableV1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefix_control_parser_ignores_reserved_meta_without_control_message_id() {
+        let state = prefix_state();
+        let notif = prefix_notification(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "ordinary-message",
+            "content": {"type": "text", "text": ""},
+            "_meta": unavailable_prefix_meta("multiple_commit_markers"),
+        }));
+        assert!(AcpBackend::parse_prefix_control_notification(&notif, &state).is_none());
+    }
+
+    #[test]
+    fn prefix_control_parser_rejects_bridge_internal_unavailable_reason() {
+        let state = prefix_state();
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(
+                &prefix_control_notification(unavailable_prefix_meta(
+                    "bridge_synthetic_cancellation",
+                )),
+                &state,
+            ),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::MalformedMetadata,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn prefix_control_parser_rejects_wrong_turn_nonce_version_and_meta_shape() {
+        let state = prefix_state();
+
+        let wrong_turn = prefix_meta(serde_json::json!({
+            "schema_version": 1,
+            "kind": "attested",
+            "issuer_id": ATTESTED_PREFIX_ISSUER_V1,
+            "turn_id": "turn_ffffffffffffffffffffffffffffffff",
+            "marker_nonce": TEST_PREFIX_NONCE,
+            "process_prefix_bytes": "3",
+            "body_len_bytes": "4",
+            "body_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        }));
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(
+                &prefix_control_notification(wrong_turn),
+                &state,
+            ),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::TurnMismatch,
+                ..
+            }))
+        ));
+
+        let wrong_nonce = prefix_meta(serde_json::json!({
+            "schema_version": 1,
+            "kind": "attested",
+            "issuer_id": ATTESTED_PREFIX_ISSUER_V1,
+            "turn_id": TEST_PREFIX_TURN,
+            "marker_nonce": "ffffffffffffffffffffffffffffffff",
+            "process_prefix_bytes": "3",
+            "body_len_bytes": "4",
+            "body_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        }));
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(
+                &prefix_control_notification(wrong_nonce),
+                &state,
+            ),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::NonceMismatch,
+                ..
+            }))
+        ));
+
+        let wrong_version = prefix_meta(serde_json::json!({
+            "schema_version": 2,
+            "kind": "unavailable",
+            "issuer_id": ATTESTED_PREFIX_ISSUER_V1,
+            "turn_id": TEST_PREFIX_TURN,
+            "marker_nonce": TEST_PREFIX_NONCE,
+            "reason": "multiple_commit_markers",
+        }));
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(
+                &prefix_control_notification(wrong_version),
+                &state,
+            ),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::UnsupportedVersion,
+                ..
+            }))
+        ));
+
+        let missing_meta = prefix_notification(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": format!("_b2a_apc_control/{TEST_PREFIX_TURN}"),
+            "content": {"type": "text", "text": ""},
+        }));
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(&missing_meta, &state),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::MalformedMetadata,
+                ..
+            }))
+        ));
+
+        let mut extra_meta = attested_prefix_meta();
+        extra_meta
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".to_string(), serde_json::json!(true));
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(
+                &prefix_control_notification(extra_meta),
+                &state,
+            ),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::MalformedMetadata,
+                ..
+            }))
+        ));
+
+        let mut extra_inner = attested_prefix_meta();
+        extra_inner
+            .as_object_mut()
+            .unwrap()
+            .get_mut(ATTESTED_PREFIX_META_KEY)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("extra_inner".to_string(), serde_json::json!(true));
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(
+                &prefix_control_notification(extra_inner),
+                &state,
+            ),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::MalformedMetadata,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn prefix_control_parser_rejects_control_when_capability_downgraded() {
+        let state = PrefixTurnState::new(
+            "producer".to_string(),
+            TEST_PREFIX_TURN.to_string(),
+            TEST_PREFIX_NONCE.to_string(),
+            PrefixAttestationCapability::unsupported(
+                CapabilityUnavailableReason::ProtocolDowngrade,
+            ),
+        );
+        assert!(matches!(
+            AcpBackend::parse_prefix_control_notification(
+                &prefix_control_notification(attested_prefix_meta()),
+                &state,
+            ),
+            Some(PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::BackendCapabilityMismatch,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn prefix_terminal_status_distinguishes_incapable_downgrade_and_supported_missing_control() {
+        let incapable = PrefixTurnState::new(
+            "producer".to_string(),
+            TEST_PREFIX_TURN.to_string(),
+            TEST_PREFIX_NONCE.to_string(),
+            PrefixAttestationCapability::unsupported(
+                CapabilityUnavailableReason::BackendDeclaredIncapable,
+            ),
+        );
+        assert!(matches!(
+            incapable.terminal_status(true),
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::BackendDeclaredIncapable,
+                ..
+            })
+        ));
+
+        let downgraded = PrefixTurnState::new(
+            "producer".to_string(),
+            TEST_PREFIX_TURN.to_string(),
+            TEST_PREFIX_NONCE.to_string(),
+            PrefixAttestationCapability::unsupported(
+                CapabilityUnavailableReason::ProtocolDowngrade,
+            ),
+        );
+        assert!(matches!(
+            downgraded.terminal_status(true),
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::ProtocolDowngrade,
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            prefix_state().terminal_status(true),
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::BackendProtocolViolation,
+                ..
+            })
+        ));
+        assert!(matches!(
+            prefix_state().terminal_status(false),
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::SanitizationNotRequested,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn prefix_control_parser_records_duplicate_control_as_rejected() {
+        let state = prefix_state();
+        let first = AcpBackend::parse_prefix_control_notification(
+            &prefix_control_notification(attested_prefix_meta()),
+            &state,
+        )
+        .expect("first control");
+        let second = AcpBackend::parse_prefix_control_notification(
+            &prefix_control_notification(unavailable_prefix_meta("multiple_commit_markers")),
+            &state,
+        )
+        .expect("second control");
+        state.record_control(first);
+        state.record_control(second);
+        assert!(matches!(
+            state.terminal_status(true),
+            PrefixAttestationStatus::Rejected(RejectedAttestation {
+                reason: InvalidAttestationReason::DuplicateControlMetadata,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn prefix_terminal_status_waits_for_racing_control_notification() {
+        let state = prefix_state();
+        let control = AcpBackend::parse_prefix_control_notification(
+            &prefix_control_notification(attested_prefix_meta()),
+            &state,
+        )
+        .expect("control");
+        let recorder = state.clone();
+        let handle = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            recorder.record_control(control);
+        });
+
+        let terminal = state.terminal_status_after_control_quiescence(true).await;
+        handle.await.unwrap();
+        assert!(matches!(terminal, PrefixAttestationStatus::AttestedV1(_)));
+    }
+
+    /// Commit `status` for one enabled-mode completion into a retaining
+    /// memory store and return the durable bundle (what the audit row keeps).
+    async fn commit_prefix_terminal_status(
+        status: PrefixAttestationStatus,
+    ) -> bridge_core::harvest::HarvestAuditBundleV1 {
+        use bridge_core::attestation::HarvestSanitizationMode;
+        use bridge_core::harvest::{commit_harvested_completion, CompletionBodyOrigin};
+        use bridge_core::task_store::{MemoryTaskStore, TaskStoreHarvestAuditStore};
+
+        let store = TaskStoreHarvestAuditStore::new(Arc::new(MemoryTaskStore::default()));
+        let context = bridge_core::ports::TurnContext {
+            turn_id: bridge_core::ids::TurnId::parse(TEST_PREFIX_TURN).unwrap(),
+            session_id: bridge_core::ids::ContextId::parse("prefix-audit-ctx").unwrap(),
+            task_id: None,
+            workflow: None,
+            node: None,
+            attempt: 0,
+            agent: "codex".to_string(),
+            model: None,
+            effort: None,
+            mode: None,
+            prompt_id: None,
+            traceparent: None,
+        };
+        let committed = commit_harvested_completion(
+            &context,
+            HarvestSanitizationMode::AttestedPrefixV1,
+            &PrefixAttestationCapability::codex_commit_marker_v1(),
+            "producer",
+            CompletionBodyOrigin::ModelText,
+            "whole body".to_string(),
+            status,
+            &store,
+        )
+        .await
+        .expect("terminal status commits");
+        bridge_core::harvest::HarvestAuditStore::get_by_audit_id(&store, &committed.audit_id)
+            .await
+            .expect("bundle lookup")
+            .expect("bundle exists")
+    }
+
+    /// MAJOR-1 regression: classification is causally dependent on the
+    /// control-frame drain, not on a wall clock. A valid frame recorded well
+    /// after the old 10 ms window (here 30 ms) must still win because the
+    /// drain has not been closed. The pre-fix code returned
+    /// `BackendProtocolViolation` at 10 ms and lost the frame.
+    #[tokio::test(start_paused = true)]
+    async fn prefix_terminal_classification_waits_for_drain_not_wall_clock() {
+        let state = prefix_state();
+        let control = AcpBackend::parse_prefix_control_notification(
+            &prefix_control_notification(attested_prefix_meta()),
+            &state,
+        )
+        .expect("control");
+        let recorder = state.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            recorder.record_control(control);
+        });
+
+        let terminal = state.terminal_status_after_control_quiescence(true).await;
+        handle.await.unwrap();
+        assert!(matches!(terminal, PrefixAttestationStatus::AttestedV1(_)));
+    }
+
+    /// With the drain closed (route removed, no further record possible) and
+    /// no control frame observed, the missing-control classification is a
+    /// legitimate `backend_protocol_violation` — and that is exactly what the
+    /// committed audit bundle records.
+    #[tokio::test]
+    async fn prefix_closed_drain_missing_control_commits_protocol_violation_reason() {
+        let state = prefix_state();
+        state.close_control();
+        let terminal = state.terminal_status_after_control_quiescence(true).await;
+        assert!(matches!(
+            &terminal,
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::BackendProtocolViolation,
+                ..
+            })
+        ));
+
+        let bundle = commit_prefix_terminal_status(terminal).await;
+        assert_eq!(
+            bundle.decision.decision,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation
+        );
+        assert_eq!(
+            bundle.decision.reason.as_deref(),
+            Some("backend_protocol_violation")
+        );
+    }
+
+    /// MAJOR-4 regression: the terminal-audit `requested` flag follows the
+    /// node's ORIGINAL mode, not the collapsed transport request, and the
+    /// per-turn state carries the backend's resolved capability — so the
+    /// audit record distinguishes Off (`sanitization_not_requested`) from
+    /// enabled-but-incapable (`backend_declared_incapable`, and
+    /// `protocol_downgrade` for a failed wrapper handshake).
+    #[tokio::test]
+    async fn enabled_mode_on_incapable_backend_audits_incapability_not_unrequested() {
+        let meta = |mode| bridge_core::permission::TurnMeta {
+            context_id: bridge_core::ids::ContextId::parse("ctx-major4").unwrap(),
+            generation: 1,
+            op: bridge_core::ids::OperationId::parse("op-major4").unwrap(),
+            turn_id: bridge_core::ids::TurnId::parse(TEST_PREFIX_TURN).unwrap(),
+            requested_mode: mode,
+            // Both modes collapse to a Disabled transport request on an
+            // incapable backend — the pre-fix code could not tell them apart.
+            prefix_attestation_request: PrefixAttestationRequest::Disabled,
+        };
+        let incapable = PrefixAttestationCapability::unsupported(
+            CapabilityUnavailableReason::BackendDeclaredIncapable,
+        );
+
+        let (requested, state) = prefix_turn_state_for_meta(
+            &meta(HarvestSanitizationMode::AttestedPrefixV1),
+            "producer",
+            &incapable,
+        );
+        assert!(requested, "enabled mode must stay requested for the audit");
+        state.close_control();
+        let enabled_incapable = state
+            .terminal_status_after_control_quiescence(requested)
+            .await;
+        assert!(matches!(
+            &enabled_incapable,
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::BackendDeclaredIncapable,
+                ..
+            })
+        ));
+        let bundle = commit_prefix_terminal_status(enabled_incapable).await;
+        assert_eq!(
+            bundle.decision.reason.as_deref(),
+            Some("backend_declared_incapable"),
+            "enabled-but-incapable must audit its distinct reason code"
+        );
+
+        let (requested, state) =
+            prefix_turn_state_for_meta(&meta(HarvestSanitizationMode::Off), "producer", &incapable);
+        assert!(!requested, "off mode is not a sanitization request");
+        state.close_control();
+        assert!(matches!(
+            state
+                .terminal_status_after_control_quiescence(requested)
+                .await,
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::SanitizationNotRequested,
+                ..
+            })
+        ));
+
+        let downgraded = PrefixAttestationCapability::unsupported(
+            CapabilityUnavailableReason::ProtocolDowngrade,
+        );
+        let (requested, state) = prefix_turn_state_for_meta(
+            &meta(HarvestSanitizationMode::AttestedPrefixV1),
+            "producer",
+            &downgraded,
+        );
+        state.close_control();
+        assert!(matches!(
+            state
+                .terminal_status_after_control_quiescence(requested)
+                .await,
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::ProtocolDowngrade,
+                ..
+            })
+        ));
+    }
+
+    /// Review-mandated timeout-expired-path test: when a mis-sequenced caller
+    /// demands the terminal status while the drain is still open and the
+    /// operational backstop elapses, the audit must NOT claim a backend
+    /// protocol violation (a valid in-flight frame could still arrive); the
+    /// committed bundle records the operational `control_drain_timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn prefix_undrained_backstop_expiry_commits_operational_timeout_reason() {
+        let state = prefix_state();
+        let terminal = state.terminal_status_after_control_quiescence(true).await;
+        assert!(matches!(
+            &terminal,
+            PrefixAttestationStatus::UnavailableV1(NoAttestationV1 {
+                reason: NoAttestationReason::ControlDrainTimeout,
+                ..
+            })
+        ));
+
+        let bundle = commit_prefix_terminal_status(terminal).await;
+        assert_eq!(
+            bundle.decision.decision,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation
+        );
+        assert_eq!(
+            bundle.decision.reason.as_deref(),
+            Some("control_drain_timeout")
+        );
     }
 
     #[test]
@@ -6895,6 +8586,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_records_backend_declared_incapable_prefix_diagnostic() {
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_fake_agent(
+            agent_side,
+            InitializeResponse::new(ProtocolVersion::V1)
+                .agent_capabilities(AgentCapabilities::default()),
+        );
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+        let be = AcpBackend::connect_observed(client_side, test_config(), observer.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            be.prefix_attestation_capability(),
+            PrefixAttestationCapability::unsupported(
+                CapabilityUnavailableReason::BackendDeclaredIncapable
+            )
+        );
+        let events = observer.snapshot().await;
+        assert!(
+            events.iter().any(|event| {
+                event.transition().phase() == DiagnosticPhase::Initialize
+                    && event.transition().status() == PhaseStatus::Skipped
+                    && event.transition().code().map(|code| code.as_str())
+                        == Some("acp.prefix_attestation.backend_declared_incapable")
+            }),
+            "connect must record the incapable prefix diagnostic, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_capability_handshake_missing_private_response_downgrades() {
+        let (client_side, agent_side) = Channel::duplex();
+        spawn_fake_agent(
+            agent_side,
+            InitializeResponse::new(ProtocolVersion::V1)
+                .agent_capabilities(AgentCapabilities::default()),
+        );
+        let mut config = test_config();
+        config.prefix_attestation_transport = PrefixAttestationTransport::PackagedCodexAcpAttested;
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+        let be = AcpBackend::connect_observed(client_side, config, observer.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            be.prefix_attestation_capability(),
+            PrefixAttestationCapability::unsupported(
+                CapabilityUnavailableReason::ProtocolDowngrade
+            )
+        );
+        let events = observer.snapshot().await;
+        assert!(
+            events.iter().any(|event| {
+                event.transition().phase() == DiagnosticPhase::Initialize
+                    && event.transition().status() == PhaseStatus::Skipped
+                    && event.transition().code().map(|code| code.as_str())
+                        == Some("acp.prefix_attestation.protocol_downgrade")
+            }),
+            "connect must record the protocol downgrade prefix diagnostic, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn capabilities_maps_agent_session_capabilities() {
         let (client_side, agent_side) = Channel::duplex();
         let agent_caps = AgentCapabilities::new()
@@ -7227,6 +8980,7 @@ mod tests {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            prefix_attestation_capability: PrefixAttestationCapability::default(),
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),
@@ -7428,6 +9182,12 @@ mod tests {
         /// When set, the `session/set_mode` handler REJECTS the request with a
         /// JSON-RPC error (modeling an agent that does not know the mode id).
         reject_set_mode: Arc<AtomicBool>,
+        /// Model ids observed via `session/set_model` requests (in order).
+        set_models: Arc<Mutex<Vec<String>>>,
+        /// Fires every time a `session/set_model` is recorded.
+        set_model_seen: Arc<Notify>,
+        /// When set, the `session/set_model` handler REJECTS the request.
+        reject_set_model: Arc<AtomicBool>,
         /// Auth-method ids observed via `authenticate` requests (in order).
         authenticates: Arc<Mutex<Vec<String>>>,
         /// When set, the `authenticate` handler REJECTS with a JSON-RPC error
@@ -7437,6 +9197,8 @@ mod tests {
         auth_methods: Arc<Mutex<Vec<AuthMethod>>>,
         /// Optional SDK session mode state advertised from `session/new`.
         session_modes: Arc<Mutex<Option<SessionModeState>>>,
+        /// Optional ACP `models` state advertised from `session/new`.
+        session_models: Arc<Mutex<Option<SessionModelState>>>,
 
         // ── Increment 3b: session/set_config_option (effort) ──────────────────
         /// `(config_id, value_id)` pairs observed via `session/set_config_option`.
@@ -7506,10 +9268,14 @@ mod tests {
                 set_modes: Arc::new(Mutex::new(Vec::new())),
                 set_mode_seen: Arc::new(Notify::new()),
                 reject_set_mode: Arc::new(AtomicBool::new(false)),
+                set_models: Arc::new(Mutex::new(Vec::new())),
+                set_model_seen: Arc::new(Notify::new()),
+                reject_set_model: Arc::new(AtomicBool::new(false)),
                 authenticates: Arc::new(Mutex::new(Vec::new())),
                 reject_authenticate: Arc::new(AtomicBool::new(false)),
                 auth_methods: Arc::new(Mutex::new(Vec::new())),
                 session_modes: Arc::new(Mutex::new(None)),
+                session_models: Arc::new(Mutex::new(None)),
                 set_config_options: Arc::new(Mutex::new(Vec::new())),
                 set_config_seen: Arc::new(Notify::new()),
                 reject_set_config: Arc::new(AtomicBool::new(false)),
@@ -7583,6 +9349,20 @@ mod tests {
             }
 
             options
+        }
+
+        async fn advertise_session_models(&self, current: &str, values: &[&str]) {
+            *self.session_models.lock().await = Some(SessionModelState::new(
+                current,
+                values.iter().map(|value| (*value).to_string()).collect(),
+            ));
+        }
+
+        async fn refresh_session_model_current(&self, model_id: &str) {
+            let mut guard = self.session_models.lock().await;
+            if let Some(models) = guard.clone() {
+                *guard = Some(models.with_current(model_id.to_string()));
+            }
         }
 
         async fn refresh_config_current(&self, config_id: &str, value_id: &str) {
@@ -7950,6 +9730,7 @@ mod tests {
             let r_auth = rec.clone();
             let r_new = rec.clone();
             let r_mode = rec.clone();
+            let r_model = rec.clone();
             let r_config = rec.clone();
             let r_prompt = rec.clone();
             let r_cancel = rec.clone();
@@ -8012,6 +9793,25 @@ mod tests {
                     agent_client_protocol::on_receive_request!(),
                 )
                 .on_receive_request(
+                    move |req: SetSessionModelRequest,
+                          responder: agent_client_protocol::Responder<SetSessionModelResponse>,
+                          _cx| {
+                        let r = r_model.clone();
+                        async move {
+                            r.set_models.lock().await.push(req.model_id.clone());
+                            r.set_model_seen.notify_one();
+                            if r.reject_set_model.load(Ordering::SeqCst) {
+                                responder.respond_with_internal_error("unknown model id")?;
+                            } else {
+                                r.refresh_session_model_current(&req.model_id).await;
+                                responder.respond(SetSessionModelResponse::new())?;
+                            }
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
                     move |req: SetSessionConfigOptionRequest,
                           responder: agent_client_protocol::Responder<
                         SetSessionConfigOptionResponse,
@@ -8050,8 +9850,8 @@ mod tests {
                     agent_client_protocol::on_receive_request!(),
                 )
                 .on_receive_request(
-                    move |req: NewSessionRequest,
-                          responder: agent_client_protocol::Responder<NewSessionResponse>,
+                    move |req: ModelAwareNewSessionRequest,
+                          responder: agent_client_protocol::Responder<ModelAwareNewSessionResponse>,
                           _cx| {
                         let r = r_new.clone();
                         async move {
@@ -8059,7 +9859,7 @@ mod tests {
                                 r.new_session_calls.fetch_add(1, Ordering::SeqCst) + 1;
                             // Record the cwd the client sent so Task-4 tests can
                             // assert the correct cwd reached the wire.
-                            *r.new_session_cwd.lock().await = Some(req.cwd);
+                            *r.new_session_cwd.lock().await = Some(req.0.cwd);
                             // Signal entry BEFORE awaiting the gate so a driver can
                             // deterministically know the mint is in flight (no sleep).
                             r.new_session_started.notify_one();
@@ -8069,14 +9869,16 @@ mod tests {
                                 r.new_session_gate.notified().await;
                             }
                             let modes = r.session_modes.lock().await.clone();
+                            let models = r.session_models.lock().await.clone();
                             let minted_id = if r.unique_minted_ids.load(Ordering::SeqCst) {
                                 format!("{}-{mint_sequence}", r.minted_id)
                             } else {
                                 r.minted_id.to_string()
                             };
                             responder.respond(
-                                NewSessionResponse::new(AgentSessionId::new(minted_id))
+                                ModelAwareNewSessionResponse::new(AgentSessionId::new(minted_id))
                                     .modes(modes)
+                                    .models(models)
                                     .config_options(r.advertised_config_options().await),
                             )?;
                             Ok(())
@@ -8360,6 +10162,10 @@ mod tests {
             context_id: bridge_core::ids::ContextId::parse(ctx).unwrap(),
             generation,
             op: bridge_core::ids::OperationId::parse(op).unwrap(),
+            turn_id: bridge_core::ids::TurnId::parse(format!("turn_{generation:032x}")).unwrap(),
+            requested_mode: HarvestSanitizationMode::Off,
+            prefix_attestation_request:
+                bridge_core::attestation::PrefixAttestationRequest::Disabled,
         }
     }
 
@@ -9517,7 +11323,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             stream.next().await,
-            Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn"
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn"
         ));
         assert!(stream.next().await.is_none());
 
@@ -9605,6 +11411,7 @@ mod tests {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            prefix_attestation_capability: PrefixAttestationCapability::default(),
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),
@@ -9727,7 +11534,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), stream.next())
                 .await
                 .expect("completion observer release must finish the stream"),
-            Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn"
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn"
         ));
     }
 
@@ -9790,7 +11597,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), stream.next())
                 .await
                 .expect("completion observer release must finish the stream"),
-            Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn"
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn"
         ));
         tokio::task::yield_now().await;
         assert!(
@@ -9848,7 +11655,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), stream.next())
                 .await
                 .expect("completion persistence release must finish the stream"),
-            Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn"
+            Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn"
         ));
     }
 
@@ -10033,7 +11840,7 @@ mod tests {
 
         rec.prompt_gate.notify_one();
         assert!(
-            matches!(stream.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+            matches!(stream.next().await, Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn")
         );
     }
 
@@ -10540,7 +12347,7 @@ mod tests {
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "hello "));
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "world"));
         assert!(
-            matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+            matches!(s.next().await, Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn")
         );
         assert!(s.next().await.is_none(), "stream terminates after Done");
     }
@@ -10567,7 +12374,9 @@ mod tests {
         assert_eq!(sink.records(), 1, "tool call routed to rich sink");
         assert_eq!(items.len(), 2, "stream yields only text + terminal done");
         assert!(matches!(&items[0], Ok(Update::Text(t)) if t == "visible"));
-        assert!(matches!(&items[1], Ok(Update::Done { stop_reason }) if stop_reason == "end_turn"));
+        assert!(
+            matches!(&items[1], Ok(Update::Done { stop_reason, .. }) if stop_reason == "end_turn")
+        );
         assert!(
             items
                 .iter()
@@ -10662,7 +12471,7 @@ mod tests {
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "A"));
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "B"));
         assert!(
-            matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+            matches!(s.next().await, Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn")
         );
         assert!(s.next().await.is_none());
     }
@@ -10687,7 +12496,7 @@ mod tests {
             let mut s = be.prompt(&key, vec![]).await.unwrap();
             let last = loop {
                 match s.next().await {
-                    Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                    Some(Ok(Update::Done { stop_reason, .. })) => break stop_reason,
                     Some(_) => continue,
                     None => panic!("stream ended without a Done"),
                 }
@@ -10801,7 +12610,7 @@ mod tests {
             .await
             .expect("stream must complete after the cancelled result")
         {
-            Some(Ok(Update::Done { stop_reason })) => {
+            Some(Ok(Update::Done { stop_reason, .. })) => {
                 assert_eq!(
                     stop_reason, "cancelled",
                     "completion is the Cancelled RESULT"
@@ -10866,7 +12675,7 @@ mod tests {
             .expect("the racing-cancel turn must complete, not hang")
             .unwrap();
         match last {
-            Some(Ok(Update::Done { stop_reason })) => {
+            Some(Ok(Update::Done { stop_reason, .. })) => {
                 assert_eq!(
                     stop_reason, "cancelled",
                     "racing cancel completes the turn cancelled"
@@ -11061,7 +12870,7 @@ mod tests {
                 .await
                 .expect("fresh turn must complete")
             {
-                Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                Some(Ok(Update::Done { stop_reason, .. })) => break stop_reason,
                 Some(_) => continue,
                 None => panic!("fresh turn ended without Done"),
             }
@@ -11162,7 +12971,7 @@ mod tests {
                     .await
                     .expect("active turn must complete without watchdog timeout")
                 {
-                    Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                    Some(Ok(Update::Done { stop_reason, .. })) => break stop_reason,
                     Some(Ok(_)) => continue,
                     Some(Err(err)) => panic!("active turn must not fail: {err:?}"),
                     None => panic!("stream ended without Done"),
@@ -11213,7 +13022,7 @@ mod tests {
             .await
             .expect("released no-watchdog turn should complete")
         {
-            Some(Ok(Update::Done { stop_reason })) => assert_eq!(stop_reason, "end_turn"),
+            Some(Ok(Update::Done { stop_reason, .. })) => assert_eq!(stop_reason, "end_turn"),
             other => panic!("expected natural Done after releasing the fake agent, got {other:?}"),
         }
         assert!(s.next().await.is_none());
@@ -11345,7 +13154,7 @@ mod tests {
                 .await
                 .expect("turn must complete (permission auto-approved)")
             {
-                Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                Some(Ok(Update::Done { stop_reason, .. })) => break stop_reason,
                 Some(_) => continue,
                 None => panic!("stream ended without Done"),
             }
@@ -11392,7 +13201,7 @@ mod tests {
             );
             let done = loop {
                 match s.next().await {
-                    Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                    Some(Ok(Update::Done { stop_reason, .. })) => break stop_reason,
                     Some(_) => continue,
                     None => panic!("stream ended without Done"),
                 }
@@ -11433,7 +13242,7 @@ mod tests {
                 .await
                 .expect("turn must complete (permission denied)")
             {
-                Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                Some(Ok(Update::Done { stop_reason, .. })) => break stop_reason,
                 Some(_) => continue,
                 None => panic!("stream ended without Done"),
             }
@@ -11677,7 +13486,7 @@ mod tests {
             );
             let done = loop {
                 match s.next().await {
-                    Some(Ok(Update::Done { stop_reason })) => break stop_reason,
+                    Some(Ok(Update::Done { stop_reason, .. })) => break stop_reason,
                     Some(_) => continue,
                     None => panic!("stream ended without Done"),
                 }
@@ -11831,6 +13640,281 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn models_field_folds_model_and_effort_into_set_model() {
+        let rec = Recorder::new("agent-sess-MODELS-FOLD");
+        rec.advertise_session_models(
+            "gpt-5.6-sol[medium]",
+            &[
+                "gpt-5.6-sol[medium]",
+                "gpt-5.6-sol[high]",
+                "gpt-5.6-sol[xhigh]",
+            ],
+        )
+        .await;
+        let cfg = AcpConfig {
+            agent_id: "recorder".to_string(),
+            ..test_config()
+        };
+        let be = connect_recording_with(rec.clone(), cfg).await;
+        let key = bkey("bridge-MODELS-FOLD");
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: Some("gpt-5.6-sol".to_string()),
+                effort: Some(Effort::Xhigh),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        be.ensure_session(&key).await.unwrap();
+
+        assert_eq!(
+            rec.set_models.lock().await.as_slice(),
+            &["gpt-5.6-sol[xhigh]".to_string()],
+            "effort-suffixed model surfaces must select the exact modelId via session/set_model"
+        );
+        assert!(
+            rec.set_config_options.lock().await.is_empty(),
+            "models field takes precedence over legacy model/effort config options"
+        );
+        let catalog = be.session_catalog(&key).expect("catalog retained");
+        assert_eq!(catalog.current_model.as_deref(), Some("gpt-5.6-sol[xhigh]"));
+        assert_eq!(
+            catalog.models,
+            vec![
+                "gpt-5.6-sol[medium]",
+                "gpt-5.6-sol[high]",
+                "gpt-5.6-sol[xhigh]"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn models_field_set_model_rejection_maps_informative_error() {
+        let rec = Recorder::new("agent-sess-MODELS-REJECT");
+        rec.advertise_session_models(
+            "gpt-5.6-sol[medium]",
+            &[
+                "gpt-5.6-sol[medium]",
+                "gpt-5.6-sol[high]",
+                "gpt-5.6-sol[xhigh]",
+            ],
+        )
+        .await;
+        rec.reject_set_model.store(true, Ordering::SeqCst);
+        let cfg = AcpConfig {
+            agent_id: "recorder".to_string(),
+            ..test_config()
+        };
+        let be = connect_recording_with(rec.clone(), cfg).await;
+        let key = bkey("bridge-MODELS-REJECT");
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: Some("gpt-5.6-sol".to_string()),
+                effort: Some(Effort::Xhigh),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        match be.ensure_session(&key).await {
+            Err(error) => {
+                let diagnostic = assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::ConfigApply,
+                    DiagnosticFailureClass::Model,
+                    false,
+                );
+                assert_eq!(diagnostic.code().as_str(), "acp.config.model_rejected");
+                let cause = diagnostic.causes().join(" ");
+                assert!(
+                    cause.contains("session/set_model rejected modelId=gpt-5.6-sol[xhigh]"),
+                    "{cause}"
+                );
+                assert!(cause.contains("unknown model id"), "{cause}");
+            }
+            other => panic!("a rejected set_model must fail session setup, got {other:?}"),
+        }
+        assert_eq!(
+            rec.set_models.lock().await.as_slice(),
+            &["gpt-5.6-sol[xhigh]".to_string()]
+        );
+        assert!(rec.set_config_options.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn models_field_effort_only_uses_current_model_base_at_mint() {
+        let rec = Recorder::new("agent-sess-MODELS-EFFORT-ONLY");
+        rec.advertise_session_models(
+            "gpt-5.6-sol[medium]",
+            &[
+                "gpt-5.6-sol[medium]",
+                "gpt-5.6-sol[high]",
+                "gpt-5.6-sol[xhigh]",
+            ],
+        )
+        .await;
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-MODELS-EFFORT-ONLY");
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: None,
+                effort: Some(Effort::Xhigh),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        be.ensure_session(&key).await.unwrap();
+
+        assert_eq!(
+            rec.set_models.lock().await.as_slice(),
+            &["gpt-5.6-sol[xhigh]".to_string()],
+            "effort-only models-field selection must use the current model base"
+        );
+        assert!(
+            rec.set_config_options.lock().await.is_empty(),
+            "models field effort selection must not fall through to config options"
+        );
+        let catalog = be.session_catalog(&key).expect("catalog retained");
+        assert_eq!(catalog.current_model.as_deref(), Some("gpt-5.6-sol[xhigh]"));
+    }
+
+    #[tokio::test]
+    async fn mixed_models_field_effort_only_nonmatching_base_warn_skips_at_mint() {
+        let rec = Recorder::new("agent-sess-MODELS-EFFORT-DROP");
+        rec.advertise_session_models(
+            "haiku",
+            &["haiku", "gpt-5.6-sol[medium]", "gpt-5.6-sol[xhigh]"],
+        )
+        .await;
+        rec.advertise_effort_config.store(false, Ordering::SeqCst);
+        let be = connect_recording(rec.clone()).await;
+        let key = bkey("bridge-MODELS-EFFORT-DROP");
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: None,
+                effort: Some(Effort::Xhigh),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        be.ensure_session(&key)
+            .await
+            .expect("mint keeps legacy best-effort semantics after warning");
+
+        assert!(rec.set_models.lock().await.is_empty());
+        assert!(rec.set_config_options.lock().await.is_empty());
+        let catalog = be.session_catalog(&key).expect("catalog retained");
+        assert_eq!(catalog.current_model.as_deref(), Some("haiku"));
+    }
+
+    #[tokio::test]
+    async fn legacy_config_option_model_path_still_applies_when_models_absent() {
+        let rec = Recorder::new("agent-sess-LEGACY-MODEL");
+        let cfg = AcpConfig {
+            agent_id: "recorder".to_string(),
+            model: Some("m".to_string()),
+            ..test_config()
+        };
+        let be = connect_recording_with(rec.clone(), cfg).await;
+        let key = bkey("bridge-LEGACY-MODEL");
+
+        be.ensure_session(&key).await.unwrap();
+
+        assert!(rec.set_models.lock().await.is_empty());
+        assert_eq!(
+            rec.set_config_options.lock().await.as_slice(),
+            &[("model".to_string(), "m".to_string())],
+            "agents without models state keep the legacy config-option path"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_field_unadvertised_model_fails_before_rpc_with_catalog() {
+        let rec = Recorder::new("agent-sess-MODELS-MISS");
+        rec.advertise_model_config.store(false, Ordering::SeqCst);
+        rec.advertise_effort_config.store(false, Ordering::SeqCst);
+        rec.advertise_session_models("gpt-5.5[medium]", &["gpt-5.5[medium]", "gpt-5.5[xhigh]"])
+            .await;
+        let cfg = AcpConfig {
+            agent_id: "recorder".to_string(),
+            ..test_config()
+        };
+        let be = connect_recording_with(rec.clone(), cfg).await;
+        let key = bkey("bridge-MODELS-MISS");
+        be.configure_session(
+            &key,
+            &SessionSpec::from_config(EffectiveConfig {
+                model: Some("gpt-5.6-sol".to_string()),
+                effort: Some(Effort::Xhigh),
+                mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        match be.ensure_session(&key).await {
+            Err(error) => {
+                let diagnostic = assert_agent_failure(
+                    &error,
+                    DiagnosticPhase::ConfigApply,
+                    DiagnosticFailureClass::Model,
+                    false,
+                );
+                let cause = diagnostic.causes().join(" ");
+                assert!(cause.contains("gpt-5.6-sol with effort xhigh"), "{cause}");
+                assert!(cause.contains("valid models:"), "{cause}");
+                assert!(cause.contains("gpt-5.5[medium]"), "{cause}");
+                assert!(cause.contains("gpt-5.5[xhigh]"), "{cause}");
+            }
+            other => panic!("unadvertised models-field selection must fail mint, got {other:?}"),
+        }
+        assert!(
+            rec.set_models.lock().await.is_empty()
+                && rec.set_config_options.lock().await.is_empty(),
+            "invalid model/effort must fail before any model-selection RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_options_reads_models_field_over_config_option_models() {
+        let rec = Recorder::new("agent-sess-MODELS-DESCRIBE");
+        rec.advertise_session_models(
+            "gpt-5.6-sol[medium]",
+            &["gpt-5.6-sol[medium]", "gpt-5.6-sol[xhigh]"],
+        )
+        .await;
+        let be = connect_recording(rec.clone()).await;
+
+        let caps = be
+            .describe_options(std::path::Path::new("/tmp"))
+            .await
+            .expect("describe_options succeeds");
+
+        assert_eq!(caps.current_model.as_deref(), Some("gpt-5.6-sol[medium]"));
+        assert_eq!(
+            caps.models,
+            vec!["gpt-5.6-sol[medium]", "gpt-5.6-sol[xhigh]"]
+        );
+        assert!(caps.model_configurable);
+        assert_eq!(
+            caps.effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max"],
+            "legacy config options still contribute separate effort capabilities"
+        );
+    }
+
+    #[tokio::test]
     async fn authenticate_failure_surfaces_agent_not_authenticated() {
         // The agent advertises an auth method, then REJECTS `authenticate`. The
         // backend must surface a structured authentication failure from `connect` (hard fail).
@@ -11956,6 +14040,17 @@ mod tests {
             .expect("auth method selected");
 
         assert_eq!(chosen.0.as_ref(), "custom");
+    }
+
+    #[test]
+    fn choose_auth_method_none_skips_even_when_advertised() {
+        // `auth_method = "none"` is the operator opt-out for agents that are
+        // already authenticated out-of-band (e.g. codex with a valid
+        // ~/.codex/auth.json): skip client-driven `authenticate` even though the
+        // agent advertises methods — codex-acp's `chat-gpt` flow otherwise falls
+        // into an interactive browser OAuth and hangs headless runs.
+        let advertised = vec![auth_method("api-key"), auth_method("chat-gpt")];
+        assert!(AcpBackend::choose_auth_method(Some("none"), &advertised).is_none());
     }
 
     #[tokio::test]
@@ -12402,6 +14497,7 @@ mod tests {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            prefix_attestation_capability: PrefixAttestationCapability::default(),
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),
@@ -12522,7 +14618,7 @@ mod tests {
         let mut s = be.prompt(&key, vec![]).await.unwrap();
         assert!(matches!(s.next().await, Some(Ok(Update::Text(t))) if t == "ok"));
         assert!(
-            matches!(s.next().await, Some(Ok(Update::Done { stop_reason })) if stop_reason == "end_turn")
+            matches!(s.next().await, Some(Ok(Update::Done { stop_reason, .. })) if stop_reason == "end_turn")
         );
     }
 
@@ -13594,6 +15690,7 @@ mod tests {
             session_catalogs: Arc::new(StdMutex::new(HashMap::new())),
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
+            prefix_attestation_capability: PrefixAttestationCapability::default(),
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),

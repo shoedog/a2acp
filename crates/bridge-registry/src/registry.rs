@@ -573,6 +573,11 @@ impl AgentRegistry for Registry {
         Self::spawn_retirement(old_slot, INVALIDATE_RETIRE_GRACE);
     }
 
+    fn entry_snapshot(&self, id: &AgentId) -> Option<Arc<AgentEntry>> {
+        let st = self.state.load();
+        st.slots.get(id).map(|slot| slot.entry.load_full())
+    }
+
     fn list(&self) -> Vec<AgentId> {
         self.state.load().slots.keys().cloned().collect()
     }
@@ -622,6 +627,7 @@ mod tests {
             Ok(Box::pin(futures::stream::once(async {
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 })
             })))
         }
@@ -646,6 +652,8 @@ mod tests {
             model: None,
             effort: None::<Effort>,
             mode: None,
+            preflight: false,
+            fallback_models: vec![],
             cwd: None,
             session_cwd: None,
             sandbox: None,
@@ -706,6 +714,8 @@ mod tests {
                 model: None,
                 effort: None,
                 mode: None,
+                preflight: false,
+                fallback_models: vec![],
                 cwd: None,
                 session_cwd: None,
                 sandbox: None,

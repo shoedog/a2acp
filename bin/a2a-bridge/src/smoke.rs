@@ -48,7 +48,11 @@ const CLEANUP_TIMEOUT_SECS: u64 = 10;
 const MAX_CAPTURED_TEXT_BYTES: usize = 1024;
 const DIAGNOSTIC_CAPACITY: usize = 128;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
-const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+// Shared with `compatibility` so plan-time pinning and smoke-time rechecks agree
+// (release keeps the production cap; debug/test binaries are unstripped and larger).
+// A stale 256 MiB copy here made the guarded-smoke executable recheck fail its
+// bounded read in hermetic verify and misreport `smoke.fallback_executable_drift`.
+use crate::compatibility::MAX_EXECUTABLE_BYTES;
 const MAX_ARTIFACT_TEXT_BYTES: usize = 16 * 1024;
 const MAX_CATALOG_ENTRIES: usize = 128;
 const MAX_CATALOG_VALUE_BYTES: usize = 256;
@@ -933,7 +937,27 @@ impl ArtifactState {
         summary: &'static str,
         accepted: bool,
     ) {
-        self.failure = Some(static_failure(phase, class, code, summary, accepted));
+        self.fail_static_with_causes(phase, class, code, summary, Vec::new(), accepted);
+    }
+
+    fn fail_static_with_causes(
+        &mut self,
+        phase: DiagnosticPhase,
+        class: DiagnosticFailureClass,
+        code: &'static str,
+        summary: &'static str,
+        causes: Vec<String>,
+        accepted: bool,
+    ) {
+        self.failure = Some(static_failure_with_causes(
+            phase,
+            last_completed_for_smoke_failure(phase, accepted),
+            class,
+            code,
+            summary,
+            causes,
+            accepted,
+        ));
         self.artifact.attempt.prompt_may_have_been_accepted = accepted;
     }
 
@@ -1045,6 +1069,22 @@ fn build_git_commit() -> Option<&'static str> {
         .filter(|value| !value.is_empty())
 }
 
+fn last_completed_for_smoke_failure(
+    phase: DiagnosticPhase,
+    accepted: bool,
+) -> Option<DiagnosticPhase> {
+    if !accepted {
+        return None;
+    }
+    match phase {
+        DiagnosticPhase::PromptStart => Some(DiagnosticPhase::ConfigApply),
+        DiagnosticPhase::PromptStream => Some(DiagnosticPhase::PromptStart),
+        DiagnosticPhase::PromptFinish => Some(DiagnosticPhase::PromptStream),
+        DiagnosticPhase::Teardown => Some(DiagnosticPhase::PromptFinish),
+        _ => None,
+    }
+}
+
 fn static_failure(
     phase: DiagnosticPhase,
     class: DiagnosticFailureClass,
@@ -1052,18 +1092,14 @@ fn static_failure(
     summary: &'static str,
     accepted: bool,
 ) -> FailureDiagnostic {
-    let last_completed_phase = if accepted {
-        match phase {
-            DiagnosticPhase::PromptStart => Some(DiagnosticPhase::ConfigApply),
-            DiagnosticPhase::PromptStream => Some(DiagnosticPhase::PromptStart),
-            DiagnosticPhase::PromptFinish => Some(DiagnosticPhase::PromptStream),
-            DiagnosticPhase::Teardown => Some(DiagnosticPhase::PromptFinish),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    static_failure_with_context(phase, last_completed_phase, class, code, summary, accepted)
+    static_failure_with_context(
+        phase,
+        last_completed_for_smoke_failure(phase, accepted),
+        class,
+        code,
+        summary,
+        accepted,
+    )
 }
 
 fn static_failure_with_context(
@@ -1074,6 +1110,26 @@ fn static_failure_with_context(
     summary: &'static str,
     accepted: bool,
 ) -> FailureDiagnostic {
+    static_failure_with_causes(
+        phase,
+        last_completed_phase,
+        class,
+        code,
+        summary,
+        Vec::new(),
+        accepted,
+    )
+}
+
+fn static_failure_with_causes(
+    phase: DiagnosticPhase,
+    last_completed_phase: Option<DiagnosticPhase>,
+    class: DiagnosticFailureClass,
+    code: &'static str,
+    summary: &'static str,
+    causes: Vec<String>,
+    accepted: bool,
+) -> FailureDiagnostic {
     FailureDiagnostic::build_static_code(
         FailureDiagnosticInput {
             failed_phase: phase,
@@ -1082,7 +1138,7 @@ fn static_failure_with_context(
             disposition: FailureDisposition::Fatal,
             code: String::new(),
             summary: summary.to_owned(),
-            causes: Vec::new(),
+            causes,
             stderr_observed: false,
             stderr_line_count: 0,
             stderr_scope: None,
@@ -1535,7 +1591,7 @@ async fn drain_stream(
                 }
                 usage = Some(next);
             }
-            Ok(Update::Done { stop_reason }) => {
+            Ok(Update::Done { stop_reason, .. }) => {
                 let safe_reason = safe_stop_reason(&stop_reason);
                 turn.stop_reason = Some(safe_reason);
                 turn.terminal_state = if safe_reason == "cancelled" {
@@ -1556,8 +1612,7 @@ async fn drain_stream(
     if turn.stop_reason.is_none() {
         turn.terminal_state = "eof_without_terminal";
     }
-    turn.exact_pong =
-        !capture_overflow && std::str::from_utf8(&captured).is_ok_and(|text| text.trim() == "PONG");
+    turn.exact_pong = !capture_overflow && captured.as_slice() == b"PONG";
 
     let successful = turn.terminal_state == "completed"
         && turn.exact_pong
@@ -2655,12 +2710,14 @@ mod tests {
                     Ok(Update::Text("PONG".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::Whitespace => Box::pin(futures::stream::iter(vec![
                     Ok(Update::Text("  PONG\n".into())),
                     Ok(Update::Done {
                         stop_reason: "stop".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::NoTerminal => {
@@ -2670,6 +2727,7 @@ mod tests {
                     Ok(Update::Text("not pong".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::Tool => {
@@ -2688,6 +2746,7 @@ mod tests {
                         Ok(Update::Text("PONG".into())),
                         Ok(Update::Done {
                             stop_reason: "end_turn".into(),
+                            prefix_attestation: Default::default(),
                         }),
                     ]))
                 }
@@ -2696,18 +2755,21 @@ mod tests {
                     Ok(Update::Text("PONG".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::Cancelled => Box::pin(futures::stream::iter(vec![
                     Ok(Update::Text("PONG".into())),
                     Ok(Update::Done {
                         stop_reason: "cancelled".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::Refusal => Box::pin(futures::stream::iter(vec![
                     Ok(Update::Text("PONG".into())),
                     Ok(Update::Done {
                         stop_reason: "refusal".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::Empty => Box::pin(futures::stream::empty()),
@@ -2730,6 +2792,7 @@ mod tests {
                     Ok(Update::Text("PONG".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::ValidThenInvalidUsage => Box::pin(futures::stream::iter(vec![
@@ -2750,6 +2813,7 @@ mod tests {
                     Ok(Update::Text("PONG".into())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])),
                 Behavior::InvalidThenValidUsageThenBackendError => {
@@ -3495,10 +3559,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_whitespace_is_normalized_but_no_other_success_condition_is_relaxed() {
+    async fn protocol_whitespace_is_not_an_exact_pong() {
         let (_, whitespace) = execute(Behavior::Whitespace, Duration::from_secs(1)).await;
-        assert!(whitespace.error.is_none());
-        assert!(whitespace.turn.exact_pong);
+        assert!(whitespace.error.is_some());
+        assert!(!whitespace.turn.exact_pong);
 
         for behavior in [
             Behavior::NoTerminal,
@@ -3967,6 +4031,8 @@ mod tests {
             model: None,
             effort: None,
             mode: None,
+            preflight: false,
+            fallback_models: vec![],
             cwd: None,
             session_cwd: None,
             sandbox: None,
@@ -4297,6 +4363,28 @@ mod tests {
         assert_eq!(value["diagnostics"]["failure"]["retry_after_ms"], 1234);
         assert_eq!(value["diagnostics"]["failure"]["reset_at_ms"], now + 5000);
         assert_eq!(value["success"], false);
+    }
+
+    #[tokio::test]
+    async fn smoke_config_failure_does_not_persist_untrusted_message() {
+        let sentinel = "ordinary-config-sentinel-7f4d8ac2";
+        let mut state = ArtifactState::new(&args());
+        state.fail_error(
+            &BridgeError::ConfigInvalid {
+                reason: format!("container agent rejected {sentinel} at prompt_start"),
+            },
+            DiagnosticPhase::PromptStart,
+            true,
+        );
+
+        let artifact = state.finalize(false).await;
+        let failure = artifact.diagnostics.failure.expect("failure JSON");
+        assert_eq!(failure["code"], "smoke.config");
+        assert_eq!(failure["causes"], serde_json::json!([]));
+        assert!(
+            !serde_json::to_string(&failure).unwrap().contains(sentinel),
+            "config failure persisted untrusted text: {failure:?}"
+        );
     }
 
     #[test]

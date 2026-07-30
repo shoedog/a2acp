@@ -16,7 +16,7 @@ pub async fn drain_turn(mut stream: bridge_core::ports::BackendStream) -> TurnOu
     let mut last_err = None;
     while let Some(item) = stream.next().await {
         match item {
-            Ok(Update::Done { stop_reason }) => {
+            Ok(Update::Done { stop_reason, .. }) => {
                 if stop_reason != STOP_REASON_CANCELLED {
                     completed = true;
                 }

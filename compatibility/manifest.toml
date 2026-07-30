@@ -8,6 +8,145 @@ timeout_secs = 1800
 max_tokens = 500000
 max_cost_usd = 5.0
 
+# Current v0.3.0 support gates. These are the only rows whose classification can block promotion.
+[[cases]]
+id = "codex-host-bridge-gpt56-luna"
+lane = "pinned"
+evidence_path = "bridge_smoke"
+execution_mode = "host"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+config = "configs/codex-luna-host.toml"
+agent = "codex-luna-host"
+model = "gpt-5.6-luna"
+effort = "low"
+mode = "read-only"
+session_cwd = "/Users/wesleyjinks/code/a2a-bridge"
+auth_path = "pre_authenticated"
+required_env = []
+probe = "minimal"
+billable = true
+timeout_secs = 180
+max_tokens = 100000
+retry_cap = 0
+expected_status = "PASS"
+classification = "support"
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[cases.pins]
+config_sha256 = "968697a66a8f116cb09bca2b6db9edb89713ab765d3b289d37401f2ad6ce8c7b"
+model = "gpt-5.6-luna"
+adapter = "@agentclientprotocol/codex-acp=1.1.7"
+agent_cli = "@openai/codex=0.145.0"
+
+[[cases]]
+id = "codex-reader-bridge-gpt56-luna"
+lane = "pinned"
+evidence_path = "bridge_smoke"
+execution_mode = "container_ro"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+expected_image_digest = "sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f"
+config = "configs/codex-luna-reader.toml"
+agent = "codex-luna-reader"
+model = "gpt-5.6-luna"
+effort = "low"
+session_cwd = "/Users/wesleyjinks/code/a2a-bridge"
+auth_path = "pre_authenticated"
+required_env = []
+probe = "minimal"
+billable = true
+timeout_secs = 300
+max_tokens = 100000
+retry_cap = 0
+expected_status = "PASS"
+classification = "support"
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[cases.pins]
+config_sha256 = "3ef69ed73449ae6b2da38274f7157d956bf0436af09de840c8374c417da65865"
+model = "gpt-5.6-luna"
+adapter = "@agentclientprotocol/codex-acp=1.1.7"
+agent_cli = "@openai/codex=0.145.0"
+image_digest = "sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f"
+
+[[cases]]
+id = "claude-host-acp-063-sonnet5"
+lane = "pinned"
+evidence_path = "bridge_smoke"
+execution_mode = "host"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+config = "configs/claude-sonnet-low-host.toml"
+agent = "claude-sonnet-low-host"
+model = "sonnet"
+effort = "low"
+session_cwd = "/Users/wesleyjinks/code/a2a-bridge"
+auth_path = "automatic"
+required_env = []
+probe = "minimal"
+billable = true
+timeout_secs = 180
+max_tokens = 100000
+retry_cap = 0
+expected_status = "PASS"
+classification = "support"
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[cases.pins]
+config_sha256 = "edd39868c81c6d2d354831ac896cd00a8a8956fe4f29da105aa454bb7f374a5e"
+model = "sonnet"
+adapter = "@agentclientprotocol/claude-agent-acp=0.63.0"
+agent_cli = "@anthropic-ai/claude-agent-sdk=0.3.220"
+
+[[cases]]
+id = "claude-reader-063-sonnet5"
+lane = "pinned"
+evidence_path = "bridge_smoke"
+execution_mode = "container_ro"
+os = "macos"
+architecture = "aarch64"
+environment_owner = "wesley-macbook"
+expected_image_digest = "sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f"
+config = "configs/claude-sonnet-low-reader.toml"
+agent = "claude-sonnet-low-reader"
+model = "sonnet"
+effort = "low"
+session_cwd = "/Users/wesleyjinks/code/a2a-bridge"
+auth_path = "pre_authenticated"
+required_env = []
+probe = "minimal"
+billable = true
+timeout_secs = 600
+max_tokens = 100000
+retry_cap = 0
+expected_status = "PASS"
+classification = "support"
+
+[cases.artifact]
+retention_days = 30
+redaction = "strict"
+
+[cases.pins]
+config_sha256 = "f4d5582f69d975d5f14da380a4812b2fbdaad4f0f603c94c6aeb47e4cf26fcd0"
+model = "sonnet"
+adapter = "@agentclientprotocol/claude-agent-acp=0.63.0"
+agent_cli = "@anthropic-ai/claude-agent-sdk=0.3.220"
+image_digest = "sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f"
+
+# Historical support evidence retained under its original identities. These rows are non-goal controls.
 [[cases]]
 id = "codex-host-bridge-gpt56-sol"
 lane = "pinned"
@@ -30,7 +169,7 @@ timeout_secs = 180
 max_tokens = 100000
 retry_cap = 0
 expected_status = "PASS"
-classification = "support"
+classification = "non_goal"
 
 [cases.artifact]
 retention_days = 30
@@ -64,7 +203,7 @@ timeout_secs = 300
 max_tokens = 100000
 retry_cap = 0
 expected_status = "PASS"
-classification = "support"
+classification = "non_goal"
 
 [cases.artifact]
 retention_days = 30
@@ -128,7 +267,7 @@ timeout_secs = 180
 max_tokens = 100000
 retry_cap = 0
 expected_status = "PASS"
-classification = "support"
+classification = "non_goal"
 
 [cases.artifact]
 retention_days = 30
@@ -194,7 +333,7 @@ timeout_secs = 600
 max_tokens = 100000
 retry_cap = 0
 expected_status = "PASS"
-classification = "support"
+classification = "non_goal"
 
 [cases.artifact]
 retention_days = 30

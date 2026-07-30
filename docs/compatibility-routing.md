@@ -46,15 +46,15 @@ compatibility/promotion evidence.
 
 ## Initial compatibility identities
 
-The default-off R3d0 registry proposes Codex Luna-low host/reader, Claude Haiku host/reader, a Claude
-Sonnet-low effort control, and local Ollama `qwen3.5:9b`. They remain
-`characterization_required`; their presence is not evidence that they work. Kiro/Qwen remains deferred
-until exact model application and reproducible reader inputs exist. OpenRouter and OpenCode remain separate
+The default-off R3d0 advisory registry separately proposes Codex Luna-low host/reader, Claude Haiku
+host/reader, a Claude Sonnet-low effort control, and local Ollama `qwen3.5:9b`. Those advisory rows remain
+`characterization_required`; their presence is not support evidence. Kiro/Qwen remains deferred until exact
+model application and reproducible reader inputs exist. OpenRouter and OpenCode remain separate
 provider-integration increments.
 
-The four production Sol/Fable support rows are inventoried separately for future claimed-support
-characterization. They are not converted into daily low-cost probes, and the production support manifest is
-unchanged.
+The current pinned production manifest has four blocking support gates: Codex Luna-low host/reader and
+Claude Sonnet-low host/reader. Sol/Fable rows are retained only as historical `non_goal` controls. The
+support gates require explicit operator selection and are not unattended daily low-cost probes.
 
 See [Compatibility scheduling foundation](compatibility-scheduling-foundation.md) for the local validators
 and the strict no-effect boundary.

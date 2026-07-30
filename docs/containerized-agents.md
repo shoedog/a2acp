@@ -25,7 +25,16 @@ docker run --rm a2a-agent-reader:latest sh -c \
   'command -v claude-agent-acp && command -v codex-acp && command -v kiro-cli'
 ```
 The image is `node:24-slim` + `claude-agent-acp` + `codex-acp` (npm) + `kiro-cli` (Linux build via the
-official zip; installed with `--force --no-confirm` since it runs as root unattended).
+official zip; installed with `--force --no-confirm` since it runs as root unattended). As of 2026-07-27,
+the exact Node trees are Codex ACP 1.1.7 / Codex 0.145.0 and Claude ACP 0.63.0 / Agent SDK 0.3.220 /
+bundled Claude Code 2.1.220. Those versions passed provider-free host ACP and bridge catalog probes plus
+one fixed-PONG host and immutable-reader bridge smoke per provider. The exact reader image was subsequently
+promoted to `a2a-agent-reader:release-eb79133c85b6360c` and `a2a-agent-reader:latest`; the corresponding
+toolchain image and served operator also passed their separately authorized promotion checks. Exact image
+IDs, evidence digests, and the still-uncovered Fable/Kiro lanes are recorded in
+[`compatibility.md`](compatibility.md).
+The same immutable release tag is the documented v0.3.0 reader rollback target; follow the exact
+identity check, retag command, STOP conditions, and post-rollback verification in that compatibility record.
 
 ## 2. Bring up the egress lockdown
 
@@ -52,8 +61,9 @@ mount breaks refresh):
   ```
 
   **Fable-specific settings mount.** The credential copy is sufficient for normal Claude models, but
-  `claude-agent-acp` 0.55.0 did not advertise Fable from a credential-only reader home. A deliberate
-  Fable reader must also mount the checked-in minimal model/effort settings file:
+  The historical `claude-agent-acp` 0.55.0 reader control did not advertise Fable from a
+  credential-only reader home. The current 0.63.0 candidate has not yet replaced that live evidence, so
+  a deliberate Fable reader must still mount the checked-in minimal model/effort settings file:
 
   ```toml
   [[agents]]

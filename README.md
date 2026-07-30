@@ -205,7 +205,7 @@ allowed_cmds = ["kiro-cli", "codex-acp"]   # optional; defaults to the union of 
 id   = "kiro"
 cmd  = "kiro-cli"
 args = ["acp"]
-# name / model / model_provider / effort / mode / cwd / auth_method / pre_authenticated — optional
+# name / model / model_provider / effort / mode / preflight / fallback_models / cwd / auth_method / pre_authenticated — optional
 
 [[agents]]
 id   = "codex"
@@ -230,8 +230,10 @@ addr = "127.0.0.1:8080"
 | `model_provider` | no | LLM vendor label — descriptive/routing metadata only, never sent on the wire |
 | `effort` | no | Effort tier (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`); falls back to the highest supported level ≤ requested |
 | `mode` | no | Mode id for `session/set_mode` (hard error if the agent rejects it) |
+| `preflight` | no | Default `false`. When true, workflow execution sends a fixed `PONG` smoke before this agent's first real turn in a run. A fallback is allowed only after failure proven to precede prompt acceptance; an accepted or possibly accepted smoke failure is sticky and is never replayed. |
+| `fallback_models` | no | Ordered raw model ids used only by `preflight = true` after a proven pre-acceptance failure; the selected fallback replaces `model` for that workflow run while leaving effort/mode/cwd unchanged. |
 | `cwd` | no | Working directory for `session/new`; relative values join onto the bridge's `current_dir()` |
-| `auth_method` | no | Auth method id for `authenticate` (defaults to ChatGPT-style auth when advertised, else the first advertised method) |
+| `auth_method` | no | Auth method id for `authenticate` (defaults to ChatGPT-style auth when advertised, else the first advertised method); `"none"` skips client-driven `authenticate` entirely for agents already authenticated out-of-band |
 | `pre_authenticated` | no | Skip `authenticate` because credentials are already ambient (for example, `codex login` or a mounted `auth.json`); cannot be combined with `auth_method` |
 | `host_fallback_eligible` | no | Default `false`. Marks only an unsandboxed `kind="acp"` entry as an allowed target for a locally confirmed trusted-own-repo read-only fallback plan; it never asserts content trust or starts a fallback. |
 | `description`, `tags`, `version` | no | Seamed for future per-entry Agent Cards |

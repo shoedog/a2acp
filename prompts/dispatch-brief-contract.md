@@ -10,6 +10,10 @@ churn). The bridge's node templates already encode most of this; ad-hoc briefs m
 
 Two artifacts, never one:
 - **Facts file** — only `file:line` facts, run numbers, probe outputs. No adjectives, no framing.
+  Behavioral premises about live systems carry a label: `FACT — <source/probe attached>` or
+  `HYPOTHESIS — verify`. Uncited "current facts" are prohibited — a cleanroom reader once had
+  to refute two of them mid-task (success-mode catalog, A-FAILURE-1); a less skeptical reader
+  would have laundered them into the design.
 - **Framing file (optional, labeled)** — the author's reading, marked non-authoritative.
 
 Boilerplate (from the corrected D1–D6 dispatch — keep the voice):
@@ -34,7 +38,17 @@ addressed" — carries, in the same brief:
 > not yours.
 
 Never narrow a verifier's scope below what its claims require (a reviewer endorsing repo
-claims must be allowed to read the repo).
+claims must be allowed to read the repo). If the brief's framing itself is wrong, the
+refutation IS the deliverable: a proven "this frame cannot work" outranks a compliant
+artifact inside a broken frame (the W2b impossibility argument saved a fourth churn round).
+
+## 2b. Evidence-capture dispatches: probe obtainability first, controls always
+
+If a dispatch's deliverable is evidence, probe that the evidence is obtainable BEFORE
+writing the brief (a cheap pre-dispatch probe once converted a doomed long run into an ADR).
+Any negative observation reported as fact must be accompanied by a positive control on the
+same apparatus — proof the instrument could have produced the signal. Task specs for
+evidence capture carry a `control:` line naming it.
 
 ## 3. Provenance tiers (required in relays and fix-claims)
 

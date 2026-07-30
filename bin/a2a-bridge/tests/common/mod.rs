@@ -31,6 +31,8 @@ pub fn single_agent_registry(id: &str, backend: Arc<dyn AgentBackend>) -> Arc<dy
         model: None,
         effort: None,
         mode: None,
+        preflight: false,
+        fallback_models: vec![],
         cwd: None,
         session_cwd: None,
         sandbox: None,

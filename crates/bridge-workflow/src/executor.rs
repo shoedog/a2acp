@@ -2,10 +2,18 @@
 //! → prompt → concatenate Update::Text into the node output. Cancel via token.
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::template::render;
-use bridge_core::domain::{effective_config, Part, SessionSpec};
+use bridge_core::attestation::{
+    append_prompt_contract, prefix_attestation_request_for_capability, HarvestSanitizationMode,
+    PrefixAttestationCapability, PrefixAttestationStatus,
+};
+use bridge_core::domain::{effective_config, AgentEntry, AgentOverride, Part, SessionSpec};
 use bridge_core::error::BridgeError;
-use bridge_core::ids::{NodeId, SessionId};
+use bridge_core::harvest::{
+    commit_harvested_completion, CompletionBodyOrigin, HarvestAuditStore, NoopHarvestAuditStore,
+};
+use bridge_core::ids::{NodeId, OperationId, SessionId};
 use bridge_core::orch::UsageSnapshot;
+use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
     classify_failure, AgentBackend, AgentRegistry, BackendObservers, DiagnosticObserver,
     DiagnosticObserverFactory, FailureClass, ObsEvent, Observer, RichEventSinkFactory, TurnContext,
@@ -31,6 +39,7 @@ pub struct WorkflowRunContext {
     pub parent_traceparent: Option<bridge_core::ports::TraceParent>,
     pub task_id: Option<bridge_core::ids::TaskId>,
     pub prompt_id: Option<String>,
+    pub harvest_audit_store: Arc<dyn HarvestAuditStore>,
 }
 
 impl Default for WorkflowRunContext {
@@ -42,6 +51,7 @@ impl Default for WorkflowRunContext {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         }
     }
 }
@@ -61,6 +71,27 @@ pub struct WorkflowDiagnosticContext {
     request: WorkflowRunContext,
     factory: Arc<dyn DiagnosticObserverFactory>,
     prompt_dispatch: Option<PromptDispatchBarrier>,
+}
+
+/// True when at least one node explicitly renders the run-workflow input variable.
+pub fn graph_consumes_input(graph: &WorkflowGraph) -> bool {
+    graph
+        .nodes
+        .iter()
+        .any(|node| node.prompt_template.contains("{{input}}"))
+}
+
+/// Error text for the local CLI guard that prevents a non-empty `--input` brief
+/// from being silently ignored by a workflow whose prompts never reference it.
+pub fn input_consumption_error(graph: &WorkflowGraph, input: &str) -> Option<String> {
+    if input.is_empty() || graph_consumes_input(graph) {
+        None
+    } else {
+        Some(format!(
+            "workflow {:?} has no node prompt containing {{{{input}}}}, so the supplied --input would be ignored",
+            graph.id.as_str()
+        ))
+    }
 }
 
 impl WorkflowDiagnosticContext {
@@ -155,18 +186,118 @@ pub trait WorkflowNodeDispatcher: Send + Sync {
     ) -> Result<NodeTurn, BridgeError> {
         self.checkout(wf_id, node, run_id, ctx).await
     }
+
+    /// Checkout a warm node turn with executor-selected config overrides.
+    /// Dispatchers that configure model/effort/mode during checkout must forward
+    /// these overrides; the default preserves legacy dispatchers by dropping them.
+    async fn checkout_observed_with_overrides(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        run_id: &str,
+        ctx: &WorkflowRunContext,
+        _overrides: Option<AgentOverride>,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<NodeTurn, BridgeError> {
+        self.checkout_observed(wf_id, node, run_id, ctx, observer)
+            .await
+    }
 }
 
 /// Uniform future type used in the per-run `FuturesUnordered` pool.
 /// Each fan-out node is boxed to this type so `FuturesUnordered` can hold
 /// futures of different async-block monomorphisations in one collection.
 type NodeFut<'a> = std::pin::Pin<
-    Box<
-        dyn futures::Future<Output = (NodeId, String, bool, Option<UsageSnapshot>, NodeDisposition)>
-            + Send
-            + 'a,
-    >,
+    Box<dyn futures::Future<Output = (NodeId, Result<NodeRunOutput, BridgeError>)> + Send + 'a>,
 >;
+
+#[derive(Clone)]
+struct NodeHarvestMeta {
+    context: TurnContext,
+    mode: HarvestSanitizationMode,
+    capability: PrefixAttestationCapability,
+    producer_id: String,
+    status: PrefixAttestationStatus,
+    origin: CompletionBodyOrigin,
+}
+
+struct NodeRunOutput {
+    text: String,
+    ok: bool,
+    usage: Option<UsageSnapshot>,
+    disposition: NodeDisposition,
+    harvest: NodeHarvestMeta,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn node_harvest_meta_from_context(
+    context: TurnContext,
+    node: &WorkflowNode,
+    capability: PrefixAttestationCapability,
+    status: PrefixAttestationStatus,
+    origin: CompletionBodyOrigin,
+) -> NodeHarvestMeta {
+    NodeHarvestMeta {
+        context,
+        mode: node.harvest_sanitization.unwrap_or_default(),
+        capability,
+        producer_id: node.agent.as_str().to_string(),
+        status,
+        origin,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn node_harvest_meta(
+    wf_id: &str,
+    node: &WorkflowNode,
+    run_id: &str,
+    ctx: &WorkflowRunContext,
+    attempt: u32,
+    capability: PrefixAttestationCapability,
+    status: PrefixAttestationStatus,
+    origin: CompletionBodyOrigin,
+) -> Result<NodeHarvestMeta, BridgeError> {
+    Ok(node_harvest_meta_from_context(
+        node_turn_context(wf_id, node, run_id, ctx, None, None, None, attempt)?,
+        node,
+        capability,
+        status,
+        origin,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn node_run_output(
+    wf_id: &str,
+    node: &WorkflowNode,
+    run_id: &str,
+    ctx: &WorkflowRunContext,
+    text: String,
+    ok: bool,
+    usage: Option<UsageSnapshot>,
+    disposition: NodeDisposition,
+    origin: CompletionBodyOrigin,
+) -> Result<NodeRunOutput, BridgeError> {
+    Ok(NodeRunOutput {
+        text,
+        ok,
+        usage,
+        disposition,
+        // attempt=0 denotes a pre-attempt synthetic exit, not a real
+        // backend prompt attempt.
+        harvest: node_harvest_meta(
+            wf_id,
+            node,
+            run_id,
+            ctx,
+            0,
+            PrefixAttestationCapability::default(),
+            PrefixAttestationStatus::default(),
+            origin,
+        )?,
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NodeDisposition {
@@ -279,6 +410,179 @@ async fn cleanup_warm_turn(
     result
 }
 
+const WORKFLOW_PREFLIGHT_PROMPT: &str = "Reply with exactly PONG and nothing else.";
+const PREFLIGHT_OBSERVER_ATTEMPT_BASE: u32 = 10_000;
+
+fn is_exact_preflight_pong(text: &str) -> bool {
+    text == "PONG"
+}
+
+type PreflightCacheEntry = Arc<tokio::sync::OnceCell<Result<PreflightDecision, PreflightFailure>>>;
+type PreflightCache = Arc<tokio::sync::Mutex<HashMap<String, PreflightCacheEntry>>>;
+
+#[derive(Clone, Debug)]
+struct PreflightDecision {
+    selected_model: Option<String>,
+    substituted_from: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum PreflightFailure {
+    Canceled,
+    Hard {
+        message: String,
+        failure_class: FailureClass,
+        retain_in_run_cache: bool,
+    },
+}
+
+impl PreflightFailure {
+    fn retain_in_run_cache(&self) -> bool {
+        matches!(
+            self,
+            Self::Hard {
+                retain_in_run_cache: true,
+                ..
+            }
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AttemptSummary {
+    attempt: u32,
+    model: Option<String>,
+    duration: std::time::Duration,
+    usage: Option<UsageSnapshot>,
+    reason: String,
+}
+
+fn model_label(model: Option<&str>) -> String {
+    model.unwrap_or("<default>").to_string()
+}
+
+fn usage_label(usage: Option<&UsageSnapshot>) -> String {
+    match usage {
+        Some(usage) => format!(
+            "used={:?}, size={:?}, total_tokens={:?}",
+            usage.used,
+            usage.size,
+            usage
+                .terminal
+                .as_ref()
+                .map(|terminal| terminal.total_tokens)
+        ),
+        None => "usage=n/a".to_string(),
+    }
+}
+
+fn format_attempt_summaries(attempts: &[AttemptSummary]) -> String {
+    attempts
+        .iter()
+        .map(|attempt| {
+            format!(
+                "attempt {} model={} duration_ms={} {} reason={}",
+                attempt.attempt,
+                model_label(attempt.model.as_deref()),
+                attempt.duration.as_millis(),
+                usage_label(attempt.usage.as_ref()),
+                attempt.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn stream_dropped_error() -> BridgeError {
+    BridgeError::agent_crashed("backend stream ended before terminal Done")
+}
+
+async fn record_synthetic_failure(
+    observer: &Arc<dyn DiagnosticObserver>,
+    phase: bridge_core::diagnostics::DiagnosticPhase,
+    code: &'static str,
+    class: bridge_core::diagnostics::DiagnosticFailureClass,
+    summary: impl Into<String>,
+    causes: Vec<String>,
+) {
+    use bridge_core::diagnostics::{
+        diagnostic_timestamp_ms, DiagnosticEvent, DiagnosticRedactor, FailureDiagnostic,
+        FailureDiagnosticInput, FailureDisposition, PersistedPhaseTransition,
+        PersistedPhaseTransitionInput, PhaseStatus,
+    };
+
+    let redactor = DiagnosticRedactor::default();
+    let started = PersistedPhaseTransition::build_static_code(
+        PersistedPhaseTransitionInput {
+            phase,
+            status: PhaseStatus::Started,
+            at_ms: diagnostic_timestamp_ms(),
+            operation: None,
+            code: None,
+            auth: None,
+        },
+        Some(code),
+        &redactor,
+    )
+    .and_then(|transition| DiagnosticEvent::new(transition, None));
+    if let Ok(event) = started {
+        let _ = observer.record(event).await;
+    }
+
+    let failure = FailureDiagnostic::build_static_code(
+        FailureDiagnosticInput {
+            failed_phase: phase,
+            last_completed_phase: match phase {
+                bridge_core::diagnostics::DiagnosticPhase::PromptFinish => {
+                    Some(bridge_core::diagnostics::DiagnosticPhase::PromptStream)
+                }
+                bridge_core::diagnostics::DiagnosticPhase::PromptStream => {
+                    Some(bridge_core::diagnostics::DiagnosticPhase::PromptStart)
+                }
+                _ => None,
+            },
+            class,
+            disposition: FailureDisposition::Fatal,
+            code: code.to_string(),
+            summary: summary.into(),
+            causes,
+            stderr_observed: false,
+            stderr_line_count: 0,
+            stderr_scope: None,
+            stderr_tail: None,
+            stderr_redaction: None,
+            retry_after_ms: None,
+            reset_at_ms: None,
+            prompt_may_have_been_accepted: matches!(
+                phase,
+                bridge_core::diagnostics::DiagnosticPhase::PromptStart
+                    | bridge_core::diagnostics::DiagnosticPhase::PromptStream
+                    | bridge_core::diagnostics::DiagnosticPhase::PromptFinish
+                    | bridge_core::diagnostics::DiagnosticPhase::Teardown
+            ),
+        },
+        code,
+        &redactor,
+    )
+    .and_then(|failure| {
+        PersistedPhaseTransition::build_static_code(
+            PersistedPhaseTransitionInput {
+                phase,
+                status: PhaseStatus::Failed,
+                at_ms: diagnostic_timestamp_ms(),
+                operation: None,
+                code: None,
+                auth: None,
+            },
+            Some(code),
+            &redactor,
+        )
+        .and_then(|transition| DiagnosticEvent::new(transition, Some(failure)))
+    });
+    if let Ok(event) = failure {
+        let _ = observer.record(event).await;
+    }
+}
 #[derive(Clone, Copy)]
 enum ColdCleanupAction {
     Forget,
@@ -307,6 +611,23 @@ async fn cleanup_cold_session(
     };
     tracker.record(started, std::time::Instant::now(), result.is_ok());
     result
+}
+
+async fn cancel_and_forget_preflight_session(
+    backend: &Arc<dyn AgentBackend>,
+    session: &SessionId,
+    observer: &Arc<dyn DiagnosticObserver>,
+    tracker: &WorkflowCleanupTracker,
+) {
+    let _ = backend.cancel_observed(session, observer.clone()).await;
+    let _ = cleanup_cold_session(
+        backend,
+        session,
+        observer,
+        ColdCleanupAction::Forget,
+        tracker,
+    )
+    .await;
 }
 
 enum RenderInput {
@@ -459,15 +780,9 @@ fn node_turn_context(
     effort: Option<String>,
     mode: Option<String>,
     attempt: u32,
-) -> TurnContext {
-    TurnContext {
-        turn_id: bridge_core::ids::TurnId::parse(format!(
-            "turn-{run_id}-{node_id}-{attempt}",
-            node_id = node.id.as_str()
-        ))
-        .unwrap_or_else(|_| {
-            bridge_core::ids::TurnId::parse("turn-fallback").expect("fallback is valid")
-        }),
+) -> Result<TurnContext, BridgeError> {
+    Ok(TurnContext {
+        turn_id: bridge_core::attestation::generate_turn_id()?,
         session_id: bridge_core::ids::ContextId::parse(run_id).unwrap_or_else(|_| {
             bridge_core::ids::ContextId::parse("workflow-fallback").expect("fallback is valid")
         }),
@@ -481,7 +796,7 @@ fn node_turn_context(
         mode,
         prompt_id: ctx.prompt_id.clone(),
         traceparent: ctx.parent_traceparent.clone(),
-    }
+    })
 }
 
 impl WorkflowExecutor {
@@ -493,6 +808,444 @@ impl WorkflowExecutor {
     /// any agent backend.
     pub fn workload_fingerprint(&self, graph: &WorkflowGraph) -> (String, bool) {
         crate::graph::workload_fingerprint(graph, self.registry.as_ref())
+    }
+
+    fn preflight_candidates(entry: &AgentEntry) -> Vec<Option<String>> {
+        std::iter::once(entry.model.clone())
+            .chain(entry.fallback_models.iter().cloned().map(Some))
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_agent_preflight(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        run_id: &str,
+        ctx: &WorkflowRunContext,
+        diagnostic_factory: &Arc<dyn DiagnosticObserverFactory>,
+        cancel: &CancellationToken,
+        entry: Arc<AgentEntry>,
+        cache: &PreflightCache,
+        cleanup_tracker: &WorkflowCleanupTracker,
+    ) -> Result<PreflightDecision, PreflightFailure> {
+        if !entry.preflight {
+            return Ok(PreflightDecision {
+                selected_model: entry.model.clone(),
+                substituted_from: None,
+            });
+        }
+
+        let cache_key = entry.id.as_str().to_string();
+        let cell = {
+            let mut cache = cache.lock().await;
+            cache
+                .entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
+        };
+
+        // The cell single-flights concurrent first misses. Only successful
+        // decisions remain in the run cache. Cancellation and failures proved
+        // pre-acceptance are evicted below so they cannot poison later nodes;
+        // accepted or indeterminate prompt failures remain cached so another
+        // node in this run cannot replay possibly accepted work.
+        let result = cell
+            .get_or_init(|| async {
+                self.run_agent_preflight_uncached(
+                    wf_id,
+                    node,
+                    run_id,
+                    ctx,
+                    diagnostic_factory,
+                    cancel,
+                    entry.clone(),
+                    cleanup_tracker,
+                )
+                .await
+            })
+            .await
+            .clone();
+        if result.is_err()
+            && !result
+                .as_ref()
+                .is_err_and(PreflightFailure::retain_in_run_cache)
+        {
+            let mut cache = cache.lock().await;
+            if cache
+                .get(&cache_key)
+                .is_some_and(|cached| Arc::ptr_eq(cached, &cell))
+            {
+                cache.remove(&cache_key);
+            }
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_agent_preflight_uncached(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        run_id: &str,
+        ctx: &WorkflowRunContext,
+        diagnostic_factory: &Arc<dyn DiagnosticObserverFactory>,
+        cancel: &CancellationToken,
+        entry: Arc<AgentEntry>,
+        cleanup_tracker: &WorkflowCleanupTracker,
+    ) -> Result<PreflightDecision, PreflightFailure> {
+        let candidates = Self::preflight_candidates(&entry);
+        let mut attempts = Vec::new();
+        for (idx, model) in candidates.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(PreflightFailure::Canceled);
+            }
+            let attempt_no = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+            let diagnostic = diagnostic_factory.make(
+                &node.id,
+                PREFLIGHT_OBSERVER_ATTEMPT_BASE.saturating_add(attempt_no),
+            );
+            let started = std::time::Instant::now();
+            let mut usage: Option<UsageSnapshot> = None;
+            let mut reason: Option<String> = None;
+
+            let resolved_result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(PreflightFailure::Canceled),
+                result = self.registry.resolve_observed(&entry.id, diagnostic.clone()) => result,
+            };
+            let resolved = match resolved_result {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    attempts.push(AttemptSummary {
+                        attempt: attempt_no,
+                        model: model.clone(),
+                        duration: started.elapsed(),
+                        usage: None,
+                        reason: format!("resolve error: {error:?}"),
+                    });
+                    if idx + 1 < candidates.len() {
+                        self.registry.invalidate(&entry.id).await;
+                        tracing::warn!(
+                            agent = entry.id.as_str(),
+                            model = %model_label(model.as_deref()),
+                            error = ?error,
+                            "workflow preflight fallback after resolve error"
+                        );
+                        continue;
+                    }
+                    break;
+                }
+            };
+            if cancel.is_cancelled() {
+                return Err(PreflightFailure::Canceled);
+            }
+
+            let mut eff = effective_config(&resolved.entry, None);
+            eff.model = model.clone();
+            let session = match SessionId::parse(format!(
+                "workflow-preflight-{wf_id}-{}-{run_id}-{attempt_no}",
+                entry.id.as_str()
+            )) {
+                Ok(session) => session,
+                Err(error) => {
+                    return Err(PreflightFailure::Hard {
+                        message: format!("preflight failed to build session id: {error:?}"),
+                        failure_class: classify_failure(&error),
+                        retain_in_run_cache: false,
+                    });
+                }
+            };
+
+            let preflight_spec = SessionSpec {
+                config: eff,
+                cwd: ctx.session_cwd.clone(),
+            };
+            let configure_result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    let _ = cleanup_cold_session(
+                        &resolved.backend,
+                        &session,
+                        &diagnostic,
+                        ColdCleanupAction::Forget,
+                        cleanup_tracker,
+                    ).await;
+                    return Err(PreflightFailure::Canceled);
+                }
+                result = resolved.backend.configure_session(&session, &preflight_spec) => result,
+            };
+            if let Err(error) = configure_result {
+                let _ = cleanup_cold_session(
+                    &resolved.backend,
+                    &session,
+                    &diagnostic,
+                    ColdCleanupAction::Forget,
+                    cleanup_tracker,
+                )
+                .await;
+                attempts.push(AttemptSummary {
+                    attempt: attempt_no,
+                    model: model.clone(),
+                    duration: started.elapsed(),
+                    usage: None,
+                    reason: format!("configure error: {error:?}"),
+                });
+                if idx + 1 < candidates.len() {
+                    self.registry.invalidate(&entry.id).await;
+                    tracing::warn!(
+                        agent = entry.id.as_str(),
+                        model = %model_label(model.as_deref()),
+                        error = ?error,
+                        "workflow preflight fallback after configure error"
+                    );
+                    continue;
+                }
+                break;
+            }
+            if cancel.is_cancelled() {
+                let _ = cleanup_cold_session(
+                    &resolved.backend,
+                    &session,
+                    &diagnostic,
+                    ColdCleanupAction::Forget,
+                    cleanup_tracker,
+                )
+                .await;
+                return Err(PreflightFailure::Canceled);
+            }
+
+            let stream = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    cancel_and_forget_preflight_session(
+                        &resolved.backend,
+                        &session,
+                        &diagnostic,
+                        cleanup_tracker,
+                    ).await;
+                    return Err(PreflightFailure::Canceled);
+                }
+                result = resolved.backend.prompt_with_observers(
+                    &session,
+                    vec![Part {
+                        text: WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+                    }],
+                    BackendObservers::diagnostic_only(diagnostic.clone()),
+                ) => result,
+            };
+            if cancel.is_cancelled() {
+                cancel_and_forget_preflight_session(
+                    &resolved.backend,
+                    &session,
+                    &diagnostic,
+                    cleanup_tracker,
+                )
+                .await;
+                return Err(PreflightFailure::Canceled);
+            }
+            let mut stream = match stream {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let may_have_been_accepted = match &error {
+                        BridgeError::AgentFailure { diagnostic } => {
+                            diagnostic.prompt_may_have_been_accepted()
+                        }
+                        _ => true,
+                    };
+                    if may_have_been_accepted {
+                        cancel_and_forget_preflight_session(
+                            &resolved.backend,
+                            &session,
+                            &diagnostic,
+                            cleanup_tracker,
+                        )
+                        .await;
+                    } else {
+                        let _ = cleanup_cold_session(
+                            &resolved.backend,
+                            &session,
+                            &diagnostic,
+                            ColdCleanupAction::Forget,
+                            cleanup_tracker,
+                        )
+                        .await;
+                    }
+                    attempts.push(AttemptSummary {
+                        attempt: attempt_no,
+                        model: model.clone(),
+                        duration: started.elapsed(),
+                        usage: None,
+                        reason: format!("prompt error: {error:?}"),
+                    });
+                    if may_have_been_accepted {
+                        return Err(PreflightFailure::Hard {
+                            message: format!(
+                                "preflight stopped for agent {} because prompt acceptance could not be excluded: {}",
+                                entry.id.as_str(),
+                                format_attempt_summaries(&attempts)
+                            ),
+                            failure_class: classify_failure(&error),
+                            retain_in_run_cache: true,
+                        });
+                    }
+                    if idx + 1 < candidates.len() {
+                        self.registry.invalidate(&entry.id).await;
+                        tracing::warn!(
+                            agent = entry.id.as_str(),
+                            model = %model_label(model.as_deref()),
+                            error = ?error,
+                            "workflow preflight fallback after prompt error"
+                        );
+                        continue;
+                    }
+                    break;
+                }
+            };
+
+            let mut text = String::new();
+            let mut saw_done = false;
+            let mut replay_barrier = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    item = stream.next() => match item {
+                        Some(Ok(Update::Text(chunk))) => text.push_str(&chunk),
+                        Some(Ok(Update::Usage(mut next_usage))) => {
+                            if let Some(previous) = &usage {
+                                next_usage.merge_missing_from(previous);
+                            }
+                            usage = Some(next_usage);
+                        }
+                        Some(Ok(Update::Permission(_))) => {}
+                        Some(Ok(Update::Done { stop_reason, .. })) => {
+                            saw_done = true;
+                            if stop_reason != STOP_REASON_CANCELLED {
+                                break;
+                            }
+                            reason = Some("preflight canceled by agent".to_string());
+                            break;
+                        }
+                        Some(Err(error)) => {
+                            reason = Some(format!("stream error: {error:?}"));
+                            replay_barrier = true;
+                            break;
+                        }
+                        None => {
+                            reason = Some("stream ended before terminal Done".to_string());
+                            replay_barrier = true;
+                            break;
+                        }
+                    },
+                    _ = cancel.cancelled() => {
+                        cancel_and_forget_preflight_session(
+                            &resolved.backend,
+                            &session,
+                            &diagnostic,
+                            cleanup_tracker,
+                        ).await;
+                        return Err(PreflightFailure::Canceled);
+                    }
+                }
+            }
+
+            let cleanup_error = if replay_barrier {
+                cancel_and_forget_preflight_session(
+                    &resolved.backend,
+                    &session,
+                    &diagnostic,
+                    cleanup_tracker,
+                )
+                .await;
+                None
+            } else {
+                cleanup_cold_session(
+                    &resolved.backend,
+                    &session,
+                    &diagnostic,
+                    ColdCleanupAction::Forget,
+                    cleanup_tracker,
+                )
+                .await
+                .err()
+            };
+
+            if saw_done
+                && reason.is_none()
+                && is_exact_preflight_pong(&text)
+                && cleanup_error.is_none()
+            {
+                let substituted_from = if model != &entry.model {
+                    Some(model_label(entry.model.as_deref()))
+                } else {
+                    None
+                };
+                if let Some(from) = &substituted_from {
+                    let to = model_label(model.as_deref());
+                    tracing::warn!(
+                        agent = entry.id.as_str(),
+                        from = %from,
+                        to = %to,
+                        "workflow preflight selected fallback model"
+                    );
+                    if let Some(factory) = &ctx.make_rich_sink {
+                        let sink = factory.make(&node.id);
+                        sink.record(bridge_core::orch::OrchEventKind::Progress {
+                            progress: bridge_core::orch::ProgressPayload::legacy(format!(
+                                "workflow preflight selected fallback model for agent {}: {from} -> {to}",
+                                entry.id.as_str()
+                            )),
+                        });
+                        let _ = sink.flush().await;
+                    }
+                }
+                let decision = PreflightDecision {
+                    selected_model: model.clone(),
+                    substituted_from,
+                };
+                return Ok(decision);
+            }
+
+            let reason = match cleanup_error {
+                Some(error) => format!("cleanup error: {error:?}"),
+                None => reason.unwrap_or_else(|| {
+                    if !saw_done {
+                        "stream ended before terminal Done".to_string()
+                    } else if text.trim().is_empty() {
+                        "empty final".to_string()
+                    } else {
+                        format!("unexpected smoke response: {text:?}")
+                    }
+                }),
+            };
+            attempts.push(AttemptSummary {
+                attempt: attempt_no,
+                model: model.clone(),
+                duration: started.elapsed(),
+                usage: usage.clone(),
+                reason: reason.clone(),
+            });
+            return Err(PreflightFailure::Hard {
+                message: format!(
+                    "preflight stopped for agent {} because the prompt was accepted and must not be replayed: {}",
+                    entry.id.as_str(),
+                    format_attempt_summaries(&attempts)
+                ),
+                failure_class: FailureClass::Other,
+                retain_in_run_cache: true,
+            });
+        }
+
+        Err(PreflightFailure::Hard {
+            message: format!(
+                "preflight exhausted for agent {} after {} model(s): {}",
+                entry.id.as_str(),
+                attempts.len(),
+                format_attempt_summaries(&attempts)
+            ),
+            failure_class: FailureClass::Other,
+            retain_in_run_cache: false,
+        })
     }
 
     /// Run one node: render its prompt from `vars`, resolve+configure+prompt+drain, forget.
@@ -510,156 +1263,157 @@ impl WorkflowExecutor {
         prompt_dispatch: &Option<PromptDispatchBarrier>,
         cleanup_tracker: &WorkflowCleanupTracker,
         dispatcher: Option<&Arc<dyn WorkflowNodeDispatcher>>,
-    ) -> (String, bool, Option<UsageSnapshot>, NodeDisposition) {
+        preflight_cache: &PreflightCache,
+    ) -> Result<NodeRunOutput, BridgeError> {
         if cancel.is_cancelled() {
-            return (
+            return node_run_output(
+                wf_id,
+                node,
+                run_id,
+                ctx,
                 format!("[node {} canceled]", node.id.as_str()),
                 false,
                 None,
                 NodeDisposition::Canceled,
+                CompletionBodyOrigin::BridgeSyntheticCancellation,
             );
         }
         if let Some(d) = dispatcher {
             let rendered = render(&node.prompt_template, vars);
-            let diagnostic = diagnostic_factory.make(&node.id, 1);
-            // Emit NodeStarted before checkout (analogous to the cold path emitting before resolve).
-            let obs_ctx = node_turn_context(wf_id, node, run_id, ctx, None, None, None, 1);
+            let node_obs_ctx = node_turn_context(wf_id, node, run_id, ctx, None, None, None, 0)?;
             ctx.observer
-                .record(&ObsEvent::NodeStarted { ctx: &obs_ctx });
-            let mut turn = match d
-                .checkout_observed(wf_id, node, run_id, ctx, diagnostic.clone())
-                .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    let fail_out = TurnOutcome::Failed(classify_failure(&e));
-                    ctx.observer.record(&ObsEvent::NodeFinished {
-                        ctx: &obs_ctx,
-                        outcome: &fail_out,
-                    });
-                    return (
-                        format!("[node {} failed: {:?}]", node.id.as_str(), e),
-                        false,
-                        None,
-                        NodeDisposition::Failed,
-                    );
-                }
-            };
-            if cancel.is_cancelled() {
-                let cleanup = cleanup_warm_turn(
-                    turn.cleanup,
-                    NodeTurnExit::Normal,
-                    diagnostic.clone(),
-                    cleanup_tracker,
-                )
-                .await;
-                let (text, outcome) = match cleanup {
-                    Ok(()) => (
-                        format!("[node {} canceled]", node.id.as_str()),
-                        TurnOutcome::Canceled,
-                    ),
-                    Err(error) => (
-                        format!("[node {} cleanup failed: {:?}]", node.id.as_str(), error),
-                        TurnOutcome::Failed(classify_failure(&error)),
-                    ),
-                };
-                ctx.observer.record(&ObsEvent::NodeFinished {
-                    ctx: &obs_ctx,
-                    outcome: &outcome,
-                });
-                let disposition = NodeDisposition::from_turn(&outcome);
-                return (text, false, None, disposition);
-            }
-
-            let mut parts = vec![Part { text: rendered }];
-            if let Some(seed) = turn.seed {
-                parts.insert(
-                    0,
-                    Part {
-                        text: format!("[Summary of earlier context in this session]\n{seed}"),
-                    },
-                );
-            }
-
-            ctx.observer
-                .record(&ObsEvent::TurnStarted { ctx: &obs_ctx });
-            let turn_start = std::time::Instant::now();
-            let mut ttft_val: Option<std::time::Duration> = None;
-            let rich_sink = ctx
-                .make_rich_sink
-                .as_ref()
-                .map(|factory| factory.make(&node.id));
-
-            let mut stream = tokio::select! {
-                biased;
-                // Prompt-open is the ownership boundary. If the backend result
-                // and workflow cancellation are simultaneously ready, observe
-                // the concrete backend result first so a structured failure
-                // can arm warm-session expiry. A pending prompt still yields
-                // immediately to cancellation.
-                s = async {
-                    if let Some(barrier) = prompt_dispatch {
-                        barrier().await;
-                    }
-                    turn.backend.prompt_with_observers(
-                        &turn.session,
-                        parts,
-                        BackendObservers::new(diagnostic.clone(), rich_sink.clone()),
-                    ).await
-                } => match s {
-                    Ok(s) => s,
-                    Err(e) => {
-                        turn
-                            .cleanup
-                            .arm_exit(&NodeTurnExit::Error(e.clone()));
-                        if let Some(sink) = &rich_sink {
-                            if let Err(flush_error) = sink.flush().await {
-                                eprintln!(
-                                    "rich sink flush failed after warm prompt error for node {}: {:?}",
-                                    node.id.as_str(),
-                                    flush_error
-                                );
-                            }
-                        }
-                        let text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
-                        let fail_out = TurnOutcome::Failed(classify_failure(&e));
-                        let _ = cleanup_warm_turn(
-                            turn.cleanup,
-                            NodeTurnExit::Error(e),
-                            diagnostic.clone(),
+                .record(&ObsEvent::NodeStarted { ctx: &node_obs_ctx });
+            let entry_snapshot = self.registry.entry_snapshot(&node.agent);
+            let (checkout_overrides, obs_model, obs_effort, obs_mode) =
+                if let Some(entry) = entry_snapshot.as_ref().filter(|entry| entry.preflight) {
+                    let preflight_decision = match self
+                        .ensure_agent_preflight(
+                            wf_id,
+                            node,
+                            run_id,
+                            ctx,
+                            diagnostic_factory,
+                            cancel,
+                            entry.clone(),
+                            preflight_cache,
                             cleanup_tracker,
                         )
-                        .await;
-                        ctx.observer.record(&ObsEvent::TurnFinished {
-                            ctx: &obs_ctx,
-                            latency: turn_start.elapsed(),
-                            ttft: None,
-                            outcome: &fail_out,
-                        });
-                        ctx.observer.record(&ObsEvent::UsageFinalized {
-                            ctx: &obs_ctx,
-                            usage: None,
-                            fin: UsageFinalization::TurnFinal,
-                        });
-                        ctx.observer
-                            .record(&ObsEvent::NodeFinished { ctx: &obs_ctx, outcome: &fail_out });
-                        return (text, false, None, NodeDisposition::Failed);
-                    }
-                },
-                _ = cancel.cancelled() => {
-                    turn.cleanup.arm_exit(&NodeTurnExit::Canceled);
-                    if let Some(sink) = &rich_sink {
-                        if let Err(flush_error) = sink.flush().await {
-                            eprintln!(
-                                "rich sink flush failed after warm prompt-open cancellation for node {}: {:?}",
-                                node.id.as_str(),
-                                flush_error
+                        .await
+                    {
+                        Ok(decision) => decision,
+                        Err(PreflightFailure::Canceled) => {
+                            let outcome = TurnOutcome::Canceled;
+                            ctx.observer.record(&ObsEvent::NodeFinished {
+                                ctx: &node_obs_ctx,
+                                outcome: &outcome,
+                            });
+                            return node_run_output(
+                                wf_id,
+                                node,
+                                run_id,
+                                ctx,
+                                format!("[node {} canceled]", node.id.as_str()),
+                                false,
+                                None,
+                                NodeDisposition::Canceled,
+                                CompletionBodyOrigin::BridgeSyntheticCancellation,
                             );
                         }
+                        Err(PreflightFailure::Hard {
+                            message,
+                            failure_class,
+                            ..
+                        }) => {
+                            let outcome = TurnOutcome::Failed(failure_class);
+                            ctx.observer.record(&ObsEvent::NodeFinished {
+                                ctx: &node_obs_ctx,
+                                outcome: &outcome,
+                            });
+                            return node_run_output(
+                                wf_id,
+                                node,
+                                run_id,
+                                ctx,
+                                format!("[node {} failed: {message}]", node.id.as_str()),
+                                false,
+                                None,
+                                NodeDisposition::Failed,
+                                CompletionBodyOrigin::BridgeSyntheticStreamError,
+                            );
+                        }
+                    };
+                    let mut eff = effective_config(entry, None);
+                    eff.model = preflight_decision.selected_model.clone();
+                    let checkout_overrides =
+                        preflight_decision
+                            .substituted_from
+                            .as_ref()
+                            .map(|_| AgentOverride {
+                                model: preflight_decision.selected_model.clone(),
+                                effort: None,
+                                mode: None,
+                            });
+                    (
+                        checkout_overrides,
+                        eff.model.clone(),
+                        eff.effort
+                            .as_ref()
+                            .map(|e| format!("{e:?}").to_ascii_lowercase()),
+                        eff.mode.clone(),
+                    )
+                } else {
+                    (None, None, None, None)
+                };
+            let attempt = 1_u32;
+            // A successful prompt-open makes this path deliberately single-attempt:
+            // terminal failures must leave the accepted prompt unreplayed.
+            {
+                let diagnostic = diagnostic_factory.make(&node.id, attempt);
+                let obs_ctx = node_turn_context(
+                    wf_id,
+                    node,
+                    run_id,
+                    ctx,
+                    obs_model.clone(),
+                    obs_effort.clone(),
+                    obs_mode.clone(),
+                    attempt,
+                )?;
+                let mut turn = match d
+                    .checkout_observed_with_overrides(
+                        wf_id,
+                        node,
+                        run_id,
+                        ctx,
+                        checkout_overrides.clone(),
+                        diagnostic.clone(),
+                    )
+                    .await
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let fail_out = TurnOutcome::Failed(classify_failure(&e));
+                        ctx.observer.record(&ObsEvent::NodeFinished {
+                            ctx: &node_obs_ctx,
+                            outcome: &fail_out,
+                        });
+                        return node_run_output(
+                            wf_id,
+                            node,
+                            run_id,
+                            ctx,
+                            format!("[node {} failed: {:?}]", node.id.as_str(), e),
+                            false,
+                            None,
+                            NodeDisposition::Failed,
+                            CompletionBodyOrigin::BridgeSyntheticStreamError,
+                        );
                     }
+                };
+                if cancel.is_cancelled() {
                     let cleanup = cleanup_warm_turn(
                         turn.cleanup,
-                        NodeTurnExit::Canceled,
+                        NodeTurnExit::Normal,
                         diagnostic.clone(),
                         cleanup_tracker,
                     )
@@ -674,154 +1428,461 @@ impl WorkflowExecutor {
                             TurnOutcome::Failed(classify_failure(&error)),
                         ),
                     };
-                    ctx.observer.record(&ObsEvent::TurnFinished {
-                        ctx: &obs_ctx,
-                        latency: turn_start.elapsed(),
-                        ttft: None,
-                        outcome: &outcome,
-                    });
-                    ctx.observer.record(&ObsEvent::UsageFinalized {
-                        ctx: &obs_ctx,
-                        usage: None,
-                        fin: UsageFinalization::TurnFinal,
-                    });
                     ctx.observer.record(&ObsEvent::NodeFinished {
-                        ctx: &obs_ctx,
+                        ctx: &node_obs_ctx,
                         outcome: &outcome,
                     });
                     let disposition = NodeDisposition::from_turn(&outcome);
-                    return (text, false, None, disposition);
+                    let origin = if matches!(disposition, NodeDisposition::Canceled) {
+                        CompletionBodyOrigin::BridgeSyntheticCancellation
+                    } else {
+                        CompletionBodyOrigin::BridgeSyntheticStreamError
+                    };
+                    return node_run_output(
+                        wf_id,
+                        node,
+                        run_id,
+                        ctx,
+                        text,
+                        false,
+                        None,
+                        disposition,
+                        origin,
+                    );
                 }
-            };
-            let mut text = String::new();
-            let mut ok = true;
-            let mut last_usage: Option<UsageSnapshot> = None;
-            let mut exit = loop {
-                tokio::select! {
+
+                let prefix_capability = turn.backend.prefix_attestation_capability();
+                let node_harvest_mode = node.harvest_sanitization.unwrap_or_default();
+                let prefix_attestation_request = match prefix_attestation_request_for_capability(
+                    node_harvest_mode,
+                    &prefix_capability,
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let cleanup = cleanup_warm_turn(
+                            turn.cleanup,
+                            NodeTurnExit::Normal,
+                            diagnostic.clone(),
+                            cleanup_tracker,
+                        )
+                        .await;
+                        let text = match cleanup {
+                            Ok(()) => {
+                                format!("[node {} failed: {:?}]", node.id.as_str(), error)
+                            }
+                            Err(cleanup_error) => format!(
+                                "[node {} cleanup failed after prefix setup error: {:?}]",
+                                node.id.as_str(),
+                                cleanup_error
+                            ),
+                        };
+                        let outcome = TurnOutcome::Failed(classify_failure(&error));
+                        ctx.observer.record(&ObsEvent::NodeFinished {
+                            ctx: &node_obs_ctx,
+                            outcome: &outcome,
+                        });
+                        return node_run_output(
+                            wf_id,
+                            node,
+                            run_id,
+                            ctx,
+                            text,
+                            false,
+                            None,
+                            NodeDisposition::Failed,
+                            CompletionBodyOrigin::BridgeSyntheticStreamError,
+                        );
+                    }
+                };
+                turn.backend
+                    .configure_turn(
+                        &turn.session,
+                        TurnMeta {
+                            context_id: obs_ctx.session_id.clone(),
+                            // NodeTurn carries no session-manager generation/op;
+                            // mirror the cold-path convention: attempt-scoped
+                            // generation and a synthesized workflow operation id.
+                            generation: u64::from(attempt),
+                            op: OperationId::parse(format!(
+                                "workflow-{}-{attempt}",
+                                node.id.as_str()
+                            ))
+                            .expect("workflow operation id is nonempty"),
+                            turn_id: obs_ctx.turn_id.clone(),
+                            requested_mode: node_harvest_mode,
+                            prefix_attestation_request: prefix_attestation_request.clone(),
+                        },
+                    )
+                    .await;
+                let rendered_with_contract = append_prompt_contract(
+                    rendered.clone(),
+                    &prefix_capability,
+                    &prefix_attestation_request,
+                );
+                let mut parts = vec![Part {
+                    text: rendered_with_contract,
+                }];
+                if let Some(seed) = turn.seed {
+                    parts.insert(
+                        0,
+                        Part {
+                            text: format!("[Summary of earlier context in this session]\n{seed}"),
+                        },
+                    );
+                }
+
+                ctx.observer
+                    .record(&ObsEvent::TurnStarted { ctx: &obs_ctx });
+                let turn_start = std::time::Instant::now();
+                let mut ttft_val: Option<std::time::Duration> = None;
+                let rich_sink = ctx
+                    .make_rich_sink
+                    .as_ref()
+                    .map(|factory| factory.make(&node.id));
+
+                let mut stream = tokio::select! {
                     biased;
-                    // Prompt ownership already exists here. If a backend item
-                    // and workflow cancellation are simultaneously ready, the
-                    // concrete backend result wins so a queued AgentFailure can
-                    // arm warm-session expiry. A pending stream still yields
+                    // Prompt-open is the ownership boundary. If the backend result
+                    // and workflow cancellation are simultaneously ready, observe
+                    // the concrete backend result first so a structured failure
+                    // can arm warm-session expiry. A pending prompt still yields
                     // immediately to cancellation.
-                    item = stream.next() => match item {
-                        Some(Ok(Update::Text(t))) => {
-                            if ttft_val.is_none() && !t.is_empty() {
-                                ttft_val = Some(turn_start.elapsed());
-                            }
-                            text.push_str(&t);
-                            if cancel.is_cancelled() {
-                                ok = false;
-                                text = format!("[node {} canceled]", node.id.as_str());
-                                break NodeTurnExit::Canceled;
-                            }
+                    s = async {
+                        if let Some(barrier) = prompt_dispatch {
+                            barrier().await;
                         }
-                        Some(Ok(Update::Permission(_))) => {
-                            if cancel.is_cancelled() {
-                                ok = false;
-                                text = format!("[node {} canceled]", node.id.as_str());
-                                break NodeTurnExit::Canceled;
+                        turn.backend.prompt_with_observers(
+                            &turn.session,
+                            parts,
+                            BackendObservers::new(diagnostic.clone(), rich_sink.clone()),
+                        ).await
+                    } => match s {
+                        Ok(s) => s,
+                        Err(e) => {
+                            turn
+                                .cleanup
+                                .arm_exit(&NodeTurnExit::Error(e.clone()));
+                            if let Some(sink) = &rich_sink {
+                                if let Err(flush_error) = sink.flush().await {
+                                    eprintln!(
+                                        "rich sink flush failed after warm prompt error for node {}: {:?}",
+                                        node.id.as_str(),
+                                        flush_error
+                                    );
+                                }
                             }
+                            let text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
+                            let fail_out = TurnOutcome::Failed(classify_failure(&e));
+                            let _ = cleanup_warm_turn(
+                                turn.cleanup,
+                                NodeTurnExit::Error(e),
+                                diagnostic.clone(),
+                                cleanup_tracker,
+                            )
+                            .await;
+                            ctx.observer.record(&ObsEvent::TurnFinished {
+                                ctx: &obs_ctx,
+                                latency: turn_start.elapsed(),
+                                ttft: None,
+                                outcome: &fail_out,
+                            });
+                            ctx.observer.record(&ObsEvent::UsageFinalized {
+                                ctx: &obs_ctx,
+                                usage: None,
+                                fin: UsageFinalization::TurnFinal,
+                            });
+                            ctx.observer.record(&ObsEvent::NodeFinished {
+                                ctx: &node_obs_ctx,
+                                outcome: &fail_out,
+                            });
+                            return node_run_output(
+                                wf_id,
+                                node,
+                                run_id,
+                                ctx,
+                                text,
+                                false,
+                                None,
+                                NodeDisposition::Failed,
+                                CompletionBodyOrigin::BridgeSyntheticStreamError,
+                            );
                         }
-                        Some(Ok(Update::Usage(mut u))) => {
-                            if let Some(previous) = &last_usage {
-                                u.merge_missing_from(previous);
-                            }
-                            last_usage = Some(u);
-                            if cancel.is_cancelled() {
-                                ok = false;
-                                text = format!("[node {} canceled]", node.id.as_str());
-                                break NodeTurnExit::Canceled;
-                            }
-                        }
-                        Some(Ok(Update::Done { stop_reason })) => {
-                            if stop_reason == STOP_REASON_CANCELLED { ok = false; }
-                            break NodeTurnExit::Normal;
-                        }
-                        Some(Err(e)) => {
-                            ok = false;
-                            text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
-                            break NodeTurnExit::Error(e);
-                        }
-                        None => break NodeTurnExit::Normal,
                     },
                     _ = cancel.cancelled() => {
-                        ok = false;
-                        text = format!("[node {} canceled]", node.id.as_str());
-                        break NodeTurnExit::Canceled;
-                    }
-                }
-            };
-            // The cleanup owner must learn the terminal state before rich-sink
-            // flush, which is a cancellation point. Warm cleanup uses this to
-            // make structured-failure expiry sticky if the executor is dropped
-            // while the flush is pending.
-            turn.cleanup.arm_exit(&exit);
-            if let Some(sink) = &rich_sink {
-                if let Err(flush_error) = sink.flush().await {
-                    if ok && matches!(&exit, NodeTurnExit::Normal) {
-                        ok = false;
-                        text = format!(
-                            "[node {} rich-flush failed: {:?}]",
-                            node.id.as_str(),
-                            flush_error
+                        turn.cleanup.arm_exit(&NodeTurnExit::Canceled);
+                        if let Some(sink) = &rich_sink {
+                            if let Err(flush_error) = sink.flush().await {
+                                eprintln!(
+                                    "rich sink flush failed after warm prompt-open cancellation for node {}: {:?}",
+                                    node.id.as_str(),
+                                    flush_error
+                                );
+                            }
+                        }
+                        let cleanup = cleanup_warm_turn(
+                            turn.cleanup,
+                            NodeTurnExit::Canceled,
+                            diagnostic.clone(),
+                            cleanup_tracker,
+                        )
+                        .await;
+                        let (text, outcome) = match cleanup {
+                            Ok(()) => (
+                                format!("[node {} canceled]", node.id.as_str()),
+                                TurnOutcome::Canceled,
+                            ),
+                            Err(error) => (
+                                format!("[node {} cleanup failed: {:?}]", node.id.as_str(), error),
+                                TurnOutcome::Failed(classify_failure(&error)),
+                            ),
+                        };
+                        ctx.observer.record(&ObsEvent::TurnFinished {
+                            ctx: &obs_ctx,
+                            latency: turn_start.elapsed(),
+                            ttft: None,
+                            outcome: &outcome,
+                        });
+                        ctx.observer.record(&ObsEvent::UsageFinalized {
+                            ctx: &obs_ctx,
+                            usage: None,
+                            fin: UsageFinalization::TurnFinal,
+                        });
+                        ctx.observer.record(&ObsEvent::NodeFinished {
+                            ctx: &node_obs_ctx,
+                            outcome: &outcome,
+                        });
+                        let disposition = NodeDisposition::from_turn(&outcome);
+                        let origin = if matches!(disposition, NodeDisposition::Canceled) {
+                            CompletionBodyOrigin::BridgeSyntheticCancellation
+                        } else {
+                            CompletionBodyOrigin::BridgeSyntheticStreamError
+                        };
+                        return node_run_output(
+                            wf_id,
+                            node,
+                            run_id,
+                            ctx,
+                            text,
+                            false,
+                            None,
+                            disposition,
+                            origin,
                         );
-                        exit = NodeTurnExit::Error(flush_error);
-                        turn.cleanup.arm_exit(&exit);
-                    } else {
-                        eprintln!(
-                            "rich sink flush failed after warm node exit for {}: {:?}",
-                            node.id.as_str(),
-                            flush_error
-                        );
                     }
+                };
+                let mut text = String::new();
+                let mut ok = true;
+                let mut saw_done = false;
+                let mut done_stop_cancelled = false;
+                let mut prefix_attestation_status = PrefixAttestationStatus::default();
+                let mut last_usage: Option<UsageSnapshot> = None;
+                let mut exit = loop {
+                    tokio::select! {
+                        biased;
+                        // Prompt ownership already exists here. If a backend item
+                        // and workflow cancellation are simultaneously ready, the
+                        // concrete backend result wins so a queued AgentFailure can
+                        // arm warm-session expiry. A pending stream still yields
+                        // immediately to cancellation.
+                        item = stream.next() => match item {
+                            Some(Ok(Update::Text(t))) => {
+                                if ttft_val.is_none() && !t.is_empty() {
+                                    ttft_val = Some(turn_start.elapsed());
+                                }
+                                text.push_str(&t);
+                                if cancel.is_cancelled() {
+                                    ok = false;
+                                    text = format!("[node {} canceled]", node.id.as_str());
+                                    break NodeTurnExit::Canceled;
+                                }
+                            }
+                            Some(Ok(Update::Permission(_))) => {
+                                if cancel.is_cancelled() {
+                                    ok = false;
+                                    text = format!("[node {} canceled]", node.id.as_str());
+                                    break NodeTurnExit::Canceled;
+                                }
+                            }
+                            Some(Ok(Update::Usage(mut u))) => {
+                                if let Some(previous) = &last_usage {
+                                    u.merge_missing_from(previous);
+                                }
+                                last_usage = Some(u);
+                                if cancel.is_cancelled() {
+                                    ok = false;
+                                    text = format!("[node {} canceled]", node.id.as_str());
+                                    break NodeTurnExit::Canceled;
+                                }
+                            }
+                            Some(Ok(Update::Done { stop_reason, prefix_attestation })) => {
+                                saw_done = true;
+                                prefix_attestation_status = prefix_attestation;
+                                if stop_reason == STOP_REASON_CANCELLED {
+                                    done_stop_cancelled = true;
+                                    ok = false;
+                                }
+                                break NodeTurnExit::Normal;
+                            }
+                            Some(Err(e)) => {
+                                ok = false;
+                                text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
+                                break NodeTurnExit::Error(e);
+                            }
+                            None => {
+                                let dropped = stream_dropped_error();
+                                ok = false;
+                                text = format!("[node {} failed: {:?}]", node.id.as_str(), dropped);
+                                break NodeTurnExit::Error(dropped);
+                            }
+                        },
+                        _ = cancel.cancelled() => {
+                            ok = false;
+                            text = format!("[node {} canceled]", node.id.as_str());
+                            break NodeTurnExit::Canceled;
+                        }
+                    }
+                };
+                if matches!(&exit, NodeTurnExit::Error(BridgeError::AgentCrashed { .. })) {
+                    record_synthetic_failure(
+                        &diagnostic,
+                        bridge_core::diagnostics::DiagnosticPhase::PromptStream,
+                        "workflow.stream.dropped",
+                        bridge_core::diagnostics::DiagnosticFailureClass::AgentProcess,
+                        format!(
+                            "node {} stream ended before terminal Done",
+                            node.id.as_str()
+                        ),
+                        vec!["missing Update::Done".to_string()],
+                    )
+                    .await;
                 }
-            }
-            // Settle operation-owned cleanup before terminal observability. A
-            // teardown failure is primary only when no earlier backend/rich
-            // failure already owns the node outcome.
-            let had_primary_failure = matches!(&exit, NodeTurnExit::Error(_));
-            let mut node_outcome = match &exit {
-                NodeTurnExit::Canceled => TurnOutcome::Canceled,
-                NodeTurnExit::Error(error) => TurnOutcome::Failed(classify_failure(error)),
-                NodeTurnExit::Normal if ok => TurnOutcome::Success,
-                NodeTurnExit::Normal => TurnOutcome::Failed(FailureClass::Other),
-            };
-            let cleanup_result =
-                cleanup_warm_turn(turn.cleanup, exit, diagnostic.clone(), cleanup_tracker).await;
-            if let Err(error) = cleanup_result {
-                if !had_primary_failure {
+                if saw_done && ok && text.trim().is_empty() {
+                    record_synthetic_failure(
+                        &diagnostic,
+                        bridge_core::diagnostics::DiagnosticPhase::PromptFinish,
+                        "workflow.empty_final",
+                        bridge_core::diagnostics::DiagnosticFailureClass::Protocol,
+                        format!(
+                            "node {} completed with an empty final agent message",
+                            node.id.as_str()
+                        ),
+                        vec!["empty final agent message".to_string()],
+                    )
+                    .await;
                     ok = false;
-                    text = format!("[node {} cleanup failed: {:?}]", node.id.as_str(), error);
-                    node_outcome = TurnOutcome::Failed(classify_failure(&error));
+                    text = format!(
+                        "[node {} failed: {:?}]",
+                        node.id.as_str(),
+                        BridgeError::EmptyFinal
+                    );
+                    exit = NodeTurnExit::Error(BridgeError::EmptyFinal);
                 }
-                // Otherwise the operation observer recorded bounded teardown
-                // evidence and the earlier backend/rich failure remains primary.
-            }
+                // The cleanup owner must learn the terminal state before rich-sink
+                // flush, which is a cancellation point. Warm cleanup uses this to
+                // make structured-failure expiry sticky if the executor is dropped
+                // while the flush is pending.
+                turn.cleanup.arm_exit(&exit);
+                if let Some(sink) = &rich_sink {
+                    if let Err(flush_error) = sink.flush().await {
+                        if ok && matches!(&exit, NodeTurnExit::Normal) {
+                            ok = false;
+                            text = format!(
+                                "[node {} rich-flush failed: {:?}]",
+                                node.id.as_str(),
+                                flush_error
+                            );
+                            exit = NodeTurnExit::Error(flush_error);
+                            turn.cleanup.arm_exit(&exit);
+                        } else {
+                            eprintln!(
+                                "rich sink flush failed after warm node exit for {}: {:?}",
+                                node.id.as_str(),
+                                flush_error
+                            );
+                        }
+                    }
+                }
+                // Settle operation-owned cleanup before terminal observability. A
+                // teardown failure is primary only when no earlier backend/rich
+                // failure already owns the node outcome.
+                let empty_final_failure =
+                    matches!(&exit, NodeTurnExit::Error(BridgeError::EmptyFinal));
+                let had_primary_failure = matches!(&exit, NodeTurnExit::Error(_));
+                // Capture the classification facts needed after `exit` is moved
+                // into `on_exit_observed` (origin classification below reads them).
+                let exit_was_normal = matches!(&exit, NodeTurnExit::Normal);
+                let exit_agent_crashed =
+                    matches!(&exit, NodeTurnExit::Error(BridgeError::AgentCrashed { .. }));
+                let mut node_outcome = match &exit {
+                    NodeTurnExit::Canceled => TurnOutcome::Canceled,
+                    NodeTurnExit::Error(error) => TurnOutcome::Failed(classify_failure(error)),
+                    NodeTurnExit::Normal if ok => TurnOutcome::Success,
+                    NodeTurnExit::Normal => TurnOutcome::Failed(FailureClass::Other),
+                };
+                let cleanup_result =
+                    cleanup_warm_turn(turn.cleanup, exit, diagnostic.clone(), cleanup_tracker)
+                        .await;
+                if let Err(error) = cleanup_result {
+                    if !had_primary_failure {
+                        ok = false;
+                        text = format!("[node {} cleanup failed: {:?}]", node.id.as_str(), error);
+                        node_outcome = TurnOutcome::Failed(classify_failure(&error));
+                    }
+                    // Otherwise the operation observer recorded bounded teardown
+                    // evidence and the earlier backend/rich failure remains primary.
+                }
 
-            // Keep whatever usage the agent reported, even if the turn then errored or was
-            // cancelled — the tokens were really consumed and belong in the durable footprint.
-            // `last_usage` is already `None` when no `Update::Usage` was ever observed.
-            ctx.observer.record(&ObsEvent::TurnFinished {
-                ctx: &obs_ctx,
-                latency: turn_start.elapsed(),
-                ttft: ttft_val,
-                outcome: &node_outcome,
-            });
-            ctx.observer.record(&ObsEvent::UsageFinalized {
-                ctx: &obs_ctx,
-                usage: last_usage.as_ref(),
-                fin: UsageFinalization::TurnFinal,
-            });
-            ctx.observer.record(&ObsEvent::NodeFinished {
-                ctx: &obs_ctx,
-                outcome: &node_outcome,
-            });
-            let disposition = NodeDisposition::from_turn(&node_outcome);
-            return (text, ok, last_usage, disposition);
+                // Keep whatever usage the agent reported, even if the turn then errored or was
+                // cancelled — the tokens were really consumed and belong in the durable footprint.
+                // `last_usage` is already `None` when no `Update::Usage` was ever observed.
+                ctx.observer.record(&ObsEvent::TurnFinished {
+                    ctx: &obs_ctx,
+                    latency: turn_start.elapsed(),
+                    ttft: ttft_val,
+                    outcome: &node_outcome,
+                });
+                ctx.observer.record(&ObsEvent::UsageFinalized {
+                    ctx: &obs_ctx,
+                    usage: last_usage.as_ref(),
+                    fin: UsageFinalization::TurnFinal,
+                });
+                ctx.observer.record(&ObsEvent::NodeFinished {
+                    ctx: &node_obs_ctx,
+                    outcome: &node_outcome,
+                });
+                let disposition = NodeDisposition::from_turn(&node_outcome);
+                let origin = if matches!(node_outcome, TurnOutcome::Canceled) {
+                    CompletionBodyOrigin::BridgeSyntheticCancellation
+                } else if empty_final_failure {
+                    CompletionBodyOrigin::BridgeSyntheticEmptyFinal
+                } else if !saw_done {
+                    CompletionBodyOrigin::BridgeSyntheticMissingDone
+                } else if done_stop_cancelled {
+                    CompletionBodyOrigin::BridgeSyntheticCancellation
+                } else if ok && exit_was_normal {
+                    CompletionBodyOrigin::ModelText
+                } else if exit_agent_crashed {
+                    CompletionBodyOrigin::BridgeSyntheticMissingDone
+                } else {
+                    CompletionBodyOrigin::BridgeSyntheticStreamError
+                };
+                return Ok(NodeRunOutput {
+                    text,
+                    ok,
+                    usage: last_usage,
+                    disposition,
+                    harvest: node_harvest_meta_from_context(
+                        obs_ctx.clone(),
+                        node,
+                        prefix_capability.clone(),
+                        prefix_attestation_status,
+                        origin,
+                    ),
+                });
+            }
         }
         let rendered = render(&node.prompt_template, vars);
-        let session = match SessionId::parse(format!(
+        let base_session = match SessionId::parse(format!(
             "workflow-{}-{}-{}",
             wf_id,
             node.id.as_str(),
@@ -829,11 +1890,16 @@ impl WorkflowExecutor {
         )) {
             Ok(s) => s,
             Err(_) => {
-                return (
+                return node_run_output(
+                    wf_id,
+                    node,
+                    run_id,
+                    ctx,
                     format!("[node {} failed: bad session id]", node.id.as_str()),
                     false,
                     None,
                     NodeDisposition::Failed,
+                    CompletionBodyOrigin::BridgeSyntheticStreamError,
                 )
             }
         };
@@ -857,37 +1923,72 @@ impl WorkflowExecutor {
                 usage: Option<UsageSnapshot>,
                 cleanup_allows_retry: bool,
             },
+            EmptyFinal {
+                usage: Option<UsageSnapshot>,
+            },
         }
 
         let attempts = node.retry.as_ref().map(|r| r.attempts()).unwrap_or(1);
         let retry_enabled = node.retry.is_some();
 
         // Emit NodeStarted exactly once before the retry loop.
-        let node_obs_ctx = node_turn_context(wf_id, node, run_id, ctx, None, None, None, 0);
+        let node_obs_ctx = node_turn_context(wf_id, node, run_id, ctx, None, None, None, 0)?;
         ctx.observer
             .record(&ObsEvent::NodeStarted { ctx: &node_obs_ctx });
 
-        let (final_text, final_ok, final_usage, final_node_outcome) = 'node_loop: {
-            for attempt in 1..=attempts {
+        let (final_text, final_ok, final_usage, final_node_outcome, final_harvest) = 'node_loop: {
+            let mut attempt = 1_u32;
+            loop {
                 if cancel.is_cancelled() {
                     break 'node_loop (
                         format!("[node {} canceled]", node.id.as_str()),
                         false,
                         None,
                         TurnOutcome::Canceled,
+                        node_harvest_meta(
+                            wf_id,
+                            node,
+                            run_id,
+                            ctx,
+                            attempt,
+                            PrefixAttestationCapability::default(),
+                            PrefixAttestationStatus::default(),
+                            CompletionBodyOrigin::BridgeSyntheticCancellation,
+                        )?,
                     );
                 }
 
+                let session = base_session.clone();
                 let should_retry_after_attempt = attempt < attempts;
                 let mut obs_ctx_opt: Option<TurnContext> = None;
                 let mut turn_started: Option<std::time::Instant> = None;
                 let mut ttft_val: Option<std::time::Duration> = None;
                 let diagnostic = diagnostic_factory.make(&node.id, attempt);
+                let mut attempt_harvest = node_harvest_meta(
+                    wf_id,
+                    node,
+                    run_id,
+                    ctx,
+                    attempt,
+                    PrefixAttestationCapability::default(),
+                    PrefixAttestationStatus::default(),
+                    CompletionBodyOrigin::BridgeSyntheticStreamError,
+                )?;
                 let outcome = 'attempt: {
                     // resolve, with cancel
-                    let resolved = tokio::select! {
+                    let mut resolved = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
+                            attempt_harvest = node_harvest_meta(
+                                wf_id,
+                                node,
+                                run_id,
+                                ctx,
+                                attempt,
+                                PrefixAttestationCapability::default(),
+                                PrefixAttestationStatus::default(),
+                                CompletionBodyOrigin::BridgeSyntheticCancellation,
+                            )?;
                             break 'attempt Attempt::Canceled {
                                 marker: format!("[node {} canceled]", node.id.as_str()),
                                 usage: None,
@@ -911,26 +2012,93 @@ impl WorkflowExecutor {
                             }
                         },
                     };
+                    let preflight_decision = match self
+                        .ensure_agent_preflight(
+                            wf_id,
+                            node,
+                            run_id,
+                            ctx,
+                            diagnostic_factory,
+                            cancel,
+                            resolved.entry.clone(),
+                            preflight_cache,
+                            cleanup_tracker,
+                        )
+                        .await
+                    {
+                        Ok(decision) => decision,
+                        Err(PreflightFailure::Canceled) => {
+                            attempt_harvest = node_harvest_meta(
+                                wf_id,
+                                node,
+                                run_id,
+                                ctx,
+                                attempt,
+                                PrefixAttestationCapability::default(),
+                                PrefixAttestationStatus::default(),
+                                CompletionBodyOrigin::BridgeSyntheticCancellation,
+                            )?;
+                            break 'attempt Attempt::Canceled {
+                                marker: format!("[node {} canceled]", node.id.as_str()),
+                                usage: None,
+                            };
+                        }
+                        Err(PreflightFailure::Hard {
+                            message,
+                            failure_class,
+                            ..
+                        }) => {
+                            break 'attempt Attempt::Fatal {
+                                text: format!("[node {} failed: {message}]", node.id.as_str()),
+                                usage: None,
+                                failure_class,
+                            };
+                        }
+                    };
+                    if preflight_decision.substituted_from.is_some() {
+                        resolved = match self
+                            .registry
+                            .resolve_observed(&node.agent, diagnostic.clone())
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                break 'attempt Attempt::Fatal {
+                                    text: format!(
+                                        "[node {} failed after preflight: {:?}]",
+                                        node.id.as_str(),
+                                        e
+                                    ),
+                                    usage: None,
+                                    failure_class: classify_failure(&e),
+                                };
+                            }
+                        };
+                    }
+                    let mut eff = effective_config(&resolved.entry, None);
+                    eff.model = preflight_decision.selected_model.clone();
+                    let obs_model = eff.model.clone();
+                    let obs_effort = eff
+                        .effort
+                        .as_ref()
+                        .map(|e| format!("{e:?}").to_ascii_lowercase());
+                    let obs_mode = eff.mode.clone();
                     let obs_ctx_here = node_turn_context(
-                        wf_id,
-                        node,
-                        run_id,
-                        ctx,
-                        resolved.entry.model.clone(),
-                        resolved
-                            .entry
-                            .effort
-                            .as_ref()
-                            .map(|e| format!("{e:?}").to_ascii_lowercase()),
-                        resolved.entry.mode.clone(),
-                        attempt,
-                    );
+                        wf_id, node, run_id, ctx, obs_model, obs_effort, obs_mode, attempt,
+                    )?;
                     // NodeStarted was emitted before the loop; only emit TurnStarted here.
                     ctx.observer
                         .record(&ObsEvent::TurnStarted { ctx: &obs_ctx_here });
                     obs_ctx_opt = Some(obs_ctx_here);
                     turn_started = Some(std::time::Instant::now());
-                    let eff = effective_config(&resolved.entry, None);
+                    if preflight_decision.substituted_from.is_some() {
+                        tracing::debug!(
+                            node = node.id.as_str(),
+                            agent = node.agent.as_str(),
+                            model = %model_label(preflight_decision.selected_model.as_deref()),
+                            "workflow node using preflight-selected fallback model"
+                        );
+                    }
                     if let Err(e) = resolved
                         .backend
                         .configure_session(
@@ -988,6 +2156,16 @@ impl WorkflowExecutor {
                         .await
                         {
                             Ok(()) => {
+                                attempt_harvest = node_harvest_meta(
+                                    wf_id,
+                                    node,
+                                    run_id,
+                                    ctx,
+                                    attempt,
+                                    PrefixAttestationCapability::default(),
+                                    PrefixAttestationStatus::default(),
+                                    CompletionBodyOrigin::BridgeSyntheticCancellation,
+                                )?;
                                 break 'attempt Attempt::Canceled {
                                     marker: format!("[node {} canceled]", node.id.as_str()),
                                     usage: None,
@@ -1007,6 +2185,59 @@ impl WorkflowExecutor {
                         }
                     }
                     // prompt, with cancel
+                    let prefix_capability = resolved.backend.prefix_attestation_capability();
+                    let node_harvest_mode = node.harvest_sanitization.unwrap_or_default();
+                    let prefix_attestation_request = match prefix_attestation_request_for_capability(
+                        node_harvest_mode,
+                        &prefix_capability,
+                    ) {
+                        Ok(request) => request,
+                        Err(e) => {
+                            let _ = cleanup_cold_session(
+                                &resolved.backend,
+                                &session,
+                                &diagnostic,
+                                ColdCleanupAction::Forget,
+                                cleanup_tracker,
+                            )
+                            .await;
+                            break 'attempt Attempt::Fatal {
+                                text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
+                                usage: None,
+                                failure_class: classify_failure(&e),
+                            };
+                        }
+                    };
+                    // The per-attempt context was stashed into `obs_ctx_opt`
+                    // just above; borrow it back for the turn identifiers.
+                    let obs_ctx_ref = obs_ctx_opt
+                        .as_ref()
+                        .expect("turn context is stashed before the prompt is dispatched");
+                    resolved
+                        .backend
+                        .configure_turn(
+                            &session,
+                            TurnMeta {
+                                context_id: obs_ctx_ref.session_id.clone(),
+                                generation: u64::from(attempt),
+                                op: OperationId::parse(format!(
+                                    "workflow-{}-{attempt}",
+                                    node.id.as_str()
+                                ))
+                                .expect("workflow operation id is nonempty"),
+                                turn_id: obs_ctx_ref.turn_id.clone(),
+                                requested_mode: node_harvest_mode,
+                                prefix_attestation_request: prefix_attestation_request.clone(),
+                            },
+                        )
+                        .await;
+                    let prompt_parts = vec![Part {
+                        text: append_prompt_contract(
+                            rendered.clone(),
+                            &prefix_capability,
+                            &prefix_attestation_request,
+                        ),
+                    }];
                     let rich_sink = ctx
                         .make_rich_sink
                         .as_ref()
@@ -1019,7 +2250,7 @@ impl WorkflowExecutor {
                             }
                             resolved.backend.prompt_with_observers(
                                 &session,
-                                vec![Part { text: rendered.clone() }],
+                                prompt_parts,
                                 BackendObservers::new(diagnostic.clone(), rich_sink.clone()),
                             ).await
                         } => match s {
@@ -1113,6 +2344,13 @@ impl WorkflowExecutor {
                                     };
                                 }
                                 None => {
+                                    attempt_harvest = node_harvest_meta_from_context(
+                                        obs_ctx_ref.clone(),
+                                        node,
+                                        prefix_capability.clone(),
+                                        PrefixAttestationStatus::default(),
+                                        CompletionBodyOrigin::BridgeSyntheticCancellation,
+                                    );
                                     break 'attempt Attempt::Canceled {
                                         marker: format!("[node {} canceled]", node.id.as_str()),
                                         usage: None,
@@ -1124,6 +2362,9 @@ impl WorkflowExecutor {
                     let mut text = String::new();
                     let mut ok = true;
                     let mut canceled_during_drain = false;
+                    let mut saw_done = false;
+                    let mut done_stop_cancelled = false;
+                    let mut prefix_attestation_status = PrefixAttestationStatus::default();
                     let mut last_usage: Option<UsageSnapshot> = None;
                     let mut err: Option<BridgeError> = None;
                     loop {
@@ -1164,17 +2405,36 @@ impl WorkflowExecutor {
                                         break;
                                     }
                                 }
-                                Some(Ok(Update::Done { stop_reason })) => {
-                                    if stop_reason == STOP_REASON_CANCELLED { ok = false; }
+                                Some(Ok(Update::Done { stop_reason, prefix_attestation })) => {
+                                    saw_done = true;
+                                    prefix_attestation_status = prefix_attestation;
+                                    if stop_reason == STOP_REASON_CANCELLED {
+                                        done_stop_cancelled = true;
+                                        ok = false;
+                                    }
                                     break;
                                 }
                                 Some(Err(e)) => {
                                     ok = false;
-                                    text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
+                                    text = format!(
+                                        "[node {} failed: {:?}]",
+                                        node.id.as_str(),
+                                        e
+                                    );
                                     err = Some(e);
                                     break;
                                 }
-                                None => break,
+                                None => {
+                                    let dropped = stream_dropped_error();
+                                    ok = false;
+                                    text = format!(
+                                        "[node {} failed: {:?}]",
+                                        node.id.as_str(),
+                                        dropped
+                                    );
+                                    err = Some(dropped);
+                                    break;
+                                }
                             },
                             _ = cancel.cancelled() => {
                                 canceled_during_drain = true;
@@ -1219,6 +2479,13 @@ impl WorkflowExecutor {
                                     cleanup_tracker,
                                 )
                                 .await;
+                                attempt_harvest = node_harvest_meta_from_context(
+                                    obs_ctx_ref.clone(),
+                                    node,
+                                    prefix_capability.clone(),
+                                    prefix_attestation_status.clone(),
+                                    CompletionBodyOrigin::BridgeSyntheticStreamError,
+                                );
                                 break 'attempt Attempt::Fatal {
                                     text: format!(
                                         "[node {} rich-flush failed: {:?}]",
@@ -1243,6 +2510,13 @@ impl WorkflowExecutor {
                         .err();
                         match cancel_error.or(cleanup_error) {
                             Some(error) => {
+                                attempt_harvest = node_harvest_meta_from_context(
+                                    obs_ctx_ref.clone(),
+                                    node,
+                                    prefix_capability.clone(),
+                                    prefix_attestation_status.clone(),
+                                    CompletionBodyOrigin::BridgeSyntheticStreamError,
+                                );
                                 break 'attempt Attempt::Fatal {
                                     text: format!(
                                         "[node {} cleanup failed: {:?}]",
@@ -1254,12 +2528,63 @@ impl WorkflowExecutor {
                                 };
                             }
                             None => {
+                                attempt_harvest = node_harvest_meta_from_context(
+                                    obs_ctx_ref.clone(),
+                                    node,
+                                    prefix_capability.clone(),
+                                    prefix_attestation_status.clone(),
+                                    CompletionBodyOrigin::BridgeSyntheticCancellation,
+                                );
                                 break 'attempt Attempt::Canceled {
                                     marker: text,
                                     usage,
                                 };
                             }
                         }
+                    }
+                    if matches!(err, Some(BridgeError::AgentCrashed { .. })) {
+                        record_synthetic_failure(
+                            &diagnostic,
+                            bridge_core::diagnostics::DiagnosticPhase::PromptStream,
+                            "workflow.stream.dropped",
+                            bridge_core::diagnostics::DiagnosticFailureClass::AgentProcess,
+                            format!(
+                                "node {} stream ended before terminal Done",
+                                node.id.as_str()
+                            ),
+                            vec!["missing Update::Done".to_string()],
+                        )
+                        .await;
+                    }
+                    if saw_done && ok && text.trim().is_empty() {
+                        record_synthetic_failure(
+                            &diagnostic,
+                            bridge_core::diagnostics::DiagnosticPhase::PromptFinish,
+                            "workflow.empty_final",
+                            bridge_core::diagnostics::DiagnosticFailureClass::Protocol,
+                            format!(
+                                "node {} completed with an empty final agent message",
+                                node.id.as_str()
+                            ),
+                            vec!["empty final agent message".to_string()],
+                        )
+                        .await;
+                        let _ = cleanup_cold_session(
+                            &resolved.backend,
+                            &session,
+                            &diagnostic,
+                            ColdCleanupAction::Forget,
+                            cleanup_tracker,
+                        )
+                        .await;
+                        attempt_harvest = node_harvest_meta_from_context(
+                            obs_ctx_ref.clone(),
+                            node,
+                            prefix_capability.clone(),
+                            prefix_attestation_status.clone(),
+                            CompletionBodyOrigin::BridgeSyntheticEmptyFinal,
+                        );
+                        break 'attempt Attempt::EmptyFinal { usage };
                     }
                     if let Some(e) = err {
                         if retry_enabled && e.is_transient() {
@@ -1292,6 +2617,18 @@ impl WorkflowExecutor {
                             cleanup_tracker,
                         )
                         .await;
+                        let origin = if matches!(&e, BridgeError::AgentCrashed { .. }) {
+                            CompletionBodyOrigin::BridgeSyntheticMissingDone
+                        } else {
+                            CompletionBodyOrigin::BridgeSyntheticStreamError
+                        };
+                        attempt_harvest = node_harvest_meta_from_context(
+                            obs_ctx_ref.clone(),
+                            node,
+                            prefix_capability.clone(),
+                            prefix_attestation_status.clone(),
+                            origin,
+                        );
                         break 'attempt Attempt::Fatal {
                             text,
                             usage,
@@ -1308,18 +2645,48 @@ impl WorkflowExecutor {
                     .await;
                     if ok {
                         match cleanup {
-                            Ok(()) => Attempt::Ok { text, usage },
-                            Err(error) => Attempt::Fatal {
-                                text: format!(
-                                    "[node {} cleanup failed: {:?}]",
-                                    node.id.as_str(),
-                                    error
-                                ),
-                                usage,
-                                failure_class: classify_failure(&error),
-                            },
+                            Ok(()) => {
+                                attempt_harvest = node_harvest_meta_from_context(
+                                    obs_ctx_ref.clone(),
+                                    node,
+                                    prefix_capability.clone(),
+                                    prefix_attestation_status.clone(),
+                                    CompletionBodyOrigin::ModelText,
+                                );
+                                Attempt::Ok { text, usage }
+                            }
+                            Err(error) => {
+                                attempt_harvest = node_harvest_meta_from_context(
+                                    obs_ctx_ref.clone(),
+                                    node,
+                                    prefix_capability.clone(),
+                                    prefix_attestation_status.clone(),
+                                    CompletionBodyOrigin::BridgeSyntheticStreamError,
+                                );
+                                Attempt::Fatal {
+                                    text: format!(
+                                        "[node {} cleanup failed: {:?}]",
+                                        node.id.as_str(),
+                                        error
+                                    ),
+                                    usage,
+                                    failure_class: classify_failure(&error),
+                                }
+                            }
                         }
                     } else {
+                        let origin = if done_stop_cancelled {
+                            CompletionBodyOrigin::BridgeSyntheticCancellation
+                        } else {
+                            CompletionBodyOrigin::BridgeSyntheticStreamError
+                        };
+                        attempt_harvest = node_harvest_meta_from_context(
+                            obs_ctx_ref.clone(),
+                            node,
+                            prefix_capability.clone(),
+                            prefix_attestation_status.clone(),
+                            origin,
+                        );
                         Attempt::Fatal {
                             text,
                             usage,
@@ -1343,7 +2710,13 @@ impl WorkflowExecutor {
                                 fin: UsageFinalization::TurnFinal,
                             });
                         }
-                        break 'node_loop (marker, false, usage, TurnOutcome::Canceled);
+                        break 'node_loop (
+                            marker,
+                            false,
+                            usage,
+                            TurnOutcome::Canceled,
+                            attempt_harvest.clone(),
+                        );
                     }
                     Attempt::Ok { text, usage } => {
                         if let (Some(obs_ctx), Some(start)) = (obs_ctx_opt.as_ref(), turn_started) {
@@ -1359,7 +2732,13 @@ impl WorkflowExecutor {
                                 fin: UsageFinalization::TurnFinal,
                             });
                         }
-                        break 'node_loop (text, true, usage, TurnOutcome::Success);
+                        break 'node_loop (
+                            text,
+                            true,
+                            usage,
+                            TurnOutcome::Success,
+                            attempt_harvest.clone(),
+                        );
                     }
                     Attempt::Fatal {
                         text,
@@ -1380,7 +2759,35 @@ impl WorkflowExecutor {
                                 fin: UsageFinalization::TurnFinal,
                             });
                         }
-                        break 'node_loop (text, false, usage, fail_out);
+                        break 'node_loop (text, false, usage, fail_out, attempt_harvest.clone());
+                    }
+                    Attempt::EmptyFinal { usage } => {
+                        let fail_out =
+                            TurnOutcome::Failed(classify_failure(&BridgeError::EmptyFinal));
+                        if let (Some(obs_ctx), Some(start)) = (obs_ctx_opt.as_ref(), turn_started) {
+                            ctx.observer.record(&ObsEvent::TurnFinished {
+                                ctx: obs_ctx,
+                                latency: start.elapsed(),
+                                ttft: ttft_val,
+                                outcome: &fail_out,
+                            });
+                            ctx.observer.record(&ObsEvent::UsageFinalized {
+                                ctx: obs_ctx,
+                                usage: usage.as_ref(),
+                                fin: UsageFinalization::TurnFinal,
+                            });
+                        }
+                        break 'node_loop (
+                            format!(
+                                "[node {} failed: {:?}]",
+                                node.id.as_str(),
+                                BridgeError::EmptyFinal
+                            ),
+                            false,
+                            usage,
+                            fail_out,
+                            attempt_harvest.clone(),
+                        );
                     }
                     Attempt::Transient {
                         err,
@@ -1420,10 +2827,21 @@ impl WorkflowExecutor {
                                         false,
                                         None,
                                         TurnOutcome::Canceled,
+                                        node_harvest_meta(
+                                            wf_id,
+                                            node,
+                                            run_id,
+                                            ctx,
+                                            attempt,
+                                            PrefixAttestationCapability::default(),
+                                            PrefixAttestationStatus::default(),
+                                            CompletionBodyOrigin::BridgeSyntheticCancellation,
+                                        )?,
                                     );
                                 }
                                 _ = tokio::time::sleep(retry.backoff_for(attempt)) => {}
                             }
+                            attempt = attempt.saturating_add(1);
                             continue;
                         }
                         if should_retry_after_attempt {
@@ -1435,6 +2853,7 @@ impl WorkflowExecutor {
                                 false,
                                 usage,
                                 fail_out,
+                                attempt_harvest.clone(),
                             );
                         }
                         break 'node_loop (
@@ -1445,11 +2864,11 @@ impl WorkflowExecutor {
                             false,
                             usage,
                             fail_out,
+                            attempt_harvest.clone(),
                         );
                     }
                 }
             }
-            unreachable!("retry attempts are always at least one")
         };
 
         // Emit NodeFinished exactly once after the retry loop.
@@ -1458,7 +2877,13 @@ impl WorkflowExecutor {
             outcome: &final_node_outcome,
         });
         let disposition = NodeDisposition::from_turn(&final_node_outcome);
-        (final_text, final_ok, final_usage, disposition)
+        Ok(NodeRunOutput {
+            text: final_text,
+            ok: final_ok,
+            usage: final_usage,
+            disposition,
+            harvest: final_harvest,
+        })
     }
 
     /// Run a workflow from scratch (no prior checkpoints).
@@ -1680,6 +3105,35 @@ impl WorkflowExecutor {
         };
         Box::pin(async_stream::stream! {
             let cleanup_tracker = Arc::new(WorkflowCleanupTracker::default());
+            // Off-mode audit exemption (§18-7, operator-adjudicated): audit
+            // rows are durable whenever the feature is enabled for at least
+            // one node that can still RUN in this invocation; workflows with
+            // zero runnable enabled nodes are audit-exempt. Seeded nodes are
+            // already-completed resume outputs — they are never re-sanitized
+            // (§15.2 criterion 17) and therefore need no audit durability, so
+            // a fully-seeded resume passes even with a non-retaining store.
+            let audit_required = graph.nodes.iter().any(|node| {
+                matches!(
+                    node.harvest_sanitization.unwrap_or_default(),
+                    HarvestSanitizationMode::AttestedPrefixV1
+                ) && !seed.contains_key(node.id.as_str())
+            });
+            if audit_required && !ctx.harvest_audit_store.retains_audit_records() {
+                if let Some(node) = graph.nodes.iter().find(|node| {
+                    matches!(
+                        node.harvest_sanitization.unwrap_or_default(),
+                        HarvestSanitizationMode::AttestedPrefixV1
+                    ) && !seed.contains_key(node.id.as_str())
+                }) {
+                    yield Err(BridgeError::ConfigInvalid {
+                        reason: format!(
+                            "workflow node {} enables harvest_sanitization=attested_prefix_v1 but this workflow context has no retaining harvest audit store",
+                            node.id.as_str()
+                        ),
+                    });
+                    return;
+                }
+            }
             let base_render_vars = match render_vars_for_input(&input) {
                 Ok(vars) => vars,
                 Err(msg) => {
@@ -1743,6 +3197,7 @@ impl WorkflowExecutor {
             // would otherwise be a *distinct* anonymous type, which a monomorphic
             // `FuturesUnordered<Fut>` cannot hold.
             let mut inflight: FuturesUnordered<NodeFut> = FuturesUnordered::new();
+            let preflight_cache: PreflightCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let mut scheduled: HashSet<String> = HashSet::new();
             let mut stop_scheduling = false; // set on cancel: drain in-flight, schedule nothing new
 
@@ -1801,11 +3256,12 @@ impl WorkflowExecutor {
                                 let prompt_dispatch = prompt_dispatch.clone();
                                 let cleanup_tracker = cleanup_tracker.clone();
                                 let dispatcher = dispatcher.clone();
+                                let preflight_cache = preflight_cache.clone();
                                 let this = &this;
                                 inflight.push(Box::pin(async move {
                                     let vars: HashMap<&str, &str> =
                                         owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                                    let (text, ok, usage, disposition) = this.run_node(
+                                    let output = this.run_node(
                                         &wf_id,
                                         &node,
                                         &vars,
@@ -1816,8 +3272,9 @@ impl WorkflowExecutor {
                                         &prompt_dispatch,
                                         cleanup_tracker.as_ref(),
                                         dispatcher.as_ref(),
+                                        &preflight_cache,
                                     ).await;
-                                    (node.id.clone(), text, ok, usage, disposition)
+                                    (node.id.clone(), output)
                                 }) as NodeFut);
                             }
                         }
@@ -1829,8 +3286,78 @@ impl WorkflowExecutor {
             for node in schedule_ready!() {
                 yield Ok(WorkflowEvent::NodeStarted { node });
             }
-            while let Some((node_id, text, ok, usage, disposition)) = inflight.next().await {
-                yield Ok(WorkflowEvent::NodeFinished { node: node_id.clone(), ok, output: text.clone(), usage: usage.clone() });
+            while let Some((node_id, raw_output)) = inflight.next().await {
+                let raw_output = match raw_output {
+                    Ok(output) => output,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+                let NodeRunOutput {
+                    text: raw_text,
+                    ok,
+                    usage,
+                    disposition,
+                    harvest,
+                } = raw_output;
+                // §18-7 Off-mode audit exemption: with zero runnable enabled
+                // nodes there is no audit commit at all — Off mode is the §7.1
+                // identity, so the raw body IS the effective body, and no
+                // KeptOff decision is minted only to be discarded by a noop
+                // store. When any runnable node enables the feature, EVERY
+                // completion of the run (enabled and Off nodes alike, §18-4
+                // regardless of `ok`) commits its bundle before release.
+                let text = if audit_required {
+                    let committed = match commit_harvested_completion(
+                        &harvest.context,
+                        harvest.mode,
+                        &harvest.capability,
+                        &harvest.producer_id,
+                        harvest.origin,
+                        raw_text,
+                        harvest.status.clone(),
+                        ctx.harvest_audit_store.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(committed) => committed,
+                        Err(error) => {
+                            yield Err(BridgeError::from(error));
+                            return;
+                        }
+                    };
+                    if let Some(factory) = &ctx.make_rich_sink {
+                        let sink = factory.make(&node_id);
+                        sink.record(bridge_core::orch::OrchEventKind::HarvestSanitizationDecision {
+                            audit_id: committed.audit_id.clone(),
+                            run_id: harvest.context.session_id.as_str().to_string(),
+                            node_id: node_id.as_str().to_string(),
+                            attempt_id: harvest.context.attempt,
+                            producer_id: harvest.producer_id.clone(),
+                            mode: committed.decision.mode,
+                            decision: committed.decision.decision,
+                            reason: committed.decision.reason.clone(),
+                        });
+                        if let Err(error) = sink.flush().await {
+                            tracing::warn!(
+                                node = node_id.as_str(),
+                                audit_id = committed.audit_id.as_str(),
+                                error = ?error,
+                                "harvest sanitization decision event flush failed"
+                            );
+                        }
+                    }
+                    committed.effective_body
+                } else {
+                    raw_text
+                };
+                yield Ok(WorkflowEvent::NodeFinished {
+                    node: node_id.clone(),
+                    ok,
+                    output: text.clone(),
+                    usage: usage.clone(),
+                });
                 done.insert(node_id.as_str().to_string());
                 dispositions.insert(node_id.as_str().to_string(), disposition);
                 outputs.insert(node_id.as_str().to_string(), (text, ok, usage));
@@ -1878,12 +3405,16 @@ impl WorkflowExecutor {
 mod tests {
     use super::*;
     use crate::graph::{RetryPolicy, WorkflowGraph, WorkflowNode};
+    use bridge_core::diagnostics::{
+        DiagnosticEvent, DiagnosticFailureClass, DiagnosticPhase, DiagnosticRedactor,
+        FailureDiagnostic, FailureDiagnosticInput, FailureDisposition, PhaseStatus,
+    };
     use bridge_core::domain::{Part, PermissionRequest, RegistrySnapshot, SessionSpec};
     use bridge_core::error::BridgeError;
     use bridge_core::ids::{AgentId, NodeId, SessionId, WorkflowId};
     use bridge_core::ports::{AgentBackend, AgentRegistry, BackendStream, Lease, Resolved, Update};
     use futures::StreamExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
 
@@ -1940,6 +3471,7 @@ mod tests {
                 Ok(Update::Text(self.reply.clone())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -1974,6 +3506,8 @@ mod tests {
             model: None,
             effort: None,
             mode: None,
+            preflight: false,
+            fallback_models: vec![],
             cwd: None,
             session_cwd: None,
             sandbox: None,
@@ -2025,11 +3559,45 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DiagnosticObserver for MarkerDiagnostic {
-        async fn record(
-            &self,
-            _event: bridge_core::diagnostics::DiagnosticEvent,
-        ) -> Result<(), BridgeError> {
+        async fn record(&self, _event: DiagnosticEvent) -> Result<(), BridgeError> {
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingDiagnostic {
+        events: Mutex<Vec<DiagnosticEvent>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DiagnosticObserver for CapturingDiagnostic {
+        async fn record(&self, event: DiagnosticEvent) -> Result<(), BridgeError> {
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingDiagnosticFactory {
+        observers: Mutex<Vec<Arc<CapturingDiagnostic>>>,
+    }
+
+    impl CapturingDiagnosticFactory {
+        fn events(&self) -> Vec<DiagnosticEvent> {
+            self.observers
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|observer| observer.events.lock().unwrap().clone())
+                .collect()
+        }
+    }
+
+    impl DiagnosticObserverFactory for CapturingDiagnosticFactory {
+        fn make(&self, _node: &NodeId, _attempt: u32) -> Arc<dyn DiagnosticObserver> {
+            let observer = Arc::new(CapturingDiagnostic::default());
+            self.observers.lock().unwrap().push(observer.clone());
+            observer
         }
     }
 
@@ -2146,9 +3714,13 @@ mod tests {
             if let Some(sink) = observers.rich {
                 sink.record(bridge_core::orch::OrchEventKind::Plan { entries: vec![] });
             }
-            Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
-                stop_reason: "end_turn".into(),
-            })])))
+            Ok(Box::pin(tokio_stream::iter(vec![
+                Ok(Update::Text("OK".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
+                }),
+            ])))
         }
 
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
@@ -2294,9 +3866,26 @@ mod tests {
                 prompt_template: prompt_template.into(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         })
+    }
+
+    #[test]
+    fn input_consumption_guard_detects_templates_that_use_input() {
+        let graph = one_node_graph_with_template("please review {{input}}");
+        assert!(graph_consumes_input(&graph));
+        assert_eq!(input_consumption_error(&graph, "brief"), None);
+    }
+
+    #[test]
+    fn input_consumption_guard_flags_nonempty_dropped_input() {
+        let graph = one_node_graph_with_template("static prompt");
+        let error = input_consumption_error(&graph, "brief").expect("dropped input error");
+        assert!(error.contains("{{input}}"));
+        assert!(error.contains("ignored"));
+        assert_eq!(input_consumption_error(&graph, ""), None);
     }
 
     fn retry_graph(retry: Option<RetryPolicy>) -> Arc<WorkflowGraph> {
@@ -2308,6 +3897,7 @@ mod tests {
                 prompt_template: "echo {{input}}".into(),
                 inputs: vec![],
                 retry,
+                harvest_sanitization: None,
             }],
             panel: None,
         })
@@ -2772,6 +4362,7 @@ mod tests {
                             Ok(Update::Text("OK".into())),
                             Ok(Update::Done {
                                 stop_reason: "end_turn".into(),
+                                prefix_attestation: Default::default(),
                             }),
                         ])))
                     }
@@ -3162,6 +4753,1440 @@ mod tests {
         assert_eq!(rec.invalidate_count.load(Ordering::SeqCst), 0);
     }
 
+    struct SequenceBackend {
+        replies: Mutex<std::collections::VecDeque<Vec<Result<Update, BridgeError>>>>,
+        rec: Arc<Rec>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for SequenceBackend {
+        async fn prompt(
+            &self,
+            session: &SessionId,
+            parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            self.rec
+                .prompts
+                .lock()
+                .unwrap()
+                .push(parts.iter().map(|p| p.text.clone()).collect());
+            self.rec.prompt_parts.lock().unwrap().push(parts);
+            self.rec
+                .prompt_sessions
+                .lock()
+                .unwrap()
+                .push(session.clone());
+            let updates = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted reply for prompt");
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn configure_session(
+            &self,
+            _s: &SessionId,
+            _spec: &SessionSpec,
+        ) -> Result<(), BridgeError> {
+            *self.rec.configured.lock().unwrap() = true;
+            Ok(())
+        }
+
+        async fn forget_session(&self, _s: &SessionId) {
+            *self.rec.forgets.lock().unwrap() += 1;
+        }
+    }
+
+    struct SharedBackendRegistry {
+        entry: bridge_core::domain::AgentEntry,
+        backend: Arc<dyn AgentBackend>,
+        invalidates: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for SharedBackendRegistry {
+        async fn resolve(&self, _id: &AgentId) -> Result<Resolved, BridgeError> {
+            Ok(Resolved {
+                entry: Arc::new(self.entry.clone()),
+                backend: self.backend.clone(),
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("codex").unwrap()
+        }
+
+        async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn invalidate(&self, _agent: &AgentId) {
+            self.invalidates.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn entry_snapshot(&self, _id: &AgentId) -> Option<Arc<AgentEntry>> {
+            Some(Arc::new(self.entry.clone()))
+        }
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![]
+        }
+    }
+
+    fn done_only() -> Vec<Result<Update, BridgeError>> {
+        vec![Ok(Update::Done {
+            stop_reason: "end_turn".into(),
+            prefix_attestation: Default::default(),
+        })]
+    }
+
+    fn text_done(text: &str) -> Vec<Result<Update, BridgeError>> {
+        vec![
+            Ok(Update::Text(text.into())),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
+            }),
+        ]
+    }
+
+    fn node_finished(events: &[WorkflowEvent]) -> (&bool, &String, &Option<UsageSnapshot>) {
+        match events
+            .iter()
+            .find(|event| matches!(event, WorkflowEvent::NodeFinished { .. }))
+            .expect("node finished")
+        {
+            WorkflowEvent::NodeFinished {
+                ok, output, usage, ..
+            } => (ok, output, usage),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_final_fails_without_replaying_in_a_fresh_session() {
+        let rec = Arc::new(Rec::default());
+        let backend = Arc::new(SequenceBackend {
+            replies: Mutex::new(std::collections::VecDeque::from(vec![
+                done_only(),
+                text_done("OK"),
+            ])),
+            rec: rec.clone(),
+        });
+        let agent = AgentId::parse("codex").unwrap();
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: minimal_entry(&agent),
+            backend,
+            invalidates: AtomicUsize::new(0),
+        });
+
+        let events = WorkflowExecutor::new(registry.clone())
+            .run(
+                one_node_graph(),
+                "DIFF".into(),
+                "empty-retry".into(),
+                CancellationToken::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output, _) = node_finished(&events);
+        assert!(!*ok, "accepted empty final must not replay: {output}");
+        assert!(output.contains("EmptyFinal"), "{output}");
+        let sessions = rec.prompt_sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(registry.invalidates.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_final_records_prompt_finish_protocol_diagnostic() {
+        let rec = Arc::new(Rec::default());
+        let backend = Arc::new(SequenceBackend {
+            replies: Mutex::new(std::collections::VecDeque::from(vec![
+                done_only(),
+                text_done("OK"),
+            ])),
+            rec,
+        });
+        let agent = AgentId::parse("codex").unwrap();
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: minimal_entry(&agent),
+            backend,
+            invalidates: AtomicUsize::new(0),
+        });
+        let diagnostic_factory = Arc::new(CapturingDiagnosticFactory::default());
+
+        let events = WorkflowExecutor::new(registry)
+            .run_with_diagnostic_context(
+                one_node_graph(),
+                "DIFF".into(),
+                "empty-diagnostic".into(),
+                CancellationToken::new(),
+                WorkflowDiagnosticContext::new(
+                    WorkflowRunContext::default(),
+                    diagnostic_factory.clone(),
+                ),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(Result::is_ok));
+
+        let diagnostics = diagnostic_factory.events();
+        let event = diagnostics
+            .iter()
+            .find(|event| {
+                event.transition().phase() == DiagnosticPhase::PromptFinish
+                    && event.transition().status() == PhaseStatus::Failed
+            })
+            .expect("empty final should emit a PromptFinish failure diagnostic");
+        let failure = event.failure().expect("failed event carries diagnostic");
+        assert_eq!(failure.failed_phase(), DiagnosticPhase::PromptFinish);
+        assert_eq!(failure.code().as_str(), "workflow.empty_final");
+        assert_eq!(failure.class(), DiagnosticFailureClass::Protocol);
+        assert!(
+            failure
+                .summary()
+                .contains("completed with an empty final agent message"),
+            "{}",
+            failure.summary()
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_final_is_permanent_even_with_configured_retry() {
+        let rec = Arc::new(Rec::default());
+        let backend = Arc::new(SequenceBackend {
+            replies: Mutex::new(std::collections::VecDeque::from(vec![
+                done_only(),
+                text_done("WOULD-RECOVER"),
+            ])),
+            rec: rec.clone(),
+        });
+        let agent = AgentId::parse("codex").unwrap();
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: minimal_entry(&agent),
+            backend,
+            invalidates: AtomicUsize::new(0),
+        });
+
+        let events = WorkflowExecutor::new(registry.clone())
+            .run(
+                retry_graph(Some(retry_policy(2, 0))),
+                "DIFF".into(),
+                "configured-retry-empty".into(),
+                CancellationToken::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output, _) = node_finished(&events);
+        assert!(!*ok);
+        assert!(output.contains("EmptyFinal"), "{output}");
+        assert_eq!(rec.prompt_sessions.lock().unwrap().len(), 1);
+        assert_eq!(registry.invalidates.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_stream_is_agent_crash_failure() {
+        let rec = Arc::new(Rec::default());
+        let backend = Arc::new(SequenceBackend {
+            replies: Mutex::new(std::collections::VecDeque::from(vec![Vec::<
+                Result<Update, BridgeError>,
+            >::new()])),
+            rec,
+        });
+        let agent = AgentId::parse("codex").unwrap();
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: minimal_entry(&agent),
+            backend,
+            invalidates: AtomicUsize::new(0),
+        });
+
+        let events = WorkflowExecutor::new(registry)
+            .run(
+                one_node_graph(),
+                "DIFF".into(),
+                "dropped-stream".into(),
+                CancellationToken::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output, _) = node_finished(&events);
+        assert!(!*ok);
+        assert!(
+            output.contains("backend stream ended before terminal Done"),
+            "{output}"
+        );
+    }
+
+    #[derive(Default)]
+    struct PreflightRec {
+        prompts: Mutex<Vec<String>>,
+        configured_models: Mutex<Vec<Option<String>>>,
+        session_models: Mutex<HashMap<String, Option<String>>>,
+    }
+
+    struct PreflightConfigureGate {
+        paused_first: AtomicBool,
+        entered: tokio::sync::Barrier,
+        release: tokio::sync::Notify,
+    }
+
+    impl PreflightConfigureGate {
+        fn new() -> Self {
+            Self {
+                paused_first: AtomicBool::new(false),
+                entered: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    struct PreflightBackend {
+        rec: Arc<PreflightRec>,
+        pong_models: Vec<String>,
+        configure_gate: Option<Arc<PreflightConfigureGate>>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PreflightFault {
+        PromptAccepted,
+        PromptRejected,
+        StreamError,
+        StreamEof,
+        TerminalEmpty,
+        TerminalUnexpected,
+        TerminalCancelled,
+    }
+
+    #[derive(Default)]
+    struct PreflightFaultState {
+        prompts: AtomicUsize,
+        cancels: AtomicUsize,
+        forgets: AtomicUsize,
+        session_models: Mutex<HashMap<String, Option<String>>>,
+    }
+
+    struct PreflightFaultBackend {
+        fault: PreflightFault,
+        state: Arc<PreflightFaultState>,
+    }
+
+    fn preflight_prompt_failure(accepted: bool) -> BridgeError {
+        BridgeError::agent_failure(
+            FailureDiagnostic::build_static_code(
+                FailureDiagnosticInput {
+                    failed_phase: DiagnosticPhase::PromptStart,
+                    last_completed_phase: Some(DiagnosticPhase::ConfigApply),
+                    class: DiagnosticFailureClass::Transport,
+                    disposition: FailureDisposition::Fatal,
+                    code: String::new(),
+                    summary: "scripted prompt-open failure".to_string(),
+                    causes: Vec::new(),
+                    stderr_observed: false,
+                    stderr_line_count: 0,
+                    stderr_scope: None,
+                    stderr_tail: None,
+                    stderr_redaction: None,
+                    retry_after_ms: None,
+                    reset_at_ms: None,
+                    prompt_may_have_been_accepted: accepted,
+                },
+                "test.preflight.prompt_open",
+                &DiagnosticRedactor::default(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for PreflightFaultBackend {
+        async fn prompt(
+            &self,
+            session: &SessionId,
+            parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            self.state.prompts.fetch_add(1, Ordering::SeqCst);
+            let prompt = parts
+                .first()
+                .map(|part| part.text.as_str())
+                .unwrap_or_default();
+            let model = self
+                .state
+                .session_models
+                .lock()
+                .unwrap()
+                .get(session.as_str())
+                .cloned()
+                .flatten();
+            if prompt != WORKFLOW_PREFLIGHT_PROMPT || model.as_deref() == Some("good") {
+                return Ok(Box::pin(tokio_stream::iter(text_done("PONG"))));
+            }
+            match self.fault {
+                PreflightFault::PromptAccepted => Err(preflight_prompt_failure(true)),
+                PreflightFault::PromptRejected => Err(preflight_prompt_failure(false)),
+                PreflightFault::StreamError => Ok(Box::pin(tokio_stream::iter(vec![Err(
+                    BridgeError::agent_crashed("scripted preflight stream failure"),
+                )]))),
+                PreflightFault::StreamEof => Ok(Box::pin(tokio_stream::empty())),
+                PreflightFault::TerminalEmpty => Ok(Box::pin(tokio_stream::iter(done_only()))),
+                PreflightFault::TerminalUnexpected => {
+                    Ok(Box::pin(tokio_stream::iter(text_done("NOPE"))))
+                }
+                PreflightFault::TerminalCancelled => {
+                    Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
+                        stop_reason: STOP_REASON_CANCELLED.to_string(),
+                        prefix_attestation: Default::default(),
+                    })])))
+                }
+            }
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.state.cancels.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn configure_session(
+            &self,
+            session: &SessionId,
+            spec: &SessionSpec,
+        ) -> Result<(), BridgeError> {
+            self.state
+                .session_models
+                .lock()
+                .unwrap()
+                .insert(session.as_str().to_string(), spec.config.model.clone());
+            Ok(())
+        }
+
+        async fn forget_session(&self, _session: &SessionId) {
+            self.state.forgets.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for PreflightBackend {
+        async fn prompt(
+            &self,
+            session: &SessionId,
+            parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let prompt = parts
+                .first()
+                .map(|part| part.text.clone())
+                .unwrap_or_default();
+            self.rec.prompts.lock().unwrap().push(prompt.clone());
+            let model = self
+                .rec
+                .session_models
+                .lock()
+                .unwrap()
+                .get(session.as_str())
+                .cloned()
+                .unwrap_or_default();
+            if prompt == WORKFLOW_PREFLIGHT_PROMPT {
+                if model.as_deref() == Some("reject") {
+                    Err(preflight_prompt_failure(false))
+                } else if model
+                    .as_deref()
+                    .is_some_and(|model| self.pong_models.iter().any(|allowed| allowed == model))
+                {
+                    Ok(Box::pin(tokio_stream::iter(text_done("PONG"))))
+                } else {
+                    Ok(Box::pin(tokio_stream::iter(done_only())))
+                }
+            } else {
+                Ok(Box::pin(tokio_stream::iter(text_done("REAL"))))
+            }
+        }
+
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn configure_session(
+            &self,
+            session: &SessionId,
+            spec: &SessionSpec,
+        ) -> Result<(), BridgeError> {
+            if let Some(gate) = &self.configure_gate {
+                if session.as_str().starts_with("workflow-preflight-")
+                    && !gate.paused_first.swap(true, Ordering::SeqCst)
+                {
+                    gate.entered.wait().await;
+                    gate.release.notified().await;
+                }
+            }
+            self.rec
+                .configured_models
+                .lock()
+                .unwrap()
+                .push(spec.config.model.clone());
+            self.rec
+                .session_models
+                .lock()
+                .unwrap()
+                .insert(session.as_str().to_string(), spec.config.model.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn workflow_preflight_pong_match_is_byte_exact() {
+        assert!(is_exact_preflight_pong("PONG"));
+        for response in [" PONG", "PONG ", "\nPONG", "PONG\n", "pong"] {
+            assert!(
+                !is_exact_preflight_pong(response),
+                "preflight accepted non-exact response {response:?}"
+            );
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PreflightCancelPhase {
+        Resolve,
+        Configure,
+        PromptOpen,
+    }
+
+    struct PreflightCancelGate {
+        phase: PreflightCancelPhase,
+        entered: tokio::sync::Barrier,
+        release: tokio::sync::Notify,
+    }
+
+    impl PreflightCancelGate {
+        fn new(phase: PreflightCancelPhase) -> Self {
+            Self {
+                phase,
+                entered: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+
+        async fn pause(&self, phase: PreflightCancelPhase) {
+            if self.phase == phase {
+                self.entered.wait().await;
+                self.release.notified().await;
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct PreflightCancelState {
+        resolves: AtomicUsize,
+        configures: AtomicUsize,
+        prompts: AtomicUsize,
+        cancels: AtomicUsize,
+        forgets: AtomicUsize,
+    }
+
+    struct CancelPreflightBackend {
+        gate: Arc<PreflightCancelGate>,
+        state: Arc<PreflightCancelState>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for CancelPreflightBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            self.state.prompts.fetch_add(1, Ordering::SeqCst);
+            self.gate.pause(PreflightCancelPhase::PromptOpen).await;
+            Ok(Box::pin(tokio_stream::iter(text_done("PONG"))))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            self.state.cancels.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn configure_session(
+            &self,
+            _session: &SessionId,
+            _spec: &SessionSpec,
+        ) -> Result<(), BridgeError> {
+            self.state.configures.fetch_add(1, Ordering::SeqCst);
+            self.gate.pause(PreflightCancelPhase::Configure).await;
+            Ok(())
+        }
+
+        async fn forget_session(&self, _session: &SessionId) {
+            self.state.forgets.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct CancelPreflightRegistry {
+        entry: AgentEntry,
+        backend: Arc<dyn AgentBackend>,
+        gate: Arc<PreflightCancelGate>,
+        state: Arc<PreflightCancelState>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for CancelPreflightRegistry {
+        async fn resolve(&self, _id: &AgentId) -> Result<Resolved, BridgeError> {
+            let ordinal = self.state.resolves.fetch_add(1, Ordering::SeqCst) + 1;
+            if ordinal == 2 {
+                self.gate.pause(PreflightCancelPhase::Resolve).await;
+            }
+            Ok(Resolved {
+                entry: Arc::new(self.entry.clone()),
+                backend: self.backend.clone(),
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        fn default_id(&self) -> AgentId {
+            self.entry.id.clone()
+        }
+
+        async fn apply(&self, _: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn entry_snapshot(&self, _id: &AgentId) -> Option<Arc<AgentEntry>> {
+            Some(Arc::new(self.entry.clone()))
+        }
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![self.entry.id.clone()]
+        }
+    }
+
+    async fn run_canceled_preflight(phase: PreflightCancelPhase) -> Arc<PreflightCancelState> {
+        let gate = Arc::new(PreflightCancelGate::new(phase));
+        let state = Arc::new(PreflightCancelState::default());
+        let backend: Arc<dyn AgentBackend> = Arc::new(CancelPreflightBackend {
+            gate: gate.clone(),
+            state: state.clone(),
+        });
+        let registry = Arc::new(CancelPreflightRegistry {
+            entry: preflight_entry("good", &[]),
+            backend,
+            gate: gate.clone(),
+            state: state.clone(),
+        });
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            WorkflowExecutor::new(registry)
+                .run(
+                    one_node_graph(),
+                    "DIFF".into(),
+                    format!("preflight-cancel-{phase:?}"),
+                    task_cancel,
+                )
+                .collect::<Vec<_>>()
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.entered.wait())
+            .await
+            .expect("preflight phase should reach the gate");
+        cancel.cancel();
+        let events = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("canceled preflight should settle")
+            .expect("preflight task should join")
+            .into_iter()
+            .map(|event| event.expect("workflow event"))
+            .collect::<Vec<_>>();
+        let (ok, output, _) = node_finished(&events);
+        assert!(!*ok, "canceled preflight cannot succeed: {output}");
+        assert!(output.contains("canceled"), "{output}");
+        state
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preflight_cancel_during_resolve_settles_without_prompt() {
+        let state = run_canceled_preflight(PreflightCancelPhase::Resolve).await;
+        assert_eq!(state.resolves.load(Ordering::SeqCst), 2);
+        assert_eq!(state.configures.load(Ordering::SeqCst), 0);
+        assert_eq!(state.prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(state.cancels.load(Ordering::SeqCst), 0);
+        assert_eq!(state.forgets.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preflight_cancel_during_configure_forgets_without_prompt() {
+        let state = run_canceled_preflight(PreflightCancelPhase::Configure).await;
+        assert_eq!(state.resolves.load(Ordering::SeqCst), 2);
+        assert_eq!(state.configures.load(Ordering::SeqCst), 1);
+        assert_eq!(state.prompts.load(Ordering::SeqCst), 0);
+        assert_eq!(state.cancels.load(Ordering::SeqCst), 0);
+        assert_eq!(state.forgets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preflight_cancel_during_prompt_open_cancels_and_forgets() {
+        let state = run_canceled_preflight(PreflightCancelPhase::PromptOpen).await;
+        assert_eq!(state.resolves.load(Ordering::SeqCst), 2);
+        assert_eq!(state.configures.load(Ordering::SeqCst), 1);
+        assert_eq!(state.prompts.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(state.forgets.load(Ordering::SeqCst), 1);
+    }
+
+    #[derive(Default)]
+    struct ProgressRichSink {
+        progress: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl bridge_core::ports::RichEventSink for ProgressRichSink {
+        fn record(&self, kind: bridge_core::orch::OrchEventKind) {
+            if let bridge_core::orch::OrchEventKind::Progress { progress } = kind {
+                self.progress
+                    .lock()
+                    .unwrap()
+                    .push(progress.text().to_string());
+            }
+        }
+
+        async fn flush(&self) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct ProgressRichFactory {
+        sink: Arc<ProgressRichSink>,
+    }
+
+    impl RichEventSinkFactory for ProgressRichFactory {
+        fn make(&self, _node: &NodeId) -> Arc<dyn bridge_core::ports::RichEventSink> {
+            self.sink.clone()
+        }
+    }
+
+    struct PreflightDispatcher {
+        backend: Arc<PreflightBackend>,
+        checkout_models: Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowNodeDispatcher for PreflightDispatcher {
+        async fn checkout(
+            &self,
+            _wf_id: &str,
+            _node: &WorkflowNode,
+            _run_id: &str,
+            _ctx: &WorkflowRunContext,
+        ) -> Result<NodeTurn, BridgeError> {
+            panic!("preflight dispatcher test must use observed override checkout")
+        }
+
+        async fn checkout_observed_with_overrides(
+            &self,
+            _wf_id: &str,
+            _node: &WorkflowNode,
+            _run_id: &str,
+            _ctx: &WorkflowRunContext,
+            overrides: Option<AgentOverride>,
+            _observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<NodeTurn, BridgeError> {
+            self.checkout_models
+                .lock()
+                .unwrap()
+                .push(overrides.and_then(|override_config| override_config.model));
+            Ok(NodeTurn {
+                backend: self.backend.clone(),
+                session: SessionId::parse("workflow-preflight-dispatcher").unwrap(),
+                seed: None,
+                cleanup: Box::new(CompositePathCleanup),
+            })
+        }
+    }
+
+    fn preflight_dispatcher(backend: Arc<PreflightBackend>) -> Arc<PreflightDispatcher> {
+        Arc::new(PreflightDispatcher {
+            backend,
+            checkout_models: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn preflight_entry(base: &str, fallbacks: &[&str]) -> bridge_core::domain::AgentEntry {
+        let agent = AgentId::parse("codex").unwrap();
+        let mut entry = minimal_entry(&agent);
+        entry.model = Some(base.to_string());
+        entry.preflight = true;
+        entry.fallback_models = fallbacks.iter().map(|model| model.to_string()).collect();
+        entry
+    }
+
+    async fn exercise_preflight_fault(
+        fault: PreflightFault,
+    ) -> (
+        Result<PreflightDecision, PreflightFailure>,
+        Result<PreflightDecision, PreflightFailure>,
+        Arc<PreflightFaultState>,
+        Arc<SharedBackendRegistry>,
+    ) {
+        let state = Arc::new(PreflightFaultState::default());
+        let backend: Arc<dyn AgentBackend> = Arc::new(PreflightFaultBackend {
+            fault,
+            state: state.clone(),
+        });
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: preflight_entry("bad", &["good"]),
+            backend,
+            invalidates: AtomicUsize::new(0),
+        });
+        let executor = WorkflowExecutor::new(registry.clone());
+        let graph = one_node_graph();
+        let node = graph.nodes[0].clone();
+        let diagnostic_factory: Arc<dyn DiagnosticObserverFactory> =
+            Arc::new(RecordingDiagnosticFactory::default());
+        let cancel = CancellationToken::new();
+        let ctx = WorkflowRunContext::default();
+        let cache: PreflightCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let cleanup_tracker = WorkflowCleanupTracker::default();
+
+        let first = executor
+            .ensure_agent_preflight(
+                "w",
+                &node,
+                "preflight-fault",
+                &ctx,
+                &diagnostic_factory,
+                &cancel,
+                Arc::new(registry.entry.clone()),
+                &cache,
+                &cleanup_tracker,
+            )
+            .await;
+        let second = executor
+            .ensure_agent_preflight(
+                "w",
+                &node,
+                "preflight-fault",
+                &ctx,
+                &diagnostic_factory,
+                &cancel,
+                Arc::new(registry.entry.clone()),
+                &cache,
+                &cleanup_tracker,
+            )
+            .await;
+        (first, second, state, registry)
+    }
+
+    #[tokio::test]
+    async fn preflight_prompt_open_after_possible_acceptance_is_sticky_and_never_falls_back() {
+        let (first, second, state, registry) =
+            exercise_preflight_fault(PreflightFault::PromptAccepted).await;
+        assert!(matches!(first, Err(PreflightFailure::Hard { .. })));
+        assert!(matches!(second, Err(PreflightFailure::Hard { .. })));
+        assert_eq!(state.prompts.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(state.forgets.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.invalidates.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn preflight_stream_error_is_sticky_and_never_falls_back() {
+        let (first, second, state, registry) =
+            exercise_preflight_fault(PreflightFault::StreamError).await;
+        assert!(matches!(first, Err(PreflightFailure::Hard { .. })));
+        assert!(matches!(second, Err(PreflightFailure::Hard { .. })));
+        assert_eq!(state.prompts.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(state.forgets.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.invalidates.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn preflight_missing_terminal_is_sticky_and_never_falls_back() {
+        let (first, second, state, registry) =
+            exercise_preflight_fault(PreflightFault::StreamEof).await;
+        assert!(matches!(first, Err(PreflightFailure::Hard { .. })));
+        assert!(matches!(second, Err(PreflightFailure::Hard { .. })));
+        assert_eq!(state.prompts.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(state.forgets.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.invalidates.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn preflight_terminal_failures_are_sticky_and_never_fall_back() {
+        for fault in [
+            PreflightFault::TerminalEmpty,
+            PreflightFault::TerminalUnexpected,
+            PreflightFault::TerminalCancelled,
+        ] {
+            let (first, second, state, registry) = exercise_preflight_fault(fault).await;
+            assert!(
+                matches!(first, Err(PreflightFailure::Hard { .. })),
+                "{fault:?} must fail after the accepted terminal response"
+            );
+            assert!(
+                matches!(second, Err(PreflightFailure::Hard { .. })),
+                "{fault:?} must remain sticky within the workflow run"
+            );
+            assert_eq!(state.prompts.load(Ordering::SeqCst), 1, "{fault:?}");
+            assert_eq!(state.cancels.load(Ordering::SeqCst), 0, "{fault:?}");
+            assert_eq!(state.forgets.load(Ordering::SeqCst), 1, "{fault:?}");
+            assert_eq!(registry.invalidates.load(Ordering::SeqCst), 0, "{fault:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn proven_pre_acceptance_prompt_rejection_may_use_fallback() {
+        let (first, second, state, registry) =
+            exercise_preflight_fault(PreflightFault::PromptRejected).await;
+        assert_eq!(first.unwrap().selected_model.as_deref(), Some("good"));
+        assert_eq!(second.unwrap().selected_model.as_deref(), Some("good"));
+        assert_eq!(state.prompts.load(Ordering::SeqCst), 2);
+        assert_eq!(state.cancels.load(Ordering::SeqCst), 0);
+        assert_eq!(state.forgets.load(Ordering::SeqCst), 2);
+        assert_eq!(registry.invalidates.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn preflight_proven_rejection_substitutes_fallback_and_records_progress() {
+        let rec = Arc::new(PreflightRec::default());
+        let backend = Arc::new(PreflightBackend {
+            rec: rec.clone(),
+            pong_models: vec!["good".into()],
+            configure_gate: None,
+        });
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: preflight_entry("reject", &["good"]),
+            backend,
+            invalidates: AtomicUsize::new(0),
+        });
+        let rich = Arc::new(ProgressRichSink::default());
+        let ctx = WorkflowRunContext {
+            make_rich_sink: Some(Arc::new(ProgressRichFactory { sink: rich.clone() })),
+            ..WorkflowRunContext::default()
+        };
+
+        let events = WorkflowExecutor::new(registry.clone())
+            .run_with_context(
+                one_node_graph(),
+                "DIFF".into(),
+                "preflight-fallback".into(),
+                CancellationToken::new(),
+                ctx,
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output, _) = node_finished(&events);
+        assert!(
+            *ok,
+            "fallback-selected model should run real turn: {output}"
+        );
+        assert_eq!(output, "REAL");
+        assert_eq!(
+            rec.configured_models.lock().unwrap().as_slice(),
+            [
+                Some("reject".into()),
+                Some("good".into()),
+                Some("good".into())
+            ]
+        );
+        assert_eq!(registry.invalidates.load(Ordering::SeqCst), 1);
+        assert!(
+            rich.progress
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|text| text.contains("reject -> good")),
+            "fallback substitution should be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_ladder_stops_after_fallback_accepts_empty_final() {
+        let rec = Arc::new(PreflightRec::default());
+        let backend = Arc::new(PreflightBackend {
+            rec: rec.clone(),
+            pong_models: vec![],
+            configure_gate: None,
+        });
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: preflight_entry("reject", &["worse"]),
+            backend,
+            invalidates: AtomicUsize::new(0),
+        });
+
+        let events = WorkflowExecutor::new(registry)
+            .run(
+                one_node_graph(),
+                "DIFF".into(),
+                "preflight-exhausted".into(),
+                CancellationToken::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output, _) = node_finished(&events);
+        assert!(!*ok);
+        assert!(output.contains("preflight stopped"), "{output}");
+        assert!(output.contains("model=reject"), "{output}");
+        assert!(output.contains("model=worse"), "{output}");
+        assert_eq!(
+            rec.prompts.lock().unwrap().as_slice(),
+            [WORKFLOW_PREFLIGHT_PROMPT, WORKFLOW_PREFLIGHT_PROMPT]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_preflight_runs_before_warm_checkout_when_enabled() {
+        let rec = Arc::new(PreflightRec::default());
+        let backend = Arc::new(PreflightBackend {
+            rec: rec.clone(),
+            pong_models: vec!["good".into()],
+            configure_gate: None,
+        });
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: preflight_entry("good", &[]),
+            backend: backend.clone(),
+            invalidates: AtomicUsize::new(0),
+        });
+        let dispatcher = preflight_dispatcher(backend);
+
+        let events = WorkflowExecutor::new(registry)
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "dispatcher-preflight".into(),
+                CancellationToken::new(),
+                WorkflowRunContext::default(),
+                dispatcher.clone(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output, _) = node_finished(&events);
+        assert!(
+            *ok,
+            "warm dispatcher real turn should run after preflight: {output}"
+        );
+        assert_eq!(output, "REAL");
+        assert_eq!(
+            rec.prompts.lock().unwrap().clone(),
+            vec![
+                WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+                "echo DIFF".to_string()
+            ]
+        );
+        assert_eq!(
+            dispatcher.checkout_models.lock().unwrap().clone(),
+            vec![None]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_preflight_proven_rejection_substitutes_fallback_and_records_progress() {
+        let rec = Arc::new(PreflightRec::default());
+        let backend = Arc::new(PreflightBackend {
+            rec: rec.clone(),
+            pong_models: vec!["good".into()],
+            configure_gate: None,
+        });
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: preflight_entry("reject", &["good"]),
+            backend: backend.clone(),
+            invalidates: AtomicUsize::new(0),
+        });
+        let dispatcher = preflight_dispatcher(backend);
+        let rich = Arc::new(ProgressRichSink::default());
+        let ctx = WorkflowRunContext {
+            make_rich_sink: Some(Arc::new(ProgressRichFactory { sink: rich.clone() })),
+            ..WorkflowRunContext::default()
+        };
+
+        let events = WorkflowExecutor::new(registry.clone())
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "dispatcher-preflight-fallback".into(),
+                CancellationToken::new(),
+                ctx,
+                dispatcher.clone(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output, _) = node_finished(&events);
+        assert!(
+            *ok,
+            "fallback-selected warm model should run real turn: {output}"
+        );
+        assert_eq!(output, "REAL");
+        assert_eq!(
+            rec.configured_models.lock().unwrap().as_slice(),
+            [Some("reject".into()), Some("good".into())]
+        );
+        assert_eq!(
+            rec.prompts.lock().unwrap().clone(),
+            vec![
+                WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+                WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+                "echo DIFF".to_string(),
+            ]
+        );
+        assert_eq!(registry.invalidates.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            dispatcher.checkout_models.lock().unwrap().clone(),
+            vec![Some("good".to_string())]
+        );
+        assert!(
+            rich.progress
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|text| text.contains("reject -> good")),
+            "fallback substitution should be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_preflight_stops_after_fallback_accepts_empty_final() {
+        let rec = Arc::new(PreflightRec::default());
+        let backend = Arc::new(PreflightBackend {
+            rec: rec.clone(),
+            pong_models: vec![],
+            configure_gate: None,
+        });
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: preflight_entry("reject", &["worse"]),
+            backend: backend.clone(),
+            invalidates: AtomicUsize::new(0),
+        });
+        let dispatcher = preflight_dispatcher(backend);
+
+        let events = WorkflowExecutor::new(registry)
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "dispatcher-preflight-exhausted".into(),
+                CancellationToken::new(),
+                WorkflowRunContext::default(),
+                dispatcher.clone(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output, _) = node_finished(&events);
+        assert!(!*ok);
+        assert!(output.contains("preflight stopped"), "{output}");
+        assert!(output.contains("model=reject"), "{output}");
+        assert!(output.contains("model=worse"), "{output}");
+        assert_eq!(
+            rec.prompts.lock().unwrap().clone(),
+            vec![
+                WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+                WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+            ]
+        );
+        assert_eq!(dispatcher.checkout_models.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn preflight_cache_is_shared_by_inline_and_dispatcher_paths() {
+        let rec = Arc::new(PreflightRec::default());
+        let backend = Arc::new(PreflightBackend {
+            rec: rec.clone(),
+            pong_models: vec!["good".into()],
+            configure_gate: None,
+        });
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: preflight_entry("reject", &["good"]),
+            backend: backend.clone(),
+            invalidates: AtomicUsize::new(0),
+        });
+        let executor = WorkflowExecutor::new(registry);
+        let graph = one_node_graph();
+        let node = graph.nodes[0].clone();
+        let vars = HashMap::from([("input", "DIFF")]);
+        let run_id = "shared-preflight-cache";
+        let cancel = CancellationToken::new();
+        let ctx = WorkflowRunContext::default();
+        let diagnostic_factory: Arc<dyn DiagnosticObserverFactory> =
+            Arc::new(RecordingDiagnosticFactory::default());
+        let prompt_dispatch = None;
+        let cleanup_tracker = WorkflowCleanupTracker::default();
+        let preflight_cache: PreflightCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let inline_output = executor
+            .run_node(
+                "w",
+                &node,
+                &vars,
+                run_id,
+                &cancel,
+                &ctx,
+                &diagnostic_factory,
+                &prompt_dispatch,
+                &cleanup_tracker,
+                None,
+                &preflight_cache,
+            )
+            .await
+            .unwrap();
+        assert!(
+            inline_output.ok,
+            "inline path should run after fallback preflight: {}",
+            inline_output.text
+        );
+        assert_eq!(inline_output.text, "REAL");
+
+        let dispatcher = preflight_dispatcher(backend);
+        let dispatcher_dyn: Arc<dyn WorkflowNodeDispatcher> = dispatcher.clone();
+        let dispatcher_output = executor
+            .run_node(
+                "w",
+                &node,
+                &vars,
+                run_id,
+                &cancel,
+                &ctx,
+                &diagnostic_factory,
+                &prompt_dispatch,
+                &cleanup_tracker,
+                Some(&dispatcher_dyn),
+                &preflight_cache,
+            )
+            .await
+            .unwrap();
+        assert!(
+            dispatcher_output.ok,
+            "dispatcher path should reuse cached preflight: {}",
+            dispatcher_output.text
+        );
+        assert_eq!(dispatcher_output.text, "REAL");
+
+        let prompts = rec.prompts.lock().unwrap().clone();
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|prompt| prompt.as_str() == WORKFLOW_PREFLIGHT_PROMPT)
+                .count(),
+            2,
+            "dispatcher path must not run a second smoke ladder: {prompts:?}"
+        );
+        assert_eq!(
+            prompts,
+            vec![
+                WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+                WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+                "echo DIFF".to_string(),
+                "echo DIFF".to_string(),
+            ]
+        );
+        assert_eq!(
+            dispatcher.checkout_models.lock().unwrap().clone(),
+            vec![Some("good".to_string())],
+            "cached fallback decisions must still be forwarded as dispatcher model overrides"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_preflight_first_miss_single_flights_per_agent() {
+        let rec = Arc::new(PreflightRec::default());
+        let gate = Arc::new(PreflightConfigureGate::new());
+        let backend = Arc::new(PreflightBackend {
+            rec: rec.clone(),
+            pong_models: vec!["good".into()],
+            configure_gate: Some(gate.clone()),
+        });
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: preflight_entry("reject", &["good"]),
+            backend,
+            invalidates: AtomicUsize::new(0),
+        });
+        let executor = Arc::new(WorkflowExecutor::new(registry.clone()));
+        let graph = one_node_graph();
+        let node = graph.nodes[0].clone();
+        let diagnostic_factory: Arc<dyn DiagnosticObserverFactory> =
+            Arc::new(RecordingDiagnosticFactory::default());
+        let prompt_dispatch = None;
+        let cleanup_tracker = Arc::new(WorkflowCleanupTracker::default());
+        let preflight_cache: PreflightCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let first_executor = executor.clone();
+        let first_node = node.clone();
+        let first_diagnostic_factory = diagnostic_factory.clone();
+        let first_cleanup_tracker = cleanup_tracker.clone();
+        let first_cache = preflight_cache.clone();
+        let first = tokio::spawn(async move {
+            let vars = HashMap::from([("input", "DIFF")]);
+            let cancel = CancellationToken::new();
+            let ctx = WorkflowRunContext::default();
+            first_executor
+                .run_node(
+                    "w",
+                    &first_node,
+                    &vars,
+                    "concurrent-preflight-a",
+                    &cancel,
+                    &ctx,
+                    &first_diagnostic_factory,
+                    &None,
+                    first_cleanup_tracker.as_ref(),
+                    None,
+                    &first_cache,
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.entered.wait())
+            .await
+            .expect("first preflight configure should reach the concurrency gate");
+
+        let second_vars = HashMap::from([("input", "DIFF")]);
+        let second_cancel = CancellationToken::new();
+        let second_ctx = WorkflowRunContext::default();
+        let second = executor.run_node(
+            "w",
+            &node,
+            &second_vars,
+            "concurrent-preflight-b",
+            &second_cancel,
+            &second_ctx,
+            &diagnostic_factory,
+            &prompt_dispatch,
+            cleanup_tracker.as_ref(),
+            None,
+            &preflight_cache,
+        );
+        tokio::pin!(second);
+        if !matches!(futures::poll!(&mut second), std::task::Poll::Pending) {
+            gate.release.notify_waiters();
+            panic!("second concurrent first miss should wait on the in-flight preflight cell");
+        }
+        gate.release.notify_waiters();
+
+        let first_result = first.await;
+        let second_result = second.await;
+        let first_output = first_result.unwrap().unwrap();
+        let second_output = second_result.unwrap();
+
+        assert!(
+            first_output.ok,
+            "first real turn should run: {}",
+            first_output.text
+        );
+        assert!(
+            second_output.ok,
+            "second real turn should run: {}",
+            second_output.text
+        );
+        let prompts = rec.prompts.lock().unwrap().clone();
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|prompt| prompt.as_str() == WORKFLOW_PREFLIGHT_PROMPT)
+                .count(),
+            2,
+            "one rejected+good smoke ladder should be shared by concurrent first miss: {prompts:?}"
+        );
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|prompt| prompt.as_str() == "echo DIFF")
+                .count(),
+            2,
+            "both real turns still run after the shared preflight: {prompts:?}"
+        );
+        assert_eq!(
+            registry.invalidates.load(Ordering::SeqCst),
+            1,
+            "fallback invalidation should happen once for the shared ladder"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_absent_preflight_config_runs_zero_smoke_turns() {
+        let rec = Arc::new(PreflightRec::default());
+        let backend = Arc::new(PreflightBackend {
+            rec: rec.clone(),
+            pong_models: vec!["good".into()],
+            configure_gate: None,
+        });
+        let agent = AgentId::parse("codex").unwrap();
+        let registry = Arc::new(SharedBackendRegistry {
+            entry: minimal_entry(&agent),
+            backend: backend.clone(),
+            invalidates: AtomicUsize::new(0),
+        });
+        let dispatcher = preflight_dispatcher(backend);
+
+        let events = WorkflowExecutor::new(registry)
+            .run_with_context_and_dispatcher(
+                one_node_graph(),
+                "DIFF".into(),
+                "dispatcher-no-preflight".into(),
+                CancellationToken::new(),
+                WorkflowRunContext::default(),
+                dispatcher.clone(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output, _) = node_finished(&events);
+        assert!(
+            *ok,
+            "warm dispatcher should preserve default-off behavior: {output}"
+        );
+        let prompts = rec.prompts.lock().unwrap().clone();
+        assert_eq!(
+            prompts
+                .iter()
+                .filter(|prompt| prompt.as_str() == WORKFLOW_PREFLIGHT_PROMPT)
+                .count(),
+            0,
+            "absent config must not run smoke turns: {prompts:?}"
+        );
+        assert_eq!(prompts, vec!["echo DIFF".to_string()]);
+        assert_eq!(rec.configured_models.lock().unwrap().len(), 0);
+        assert_eq!(
+            dispatcher.checkout_models.lock().unwrap().clone(),
+            vec![None]
+        );
+    }
+
     #[tokio::test]
     async fn captures_node_usage_smoke() {
         struct UsageBackend;
@@ -3197,6 +6222,7 @@ mod tests {
                     })),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])))
             }
@@ -3691,9 +6717,13 @@ mod tests {
         ) -> Result<BackendStream, BridgeError> {
             let updates = match &self.backend_error {
                 Some(error) => vec![Err(error.clone())],
-                None => vec![Ok(Update::Done {
-                    stop_reason: "end_turn".to_owned(),
-                })],
+                None => vec![
+                    Ok(Update::Text("OK".into())),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".to_owned(),
+                        prefix_attestation: Default::default(),
+                    }),
+                ],
             };
             Ok(Box::pin(tokio_stream::iter(updates)))
         }
@@ -3806,9 +6836,13 @@ mod tests {
                 (ColdTransientSite::Stream, 0) => Ok(Box::pin(tokio_stream::iter(vec![Err(
                     BridgeError::AgentTimedOut,
                 )]))),
-                _ => Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
-                    stop_reason: "end_turn".to_owned(),
-                })]))),
+                _ => Ok(Box::pin(tokio_stream::iter(vec![
+                    Ok(Update::Text("OK".into())),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".to_owned(),
+                        prefix_attestation: Default::default(),
+                    }),
+                ]))),
             }
         }
 
@@ -4313,9 +7347,13 @@ mod tests {
         ) -> Result<BackendStream, BridgeError> {
             let updates = match &self.error {
                 Some(error) => vec![Err(error.clone())],
-                None => vec![Ok(Update::Done {
-                    stop_reason: "end_turn".to_owned(),
-                })],
+                None => vec![
+                    Ok(Update::Text("OK".into())),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".to_owned(),
+                        prefix_attestation: Default::default(),
+                    }),
+                ],
             };
             Ok(Box::pin(tokio_stream::iter(updates)))
         }
@@ -4691,6 +7729,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
@@ -4698,6 +7737,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("t").unwrap(),
@@ -4705,6 +7745,7 @@ mod tests {
                     prompt_template: "{{a}}{{b}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -4776,6 +7817,7 @@ mod tests {
                 self.rec.prompt_parts.lock().unwrap().push(parts);
                 Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
                     stop_reason: STOP_REASON_CANCELLED.into(),
+                    prefix_attestation: Default::default(),
                 })])))
             }
             async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
@@ -5124,6 +8166,7 @@ mod tests {
             prompt_template: tpl.into(),
             inputs: ins.iter().map(|i| NodeId::parse(*i).unwrap()).collect(),
             retry: None,
+            harvest_sanitization: None,
         };
         Arc::new(WorkflowGraph {
             id: WorkflowId::parse("code-review").unwrap(),
@@ -5154,6 +8197,7 @@ mod tests {
                     prompt_template: "draft {{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("refinenode").unwrap(),
@@ -5161,6 +8205,7 @@ mod tests {
                     prompt_template: "refine against {{draft}} for {{input}}".into(),
                     inputs: vec![NodeId::parse("draftnode").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -5220,6 +8265,676 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enabled_harvest_requires_retaining_audit_store_before_node_start() {
+        let rec = Arc::new(Rec::default());
+        let reg = Arc::new(FakeRegistry {
+            backends: [(
+                "codex".to_string(),
+                ("SHOULD_NOT_RUN".to_string(), rec.clone()),
+            )]
+            .into(),
+        });
+        let graph = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("w").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: NodeId::parse("only").unwrap(),
+                agent: AgentId::parse("codex").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+                retry: None,
+                harvest_sanitization: Some(HarvestSanitizationMode::AttestedPrefixV1),
+            }],
+            panel: None,
+        });
+        let ex = WorkflowExecutor::new(reg);
+        let evs: Vec<_> = ex
+            .run(graph, "DIFF".into(), "r".into(), CancellationToken::new())
+            .collect()
+            .await;
+
+        assert!(matches!(
+            &evs[0],
+            Err(BridgeError::ConfigInvalid { reason })
+                if reason.contains("no retaining harvest audit store")
+        ));
+        assert!(rec.prompts.lock().unwrap().is_empty());
+    }
+
+    struct FailingHarvestAuditStore;
+
+    #[async_trait::async_trait]
+    impl bridge_core::harvest::HarvestAuditStore for FailingHarvestAuditStore {
+        async fn commit_bundle(
+            &self,
+            _raw: bridge_core::harvest::HarvestRawRecordV1,
+            _decision: bridge_core::harvest::HarvestSanitizationDecisionV1,
+        ) -> Result<
+            bridge_core::harvest::HarvestAuditCommit,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            Err(bridge_core::harvest::HarvestAuditStoreError::Persistence(
+                Box::new(std::io::Error::other("intentional harvest audit failure")),
+            ))
+        }
+
+        async fn get_by_audit_id(
+            &self,
+            _audit_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            Ok(None)
+        }
+
+        async fn get_by_attempt_key(
+            &self,
+            _run_id: &str,
+            _node_id: &str,
+            _attempt_id: u32,
+            _turn_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            Ok(None)
+        }
+
+        async fn list_by_task_id(
+            &self,
+            _task_id: &str,
+            _after_audit_id: Option<&str>,
+            _limit: u32,
+        ) -> Result<
+            Vec<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn harvest_audit_failure_releases_no_node_finished_or_fanin() {
+        let root_rec = Arc::new(Rec::default());
+        let synth_rec = Arc::new(Rec::default());
+        let reg = Arc::new(FakeRegistry {
+            backends: [
+                (
+                    "codex".to_string(),
+                    ("RAW_BODY".to_string(), root_rec.clone()),
+                ),
+                (
+                    "synth".to_string(),
+                    ("SHOULD_NOT_RUN".to_string(), synth_rec.clone()),
+                ),
+            ]
+            .into(),
+        });
+        let graph = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("w").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("root").unwrap(),
+                    agent: AgentId::parse("codex").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                    retry: None,
+                    harvest_sanitization: Some(HarvestSanitizationMode::AttestedPrefixV1),
+                },
+                WorkflowNode {
+                    id: NodeId::parse("synth").unwrap(),
+                    agent: AgentId::parse("synth").unwrap(),
+                    prompt_template: "{{root}}".into(),
+                    inputs: vec![NodeId::parse("root").unwrap()],
+                    retry: None,
+                    harvest_sanitization: None,
+                },
+            ],
+            panel: None,
+        });
+        let ctx = WorkflowRunContext {
+            task_id: Some(bridge_core::ids::TaskId::parse("task-harvest-fail").unwrap()),
+            harvest_audit_store: Arc::new(FailingHarvestAuditStore),
+            ..WorkflowRunContext::default()
+        };
+        let ex = WorkflowExecutor::new(reg);
+        let evs: Vec<_> = ex
+            .run_with_context(
+                graph,
+                "DIFF".into(),
+                "run-harvest-fail".into(),
+                CancellationToken::new(),
+                ctx,
+            )
+            .collect()
+            .await;
+
+        assert!(evs
+            .iter()
+            .any(|event| matches!(event, Err(BridgeError::HarvestAuditPersistFailed { .. }))));
+        assert!(
+            evs.iter()
+                .all(|event| !matches!(event, Ok(WorkflowEvent::NodeFinished { .. }))),
+            "audit failure must not release NodeFinished: {evs:?}"
+        );
+        assert!(
+            synth_rec.prompts.lock().unwrap().is_empty(),
+            "audit failure must not release root output into fan-in"
+        );
+        assert_eq!(
+            root_rec.prompts.lock().unwrap().clone(),
+            vec!["DIFF".to_string()]
+        );
+    }
+
+    #[derive(Default)]
+    struct CountingNonRetainingHarvestStore {
+        commits: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl bridge_core::harvest::HarvestAuditStore for CountingNonRetainingHarvestStore {
+        fn retains_audit_records(&self) -> bool {
+            false
+        }
+
+        async fn commit_bundle(
+            &self,
+            _raw: bridge_core::harvest::HarvestRawRecordV1,
+            _decision: bridge_core::harvest::HarvestSanitizationDecisionV1,
+        ) -> Result<
+            bridge_core::harvest::HarvestAuditCommit,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            self.commits.fetch_add(1, Ordering::SeqCst);
+            Ok(bridge_core::harvest::HarvestAuditCommit::Inserted)
+        }
+
+        async fn get_by_audit_id(
+            &self,
+            _audit_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            Ok(None)
+        }
+
+        async fn get_by_attempt_key(
+            &self,
+            _run_id: &str,
+            _node_id: &str,
+            _attempt_id: u32,
+            _turn_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            Ok(None)
+        }
+
+        async fn list_by_task_id(
+            &self,
+            _task_id: &str,
+            _after_audit_id: Option<&str>,
+            _limit: u32,
+        ) -> Result<
+            Vec<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            Ok(Vec::new())
+        }
+    }
+
+    fn retaining_memory_audit_store() -> Arc<dyn bridge_core::harvest::HarvestAuditStore> {
+        let task_store: Arc<dyn bridge_core::task_store::TaskStore> =
+            Arc::new(bridge_core::task_store::MemoryTaskStore::default());
+        Arc::new(bridge_core::task_store::TaskStoreHarvestAuditStore::new(
+            task_store,
+        ))
+    }
+
+    fn two_node_graph(
+        root_mode: Option<HarvestSanitizationMode>,
+        synth_mode: Option<HarvestSanitizationMode>,
+    ) -> Arc<WorkflowGraph> {
+        Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("w").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("root").unwrap(),
+                    agent: AgentId::parse("codex").unwrap(),
+                    prompt_template: "{{input}}".into(),
+                    inputs: vec![],
+                    retry: None,
+                    harvest_sanitization: root_mode,
+                },
+                WorkflowNode {
+                    id: NodeId::parse("synth").unwrap(),
+                    agent: AgentId::parse("synth").unwrap(),
+                    prompt_template: "{{root}}".into(),
+                    inputs: vec![NodeId::parse("root").unwrap()],
+                    retry: None,
+                    harvest_sanitization: synth_mode,
+                },
+            ],
+            panel: None,
+        })
+    }
+
+    fn two_node_registry() -> Arc<FakeRegistry> {
+        Arc::new(FakeRegistry {
+            backends: [
+                (
+                    "codex".to_string(),
+                    ("ROOT_OUT".to_string(), Arc::new(Rec::default())),
+                ),
+                (
+                    "synth".to_string(),
+                    ("SYNTH_OUT".to_string(), Arc::new(Rec::default())),
+                ),
+            ]
+            .into(),
+        })
+    }
+
+    /// §18-7 Off-mode audit exemption (MAJOR 3): a workflow with zero enabled
+    /// nodes commits nothing to the audit store — no KeptOff rows minted and
+    /// discarded — and succeeds both with a retaining store (which must stay
+    /// empty) and with the noop store.
+    #[tokio::test]
+    async fn all_off_workflow_is_audit_exempt_and_emits_no_rows() {
+        let audit_store = retaining_memory_audit_store();
+        let ctx = WorkflowRunContext {
+            task_id: Some(bridge_core::ids::TaskId::parse("task-alloff").unwrap()),
+            harvest_audit_store: audit_store.clone(),
+            ..WorkflowRunContext::default()
+        };
+        let ex = WorkflowExecutor::new(two_node_registry());
+        let evs: Vec<_> = ex
+            .run_with_context(
+                two_node_graph(None, Some(HarvestSanitizationMode::Off)),
+                "DIFF".into(),
+                "run-alloff".into(),
+                CancellationToken::new(),
+                ctx,
+            )
+            .collect()
+            .await;
+        let last = evs.last().unwrap().as_ref().unwrap();
+        assert!(
+            matches!(last, WorkflowEvent::Terminal { outcome: WorkflowOutcome::Completed, output } if output == "SYNTH_OUT"),
+            "all-Off workflow must complete, got {last:?}"
+        );
+        let rows = bridge_core::harvest::HarvestAuditStore::list_by_task_id(
+            audit_store.as_ref(),
+            "task-alloff",
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(
+            rows.is_empty(),
+            "all-Off workflow must produce no durable audit rows, got {}",
+            rows.len()
+        );
+
+        // The same all-Off workflow also succeeds on a non-retaining store:
+        // no commit is attempted, so nothing is silently discarded. This counted
+        // variant discriminates the production Noop path from a pre-fix
+        // mint-and-discard KeptOff bundle.
+        let counted_store = Arc::new(CountingNonRetainingHarvestStore::default());
+        let ex = WorkflowExecutor::new(two_node_registry());
+        let evs: Vec<_> = ex
+            .run_with_context(
+                two_node_graph(None, None),
+                "DIFF".into(),
+                "run-alloff-noop".into(),
+                CancellationToken::new(),
+                WorkflowRunContext {
+                    harvest_audit_store: counted_store.clone(),
+                    ..WorkflowRunContext::default()
+                },
+            )
+            .collect()
+            .await;
+        assert!(matches!(
+            evs.last().unwrap().as_ref().unwrap(),
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                ..
+            }
+        ));
+        assert_eq!(
+            counted_store.commits.load(Ordering::SeqCst),
+            0,
+            "all-Off workflow must not commit KeptOff bundles to a non-retaining store"
+        );
+    }
+
+    /// §18-4/§18-7 (MAJOR 3) + MAJOR 4 audit distinction: when at least one
+    /// runnable node enables the feature, BOTH the enabled and the Off node's
+    /// completions commit durable bundles — the Off node as `kept_off`, the
+    /// enabled-but-incapable node as `kept_no_attestation` with the distinct
+    /// `backend_declared_incapable` reason (never `sanitization_not_requested`
+    /// and never silently mistaken for Off).
+    ///
+    /// A non-retaining-store variant cannot exercise this mixed graph: the enabled
+    /// runnable node makes audit durability required for the whole invocation, so
+    /// the executor fails before either node runs. The all-Off counted-store test
+    /// above covers the only non-retaining path that may legitimately execute and
+    /// proves Off completions do not mint discarded KeptOff bundles there.
+    #[tokio::test]
+    async fn mixed_workflow_audits_both_enabled_and_off_completions() {
+        let audit_store = retaining_memory_audit_store();
+        let ctx = WorkflowRunContext {
+            task_id: Some(bridge_core::ids::TaskId::parse("task-mixed").unwrap()),
+            harvest_audit_store: audit_store.clone(),
+            ..WorkflowRunContext::default()
+        };
+        let ex = WorkflowExecutor::new(two_node_registry());
+        let evs: Vec<_> = ex
+            .run_with_context(
+                two_node_graph(Some(HarvestSanitizationMode::AttestedPrefixV1), None),
+                "DIFF".into(),
+                "run-mixed".into(),
+                CancellationToken::new(),
+                ctx,
+            )
+            .collect()
+            .await;
+        assert!(matches!(
+            evs.last().unwrap().as_ref().unwrap(),
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                ..
+            }
+        ));
+
+        let rows = bridge_core::harvest::HarvestAuditStore::list_by_task_id(
+            audit_store.as_ref(),
+            "task-mixed",
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "both completions must be audited");
+        let by_node = |node: &str| {
+            rows.iter()
+                .find(|bundle| bundle.raw.node_id == node)
+                .unwrap_or_else(|| panic!("bundle for {node}"))
+        };
+        let enabled = by_node("root");
+        assert_eq!(
+            enabled.decision.mode,
+            HarvestSanitizationMode::AttestedPrefixV1
+        );
+        assert_eq!(
+            enabled.decision.decision,
+            bridge_core::harvest::HarvestDecision::KeptNoAttestation
+        );
+        assert_eq!(
+            enabled.decision.reason.as_deref(),
+            Some("backend_declared_incapable"),
+            "enabled-but-incapable must carry its distinct reason code"
+        );
+        let off = by_node("synth");
+        assert_eq!(off.decision.mode, HarvestSanitizationMode::Off);
+        assert_eq!(
+            off.decision.decision,
+            bridge_core::harvest::HarvestDecision::KeptOff
+        );
+        assert_eq!(off.decision.reason, None);
+    }
+
+    /// MINOR 7 (verified per the MAJOR 3 adjudication): a fully-seeded resume
+    /// runs zero nodes, so even a graph with enabled nodes needs no audit
+    /// durability — the noop-store guard must not fire and the resume must
+    /// complete from the seed.
+    #[tokio::test]
+    async fn fully_seeded_resume_with_enabled_node_passes_noop_store_guard() {
+        let seed: HashMap<String, (String, bool, Option<UsageSnapshot>)> = [
+            ("root".to_string(), ("SEEDED_ROOT".to_string(), true, None)),
+            (
+                "synth".to_string(),
+                ("SEEDED_SYNTH".to_string(), true, None),
+            ),
+        ]
+        .into();
+        let reg = two_node_registry();
+        let root_rec = reg.backends.get("codex").unwrap().1.clone();
+        let synth_rec = reg.backends.get("synth").unwrap().1.clone();
+        let ex = WorkflowExecutor::new(reg);
+        let evs: Vec<_> = ex
+            .run_from_with_context(
+                two_node_graph(Some(HarvestSanitizationMode::AttestedPrefixV1), None),
+                "DIFF".into(),
+                "resume-full".into(),
+                CancellationToken::new(),
+                seed,
+                WorkflowRunContext::default(),
+            )
+            .collect()
+            .await;
+        assert!(
+            !evs.iter().any(|event| matches!(
+                event,
+                Err(BridgeError::ConfigInvalid { reason })
+                    if reason.contains("no retaining harvest audit store")
+            )),
+            "fully-seeded resume must not trip the noop-store guard: {evs:?}"
+        );
+        let last = evs.last().unwrap().as_ref().unwrap();
+        assert!(
+            matches!(last, WorkflowEvent::Terminal { outcome: WorkflowOutcome::Completed, output } if output == "SEEDED_SYNTH"),
+            "resume must complete from the seed, got {last:?}"
+        );
+        assert!(root_rec.prompts.lock().unwrap().is_empty());
+        assert!(synth_rec.prompts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn enabled_harvest_cuts_two_fan_in_inputs_before_synth_render() {
+        fn fixture_sha256(body: &str) -> [u8; 32] {
+            match body {
+                "process-a\nalpha" => [
+                    92, 114, 212, 225, 97, 190, 129, 251, 240, 113, 14, 174, 183, 110, 27, 21, 249,
+                    101, 252, 239, 17, 71, 115, 27, 47, 24, 163, 41, 226, 183, 144, 175,
+                ],
+                "process-b\nbeta" => [
+                    240, 166, 40, 223, 12, 152, 188, 43, 168, 170, 32, 54, 148, 141, 7, 139, 161,
+                    32, 99, 48, 12, 190, 101, 74, 8, 154, 227, 100, 66, 158, 235, 190,
+                ],
+                other => panic!("unexpected fixture body for sha256: {other}"),
+            }
+        }
+
+        fn attested(
+            producer_id: &str,
+            turn_id: &str,
+            body: &str,
+            prefix_len: usize,
+        ) -> bridge_core::attestation::PrefixAttestationStatus {
+            bridge_core::attestation::PrefixAttestationStatus::AttestedV1(
+                bridge_core::attestation::AttestedPrefixV1 {
+                    issuer_id: bridge_core::attestation::ATTESTED_PREFIX_ISSUER_V1.to_string(),
+                    producer_id: producer_id.to_string(),
+                    turn_id: turn_id.to_string(),
+                    body_len_bytes: body.len() as u64,
+                    body_sha256: fixture_sha256(body),
+                    process_prefix_bytes: prefix_len as u64,
+                },
+            )
+        }
+
+        #[derive(Default)]
+        struct AttestedFanInBackend {
+            turns: Mutex<std::collections::HashMap<String, bridge_core::permission::TurnMeta>>,
+            synth_prompts: Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentBackend for AttestedFanInBackend {
+            async fn prompt(
+                &self,
+                session: &SessionId,
+                parts: Vec<Part>,
+            ) -> Result<BackendStream, BridgeError> {
+                let prompt: String = parts.iter().map(|part| part.text.as_str()).collect();
+                let meta = self
+                    .turns
+                    .lock()
+                    .unwrap()
+                    .remove(session.as_str())
+                    .ok_or(BridgeError::StoreFailure)?;
+                let (producer_id, body, prefix_len) = if prompt.contains("root-a") {
+                    ("a", "process-a\nalpha", "process-a\n".len())
+                } else if prompt.contains("root-b") {
+                    ("b", "process-b\nbeta", "process-b\n".len())
+                } else {
+                    self.synth_prompts.lock().unwrap().push(prompt);
+                    ("synth", "FINAL", 0)
+                };
+                let prefix_attestation = if producer_id == "synth" {
+                    Default::default()
+                } else {
+                    attested(producer_id, meta.turn_id.as_str(), body, prefix_len)
+                };
+                Ok(Box::pin(tokio_stream::iter(vec![
+                    Ok(Update::Text(body.to_string())),
+                    Ok(Update::Done {
+                        stop_reason: "end_turn".into(),
+                        prefix_attestation,
+                    }),
+                ])))
+            }
+
+            async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+                Ok(())
+            }
+
+            fn prefix_attestation_capability(
+                &self,
+            ) -> bridge_core::attestation::PrefixAttestationCapability {
+                bridge_core::attestation::PrefixAttestationCapability::codex_commit_marker_v1()
+            }
+
+            async fn configure_turn(
+                &self,
+                session: &SessionId,
+                meta: bridge_core::permission::TurnMeta,
+            ) {
+                self.turns
+                    .lock()
+                    .unwrap()
+                    .insert(session.as_str().to_string(), meta);
+            }
+        }
+
+        let backend = Arc::new(AttestedFanInBackend::default());
+        let graph = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("w").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("a").unwrap(),
+                    agent: AgentId::parse("a").unwrap(),
+                    prompt_template: "root-a {{input}}".into(),
+                    inputs: vec![],
+                    retry: None,
+                    harvest_sanitization: Some(HarvestSanitizationMode::AttestedPrefixV1),
+                },
+                WorkflowNode {
+                    id: NodeId::parse("b").unwrap(),
+                    agent: AgentId::parse("b").unwrap(),
+                    prompt_template: "root-b {{input}}".into(),
+                    inputs: vec![],
+                    retry: None,
+                    harvest_sanitization: Some(HarvestSanitizationMode::AttestedPrefixV1),
+                },
+                WorkflowNode {
+                    id: NodeId::parse("synth").unwrap(),
+                    agent: AgentId::parse("synth").unwrap(),
+                    prompt_template: "{{a}}|{{b}}".into(),
+                    inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
+                    retry: None,
+                    harvest_sanitization: None,
+                },
+            ],
+            panel: None,
+        });
+        let audit_store = Arc::new(bridge_core::task_store::MemoryTaskStore::with_clock(
+            Arc::new(|| 100),
+        ));
+        let ctx = WorkflowRunContext {
+            task_id: Some(bridge_core::ids::TaskId::parse("task-harvest-fanin").unwrap()),
+            harvest_audit_store: audit_store.clone(),
+            ..WorkflowRunContext::default()
+        };
+        let ex = WorkflowExecutor::new(Arc::new(SingleBackendRegistry {
+            backend: backend.clone(),
+        }));
+        let evs: Vec<_> = ex
+            .run_with_context(
+                graph,
+                "DIFF".into(),
+                "run-harvest-fanin".into(),
+                CancellationToken::new(),
+                ctx,
+            )
+            .collect()
+            .await;
+        for event in &evs {
+            if let Err(error) = event {
+                panic!("workflow failed unexpectedly: {error:?}");
+            }
+        }
+        assert!(matches!(
+            evs.last().unwrap().as_ref().unwrap(),
+            WorkflowEvent::Terminal {
+                outcome: WorkflowOutcome::Completed,
+                output,
+            } if output == "FINAL"
+        ));
+        assert_eq!(
+            backend.synth_prompts.lock().unwrap().clone(),
+            vec!["alpha|beta".to_string()]
+        );
+
+        let bundles = bridge_core::harvest::HarvestAuditStore::list_by_task_id(
+            audit_store.as_ref(),
+            "task-harvest-fanin",
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        let mut cut_nodes = bundles
+            .iter()
+            .filter(|bundle| {
+                bundle.decision.decision == bridge_core::harvest::HarvestDecision::CutAttested
+            })
+            .map(|bundle| {
+                (
+                    bundle.raw.node_id.as_str(),
+                    bundle.raw.raw_body.as_str(),
+                    bundle.decision.cut_byte_offset,
+                    bundle.decision.effective_len_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        cut_nodes.sort_by_key(|(node, ..)| *node);
+        assert_eq!(
+            cut_nodes,
+            vec![
+                ("a", "process-a\nalpha", Some("process-a\n".len() as u64), 5),
+                ("b", "process-b\nbeta", Some("process-b\n".len() as u64), 4),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn fan_out_runs_concurrently() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::sync::Barrier;
@@ -5240,6 +8955,7 @@ mod tests {
                     Ok(Update::Text(self.reply.clone())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])))
             }
@@ -5295,6 +9011,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
@@ -5302,6 +9019,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("t").unwrap(),
@@ -5309,6 +9027,7 @@ mod tests {
                     prompt_template: "{{a}}{{b}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -5353,6 +9072,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
@@ -5360,6 +9080,7 @@ mod tests {
                     prompt_template: "got {{a}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("c").unwrap(),
@@ -5367,6 +9088,7 @@ mod tests {
                     prompt_template: "got {{b}}".into(),
                     inputs: vec![NodeId::parse("b").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -5450,6 +9172,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("member_b").unwrap(),
@@ -5457,6 +9180,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("synth").unwrap(),
@@ -5467,6 +9191,7 @@ mod tests {
                         NodeId::parse("member_b").unwrap(),
                     ],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -5642,6 +9367,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
@@ -5649,6 +9375,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("t").unwrap(),
@@ -5656,6 +9383,7 @@ mod tests {
                     prompt_template: "{{a}}{{b}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -5742,6 +9470,7 @@ mod tests {
                     Ok(Update::Text(self.reply.clone())),
                     Ok(Update::Done {
                         stop_reason: "end_turn".into(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])))
             }
@@ -5801,6 +9530,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
@@ -5808,6 +9538,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("t").unwrap(),
@@ -5815,6 +9546,7 @@ mod tests {
                     prompt_template: "{{a}}{{b}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap(), NodeId::parse("b").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -6151,6 +9883,7 @@ mod tests {
                 Ok(Update::Text(self.reply.clone())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -6316,6 +10049,7 @@ mod tests {
                     prompt_template: "{{input}}".into(),
                     inputs: vec![],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("b").unwrap(),
@@ -6323,6 +10057,7 @@ mod tests {
                     prompt_template: "got {{a}}".into(),
                     inputs: vec![NodeId::parse("a").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
                 WorkflowNode {
                     id: NodeId::parse("c").unwrap(),
@@ -6330,6 +10065,7 @@ mod tests {
                     prompt_template: "got {{b}}".into(),
                     inputs: vec![NodeId::parse("b").unwrap()],
                     retry: None,
+                    harvest_sanitization: None,
                 },
             ],
             panel: None,
@@ -6361,6 +10097,7 @@ mod observability_tests {
     use crate::graph::{RetryPolicy, WorkflowGraph, WorkflowNode};
     use bridge_core::domain::Part;
     use bridge_core::error::BridgeError;
+    use bridge_core::harvest::NoopHarvestAuditStore;
     use bridge_core::ids::{AgentId, SessionId};
     use bridge_core::orch::UsageSnapshot;
     use bridge_core::ports::{
@@ -6406,8 +10143,10 @@ mod observability_tests {
                     terminal: None,
                     at_ms: 0,
                 })),
+                Ok(Update::Text("usage-only-text".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -6435,6 +10174,8 @@ mod observability_tests {
                     model: None,
                     effort: None,
                     mode: None,
+                    preflight: false,
+                    fallback_models: vec![],
                     cwd: None,
                     session_cwd: None,
                     sandbox: None,
@@ -6478,6 +10219,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: Some("prompt/workflow".to_string()),
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let graph = Arc::new(WorkflowGraph {
             id: bridge_core::ids::WorkflowId::parse("wf").unwrap(),
@@ -6487,6 +10229,7 @@ mod observability_tests {
                 prompt_template: "{{input}}".to_string(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         });
@@ -6571,6 +10314,7 @@ mod observability_tests {
                 Ok(Update::Text(t)),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -6592,6 +10336,7 @@ mod observability_tests {
                 prompt_template: "{{input}}".to_string(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         })
@@ -6606,6 +10351,7 @@ mod observability_tests {
                 prompt_template: "{{input}}".to_string(),
                 inputs: vec![],
                 retry: Some(policy),
+                harvest_sanitization: None,
             }],
             panel: None,
         })
@@ -6644,6 +10390,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
         let mut stream = exec.run_with_context_and_dispatcher(
@@ -6676,6 +10423,165 @@ mod observability_tests {
         );
     }
 
+    struct EmptyThenTextBackend {
+        text: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for EmptyThenTextBackend {
+        async fn prompt(
+            &self,
+            _s: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            let mut updates = Vec::new();
+            if let Some(text) = &self.text {
+                updates.push(Ok(Update::Text(text.clone())));
+            }
+            updates.push(Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
+            }));
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _s: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct RecordingCleanup {
+        exits: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeTurnCleanup for RecordingCleanup {
+        async fn on_exit(self: Box<Self>, exit: NodeTurnExit) {
+            let label = match exit {
+                NodeTurnExit::Normal => "normal".to_string(),
+                NodeTurnExit::Canceled => "canceled".to_string(),
+                NodeTurnExit::Error(error) => format!("error:{error:?}"),
+            };
+            self.exits.lock().unwrap().push(label);
+        }
+    }
+
+    #[derive(Default)]
+    struct EmptyThenTextDispatcher {
+        checkouts: Arc<AtomicUsize>,
+        exits: Arc<Mutex<Vec<String>>>,
+        recover_on_retry: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowNodeDispatcher for EmptyThenTextDispatcher {
+        async fn checkout(
+            &self,
+            _wf_id: &str,
+            _node: &WorkflowNode,
+            _run_id: &str,
+            _ctx: &WorkflowRunContext,
+        ) -> Result<NodeTurn, BridgeError> {
+            let checkout = self.checkouts.fetch_add(1, Ordering::SeqCst) + 1;
+            let text = if checkout == 1 || !self.recover_on_retry {
+                None
+            } else {
+                Some("warm-retried".to_string())
+            };
+            Ok(NodeTurn {
+                backend: Arc::new(EmptyThenTextBackend { text }),
+                session: SessionId::parse(format!("warm-empty-retry-{checkout}")).unwrap(),
+                seed: None,
+                cleanup: Box::new(RecordingCleanup {
+                    exits: self.exits.clone(),
+                }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_empty_final_fails_without_replaying_in_a_fresh_checkout() {
+        let rec = Arc::new(DetailedRec::default());
+        let ctx = WorkflowRunContext {
+            session_cwd: None,
+            make_rich_sink: None,
+            observer: rec,
+            parent_traceparent: None,
+            task_id: None,
+            prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
+        };
+        let dispatcher = Arc::new(EmptyThenTextDispatcher {
+            recover_on_retry: true,
+            ..Default::default()
+        });
+        let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
+        let events = exec
+            .run_with_context_and_dispatcher(
+                make_single_node_graph(),
+                "inp".into(),
+                "run-empty-warm".into(),
+                CancellationToken::new(),
+                ctx,
+                dispatcher.clone(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output) = events
+            .iter()
+            .find_map(|event| match event {
+                WorkflowEvent::NodeFinished { ok, output, .. } => Some((*ok, output.clone())),
+                _ => None,
+            })
+            .expect("node finished");
+        assert!(
+            !ok,
+            "accepted dispatcher empty final must not replay: {output}"
+        );
+        assert!(output.contains("EmptyFinal"), "{output}");
+        assert_eq!(dispatcher.checkouts.load(Ordering::SeqCst), 1);
+        let exits = dispatcher.exits.lock().unwrap().clone();
+        assert_eq!(exits, vec!["error:EmptyFinal".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_empty_final_stays_single_attempt_when_recovery_is_unavailable() {
+        let dispatcher = Arc::new(EmptyThenTextDispatcher::default());
+        let events = WorkflowExecutor::new(Arc::new(UsageRegistry))
+            .run_with_context_and_dispatcher(
+                make_single_node_graph(),
+                "inp".into(),
+                "run-twin-empty-warm".into(),
+                CancellationToken::new(),
+                WorkflowRunContext::default(),
+                dispatcher.clone(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|event| event.unwrap())
+            .collect::<Vec<_>>();
+
+        let (ok, output) = events
+            .iter()
+            .find_map(|event| match event {
+                WorkflowEvent::NodeFinished { ok, output, .. } => Some((*ok, output.clone())),
+                _ => None,
+            })
+            .expect("node finished");
+        assert!(!ok, "accepted empty final cannot succeed: {output}");
+        assert!(output.contains("EmptyFinal"), "{output}");
+        assert_eq!(dispatcher.checkouts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            dispatcher.exits.lock().unwrap().as_slice(),
+            ["error:EmptyFinal"]
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Test 2: cold path TurnFinished.ttft is Some when text is emitted
     // ---------------------------------------------------------------------------
@@ -6697,6 +10603,8 @@ mod observability_tests {
                     model: None,
                     effort: None,
                     mode: None,
+                    preflight: false,
+                    fallback_models: vec![],
                     cwd: None,
                     session_cwd: None,
                     sandbox: None,
@@ -6737,6 +10645,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(TextRegistry));
         let mut stream = exec.run_with_context(
@@ -6798,6 +10707,8 @@ mod observability_tests {
                     model: None,
                     effort: None,
                     mode: None,
+                    preflight: false,
+                    fallback_models: vec![],
                     cwd: None,
                     session_cwd: None,
                     sandbox: None,
@@ -6838,6 +10749,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         // No retry → AgentTimedOut is fatal on the only attempt.
         let exec = WorkflowExecutor::new(Arc::new(TimedOutRegistry));
@@ -6887,6 +10799,7 @@ mod observability_tests {
                 Ok(Update::Text("ok".into())),
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
                 }),
             ];
             Ok(Box::pin(tokio_stream::iter(updates)))
@@ -6915,6 +10828,8 @@ mod observability_tests {
                     model: None,
                     effort: None,
                     mode: None,
+                    preflight: false,
+                    fallback_models: vec![],
                     cwd: None,
                     session_cwd: None,
                     sandbox: None,
@@ -6958,6 +10873,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(FailOnceThenTextRegistry { calls }));
         // 2 attempts, 0ms backoff so the test doesn't sleep.
@@ -7131,6 +11047,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(TextRegistry));
         let mut stream = exec.run_with_context(
@@ -7156,6 +11073,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(TimedOutRegistry));
         let mut stream = exec.run_with_context(
@@ -7181,6 +11099,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let token = CancellationToken::new();
         let exec = WorkflowExecutor::new(Arc::new(NoUsageIdleRegistry));
@@ -7217,6 +11136,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
         let mut stream = exec.run_with_context(
@@ -7264,6 +11184,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
         let mut stream = exec.run_with_context_and_dispatcher(
@@ -7390,6 +11311,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
 
@@ -7461,6 +11383,7 @@ mod observability_tests {
             parent_traceparent: None,
             task_id: None,
             prompt_id: None,
+            harvest_audit_store: Arc::new(NoopHarvestAuditStore),
         };
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
 

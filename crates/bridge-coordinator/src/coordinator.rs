@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use a2a;
+use bridge_core::attestation::{
+    append_attestation_contract_to_last_part, prefix_attestation_request_for_capability,
+    HarvestSanitizationMode,
+};
 use bridge_core::domain::{AgentOverride, Effort, InjectRequest, Part, PermitDecision};
 use bridge_core::error::BridgeError;
 #[cfg(test)]
@@ -895,18 +898,18 @@ impl Coordinator {
             .unwrap_or(false))
     }
 
-    fn new_turn_id() -> bridge_core::ids::TurnId {
-        bridge_core::ids::TurnId::parse(format!("turn-{}", a2a::new_task_id()))
-            .expect("a2a task id is non-empty")
+    fn new_turn_id() -> Result<bridge_core::ids::TurnId, BridgeError> {
+        bridge_core::attestation::generate_turn_id()
     }
 
     fn turn_context_for_warm(
         ctx: &ContextId,
         task: Option<TaskId>,
         turn: &crate::session_manager::WarmTurn,
-    ) -> TurnContext {
-        TurnContext {
-            turn_id: Self::new_turn_id(),
+        turn_id: Result<bridge_core::ids::TurnId, BridgeError>,
+    ) -> Result<TurnContext, BridgeError> {
+        Ok(TurnContext {
+            turn_id: turn_id?,
             session_id: ctx.clone(),
             task_id: task,
             workflow: None,
@@ -918,7 +921,7 @@ impl Coordinator {
             mode: turn.mode.clone(),
             prompt_id: None,
             traceparent: None,
-        }
+        })
     }
 
     /// Drive ONE warm turn to completion and collect it into a `TurnOutput`. Records usage as a side
@@ -960,20 +963,31 @@ impl Coordinator {
         turn: crate::session_manager::WarmTurn,
         input: String,
         diagnostic: Arc<dyn DiagnosticObserver>,
-        mut attempt: Option<DirectAttemptHandle>,
+        attempt: Option<DirectAttemptHandle>,
     ) -> Result<TurnOutput, BridgeError> {
-        let task = match attempt.as_ref() {
-            Some(attempt) => TaskId::parse(attempt.identity.execution_id.as_str().to_string())?,
-            None => self.mint_prompt_task_id(),
-        };
-        let obs_ctx = Self::turn_context_for_warm(&ctx, Some(task.clone()), &turn);
-        let started = Instant::now();
-        let mut ttft = None;
-        let mut last_usage: Option<UsageSnapshot> = None;
-        let shared_usage: Arc<std::sync::Mutex<Option<UsageSnapshot>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        self.observer
-            .record(&ObsEvent::TurnStarted { ctx: &obs_ctx });
+        self.collect_turn_observed_with_attempt_and_turn_id(
+            ctx,
+            turn,
+            input,
+            diagnostic,
+            attempt,
+            Self::new_turn_id(),
+        )
+        .await
+    }
+
+    async fn collect_turn_observed_with_attempt_and_turn_id(
+        &self,
+        ctx: ContextId,
+        turn: crate::session_manager::WarmTurn,
+        input: String,
+        diagnostic: Arc<dyn DiagnosticObserver>,
+        mut attempt: Option<DirectAttemptHandle>,
+        turn_id: Result<bridge_core::ids::TurnId, BridgeError>,
+    ) -> Result<TurnOutput, BridgeError> {
+        // The caller has already checked out this exact warm operation. Arm
+        // completion before task/turn identity minting or any later fallible
+        // setup so an early return cannot strand the handle in Running.
         let completion = WarmCompletionGuard::finish_owner(
             self.session_manager.clone(),
             ctx.clone(),
@@ -982,6 +996,18 @@ impl Coordinator {
             turn.expiry_intent.clone(),
             diagnostic.clone(),
         );
+        let task = match attempt.as_ref() {
+            Some(attempt) => TaskId::parse(attempt.identity.execution_id.as_str().to_string())?,
+            None => self.mint_prompt_task_id(),
+        };
+        let obs_ctx = Self::turn_context_for_warm(&ctx, Some(task.clone()), &turn, turn_id)?;
+        let started = Instant::now();
+        let mut ttft = None;
+        let mut last_usage: Option<UsageSnapshot> = None;
+        let shared_usage: Arc<std::sync::Mutex<Option<UsageSnapshot>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        self.observer
+            .record(&ObsEvent::TurnStarted { ctx: &obs_ctx });
         let mut finish_guard = TurnFinishGuard {
             observer: self.observer.clone(),
             ctx: obs_ctx.clone(),
@@ -991,10 +1017,23 @@ impl Coordinator {
             completion: Some(completion),
         };
 
-        let parts = assemble_turn_parts(
+        let prefix_capability = turn.backend.prefix_attestation_capability();
+        // Task P: mode is structurally Off until Task F lands the
+        // `harvest_sanitization` node config (§4.5/§6; AC 16) — the request
+        // stays Disabled, so no prompt contract and no enabled beginTurn.
+        let prefix_attestation_request = prefix_attestation_request_for_capability(
+            HarvestSanitizationMode::Off,
+            &prefix_capability,
+        )?;
+        let mut parts = assemble_turn_parts(
             turn.seed.as_deref(),
             &turn.injects,
             vec![Part { text: input }],
+        );
+        append_attestation_contract_to_last_part(
+            &mut parts,
+            &prefix_capability,
+            &prefix_attestation_request,
         );
 
         turn.backend
@@ -1004,11 +1043,19 @@ impl Coordinator {
                     context_id: ctx.clone(),
                     generation: turn.generation.get(),
                     op: turn.op.clone(),
+                    turn_id: obs_ctx.turn_id.clone(),
+                    // Direct prompts have no per-node config surface (§6):
+                    // sanitization is permanently Off here.
+                    requested_mode: HarvestSanitizationMode::Off,
+                    prefix_attestation_request: prefix_attestation_request.clone(),
                 },
             )
             .await;
 
         let translator = Translator::new();
+        let harvest_audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
+            bridge_core::task_store::TaskStoreHarvestAuditStore::new(self.task_store.clone()),
+        );
         let mut events = translator.run_observed(
             turn.backend.as_ref(),
             self.session_store.as_ref(),
@@ -1017,6 +1064,8 @@ impl Coordinator {
             &turn.session,
             parts,
             diagnostic,
+            obs_ctx.clone(),
+            harvest_audit_store,
         );
         let mut collected = Vec::new();
         let mut aborted = false;
@@ -1864,9 +1913,13 @@ mod tests {
             if let Some(gate) = &self.prompt_gate {
                 gate.notified().await;
             }
-            let updates = vec![Ok(Update::Done {
-                stop_reason: "end_turn".into(),
-            })];
+            let updates = vec![
+                Ok(Update::Text("ok".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
+                }),
+            ];
             Ok(Box::pin(tokio_stream::iter(updates)))
         }
 
@@ -2013,6 +2066,7 @@ mod tests {
             }
             updates.push(Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }));
             Ok(Box::pin(tokio_stream::iter(updates)))
         }
@@ -2042,6 +2096,7 @@ mod tests {
                 .collect();
             updates.push(Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }));
             Ok(Box::pin(tokio_stream::iter(updates)))
         }
@@ -2883,6 +2938,8 @@ mod tests {
             model: None,
             effort: Some(Effort::High),
             mode: None,
+            preflight: false,
+            fallback_models: vec![],
             cwd: None,
             session_cwd: None,
             sandbox: None,
@@ -2944,6 +3001,7 @@ mod tests {
                 prompt_template: "{{input}}".into(),
                 inputs: Vec::new(),
                 retry: None,
+                harvest_sanitization: None,
             }],
             panel: None,
         })
@@ -3024,6 +3082,72 @@ mod tests {
         fn fail_next_scan(&self) {
             self.fail_scan_once
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl bridge_core::harvest::HarvestAuditStore for OneShotPendingTaskStore {
+        fn retains_audit_records(&self) -> bool {
+            bridge_core::harvest::HarvestAuditStore::retains_audit_records(&self.inner)
+        }
+
+        async fn commit_bundle(
+            &self,
+            raw: bridge_core::harvest::HarvestRawRecordV1,
+            decision: bridge_core::harvest::HarvestSanitizationDecisionV1,
+        ) -> Result<
+            bridge_core::harvest::HarvestAuditCommit,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            bridge_core::harvest::HarvestAuditStore::commit_bundle(&self.inner, raw, decision).await
+        }
+
+        async fn get_by_audit_id(
+            &self,
+            audit_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            bridge_core::harvest::HarvestAuditStore::get_by_audit_id(&self.inner, audit_id).await
+        }
+
+        async fn get_by_attempt_key(
+            &self,
+            run_id: &str,
+            node_id: &str,
+            attempt_id: u32,
+            turn_id: &str,
+        ) -> Result<
+            Option<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            bridge_core::harvest::HarvestAuditStore::get_by_attempt_key(
+                &self.inner,
+                run_id,
+                node_id,
+                attempt_id,
+                turn_id,
+            )
+            .await
+        }
+
+        async fn list_by_task_id(
+            &self,
+            task_id: &str,
+            after_audit_id: Option<&str>,
+            limit: u32,
+        ) -> Result<
+            Vec<bridge_core::harvest::HarvestAuditBundleV1>,
+            bridge_core::harvest::HarvestAuditStoreError,
+        > {
+            bridge_core::harvest::HarvestAuditStore::list_by_task_id(
+                &self.inner,
+                task_id,
+                after_audit_id,
+                limit,
+            )
+            .await
         }
     }
 
@@ -3410,6 +3534,7 @@ mod tests {
             self.prompts.lock().unwrap().push(observers.diagnostic);
             Ok(Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             })])))
         }
 
@@ -3829,6 +3954,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_turn_id_failure_returns_session_to_idle_before_backend_prompt() {
+        let backend = Arc::new(FakeBackend::new(None));
+        let fixture = coordinator_fixture_with_backend(Arc::new(HashMap::new()), backend.clone());
+        let context = ctx("ctx-coordinator-turn-id-failure");
+        let turn = fixture
+            .coordinator
+            .session_manager
+            .checkout_turn(&context, AgentId::parse("codex").unwrap(), None, None)
+            .await
+            .unwrap();
+
+        let result = fixture
+            .coordinator
+            .collect_turn_observed_with_attempt_and_turn_id(
+                context.clone(),
+                turn,
+                "hi".into(),
+                Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+                None,
+                Err(BridgeError::IdentityUnavailable),
+            )
+            .await;
+        assert!(matches!(result, Err(BridgeError::IdentityUnavailable)));
+        assert_eq!(backend.prompt_calls.load(AtomicOrdering::SeqCst), 0);
+
+        for _ in 0..100 {
+            if fixture
+                .coordinator
+                .session_manager
+                .status(&context)
+                .await
+                .is_some_and(|status| status.state == "idle")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fixture
+                .coordinator
+                .session_manager
+                .status(&context)
+                .await
+                .unwrap()
+                .state,
+            "idle"
+        );
+        let successor = fixture
+            .coordinator
+            .session_manager
+            .checkout_existing_turn(&context)
+            .await
+            .unwrap();
+        fixture
+            .coordinator
+            .session_manager
+            .finish_turn(&context, successor.generation, &successor.op)
+            .await;
+    }
+
+    #[tokio::test]
     async fn coordinator_expires_every_sampled_structured_warm_failure_but_preserves_legacy_policy()
     {
         for (index, class) in [
@@ -3975,6 +4161,8 @@ mod tests {
                         model: Some("gpt-5.5".to_string()),
                         effort: Some(Effort::High),
                         mode: Some("default".to_string()),
+                        preflight: false,
+                        fallback_models: vec![],
                         cwd: None,
                         session_cwd: None,
                         sandbox: None,
@@ -4035,6 +4223,7 @@ mod tests {
                     Ok(bridge_core::ports::Update::Text("hello".to_string())),
                     Ok(bridge_core::ports::Update::Done {
                         stop_reason: "end_turn".to_string(),
+                        prefix_attestation: Default::default(),
                     }),
                 ])))
             }

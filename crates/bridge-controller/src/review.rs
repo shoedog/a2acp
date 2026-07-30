@@ -447,6 +447,7 @@ pub fn build_review_input(
     base_sha: &str,
     head_sha: &str,
     slice_ref: Option<&str>,
+    verify: &crate::verify::VerifyOutcome,
 ) -> String {
     let slice = match slice_ref {
         Some(path) => format!(
@@ -455,12 +456,29 @@ pub fn build_review_input(
         ),
         None => String::new(),
     };
+    let verify_context = build_review_verify_context(verify);
     format!(
         "TASK:\n{task}\n\n\
          Review the committed change in this repository: `git diff {base_sha}..{head_sha}`.\n\
          Use read-only git/grep/read to navigate the surrounding code. Assess: (1) does it DELIVER the \
-         task (incl. implied requirements); (2) correctness/regressions/edge-cases; (3) design/architecture fit.{slice}"
+         task (incl. implied requirements); (2) correctness/regressions/edge-cases; (3) design/architecture fit.{slice}\
+         {verify_context}"
     )
+}
+
+fn build_review_verify_context(verify: &crate::verify::VerifyOutcome) -> String {
+    let suffix = crate::verify::outcome_suffix(verify);
+    let detail = match verify {
+        crate::verify::VerifyOutcome::Ran(verdict) => {
+            crate::verify::failure_digest(verdict, 8 * 1024)
+        }
+        _ => String::new(),
+    };
+    if detail.trim().is_empty() {
+        format!("\n\nVERIFY RESULT BEFORE REVIEW:\n{suffix}\n")
+    } else {
+        format!("\n\nVERIFY RESULT BEFORE REVIEW:\n{suffix}\n\nPer-gate verify detail:\n{detail}")
+    }
 }
 
 /// PURE. The one-line hand-off suffix (mirrors verify::outcome_suffix). Encodes reviewer-leg degradation.
@@ -573,10 +591,46 @@ mod tests {
 
     #[test]
     fn build_input_no_slice_has_task_shas_diff() {
-        let i = build_review_input("do X", "aaa", "bbb", None);
+        let i = build_review_input(
+            "do X",
+            "aaa",
+            "bbb",
+            None,
+            &crate::verify::VerifyOutcome::NotConfigured,
+        );
         assert!(i.contains("do X") && i.contains("git diff aaa..bbb") && i.contains("DELIVER"));
         assert!(!i.contains("prism review-slice"));
     }
+
+    #[test]
+    fn build_input_includes_failed_verify_gate_detail_before_review() {
+        let verify = crate::verify::VerifyOutcome::Ran(crate::verify::aggregate(vec![
+            crate::verify::VerifyResult {
+                name: "build".into(),
+                gate: true,
+                ok: false,
+                reach: crate::verify::VerifyReach::Reached { exit_status: 101 },
+                failure_class: Some(crate::verify::VerifyFailureClass::LockSync),
+                output:
+                    "error: the lock file Cargo.lock needs to be updated but --locked was passed"
+                        .into(),
+            },
+            crate::verify::VerifyResult {
+                name: "test".into(),
+                gate: true,
+                ok: false,
+                reach: crate::verify::VerifyReach::NotReached,
+                failure_class: None,
+                output: String::new(),
+            },
+        ]));
+        let input = build_review_input("do X", "aaa", "bbb", None, &verify);
+        assert!(input.contains("VERIFY RESULT BEFORE REVIEW"));
+        assert!(input.contains("verify: FAIL at lock-sync before build"));
+        assert!(input.contains("### build (reached, exit=101, lock-sync)"));
+        assert!(input.contains("### Not reached gates\ntest"));
+    }
+
     #[test]
     fn build_input_with_slice_points_at_the_ref_file() {
         let i = build_review_input(
@@ -584,6 +638,7 @@ mod tests {
             "aaa",
             "bbb",
             Some(".git/a2a-bridge/review-slices/slice-1.md"),
+            &crate::verify::VerifyOutcome::NotConfigured,
         );
         assert!(i.contains("prism review-slice") && i.contains("slice-1.md"));
     }

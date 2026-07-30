@@ -161,6 +161,7 @@ mod tests {
     fn done_stream() -> BackendStream {
         Box::pin(tokio_stream::iter(vec![Ok(Update::Done {
             stop_reason: "end_turn".into(),
+            prefix_attestation: Default::default(),
         })]))
     }
 
@@ -210,6 +211,8 @@ mod tests {
             BridgeError::SessionExpired => "SessionExpired",
             BridgeError::HandleBusy => "HandleBusy",
             BridgeError::TaskSpecInvalid { .. } => "TaskSpecInvalid",
+            BridgeError::EmptyFinal => "EmptyFinal",
+            BridgeError::HarvestAuditPersistFailed { .. } => "HarvestAuditPersistFailed",
         }
     }
 
@@ -305,6 +308,9 @@ mod tests {
                 },
                 Death::Fatal,
             ),
+            // Fatal at every retry layer: a terminal empty final proves prompt
+            // acceptance, so no component may replay that prompt.
+            (BridgeError::EmptyFinal, Death::Fatal),
         ];
         for (err, want) in cases {
             let _ = table_key(&err);

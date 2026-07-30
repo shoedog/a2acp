@@ -73,6 +73,7 @@ impl AgentBackend for FakeBackend {
             Ok(Update::Text(self.text.clone())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ];
         Ok(Box::pin(tokio_stream::iter(updates)))
@@ -332,6 +333,8 @@ fn agent_entry() -> AgentEntry {
         model: None,
         effort: Some(Effort::High),
         mode: None,
+        preflight: false,
+        fallback_models: vec![],
         cwd: None,
         session_cwd: None,
         sandbox: None,
@@ -358,6 +361,7 @@ fn workflow(id: &str) -> Arc<WorkflowGraph> {
             prompt_template: "{{input}}".into(),
             inputs: Vec::new(),
             retry: None,
+            harvest_sanitization: None,
         }],
         panel: None,
     })

@@ -133,6 +133,12 @@ pub struct AgentEntry {
     pub model: Option<String>,
     pub effort: Option<Effort>,
     pub mode: Option<String>,
+    /// Run a fixed `PONG` smoke before this agent's first real workflow turn in a run.
+    /// Disabled by default so existing configs retain today's behavior.
+    pub preflight: bool,
+    /// Ordered fallback model ids tried by workflow preflight only after a failure proven
+    /// to precede prompt acceptance. Values are raw agent-native model ids.
+    pub fallback_models: Vec<String>,
     pub cwd: Option<String>,
     /// Static ACP session cwd for this agent (the working directory set at session mint).
     /// Resolution chain at mint: `session_cwd` → `cwd` → `"."`.
@@ -421,6 +427,8 @@ mod tests {
             model: None,
             effort: None,
             mode: None,
+            preflight: false,
+            fallback_models: vec![],
             cwd: None,
             session_cwd: None,
             sandbox: None,
@@ -454,6 +462,8 @@ mod tests {
             model: None,
             effort: None,
             mode: None,
+            preflight: false,
+            fallback_models: vec![],
             cwd: None,
             session_cwd: None,
             sandbox: None,
@@ -485,6 +495,8 @@ mod tests {
             model: Some("gpt-5.5".into()),
             effort: Some(Effort::High),
             mode: Some("read-only".into()),
+            preflight: false,
+            fallback_models: vec![],
             cwd: None,
             session_cwd: None,
             sandbox: None,

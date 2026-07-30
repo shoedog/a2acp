@@ -34,6 +34,8 @@
 //             --config <path> --trusted-session-cwd <repo>
 //                                                       — emit a local-only host fallback plan
 
+#[path = "acp/attested_wrapper.rs"]
+mod attested_wrapper;
 mod catalog_probe;
 mod compatibility;
 mod compatibility_process_group;
@@ -155,7 +157,7 @@ USAGE:
 
 SUBCOMMANDS:
   run-workflow <id>   Run a workflow against a repo (design | code-review | spec-review | plan-review | …).
-                      --input <file> --session-cwd <repo> [--config <f>] [--out <f>]
+                      --input <file> --session-cwd <repo> [--config <f>] [--out <f>] [--strict-brief]
   workflow-stats      Read workflow history or pin/unpin one incident attempt.
                       [get|pin|unpin <attempt-id>] [--config <f> | --store <db>] [--json]
   run-batch <workflow> Submit a manifest of independent workflow runs to a running serve.
@@ -171,7 +173,7 @@ SUBCOMMANDS:
                       --from <artifact> --host-agent <id> --config <f> --trusted-session-cwd <repo>
                       [--confirm-trusted-own-repo-read-only]
   implement --input <file|-> Clone a repo, implement the task on a warm containerized agent, verify+review, hand off.
-                      --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>] [--merge [--onto <branch>]]
+                      --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>] [--strict-brief] [--merge [--onto <branch>]]
   merge <id>          Land an Approved run's commit into its source repo, re-authored to the operator
                       (Mode A: fast-forward --onto). [--config <f>] [--onto <branch>] [--force]
   init                Scaffold an a2a-bridge.toml + prompts.  --agents codex,claude [--dir <d>] [--force]
@@ -365,6 +367,84 @@ fn resolve_static_session_cwd(session_cwd: Option<&str>, cwd: Option<&str>) -> S
 // `run-workflow` subcommand
 // ---------------------------------------------------------------------------
 
+const CODEX_ACP_ATTESTED_INTERNAL_ARG: &str = "__a2a-codex-acp-attested";
+const CODEX_ACP_CHILD_ENV: &str = "A2A_BRIDGE_CODEX_ACP_PATH";
+
+fn is_packaged_codex_wrapper_candidate(cmd: &str) -> bool {
+    cmd == "codex-acp"
+}
+
+fn packaged_codex_attested_wrapper() -> Result<String, BridgeError> {
+    std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|error| BridgeError::ConfigInvalid {
+            reason: format!("resolve a2a-bridge wrapper executable: {error}"),
+        })
+}
+
+fn resolve_codex_acp_child() -> Result<String, BridgeError> {
+    if let Some(raw) = std::env::var_os(CODEX_ACP_CHILD_ENV) {
+        return canonical_codex_acp_child(PathBuf::from(raw));
+    }
+    let expected = format!("codex-acp{}", std::env::consts::EXE_SUFFIX);
+    let path = std::env::var_os("PATH").ok_or_else(|| BridgeError::ConfigInvalid {
+        reason: "codex-acp wrapper requires PATH or A2A_BRIDGE_CODEX_ACP_PATH".into(),
+    })?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(&expected);
+        if candidate.is_absolute() && candidate.is_file() {
+            return canonical_codex_acp_child(candidate);
+        }
+    }
+    Err(BridgeError::ConfigInvalid {
+        reason: format!("codex-acp wrapper could not resolve {expected:?} on PATH"),
+    })
+}
+
+fn canonical_codex_acp_child(path: PathBuf) -> Result<String, BridgeError> {
+    let expected = format!("codex-acp{}", std::env::consts::EXE_SUFFIX);
+    if !path.is_absolute() {
+        return Err(BridgeError::ConfigInvalid {
+            reason: format!("codex-acp child path must be absolute and name {expected}"),
+        });
+    }
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+        return Err(BridgeError::ConfigInvalid {
+            reason: format!(
+                "codex-acp child must name {expected}, got {}",
+                path.display()
+            ),
+        });
+    }
+    let canonical = std::fs::canonicalize(&path).map_err(|error| BridgeError::ConfigInvalid {
+        reason: format!("resolve codex-acp child {}: {error}", path.display()),
+    })?;
+    let metadata = std::fs::metadata(&canonical).map_err(|error| BridgeError::ConfigInvalid {
+        reason: format!("stat codex-acp child {}: {error}", canonical.display()),
+    })?;
+    if !metadata.is_file() {
+        return Err(BridgeError::ConfigInvalid {
+            reason: format!("codex-acp child {} is not a file", canonical.display()),
+        });
+    }
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
+fn acp_prefix_attestation_transport(
+    entry: &AgentEntry,
+) -> bridge_acp::acp_backend::PrefixAttestationTransport {
+    if entry.sandbox.is_none()
+        && entry
+            .cmd
+            .as_deref()
+            .is_some_and(is_packaged_codex_wrapper_candidate)
+    {
+        bridge_acp::acp_backend::PrefixAttestationTransport::PackagedCodexAcpAttested
+    } else {
+        bridge_acp::acp_backend::PrefixAttestationTransport::Unsupported
+    }
+}
+
 /// Compose-or-raw: the `(runtime program, argv)` for spawning a `kind="acp"` agent. A `[sandbox]`
 /// agent runs the runtime (docker) wrapping the agent cli; a raw agent runs `cmd`+`args` directly
 /// (Slice A compat). BOTH `SpawnFn` closures (run-workflow + serve) call this, so the two paths can't
@@ -408,6 +488,17 @@ fn acp_program_argv(
             bridge_core::sandbox::compose_sandbox_named(sb, name, cmd, &args, labels)
         }
         (Some(sb), None) => bridge_core::sandbox::compose_sandbox(sb, cmd, &args, labels),
+        (None, _) if is_packaged_codex_wrapper_candidate(cmd) => {
+            let child = resolve_codex_acp_child()?;
+            let mut wrapper_args = vec![
+                CODEX_ACP_ATTESTED_INTERNAL_ARG.to_string(),
+                "--codex-acp".to_string(),
+                child,
+                "--".to_string(),
+            ];
+            wrapper_args.extend(args);
+            (packaged_codex_attested_wrapper()?, wrapper_args)
+        }
         (None, _) => (cmd.to_string(), args),
     })
 }
@@ -539,6 +630,7 @@ fn acp_spawn_inputs_with_cwd_binding(
         container,
         watchdog: entry.watchdog.clone(),
         diagnostic_redactor,
+        prefix_attestation_transport: acp_prefix_attestation_transport(entry),
         // ACP-param MCP delivery (claude): the entry's MCP servers ride `session/new`. Codex/kiro
         // native delivery leaves this empty (they get MCP via their native channel, not the param).
         mcp: if matches!(entry.mcp_delivery, bridge_core::mcp::McpDelivery::Acp) {
@@ -1174,8 +1266,8 @@ fn permission_timeout_ms(server: &ServerConfig) -> u64 {
 /// from a raw args iterator (skipping the binary name at position 0 and the
 /// subcommand name at position 1).
 const RUN_WORKFLOW_USAGE: &str = "\
-usage: a2a-bridge run-workflow <workflow-id> --input <file|-> [--session-cwd <repo>] [--config <path>] [--out <file>]
-       a2a-bridge run-workflow --serve [--url <url>] --context <context-id> <workflow-id> --input <file|-> [--session-cwd <repo>] [--out <file>]
+usage: a2a-bridge run-workflow <workflow-id> --input <file|-> [--session-cwd <repo>] [--config <path>] [--out <file>] [--strict-brief]
+       a2a-bridge run-workflow --serve [--url <url>] --context <context-id> <workflow-id> --input <file|-> [--session-cwd <repo>] [--out <file>] [--strict-brief]
   <workflow-id>   design | code-review | spec-review | plan-review | … (whatever your --config defines)
   --input <file|-> the typed task-spec markdown the workflow acts on (required; '-' reads stdin)
   --session-cwd   the repo the agents read/work in (per-request cwd; without it they use the launch cwd)
@@ -1183,7 +1275,8 @@ usage: a2a-bridge run-workflow <workflow-id> --input <file|-> [--session-cwd <re
   --serve         call a running a2a-bridge serve via SendStreamingMessage instead of local execution
   --url <url>     serve URL for --serve (default: http://127.0.0.1:8080)
   --context       warm workflow parent context id for --serve (required with --serve)
-  --out <file>    write the terminal node's output here (default: stdout)";
+  --out <file>    write the terminal node's output here (default: stdout)
+  --strict-brief abort before spawning/contacting serve when brief lint reports a VIOLATION";
 
 #[allow(clippy::type_complexity)]
 fn parse_run_workflow_args(
@@ -1198,6 +1291,7 @@ fn parse_run_workflow_args(
         bool,
         String,
         Option<String>,
+        bool,
     ),
     BoxError,
 > {
@@ -1212,11 +1306,16 @@ fn parse_run_workflow_args(
     let mut url = "http://127.0.0.1:8080".to_string();
     let mut url_explicit = false;
     let mut context: Option<String> = None;
+    let mut strict_brief = false;
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
             "--serve" => {
                 serve = true;
+                idx += 1;
+            }
+            "--strict-brief" => {
+                strict_brief = true;
                 idx += 1;
             }
             "--input" => {
@@ -1314,6 +1413,7 @@ fn parse_run_workflow_args(
         serve,
         url,
         context,
+        strict_brief,
     ))
 }
 
@@ -1351,10 +1451,12 @@ struct ImplementArgs {
     depth: Option<review::Depth>,
     /// `--lang auto|none|<id>`: language profile selection for warm+verify.
     lang: LangArg,
+    /// `--strict-brief`: abort before clone/spawn when lint reports VIOLATION.
+    strict_brief: bool,
 }
 
 const IMPLEMENT_USAGE: &str = "\
-usage: a2a-bridge implement --input <file|-> --repo <path> [--config <path>] [--base-ref <ref>] [--workflow <id>] [--depth auto|light|standard|thorough] [--merge [--onto <branch>]]
+usage: a2a-bridge implement --input <file|-> --repo <path> [--config <path>] [--base-ref <ref>] [--workflow <id>] [--depth auto|light|standard|thorough] [--strict-brief] [--merge [--onto <branch>]]
        a2a-bridge implement --resume <id> [--config <path>] [--merge [--onto <branch>]]
   --input <file|-> task-spec markdown to implement; use '-' to read stdin (required)
   --repo <path>   the repo to implement in; cloned into a quarantine under allowed_cwd_root (required)
@@ -1363,6 +1465,7 @@ usage: a2a-bridge implement --input <file|-> --repo <path> [--config <path>] [--
   --workflow <id> the edit workflow (default: implement-edit)
   --depth         review depth: auto|light|standard|thorough (default: [review].default_depth, else auto)
   --lang          language profile: auto|none|<id> (default: auto; auto detects from repo markers)
+  --strict-brief abort before cloning/spawning when brief lint reports a VIOLATION
   --merge         after an Approved run, land it via `merge` (sugar for `a2a-bridge merge <id>`)
   --onto <branch> merge target when --merge is set (else [merge].target_ref, else the run's base_ref)
   --resume <id>   resume a stranded run by its <id> (the clone dir name)
@@ -1420,6 +1523,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
             onto,
             depth,
             lang: LangArg::Auto,
+            strict_brief: false,
         });
     }
 
@@ -1429,11 +1533,16 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
     let mut onto = None;
     let mut depth: Option<review::Depth> = None;
     let mut lang = LangArg::Auto;
+    let mut strict_brief = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--merge" => {
                 merge = true;
+                i += 1;
+            }
+            "--strict-brief" => {
+                strict_brief = true;
                 i += 1;
             }
             "--onto" => {
@@ -1521,6 +1630,7 @@ fn parse_implement_args(args: &[String]) -> Result<ImplementArgs, BoxError> {
         onto,
         depth,
         lang,
+        strict_brief,
     })
 }
 
@@ -1910,6 +2020,7 @@ async fn run_review_step(
     clone_cwd: &bridge_core::SessionCwd,
     task_id: &str,
     attempt: u32,
+    verify_outcome: &verify::VerifyOutcome,
     depth: review::Depth,
     slice: &dyn slice::SliceRunner,
 ) -> (review::ReviewOutcome, String) {
@@ -1989,7 +2100,13 @@ async fn run_review_step(
     let Some(graph) = wf_map.get(&graph_id).cloned() else {
         return (review::ReviewOutcome::NotLoaded, String::new());
     };
-    let input = review::build_review_input(task, base_sha, head_sha, slice_ref.as_deref());
+    let input = review::build_review_input(
+        task,
+        base_sha,
+        head_sha,
+        slice_ref.as_deref(),
+        verify_outcome,
+    );
     let ctx = bridge_workflow::executor::WorkflowRunContext {
         session_cwd: Some(clone_cwd.clone()),
         make_rich_sink: None,
@@ -2080,7 +2197,12 @@ impl tweak::TweakEffects for ProdEffects<'_> {
     async fn verify(&mut self, _attempt: u32) -> verify::VerifyOutcome {
         run_verify_step(self.verify_cfg, self.profile, self.clone_cwd, self.repo)
     }
-    async fn review(&mut self, attempt: u32, head_sha: &str) -> (review::ReviewOutcome, String) {
+    async fn review(
+        &mut self,
+        attempt: u32,
+        head_sha: &str,
+        verify_outcome: &verify::VerifyOutcome,
+    ) -> (review::ReviewOutcome, String) {
         run_review_step(
             self.review_cfg,
             self.wf_map,
@@ -2091,6 +2213,7 @@ impl tweak::TweakEffects for ProdEffects<'_> {
             self.clone_cwd,
             self.task_id,
             attempt,
+            verify_outcome,
             self.depth,
             &slice::ProdSliceRunner,
         )
@@ -2430,6 +2553,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     let onto = a.onto.clone();
     let depth = a.depth;
     let lang = a.lang;
+    let strict_brief = a.strict_brief;
     let (input, repo, base_ref, workflow) = match a.mode {
         ImplementMode::Fresh {
             input,
@@ -2449,6 +2573,12 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         }
     };
     let raw_input = read_input(&input)?;
+    let brief_lint = bridge_core::brief_lint::lint_brief(
+        &raw_input,
+        bridge_core::brief_lint::BriefLintKind::Implement,
+    );
+    report_brief_lint("implement", &input, &brief_lint, strict_brief);
+    enforce_strict_brief_lint("implement", &brief_lint, strict_brief)?;
     let spec = bridge_core::task_spec::validate_input(&raw_input)
         .map_err(|e| format!("implement: {e}"))?;
     let task = bridge_core::task_spec::body(&spec).to_string();
@@ -2524,6 +2654,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     }
     let branch = implement::branch_for(&task_id);
     implement::do_checkout_branch(&clone, &branch)?;
+    write_implement_brief_lint_artifact(&clone, &brief_lint, strict_brief);
     let pre = implement::head_sha(&clone)?;
     // Precompute the clone's SessionCwd ONCE (pre-commit, fallible here) — reused by the implement-edit
     // ctx, verify, and review so NO `SessionCwd::parse` runs after the commit (the hand-off must always
@@ -3271,22 +3402,62 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         return Ok(());
     }
     bridge_observ::init();
-    let (workflow_id, input_path, out_path, config_path, session_cwd, serve, url, context) =
-        parse_run_workflow_args(args)?;
+    let (
+        workflow_id,
+        input_path,
+        out_path,
+        config_path,
+        session_cwd,
+        serve,
+        url,
+        context,
+        strict_brief,
+    ) = parse_run_workflow_args(args)?;
     let identity = bridge_core::ids::AttemptIdentity::initial()?;
     println!("execution_id={}", identity.execution_id.as_str());
     println!("attempt_id={}", identity.attempt_id.as_str());
     std::io::Write::flush(&mut std::io::stdout())
         .map_err(|error| format!("run-workflow: cannot flush attempt locator: {error}"))?;
+    let run_id = identity.run_id().to_string();
 
     let input = read_input(&input_path.to_string_lossy())
         .map_err(|e| format!("run-workflow: cannot read input {:?}: {e}", input_path))?;
+    let brief_lint = bridge_core::brief_lint::lint_brief(
+        &input,
+        bridge_core::brief_lint::BriefLintKind::RunWorkflow,
+    );
+    report_brief_lint(
+        "run-workflow",
+        &input_path.to_string_lossy(),
+        &brief_lint,
+        strict_brief,
+    );
+
+    // The attempt identity also names local workflow diagnostics and artifacts.
+    let run_artifact_root = session_cwd
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    write_run_workflow_brief_lint_artifact(
+        out_path.as_deref(),
+        Some(&run_artifact_root),
+        Some(&run_id),
+        &brief_lint,
+        strict_brief,
+    );
+
+    enforce_strict_brief_lint("run-workflow", &brief_lint, strict_brief)?;
     if let Err(e) = bridge_core::task_spec::validate_input(&input) {
         eprintln!("{}", e.client_message());
         return Err(e.into());
     }
 
     if serve {
+        if !input.is_empty() {
+            eprintln!(
+                "run-workflow: WARNING: --serve cannot inspect the remote workflow graph; ensure workflow {workflow_id:?} has a node prompt containing {{{{input}}}} or the supplied --input may be ignored"
+            );
+        }
         let context = context.expect("parse_run_workflow_args requires --context with --serve");
         return run_workflow_serve_client(
             &workflow_id,
@@ -3323,6 +3494,11 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         .get(&wf_id)
         .cloned()
         .ok_or_else(|| format!("run-workflow: unknown workflow {workflow_id:?}"))?;
+
+    if let Some(error) = bridge_workflow::executor::input_consumption_error(&graph, &input) {
+        eprintln!("run-workflow: ERROR: {error}");
+        return Err(format!("run-workflow: {error}").into());
+    }
 
     let (workload_fingerprint, workload_fingerprint_complete) =
         bridge_workflow::graph::workload_fingerprint_with(&graph, |agent| {
@@ -3409,6 +3585,36 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
             None
         }
+    };
+
+    let harvest_enabled = graph.nodes.iter().any(|node| {
+        matches!(
+            node.harvest_sanitization.unwrap_or_default(),
+            bridge_core::attestation::HarvestSanitizationMode::AttestedPrefixV1
+        )
+    });
+    let (harvest_audit_store, harvest_audit_path) = run_workflow_harvest_audit_store(
+        &cfg,
+        &base,
+        &run_artifact_root,
+        &run_id,
+        harvest_enabled,
+    )?;
+    if let Some(path) = harvest_audit_path.as_ref() {
+        eprintln!(
+            "[run-workflow] harvest audit store {} task_id {}",
+            path.display(),
+            run_id
+        );
+    }
+    let task_id = if harvest_enabled {
+        Some(
+            bridge_core::ids::TaskId::parse(run_id.clone()).map_err(|e| {
+                format!("run-workflow: invalid generated task id {run_id:?}: {e:?}")
+            })?,
+        )
+    } else {
+        None
     };
 
     // #1d: warm the in-container LSP dep cache up front for container_rw agents. run-workflow targets ONE
@@ -3530,12 +3736,9 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
     );
 
-    // The existing executor run string is the monotonic attempt identity.
-    let run_id = identity.run_id().to_string();
-
     // Per-request session cwd: thread it into the context so EVERY node's agent works in the target
     // dir (a container_rw :rw target, or the repo a reader reads) — not the launch cwd.
-    let ctx = match session_cwd {
+    let mut ctx = match session_cwd {
         Some(dir) => {
             let cwd = bridge_core::SessionCwd::parse(&dir)
                 .map_err(|e| format!("run-workflow: invalid --session-cwd {dir:?}: {e:?}"))?;
@@ -3547,6 +3750,8 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         }
         None => bridge_workflow::executor::WorkflowRunContext::default(),
     };
+    ctx.task_id = task_id;
+    ctx.harvest_audit_store = harvest_audit_store;
 
     let workflow_started = std::time::Instant::now();
     let diagnostic_ctx = bridge_workflow::executor::WorkflowDiagnosticContext::in_memory(ctx);
@@ -5852,6 +6057,275 @@ fn read_input(path: &str) -> Result<String, BoxError> {
     }
 }
 
+#[derive(serde::Serialize)]
+struct BriefLintArtifact<'a> {
+    schema_version: u32,
+    strict: bool,
+    report: &'a bridge_core::brief_lint::BriefLintReport,
+}
+
+fn brief_lint_artifact_json(
+    report: &bridge_core::brief_lint::BriefLintReport,
+    strict: bool,
+) -> Result<String, BoxError> {
+    let artifact = BriefLintArtifact {
+        schema_version: 1,
+        strict,
+        report,
+    };
+    serde_json::to_string_pretty(&artifact).map_err(|e| e.into())
+}
+
+fn brief_lint_severity_label(severity: bridge_core::brief_lint::BriefLintSeverity) -> &'static str {
+    match severity {
+        bridge_core::brief_lint::BriefLintSeverity::Warn => "WARN",
+        bridge_core::brief_lint::BriefLintSeverity::Violation => "VIOLATION",
+    }
+}
+
+fn report_brief_lint(
+    command: &str,
+    input_label: &str,
+    report: &bridge_core::brief_lint::BriefLintReport,
+    strict: bool,
+) {
+    if report.is_empty() {
+        return;
+    }
+    eprintln!(
+        "[brief-lint] {command} input {input_label:?}: {} finding(s)",
+        report.findings.len()
+    );
+    for finding in &report.findings {
+        let location = finding
+            .line
+            .map(|line| format!(" line {line}"))
+            .unwrap_or_default();
+        eprintln!(
+            "[brief-lint] {} {:?} {}{}: {}",
+            brief_lint_severity_label(finding.severity),
+            finding.rule,
+            finding.name,
+            location,
+            finding.message
+        );
+        if let Some(excerpt) = &finding.excerpt {
+            eprintln!("[brief-lint]   {excerpt}");
+        }
+    }
+    if !strict && report.has_violations() {
+        eprintln!("[brief-lint] continuing; pass --strict-brief to abort on VIOLATION findings");
+    }
+}
+
+fn enforce_strict_brief_lint(
+    command: &str,
+    report: &bridge_core::brief_lint::BriefLintReport,
+    strict: bool,
+) -> Result<(), BoxError> {
+    if strict && report.has_violations() {
+        return Err(format!(
+            "{command}: --strict-brief rejected input with VIOLATION brief-lint finding(s)"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn run_workflow_brief_lint_artifact_path(out: &Path) -> PathBuf {
+    out.with_extension("brief-lint.json")
+}
+
+/// Returns the git directory used as the run artifact surface.
+///
+/// Linked worktrees have a `.git` file that points at the worktree-specific git
+/// directory; artifacts intentionally follow that pointer so concurrent
+/// worktrees keep isolated run surfaces instead of coalescing under the common
+/// repository git dir.
+fn repo_git_dir(root: &Path) -> Option<PathBuf> {
+    let git = root.join(".git");
+    if git.is_dir() {
+        return Some(git);
+    }
+    if git.is_file() {
+        let raw = std::fs::read_to_string(&git).ok()?;
+        let gitdir = raw.strip_prefix("gitdir:")?.trim();
+        if gitdir.is_empty() {
+            return None;
+        }
+        let gitdir = PathBuf::from(gitdir);
+        return Some(if gitdir.is_absolute() {
+            gitdir
+        } else {
+            root.join(gitdir)
+        });
+    }
+    None
+}
+
+fn run_workflow_brief_lint_run_artifact_path(root: &Path, run_id: &str) -> Option<PathBuf> {
+    Some(
+        repo_git_dir(root)?
+            .join("a2a-bridge")
+            .join("run-workflow")
+            .join(run_id)
+            .join("brief-lint.json"),
+    )
+}
+
+fn run_workflow_harvest_audit_artifact_path(root: &Path, run_id: &str) -> Option<PathBuf> {
+    Some(
+        repo_git_dir(root)?
+            .join("a2a-bridge")
+            .join("run-workflow")
+            .join(run_id)
+            .join("harvest-audit.sqlite"),
+    )
+}
+
+fn run_workflow_harvest_audit_store(
+    cfg: &RegistryConfig,
+    config_base: &Path,
+    run_artifact_root: &Path,
+    run_id: &str,
+    enabled: bool,
+) -> Result<
+    (
+        Arc<dyn bridge_core::harvest::HarvestAuditStore>,
+        Option<PathBuf>,
+    ),
+    BoxError,
+> {
+    if !enabled {
+        return Ok((Arc::new(bridge_core::harvest::NoopHarvestAuditStore), None));
+    }
+
+    let (store_path, create_artifact_parent) = match cfg.store.as_ref() {
+        Some(store) => {
+            let path = Path::new(&store.path);
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                config_base.join(path)
+            };
+            (path, false)
+        }
+        None => (
+            run_workflow_harvest_audit_artifact_path(run_artifact_root, run_id).unwrap_or_else(
+                || std::env::temp_dir().join(format!("a2a-bridge-{run_id}-harvest-audit.sqlite")),
+            ),
+            true,
+        ),
+    };
+
+    if create_artifact_parent {
+        let parent = store_path.parent().ok_or_else(|| {
+            format!(
+                "run-workflow: harvest audit artifact has no parent: {:?}",
+                store_path
+            )
+        })?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "run-workflow: cannot create harvest audit artifact directory {:?}: {e}",
+                parent
+            )
+        })?;
+    }
+
+    let sqlite = Arc::new(SqliteStore::open(&store_path).map_err(|e| {
+        format!(
+            "run-workflow: cannot open harvest audit store {:?}: {e:?}",
+            store_path
+        )
+    })?);
+    let task_store: Arc<dyn bridge_core::task_store::TaskStore> = sqlite;
+    let audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
+        bridge_core::task_store::TaskStoreHarvestAuditStore::new(task_store),
+    );
+    Ok((audit_store, Some(store_path)))
+}
+
+fn write_brief_lint_json_artifact(
+    path: &Path,
+    json: &str,
+    create_parent: bool,
+) -> Result<(), BoxError> {
+    if create_parent {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create brief-lint artifact dir {}: {e}", parent.display()))?;
+        }
+    }
+    std::fs::write(path, json)
+        .map_err(|e| format!("write brief-lint artifact {}: {e}", path.display()).into())
+}
+
+fn write_run_workflow_brief_lint_artifact(
+    out_path: Option<&Path>,
+    run_artifact_root: Option<&Path>,
+    run_id: Option<&str>,
+    report: &bridge_core::brief_lint::BriefLintReport,
+    strict: bool,
+) {
+    let json = match brief_lint_artifact_json(report, strict) {
+        Ok(json) => json,
+        Err(e) => {
+            eprintln!("[brief-lint] artifact write failed: {e}");
+            return;
+        }
+    };
+
+    if let (Some(root), Some(run_id)) = (run_artifact_root, run_id) {
+        match run_workflow_brief_lint_run_artifact_path(root, run_id) {
+            Some(artifact) => match write_brief_lint_json_artifact(&artifact, &json, true) {
+                Ok(()) => eprintln!("[brief-lint] wrote artifact {}", artifact.display()),
+                Err(e) => eprintln!("[brief-lint] artifact write failed: {e}"),
+            },
+            None => eprintln!(
+                "[brief-lint] artifact write skipped: no git artifact surface under {}",
+                root.display()
+            ),
+        }
+    }
+
+    if let Some(out) = out_path {
+        let artifact = run_workflow_brief_lint_artifact_path(out);
+        match write_brief_lint_json_artifact(&artifact, &json, false) {
+            Ok(()) => eprintln!("[brief-lint] wrote artifact {}", artifact.display()),
+            Err(e) => eprintln!("[brief-lint] artifact write failed: {e}"),
+        }
+    }
+}
+
+fn write_implement_brief_lint_artifact(
+    clone: &Path,
+    report: &bridge_core::brief_lint::BriefLintReport,
+    strict: bool,
+) {
+    if report.is_empty() {
+        return;
+    }
+    let artifact_dir = clone.join(".git").join("a2a-bridge");
+    let artifact = artifact_dir.join("brief-lint.json");
+    let result = (|| -> Result<(), BoxError> {
+        std::fs::create_dir_all(&artifact_dir).map_err(|e| {
+            format!(
+                "create brief-lint artifact dir {}: {e}",
+                artifact_dir.display()
+            )
+        })?;
+        let json = brief_lint_artifact_json(report, strict)?;
+        std::fs::write(&artifact, json)
+            .map_err(|e| format!("write brief-lint artifact {}: {e}", artifact.display()))?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => eprintln!("[brief-lint] wrote artifact {}", artifact.display()),
+        Err(e) => eprintln!("[brief-lint] artifact write failed: {e}"),
+    }
+}
+
 const VALIDATE_USAGE: &str = "\
 usage: a2a-bridge validate [--config <path>] [--examples-policy off|warn|deny] [--project-marker <text>]...
        a2a-bridge validate --repo-hygiene [--artifact-allowlist <path>]
@@ -6909,6 +7383,12 @@ async fn main() -> Result<(), BoxError> {
     let process_entry = std::time::Instant::now();
     // Dispatch subcommands BEFORE the server path touches the filesystem.
     let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args
+        .get(1)
+        .is_some_and(|arg| arg == CODEX_ACP_ATTESTED_INTERNAL_ARG)
+    {
+        return attested_wrapper::run_from_args(raw_args[2..].to_vec()).await;
+    }
     let sub = parse_top_subcommand(&raw_args);
     // Dispatcher-level `--help`/`-h` for the subcommands whose own parser doesn't (yet) check
     // it: see `dispatcher_help`'s doc comment for why `init` in particular needs this BEFORE
@@ -7842,7 +8322,7 @@ mod cli_tests {
                 let session_cwd = directory.path().join("cwd");
                 std::fs::create_dir(&session_cwd).unwrap();
                 std::fs::create_dir(&temp_root).unwrap();
-                std::fs::write(&prompt_path, "Reply exactly PONG.\n").unwrap();
+                std::fs::write(&prompt_path, "{{input}}\nReply exactly PONG.\n").unwrap();
                 std::fs::write(&input_path, "---\ntask-type: freeform\n---\nroute probe\n")
                     .unwrap();
                 let store = if kind == "configured" {
@@ -8004,6 +8484,7 @@ inputs = []
         let done = |sr: &str| {
             Ok(Update::Done {
                 stop_reason: sr.into(),
+                prefix_attestation: Default::default(),
             })
         };
         // end_turn → complete
@@ -8312,6 +8793,7 @@ inputs = []
                 prompt_template: "{{input}}".into(),
                 inputs: vec![],
                 retry: None,
+                harvest_sanitization: None,
             })
             .collect();
         WorkflowGraph {
@@ -8688,6 +9170,8 @@ inputs = []
             model: None,
             effort: None,
             mode: None,
+            preflight: false,
+            fallback_models: vec![],
             cwd: None,
             session_cwd: None,
             sandbox: None,
@@ -8740,12 +9224,72 @@ inputs = []
     }
 
     #[test]
+    fn prefix_attestation_transport_classifies_wrapper_only_for_unsandboxed_bare_codex() {
+        use bridge_core::domain::{EgressPolicy, MountAccess, SandboxConfig};
+
+        let mut bare = acp_entry("codex");
+        bare.cmd = Some("codex-acp".into());
+        assert_eq!(
+            acp_prefix_attestation_transport(&bare),
+            bridge_acp::acp_backend::PrefixAttestationTransport::PackagedCodexAcpAttested
+        );
+
+        let mut sandboxed = bare.clone();
+        sandboxed.sandbox = Some(SandboxConfig {
+            runtime: None,
+            image: "img".into(),
+            mount: "/work".into(),
+            access: MountAccess::Ro,
+            egress: EgressPolicy::Open,
+            volumes: vec![],
+        });
+        assert_eq!(
+            acp_prefix_attestation_transport(&sandboxed),
+            bridge_acp::acp_backend::PrefixAttestationTransport::Unsupported
+        );
+
+        let mut absolute = acp_entry("codex-absolute");
+        absolute.cmd = Some("/usr/local/bin/codex-acp".into());
+        assert_eq!(
+            acp_prefix_attestation_transport(&absolute),
+            bridge_acp::acp_backend::PrefixAttestationTransport::Unsupported
+        );
+    }
+
+    #[test]
+    fn canonical_codex_child_requires_absolute_codex_acp_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp
+            .path()
+            .join(format!("codex-acp{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&child, "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            canonical_codex_acp_child(child.clone()).unwrap(),
+            std::fs::canonicalize(&child)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert!(canonical_codex_acp_child(PathBuf::from("codex-acp")).is_err());
+        assert!(canonical_codex_acp_child(temp.path().join("not-codex-acp")).is_err());
+    }
+
+    #[test]
     fn acp_program_argv_appends_codex_native_mcp_args() {
+        use bridge_core::domain::{EgressPolicy, MountAccess, SandboxConfig};
         use bridge_core::mcp::{McpDelivery, McpServerSpec};
         // A CodexNative-delivery agent gets `-c mcp_servers.*` args appended ({cwd}-substituted);
         // an Acp-delivery agent (claude) does NOT (it gets MCP via the session/new param).
         let mut codex = acp_entry("codex");
         codex.cmd = Some("codex-acp".into());
+        codex.sandbox = Some(SandboxConfig {
+            runtime: None,
+            image: "img".into(),
+            mount: "/work".into(),
+            access: MountAccess::Ro,
+            egress: EgressPolicy::Open,
+            volumes: vec![],
+        });
         codex.mcp_delivery = McpDelivery::CodexNative;
         codex.mcp = vec![McpServerSpec {
             name: "prism".into(),
@@ -8770,6 +9314,70 @@ inputs = []
         claude.mcp = codex.mcp.clone();
         let (_p, argv) = acp_program_argv(&claude, None, &[], "/repo/z").unwrap();
         assert!(!argv.iter().any(|a| a == "-c"), "no -c for Acp: {argv:?}");
+    }
+
+    #[test]
+    fn acp_program_argv_wraps_unsandboxed_codex_and_preserves_mcp_args() {
+        use bridge_core::mcp::{McpDelivery, McpServerSpec};
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp
+            .path()
+            .join(format!("codex-acp{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&child, "#!/bin/sh\n").unwrap();
+        let previous = std::env::var_os(CODEX_ACP_CHILD_ENV);
+        std::env::set_var(CODEX_ACP_CHILD_ENV, &child);
+
+        let mut codex = acp_entry("codex");
+        codex.cmd = Some("codex-acp".into());
+        codex.sandbox = None;
+        codex.mcp_delivery = McpDelivery::CodexNative;
+        codex.mcp = vec![McpServerSpec {
+            name: "prism".into(),
+            command: "/opt/prism".into(),
+            args: vec!["--repo".into(), "{cwd}".into()],
+            env: vec![],
+        }];
+
+        let result = acp_program_argv(&codex, None, &[], "/repo/z");
+        match previous {
+            Some(value) => std::env::set_var(CODEX_ACP_CHILD_ENV, value),
+            None => std::env::remove_var(CODEX_ACP_CHILD_ENV),
+        }
+
+        let (program, argv) = result.unwrap();
+        assert_eq!(program, packaged_codex_attested_wrapper().unwrap());
+        assert_eq!(argv[0], CODEX_ACP_ATTESTED_INTERNAL_ARG);
+        assert_eq!(argv[1], "--codex-acp");
+        assert_eq!(
+            argv[2],
+            std::fs::canonicalize(&child)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+        let separator = argv
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("wrapper separator");
+        assert!(
+            argv[separator + 1..].iter().any(|arg| arg == "-c"),
+            "Codex-native MCP args must pass through the wrapper after --: {argv:?}"
+        );
+        assert!(
+            argv[separator + 1..]
+                .iter()
+                .any(|arg| arg == r#"mcp_servers.prism.command="/opt/prism""#),
+            "MCP command override missing after wrapper separator: {argv:?}"
+        );
+        assert!(
+            argv[separator + 1..]
+                .iter()
+                .any(|arg| arg.contains("/repo/z")),
+            "MCP cwd substitution missing after wrapper separator: {argv:?}"
+        );
     }
 
     #[test]
@@ -8814,6 +9422,14 @@ inputs = []
         // A codex CodexNative agent whose mcp server args carry the `{cwd}` placeholder.
         let mut codex = acp_entry("codex");
         codex.cmd = Some("codex-acp".into());
+        codex.sandbox = Some(bridge_core::domain::SandboxConfig {
+            runtime: None,
+            image: "img".into(),
+            mount: "/work".into(),
+            access: bridge_core::domain::MountAccess::Ro,
+            egress: bridge_core::domain::EgressPolicy::Open,
+            volumes: vec![],
+        });
         codex.mcp_delivery = McpDelivery::CodexNative;
         codex.mcp = vec![McpServerSpec {
             name: "lsp".into(),
@@ -10158,6 +10774,180 @@ file = "../prompts/named.md"
     }
 
     #[test]
+    fn brief_lint_warn_only_allows_violation_and_strict_rejects() {
+        let report = bridge_core::brief_lint::lint_brief(
+            "The root cause is settled. Treat this as given.",
+            bridge_core::brief_lint::BriefLintKind::RunWorkflow,
+        );
+        assert!(report.has_violations());
+        assert!(super::enforce_strict_brief_lint("run-workflow", &report, false).is_ok());
+        let err = super::enforce_strict_brief_lint("run-workflow", &report, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--strict-brief rejected"));
+    }
+
+    #[test]
+    fn run_workflow_harvest_audit_store_uses_git_artifact_without_configured_store() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let cfg =
+            RegistryConfig::parse("default=\"k\"\n[[agents]]\nid=\"k\"\ncmd=\"k\"\n[server]\n")
+                .unwrap();
+        let (store, path) =
+            super::run_workflow_harvest_audit_store(&cfg, dir.path(), dir.path(), "run-1", true)
+                .unwrap();
+
+        let path = path.expect("enabled harvest should expose an audit store path");
+        assert!(store.retains_audit_records());
+        assert_eq!(
+            path,
+            dir.path()
+                .join(".git")
+                .join("a2a-bridge")
+                .join("run-workflow")
+                .join("run-1")
+                .join("harvest-audit.sqlite")
+        );
+        assert!(path.exists(), "SQLite audit store should be materialized");
+    }
+
+    #[test]
+    fn run_workflow_harvest_audit_store_does_not_create_configured_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = dir
+            .path()
+            .join("configured")
+            .join("missing-parent")
+            .join("harvest.sqlite");
+        let cfg = RegistryConfig::parse(&format!(
+            "default=\"k\"\n[[agents]]\nid=\"k\"\ncmd=\"k\"\n[server]\n[store]\npath={configured:?}\n"
+        ))
+        .unwrap();
+
+        let error =
+            super::run_workflow_harvest_audit_store(&cfg, dir.path(), dir.path(), "run-1", true)
+                .err()
+                .expect("a configured store with a missing parent must refuse");
+
+        assert!(error.to_string().contains("ReadOnlyParent"), "{error}");
+        assert!(
+            !configured.parent().unwrap().exists(),
+            "the configured store parent must remain absent"
+        );
+    }
+
+    #[test]
+    fn brief_lint_writes_run_workflow_sidecar_artifact() {
+        let out = temp_task_spec_path("brief-lint-run-workflow-out.md");
+        let _ = std::fs::remove_file(&out);
+        let artifact = super::run_workflow_brief_lint_artifact_path(&out);
+        let _ = std::fs::remove_file(&artifact);
+        let report = bridge_core::brief_lint::lint_brief(
+            "Choose one:
+A) Stop.
+B) Continue.",
+            bridge_core::brief_lint::BriefLintKind::RunWorkflow,
+        );
+        super::write_run_workflow_brief_lint_artifact(Some(&out), None, None, &report, false);
+        let json = std::fs::read_to_string(&artifact).unwrap();
+        assert!(json.contains("option-menu"));
+        let _ = std::fs::remove_file(&artifact);
+    }
+
+    #[test]
+    fn brief_lint_writes_run_workflow_git_artifact_and_sidecar_with_out() {
+        let root = temp_task_spec_path("brief-lint-run-workflow-out-root");
+        let out = temp_task_spec_path("brief-lint-run-workflow-out.md");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&out);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let run_artifact =
+            super::run_workflow_brief_lint_run_artifact_path(&root, "run-1").unwrap();
+        let sidecar = super::run_workflow_brief_lint_artifact_path(&out);
+        let _ = std::fs::remove_file(&sidecar);
+        let report = bridge_core::brief_lint::lint_brief(
+            "Choose one:
+A) Stop.
+B) Continue.",
+            bridge_core::brief_lint::BriefLintKind::RunWorkflow,
+        );
+        super::write_run_workflow_brief_lint_artifact(
+            Some(&out),
+            Some(&root),
+            Some("run-1"),
+            &report,
+            false,
+        );
+        let run_json = std::fs::read_to_string(&run_artifact).unwrap();
+        let sidecar_json = std::fs::read_to_string(&sidecar).unwrap();
+        assert!(run_json.contains("option-menu"));
+        assert!(sidecar_json.contains("option-menu"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    #[test]
+    fn brief_lint_writes_run_workflow_git_artifact_without_out() {
+        let root = temp_task_spec_path("brief-lint-run-workflow-root");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let artifact = super::run_workflow_brief_lint_run_artifact_path(&root, "run-1").unwrap();
+        let report = bridge_core::brief_lint::lint_brief(
+            "Choose one:\nA) Stop.\nB) Continue.",
+            bridge_core::brief_lint::BriefLintKind::RunWorkflow,
+        );
+        super::write_run_workflow_brief_lint_artifact(
+            None,
+            Some(&root),
+            Some("run-1"),
+            &report,
+            false,
+        );
+        let json = std::fs::read_to_string(&artifact).unwrap();
+        assert!(json.contains("option-menu"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn brief_lint_writes_clean_run_workflow_git_artifact_without_out() {
+        let root = temp_task_spec_path("brief-lint-run-workflow-clean-root");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let artifact = super::run_workflow_brief_lint_run_artifact_path(&root, "clean").unwrap();
+        let report = bridge_core::brief_lint::lint_brief(
+            "Review the implementation and report any findings.",
+            bridge_core::brief_lint::BriefLintKind::RunWorkflow,
+        );
+        assert!(report.is_empty());
+        super::write_run_workflow_brief_lint_artifact(
+            None,
+            Some(&root),
+            Some("clean"),
+            &report,
+            false,
+        );
+        let json = std::fs::read_to_string(&artifact).unwrap();
+        assert!(json.contains("\"findings\": []"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn brief_lint_writes_implement_clone_artifact() {
+        let clone = temp_task_spec_path("brief-lint-implement-clone");
+        let _ = std::fs::remove_dir_all(&clone);
+        std::fs::create_dir_all(clone.join(".git")).unwrap();
+        let report = bridge_core::brief_lint::lint_brief(
+            "The root cause is settled.",
+            bridge_core::brief_lint::BriefLintKind::Implement,
+        );
+        super::write_implement_brief_lint_artifact(&clone, &report, false);
+        let json = std::fs::read_to_string(clone.join(".git/a2a-bridge/brief-lint.json")).unwrap();
+        assert!(json.contains("premise-without-license"));
+        let _ = std::fs::remove_dir_all(&clone);
+    }
+
+    #[test]
     fn read_input_file() {
         let path = temp_task_spec_path("read-input-file");
         std::fs::write(&path, "raw file contents\n").unwrap();
@@ -10338,13 +11128,14 @@ The command prints schemas, templates, and validates input.
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (id, input, _out, _cfg, scwd, serve, _url, context) =
+        let (id, input, _out, _cfg, scwd, serve, _url, context, strict_brief) =
             super::parse_run_workflow_args(&args).unwrap();
         assert_eq!(id, "wf");
         assert_eq!(input, std::path::PathBuf::from("in.md"));
         assert_eq!(scwd.as_deref(), Some("/work/repo"));
         assert!(!serve);
         assert!(context.is_none());
+        assert!(!strict_brief);
     }
 
     #[test]
@@ -10353,9 +11144,20 @@ The command prints schemas, templates, and validates input.
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (_id, _input, _out, _cfg, scwd, _serve, _url, _context) =
+        let (_id, _input, _out, _cfg, scwd, _serve, _url, _context, _strict_brief) =
             super::parse_run_workflow_args(&args).unwrap();
         assert!(scwd.is_none());
+    }
+
+    #[test]
+    fn parse_run_workflow_args_strict_brief_flag() {
+        let args: Vec<String> = ["wf", "--input", "in.md", "--strict-brief"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (_id, _input, _out, _cfg, _scwd, _serve, _url, _context, strict_brief) =
+            super::parse_run_workflow_args(&args).unwrap();
+        assert!(strict_brief);
     }
 
     #[test]
@@ -10418,7 +11220,7 @@ The command prints schemas, templates, and validates input.
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (id, input, _out, _cfg, scwd, serve, url, context) =
+        let (id, input, _out, _cfg, scwd, serve, url, context, strict_brief) =
             super::parse_run_workflow_args(&args).unwrap();
         assert_eq!(id, "wf");
         assert_eq!(input, std::path::PathBuf::from("in.md"));
@@ -10426,6 +11228,7 @@ The command prints schemas, templates, and validates input.
         assert!(serve);
         assert_eq!(url, "http://127.0.0.1:8080");
         assert_eq!(context.as_deref(), Some("C"));
+        assert!(!strict_brief);
     }
 
     #[test]
@@ -10849,6 +11652,7 @@ The command prints schemas, templates, and validates input.
         }
         assert_eq!(p.config, std::path::PathBuf::from("c.toml"));
         assert_eq!(p.depth, None);
+        assert!(!p.strict_brief);
 
         let stdin = super::parse_implement_args(&[
             "--input".into(),
@@ -10868,6 +11672,19 @@ The command prints schemas, templates, and validates input.
             "/src/repo".into(),
         ])
         .is_err());
+    }
+
+    #[test]
+    fn parse_implement_args_strict_brief_flag() {
+        let parsed = super::parse_implement_args(&[
+            "--input".into(),
+            "task.md".into(),
+            "--repo".into(),
+            "/r".into(),
+            "--strict-brief".into(),
+        ])
+        .unwrap();
+        assert!(parsed.strict_brief);
     }
 
     #[test]
@@ -10898,6 +11715,7 @@ The command prints schemas, templates, and validates input.
         }
         assert_eq!(fresh.config, std::path::PathBuf::from("/c.toml"));
         assert_eq!(fresh.depth, None);
+        assert!(!fresh.strict_brief);
 
         let res = super::parse_implement_args(&["--resume".into(), "impl-1-ab".into()]).unwrap();
         match res.mode {

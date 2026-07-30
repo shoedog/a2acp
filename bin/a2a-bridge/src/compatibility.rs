@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use bridge_acp::is_model_effort_level;
 use bridge_core::diagnostics::diagnostic_timestamp_ms;
 use bridge_core::domain::Effort;
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,15 @@ const DEFAULT_BASELINE: &str = "compatibility/baselines/pinned.json";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EMBEDDED_SMOKE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+// Release compatibility evidence keeps the production cap; debug/test-profile
+// binaries are unstripped and can exceed it in integration tests. This is the
+// single executable-size authority: `compatibility_resolution` imports it so a
+// resolution this binary can mint stays loadable by `run` (a stale duplicate
+// once rejected debug candidates at resolution load before any output).
+#[cfg(not(debug_assertions))]
+pub(crate) const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(debug_assertions)]
+pub(crate) const MAX_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CATALOG_ENTRIES: usize = 128;
 const MAX_CATALOG_VALUE_BYTES: usize = 256;
 const MAX_CATALOG_TOTAL_BYTES: usize = 64 * 1024;
@@ -2686,6 +2695,69 @@ fn catalog_strings<'a>(
         .collect()
 }
 
+fn is_catalog_model_effort_suffix(suffix: &str) -> bool {
+    is_model_effort_level(suffix)
+}
+
+fn catalog_model_id_effort(id: &str) -> Option<&str> {
+    if let Some(without_close) = id.strip_suffix(']') {
+        if let Some((_, suffix)) = without_close.rsplit_once('[') {
+            if is_catalog_model_effort_suffix(suffix) {
+                return Some(suffix);
+            }
+        }
+    }
+
+    id.rsplit_once('/')
+        .and_then(|(_, suffix)| is_catalog_model_effort_suffix(suffix).then_some(suffix))
+}
+
+fn catalog_model_id_base(id: &str) -> &str {
+    if let Some(without_close) = id.strip_suffix(']') {
+        if let Some((base, suffix)) = without_close.rsplit_once('[') {
+            if catalog_model_id_effort(id) == Some(suffix) {
+                return base;
+            }
+        }
+    }
+
+    if let Some((base, suffix)) = id.rsplit_once('/') {
+        if catalog_model_id_effort(id) == Some(suffix) {
+            return base;
+        }
+    }
+
+    id
+}
+
+fn catalog_current_model_matches_request(
+    current_model: Option<&str>,
+    model: &str,
+    effort: Option<&str>,
+) -> bool {
+    let Some(current_model) = current_model else {
+        return false;
+    };
+    current_model == model
+        || effort.is_some_and(|effort| {
+            catalog_model_id_base(current_model) == model
+                && catalog_model_id_effort(current_model) == Some(effort)
+        })
+}
+
+fn catalog_effort_matches_request(
+    efforts: &[&str],
+    current_model: Option<&str>,
+    effort: Option<&str>,
+) -> bool {
+    let Some(effort) = effort else {
+        return true;
+    };
+    efforts.contains(&effort)
+        || current_model
+            .is_some_and(|current_model| catalog_model_id_effort(current_model) == Some(effort))
+}
+
 fn valid_available_catalog_for(
     smoke: &Value,
     model: &str,
@@ -2742,8 +2814,8 @@ fn valid_available_catalog_for(
         || configurable && models.is_empty()
         || current_model.is_some_and(|current| !models.contains(&current))
         || current_mode.is_some_and(|current| !modes.contains(&current))
-        || current_model != Some(model)
-        || effort.is_some_and(|effort| !efforts.contains(&effort))
+        || !catalog_current_model_matches_request(current_model, model, effort)
+        || !catalog_effort_matches_request(&efforts, current_model, effort)
         || mode.is_some_and(|mode| !modes.contains(&mode) || current_mode != Some(mode))
     {
         return false;
@@ -6614,6 +6686,46 @@ agent_cli = "@openai/codex=0.144.1"
         }
     }
 
+    #[test]
+    fn catalog_model_effort_suffixes_follow_acp_rank_invariants() {
+        assert!(is_catalog_model_effort_suffix("xhigh"));
+        assert!(is_catalog_model_effort_suffix("max"));
+        assert!(!is_catalog_model_effort_suffix("minimal"));
+        assert!(!is_catalog_model_effort_suffix("XHIGH"));
+    }
+
+    #[test]
+    fn available_catalog_accepts_effort_suffixed_current_model_ids() {
+        let mut case = case("only", EvidenceStatus::Pass);
+        case.effort = Some("xhigh".into());
+        let mut artifact = smoke(&case, true, Some(1));
+
+        artifact["target"]["model_catalog"]["current_model"] = json!("test-model[xhigh]");
+        artifact["target"]["model_catalog"]["models"] =
+            json!(["test-model[medium]", "test-model[xhigh]"]);
+        artifact["target"]["model_catalog"]["effort_levels"] = json!([]);
+        assert!(
+            valid_available_catalog(&artifact, &case),
+            "codex-acp models-field catalogs may encode effort in current_model/modelId"
+        );
+
+        artifact["target"]["model_catalog"]["current_model"] = json!("test-model/xhigh");
+        artifact["target"]["model_catalog"]["models"] =
+            json!(["test-model/medium", "test-model/xhigh"]);
+        assert!(
+            valid_available_catalog(&artifact, &case),
+            "slash-style effort suffixes are also accepted"
+        );
+
+        artifact["target"]["model_catalog"]["current_model"] = json!("test-model/high");
+        artifact["target"]["model_catalog"]["models"] =
+            json!(["test-model/medium", "test-model/high"]);
+        assert!(
+            !valid_available_catalog(&artifact, &case),
+            "a suffixed modelId with the wrong effort must not satisfy the requested pin"
+        );
+    }
+
     #[tokio::test]
     async fn floating_pass_requires_exact_terminal_and_available_same_session_catalog() {
         for (mutation, expected_drift) in [
@@ -8413,9 +8525,13 @@ agent_cli = "@openai/codex=0.144.1"
             "claude-direct-host-cli-fable",
             "claude-host-acp-044-fable",
             "claude-host-acp-055-fable",
+            "claude-host-acp-063-sonnet5",
             "claude-managed-no-egress-055-fable",
             "claude-reader-055-fable",
+            "claude-reader-063-sonnet5",
+            "codex-host-bridge-gpt56-luna",
             "codex-host-bridge-gpt56-sol",
+            "codex-reader-bridge-gpt56-luna",
             "codex-reader-bridge-gpt56-sol",
             "kiro-host-stale",
             "kiro-reader-stale",
@@ -8456,10 +8572,80 @@ agent_cli = "@openai/codex=0.144.1"
             loaded.manifest.schema_version
         );
         assert_eq!(baseline.manifest_sha256, loaded.sha256);
-        assert!(
-            baseline.cases.is_empty(),
-            "the checked-in baseline must remain unpromoted until authorized live evidence replaces this assertion"
+        assert_eq!(
+            baseline.aggregate,
+            AggregateBaseline {
+                success: true,
+                cancelled: false,
+                budget_exhausted: false,
+                token_observation_missing_cases: 0,
+                cost_observation_missing_cases: 2,
+            }
         );
+        let expected = BTreeSet::from([
+            "claude-host-acp-063-sonnet5",
+            "claude-reader-063-sonnet5",
+            "codex-host-bridge-gpt56-luna",
+            "codex-reader-bridge-gpt56-luna",
+        ]);
+        let actual = baseline
+            .cases
+            .iter()
+            .map(|case| case.case_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+        for case in &baseline.cases {
+            assert_eq!(case.status, EvidenceStatus::Pass, "{}", case.case_id);
+            assert_eq!(
+                case.outcome.get("execution").and_then(Value::as_str),
+                Some("completed"),
+                "{}",
+                case.case_id
+            );
+            assert_eq!(
+                case.outcome.get("expectation_met").and_then(Value::as_bool),
+                Some(true),
+                "{}",
+                case.case_id
+            );
+            assert_eq!(case.outcome["drift"], json!([]), "{}", case.case_id);
+            assert_eq!(
+                case.outcome["budget_violations"],
+                json!([]),
+                "{}",
+                case.case_id
+            );
+            assert_eq!(
+                case.terminal.pointer("/turn/prompt_calls"),
+                Some(&json!(1)),
+                "{}",
+                case.case_id
+            );
+            assert_eq!(
+                case.terminal.pointer("/turn/exact_pong"),
+                Some(&json!(true)),
+                "{}",
+                case.case_id
+            );
+            assert_eq!(
+                case.terminal.pointer("/turn/tool_event_count"),
+                Some(&json!(0)),
+                "{}",
+                case.case_id
+            );
+            assert_eq!(
+                case.terminal.pointer("/turn/permission_update_count"),
+                Some(&json!(0)),
+                "{}",
+                case.case_id
+            );
+            assert_eq!(
+                case.diagnostic.get("dropped_events"),
+                Some(&json!(0)),
+                "{}",
+                case.case_id
+            );
+        }
     }
 
     #[tokio::test]

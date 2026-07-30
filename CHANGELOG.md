@@ -7,20 +7,50 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-29
+
 ### Added
 
-- The R3b compatibility manifest now carries exact pinned contracts for four supported bridge-smoke
-  paths plus explicit historical Claude and stale Kiro controls. Pinned configs are digest-gated before
-  provider spawn; reader provenance binds immutable image package labels and the minimal Fable settings
-  file's SHA-256.
+- A bounded compatibility system now validates and runs exact pinned bridge-smoke contracts, resolves
+  provider-free floating-current candidates, compares retained evidence, enforces per-case budgets, and
+  schedules canaries through durable admission and evidence-retention state. Pinned configs are digest-gated
+  before provider spawn; reader provenance binds immutable image package labels and the minimal Fable
+  settings file's SHA-256.
+- The fixed-prompt `smoke` command records private schema-versioned live evidence, while `fallback-plan`
+  can prepare a separately authorized, object-identity-guarded host verification after a classified reader
+  failure.
+- Experimental attested-prefix harvesting adds a capability-negotiated Codex ACP wrapper, default-off
+  `harvest_sanitization` workflow configuration, atomic raw-output and decision auditing, and committed
+  effective-body delivery at the workflow fan-in boundary.
+- Implement and workflow inputs receive a native warning-only brief lint, with `--strict-brief` available
+  when unsupported evidence claims should block dispatch.
 
 ### Changed
 
-- The reader image build pins and asserts the nested Codex 0.144.1 and Claude SDK 0.3.198 package
-  resolutions and publishes their non-secret exact identities as bounded-inspection image labels.
+- Workflow node TOML parsing now rejects unknown keys. Pre-Task-F configs with stray keys under
+  `[[workflows.nodes]]` must remove or rename them before startup; use only `id`, `agent`, one prompt
+  source, `inputs`, `retry`, and `harvest_sanitization`.
+
+- Reader and writable-toolchain images now pin and assert Codex ACP 1.1.7 with Codex 0.145.0 and Claude
+  ACP 0.63.0 with Agent SDK 0.3.220 and bundled Claude Code 2.1.220. Their non-secret exact identities are
+  published as bounded-inspection image labels, and the toolchain independently pins
+  `basedpyright` 1.39.8 without a location-dependent mise shim.
 
 ### Fixed
 
+- Compatibility release gates now target the promoted Codex ACP 1.1.7 / Codex 0.145.0 and Claude ACP
+  0.63.0 / Agent SDK 0.3.220 host and reader paths with Luna/Sonnet, while preserving the former Sol/Fable
+  rows explicitly as historical controls. Standalone and workflow smokes both require byte-exact `PONG`.
+- Workflow preflight no longer falls through to a second model after prompt acceptance: empty, non-`PONG`,
+  cancelled, and broken-stream terminals are sticky. Ordinary cold and warm workflow turns likewise never
+  replay an accepted empty final, even when a retry policy or a fresh checkout could recover. Reader-impact
+  scheduling derives its subset from the same typed claimed-support inventory, avoiding stale model-era IDs.
+- The package explicitly keeps `a2a-bridge` as its default binary, so documented `cargo run -p a2a-bridge -- …`
+  operator and hygiene commands remain unambiguous alongside the new attested wrapper binary. Warm dispatch
+  also arms its completion owner before fallible turn-ID setup so an identity failure cannot strand a session
+  in `Running`.
+- The attested Codex ACP wrapper now preserves untouched LF, CRLF, and final EOF-delimited frames byte for
+  byte in both proxy directions and in spill-to-disk buffering.
 - Bridge-managed agents can no longer accidentally recurse into the bridge's external-controller MCP
   surface. Direct `[[agents.mcp]]` loopback configurations are rejected, every managed MCP delivery carries
   a reserved depth marker, and marked `a2a-bridge mcp` invocations refuse before config, store, or coordinator

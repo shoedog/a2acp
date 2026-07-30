@@ -1,0 +1,25 @@
+# Current pinned Sonnet reader support profile. Only the isolated credential copy is mounted.
+default = "claude-sonnet-low-reader"
+allowed_cwd_root = "/Users/wesleyjinks/code"
+
+[[agents]]
+id = "claude-sonnet-low-reader"
+cmd = "claude-agent-acp"
+pre_authenticated = true
+model = "sonnet"
+effort = "low"
+
+[agents.sandbox]
+image = "sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f"
+mount = "/Users/wesleyjinks/code"
+access = "ro"
+egress = "locked"
+network = "a2a-egress-internal"
+proxy = "http://a2a-egress-proxy:8888"
+volumes = ["/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json"]
+
+[registry]
+allowed_cmds = ["docker"]
+
+[server]
+addr = "127.0.0.1:8080"

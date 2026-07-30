@@ -26,12 +26,45 @@ const MAX_TIMEOUT_SECS: u64 = 900;
 const MAX_TOKENS: u64 = 1_000_000;
 const MAX_COST_MICROUSD: u64 = 100_000_000;
 const OWNER_APPROVED_TRUSTED_CWD_ROOT: &str = "/Users/wesleyjinks/code";
-pub(super) const EXPECTED_SUPPORT_PROFILES: [&str; 4] = [
-    "claude-host-acp-044-fable",
-    "claude-reader-055-fable",
-    "codex-host-bridge-gpt56-sol",
-    "codex-reader-bridge-gpt56-sol",
+#[derive(Clone, Copy)]
+struct ExpectedSupportProfile {
+    case_id: &'static str,
+    reader: bool,
+}
+
+const EXPECTED_SUPPORT_PROFILES: [ExpectedSupportProfile; 4] = [
+    ExpectedSupportProfile {
+        case_id: "claude-host-acp-063-sonnet5",
+        reader: false,
+    },
+    ExpectedSupportProfile {
+        case_id: "claude-reader-063-sonnet5",
+        reader: true,
+    },
+    ExpectedSupportProfile {
+        case_id: "codex-host-bridge-gpt56-luna",
+        reader: false,
+    },
+    ExpectedSupportProfile {
+        case_id: "codex-reader-bridge-gpt56-luna",
+        reader: true,
+    },
 ];
+
+pub(super) fn expected_support_profile_ids() -> BTreeSet<&'static str> {
+    EXPECTED_SUPPORT_PROFILES
+        .iter()
+        .map(|profile| profile.case_id)
+        .collect()
+}
+
+pub(super) fn expected_support_reader_case_ids() -> BTreeSet<&'static str> {
+    EXPECTED_SUPPORT_PROFILES
+        .iter()
+        .filter(|profile| profile.reader)
+        .map(|profile| profile.case_id)
+        .collect()
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -2164,8 +2197,6 @@ fn validate_claimed_support_config_effect_boundary(
         "anthropic-claude" => vec![
             "/Users/wesleyjinks/.config/a2a-creds/claude/.credentials.json:/root/.claude/.credentials.json"
                 .to_owned(),
-            "/Users/wesleyjinks/code/a2a-bridge-operator-main/deploy/containers/claude-fable-settings.json:/root/.claude/settings.json:ro"
-                .to_owned(),
         ],
         _ => unreachable!("provider family was closed above"),
     };
@@ -2489,7 +2520,7 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
         .iter()
         .map(|profile| profile.source_id.as_str())
         .collect::<BTreeSet<_>>();
-    if support_ids != EXPECTED_SUPPORT_PROFILES.into_iter().collect() {
+    if support_ids != expected_support_profile_ids() {
         return Err(format!(
             "schedule foundation: claimed-support inventory changed: {support_ids:?}"
         )
@@ -2908,6 +2939,24 @@ mod tests {
             resolve_trusted_session_cwd("offline fixture", &declared, &offline_root).unwrap(),
             declared
         );
+    }
+
+    #[test]
+    fn trusted_session_cwd_rejects_absent_cwd_when_owner_root_is_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("trusted-root");
+        std::fs::create_dir(&root).unwrap();
+        for declared in [
+            root.join("repository"),
+            root.join("nested/deeper/repository"),
+        ] {
+            let error =
+                resolve_trusted_session_cwd("absent fixture", &declared, &root).unwrap_err();
+            assert!(
+                error.to_string().contains("not a resolvable directory"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

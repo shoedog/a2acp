@@ -36,7 +36,10 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_ID_BYTES: usize = 128;
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const SMOKE_SCHEMA_V2: u16 = 2;
-const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+// Shared with `compatibility` (single executable-size authority; release keeps the
+// production cap, debug/test binaries are unstripped and larger) so the fallback
+// planner cannot diverge from the smoke-side recheck or the compatibility runner.
+use crate::compatibility::MAX_EXECUTABLE_BYTES;
 
 #[derive(Debug)]
 struct FallbackArgs {

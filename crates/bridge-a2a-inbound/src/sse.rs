@@ -317,6 +317,7 @@ mod tests {
             Ok(Update::Text("hello".into())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ])));
         let st = FakeStore;
@@ -399,6 +400,7 @@ mod tests {
             Ok(Update::Text("hello".into())),
             Ok(Update::Done {
                 stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
             }),
         ])));
         let st = FakeStore;

@@ -1,4 +1,4 @@
-# R3d0 characterization-required provider-minimal reader profile. The immutable image is deliberate.
+# Current pinned Luna reader support profile. The immutable image is deliberate.
 default = "codex-luna-reader"
 allowed_cwd_root = "/Users/wesleyjinks/code"
 
@@ -11,7 +11,7 @@ effort = "low"
 args = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
 
 [agents.sandbox]
-image = "sha256:b154aefda301a59a11857700debe826a282dc6e07b76a0ebb46dd6a8e55a03f1"
+image = "sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f"
 mount = "/Users/wesleyjinks/code"
 access = "ro"
 egress = "locked"
