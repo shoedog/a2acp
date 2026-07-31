@@ -174,8 +174,8 @@ SUBCOMMANDS:
                       [--confirm-trusted-own-repo-read-only]
   implement --input <file|-> Clone a repo, implement the task on a warm containerized agent, verify+review, hand off.
                       --repo <path> [--config <f>] [--base-ref <ref>] [--workflow <id>] [--strict-brief] [--merge [--onto <branch>]]
-  merge <id>          Land an Approved run's commit into its source repo, re-authored to the operator
-                      (Mode A: fast-forward --onto). [--config <f>] [--onto <branch>] [--force]
+  merge <id>          Land an Approved run's commit into its source repo, re-authored to the operator.
+                      [--config <f>] [--onto <branch>] [--integrate-current] [--force]
   init                Scaffold an a2a-bridge.toml + prompts.  --agents codex,claude [--dir <d>] [--force]
   validate            Validate config schema, registry, workflow DAGs, and prompt refs.
                       [--config <f>] [--examples-policy off|warn|deny] [--project-marker <text>]...
@@ -2506,6 +2506,7 @@ fn merge_after_loop(
     clone: &Path,
     root: &Path,
     onto: Option<&str>,
+    operation: Option<bridge_core::liveness::LeaseGuard>,
 ) -> Result<(), BoxError> {
     if !merge_requested {
         return Ok(());
@@ -2515,12 +2516,31 @@ fn merge_after_loop(
             let mcfg = merge_cfg
                 .transpose()
                 .map_err(|e| format!("implement --merge: {e}"))?;
-            let outcome = merge::merge_clone(mcfg.as_ref(), clone, root, onto, false);
+            let outcome = match operation {
+                Some(lock) => merge::merge_clone_with_operation_lock(
+                    lock,
+                    mcfg.as_ref(),
+                    clone,
+                    root,
+                    onto,
+                    false,
+                    merge::MergeMode::ExactBase,
+                ),
+                None => merge::merge_clone(
+                    mcfg.as_ref(),
+                    clone,
+                    root,
+                    onto,
+                    false,
+                    merge::MergeMode::ExactBase,
+                ),
+            };
             use std::io::Write;
             std::io::stdout().flush().ok();
             std::process::exit(outcome.code());
         }
         other => {
+            drop(operation);
             eprintln!("not merged: run ended {other:?}, not Approved — resume/re-run the agent");
             std::process::exit(2);
         }
@@ -2949,6 +2969,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 &clone,
                 &root,
                 onto.as_deref(),
+                None,
             )
         }
     }
@@ -2981,14 +3002,10 @@ async fn implement_resume_cmd(
     let root = std::fs::canonicalize(&root)
         .map_err(|e| format!("implement --resume: allowed_cwd_root {root:?}: {e}"))?;
     let clone = implement_resume::resolve_clone(&root, resume_id)?;
+    let _operation = implement_resume::acquire_operation_lock(&clone)
+        .map_err(|e| format!("implement --resume: run {resume_id} is busy: {e}"))?;
     let ck = implement_resume::load_checkpoint(&clone)?;
     implement_resume::validate_resumable(&ck)?;
-
-    let lock_dir = clone.join(".git").join("a2a-bridge").join("locks");
-    std::fs::create_dir_all(&lock_dir)
-        .map_err(|e| format!("implement --resume: mkdir {lock_dir:?}: {e}"))?;
-    let _takeover = bridge_core::liveness::acquire_lease_in(&lock_dir, "implement-resume")
-        .map_err(|e| format!("implement --resume: another resume holds {resume_id} ({e})"))?;
 
     let resume_sha = implement_resume::reconcile_head(&clone, &ck)?;
     let clone_cwd = bridge_core::SessionCwd::parse(&clone.to_string_lossy())?;
@@ -3193,29 +3210,42 @@ async fn implement_resume_cmd(
         &clone,
         &root,
         onto,
+        Some(_operation),
     )
 }
 
 /// Dispatcher-level `--help`/`-h` for `merge` is handled in `main.rs` (this constant is
 /// `pub` so the top-level dispatcher can print it) BEFORE `merge_cmd`'s own parser runs —
-/// its `--onto`/`--config`/`--force`-only loop would otherwise reject `--help` as an
+/// its merge-flag-only loop would otherwise reject `--help` as an
 /// "unexpected arg".
 pub const MERGE_USAGE: &str = "\
-usage: a2a-bridge merge <id> [--config <path>] [--onto <branch>] [--force]
+usage: a2a-bridge merge <id> [--config <path>] [--onto <branch>] [--integrate-current] [--force]
 
 Land an Approved `implement` run's commit into its source_repo, re-authored to the operator,
-via `git commit-tree` + `git push --force-with-lease` (Mode A: fast-forward onto --onto).
+via `git commit-tree` + `git push --force-with-lease`.
   <id>             the run id (the clone dir name under .a2a-implement/)
   --config <path>  registry config providing allowed_cwd_root + [merge] (default: ./a2a-bridge.toml)
   --onto <branch>  target branch to land onto (else [merge].target_ref, else the run's base_ref)
+  --integrate-current
+                    three-way integrate the run delta onto the current target before its lease push;
+                    use only for an inspected parallel sibling (default requires target == run base)
   --force          also allow landing a LoopStopped (not Approved) run";
 
-/// `a2a-bridge merge <id> [--config <path>] [--onto <branch>] [--force]`
-pub async fn merge_cmd(args: &[String]) -> Result<(), BoxError> {
+#[derive(Debug, PartialEq, Eq)]
+struct MergeCliArgs {
+    id: String,
+    config_path: PathBuf,
+    onto: Option<String>,
+    force: bool,
+    mode: merge::MergeMode,
+}
+
+fn parse_merge_args(args: &[String]) -> Result<MergeCliArgs, BoxError> {
     let mut id: Option<String> = None;
     let mut config_path = std::path::PathBuf::from(CONFIG_PATH);
     let mut onto: Option<String> = None;
     let mut force = false;
+    let mut mode = merge::MergeMode::ExactBase;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -3228,15 +3258,29 @@ pub async fn merge_cmd(args: &[String]) -> Result<(), BoxError> {
                 onto = Some(args.get(i).ok_or("merge: --onto needs a branch")?.clone());
             }
             "--force" => force = true,
+            "--integrate-current" => mode = merge::MergeMode::IntegrateCurrent,
             s if !s.starts_with('-') && id.is_none() => id = Some(s.to_string()),
             s => return Err(format!("merge: unexpected arg {s:?}").into()),
         }
         i += 1;
     }
-    let id =
-        id.ok_or("merge: missing <id> (usage: a2a-bridge merge <id> [--onto <branch>] [--force])")?;
-    let config_path = std::fs::canonicalize(&config_path)
-        .map_err(|e| format!("merge: config {}: {e}", config_path.display()))?;
+    let id = id.ok_or(
+        "merge: missing <id> (usage: a2a-bridge merge <id> [--onto <branch>] [--integrate-current] [--force])",
+    )?;
+    Ok(MergeCliArgs {
+        id,
+        config_path,
+        onto,
+        force,
+        mode,
+    })
+}
+
+/// `a2a-bridge merge <id> [--config <path>] [--onto <branch>] [--integrate-current] [--force]`
+pub async fn merge_cmd(args: &[String]) -> Result<(), BoxError> {
+    let parsed = parse_merge_args(args)?;
+    let config_path = std::fs::canonicalize(&parsed.config_path)
+        .map_err(|e| format!("merge: config {}: {e}", parsed.config_path.display()))?;
     let raw =
         std::fs::read_to_string(&config_path).map_err(|e| format!("merge: read config: {e}"))?;
     let cfg =
@@ -3253,9 +3297,17 @@ pub async fn merge_cmd(args: &[String]) -> Result<(), BoxError> {
         .map(|m| m.to_config())
         .transpose()
         .map_err(|e| format!("merge: {e}"))?;
-    let clone = implement_resume::resolve_clone(&root, &id).map_err(|e| format!("merge: {e}"))?;
+    let clone =
+        implement_resume::resolve_clone(&root, &parsed.id).map_err(|e| format!("merge: {e}"))?;
 
-    let outcome = merge::merge_clone(mcfg.as_ref(), &clone, &root, onto.as_deref(), force);
+    let outcome = merge::merge_clone(
+        mcfg.as_ref(),
+        &clone,
+        &root,
+        parsed.onto.as_deref(),
+        parsed.force,
+        parsed.mode,
+    );
     use std::io::Write;
     std::io::stdout().flush().ok();
     std::process::exit(outcome.code());
@@ -9512,15 +9564,43 @@ inputs = []
 
     #[test]
     fn merge_usage_matches_the_actual_parser() {
-        // `merge_cmd`'s loop accepts exactly --config/--onto/--force plus a positional <id>;
+        // `parse_merge_args` accepts these flags plus one positional <id>;
         // keep the usage constant honest against that, not a guess (W3-A).
         assert!(MERGE_USAGE.starts_with("usage: a2a-bridge merge <id>"));
-        for flag in ["--config <path>", "--onto <branch>", "--force"] {
+        for flag in [
+            "--config <path>",
+            "--onto <branch>",
+            "--integrate-current",
+            "--force",
+        ] {
             assert!(
                 MERGE_USAGE.contains(flag),
                 "missing {flag:?}: {MERGE_USAGE}"
             );
         }
+    }
+
+    #[test]
+    fn merge_parser_requires_explicit_current_integration_flag() {
+        let exact = parse_merge_args(&["run-1".into(), "--onto".into(), "main".into()]).unwrap();
+        assert_eq!(exact.mode, merge::MergeMode::ExactBase);
+        assert_eq!(exact.onto.as_deref(), Some("main"));
+
+        let parallel = parse_merge_args(&[
+            "run-2".into(),
+            "--config".into(),
+            "parallel.toml".into(),
+            "--onto".into(),
+            "main".into(),
+            "--integrate-current".into(),
+        ])
+        .unwrap();
+        assert_eq!(parallel.id, "run-2");
+        assert_eq!(parallel.config_path, PathBuf::from("parallel.toml"));
+        assert_eq!(parallel.mode, merge::MergeMode::IntegrateCurrent);
+        assert!(!parallel.force);
+
+        assert!(parse_merge_args(&["run-3".into(), "--unknown".into()]).is_err());
     }
 
     // ---- W3-A: dispatcher-level `--help`/`-h` + silent-config-write removal ----

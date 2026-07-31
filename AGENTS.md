@@ -98,16 +98,27 @@ run host-side with prism code-nav (read-only).
 ```bash
 a2a-bridge merge <id> --onto main          # land run <id> onto `main` (fast-forward off its base_commit)
 a2a-bridge implement --input task.md --repo … --merge --onto main   # implement + auto-merge when Approved
+a2a-bridge merge <id> --onto main --integrate-current  # inspected parallel sibling; compose onto current main
 ```
 
 `merge` re-authors the clone's commit via `git commit-tree` and lands it with
 `git push --force-with-lease=refs/heads/<target>:<base_commit>` (the lease IS the concurrency CAS — one of N
 concurrent merges wins, the rest get a stale-lease refusal). Operator identity comes from the source repo's
 `git config user.name/email` (or a `[merge]` `author_name/author_email` override). **Exit codes:** `0` merged ·
-`1` usage/preflight · `2` (`--merge`) run not Approved · `3` (`--merge`) Approved but couldn't land (target
-moved / checked out). **Mode A only** (fast-forward `--onto`); a target moved off `base_commit` refuses (re-run
-off the moved target). **Caveat:** a source repo with `receive.denyCurrentBranch=updateInstead`/`ignore` is out
-of scope (the default `refuse` is the no-touch backstop).
+`1` usage/preflight · `2` (`--merge`) run not Approved · `3` Approved but couldn't land (target moved, checked
+out, diverged, or conflicted). Default merge remains exact-base Mode A. For a reviewed sibling from a shared
+immutable base, `--integrate-current` three-way composes its delta onto the fetched current target and leases
+that exact target commit; conflict or non-ancestor history refuses with the clone retained. Resume and merge use
+one clone-local operation lock. **Caveat:** a source repo with
+`receive.denyCurrentBranch=updateInstead`/`ignore` is out of scope (the default `refuse` is the no-touch backstop).
+
+**Parallel implementor flight (ADR-0040).** Freeze one base SHA, write independently testable task specs, and
+assign every changed path/seam to one implementor; reserve shared manifests, roadmaps, generated files, and
+cross-cutting cleanup for an integration task. Start all siblings with the same `--base-ref <sha>` and one shared
+config, but do not give siblings `--merge`. Inspect every terminal result, then integrate Approved siblings one at
+a time in dependency order with `merge --integrate-current`. A conflict stops the flight for an ownership/fix
+decision; it never triggers an automatic agent retry. Run the aggregate full suite and review the combined
+`<base>..<target>` diff after the final landing. The reliability roadmap remains the sole program cursor.
 
 ## 4. Serve (A2A server)
 

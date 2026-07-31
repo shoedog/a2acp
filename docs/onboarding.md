@@ -19,7 +19,9 @@ to a running multi-agent bridge.
 > repo twice, or different repos at once. Each run stamps a unique `a2a.run` instance id (`{pid}-{nonce}`)
 > into its container names (no name clash) and holds an OS `flock` lease that marks it alive, so a peer's
 > before-first-use recovery classifies + reaps only **crashed** (Dead) orphans, never a live run's containers
-> (ADR-0025). Inspect or clean up with `a2a-bridge containers list|reap`.
+> (ADR-0025). Concurrent execution is only half of a parallel implementation flight; use the ownership and
+> integration protocol in [ADR-0040](adr/0040-parallel-implementor-flight.md). Inspect or clean up with
+> `a2a-bridge containers list|reap`.
 
 > **Podman (macOS):** use `examples/a2a-bridge.containerized.podman.toml` and see
 > `docs/containerized-agents.md` → §9 Podman (separate image store, `podman-egress.sh`, re-up after a
@@ -180,6 +182,28 @@ rigor) to the committed diff size:
 Auto-selected from `git diff --numstat` each attempt; override with
 `a2a-bridge implement … --depth auto|light|standard|thorough`. A forced depth is
 stored in the resume checkpoint (and `--depth` on `--resume` overrides it).
+
+### Parallel implementation flights
+
+To keep several implementors in flight against one repo, freeze one base SHA and partition the work before
+dispatch. Each task spec must own disjoint paths or named seams; give shared manifests, roadmaps, generated files,
+and cross-cutting cleanup to a designated integration task. Launch every sibling with the same
+`--base-ref <sha>` and shared config. Do not use `implement --merge` for these siblings.
+
+After all siblings reach a terminal checkpoint, inspect them and integrate Approved results sequentially in
+dependency order:
+
+```bash
+a2a-bridge merge <first-id> --onto main
+a2a-bridge merge <next-id> --onto main --integrate-current
+```
+
+The explicit mode fetches current `main`, requires it to descend from the frozen base, three-way composes the
+reviewed sibling delta without touching either checkout, creates one operator-authored linear commit, and
+lease-pushes against the fetched commit. A conflict, divergence, or concurrent target move makes no target update
+and keeps the clone; rerunning after a target-move refusal is a non-agent operation. Finish with the aggregate full
+suite and a review of the combined base-to-target diff. See
+[ADR-0040](adr/0040-parallel-implementor-flight.md) for the complete custody and ownership contract.
 
 ## Path + reload rules
 

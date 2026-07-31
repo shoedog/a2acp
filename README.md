@@ -254,7 +254,7 @@ that already cover them:
 | `[[prompts]]` | top-level | Named, reusable prompt registry (`file=`/`text=` + `description`) referenced from workflow nodes by id | [AGENTS.md](AGENTS.md), [docs/onboarding.md](docs/onboarding.md) |
 | `[[languages]]` | top-level | Per-language LSP-MCP nav + build/test verify profiles the `implement` review loop uses in-container | [docs/onboarding.md](docs/onboarding.md), `lsp-mcp` crate |
 | `[review]` / `[implement]` | top-level | `implement`'s review-the-diff sizing and the review→tweak loop | `a2a-bridge implement --help`, ADR-0022–0024, ADR-0026 |
-| `[merge]` | top-level | `merge` hand-off target + operator identity override | `a2a-bridge merge --help`, [ADR-0027](docs/adr/0027-merge-handoff.md) |
+| `[merge]` | top-level | exact-base or explicit current-target hand-off + operator identity override | `a2a-bridge merge --help`, [ADR-0027](docs/adr/0027-merge-handoff.md), [ADR-0040](docs/adr/0040-parallel-implementor-flight.md) |
 | `[batch]` | top-level | `run-batch` concurrency admission caps | `a2a-bridge run-batch --help` |
 
 Registry agent entries (`[[agents]]`, `[registry]`) hot-reload on file change (200 ms debounce,

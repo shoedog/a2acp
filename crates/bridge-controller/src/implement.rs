@@ -276,17 +276,18 @@ pub fn nonce(n: usize) -> String {
 
 // ─── Hand-off text ───────────────────────────────────────────────────────────
 
-/// The operator hand-off (informational): merge the bot-authored quarantine branch into <repo> RE-AUTHORED
-/// as the operator, then reap the clone. Paths are quoted so spaces survive the copy-paste. The `clone:`
-/// line carries the bare path (the acceptance gate parses it).
-pub fn handoff_text(clone: &str, branch: &str, sha: &str, subject: &str, repo: &str) -> String {
+/// The operator hand-off (informational). The guarded `merge` command re-authors, lease-pushes, and reaps
+/// only on success; it supersedes the old manual fetch/cherry-pick/raw-delete recipe. The `clone:` line
+/// carries the bare path (the acceptance gate parses it).
+pub fn handoff_text(clone: &str, branch: &str, sha: &str, subject: &str, _repo: &str) -> String {
+    let id = branch.strip_prefix("implement/").unwrap_or(branch);
     format!(
         "implement: committed {sha} \"{subject}\" on {branch}\n\
          clone: {clone}\n\
-         To merge as YOURSELF (bot identity is pre-merge only) and reap the clone:\n\
-         \x20 git -C \"{repo}\" fetch \"{clone}\" {branch}\n\
-         \x20 git -C \"{repo}\" cherry-pick -n FETCH_HEAD && git -C \"{repo}\" commit -C FETCH_HEAD --reset-author\n\
-         \x20 rm -rf \"{clone}\"\n"
+         After an Approved result, use the guarded operator-authored hand-off (add --config when non-default):\n\
+         \x20 a2a-bridge merge {id} --onto <target>\n\
+         For an inspected parallel sibling whose target advanced from the shared base:\n\
+         \x20 a2a-bridge merge {id} --onto <target> --integrate-current\n"
     )
 }
 
@@ -823,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn handoff_text_corrected_reauthor_and_quoted() {
+    fn handoff_text_uses_guarded_merge_and_never_raw_deletes() {
         let t = handoff_text(
             "/root/.a2a-implement/impl-1-ab",
             "implement/impl-1-ab",
@@ -835,11 +836,10 @@ mod tests {
         assert!(
             t.contains("implement/impl-1-ab") && t.contains("abc1234") && t.contains("Fix widget")
         );
-        assert!(t.contains("cherry-pick -n FETCH_HEAD"));
-        assert!(t.contains("commit -C FETCH_HEAD --reset-author"));
-        assert!(!t.contains("cherry-pick --reset-author"));
-        assert!(t.contains("rm -rf \"/root/.a2a-implement/impl-1-ab\"")); // quoted
-        assert!(t.contains("git -C \"/src/repo\" fetch"));
+        assert!(t.contains("a2a-bridge merge impl-1-ab --onto <target>"));
+        assert!(t.contains("--integrate-current"));
+        assert!(!t.contains("cherry-pick"));
+        assert!(!t.contains("rm -rf"));
     }
 
     #[test]

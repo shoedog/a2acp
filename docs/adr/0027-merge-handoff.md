@@ -3,6 +3,9 @@
 **Date:** 2026-06-09
 **Status:** Accepted
 
+**Current extension:** ADR-0040 adds an opt-in current-target integration mode and a shared per-run operation
+lock. The exact-base Mode A behavior in this ADR remains the default.
+
 **Builds on:** ADR-0026 (resume — `resolve_clone`/`load_checkpoint`/`ImplementCheckpoint`), ADR-0019 (B2b-1 —
 host-commits + the commit pin set + bot-identity-pre-merge), ADR-0025 (concurrent runs — flock lease + labels).
 
@@ -70,11 +73,10 @@ source's post-failure ref state — **never parses push stderr**.
   none).
 - **Operator identity** comes from `source_repo`'s git `user.name`/`user.email`, or a `[merge]`
   `author_name`/`author_email` override (both-or-neither); fail-loud if unset.
-- **Concurrency caveat:** `merge` takes no run lease, so it must not run concurrently with `resume`/`merge` on the
-  SAME `<id>` (a partial guard — the clone-HEAD preflight — exists; a first-class per-`<id>` advisory lock is
-  deferred). Under genuine concurrency, target-moved (`StaleLease`) is the common case and each collision
-  discards an Approved run's cost; the replay seam is kept open (clone retained, `commit-tree` pristine) but
-  auto-replay is a follow-up. Mode A is not production-resilient under heavy concurrency.
+- **Superseded concurrency caveat:** ADR-0040 now gives `resume` and `merge` one per-run operation lock outside
+  the reapable clone and lets an operator explicitly compose a reviewed parallel sibling with
+  `--integrate-current`. Exact-base Mode A still returns `StaleLease` when its target moved, and every target
+  update still uses the atomic push lease.
 - **Review provenance:** brainstormed, then 4 dual `spec-review` rounds (codex rigor + claude soundness) on the
   bridge's own containerized `spec-review`, plus a dual `plan-review`; the regression-prone Mode B was deferred.
 

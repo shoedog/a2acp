@@ -54,6 +54,23 @@ pub struct ImplementCheckpoint {
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// One non-blocking operation lock for a quarantine clone. Its namespace is a sibling of the clones rather
+/// than inside `.git`, so guarded clone reaping cannot unlink the lock inode while another command has already
+/// resolved the run. Resume and merge both hold this guard for their entire clone-mutating/reaping operation.
+pub fn acquire_operation_lock(clone: &Path) -> Result<bridge_core::liveness::LeaseGuard, String> {
+    let implement_root = clone
+        .parent()
+        .ok_or_else(|| format!("run clone has no parent: {}", clone.display()))?;
+    let id = clone
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+        .ok_or_else(|| format!("run clone has no valid id: {}", clone.display()))?;
+    let lock_dir = implement_root.join(".operation-locks");
+    bridge_core::liveness::acquire_lease_in(&lock_dir, id)
+        .map_err(|e| format!("another resume or merge operation holds this run ({e})"))
+}
+
 /// `CLONE/.git/a2a-bridge/implement-checkpoint.json` — survives `git reset --hard && git clean -fdq`
 /// (the loop resets the WORKTREE, not `.git/`) and can never be staged into the hand-off commit.
 pub fn checkpoint_path(clone: &Path) -> PathBuf {
@@ -227,6 +244,42 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 2,
         }
+    }
+
+    #[test]
+    fn operation_lock_excludes_same_run_but_not_another_clone() {
+        let root = tempfile::tempdir().unwrap();
+        let implement_root = root.path().join(".a2a-implement");
+        let a = implement_root.join("run-a");
+        let b = implement_root.join("run-b");
+        std::fs::create_dir_all(a.join(".git")).unwrap();
+        std::fs::create_dir_all(b.join(".git")).unwrap();
+
+        let held = acquire_operation_lock(&a).unwrap();
+        assert!(
+            held.path()
+                .starts_with(implement_root.join(".operation-locks")),
+            "the lock must survive guarded clone reaping"
+        );
+        assert!(!held.path().starts_with(&a));
+        assert!(
+            acquire_operation_lock(&a).is_err(),
+            "resume and merge must not operate on the same clone concurrently"
+        );
+        let other = acquire_operation_lock(&b).unwrap();
+
+        std::fs::remove_dir_all(&a).unwrap();
+        assert!(
+            acquire_operation_lock(&a).is_err(),
+            "reaping the clone must not unlink or replace the held operation lock"
+        );
+        assert!(
+            !a.exists(),
+            "a contender must not recreate a ghost clone path"
+        );
+        drop((held, other));
+        let reacquired = acquire_operation_lock(&b).unwrap();
+        drop(reacquired);
     }
 
     #[test]
