@@ -58,6 +58,11 @@ For the explicit mode, the bridge:
    tree; and
 6. pushes it with `--force-with-lease=<target>:<fetched-destination>`.
 
+When that merge tree already equals the fetched destination tree, step 5 creates no empty commit and step 6 uses a
+verify-only `git update-ref --stdin` transaction instead. The transaction locks and compares the destination ref at
+one linearization point; a same-value push is insufficient because Git may send no update command after advertising
+the destination.
+
 This produces a linear target and preserves the reviewed run commit as the immutable delta source. It is not an
 agent retry, prompt replay, textual patch application, or automatic conflict resolution.
 
@@ -71,7 +76,9 @@ recomputes against the new destination. No failed integration automatically spen
 `implement --resume` and `merge` acquire the same non-blocking advisory lock at
 `.a2a-implement/.operation-locks/<id>.lock`, outside the clone that a successful merge reaps. Two operations on one
 run therefore cannot reconcile, create integration objects, push, or reap the same clone concurrently, and clone
-reaping cannot unlink the held lock namespace. Different run IDs use different lock files and remain parallel.
+reaping cannot unlink the held lock namespace. Operation-lock paths persist after release, so a contender that
+opened the path before release and a later opener cannot acquire locks on different inodes. Different run IDs use
+different lock files and remain parallel.
 The destination lease, not this per-run lock, remains the cross-run atomicity boundary.
 
 ## Consequences

@@ -92,6 +92,42 @@ pub fn acquire_lease_in(dir: &Path, run_id: &str) -> std::io::Result<LeaseGuard>
     Ok(LeaseGuard { path, _file: file })
 }
 
+/// A stable-path advisory mutex. Unlike [`LeaseGuard`], dropping this guard never removes the lock path:
+/// a contender may already have opened that inode and be waiting to acquire it. Keeping the path stable until
+/// every contender closes its descriptor prevents a later opener from locking a replacement inode concurrently.
+pub struct PersistentLockGuard {
+    path: PathBuf,
+    _file: std::fs::File,
+}
+impl PersistentLockGuard {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Create + exclusively flock `<dir>/<lock_id>.lock` without unlinking it on guard drop. This is for reusable
+/// operation mutexes; crash-detecting run leases must continue to use [`acquire_lease_in`].
+pub fn acquire_persistent_lock_in(
+    dir: &Path,
+    lock_id: &str,
+) -> std::io::Result<PersistentLockGuard> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{lock_id}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    if !flock_nb(&file, true)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "operation lock already held",
+        ));
+    }
+    Ok(PersistentLockGuard { path, _file: file })
+}
+
 /// Production: acquire under the default lease dir (`$A2A_LEASE_DIR` else `$HOME/.a2a-bridge/leases`).
 pub fn acquire_lease(run_id: &str) -> std::io::Result<LeaseGuard> {
     acquire_lease_in(&lease_dir(), run_id)
@@ -171,6 +207,33 @@ mod tests {
             acquire_lease_in(dir.path(), "x").is_err(),
             "a held lease can't be acquired again"
         );
+    }
+
+    #[test]
+    fn persistent_lock_keeps_one_inode_across_open_drop_reacquire_interleaving() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_persistent_lock_in(dir.path(), "same-run").unwrap();
+        let path = first.path().to_path_buf();
+
+        // Contender B opens the path while A owns it, but has not tried flock yet.
+        let opened_before_release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        drop(first);
+
+        // C opens after A releases. Because A did not unlink, B and C still address the same inode.
+        let current = acquire_persistent_lock_in(dir.path(), "same-run").unwrap();
+        assert!(
+            !flock_nb(&opened_before_release, true).unwrap(),
+            "an earlier opener must not acquire a detached predecessor inode beside the current lock"
+        );
+        drop(current);
+
+        assert!(path.exists(), "a reusable operation-lock path must persist");
+        let reacquired = acquire_persistent_lock_in(dir.path(), "same-run").unwrap();
+        drop(reacquired);
     }
 
     #[test]

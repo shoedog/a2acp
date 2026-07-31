@@ -418,6 +418,62 @@ pub fn push_landing(
     }
 }
 
+/// Establish a linearization point for an already-integrated tree without moving the destination ref. A
+/// same-value `git push` is not a compare-and-swap: after advertisement Git may send no update command at all.
+/// An `update-ref` verify transaction instead locks the local destination and compares it to `expected_commit`.
+fn verify_target_unchanged(
+    source_repo: &Path,
+    target: &str,
+    expected_commit: &str,
+) -> Result<(), PushError> {
+    let transaction =
+        format!("start\nverify refs/heads/{target} {expected_commit}\nprepare\ncommit\n");
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(source_repo)
+        .args(["update-ref", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| PushError::Other(format!("git update-ref spawn: {e}")))?;
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .expect("piped update-ref stdin")
+            .write_all(transaction.as_bytes())
+            .map_err(|e| PushError::Other(format!("git update-ref stdin: {e}")))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| PushError::Other(format!("git update-ref wait: {e}")))?;
+    if out.status.success() {
+        return Ok(());
+    }
+
+    // Classify from the source's current ref, not version-specific update-ref stderr.
+    let observed = run_git(
+        Some(source_repo),
+        &[
+            "rev-parse",
+            "-q",
+            "--verify",
+            &format!("refs/heads/{target}"),
+        ],
+    )
+    .map_err(|e| PushError::Other(format!("git rev-parse after update-ref failure: {e}")))?;
+    if !observed.status.success()
+        || String::from_utf8_lossy(&observed.stdout).trim() != expected_commit
+    {
+        return Err(PushError::StaleLease);
+    }
+    Err(PushError::Other(
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    ))
+}
+
 /// source_repo git config user.name+user.email, or a `[merge]` override. Fail loud if EITHER half is
 /// missing and there is no override.
 pub fn operator_from(
@@ -525,7 +581,7 @@ pub fn merge_clone(
 /// its resume guard here, making the resume-to-merge transition gap-free without recursively acquiring the
 /// non-blocking lock. The guard remains live through push and guarded reap, then drops on return.
 pub fn merge_clone_with_operation_lock(
-    _operation: bridge_core::liveness::LeaseGuard,
+    operation: bridge_core::liveness::PersistentLockGuard,
     mcfg: Option<&MergeConfig>,
     clone: &Path,
     root: &Path,
@@ -533,6 +589,22 @@ pub fn merge_clone_with_operation_lock(
     force: bool,
     mode: MergeMode,
 ) -> MergeOutcome {
+    merge_clone_with_operation_lock_inner(operation, mcfg, clone, root, onto, force, mode, || {})
+}
+
+fn merge_clone_with_operation_lock_inner<F>(
+    _operation: bridge_core::liveness::PersistentLockGuard,
+    mcfg: Option<&MergeConfig>,
+    clone: &Path,
+    root: &Path,
+    onto: Option<&str>,
+    force: bool,
+    mode: MergeMode,
+    before_landing: F,
+) -> MergeOutcome
+where
+    F: FnOnce(),
+{
     let ck: ImplementCheckpoint = match load_checkpoint(clone) {
         Ok(c) => c,
         Err(e) => {
@@ -687,8 +759,8 @@ pub fn merge_clone_with_operation_lock(
                         }
                     };
                     if tree == target_tree {
-                        // Still push the fetched value with its exact lease. That makes the no-op decision
-                        // atomic with respect to a concurrent destination move without creating an empty commit.
+                        // A verify-only ref transaction supplies the no-op linearization point without an empty
+                        // commit. A same-value push may send no update command after its ref advertisement.
                         (target_commit.clone(), target_commit, true)
                     } else {
                         let rt = match author_tree_commit(clone, &tree, &target_commit, &msg, &op) {
@@ -702,7 +774,13 @@ pub fn merge_clone_with_operation_lock(
                     }
                 }
             };
-            match push_landing(clone, &src, &rt, &target, &expected_target) {
+            before_landing();
+            let landing = if already_integrated {
+                verify_target_unchanged(&src, &target, &expected_target)
+            } else {
+                push_landing(clone, &src, &rt, &target, &expected_target)
+            };
+            match landing {
                 Ok(()) => {
                     if let Err(e) = reap_clone(clone, &src, root) {
                         eprintln!("merge: landed but {e}");
@@ -723,7 +801,7 @@ pub fn merge_clone_with_operation_lock(
                             clone.display()
                         ),
                         MergeMode::IntegrateCurrent => eprintln!(
-                            "merge: '{target}' moved off fetched commit {:.12} before the lease push; rerun the same non-agent `merge {} --onto {target} --integrate-current` command. (clone kept at {})",
+                            "merge: '{target}' moved off fetched commit {:.12} before the landing compare-and-swap; rerun the same non-agent `merge {} --onto {target} --integrate-current` command. (clone kept at {})",
                             expected_target,
                             ck.resume_id,
                             clone.display()
@@ -732,7 +810,10 @@ pub fn merge_clone_with_operation_lock(
                     MergeOutcome::Unlanded
                 }
                 Err(PushError::Other(e)) => {
-                    eprintln!("merge: push failed: {e}; clone kept at {}", clone.display());
+                    eprintln!(
+                        "merge: landing failed: {e}; clone kept at {}",
+                        clone.display()
+                    );
                     MergeOutcome::Unlanded
                 }
             }
@@ -981,6 +1062,30 @@ mod git_tests {
             Err(PushError::StaleLease)
         ));
         assert_eq!(run_git_str(&src, &["rev-parse", "release"]), moved_to); // unchanged
+    }
+
+    #[test]
+    fn verify_target_unchanged_accepts_exact_ref_and_rejects_move() {
+        let (_gs, src, base) = repo_with_base();
+        run_git(Some(&src), &["branch", "release", &base]).unwrap();
+        assert!(verify_target_unchanged(&src, "release", &base).is_ok());
+        assert_eq!(run_git_str(&src, &["rev-parse", "release"]), base);
+
+        std::fs::write(src.join("next.txt"), "next\n").unwrap();
+        run_git(Some(&src), &["add", "next.txt"]).unwrap();
+        run_git(Some(&src), &["commit", "-q", "-m", "next"]).unwrap();
+        let moved = run_git_str(&src, &["rev-parse", "HEAD"]);
+        run_git(Some(&src), &["branch", "-f", "release", &moved]).unwrap();
+
+        assert!(matches!(
+            verify_target_unchanged(&src, "release", &base),
+            Err(PushError::StaleLease)
+        ));
+        assert_eq!(
+            run_git_str(&src, &["rev-parse", "release"]),
+            moved,
+            "a failed compare-only transaction must not restore the stale value"
+        );
     }
 
     #[test]
@@ -1387,6 +1492,26 @@ mod git_tests {
         ));
         let already = run_git_str(&src, &["rev-parse", "release"]);
 
+        // A verify-only reference transaction invokes this hook. The pre-fix same-value push sent no update
+        // command and therefore never crossed this transaction boundary.
+        let hook_log = root.path().join("reference-transaction.log");
+        let hook = src.join(".git").join("hooks").join("reference-transaction");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncat >> '{}'\n",
+                hook_log.display(),
+                hook_log.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&hook, permissions).unwrap();
+        }
+
         assert!(matches!(
             merge_clone(
                 None,
@@ -1400,6 +1525,83 @@ mod git_tests {
         ));
         assert_eq!(run_git_str(&src, &["rev-parse", "release"]), already);
         assert!(!clone_b.exists());
+        let transactions = std::fs::read_to_string(&hook_log).unwrap();
+        assert!(transactions.lines().any(|line| line == "prepared"));
+        assert!(transactions.lines().any(|line| line == "committed"));
+    }
+
+    #[test]
+    fn integrate_current_identical_delta_move_before_compare_keeps_clone_and_new_target() {
+        let (_gs, src, base) = repo_with_base();
+        run_git(Some(&src), &["branch", "release", &base]).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (clone_a, _) = clone_with_change(
+            root.path(),
+            &src,
+            &base,
+            "impl-race-a",
+            "same.txt",
+            "same\n",
+            ImplementPhase::Approved,
+        );
+        let (clone_b, _) = clone_with_change(
+            root.path(),
+            &src,
+            &base,
+            "impl-race-b",
+            "same.txt",
+            "same\n",
+            ImplementPhase::Approved,
+        );
+        assert!(matches!(
+            merge_clone(
+                None,
+                &clone_a,
+                root.path(),
+                Some("release"),
+                false,
+                MergeMode::ExactBase,
+            ),
+            MergeOutcome::Merged
+        ));
+        let fetched = run_git_str(&src, &["rev-parse", "release"]);
+        let tree = run_git_str(&src, &["rev-parse", &format!("{fetched}^{{tree}}")]);
+        let moved_out = run_git(
+            Some(&src),
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &fetched,
+                "-m",
+                "concurrent destination move",
+            ],
+        )
+        .unwrap();
+        assert!(moved_out.status.success());
+        let moved = String::from_utf8_lossy(&moved_out.stdout)
+            .trim()
+            .to_string();
+
+        let operation = acquire_operation_lock(&clone_b).unwrap();
+        let outcome = merge_clone_with_operation_lock_inner(
+            operation,
+            None,
+            &clone_b,
+            root.path(),
+            Some("release"),
+            false,
+            MergeMode::IntegrateCurrent,
+            || {
+                run_git(Some(&src), &["branch", "-f", "release", &moved]).unwrap();
+            },
+        );
+        assert!(matches!(outcome, MergeOutcome::Unlanded));
+        assert_eq!(run_git_str(&src, &["rev-parse", "release"]), moved);
+        assert!(
+            clone_b.exists(),
+            "a stale compare-only transaction must retain the reviewed clone"
+        );
     }
 
     #[test]

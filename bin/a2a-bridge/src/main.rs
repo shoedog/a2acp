@@ -2506,7 +2506,7 @@ fn merge_after_loop(
     clone: &Path,
     root: &Path,
     onto: Option<&str>,
-    operation: Option<bridge_core::liveness::LeaseGuard>,
+    operation: Option<bridge_core::liveness::PersistentLockGuard>,
 ) -> Result<(), BoxError> {
     if !merge_requested {
         return Ok(());

@@ -57,7 +57,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// One non-blocking operation lock for a quarantine clone. Its namespace is a sibling of the clones rather
 /// than inside `.git`, so guarded clone reaping cannot unlink the lock inode while another command has already
 /// resolved the run. Resume and merge both hold this guard for their entire clone-mutating/reaping operation.
-pub fn acquire_operation_lock(clone: &Path) -> Result<bridge_core::liveness::LeaseGuard, String> {
+pub fn acquire_operation_lock(
+    clone: &Path,
+) -> Result<bridge_core::liveness::PersistentLockGuard, String> {
     let implement_root = clone
         .parent()
         .ok_or_else(|| format!("run clone has no parent: {}", clone.display()))?;
@@ -67,7 +69,7 @@ pub fn acquire_operation_lock(clone: &Path) -> Result<bridge_core::liveness::Lea
         .filter(|name| !name.is_empty() && !name.contains('/'))
         .ok_or_else(|| format!("run clone has no valid id: {}", clone.display()))?;
     let lock_dir = implement_root.join(".operation-locks");
-    bridge_core::liveness::acquire_lease_in(&lock_dir, id)
+    bridge_core::liveness::acquire_persistent_lock_in(&lock_dir, id)
         .map_err(|e| format!("another resume or merge operation holds this run ({e})"))
 }
 
