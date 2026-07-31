@@ -24949,6 +24949,7 @@ mod r2f0a_history_tests {
         create_pre_history_task_store_fixture_with_task_id(path, "id TEXT PRIMARY KEY", true);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn create_tagged_v021_task_store_fixture(path: &std::path::Path) {
         create_pre_history_task_store_fixture(path);
         let conn = rusqlite::Connection::open(path).unwrap();
