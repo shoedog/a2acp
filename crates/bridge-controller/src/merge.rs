@@ -589,7 +589,21 @@ pub fn merge_clone_with_operation_lock(
     force: bool,
     mode: MergeMode,
 ) -> MergeOutcome {
-    merge_clone_with_operation_lock_inner(operation, mcfg, clone, root, onto, force, mode, || {})
+    merge_clone_with_operation_lock_inner(
+        operation,
+        mcfg,
+        clone,
+        root,
+        onto,
+        MergeOptions { force, mode },
+        || {},
+    )
+}
+
+#[derive(Clone, Copy)]
+struct MergeOptions {
+    force: bool,
+    mode: MergeMode,
 }
 
 fn merge_clone_with_operation_lock_inner<F>(
@@ -598,13 +612,13 @@ fn merge_clone_with_operation_lock_inner<F>(
     clone: &Path,
     root: &Path,
     onto: Option<&str>,
-    force: bool,
-    mode: MergeMode,
+    options: MergeOptions,
     before_landing: F,
 ) -> MergeOutcome
 where
     F: FnOnce(),
 {
+    let MergeOptions { force, mode } = options;
     let ck: ImplementCheckpoint = match load_checkpoint(clone) {
         Ok(c) => c,
         Err(e) => {
@@ -1590,8 +1604,10 @@ mod git_tests {
             &clone_b,
             root.path(),
             Some("release"),
-            false,
-            MergeMode::IntegrateCurrent,
+            MergeOptions {
+                force: false,
+                mode: MergeMode::IntegrateCurrent,
+            },
             || {
                 run_git(Some(&src), &["branch", "-f", "release", &moved]).unwrap();
             },
