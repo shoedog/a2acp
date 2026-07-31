@@ -15,6 +15,63 @@ Status meanings:
 - **STALE** — it passed previously, but a relevant component has changed or the evidence is too old for
   a release decision.
 
+## v0.3.1 exact-candidate release verification — 2026-07-30
+
+The release-mode v0.3.1 candidate at
+`/private/tmp/a2a-bridge-main-merge.vwanDC/main/target/release/a2a-bridge`, SHA-256
+`beda5c2a83998d5968b7cb1f030c137f388b553226c8fd845af77e69b01b5a00`, 29,711,040 bytes, ran the
+current support paths from manifest
+`aee0476dae4ed1956d2b1bc9f1b76008c75ad1c40e2fea64dfcdd00ec01daf33`. The owner-only aggregate is
+mode `0600`, 39,428 bytes, at
+`/private/tmp/a2a-bridge-v031-live.WG56vK/v0.3.1-four-lane-aggregate.json`, SHA-256
+`527c48df85be722c8b4036af9c397039c4333bcb76eaa58a918b0758b6c5616a`. It completed in 23.196 seconds
+with success true, cancellation and budget exhaustion false, 149,264 observed tokens, and USD 0.2019044
+observed cost.
+
+Every current `support` case ran exactly one fixed
+`Reply exactly PONG. Do not use tools.` prompt with retry and fallback caps zero. Every support child
+recorded bridge version 0.3.1, one configure and one prompt call, terminal completed/end-turn, byte-exact
+four-byte `PONG`, zero tool or permission-update events, no timeout, no dropped diagnostics, strict
+stderr exclusion, no drift or budget violation, and completed release and retirement. No managed
+container remained afterward.
+
+| Current support case | Exact path and components | Effective model / effort / mode | Status | Live evidence |
+|---|---|---|---|---|
+| `codex-host-bridge-gpt56-luna` | Host `@agentclientprotocol/codex-acp` 1.1.7 with nested `@openai/codex` 0.145.0; config `968697a6…c7b` | `gpt-5.6-luna` / `low` / `read-only` | **PASS** | 5.427 s; 24,587 tokens; no cost observation. |
+| `codex-reader-bridge-gpt56-luna` | Read-only container image `sha256:79a7ded7f20c9cac640a331436ba0d01b198a82b98b980cf220c37f93e94960f`; Codex ACP 1.1.7 / Codex 0.145.0; config `3ef69ed7…865` | `gpt-5.6-luna` / `low` / adapter `agent` mode inside the read-only container boundary | **PASS** | 6.244 s; 18,160 tokens; no cost observation. |
+| `claude-host-acp-063-sonnet5` | Host `@agentclientprotocol/claude-agent-acp` 0.63.0 with Agent SDK 0.3.220 and bundled Claude Code 2.1.220; config `edd39868…a5e` | `sonnet` (Sonnet 5) / `low` / `auto` | **PASS** | 3.670 s; 46,005 tokens; USD 0.1410702. |
+| `claude-reader-063-sonnet5` | Same immutable read-only image; Claude ACP 0.63.0 / Agent SDK 0.3.220; isolated credential-only mount; config `f4d5582f…fcd0` | `sonnet` (Sonnet 5) / `low` / `default` | **PASS** | 2.523 s; 32,532 tokens; USD 0.0608342. |
+
+The four support-case projections have no changed comparison dimension relative to the checked-in pinned
+baseline. Because the explicit `--lane pinned` selection also evaluates eligible historical
+`non_goal` rows, the aggregate additionally sent one accepted prompt to
+`codex-host-bridge-gpt56-sol`; it returned exact `PONG` and recorded the expected current-package
+provenance drift from its historical pins. Its stale reader companion stopped before prompt with the
+expected missing-image provenance drift, and the remaining seven historical controls were not run. The
+whole-aggregate comparison therefore reports only aggregate-budget drift and the nine non-goal rows as
+added; it reports no support-case drift. No prompt was retried.
+
+The release repair was also checked against a fresh SQLite online backup of the actual v0.2.1 operator
+store. Candidate read-only classification returned the expected typed `Migration`, and the backup
+SHA-256 remained
+`39e23eda04f1b3078032f07dfb1ef5d8a3471ae2270e3b57b5c1e0abbfba9fe6` before and after. This proves
+the exact served predecessor is recognized without mutating the source or backup; it is not post-swap
+served evidence.
+
+Deterministic release gates passed format and diff checks, workspace check, warnings-denied all-target
+Clippy, dependency policy, repository hygiene (38 artifacts / 7 example configs), the 13-case pinned
+manifest, four-case floating recipe, 6/4 schedule foundation, and the locked release build. The complete
+serialized workspace suite passed 2,988 tests with 0 failed and 12 ignored; documentation passed 1/0.
+LLVM line coverage passed at 91.54% workspace, with all six documented package floors green. A fresh
+read-only Sol/xhigh terminal review through this candidate bridge reported no WRONG or SMELL findings and
+`VERDICT: APPROVE`; its retained artifact SHA-256 is
+`07a96d94f92abfd3a0a00047a5851d11ab6e165e86fe670061d4b71127c9f1c3`.
+
+The separately recorded floating-current evidence and production adapter/image pins are unchanged from
+v0.3.0. This verification did not replace a mutable image tag or restart the long-lived served operator;
+the prior v0.3.0 store-admission rollback remains the current incident disposition until the separately
+guarded v0.3.1 service swap completes.
+
 ## v0.3.0 exact-candidate release verification — 2026-07-29
 
 The release-mode v0.3.0 candidate at

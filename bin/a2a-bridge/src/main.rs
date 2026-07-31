@@ -3537,6 +3537,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             opened
         }
     };
+    let configured_harvest_store = cfg
+        .store
+        .as_ref()
+        .and_then(|_| selected_history.as_ref().ok().cloned());
     // Admit the exact offline attempt before registry construction, container
     // warmup, session creation, executor resolution, or provider work. Ordinary
     // summary failures remain fail-open; identity collisions are replay refusal.
@@ -3595,6 +3599,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     });
     let (harvest_audit_store, harvest_audit_path) = run_workflow_harvest_audit_store(
         &cfg,
+        configured_harvest_store,
         &base,
         &run_artifact_root,
         &run_id,
@@ -6185,6 +6190,7 @@ fn run_workflow_harvest_audit_artifact_path(root: &Path, run_id: &str) -> Option
 
 fn run_workflow_harvest_audit_store(
     cfg: &RegistryConfig,
+    configured_store: Option<Arc<SqliteStore>>,
     config_base: &Path,
     run_artifact_root: &Path,
     run_id: &str,
@@ -6233,12 +6239,20 @@ fn run_workflow_harvest_audit_store(
         })?;
     }
 
-    let sqlite = Arc::new(SqliteStore::open(&store_path).map_err(|e| {
-        format!(
-            "run-workflow: cannot open harvest audit store {:?}: {e:?}",
-            store_path
-        )
-    })?);
+    let sqlite = match cfg.store.as_ref() {
+        Some(_) => configured_store.ok_or_else(|| {
+            format!(
+                "run-workflow: configured history store {:?} was not admitted; refusing untyped harvest reopen",
+                store_path
+            )
+        })?,
+        None => Arc::new(SqliteStore::open(&store_path).map_err(|e| {
+            format!(
+                "run-workflow: cannot open harvest audit store {:?}: {e:?}",
+                store_path
+            )
+        })?),
+    };
     let task_store: Arc<dyn bridge_core::task_store::TaskStore> = sqlite;
     let audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
         bridge_core::task_store::TaskStoreHarvestAuditStore::new(task_store),
@@ -10794,9 +10808,15 @@ file = "../prompts/named.md"
         let cfg =
             RegistryConfig::parse("default=\"k\"\n[[agents]]\nid=\"k\"\ncmd=\"k\"\n[server]\n")
                 .unwrap();
-        let (store, path) =
-            super::run_workflow_harvest_audit_store(&cfg, dir.path(), dir.path(), "run-1", true)
-                .unwrap();
+        let (store, path) = super::run_workflow_harvest_audit_store(
+            &cfg,
+            None,
+            dir.path(),
+            dir.path(),
+            "run-1",
+            true,
+        )
+        .unwrap();
 
         let path = path.expect("enabled harvest should expose an audit store path");
         assert!(store.retains_audit_records());
@@ -10825,16 +10845,113 @@ file = "../prompts/named.md"
         ))
         .unwrap();
 
-        let error =
-            super::run_workflow_harvest_audit_store(&cfg, dir.path(), dir.path(), "run-1", true)
-                .err()
-                .expect("a configured store with a missing parent must refuse");
+        let error = super::run_workflow_harvest_audit_store(
+            &cfg,
+            None,
+            dir.path(),
+            dir.path(),
+            "run-1",
+            true,
+        )
+        .err()
+        .expect("an unavailable configured store must refuse harvest setup");
 
-        assert!(error.to_string().contains("ReadOnlyParent"), "{error}");
+        assert!(error.to_string().contains("was not admitted"), "{error}");
         assert!(
             !configured.parent().unwrap().exists(),
             "the configured store parent must remain absent"
         );
+    }
+
+    #[test]
+    fn run_workflow_harvest_audit_store_does_not_reopen_rejected_configured_store() {
+        fn user_schema(path: &std::path::Path) -> Vec<(String, String, String)> {
+            let connection = rusqlite::Connection::open(path).unwrap();
+            let mut statement = connection
+                .prepare(
+                    "SELECT type, name, COALESCE(sql, '')
+                     FROM sqlite_schema
+                     WHERE name NOT GLOB 'sqlite_*'
+                     ORDER BY type COLLATE BINARY, name COLLATE BINARY",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let configured = dir.path().join("malformed-configured.sqlite");
+        drop(SqliteStore::open(&configured).unwrap());
+        let connection = rusqlite::Connection::open(&configured).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE task_attempt_locators;
+                 DROP TABLE attempt_identities;
+                 DROP TABLE workflow_attempt_summaries;
+                 DROP TABLE workflow_history_attachment;
+                 DROP TABLE workflow_history_rewrite_reserve;
+                 ALTER TABLE sessions DROP COLUMN session_id;",
+            )
+            .unwrap();
+        drop(connection);
+        let typed_error = SqliteStore::open_configured_history_read_only(&configured)
+            .err()
+            .expect("the malformed configured store must fail typed admission");
+        assert_eq!(
+            typed_error.reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Corruption
+        );
+        let before = user_schema(&configured);
+        let cfg = RegistryConfig::parse(&format!(
+            "default=\"k\"\n[[agents]]\nid=\"k\"\ncmd=\"k\"\n[server]\n[store]\npath={configured:?}\n"
+        ))
+        .unwrap();
+
+        let outcome = super::run_workflow_harvest_audit_store(
+            &cfg,
+            None,
+            dir.path(),
+            dir.path(),
+            "run-1",
+            true,
+        );
+
+        assert!(
+            outcome.is_err(),
+            "harvest setup must not reopen a configured path after typed admission failed"
+        );
+        assert_eq!(
+            user_schema(&configured),
+            before,
+            "harvest setup mutated the rejected configured store"
+        );
+    }
+
+    #[test]
+    fn run_workflow_harvest_audit_store_reuses_admitted_configured_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = dir.path().join("configured.sqlite");
+        let admitted = Arc::new(SqliteStore::open_shared_history(&configured).unwrap());
+        let cfg = RegistryConfig::parse(&format!(
+            "default=\"k\"\n[[agents]]\nid=\"k\"\ncmd=\"k\"\n[server]\n[store]\npath={configured:?}\n"
+        ))
+        .unwrap();
+
+        let (store, path) = super::run_workflow_harvest_audit_store(
+            &cfg,
+            Some(admitted),
+            dir.path(),
+            dir.path(),
+            "run-1",
+            true,
+        )
+        .unwrap();
+
+        assert!(store.retains_audit_records());
+        assert_eq!(path.as_deref(), Some(configured.as_path()));
     }
 
     #[test]

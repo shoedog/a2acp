@@ -6090,10 +6090,10 @@ mod tests {
         );
         tokio::pin!(second);
         if !matches!(futures::poll!(&mut second), std::task::Poll::Pending) {
-            gate.release.notify_waiters();
+            gate.release.notify_one();
             panic!("second concurrent first miss should wait on the in-flight preflight cell");
         }
-        gate.release.notify_waiters();
+        gate.release.notify_one();
 
         let first_result = first.await;
         let second_result = second.await;

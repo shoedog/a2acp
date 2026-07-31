@@ -4,6 +4,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,14 @@ fn serve_one_response(
     status: &'static str,
     body: &'static [u8],
 ) -> (String, thread::JoinHandle<()>) {
+    serve_one_response_observed(status, body, None)
+}
+
+fn serve_one_response_observed(
+    status: &'static str,
+    body: &'static [u8],
+    mut first_read: Option<mpsc::Sender<()>>,
+) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake model endpoint");
     let address = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -59,11 +68,32 @@ fn serve_one_response(
                 Err(error) => panic!("accept model request: {error}"),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let mut request = [0_u8; 2048];
-        let _ = stream.read(&mut request);
+        let mut request = [0_u8; 16 * 1024];
+        let mut request_len = 0;
+        loop {
+            let read = stream
+                .read(&mut request[request_len..])
+                .expect("read fake model request");
+            assert!(read > 0, "model request closed before headers completed");
+            request_len += read;
+            if let Some(first_read) = first_read.take() {
+                first_read.send(()).unwrap();
+            }
+            if request[..request_len]
+                .windows(4)
+                .any(|window| window == b"\r\n\r\n")
+            {
+                break;
+            }
+            assert!(
+                request_len < request.len(),
+                "model request headers exceeded fixture limit"
+            );
+        }
         write!(
             stream,
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -74,6 +104,50 @@ fn serve_one_response(
         stream.flush().unwrap();
     });
     (format!("http://{address}/v1"), handle)
+}
+
+#[test]
+fn fake_model_endpoint_waits_for_complete_request_headers() {
+    let (first_read_tx, first_read_rx) = mpsc::channel();
+    let (base_url, server) =
+        serve_one_response_observed("200 OK", br#"{"data":[]}"#, Some(first_read_tx));
+    let address = base_url
+        .strip_prefix("http://")
+        .and_then(|value| value.strip_suffix("/v1"))
+        .unwrap();
+    let mut client = std::net::TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    client
+        .write_all(b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\n")
+        .unwrap();
+    client.flush().unwrap();
+    first_read_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let mut first_response_byte = [0_u8; 1];
+    let early_read = client.read(&mut first_response_byte);
+    assert!(
+        matches!(
+            early_read,
+            Err(ref error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ),
+        "endpoint responded before the request header terminator: {early_read:?}"
+    );
+
+    client.write_all(b"Connection: close\r\n\r\n").unwrap();
+    client.flush().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    server.join().unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
 }
 
 #[test]

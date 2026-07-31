@@ -7,6 +7,19 @@ release (see [`docs/adr/`](docs/adr/) for the full architectural record).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-30
+
+### Fixed
+
+- `serve` now recognizes the two complete v0.2.1 pre-history task-store profiles (the tagged
+  release and the previously served operator schema) as eligible writable migration sources. The
+  configured-history upgrade preserves existing task, session, journal, checkpoint, and turn-log
+  rows while atomically adding the empty history allocation; read-only history access still reports
+  `Migration`, and mixed, partial, or later schemas remain fail-closed as `Corruption` without
+  database mutation. Admission binds exact column order and is repeated inside the same
+  `BEGIN IMMEDIATE` transaction as migration, including a fresh empty-schema check when the path was
+  initially absent, so a concurrent writer cannot substitute an unknown database before bridge DDL.
+
 ## [0.3.0] - 2026-07-29
 
 ### Added

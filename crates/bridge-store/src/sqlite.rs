@@ -893,26 +893,33 @@ impl SqliteStore {
             }
             _ => history_kind,
         };
-        let schema_lock = if effective_history_kind.is_some() {
+        let (schema_lock, schema_admission) = if effective_history_kind.is_some() {
             let file = history_parent.open_file(".schema.lock", true, R::Open, R::ReadOnlyLock)?;
             file.try_lock_exclusive()
                 .map_err(|error| history_lock_error(&error))?;
+            let mut schema_admission = None;
             if let Some(expected) = effective_history_kind {
                 match prevalidate_tagged_history_path(
                     path,
                     Some(expected),
                     expected == HistoryAllocationKind::Platform,
                 )? {
-                    Some(_) => {}
-                    None if path.exists() => {
-                        validate_untagged_history_schema_path(path)?;
+                    Some(actual) => {
+                        schema_admission = Some(WritableHistorySchemaAdmission::Tagged(actual));
                     }
-                    None => {}
+                    None if path.exists() => {
+                        schema_admission = Some(WritableHistorySchemaAdmission::Untagged(
+                            validate_untagged_history_schema_path(path)?,
+                        ));
+                    }
+                    None => {
+                        schema_admission = Some(WritableHistorySchemaAdmission::Absent);
+                    }
                 }
             }
-            Some(file)
+            (Some(file), schema_admission)
         } else {
-            None
+            (None, None)
         };
         if history_kind == Some(HistoryAllocationKind::Platform) {
             preflight_platform_history_physical_limit(path)?;
@@ -988,7 +995,7 @@ impl SqliteStore {
             store.configure_history_page_limit()?;
         }
         store
-            .create_schema_sqlite(effective_history_kind)
+            .create_schema_sqlite(effective_history_kind, schema_admission)
             .map_err(|error| schema_migration_error(&error))?;
         if history_kind == Some(HistoryAllocationKind::Platform) {
             store.configure_history_physical_limit()?;
@@ -1100,15 +1107,20 @@ impl SqliteStore {
             }
         }
 
-        match prevalidate_tagged_history_path(path, Some(HistoryAllocationKind::Platform), true)? {
-            Some(_) => {}
+        let schema_admission = match prevalidate_tagged_history_path(
+            path,
+            Some(HistoryAllocationKind::Platform),
+            true,
+        )? {
+            Some(actual) => Some(WritableHistorySchemaAdmission::Tagged(actual)),
             None if path.exists() => {
-                validate_untagged_history_schema_path(path)?;
+                let schema = validate_untagged_history_schema_path(path)?;
                 #[cfg(test)]
                 platform_open_pause(path, PlatformOpenPausePoint::WhileUntaggedUnderSchemaLock)?;
+                Some(WritableHistorySchemaAdmission::Untagged(schema))
             }
-            None => {}
-        }
+            None => Some(WritableHistorySchemaAdmission::Absent),
+        };
 
         preflight_platform_history_physical_limit(path)?;
         #[cfg(test)]
@@ -1147,7 +1159,7 @@ impl SqliteStore {
         // ceiling is installed before the durable migrating marker.
         store.configure_history_page_limit()?;
         store
-            .create_schema_sqlite(Some(HistoryAllocationKind::Platform))
+            .create_schema_sqlite(Some(HistoryAllocationKind::Platform), schema_admission)
             .map_err(|error| schema_migration_error(&error))?;
         #[cfg(test)]
         platform_open_pause(path, PlatformOpenPausePoint::AfterMigratingBeforeReady)?;
@@ -1215,7 +1227,13 @@ impl SqliteStore {
         {
             return Self::open_history_read_only(path);
         }
-        validate_untagged_history_schema_path(path)?;
+        if validate_untagged_history_schema_path(path)?
+            == UntaggedHistorySchema::PreHistoryTaskStore
+        {
+            return Err(bridge_core::workflow_history::LedgerError::new(
+                bridge_core::workflow_history::LedgerUnavailableReason::Migration,
+            ));
+        }
         let conn = rusqlite::Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -2088,18 +2106,46 @@ impl SqliteStore {
     }
 
     fn create_schema(&self) -> Result<(), BridgeError> {
-        self.create_schema_sqlite(None)
+        self.create_schema_sqlite(None, None)
             .map_err(|_| BridgeError::StoreFailure)
     }
 
     fn create_schema_sqlite(
         &self,
         allocation_kind: Option<HistoryAllocationKind>,
+        schema_admission: Option<WritableHistorySchemaAdmission>,
     ) -> Result<(), SchemaMigrationError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(SchemaMigrationError::Sqlite)?;
+        if let Some(schema_admission) = schema_admission {
+            match schema_admission {
+                WritableHistorySchemaAdmission::Tagged(expected) => {
+                    validate_tagged_history_allocation(
+                        &tx,
+                        expected,
+                        expected == HistoryAllocationKind::Platform,
+                    )?;
+                }
+                WritableHistorySchemaAdmission::Untagged(expected) => {
+                    let actual = validate_untagged_history_schema(&tx)?;
+                    if actual != expected {
+                        return Err(SchemaMigrationError::Validation(
+                            MigrationValidationError::Corruption,
+                        ));
+                    }
+                }
+                WritableHistorySchemaAdmission::Absent => {
+                    let actual = sqlite_schema_fingerprint(&tx)?;
+                    if !actual.objects.is_empty() || !actual.tables.is_empty() {
+                        return Err(SchemaMigrationError::Validation(
+                            MigrationValidationError::Corruption,
+                        ));
+                    }
+                }
+            }
+        }
         let allocation_table_preexisting = history_allocation_table_exists(&tx)?;
         if let Some(kind) = allocation_kind {
             if allocation_table_preexisting {
@@ -5767,7 +5813,7 @@ const CANONICAL_HISTORY_ALLOCATION_DDL: &str = "
         )
     )";
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SchemaSqlToken {
     Word(String),
     Number(String),
@@ -5861,6 +5907,458 @@ fn schema_sql_tokens(sql: &str) -> Option<Vec<SchemaSqlToken>> {
     Some(tokens)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct TableSqlFingerprint {
+    clauses: Vec<Vec<SchemaSqlToken>>,
+    suffix: Vec<SchemaSqlToken>,
+}
+
+fn table_sql_fingerprint(sql: &str) -> Option<TableSqlFingerprint> {
+    let tokens = schema_sql_tokens(sql)?;
+    let open = tokens
+        .iter()
+        .position(|token| token == &SchemaSqlToken::Symbol("(".into()))?;
+    let mut clauses = Vec::new();
+    let mut clause = Vec::new();
+    let mut nested = 0usize;
+    let mut close = None;
+    for (offset, token) in tokens.iter().enumerate().skip(open + 1) {
+        match token {
+            SchemaSqlToken::Symbol(symbol) if symbol == "(" => {
+                nested = nested.checked_add(1)?;
+                clause.push(token.clone());
+            }
+            SchemaSqlToken::Symbol(symbol) if symbol == ")" => {
+                if nested == 0 {
+                    if !clause.is_empty() {
+                        clauses.push(std::mem::take(&mut clause));
+                    }
+                    close = Some(offset);
+                    break;
+                }
+                nested -= 1;
+                clause.push(token.clone());
+            }
+            SchemaSqlToken::Symbol(symbol) if symbol == "," && nested == 0 => {
+                if clause.is_empty() {
+                    return None;
+                }
+                clauses.push(std::mem::take(&mut clause));
+            }
+            _ => clause.push(token.clone()),
+        }
+    }
+    let close = close?;
+    let suffix = tokens[(close + 1)..]
+        .iter()
+        .filter(|token| token != &&SchemaSqlToken::Symbol(";".into()))
+        .cloned()
+        .collect();
+    Some(TableSqlFingerprint { clauses, suffix })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SchemaObjectSqlFingerprint {
+    Table(Option<TableSqlFingerprint>),
+    Other(Option<Vec<SchemaSqlToken>>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SchemaObjectFingerprint {
+    object_type: String,
+    name: String,
+    table: String,
+    sql: SchemaObjectSqlFingerprint,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TableColumnFingerprint {
+    cid: i64,
+    name: String,
+    declared_type: String,
+    not_null: i64,
+    default_value: Option<String>,
+    primary_key_ordinal: i64,
+    hidden: i64,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ForeignKeyFingerprint {
+    id: i64,
+    sequence: i64,
+    parent_table: String,
+    from_column: String,
+    to_column: Option<String>,
+    on_update: String,
+    on_delete: String,
+    match_kind: String,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum IndexColumnReference {
+    RowId,
+    Expression,
+    Column(String),
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct IndexColumnFingerprint {
+    sequence: i64,
+    reference: IndexColumnReference,
+    descending: i64,
+    collation: String,
+    key: i64,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct IndexFingerprint {
+    name: String,
+    unique: i64,
+    origin: String,
+    partial: i64,
+    columns: Vec<IndexColumnFingerprint>,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TableFingerprint {
+    name: String,
+    columns: Vec<TableColumnFingerprint>,
+    foreign_keys: Vec<ForeignKeyFingerprint>,
+    indexes: Vec<IndexFingerprint>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SqliteSchemaFingerprint {
+    objects: Vec<SchemaObjectFingerprint>,
+    tables: Vec<TableFingerprint>,
+}
+
+fn quote_schema_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn sqlite_schema_fingerprint(
+    conn: &rusqlite::Connection,
+) -> Result<SqliteSchemaFingerprint, SchemaMigrationError> {
+    let objects = {
+        let mut statement = conn.prepare(
+            "SELECT type, name, tbl_name, sql
+             FROM sqlite_master
+             WHERE name NOT GLOB 'sqlite_*'
+             ORDER BY type COLLATE BINARY, name COLLATE BINARY",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let object_type = row.get::<_, String>(0)?;
+            let sql = row.get::<_, Option<String>>(3)?;
+            let sql = if object_type == "table" {
+                SchemaObjectSqlFingerprint::Table(sql.as_deref().and_then(table_sql_fingerprint))
+            } else {
+                SchemaObjectSqlFingerprint::Other(sql.as_deref().and_then(schema_sql_tokens))
+            };
+            Ok(SchemaObjectFingerprint {
+                object_type,
+                name: row.get(1)?,
+                table: row.get(2)?,
+                sql,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let table_names = objects
+        .iter()
+        .filter(|object| object.object_type == "table")
+        .map(|object| object.name.clone())
+        .collect::<Vec<_>>();
+    let mut tables = Vec::with_capacity(table_names.len());
+    for name in table_names {
+        let quoted_table = quote_schema_identifier(&name);
+        let mut columns = {
+            let mut statement = conn.prepare(&format!("PRAGMA table_xinfo({quoted_table})"))?;
+            let rows = statement.query_map([], |row| {
+                Ok(TableColumnFingerprint {
+                    cid: row.get(0)?,
+                    name: row.get(1)?,
+                    declared_type: row.get(2)?,
+                    not_null: row.get(3)?,
+                    default_value: row.get(4)?,
+                    primary_key_ordinal: row.get(5)?,
+                    hidden: row.get(6)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        columns.sort_by_key(|column| column.cid);
+        let mut foreign_keys = {
+            let mut statement =
+                conn.prepare(&format!("PRAGMA foreign_key_list({quoted_table})"))?;
+            let rows = statement.query_map([], |row| {
+                Ok(ForeignKeyFingerprint {
+                    id: row.get(0)?,
+                    sequence: row.get(1)?,
+                    parent_table: row.get(2)?,
+                    from_column: row.get(3)?,
+                    to_column: row.get(4)?,
+                    on_update: row.get(5)?,
+                    on_delete: row.get(6)?,
+                    match_kind: row.get(7)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        foreign_keys.sort();
+        let mut indexes = {
+            let mut statement = conn.prepare(&format!("PRAGMA index_list({quoted_table})"))?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut index_fingerprints = Vec::with_capacity(indexes.len());
+        for (index_name, unique, origin, partial) in indexes.drain(..) {
+            let quoted_index = quote_schema_identifier(&index_name);
+            let columns = {
+                let mut statement = conn.prepare(&format!("PRAGMA index_xinfo({quoted_index})"))?;
+                let rows = statement.query_map([], |row| {
+                    let column_id = row.get::<_, i64>(1)?;
+                    let column_name = row.get::<_, Option<String>>(2)?;
+                    let reference = match column_id {
+                        -1 => IndexColumnReference::RowId,
+                        -2 => IndexColumnReference::Expression,
+                        _ => IndexColumnReference::Column(
+                            column_name.ok_or(rusqlite::Error::InvalidQuery)?,
+                        ),
+                    };
+                    Ok(IndexColumnFingerprint {
+                        sequence: row.get(0)?,
+                        reference,
+                        descending: row.get(3)?,
+                        collation: row.get(4)?,
+                        key: row.get(5)?,
+                    })
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            index_fingerprints.push(IndexFingerprint {
+                name: index_name,
+                unique,
+                origin,
+                partial,
+                columns,
+            });
+        }
+        index_fingerprints.sort();
+        tables.push(TableFingerprint {
+            name,
+            columns,
+            foreign_keys,
+            indexes: index_fingerprints,
+        });
+    }
+    tables.sort();
+    Ok(SqliteSchemaFingerprint { objects, tables })
+}
+
+const SERVED_V021_PRE_HISTORY_SCHEMA_DDL: &str = "
+    CREATE TABLE sessions (
+        task_id TEXT PRIMARY KEY,
+        session_id TEXT,
+        pending_request_id TEXT,
+        pending_kind TEXT,
+        created_at INTEGER NOT NULL DEFAULT 0,
+        peer_task_id TEXT,
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
+        fanout INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        workflow TEXT NOT NULL,
+        status TEXT NOT NULL,
+        result TEXT,
+        error TEXT,
+        created_ms INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        last_artifact_ms INTEGER,
+        artifacts_purged_at INTEGER,
+        input TEXT NOT NULL DEFAULT '',
+        workflow_spec_json TEXT,
+        resume_attempts INTEGER NOT NULL DEFAULT 0,
+        last_resume_ms INTEGER,
+        session_cwd TEXT,
+        last_event_seq INTEGER NOT NULL DEFAULT 0,
+        terminal_seq INTEGER,
+        journal_complete_from_birth INTEGER NOT NULL DEFAULT 0,
+        batch_id TEXT,
+        item_id TEXT
+    );
+    CREATE INDEX idx_tasks_updated ON tasks(updated_ms);
+    CREATE UNIQUE INDEX idx_tasks_batch_item
+        ON tasks(batch_id, item_id) WHERE batch_id IS NOT NULL;
+    CREATE INDEX idx_tasks_artifact_retention
+        ON tasks(status, updated_ms, last_artifact_ms);
+    CREATE TABLE task_node_checkpoints (
+        task_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        output TEXT NOT NULL,
+        ok INTEGER NOT NULL,
+        ts INTEGER NOT NULL,
+        usage_json TEXT,
+        seq INTEGER,
+        PRIMARY KEY (task_id, node_id),
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    );
+    CREATE TABLE task_node_starts (
+        task_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        ts INTEGER NOT NULL,
+        PRIMARY KEY (task_id, node_id),
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    );
+    CREATE TABLE task_journal (
+        task_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        event_json TEXT NOT NULL,
+        PRIMARY KEY (task_id, seq),
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    );
+    CREATE TABLE turn_log (
+        turn_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        task_id TEXT,
+        workflow TEXT,
+        node TEXT,
+        attempt INTEGER NOT NULL,
+        agent TEXT NOT NULL,
+        model TEXT,
+        effort TEXT,
+        mode TEXT,
+        prompt_id TEXT,
+        started_ms INTEGER,
+        completed_ms INTEGER,
+        latency_ms INTEGER,
+        ttft_ms INTEGER,
+        outcome TEXT,
+        failure_class TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        thought_tokens INTEGER,
+        cached_read_tokens INTEGER,
+        cached_write_tokens INTEGER,
+        cost_amount REAL,
+        cost_currency TEXT,
+        traceparent TEXT,
+        usage_finalized_ms INTEGER,
+        usage_finalization_kind TEXT NOT NULL DEFAULT 'pending'
+    );
+    CREATE INDEX idx_turn_log_completed ON turn_log(completed_ms);
+    CREATE INDEX idx_turn_log_task ON turn_log(task_id, node);
+    CREATE INDEX idx_turn_log_eval ON turn_log(prompt_id, model, effort);
+    CREATE INDEX idx_turn_log_retention
+        ON turn_log(usage_finalized_ms, completed_ms);
+    CREATE TABLE batch (
+        id TEXT PRIMARY KEY,
+        workflow TEXT NOT NULL,
+        concurrency INTEGER NOT NULL,
+        total INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        items_json TEXT NOT NULL,
+        error TEXT,
+        created_ms INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL
+    );
+    CREATE TABLE harvest_raw_records_v1 (
+        audit_id TEXT PRIMARY KEY NOT NULL,
+        task_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        attempt_id INTEGER NOT NULL
+            CHECK (attempt_id >= 0 AND attempt_id <= 4294967295),
+        turn_id TEXT NOT NULL,
+        backend_id TEXT NOT NULL,
+        producer_id TEXT NOT NULL,
+        declared_capability_json TEXT NOT NULL,
+        raw_body TEXT NOT NULL,
+        raw_len_bytes INTEGER NOT NULL CHECK (raw_len_bytes >= 0),
+        raw_body_sha256 BLOB NOT NULL CHECK (length(raw_body_sha256) = 32),
+        prefix_attestation_json TEXT NOT NULL,
+        provenance_sha256 BLOB NOT NULL CHECK (length(provenance_sha256) = 32),
+        created_at_ms INTEGER NOT NULL,
+        UNIQUE (run_id, node_id, attempt_id, turn_id)
+    );
+    CREATE TABLE harvest_sanitization_decisions_v1 (
+        audit_id TEXT PRIMARY KEY NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('off', 'attested_prefix_v1')),
+        decision TEXT NOT NULL CHECK (decision IN (
+            'kept_off',
+            'kept_no_attestation',
+            'kept_invalid_attestation',
+            'kept_suspicious_attestation',
+            'kept_zero_prefix',
+            'cut_attested'
+        )),
+        reason TEXT,
+        node_id TEXT NOT NULL,
+        producer_id TEXT NOT NULL,
+        issuer_id TEXT,
+        raw_body_sha256 BLOB NOT NULL CHECK (length(raw_body_sha256) = 32),
+        effective_body_sha256 BLOB NOT NULL CHECK (length(effective_body_sha256) = 32),
+        raw_len_bytes INTEGER NOT NULL CHECK (raw_len_bytes >= 0),
+        effective_len_bytes INTEGER NOT NULL CHECK (effective_len_bytes >= 0),
+        cut_byte_offset INTEGER CHECK (cut_byte_offset >= 0),
+        provenance_sha256 BLOB NOT NULL CHECK (length(provenance_sha256) = 32),
+        suspicious_threshold_percent INTEGER NOT NULL
+            CHECK (suspicious_threshold_percent = 90),
+        created_at_ms INTEGER NOT NULL,
+        FOREIGN KEY (audit_id) REFERENCES harvest_raw_records_v1(audit_id)
+            ON DELETE CASCADE
+    );
+    CREATE INDEX harvest_raw_records_v1_task_idx
+        ON harvest_raw_records_v1(task_id, created_at_ms, audit_id);
+    CREATE INDEX harvest_raw_records_v1_attempt_idx
+        ON harvest_raw_records_v1(run_id, node_id, attempt_id, turn_id);
+";
+
+const TAGGED_V021_PROFILE_DOWNGRADE_DDL: &str = "
+    DROP INDEX idx_tasks_artifact_retention;
+    DROP INDEX idx_turn_log_retention;
+    DROP TABLE harvest_sanitization_decisions_v1;
+    DROP TABLE harvest_raw_records_v1;
+    ALTER TABLE tasks DROP COLUMN last_artifact_ms;
+    ALTER TABLE tasks DROP COLUMN artifacts_purged_at;
+    ALTER TABLE turn_log DROP COLUMN usage_finalized_ms;
+    ALTER TABLE turn_log DROP COLUMN usage_finalization_kind;
+";
+
+#[derive(Clone, Copy)]
+enum PreHistoryTaskStoreProfile {
+    TaggedV021,
+    ServedV021,
+}
+
+fn create_pre_history_task_store_profile(
+    conn: &rusqlite::Connection,
+    profile: PreHistoryTaskStoreProfile,
+) -> Result<(), SchemaMigrationError> {
+    conn.execute_batch(SERVED_V021_PRE_HISTORY_SCHEMA_DDL)?;
+    if matches!(profile, PreHistoryTaskStoreProfile::TaggedV021) {
+        conn.execute_batch(TAGGED_V021_PROFILE_DOWNGRADE_DDL)?;
+    }
+    Ok(())
+}
+
+fn pre_history_task_store_profile_fingerprint(
+    profile: PreHistoryTaskStoreProfile,
+) -> Result<SqliteSchemaFingerprint, SchemaMigrationError> {
+    let expected = rusqlite::Connection::open_in_memory()?;
+    create_pre_history_task_store_profile(&expected, profile)?;
+    sqlite_schema_fingerprint(&expected)
+}
+
 fn validate_history_allocation_schema(
     conn: &rusqlite::Connection,
 ) -> Result<(), SchemaMigrationError> {
@@ -5888,6 +6386,19 @@ enum HistoryIdentityDispositionColumn {
     HistoryDisposition,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UntaggedHistorySchema {
+    PreHistoryTaskStore,
+    History,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WritableHistorySchemaAdmission {
+    Tagged(HistoryAllocationKind),
+    Untagged(UntaggedHistorySchema),
+    Absent,
+}
+
 fn history_identity_disposition_column(
     conn: &rusqlite::Connection,
 ) -> Result<HistoryIdentityDispositionColumn, SchemaMigrationError> {
@@ -5907,25 +6418,338 @@ fn history_identity_disposition_column(
     }
 }
 
+fn sqlite_table_columns(
+    conn: &rusqlite::Connection,
+    table: &str,
+) -> Result<HashSet<String>, SchemaMigrationError> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<HashSet<_>, _>>()?;
+    Ok(columns)
+}
+
+fn sqlite_columns_are(columns: &HashSet<String>, expected: &[&str]) -> bool {
+    columns.len() == expected.len() && expected.iter().all(|name| columns.contains(*name))
+}
+
+fn validate_pre_history_task_store_schema(
+    conn: &rusqlite::Connection,
+) -> Result<(), SchemaMigrationError> {
+    let corruption = || SchemaMigrationError::Validation(MigrationValidationError::Corruption);
+    let actual = sqlite_schema_fingerprint(conn)?;
+    let tagged =
+        pre_history_task_store_profile_fingerprint(PreHistoryTaskStoreProfile::TaggedV021)?;
+    let served =
+        pre_history_task_store_profile_fingerprint(PreHistoryTaskStoreProfile::ServedV021)?;
+    if actual != tagged && actual != served {
+        return Err(corruption());
+    }
+    let user_tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='table' AND name NOT GLOB 'sqlite_*'",
+        [],
+        |row| row.get(0),
+    )?;
+    let batch_tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='batch'",
+        [],
+        |row| row.get(0),
+    )?;
+    if batch_tables != 1 {
+        return Err(corruption());
+    }
+
+    let sessions = sqlite_table_columns(conn, "sessions")?;
+    let tasks = sqlite_table_columns(conn, "tasks")?;
+    let checkpoints = sqlite_table_columns(conn, "task_node_checkpoints")?;
+    let starts = sqlite_table_columns(conn, "task_node_starts")?;
+    let journal = sqlite_table_columns(conn, "task_journal")?;
+    let turns = sqlite_table_columns(conn, "turn_log")?;
+    let batch = sqlite_table_columns(conn, "batch")?;
+
+    if !sqlite_columns_are(
+        &sessions,
+        &[
+            "task_id",
+            "session_id",
+            "pending_request_id",
+            "pending_kind",
+            "created_at",
+            "peer_task_id",
+            "cancel_requested",
+            "fanout",
+        ],
+    ) || !sqlite_columns_are(
+        &checkpoints,
+        &[
+            "task_id",
+            "node_id",
+            "output",
+            "ok",
+            "ts",
+            "usage_json",
+            "seq",
+        ],
+    ) || !sqlite_columns_are(&starts, &["task_id", "node_id", "seq", "ts"])
+        || !sqlite_columns_are(&journal, &["task_id", "seq", "event_json"])
+        || !sqlite_columns_are(
+            &batch,
+            &[
+                "id",
+                "workflow",
+                "concurrency",
+                "total",
+                "status",
+                "items_json",
+                "error",
+                "created_ms",
+                "updated_ms",
+            ],
+        )
+    {
+        return Err(corruption());
+    }
+
+    const V021_TASK_COLUMNS: &[&str] = &[
+        "id",
+        "workflow",
+        "status",
+        "result",
+        "error",
+        "created_ms",
+        "updated_ms",
+        "input",
+        "workflow_spec_json",
+        "resume_attempts",
+        "last_resume_ms",
+        "session_cwd",
+        "last_event_seq",
+        "terminal_seq",
+        "journal_complete_from_birth",
+        "batch_id",
+        "item_id",
+    ];
+    const SERVED_V021_TASK_COLUMNS: &[&str] = &[
+        "id",
+        "workflow",
+        "status",
+        "result",
+        "error",
+        "created_ms",
+        "updated_ms",
+        "last_artifact_ms",
+        "artifacts_purged_at",
+        "input",
+        "workflow_spec_json",
+        "resume_attempts",
+        "last_resume_ms",
+        "session_cwd",
+        "last_event_seq",
+        "terminal_seq",
+        "journal_complete_from_birth",
+        "batch_id",
+        "item_id",
+    ];
+    const V021_TURN_COLUMNS: &[&str] = &[
+        "turn_id",
+        "session_id",
+        "task_id",
+        "workflow",
+        "node",
+        "attempt",
+        "agent",
+        "model",
+        "effort",
+        "mode",
+        "prompt_id",
+        "started_ms",
+        "completed_ms",
+        "latency_ms",
+        "ttft_ms",
+        "outcome",
+        "failure_class",
+        "input_tokens",
+        "output_tokens",
+        "thought_tokens",
+        "cached_read_tokens",
+        "cached_write_tokens",
+        "cost_amount",
+        "cost_currency",
+        "traceparent",
+    ];
+    const SERVED_V021_TURN_COLUMNS: &[&str] = &[
+        "turn_id",
+        "session_id",
+        "task_id",
+        "workflow",
+        "node",
+        "attempt",
+        "agent",
+        "model",
+        "effort",
+        "mode",
+        "prompt_id",
+        "started_ms",
+        "completed_ms",
+        "latency_ms",
+        "ttft_ms",
+        "outcome",
+        "failure_class",
+        "input_tokens",
+        "output_tokens",
+        "thought_tokens",
+        "cached_read_tokens",
+        "cached_write_tokens",
+        "cost_amount",
+        "cost_currency",
+        "traceparent",
+        "usage_finalized_ms",
+        "usage_finalization_kind",
+    ];
+
+    let harvest_tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='table' AND name IN (
+             'harvest_raw_records_v1', 'harvest_sanitization_decisions_v1'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let harvest_namespace_objects: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type IN ('table','view') AND (
+             name COLLATE NOCASE='harvest_raw_records_v1'
+             OR name COLLATE NOCASE='harvest_sanitization_decisions_v1'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let tagged_v021 = user_tables == 7
+        && harvest_tables == 0
+        && harvest_namespace_objects == 0
+        && sqlite_columns_are(&tasks, V021_TASK_COLUMNS)
+        && sqlite_columns_are(&turns, V021_TURN_COLUMNS);
+    let served_v021 = user_tables == 9
+        && harvest_tables == 2
+        && harvest_namespace_objects == 2
+        && sqlite_columns_are(&tasks, SERVED_V021_TASK_COLUMNS)
+        && sqlite_columns_are(&turns, SERVED_V021_TURN_COLUMNS);
+    if tagged_v021 {
+        return Ok(());
+    }
+    if !served_v021 {
+        return Err(corruption());
+    }
+
+    let raw_harvest = sqlite_table_columns(conn, "harvest_raw_records_v1")?;
+    let sanitization = sqlite_table_columns(conn, "harvest_sanitization_decisions_v1")?;
+    if !sqlite_columns_are(
+        &raw_harvest,
+        &[
+            "audit_id",
+            "task_id",
+            "run_id",
+            "node_id",
+            "attempt_id",
+            "turn_id",
+            "backend_id",
+            "producer_id",
+            "declared_capability_json",
+            "raw_body",
+            "raw_len_bytes",
+            "raw_body_sha256",
+            "prefix_attestation_json",
+            "provenance_sha256",
+            "created_at_ms",
+        ],
+    ) || !sqlite_columns_are(
+        &sanitization,
+        &[
+            "audit_id",
+            "mode",
+            "decision",
+            "reason",
+            "node_id",
+            "producer_id",
+            "issuer_id",
+            "raw_body_sha256",
+            "effective_body_sha256",
+            "raw_len_bytes",
+            "effective_len_bytes",
+            "cut_byte_offset",
+            "provenance_sha256",
+            "suspicious_threshold_percent",
+            "created_at_ms",
+        ],
+    ) {
+        return Err(corruption());
+    }
+    Ok(())
+}
+
 fn validate_untagged_history_schema(
     conn: &rusqlite::Connection,
-) -> Result<HistoryIdentityDispositionColumn, SchemaMigrationError> {
+) -> Result<UntaggedHistorySchema, SchemaMigrationError> {
     if history_allocation_table_exists(conn)? {
         return Err(SchemaMigrationError::Validation(
             MigrationValidationError::AllocationKind,
         ));
     }
-    let required_tables: i64 = conn.query_row(
+    let task_tables: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master
          WHERE type='table' AND name IN (
-             'sessions', 'tasks', 'task_attempt_locators', 'attempt_identities',
-             'task_node_checkpoints', 'task_node_starts', 'task_journal', 'turn_log',
+             'sessions', 'tasks', 'task_node_checkpoints', 'task_node_starts',
+             'task_journal', 'turn_log'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if task_tables != 6 {
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::Corruption,
+        ));
+    }
+    let history_tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='table' AND name IN (
+             'task_attempt_locators', 'attempt_identities',
              'workflow_attempt_summaries', 'workflow_history_rewrite_reserve'
          )",
         [],
         |row| row.get(0),
     )?;
-    if required_tables != 10 {
+    let attachments: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='table' AND name='workflow_history_attachment'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if history_tables == 0 {
+        let history_namespace_objects: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type IN ('table','view') AND (
+                 name COLLATE NOCASE='task_attempt_locators'
+                 OR name COLLATE NOCASE='attempt_identities'
+                 OR name COLLATE NOCASE='task_attempt_identities'
+                 OR name COLLATE NOCASE='workflow_attempt_summaries'
+                 OR name COLLATE NOCASE='workflow_history_attachment'
+                 OR name COLLATE NOCASE='workflow_history_rewrite_reserve'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if history_namespace_objects == 0 {
+            validate_pre_history_task_store_schema(conn)?;
+            return Ok(UntaggedHistorySchema::PreHistoryTaskStore);
+        }
+        return Err(SchemaMigrationError::Validation(
+            MigrationValidationError::Corruption,
+        ));
+    }
+    if history_tables != 4 {
         return Err(SchemaMigrationError::Validation(
             MigrationValidationError::Corruption,
         ));
@@ -5933,13 +6757,17 @@ fn validate_untagged_history_schema(
     for projection in [
         "SELECT task_id, session_id FROM sessions LIMIT 0",
         "SELECT id, workflow, status, result, error, created_ms, updated_ms FROM tasks LIMIT 0",
-        "SELECT task_id, locator_json FROM task_attempt_locators LIMIT 0",
-        "SELECT attempt_id, execution_id, ordinal, task_id, owner_surface
-         FROM attempt_identities LIMIT 0",
         "SELECT task_id, node_id, output, ok, ts FROM task_node_checkpoints LIMIT 0",
         "SELECT task_id, node_id, seq, ts FROM task_node_starts LIMIT 0",
         "SELECT task_id, seq, event_json FROM task_journal LIMIT 0",
         "SELECT turn_id, session_id, attempt, agent FROM turn_log LIMIT 0",
+    ] {
+        conn.prepare(projection)?;
+    }
+    for projection in [
+        "SELECT task_id, locator_json FROM task_attempt_locators LIMIT 0",
+        "SELECT attempt_id, execution_id, ordinal, task_id, owner_surface
+         FROM attempt_identities LIMIT 0",
         "SELECT attempt_id, execution_id, parent_attempt_id, ordinal, task_id,
                 workflow, task_class, surface, policy, workload_fingerprint,
                 started_ms, completed_ms, status, outcome, degraded, pinned,
@@ -5949,22 +6777,16 @@ fn validate_untagged_history_schema(
     ] {
         conn.prepare(projection)?;
     }
-    let disposition = history_identity_disposition_column(conn)?;
-    let attachments: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master
-         WHERE type='table' AND name='workflow_history_attachment'",
-        [],
-        |row| row.get(0),
-    )?;
+    history_identity_disposition_column(conn)?;
     if attachments == 1 {
         conn.prepare("SELECT attempt_id, charged_bytes FROM workflow_history_attachment LIMIT 0")?;
     }
-    Ok(disposition)
+    Ok(UntaggedHistorySchema::History)
 }
 
 fn validate_untagged_history_schema_path(
     path: &std::path::Path,
-) -> Result<HistoryIdentityDispositionColumn, bridge_core::workflow_history::LedgerError> {
+) -> Result<UntaggedHistorySchema, bridge_core::workflow_history::LedgerError> {
     let mut connection = rusqlite::Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -23926,6 +24748,847 @@ mod r2f0a_history_tests {
             std::fs::read(&victim).unwrap(),
             b"unchanged",
             "no alias or special-file refusal may mutate its target"
+        );
+    }
+
+    fn create_pre_history_task_store_fixture_with_task_id(
+        path: &std::path::Path,
+        task_id_definition: &str,
+        include_legacy_rows: bool,
+    ) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let mut schema_and_rows = "CREATE TABLE sessions (
+                 task_id TEXT PRIMARY KEY,
+                 session_id TEXT,
+                 pending_request_id TEXT,
+                 pending_kind TEXT,
+                 created_at INTEGER NOT NULL DEFAULT 0,
+                 peer_task_id TEXT,
+                 cancel_requested INTEGER NOT NULL DEFAULT 0,
+                 fanout INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE tasks (
+                 __TASK_ID_DEFINITION__,
+                 workflow TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 result TEXT,
+                 error TEXT,
+                 created_ms INTEGER NOT NULL,
+                 updated_ms INTEGER NOT NULL,
+                 last_artifact_ms INTEGER,
+                 artifacts_purged_at INTEGER,
+                 input TEXT NOT NULL DEFAULT '',
+                 workflow_spec_json TEXT,
+                 resume_attempts INTEGER NOT NULL DEFAULT 0,
+                 last_resume_ms INTEGER,
+                 session_cwd TEXT,
+                 last_event_seq INTEGER NOT NULL DEFAULT 0,
+                 terminal_seq INTEGER,
+                 journal_complete_from_birth INTEGER NOT NULL DEFAULT 0,
+                 batch_id TEXT,
+                 item_id TEXT
+             );
+             CREATE INDEX idx_tasks_updated ON tasks(updated_ms);
+             CREATE UNIQUE INDEX idx_tasks_batch_item
+                 ON tasks(batch_id, item_id) WHERE batch_id IS NOT NULL;
+             CREATE INDEX idx_tasks_artifact_retention
+                 ON tasks(status, updated_ms, last_artifact_ms);
+             CREATE TABLE task_node_checkpoints (
+                 task_id TEXT NOT NULL,
+                 node_id TEXT NOT NULL,
+                 output TEXT NOT NULL,
+                 ok INTEGER NOT NULL,
+                 ts INTEGER NOT NULL,
+                 usage_json TEXT,
+                 seq INTEGER,
+                 PRIMARY KEY (task_id, node_id),
+                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+             );
+             CREATE TABLE task_node_starts (
+                 task_id TEXT NOT NULL,
+                 node_id TEXT NOT NULL,
+                 seq INTEGER NOT NULL,
+                 ts INTEGER NOT NULL,
+                 PRIMARY KEY (task_id, node_id),
+                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+             );
+             CREATE TABLE task_journal (
+                 task_id TEXT NOT NULL,
+                 seq INTEGER NOT NULL,
+                 event_json TEXT NOT NULL,
+                 PRIMARY KEY (task_id, seq),
+                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+             );
+             CREATE TABLE turn_log (
+                 turn_id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 task_id TEXT,
+                 workflow TEXT,
+                 node TEXT,
+                 attempt INTEGER NOT NULL,
+                 agent TEXT NOT NULL,
+                 model TEXT,
+                 effort TEXT,
+                 mode TEXT,
+                 prompt_id TEXT,
+                 started_ms INTEGER,
+                 completed_ms INTEGER,
+                 latency_ms INTEGER,
+                 ttft_ms INTEGER,
+                 outcome TEXT,
+                 failure_class TEXT,
+                 input_tokens INTEGER,
+                 output_tokens INTEGER,
+                 thought_tokens INTEGER,
+                 cached_read_tokens INTEGER,
+                 cached_write_tokens INTEGER,
+                 cost_amount REAL,
+                 cost_currency TEXT,
+                 traceparent TEXT,
+                 usage_finalized_ms INTEGER,
+                 usage_finalization_kind TEXT NOT NULL DEFAULT 'pending'
+             );
+             CREATE INDEX idx_turn_log_completed ON turn_log(completed_ms);
+             CREATE INDEX idx_turn_log_task ON turn_log(task_id, node);
+             CREATE INDEX idx_turn_log_eval ON turn_log(prompt_id, model, effort);
+             CREATE INDEX idx_turn_log_retention
+                 ON turn_log(usage_finalized_ms, completed_ms);
+             CREATE TABLE batch (
+                 id TEXT PRIMARY KEY,
+                 workflow TEXT NOT NULL,
+                 concurrency INTEGER NOT NULL,
+                 total INTEGER NOT NULL,
+                 status TEXT NOT NULL,
+                 items_json TEXT NOT NULL,
+                 error TEXT,
+                 created_ms INTEGER NOT NULL,
+                 updated_ms INTEGER NOT NULL
+             );
+             CREATE TABLE harvest_raw_records_v1 (
+                 audit_id TEXT PRIMARY KEY NOT NULL,
+                 task_id TEXT NOT NULL,
+                 run_id TEXT NOT NULL,
+                 node_id TEXT NOT NULL,
+                 attempt_id INTEGER NOT NULL
+                     CHECK (attempt_id >= 0 AND attempt_id <= 4294967295),
+                 turn_id TEXT NOT NULL,
+                 backend_id TEXT NOT NULL,
+                 producer_id TEXT NOT NULL,
+                 declared_capability_json TEXT NOT NULL,
+                 raw_body TEXT NOT NULL,
+                 raw_len_bytes INTEGER NOT NULL CHECK (raw_len_bytes >= 0),
+                 raw_body_sha256 BLOB NOT NULL CHECK (length(raw_body_sha256) = 32),
+                 prefix_attestation_json TEXT NOT NULL,
+                 provenance_sha256 BLOB NOT NULL CHECK (length(provenance_sha256) = 32),
+                 created_at_ms INTEGER NOT NULL,
+                 UNIQUE (run_id, node_id, attempt_id, turn_id)
+             );
+             CREATE TABLE harvest_sanitization_decisions_v1 (
+                 audit_id TEXT PRIMARY KEY NOT NULL,
+                 mode TEXT NOT NULL CHECK (mode IN ('off', 'attested_prefix_v1')),
+                 decision TEXT NOT NULL CHECK (decision IN (
+                     'kept_off',
+                     'kept_no_attestation',
+                     'kept_invalid_attestation',
+                     'kept_suspicious_attestation',
+                     'kept_zero_prefix',
+                     'cut_attested'
+                 )),
+                 reason TEXT,
+                 node_id TEXT NOT NULL,
+                 producer_id TEXT NOT NULL,
+                 issuer_id TEXT,
+                 raw_body_sha256 BLOB NOT NULL CHECK (length(raw_body_sha256) = 32),
+                 effective_body_sha256 BLOB NOT NULL CHECK (length(effective_body_sha256) = 32),
+                 raw_len_bytes INTEGER NOT NULL CHECK (raw_len_bytes >= 0),
+                 effective_len_bytes INTEGER NOT NULL CHECK (effective_len_bytes >= 0),
+                 cut_byte_offset INTEGER CHECK (cut_byte_offset >= 0),
+                 provenance_sha256 BLOB NOT NULL CHECK (length(provenance_sha256) = 32),
+                 suspicious_threshold_percent INTEGER NOT NULL
+                     CHECK (suspicious_threshold_percent = 90),
+                 created_at_ms INTEGER NOT NULL,
+                 FOREIGN KEY (audit_id) REFERENCES harvest_raw_records_v1(audit_id)
+                     ON DELETE CASCADE
+             );
+             CREATE INDEX harvest_raw_records_v1_task_idx
+                 ON harvest_raw_records_v1(task_id, created_at_ms, audit_id);
+             CREATE INDEX harvest_raw_records_v1_attempt_idx
+                 ON harvest_raw_records_v1(run_id, node_id, attempt_id, turn_id);
+             INSERT INTO tasks(
+                 id, workflow, status, result, created_ms, updated_ms, input,
+                 last_event_seq, terminal_seq, journal_complete_from_birth
+             ) VALUES(
+                 'legacy-task', 'legacy-workflow', 'completed', 'legacy-result',
+                 100, 200, 'legacy-input', 2, 2, 1
+             );
+             INSERT INTO sessions(task_id, session_id, created_at)
+                 VALUES('legacy-task', 'legacy-session', 100);
+             INSERT INTO task_node_checkpoints(
+                 task_id, node_id, output, ok, ts, usage_json, seq
+             ) VALUES(
+                 'legacy-task', 'legacy-node', 'legacy-output', 1, 150, NULL, 1
+             );
+             INSERT INTO task_node_starts(task_id, node_id, seq, ts)
+                 VALUES('legacy-task', 'legacy-node', 1, 125);
+             INSERT INTO task_journal(task_id, seq, event_json)
+                 VALUES('legacy-task', 2, '{\"legacy\":true}');
+             INSERT INTO turn_log(turn_id, session_id, task_id, attempt, agent)
+                 VALUES('legacy-turn', 'legacy-session', 'legacy-task', 1, 'codex');"
+            .replace("__TASK_ID_DEFINITION__", task_id_definition);
+        if !include_legacy_rows {
+            schema_and_rows.truncate(
+                schema_and_rows
+                    .find("INSERT INTO tasks(")
+                    .expect("fixture schema must precede its rows"),
+            );
+        }
+        conn.execute_batch(&schema_and_rows).unwrap();
+    }
+
+    fn create_pre_history_task_store_fixture(path: &std::path::Path) {
+        create_pre_history_task_store_fixture_with_task_id(path, "id TEXT PRIMARY KEY", true);
+    }
+
+    fn create_tagged_v021_task_store_fixture(path: &std::path::Path) {
+        create_pre_history_task_store_fixture(path);
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_tasks_artifact_retention;
+             DROP INDEX idx_turn_log_retention;
+             DROP TABLE harvest_sanitization_decisions_v1;
+             DROP TABLE harvest_raw_records_v1;
+             ALTER TABLE tasks DROP COLUMN last_artifact_ms;
+             ALTER TABLE tasks DROP COLUMN artifacts_purged_at;
+             ALTER TABLE turn_log DROP COLUMN usage_finalized_ms;
+             ALTER TABLE turn_log DROP COLUMN usage_finalization_kind;",
+        )
+        .unwrap();
+    }
+
+    fn create_reordered_pre_history_task_store_fixture(
+        path: &std::path::Path,
+        profile: PreHistoryTaskStoreProfile,
+    ) {
+        let reordered = SERVED_V021_PRE_HISTORY_SCHEMA_DDL.replacen(
+            "        session_id TEXT,\n        pending_request_id TEXT,",
+            "        pending_request_id TEXT,\n        session_id TEXT,",
+            1,
+        );
+        assert_ne!(reordered, SERVED_V021_PRE_HISTORY_SCHEMA_DDL);
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(&reordered).unwrap();
+        if matches!(profile, PreHistoryTaskStoreProfile::TaggedV021) {
+            conn.execute_batch(TAGGED_V021_PROFILE_DOWNGRADE_DDL)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn configured_writer_migrates_pre_history_task_store_without_data_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v0.2.1-task-store.sqlite");
+        create_pre_history_task_store_fixture(&path);
+
+        drop(SqliteStore::open_shared_history(&path).unwrap());
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let task: (String, String, String, String, i64, i64) = conn
+            .query_row(
+                "SELECT workflow, status, result, input, last_event_seq, terminal_seq
+                 FROM tasks WHERE id='legacy-task'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            task,
+            (
+                "legacy-workflow".into(),
+                "completed".into(),
+                "legacy-result".into(),
+                "legacy-input".into(),
+                2,
+                2,
+            )
+        );
+        let legacy_rows: (i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM sessions WHERE task_id='legacy-task'),
+                     (SELECT COUNT(*) FROM task_node_checkpoints WHERE task_id='legacy-task'),
+                     (SELECT COUNT(*) FROM task_node_starts WHERE task_id='legacy-task'),
+                     (SELECT COUNT(*) FROM task_journal WHERE task_id='legacy-task'),
+                     (SELECT COUNT(*) FROM turn_log WHERE task_id='legacy-task')",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(legacy_rows, (1, 1, 1, 1, 1));
+        let allocation: (String, String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT allocation_kind, allocation_state, charged_bytes,
+                        slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(allocation, ("configured".into(), "ready".into(), 0, 0, 0));
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn configured_read_only_reports_pre_history_task_store_as_migration_without_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v0.2.1-read-only.sqlite");
+        create_pre_history_task_store_fixture(&path);
+        let before = std::fs::read(&path).unwrap();
+
+        let error = SqliteStore::open_configured_history_read_only(&path)
+            .err()
+            .expect("a pre-history task store needs a writable migration");
+
+        assert_eq!(
+            error.reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Migration
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn configured_openers_reject_pre_history_store_without_task_primary_key() {
+        for read_only in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(if read_only {
+                "missing-task-primary-key-read-only.sqlite"
+            } else {
+                "missing-task-primary-key-writable.sqlite"
+            });
+            create_pre_history_task_store_fixture_with_task_id(&path, "id TEXT", false);
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 INSERT INTO tasks(id, workflow, status, created_ms, updated_ms, input)
+                     VALUES('duplicate-task', 'one', 'working', 1, 1, ''),
+                           ('duplicate-task', 'two', 'working', 2, 2, '');",
+            )
+            .unwrap();
+            drop(conn);
+            let before = legacy_configured_snapshot(&path);
+
+            let error = if read_only {
+                SqliteStore::open_configured_history_read_only(&path).err()
+            } else {
+                SqliteStore::open_shared_history(&path).err()
+            }
+            .expect("a predecessor-shaped store without its task primary key must be refused");
+
+            assert_eq!(
+                error.reason,
+                bridge_core::workflow_history::LedgerUnavailableReason::Corruption
+            );
+            assert_eq!(legacy_configured_snapshot(&path), before);
+        }
+    }
+
+    #[test]
+    fn configured_openers_classify_missing_pre_history_projection_as_corruption() {
+        for read_only in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(if read_only {
+                "missing-session-id-read-only.sqlite"
+            } else {
+                "missing-session-id-writable.sqlite"
+            });
+            create_pre_history_task_store_fixture(&path);
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("ALTER TABLE sessions DROP COLUMN session_id;")
+                .unwrap();
+            drop(conn);
+            let before = legacy_configured_snapshot(&path);
+
+            let error = if read_only {
+                SqliteStore::open_configured_history_read_only(&path).err()
+            } else {
+                SqliteStore::open_shared_history(&path).err()
+            }
+            .expect("a partial predecessor schema must be refused before projection");
+
+            assert_eq!(
+                error.reason,
+                bridge_core::workflow_history::LedgerUnavailableReason::Corruption
+            );
+            assert_eq!(legacy_configured_snapshot(&path), before);
+        }
+    }
+
+    #[test]
+    fn configured_openers_reject_noncanonical_pre_history_schema_metadata() {
+        let variants = [
+            (
+                "declared-type",
+                Some(("workflow TEXT NOT NULL", "workflow BLOB NOT NULL")),
+                "",
+            ),
+            (
+                "nullability",
+                Some(("session_id TEXT,", "session_id TEXT NOT NULL,")),
+                "",
+            ),
+            (
+                "default",
+                Some((
+                    "created_at INTEGER NOT NULL DEFAULT 0",
+                    "created_at INTEGER NOT NULL DEFAULT 1",
+                )),
+                "",
+            ),
+            (
+                "foreign-key",
+                Some((
+                    "FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE",
+                    "FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE SET NULL",
+                )),
+                "",
+            ),
+            (
+                "check",
+                Some((
+                    "CHECK (attempt_id >= 0 AND attempt_id <= 4294967295)",
+                    "CHECK (attempt_id >= 0)",
+                )),
+                "",
+            ),
+            (
+                "index",
+                None,
+                "DROP INDEX idx_tasks_updated;
+                 CREATE UNIQUE INDEX idx_tasks_updated ON tasks(status);",
+            ),
+            (
+                "trigger",
+                None,
+                "CREATE TRIGGER unexpected_task_trigger AFTER INSERT ON tasks
+                     BEGIN UPDATE tasks SET updated_ms=updated_ms WHERE id=NEW.id; END;",
+            ),
+            (
+                "generated-column",
+                None,
+                "ALTER TABLE batch ADD COLUMN generated_status TEXT
+                     GENERATED ALWAYS AS (status) VIRTUAL;",
+            ),
+        ];
+
+        for (variant, replacement, extra_ddl) in variants {
+            for read_only in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join(format!(
+                    "{variant}-{}.sqlite",
+                    if read_only { "ro" } else { "rw" }
+                ));
+                let schema = match replacement {
+                    Some((from, to)) => {
+                        let replaced = SERVED_V021_PRE_HISTORY_SCHEMA_DDL.replacen(from, to, 1);
+                        assert_ne!(replaced, SERVED_V021_PRE_HISTORY_SCHEMA_DDL);
+                        replaced
+                    }
+                    None => SERVED_V021_PRE_HISTORY_SCHEMA_DDL.to_owned(),
+                };
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.execute_batch(&schema).unwrap();
+                conn.execute_batch(extra_ddl).unwrap();
+                drop(conn);
+                let before = legacy_configured_snapshot(&path);
+
+                let error = if read_only {
+                    SqliteStore::open_configured_history_read_only(&path).err()
+                } else {
+                    SqliteStore::open_shared_history(&path).err()
+                }
+                .unwrap_or_else(|| panic!("{variant} predecessor variant must be refused"));
+
+                assert_eq!(
+                    error.reason,
+                    bridge_core::workflow_history::LedgerUnavailableReason::Corruption,
+                    "wrong classification for {variant}"
+                );
+                assert_eq!(
+                    legacy_configured_snapshot(&path),
+                    before,
+                    "{variant} refusal mutated the store"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configured_openers_reject_reordered_columns_in_both_pre_history_profiles() {
+        for (profile_name, profile) in [
+            ("served", PreHistoryTaskStoreProfile::ServedV021),
+            ("tagged", PreHistoryTaskStoreProfile::TaggedV021),
+        ] {
+            for read_only in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join(format!(
+                    "{profile_name}-reordered-{}.sqlite",
+                    if read_only { "read-only" } else { "writable" }
+                ));
+                create_reordered_pre_history_task_store_fixture(&path, profile);
+                let before = legacy_configured_snapshot(&path);
+
+                let error = if read_only {
+                    SqliteStore::open_configured_history_read_only(&path).err()
+                } else {
+                    SqliteStore::open_shared_history(&path).err()
+                }
+                .unwrap_or_else(|| {
+                    panic!("{profile_name} reordered-column profile must be refused")
+                });
+
+                assert_eq!(
+                    error.reason,
+                    bridge_core::workflow_history::LedgerUnavailableReason::Corruption,
+                    "wrong classification for {profile_name} reordered-column profile"
+                );
+                assert_eq!(
+                    legacy_configured_snapshot(&path),
+                    before,
+                    "{profile_name} reordered-column refusal mutated the store"
+                );
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn configured_writer_reclassifies_predecessor_inside_migration_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("raced-predecessor.sqlite");
+        create_pre_history_task_store_fixture(&path);
+        let canonical_path = canonical_fixture_path(&path);
+        let (_control, (mut reached, proceed)) = arm_history_file_open_control(
+            &canonical_path,
+            &[],
+            &[HistoryFileOpenPausePoint::BeforeFdValidation],
+        );
+        let opener_path = canonical_path.clone();
+        let opener = std::thread::spawn(move || SqliteStore::open_shared_history(&opener_path));
+        reached
+            .remove(0)
+            .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+            .expect("configured opener did not reach the post-classification file-open pause");
+
+        let writer = rusqlite::Connection::open(&canonical_path).unwrap();
+        writer
+            .execute_batch("ALTER TABLE sessions DROP COLUMN session_id;")
+            .unwrap();
+        drop(writer);
+        let after_external_write = legacy_configured_snapshot(&canonical_path);
+        proceed[0].send(()).unwrap();
+
+        let error =
+            opener.join().unwrap().err().expect(
+                "transactional adoption must reject schema drift after preliminary admission",
+            );
+        assert_eq!(
+            error.reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Corruption
+        );
+        assert_eq!(
+            legacy_configured_snapshot(&canonical_path),
+            after_external_write,
+            "failed transactional reclassification mutated the raced predecessor"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn platform_writers_reclassify_predecessor_inside_migration_transaction() {
+        type HistoryOpener =
+            fn(&std::path::Path) -> Result<SqliteStore, bridge_core::workflow_history::LedgerError>;
+
+        for (name, open) in [
+            (
+                "direct-platform",
+                SqliteStore::open_platform_history as HistoryOpener,
+            ),
+            (
+                "selected-platform",
+                SqliteStore::open_history as HistoryOpener,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(format!("{name}-raced.sqlite"));
+            create_tagged_v021_task_store_fixture(&path);
+            let canonical_path = canonical_fixture_path(&path);
+            let (_control, (mut reached, proceed)) = arm_history_file_open_control(
+                &canonical_path,
+                &[],
+                &[HistoryFileOpenPausePoint::BeforeFdValidation],
+            );
+            let opener_path = canonical_path.clone();
+            let opener = std::thread::spawn(move || open(&opener_path));
+            reached
+                .remove(0)
+                .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+                .unwrap_or_else(|_| panic!("{name} opener did not reach the database-open pause"));
+
+            let writer = rusqlite::Connection::open(&canonical_path).unwrap();
+            writer
+                .execute_batch("ALTER TABLE sessions DROP COLUMN session_id;")
+                .unwrap();
+            drop(writer);
+            let after_external_write = legacy_configured_snapshot(&canonical_path);
+            proceed[0].send(()).unwrap();
+
+            let error = opener.join().unwrap().err().unwrap_or_else(|| {
+                panic!("{name} adoption must reject drift after preliminary admission")
+            });
+            assert_eq!(
+                error.reason,
+                bridge_core::workflow_history::LedgerUnavailableReason::Corruption,
+                "wrong classification for {name}"
+            );
+            assert_eq!(
+                legacy_configured_snapshot(&canonical_path),
+                after_external_write,
+                "failed {name} transactional reclassification mutated the database"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn history_writers_reject_unknown_schema_created_after_absence_admission() {
+        type HistoryOpener =
+            fn(&std::path::Path) -> Result<SqliteStore, bridge_core::workflow_history::LedgerError>;
+
+        for (name, open) in [
+            (
+                "configured",
+                SqliteStore::open_shared_history as HistoryOpener,
+            ),
+            (
+                "direct-platform",
+                SqliteStore::open_platform_history as HistoryOpener,
+            ),
+            (
+                "selected-platform",
+                SqliteStore::open_history as HistoryOpener,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(format!("{name}-absent-race.sqlite"));
+            let canonical_path = std::fs::canonicalize(directory.path())
+                .unwrap()
+                .join(format!("{name}-absent-race.sqlite"));
+            let (_control, (mut reached, proceed)) = arm_history_file_open_control(
+                &canonical_path,
+                &[],
+                &[HistoryFileOpenPausePoint::BeforeFdValidation],
+            );
+            let opener_path = path.clone();
+            let opener = std::thread::spawn(move || open(&opener_path));
+            reached
+                .remove(0)
+                .recv_timeout(HISTORY_TEST_HOOK_TIMEOUT)
+                .unwrap_or_else(|_| panic!("{name} opener did not reach the new-file pause"));
+
+            let writer = rusqlite::Connection::open(&canonical_path).unwrap();
+            writer
+                .execute_batch(
+                    "CREATE TABLE unrelated_payload(
+                         id INTEGER PRIMARY KEY,
+                         payload TEXT NOT NULL
+                     );
+                     INSERT INTO unrelated_payload(payload) VALUES('external');",
+                )
+                .unwrap();
+            drop(writer);
+            let after_external_write = legacy_configured_snapshot(&canonical_path);
+            proceed[0].send(()).unwrap();
+
+            let error = opener.join().unwrap().err().unwrap_or_else(|| {
+                panic!("{name} opener adopted a schema created after absence admission")
+            });
+            assert_eq!(
+                error.reason,
+                bridge_core::workflow_history::LedgerUnavailableReason::Corruption,
+                "wrong classification for {name} new-file race"
+            );
+            assert_eq!(
+                legacy_configured_snapshot(&canonical_path),
+                after_external_write,
+                "failed {name} absence revalidation mutated the database"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_writer_refuses_partial_pre_history_schema_without_database_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("partial-pre-history.sqlite");
+        create_pre_history_task_store_fixture(&path);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE attempt_identities (
+                 attempt_id TEXT PRIMARY KEY,
+                 execution_id TEXT NOT NULL,
+                 ordinal INTEGER NOT NULL,
+                 task_id TEXT,
+                 owner_surface TEXT NOT NULL,
+                 history_disposition INTEGER NOT NULL DEFAULT 0,
+                 history_unavailable_reason TEXT
+             );",
+        )
+        .unwrap();
+        drop(conn);
+        let before = std::fs::read(&path).unwrap();
+
+        let error = SqliteStore::open_shared_history(&path)
+            .err()
+            .expect("a partial history schema cannot be adopted");
+
+        assert_eq!(
+            error.reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Corruption
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn configured_writer_refuses_case_variant_pre_history_namespace_objects() {
+        for (fixture, ddl) in [
+            (
+                "case-variant-legacy-table.sqlite",
+                "CREATE TABLE Task_Attempt_Identities(
+                     task_id TEXT PRIMARY KEY,
+                     attempt_id TEXT NOT NULL,
+                     execution_id TEXT NOT NULL,
+                     ordinal INTEGER NOT NULL
+                 );",
+            ),
+            (
+                "case-variant-attachment-view.sqlite",
+                "CREATE VIEW Workflow_History_Attachment AS
+                     SELECT id AS attempt_id, 1024 AS charged_bytes FROM tasks;",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(fixture);
+            create_pre_history_task_store_fixture(&path);
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(ddl).unwrap();
+            drop(conn);
+            let before = legacy_configured_snapshot(&path);
+
+            let error = SqliteStore::open_shared_history(&path)
+                .err()
+                .expect("a case-variant history namespace object cannot be adopted");
+
+            assert_eq!(
+                error.reason,
+                bridge_core::workflow_history::LedgerUnavailableReason::Corruption
+            );
+            assert_eq!(legacy_configured_snapshot(&path), before);
+        }
+    }
+
+    #[test]
+    fn configured_writer_refuses_current_store_with_history_namespace_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stripped-current-history.sqlite");
+        drop(SqliteStore::open(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE task_attempt_locators;
+             DROP TABLE attempt_identities;
+             DROP TABLE workflow_attempt_summaries;
+             DROP TABLE workflow_history_attachment;
+             DROP TABLE workflow_history_rewrite_reserve;",
+        )
+        .unwrap();
+        drop(conn);
+        let before = legacy_configured_snapshot(&path);
+
+        let error = SqliteStore::open_shared_history(&path)
+            .err()
+            .expect("a stripped current history schema cannot become a predecessor store");
+
+        assert_eq!(
+            error.reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Corruption
+        );
+        assert_eq!(legacy_configured_snapshot(&path), before);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn platform_writer_migrates_tagged_v021_pre_history_task_store() {
+        let _platform_open_test_serial_guard = PLATFORM_OPEN_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tagged-v0.2.1-platform.sqlite");
+        create_tagged_v021_task_store_fixture(&path);
+
+        drop(SqliteStore::open_platform_history(&path).unwrap());
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let allocation: (String, String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT allocation_kind, allocation_state, charged_bytes,
+                        slots_used, terminal_rows
+                 FROM workflow_history_allocation WHERE singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(allocation, ("platform".into(), "ready".into(), 0, 0, 0));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id='legacy-task'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
         );
     }
 
