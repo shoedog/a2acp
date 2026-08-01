@@ -586,12 +586,37 @@ fn validate_relative_path(label: &str, path: &Path) -> Result<(), BoxError> {
 }
 
 #[cfg(test)]
+fn prepare_test_trusted_cwd(
+    trusted_root: &Path,
+    temp_root: &Path,
+) -> (Option<tempfile::TempDir>, PathBuf, PathBuf) {
+    if trusted_root.is_dir() {
+        let trusted_temp = tempfile::Builder::new()
+            .prefix(".r2f0b-trusted-cwd-")
+            .tempdir_in(trusted_root)
+            .unwrap();
+        let trusted_cwd = trusted_temp.path().to_path_buf();
+        let invalid_cwd = trusted_cwd.with_file_name(format!(
+            "{}-missing",
+            trusted_cwd.file_name().unwrap().to_string_lossy()
+        ));
+        (Some(trusted_temp), trusted_cwd, invalid_cwd)
+    } else {
+        (
+            None,
+            trusted_root.join(".r2f0b-offline-trusted-cwd"),
+            temp_root.join("outside-trusted-cwd"),
+        )
+    }
+}
+
+#[cfg(test)]
 pub(super) struct TestScheduleFoundation {
     _temp: tempfile::TempDir,
-    _trusted_temp: tempfile::TempDir,
+    _trusted_temp: Option<tempfile::TempDir>,
     root: PathBuf,
     trusted_cwd: PathBuf,
-    missing_cwd: PathBuf,
+    invalid_cwd: PathBuf,
 }
 
 #[cfg(test)]
@@ -667,27 +692,16 @@ impl TestScheduleFoundation {
         }
 
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("compatibility");
+        let temp_root = std::fs::canonicalize(temp.path()).unwrap();
+        let root = temp_root.join("compatibility");
         copy_tree(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compatibility"),
             &root,
         );
-        let repository_root =
-            std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
-        let trusted_temp = tempfile::Builder::new()
-            .prefix(".r2f0b-trusted-cwd-")
-            .tempdir_in(repository_root)
-            .unwrap();
-        let trusted_cwd = std::fs::canonicalize(trusted_temp.path()).unwrap();
-        let missing_cwd = trusted_cwd.with_file_name(format!(
-            "{}-missing",
-            trusted_cwd.file_name().unwrap().to_string_lossy()
-        ));
-        for relative in [
-            "scheduling-policy.toml",
-            "scheduled-cases.toml",
-            "manifest.toml",
-        ] {
+        let trusted_root = Path::new(OWNER_APPROVED_TRUSTED_CWD_ROOT);
+        let (trusted_temp, trusted_cwd, invalid_cwd) =
+            prepare_test_trusted_cwd(trusted_root, &temp_root);
+        for relative in ["scheduled-cases.toml", "manifest.toml"] {
             let path = root.join(relative);
             let source = std::fs::read_to_string(&path).unwrap();
             let source = source.replace(
@@ -702,7 +716,7 @@ impl TestScheduleFoundation {
             _trusted_temp: trusted_temp,
             root,
             trusted_cwd,
-            missing_cwd,
+            invalid_cwd,
         }
     }
 
@@ -710,13 +724,13 @@ impl TestScheduleFoundation {
         &self.root
     }
 
-    pub(super) fn configure_missing_trusted_cwd(&self) {
+    pub(super) fn configure_invalid_trusted_cwd(&self) {
         for relative in ["scheduled-cases.toml", "manifest.toml"] {
             let path = self.root.join(relative);
             let source = std::fs::read_to_string(&path).unwrap();
             let source = source.replace(
                 self.trusted_cwd.to_str().unwrap(),
-                self.missing_cwd.to_str().unwrap(),
+                self.invalid_cwd.to_str().unwrap(),
             );
             std::fs::write(path, source).unwrap();
         }
@@ -2750,11 +2764,36 @@ mod tests {
     }
 
     #[test]
-    fn r2f0b_missing_trusted_cwd_is_rejected_by_the_production_resolver() {
+    fn r2f0b_invalid_trusted_cwd_is_rejected_by_the_production_resolver() {
         let fixture = TestScheduleFoundation::new();
-        fixture.configure_missing_trusted_cwd();
+        fixture.configure_invalid_trusted_cwd();
         let error = load_schedule_foundation(fixture.root()).unwrap_err();
         assert!(error.to_string().contains("session cwd"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r2f0b_test_cwd_preserves_a_symlinked_trusted_root_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_root = std::fs::canonicalize(temp.path()).unwrap();
+        let physical_root = temp_root.join("physical-root");
+        let lexical_root = temp_root.join("approved-root");
+        std::fs::create_dir(&physical_root).unwrap();
+        std::os::unix::fs::symlink(&physical_root, &lexical_root).unwrap();
+
+        let (_guard, declared, invalid) = prepare_test_trusted_cwd(&lexical_root, &temp_root);
+        assert!(declared.starts_with(&lexical_root));
+        assert_eq!(
+            resolve_trusted_session_cwd("symlinked root fixture", &declared, &lexical_root)
+                .unwrap(),
+            std::fs::canonicalize(&declared).unwrap()
+        );
+        assert!(resolve_trusted_session_cwd(
+            "invalid symlinked root fixture",
+            &invalid,
+            &lexical_root
+        )
+        .is_err());
     }
 
     #[test]
