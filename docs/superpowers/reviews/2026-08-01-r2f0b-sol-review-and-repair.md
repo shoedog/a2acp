@@ -12,8 +12,9 @@ quarantined implementation clone. The read-only review was frozen to custody sna
 
 The reviewer returned `REJECT`: six concrete `WRONG` findings were blockers and four `SMELL` findings
 needed disposition. Per the declared one-review cap, the repair stayed on the existing artifact and no
-second Sol review was launched. The review verdict therefore remains a rejection of the frozen pre-repair
-tree; it is not relabeled as an approval of later bytes.
+second Sol review of that production repair tree was launched. The review verdict therefore remains a rejection
+of the frozen pre-repair tree; it is not relabeled as an approval of later bytes. A distinct post-merge review
+later inspected only the CI fixture repair and is recorded below.
 
 ## WRONG findings and closed repairs
 
@@ -38,14 +39,38 @@ blocker/defer triage. The former dual-review workflows remain explicit opt-ins.
   controls against exact base `ce38a4e` and the repaired tree; base was red and the repaired tree green.
 - A provider/tool transition counter can theoretically exceed `u64::MAX`. No realistic execution reaches
   that population; defer until the counter boundary is otherwise changed.
-- Nine compatibility-schedule tests fail during fixture-foundation setup. The same nine names fail on the
-  exact pre-repair base in the same environment before the intended behavior is reached; defer as an
-  independently owned fixture repair and do not count those exits as behavioral evidence.
+- Nine compatibility-schedule tests failed during fixture-foundation setup on both the repaired candidate and
+  immediate base `ce38a4e`. That controls only the six-finding repair delta. Exact pre-R2f0b main `1a8cfc0`
+  passed the same GitHub workflow, while post-merge run `30704164902` failed the nine tests. The earlier defer
+  was therefore superseded: this was a cumulative R2f0b `WRONG`, repaired at `2744cb1` without weakening
+  production admission.
 - One controller concurrency observation lacked a same-harness base control. It does not establish a
-  regression and remains deferred rather than silently attributed to R2f0b.
+  regression and remains deferred rather than silently attributed to R2f0b. A later intermittent local macOS
+  operation-lock test failure remains outside the fixture diff; its exact and full-crate controls passed alone.
+
+## Post-merge fixture review and folded finding
+
+One distinct bridge-mediated Sol/xhigh/read-only review inspected the exact uncommitted fixture diff against
+`666abb8a24f61b685219ac725f5e533b31f818a4`:
+
+- execution: `exec-e8a0ef8a7efc75f9a2847e9c2e086d5a`;
+- attempt: `attempt-0e4f387ac85602dcaa4563c3b35b8219`;
+- result: 5,553 bytes, SHA-256
+  `d7e4b8e2715dbc2e3659352426bffe3a5c5ad5fbbc6c24b6d16ef4735e47452c`;
+- verdict: `APPROVE`;
+- findings: one rare test-only `WRONG / DEFER`, no `SMELL`.
+
+The finding constructed an owner host where `/Users/wesleyjinks/code` is a symlink. Canonicalizing the
+generated child before the production resolver's lexical check made the fixture falsely reject an otherwise
+valid rooted directory. Although nonblocking and inherited from the earlier fixture, the owner directed valid
+findings to be folded. A Unix regression failed **0 / 1** on the reviewed construction, then passed **1 / 0**
+after returning the retained temporary directory's lexical path and leaving canonical containment to the
+production resolver. Final repair commit `2744cb13db336b8fa99db9c48e638b99c161fd82` passed the complete schedule
+slice **302 / 0**, full workspace **3,089 / 0 / 12 ignored**, static gates, and green replacement CI run
+`30706571173`.
 
 ## Acceptance boundary
 
-The operator authorized the one review, every closed repair, fail-first controls, the full deterministic
-suite, and landing. No live provider turn, compatibility canary, production-server replacement, release,
-or operator deployment is part of this acceptance.
+The operator authorized the initial review, every closed repair, fail-first controls, full deterministic suite,
+landing, and the distinct post-merge Sol fixture review. No compatibility canary, production-server replacement,
+release, or operator deployment is part of this acceptance.

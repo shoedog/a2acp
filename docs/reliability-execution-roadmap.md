@@ -4,8 +4,10 @@
 - **Current main lineage:** R2f0b is **MERGED** at operator-authored code boundary
   `4ffcd5607a308ed9b1c73fe59bf2ff71b3f72889`, exact tree
   `8bc7e3c43417ad650e2426756b4aafc5aca2582a`, from frozen `origin/main`
-  `1a8cfc0020c0979b7a11724a7a39536dce41a680`.
-- **Completed through:** R2f0b **MERGED** at `4ffcd5607a308ed9b1c73fe59bf2ff71b3f72889`; R2f0p **MERGED** at `cc9e4ca49fb6e9c193508254ccc0341ea2974d78`; R2f0a **MERGED** by PR #48 at `2685ffb78ef21c987b3f63f7aba1ddc096b01189`
+  `1a8cfc0020c0979b7a11724a7a39536dce41a680`. Post-merge fixture repair
+  `2744cb13db336b8fa99db9c48e638b99c161fd82` has green CI run `30706571173`.
+- **Completed through:** R2f0b **MERGED** at `4ffcd5607a308ed9b1c73fe59bf2ff71b3f72889`, with green post-merge
+  fixture repair `2744cb13db336b8fa99db9c48e638b99c161fd82`; R2f0p **MERGED** at `cc9e4ca49fb6e9c193508254ccc0341ea2974d78`; R2f0a **MERGED** by PR #48 at `2685ffb78ef21c987b3f63f7aba1ddc096b01189`
   (final PR head `630b9cc9d7ae86c323b183763b3d4e83bdbfc792`); R3d3 **MERGED** at `3c02bf3f`;
   standalone issues #35/#39 **MERGED** at `0f84a5ca`, issue #30 **MERGED** at `0d628271`, issue #36
   **MERGED** by PR #46 at `345941db`, and R2f incident intake **MERGED** by PR #45 at `db0eb28f`. R2e remains
@@ -25,17 +27,20 @@
   `FIXED`, found no fresh `WRONG` or `SMELL`, and returned `APPROVE`. Exact closure head `cc9e4ca` passed the final
   canonical suite and advanced `origin/main` from the frozen base with an exact force-with-lease. R2f0b's
   [focused implementation boundary](superpowers/plans/2026-07-30-r2f0b-focused-boundary.md) was implemented from
-  exact main `1a8cfc0`; the operator-authored merge boundary is `4ffcd560`, with exact verified tree `8bc7e3c4`.
+  exact main `1a8cfc0`; the operator-authored merge boundary is `4ffcd560`, with exact verified tree `8bc7e3c4`,
+  and post-merge fixture repair boundary is `2744cb1`.
 - **R2f0b verification and review (2026-08-01):** [native verification](superpowers/reviews/2026-08-01-r2f0b-native-verification.md)
   records format, warnings-denied all-target/all-feature Clippy, four changed-config validations, and repository
-  hygiene **39 tracked artifacts / 7 validated example configs** green. The full workspace emitted
-  **3,079 passed / 9 failed / 12 ignored**; exact-base same-environment control reproduced the identical nine
-  fixture-foundation failures before target behavior, so they remain reported and deferred rather than attributed
-  or re-baselined. One bounded [Sol/xhigh review and repair disposition](superpowers/reviews/2026-08-01-r2f0b-sol-review-and-repair.md)
+  hygiene **39 tracked artifacts / 7 validated example configs** green. The initial full workspace emitted
+  **3,079 passed / 9 failed / 12 ignored**. Immediate-base `ce38a4e` reproduced the nine, but exact pre-R2f0b main
+  `1a8cfc0` had green same-workflow CI; post-merge run `30704164902` therefore established a cumulative fixture
+  portability regression. Repair `2744cb1` now passes the complete schedule slice **302 / 0**, final local full
+  workspace **3,089 / 0 / 12 ignored**, and replacement CI run `30706571173` across Linux coverage, macOS store,
+  and Windows unsupported-target. One bounded [Sol/xhigh review and repair disposition](superpowers/reviews/2026-08-01-r2f0b-sol-review-and-repair.md)
   returned `REJECT` on six concrete blocker `WRONG` findings; all six received bounded repairs plus exact-base-red /
-  repaired-tree-green behavioral controls on the same artifact. The declared one-review cap was honored, so no
-  post-repair Sol verdict is claimed. No provider, compatibility, production-server, release, deployment, or
-  running-operator effect was exercised.
+  repaired-tree-green behavioral controls on the same artifact. A distinct post-merge Sol/xhigh fixture review
+  returned `APPROVE` with one rare test-only `WRONG / DEFER`; its bounded symlink-root fix was folded with red/green
+  evidence. No compatibility, production-server, release, deployment, or running-operator effect was exercised.
 - **R2f0p candidate verification (2026-07-30):** locked full workspace **2,994 passed / 0 failed / 12 ignored**
   across **61** test targets; diff/format, locked all-target/all-feature workspace check, warnings-denied Clippy,
   locked release workspace build, and repository hygiene **38 tracked artifacts / 7 example configs** are green.
@@ -60,7 +65,7 @@
   R2f0a IMPLEMENTATION+CORRECTION COMPLETE / [INTEGRATED NATIVE VERIFIED](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md) /
   [INTEGRATED FINAL SOL APPROVE](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md) /
   [INTEGRATED FINAL FABLE APPROVE](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md) /
-  PR #48 MERGED WITH GREEN CI / R2f0p MERGED AT `cc9e4ca` / R2f0b MERGED AT `4ffcd560`**.
+  PR #48 MERGED WITH GREEN CI / R2f0p MERGED AT `cc9e4ca` / R2f0b MERGED AT `4ffcd560` + CI REPAIR `2744cb1` GREEN**.
   Fan-out policy, the three liveness clocks, workflow telemetry and its
   180-day/100,000-row/128-MiB retention boundary, provisional review budgets, and local-only destructive takeover
   were owner-approved on 2026-07-20. Health enforcement is explicitly production-operator-only; two-strike
@@ -898,7 +903,7 @@ R2a provenance (MERGED)
 
 R2f0a identity/ledger/stats (MERGED by PR #48)
   -> R2f0p parallel implementor flight prerequisite (MERGED at cc9e4ca)
-    -> R2f0b terminal evidence/activity custody (MERGED at 4ffcd560)
+    -> R2f0b terminal evidence/activity custody (MERGED at 4ffcd560; CI fixture repair 2744cb1 GREEN)
       -> R2f1a/1b/2/3a/3b/3c/4 liveness, takeover, health, and closure (1a NEXT)
     -> R2g stable ingress/release handoff (QUEUED)
       -> R3d4 trusted triggers and remote check publication (NOT STARTED)
@@ -929,15 +934,17 @@ PR #48 merged R2f0a at `2685ffb78ef21c987b3f63f7aba1ddc096b01189` with green CI.
 [Sol closure review](superpowers/reviews/2026-07-30-r2f0p-sol-closure-review.md) marked both inherited findings
 `FIXED`, found no fresh finding, and returned `APPROVE`. Exact closure head `cc9e4ca` then passed the final gate and
 advanced `origin/main` under an exact lease. R2f0p is merged. R2f0b then closed its six Sol/xhigh blocker findings
-with exact-base-red/repaired-tree-green controls, retained the nine same-environment fixture-foundation failures as
-deferred, and merged at operator-authored code boundary `4ffcd560` with exact verified tree `8bc7e3c4`. No second
-Sol verdict is claimed after the one-review cap. R2f1a is next. Health enforcement is explicit-production-only with approved differential
+with exact-base-red/repaired-tree-green controls and merged at operator-authored code boundary `4ffcd560` with exact
+verified tree `8bc7e3c4`. Post-merge CI correctly reclassified the nine fixture-foundation failures as a cumulative
+R2f0b portability regression: exact pre-R2f0b main CI was green, while run `30704164902` failed. Fixture repair
+`2744cb1`, including the one valid finding from a distinct Sol/xhigh `APPROVE` review, passed local **3,089 / 0 / 12**
+and replacement CI `30706571173`. R2f1a is next. Health enforcement is explicit-production-only with approved differential
 and self-clearing recovery, planned drain
 preserves exact running/warm ownership, and process deployment is split at an approved R2f3c-to-R2g boundary. No
 owner bound remains open;
 R3d may display a future read-only R2f health result but cannot perform operator lifecycle actions.
 
-R2f0p MERGED -> R2f0b MERGED -> R2f1a NEXT -> R2f1b/2/3a/3b/3c/4 -> R2g stable ingress -> R3d4/R3d5 -> R3e/R3f -> R4 release promotion.
+R2f0p MERGED -> R2f0b MERGED + CI REPAIR GREEN -> R2f1a NEXT -> R2f1b/2/3a/3b/3c/4 -> R2g stable ingress -> R3d4/R3d5 -> R3e/R3f -> R4 release promotion.
 ```
 
 M4 Slice 3b/3c remains parked until the reliability exit gates in
@@ -957,7 +964,7 @@ M4 Slice 3b/3c remains parked until the reliability exit gates in
 | R2c — live smoke | **MERGED** at `be54bc51` by PR #28 (initial Fable/xhigh review `REVISE`; closure re-review `APPROVE` at `0e3b8ce`; attempt 1 rejected for initial `0644`; permission-fold review `APPROVE` at `23384622`; create-new closure review `APPROVE` at `ffb7e891`; full host workspace **1,933 / 0 / 12 ignored**; separately authorized attempt 2 on `1c9e4a43` passed artifact-exact in 8.770 s with mode `0600`, exact terminal `PONG`, no retry/fallback, and clean teardown) | [R2c implementation plan](superpowers/plans/2026-07-11-r2c-live-smoke.md) | Deterministic command/artifact gates first; then one explicit, bounded, billable turn with no retry. |
 | R2d — fallback plan | **MERGED** at `a6fec94c` by PR #29 (initial review and closure re-reviews 1–7 `REVISE`; closure re-review 8 `APPROVE` at `1586f24`; post-approval CI-only fold `15174d0` has green replacement Build/Lint/Coverage + CLA; v23 planner **24/0**, smoke **22/0**, local-file **7/0**, Linux planner **24/0** + local-file **7/0** + guarded composition **1/0**; full workspace **1,985/0/12 ignored**, hygiene **37/7**) | [R2d implementation plan](superpowers/plans/2026-07-11-r2d-local-fallback-plan.md) | Local plan only; complete smoke-v2/current-config/exact-cleanup evidence; exact trusted cwd and source-mount persistent-object identities; action-time config/executable/cwd/source/target guard; guarded host composition and child cwd use only the pinned repo object and never consult the degraded runtime. |
 | R2e — in-process fallback | **DEFERRED / BLOCKED BY POLICY** | [R2e gated plan](superpowers/plans/2026-07-11-r2e-policy-authorized-fallback.md) | No implementation until authenticated attestation design is approved. |
-| R2f — phase-aware liveness/takeover | **ACTIVE / R2f0p MERGED AT `cc9e4ca` / R2f0a MERGED / R2f0b MERGED AT `4ffcd560` / R2f1a NEXT** (31-second ACP and 6-second cancellation observable bounds). R2f0a integrated checkpoint `7b01ab4bae167d3640050dfda5de7e1478728497`; merge `2685ffb78ef21c987b3f63f7aba1ddc096b01189`. | R2f0b [focused boundary](superpowers/plans/2026-07-30-r2f0b-focused-boundary.md), [native verification](superpowers/reviews/2026-08-01-r2f0b-native-verification.md), and [Sol review/repair disposition](superpowers/reviews/2026-08-01-r2f0b-sol-review-and-repair.md); R2f0p [initial Sol review](superpowers/reviews/2026-07-30-r2f0p-sol-review.md), [corrected native gate](superpowers/reviews/2026-07-30-r2f0p-native-verification.md), and [Sol closure approval](superpowers/reviews/2026-07-30-r2f0p-sol-closure-review.md); [parallel-flight ADR](adr/0040-parallel-implementor-flight.md), [R2f owner design](superpowers/specs/2026-07-20-r2f-owner-design.md), [implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md), [short-bound spike](superpowers/spikes/2026-07-20-r2f-short-bound-validation.md), integrated [Sol](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md), [Fable](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md), and [native](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md) | Freeze R2f1a's focused boundary, then continue `1a/1b/2/3a/3b/3c/4` in order. |
+| R2f — phase-aware liveness/takeover | **ACTIVE / R2f0p MERGED AT `cc9e4ca` / R2f0a MERGED / R2f0b MERGED AT `4ffcd560` + CI REPAIR `2744cb1` GREEN / R2f1a NEXT** (31-second ACP and 6-second cancellation observable bounds). R2f0a integrated checkpoint `7b01ab4bae167d3640050dfda5de7e1478728497`; merge `2685ffb78ef21c987b3f63f7aba1ddc096b01189`. | R2f0b [focused boundary](superpowers/plans/2026-07-30-r2f0b-focused-boundary.md), [native verification](superpowers/reviews/2026-08-01-r2f0b-native-verification.md), and [Sol review/repair disposition](superpowers/reviews/2026-08-01-r2f0b-sol-review-and-repair.md); R2f0p [initial Sol review](superpowers/reviews/2026-07-30-r2f0p-sol-review.md), [corrected native gate](superpowers/reviews/2026-07-30-r2f0p-native-verification.md), and [Sol closure approval](superpowers/reviews/2026-07-30-r2f0p-sol-closure-review.md); [parallel-flight ADR](adr/0040-parallel-implementor-flight.md), [R2f owner design](superpowers/specs/2026-07-20-r2f-owner-design.md), [implementation plan](superpowers/plans/2026-07-11-r2f-phase-aware-liveness.md), [short-bound spike](superpowers/spikes/2026-07-20-r2f-short-bound-validation.md), integrated [Sol](superpowers/reviews/2026-07-25-r2f0a-integrated-final-sol-review.md), [Fable](superpowers/reviews/2026-07-25-r2f0a-integrated-final-fable-review.md), and [native](superpowers/reviews/2026-07-25-r2f0a-integrated-native-verification.md) | Freeze R2f1a's focused boundary, then continue `1a/1b/2/3a/3b/3c/4` in order. |
 | R2g — stable ingress/release handoff | **QUEUED AFTER R2f / SCOPE BOUNDARY APPROVED / FOCUSED OWNER DESIGN NOT STARTED** | [R2g queued plan](superpowers/plans/2026-07-20-r2g-stable-ingress.md) | Stable local ingress, exact task/session/SSE affinity, side-by-side release promotion/rollback, safe store ownership, predecessor drain, and operator integration. No provider integration is mixed into this slice. |
 | R3 — compatibility canaries | R3a **MERGED** at `3927df3f` by PR #31; R3b **MERGED** at `504c1e43` by PR #32; R3c **MERGED** at `98339842` by PR #33; R3d design **APPROVED / MERGED** by PR #37; R3d0–R3d3 **MERGED** by PRs #38/#40/#41/#42. R3d4 trusted triggers and R3d5 characterization/activation are **NOT STARTED**. R3e OpenRouter and R3f OpenCode are **NOT STARTED** and follow completed R3d. R3d3 remains default-off; no live compatibility gate or production state/iCloud/runtime/notification effect was part of it. | [R3 design/implementation plan](superpowers/plans/2026-07-11-r3-compatibility-canaries.md), [R3d3 plan](superpowers/plans/2026-07-19-r3d3-evidence-status-retention.md) | After R2f/R2g, implement R3d4 triggers, R3d5 characterization/activation, R3e, then R3f; each keeps its own reviewed, default-off or separately authorized effect boundary. |
 | R4 — reproducible release policy | **NOT STARTED** | [R4 implementation plan](superpowers/plans/2026-07-11-r4-reproducible-release-policy.md) | Full resolution pins, candidate smokes, promotion and rollback. |
@@ -1285,10 +1292,12 @@ Next action:
   canonical suite and advanced `origin/main` under an exact lease. R2f0p is merged. R2f0b's one bounded Sol/xhigh
   review returned `REJECT` on six concrete blockers; all six were repaired on the same artifact and received
   exact-base-red/repaired-tree-green controls. Exact repaired tree `8bc7e3c4` passed format, warnings-denied Clippy,
-  config validation, and hygiene; the full workspace reported **3,079 passed / 9 failed / 12 ignored**, with the
-  same nine fixture-foundation failures reproduced on exact pre-repair base in the same environment. The
-  operator-authored R2f0b code boundary is `4ffcd560`; no post-repair second Sol verdict is claimed. No live/billable
-  canary, production-server update, release, deployment, or post-merge operator build is proved by that merge.
+  config validation, and hygiene. The initial **3,079 / 9 / 12 ignored** workspace result was later correctly
+  attributed using exact pre-R2f0b main and post-merge GitHub controls. Post-merge repair `2744cb1` passes local
+  **3,089 / 0 / 12 ignored** and replacement CI `30706571173`. Its distinct Sol/xhigh fixture review returned
+  `APPROVE`; the review's one rare test-only `WRONG / DEFER` was folded with fail-first evidence. The
+  operator-authored R2f0b code boundary remains `4ffcd560`. No compatibility canary, production-server update,
+  release, deployment, or post-merge operator build is proved by that merge and repair.
   R2f1a is next. R2f completion, the behavior retained from closed intake #22, and open
   #24/#47 remain unproved. The design and exact slice order are in
   `2026-07-20-r2f-owner-design.md` and `2026-07-11-r2f-phase-aware-liveness.md`. R3d3's focused restart plan remains
