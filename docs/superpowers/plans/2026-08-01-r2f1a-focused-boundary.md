@@ -1,8 +1,8 @@
 # R2f1a focused implementation boundary — profiles, fan-out policy, and per-node control
 
-- **Status:** PARKED — Sol/xhigh closure review 2 rejected five blockers; the required cursor reconciliation is
-  applied below, four technical blockers remain, the authorized design round is exhausted, and no implementation
-  has started
+- **Status:** AWAITING SOL CLOSURE REVIEW — the four closed technical blockers from Sol/xhigh closure review 2 and
+  its deferred encoder finding are repaired below; the roadmap cursor reconciliation is already applied; no
+  implementation has started
 - **Frozen base:** `3f35ee6e07e9af314bb548b9d3ab694f3bba5fb1`
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Normative authority:** [`../specs/2026-07-20-r2f-owner-design.md`](../specs/2026-07-20-r2f-owner-design.md)
@@ -69,10 +69,9 @@ entry; the node-terminal reserve must bound worst-case encoded JSON rather than 
 must not be undercharged through a duplicated SQLite key; and a healthy offline history ledger needs its own durable
 trigger-commit barrier result. All four are closed enumerable design defects rather than an open class.
 
-The operator then authorized exactly one targeted Opus/xhigh design repair of those four blockers, followed by one
-Sol/xhigh closure review. That authorization is the entire extension. It does not authorize implementation, a second
-repair pass, a further review round, a provider turn, a live gate, or any R2f1b scope. This revision is the repaired
-artifact awaiting that closure review; §16 records the blocker-to-mechanism disposition.
+For that round, the operator authorized exactly one targeted Opus/xhigh design repair of those four blockers,
+followed by one Sol/xhigh closure review. That historical extension did not authorize implementation, a second
+repair pass, another review, a live gate, or any R2f1b scope. §16 retains its blocker-to-mechanism disposition.
 
 The first Tier-3 setup execution, `exec-53f8494cc17d7a1d3145dadddd4c5471` /
 `attempt-02f8b2aced9b0e213403560b131365fb`, refused during `ConfigApply` with
@@ -97,12 +96,42 @@ newline. The review closed the encoded-terminal reserve, deferred the theoretica
 and rejected five blockers: provider-effect identity remains incomplete, the proposed `WITHOUT ROWID` metadata
 assertion is false, the arbitrary-ID page formula is not conservative, `Collision` is simultaneously fail-open and
 fail-closed, and the authoritative roadmap still directs a fresh freeze followed by implementation. It found no
-SMELL and classified the remaining population as closed enumerable. The authorized repair/review cap is exhausted;
-implementation and another repair or review round remain unauthorized pending owner direction.
+SMELL and classified the remaining population as closed enumerable.
 
-The same evidence-reconciliation fold removes the stale roadmap instruction identified as W6; that custody-only
-correction has no follow-up reviewer approval. The four provider/SQLite/collision design blockers and deferred
-overflow-fallback item remain parked.
+The owner then approved a fresh, capped convergence round: one Sonnet/xhigh source-mining turn, one Opus/xhigh
+Tier-3 repair, and one Sol/xhigh closure review. The Sonnet turn reached `PromptStart` but failed in `PromptStream`
+with `upstream.unknown` as execution `exec-86204bb975fee00dfb5510c76342fbdb`, attempt
+`attempt-a1541f6cbfa6d3363b04f02bb3dbcf93`. Its 427-byte terminal artifact has SHA-256
+`dd64d9d80f05a018aa5b57de15c841d31f4c8df186391472e77472739683f4af`; prompt acceptance could not be
+excluded, so it was not replayed and produced no mining report.
+
+The operator completed the bounded source and SQLite mining locally and retained a 14,132-byte report at SHA-256
+`c85c68831dcbe34fcca7d328ba9c0efd15eb635d787d984ef9c7f66a77dfe26c`. The one Opus repair then ran in the
+reviewed immutable Tier-3 image on exact `opus[1m]` / `xhigh` as execution
+`exec-cd4d557340381e39eb7dd5497d502cd7`, attempt `attempt-48ea7c6d9d4d01e93582283357b1e9b5`.
+Its 9,099-byte terminal artifact has SHA-256
+`0f3501a6483852c14efb8e52e83fb29b838cba816c24f2116dbd0881bd0b657f`, and it edited only this focused
+document.
+
+The Tier-3 container could not read the host-sibling mining report despite its pre-dispatch host hash being exact;
+the task carried the prescribed mechanisms, but the report-visibility predicate was therefore unresolved inside
+the model turn. The operator did not replay Opus. Instead, a complete source-bound comparison of its diff folded the
+closed discrepancies that the report had already enumerated: ordinary-workflow provider-field exclusions,
+after-bind completion on the pinned old slot, one fresh bound use per preflight candidate and real turn, exact
+slot-plus-entry invalidation and digest-keyed preflight cache, the complete hard physical-admission regime, exact PK
+metadata/column order, and the full current `Collision` producer family. These are bounded corrections to W1–W4,
+not a fresh implementation or a new provider repair.
+
+This revision repairs W1–W4, folds deferred W5, and reconciles the authoritative roadmap to the pending-review
+state. It is a design repair only: only this document and the roadmap cursor change. No source, test, configuration,
+prompt, generated artifact, implementation, review approval, release, deployment, or live operator effect is
+claimed, and no execution id, attempt id, artifact hash, or verdict yet exists for the pending Sol closure review.
+
+The pre-freeze docs gate ran `cargo run -p a2a-bridge -- validate --repo-hygiene` successfully in the scratch clone
+and reported **39 tracked artifacts / 7 validated example configs**. `git diff --check` and direct existence checks
+for the changed documents' roadmap, owner-design, parent-plan, prior-review, and ADR targets also passed. The hygiene
+command compiled the dev binary in the scratch clone; no Rust test suite, compatibility case, smoke, or provider
+behavior was exercised by these deterministic checks.
 
 ## 1. Frozen authority and slice boundary
 
@@ -143,11 +172,12 @@ R2f1a does not ship any production timer. In particular, a production execution 
 | Production fixed grace | Refuse it before effects in R2f1a. Accepting it while arming no expiry would implement neither fixed grace nor a bounded policy. |
 | Trigger selection | Drain the currently ready completion batch, sort by `NodeId`, and select the lowest qualifying failed/timed-out node. Raw `FuturesUnordered` delivery order is not durable determinism. |
 | Run-spec persistence | Persist the fully resolved controls in snapshot V2. Do not re-resolve checked-in constants from declarations on resume. |
-| Provider-selection freeze | Freeze the complete per-node provider-selection tuple — agent, preflight flag, primary model, the exact ordered fallback candidate list, effort, and mode — plus its canonical digest. Freezing only the effective model/effort/mode triple leaves the candidate set mutable and is rejected. |
-| Check-to-use binding | One registry read per provider attempt produces the exact `AgentEntry` snapshot and its slot generation token; that immutable value is validated against the frozen selection and is the same value consumed for candidate selection and configuration. Re-reading the registry between validation and use is forbidden. |
+| Provider-effect and selection freeze | Freeze two distinct canonical digests per node whose combined identity covers every ordinary-workflow provider input: a **provider-effect digest** over the spawn, checkout, credential, session, watchdog, and MCP fields, and a **selection digest** over the agent, preflight flag, primary model, exact ordered fallback candidate list, effort, and mode. Freezing only the selection tuple leaves the provider call itself mutable — a tuple-identical hot reload of `base_url` or `api_key_env` passes a selection-only digest — and is rejected. Fields used only by compatibility resolution, guarded R2d fallback, or presentation are explicitly excluded by source boundary. |
+| Check-to-use binding | Lease-first, same-entry, bound-use. One bind per provider attempt takes a registry **lease** before reading the entry, yields exactly one immutable `Arc<AgentEntry>`, validates both frozen digests against that value, and is the sole source consumed for candidate selection, configuration, and dispatch. Re-reading the registry between validation and use is forbidden. There is no registry generation or revision API on current main; §5 specifies the minimal additive replacement and keeps the durable digests distinct from an opaque process-local use token. |
 | Fingerprint compatibility | Always include canonical resolved controls and every per-node provider-selection digest in new R2f1a workload fingerprints. Preserving the old hash would conflate pre-policy and bounded-policy calibration populations. |
 | `completed_degraded` task status | Keep `tasks.status = completed`; persist an additive `workflow_outcome = completed_degraded`. Do not introduce an old-binary-unknown task-status token. |
 | Node persistence | Use versioned terminal JSON on task checkpoints and normalized history node-terminal rows. Bound the JSON by proven worst-case *encoded* size, not raw field bytes. Store the history rows in a `WITHOUT ROWID` compound-primary-key table so an arbitrary node ID has exactly one physical key copy. Boolean `ok` remains a legacy compatibility projection only. |
+| Physical node-row accounting | Do not predict pages. No static logical-to-page formula is sound for an uncapped `NodeId` under SQLite's local-payload and overflow rules, so R2f1a **actually materializes** every full-size placeholder inside the pre-effect reservation transaction and gates on measured postconditions under the existing hard physical controls, rolling the whole transaction back on refusal. |
 | Legacy `ok=false` | Decode as `interrupted_legacy / unknown_legacy`, not a fabricated ordinary failure, timeout, or completed cleanup. |
 | Trigger persistence | Persist the trigger before policy cancellation through a dedicated barrier with four closed results, and also attach it additively to the triggering `NodeFinished`. A healthy admitted offline history ledger durably commits the trigger; only genuine optional-ledger unavailability may fall open to the in-process marker. Do not add an old-reader-unknown journal event variant. |
 | Strict/degraded outcome | Use explicit transitive `degraded_ancestry`; never infer failure or degradation by parsing output text. |
@@ -280,6 +310,7 @@ pub struct NodeCauseV1 {
     pub code: StaticBoundedCodeV1,                    // at most MAX_STATIC_CODE_BYTES raw
     pub deepest_cause: Option<String>,                // sanitized, at most MAX_DEEPEST_CAUSE_BYTES raw
     pub cause_truncated: bool,                        // set when encoded-aware truncation shortened the cause
+    pub evidence_overflow: bool,                      // set only by the bounded-evidence fallback below
     pub dependency_set: Option<DependencySetRefV1>,   // count plus SHA-256
 }
 
@@ -369,7 +400,7 @@ pub const MAX_STATIC_CODE_BYTES: usize = 64;        // raw, matches the diagnost
 pub const MAX_DEEPEST_CAUSE_BYTES: usize = 512;     // raw, matches the diagnostics redactor
 pub const MAX_CONTROL_EVENT_ID_BYTES: usize = 128;  // raw; validated attempt id plus ordinal
 pub const MAX_CLOSED_TOKEN_BYTES: usize = 32;       // raw ceiling for every closed enum token
-pub const NODE_TERMINAL_SKELETON_CEILING_BYTES: usize = 320;
+pub const NODE_TERMINAL_SKELETON_CEILING_BYTES: usize = 352;
 pub const POLICY_TRIGGER_SKELETON_CEILING_BYTES: usize = 160;
 
 pub const MAX_NODE_TERMINAL_JSON_BYTES: usize = 2_048;
@@ -387,7 +418,7 @@ worst case is their sum with `cause`, `deepest_cause`, `dependency_set`, and `po
 
 | Encoded component | Ceiling | Derivation |
 |---|---:|---|
-| canonical skeleton: every key, colon, comma, brace, and value-enclosing quote pair | 320 | fixed compile-time string; a constant test asserts its exact length is at most the ceiling |
+| canonical skeleton: every key, colon, comma, brace, and value-enclosing quote pair | 352 | fixed compile-time string; a constant test asserts its exact length is at most the ceiling |
 | `schema_version` | 8 | `u16` shortest decimal |
 | `primary` | 32 | longest closed token is `skipped_dependency` (18) |
 | `cleanup.disposition` | 32 | longest closed token is `unknown_legacy` (14) |
@@ -396,14 +427,17 @@ worst case is their sum with `cause`, `deepest_cause`, `dependency_set`, and `po
 | `cause.code` | 128 | 64 raw bytes × 2 |
 | `cause.deepest_cause` | 1,024 | 512 raw bytes × 2 |
 | `cause.cause_truncated` | 5 | `true`/`false` |
+| `cause.evidence_overflow` | 5 | `true`/`false` |
 | `cause.dependency_set.count` | 10 | `u32` shortest decimal |
 | `cause.dependency_set.sorted_node_refs_sha256` | 64 | fixed 64 lowercase hex |
 | `prompt_may_have_been_accepted` | 5 | `true`/`false` |
 | `degraded_ancestry` | 5 | `true`/`false` |
 | `policy_trigger_id` | 256 | 128 raw bytes × 2 |
-| **derived worst case** | **1,941** | sum of the ceilings above |
+| **derived worst case** | **1,978** | sum of the ceilings above |
 
-`MAX_NODE_TERMINAL_JSON_BYTES = 2_048` is that 1,941-byte derived worst case rounded up to the next power of two. The
+`MAX_NODE_TERMINAL_JSON_BYTES = 2_048` remains the proven bound: the derived worst case is 1,978 encoded bytes, which
+is the previous 1,941-byte derivation plus the 32-byte skeleton allowance and 5-byte value for the additive
+`evidence_overflow` indicator. The bound is unchanged and still has 70 bytes of margin. The
 invariant is exact and checked, not asserted by inspection:
 
 ```text
@@ -425,16 +459,38 @@ margin for the additive declared-control evidence block. Each constant carries t
 3. if the length exceeds `MAX_NODE_TERMINAL_JSON_BYTES`, shorten `deepest_cause` on a UTF-8 character boundary using
    an encoded-size-aware step that keeps the **deepest** cause text rather than substituting a shallower ancestor,
    set `cause_truncated = true`, and re-serialize;
-4. if the result still exceeds the bound, fail closed to `NodeTerminalV1::minimal_over_bound`, which retains the
-   primary disposition, cleanup disposition and duration, failure class, prompt-acceptance bit, degraded ancestry,
-   and trigger id, drops `deepest_cause` and `dependency_set`, and sets code `terminal_encoding_overflow`. Removing
-   the 1,024-byte cause text and the 74 bytes of dependency-set components leaves a derived bound of 843 bytes, plus
-   at most a few bytes where a `null` replaces a shorter quoted value, so the minimal shape always fits;
-5. return the exact byte string. A value that is still over bound after step 4 is an invariant violation: the node
+4. if the result still exceeds the bound, fail closed to `NodeTerminalV1::bounded_evidence_fallback`, which
+   **preserves the primary failure evidence** — the primary disposition, cleanup disposition and duration, the
+   original `failure_class`, the original static `code`, the prompt-acceptance bit, degraded ancestry, and the
+   trigger id — drops only `dependency_set`, whose exact members remain recomputable from the frozen graph and
+   terminal map, sets `evidence_overflow = true`, and retains the **deepest UTF-8 suffix** of `deepest_cause` that
+   fits the remaining encoded budget, setting `cause_truncated = true` whenever that shortened the cause;
+5. return the exact byte string. A value still over bound after step 4 is an invariant violation: the node
    terminalizes through the typed over-bound path and no over-bound row is ever written or admitted.
 
-Step 3 cannot trigger for a valid input because step 1 plus the derivation already prove the bound. It exists as an
-enforcement mechanism rather than an assumption, and step 4 is its fail-closed control.
+**Bounded-evidence fallback.** The earlier fallback discarded `deepest_cause` and *replaced* the static code with
+`terminal_encoding_overflow`, which destroyed the most useful failure evidence exactly when an invariant had already
+been violated, and contradicted the owner design's requirement that failed roots and strict/degraded results retain
+the deepest bounded cause. Overflow is therefore indicated **separately** from the failure it describes:
+
+- `failure_class` and `code` always keep their original values; no code is overwritten, and `evidence_overflow` is
+  the only signal that the encoder hit its bound. Two distinct failures that overflow remain distinguishable.
+- the retained suffix is computed by measurement, not from a constant: serialize the mandatory shape with an empty
+  cause, measure its exact encoded length, and give the cause the whole remaining budget, stepping down on UTF-8
+  character boundaries from the deepest end until the re-measured encoding fits. Keeping the suffix retains the
+  innermost text rather than substituting a shallower ancestor.
+- the mandatory shape is small enough to leave a real budget. Removing the 1,024-byte cause ceiling and the 74 bytes
+  of dependency-set components from the 1,978-byte derivation leaves 880 bytes, plus at most a few bytes where a
+  `null` replaces a shorter quoted value, so at least 1,168 encoded bytes remain for the retained suffix under
+  `MAX_NODE_TERMINAL_JSON_BYTES`. Because a sanitized cause is already bounded at 512 raw bytes and expands at most
+  2×, a current-schema cause is retained whole.
+- if even the empty-cause mandatory shape exceeds the bound, that is the step-5 invariant violation and the
+  fail-closed control still holds: no over-bound row is written or admitted.
+
+Steps 3 and 4 cannot trigger for a valid current input because step 1 plus the derivation already prove the bound.
+They are enforcement mechanisms rather than assumptions, and step 5 is their fail-closed control. This is the
+bounded evidence-preservation correction for the deferred W5 finding; it changes no bound, adds no new failure
+class, and leaves the 2,048-byte proven reserve intact.
 
 **One encoding, every projection.** The bytes produced by `encode_canonical()` are the same bytes stored in the task
 checkpoint `terminal_json`, the history node-terminal row, the additive journal `NodeFinished` field, `TaskStatusDto`,
@@ -463,8 +519,16 @@ pub struct FrozenProviderSelectionV1 {
     pub selection_digest: Sha256HexV1,
 }
 
+/// Durable, canonical digest over ordinary-workflow effect fields not carried by selection.
+/// This is semantic identity: it is persisted, replayed, and compared across processes.
+pub struct FrozenProviderEffectV1 {
+    pub agent: AgentId,
+    pub effect_digest: Sha256HexV1,
+}
+
 pub struct FrozenNodeExecutionIdentityV1 {
     pub node: PolicyNodeRefV1,
+    pub effect: FrozenProviderEffectV1,
     pub selection: FrozenProviderSelectionV1,
     pub identity_fingerprint: Sha256HexV1,
 }
@@ -488,19 +552,54 @@ pub enum LedgerAdmissionV1 {
 
 `WorkflowGraph` carries an additive optional declared-control block. Production executor entry points take `Arc<WorkflowRunSpecV1>`, not a bare graph plus optional defaults, so a production constructor cannot bypass freezing accidentally.
 
-### Frozen provider selection
+### Frozen provider effect and selection
 
-`FrozenProviderSelectionV1` freezes **every** registry-owned input that can change which provider call an attempt
-makes, not only the effective model/effort/mode triple. Freezing the triple alone leaves the preflight flag and the
-fallback candidate list mutable, which is the constructible defect: a queued preflight-enabled node freezes primary
-model `M` and fallback `F1`; a hot reload rewrites only `fallback_models` to `F2`; `M` fails before prompt
-acceptance; mutable resolution then selects `F2` while the persisted identity still names `M`.
+Selection identity alone is incomplete. `FrozenProviderSelectionV1` covers what the workflow *chose*; it does not
+cover what the registry entry *does*. The constructible defect is a tuple-identical hot reload: freeze an API agent
+against endpoint A, then rewrite only `base_url` to endpoint B before a queued node binds. Every selection field is
+byte-identical, so a selection-only digest passes, and the attempt invokes B under an identity frozen against A. The
+same hole exists for `api_key_env`, `kind`, `cmd`/`args`, `cwd`, `session_cwd`, `sandbox`, `auth_method`,
+`pre_authenticated`, `watchdog`, `mcp`, and `mcp_delivery`. R2f1a therefore freezes **both** digests.
 
-`selection_digest` is SHA-256 over a canonical, injective encoding of the whole tuple: each component is emitted as
-a length-prefixed byte string in fixed order — agent id, preflight flag, model presence plus bytes, fallback count
-plus each fallback in declaration order, effort token, mode presence plus bytes. Length prefixing is required so a
-concatenation such as `["a|b"]` cannot collide with `["a", "b"]`. `identity_fingerprint` is SHA-256 over the node
-reference and `selection_digest`, so a selection change always changes the node identity.
+**Provider-effect digest.** `effect_digest` is SHA-256 over a canonical, injective, length-prefixed encoding of every
+current `AgentEntry` field that can alter ordinary-workflow backend selection, spawn, checkout, credentials, session
+mint, watchdog behavior, or MCP prompt transport and is not already carried by the selection digest:
+
+| Effect group | Fields |
+|---|---|
+| backend construction and transport | `kind`, `cmd`, `args`, `base_url` |
+| credentials and authentication | `api_key_env` (the variable **name** only, never its value), `auth_method`, `pre_authenticated` |
+| checkout, isolation, and session location | `cwd`, `session_cwd`, `sandbox`, `watchdog` |
+| tool surface offered to the agent | `mcp` with exact server/argument/environment order and configured values, plus `mcp_delivery` |
+
+`id` is carried beside `effect_digest` in `FrozenProviderEffectV1` and is also part of `selection_digest`.
+`model`, `effort`, `mode`, `preflight`, and `fallback_models` are carried by that separate selection digest rather
+than redundantly changing both digests. `model_provider` is consumed by compatibility resolution only;
+`host_fallback_eligible` is consumed by guarded R2d fallback smoke planning, which is a non-goal here; and `name`,
+`description`, `tags`, `version`, and `extensions` are presentation, agent-card, or compatibility metadata with no
+ordinary workflow provider-path consumer. Those eight fields are therefore excluded, so an extension or fallback-
+authorization edit cannot manufacture R2f1a drift. The classification is exhaustive by construction — the digest
+builder destructures `AgentEntry` with no `..` rest pattern and explicitly routes each field to provider effect,
+selection, carried identifier, or excluded-by-source-boundary metadata. Adding a field fails compilation until it is
+classified. The ambient bearer selected by `api_key_env` is never read or hashed; only its configured variable name
+participates. Configured MCP environment values do alter the delivered tool surface and therefore participate in the
+domain-separated effect digest, but no raw MCP command, argument, or environment value is persisted, projected, or
+logged by this identity mechanism.
+
+**Selection digest.** `selection_digest` is unchanged: SHA-256 over a canonical, injective encoding of the whole
+selection tuple, each component emitted as a length-prefixed byte string in fixed order — agent id, preflight flag,
+model presence plus bytes, fallback count plus each fallback in declaration order, effort token, mode presence plus
+bytes. Length prefixing is required so a concatenation such as `["a|b"]` cannot collide with `["a", "b"]`. It remains
+separate from `effect_digest` because the two answer different questions: the selection digest is what the workflow
+froze and what a candidate must belong to; the effect digest is what the registry entry would actually do. A node
+whose selection is satisfied by an entry that has been re-pointed at another endpoint must fail on the effect digest,
+and a projection must be able to say which of the two drifted.
+
+`identity_fingerprint` is SHA-256 over the node reference, `effect_digest`, and `selection_digest`, so either a
+selection change or a provider-effect change always changes the node identity. All three are durable semantic
+identity: canonical over configuration bytes, persisted in snapshot V2, and meaningful across processes and restarts.
+They are never derived from a pointer, address, counter, or other process-local value — §5 keeps that concern in a
+strictly separate opaque token.
 
 The frozen ordered candidate set is derived once and only from frozen state:
 
@@ -609,13 +708,15 @@ Order:
 4. Validate field combinations and true-omission semantics.
 5. Validate the DAG, references, acyclicity, and exactly one terminal.
 6. Resolve the profile and checked arithmetic.
-7. Inspect the effective configured provider selection — agent, preflight flag, model, ordered fallback list, effort,
-   and mode — without resolving, checking out, configuring, or spawning a backend.
+7. Inspect the effective configured provider entry — every ordinary-workflow effect field in §3 plus the selection tuple of
+   agent, preflight flag, model, ordered fallback list, effort, and mode — without resolving, checking out,
+   configuring, or spawning a backend.
 8. Validate Max qualification.
 9. Validate retry counts and critical-path retry backoff.
-10. Freeze each node's complete `FrozenProviderSelectionV1`, compute its canonical selection digest and graph-bound
-    execution-identity fingerprint, then construct the controls fingerprint and control-inclusive workload
-    fingerprint from those frozen values.
+10. Freeze each node's complete `FrozenProviderEffectV1` and `FrozenProviderSelectionV1`, compute the canonical
+    provider-effect digest, the canonical selection digest, and the graph-bound execution-identity fingerprint over
+    both, then construct the controls fingerprint and control-inclusive workload fingerprint from those frozen
+    values.
 11. Select the one authoritative ledger and record its `LedgerAdmissionV1` disposition in the frozen run spec, so no
     later barrier has to guess whether an offline history ledger was healthy.
 12. Refuse inactive production behavior, including `fixed_grace` in R2f1a.
@@ -628,26 +729,82 @@ At admission, persist:
 - the complete frozen controls;
 - their fingerprint;
 - the control-inclusive workload fingerprint;
-- the complete per-node frozen execution identities, including each `FrozenProviderSelectionV1` and its digest;
+- the complete per-node frozen execution identities, including each `FrozenProviderEffectV1` and
+  `FrozenProviderSelectionV1` with both digests and the combined identity fingerprint;
 - the frozen `LedgerAdmissionV1` disposition;
 - task class and policy version `r2f1a`;
 - expected node count and bounded node-evidence reservation.
 
 Max validation uses the frozen per-node efforts.
 
-### Check-to-use binding for every provider attempt
+### Lease-first check-to-use binding for every provider attempt
 
 Comparing the registry against the frozen identity and then resolving the registry again is a check-then-use gap: a
 hot reload landing between the two reads makes the validated value and the used value different objects. R2f1a
 therefore validates and consumes **one** immutable value.
 
-Immediately before every provider attempt — first attempt, retry, preflight candidate walk, resumed attempt, and
-every batch child — the executor performs exactly one registry read for that attempt:
+#### What current main actually provides
+
+The mechanism must be built from the seams that exist. On current `bridge-registry`:
+
+- a `Slot` holds `entry: ArcSwap<AgentEntry>`, a `OnceCell` backend, a `retired` flag, and a lease counter;
+- `AgentRegistry::resolve` returns `Resolved { entry, backend, lease }`, and `Lease::is_retired()` is the only
+  lifecycle signal exposed to a caller;
+- `entry_snapshot` returns a bare `Arc<AgentEntry>` and takes **no lease**, so nothing it returns is pinned;
+- `apply` reuses the live slot for a **config-only** edit and swaps `slot.entry` in place, but allocates a **fresh
+  slot** whenever `cmd`, `base_url`, `args`, `cwd`, `auth_method`, `pre_authenticated`, `kind`, `sandbox`,
+  `session_cwd`, `api_key_env`, `watchdog`, `mcp`, or `mcp_delivery` changes, and marks every replaced slot
+  `retired` **synchronously** before handing it to a detached drain;
+- `invalidate` is keyed by agent id and retires whichever slot is mapped at call time.
+
+There is **no** slot generation, revision, or version accessor anywhere on `AgentRegistry`, `Resolved`, or `Lease`.
+The previous revision's `RegistryEntryGenerationV1` and its "slot generation token" assumed an API that does not
+exist, so that mechanism was not implementable as written and is replaced below. Two consequences of the reconcile
+rule above are load-bearing and are what make the replacement work without inventing a generation counter:
+
+1. every **spawn-frozen** effect change retires the old slot, while a lease acquired before retirement keeps that
+   exact slot alive long enough for the already-bound attempt to finish under its old entry and backend;
+2. every **config-only** effect change leaves the slot alive and swaps its entry, so a lease cannot observe it — but
+   an attempt that never re-reads `slot.entry` is unaffected by definition, because it keeps using the exact value
+   it validated.
+
+#### The bound-use contract
+
+Immediately before every provider attempt — each preflight candidate, the real post-preflight turn, first node
+attempt, retry, resumed attempt, and every batch child — the executor performs exactly one registry bind for that
+attempt:
 
 ```rust
+/// Additive on `AgentRegistry`; the default returns `None` and is an explicit opt-out
+/// exactly like today's `entry_snapshot`. Non-spawning: it takes a lease and reads the
+/// slot entry once, and never initializes the backend.
+fn bind_entry_use(&self, id: &AgentId) -> Option<BoundEntryUseV1> { None }
+
+/// Additive on `AgentRegistry`; resolves the backend of the **exact slot** already bound,
+/// never by agent id again. Default returns typed `BindUnsupported`.
+async fn resolve_bound(
+    &self,
+    bound: &BoundEntryUseV1,
+    observer: Arc<dyn DiagnosticObserver>,
+) -> Result<Arc<dyn AgentBackend>, BridgeError>;
+
+/// Additive on `AgentRegistry`; retires the bound slot only while both that exact slot and
+/// exact entry Arc are still mapped for its id. Default no-op.
+async fn invalidate_bound(&self, bound: &BoundEntryUseV1) {}
+
+pub struct BoundEntryUseV1 {
+    pub entry: Arc<AgentEntry>,   // the exact immutable value validated AND used
+    pub lease: Box<dyn Lease>,    // pins the slot through replacement and normal drain
+    pub use_token: EntryUseTokenV1,
+}
+
+/// Opaque, process-local, non-durable. Identifies the exact bound slot and entry object
+/// within this process only.
+pub struct EntryUseTokenV1(/* private */);
+
 struct FrozenEntryUseV1 {
-    entry: Arc<AgentEntry>,                 // the exact resolved snapshot, immutable for this attempt
-    slot_generation: RegistryEntryGenerationV1,
+    bound: BoundEntryUseV1,
+    effect: FrozenProviderEffectV1,         // the frozen value, carried alongside for comparison
     selection: FrozenProviderSelectionV1,   // the frozen value, carried alongside for use
 }
 
@@ -655,37 +812,104 @@ fn bind_frozen_entry(node: &FrozenNodeExecutionIdentityV1)
     -> Result<FrozenEntryUseV1, ConfigurationDriftV1>;
 ```
 
-`bind_frozen_entry` reads `(Arc<AgentEntry>, RegistryEntryGenerationV1)` once, recomputes the canonical selection
-digest from that exact snapshot, and compares it plus the identity fingerprint with the node's frozen identity. The
+This is the minimum additive surface that makes the binding implementable, and it is added only where necessary:
+`bind_entry_use` because no existing accessor returns a pinned entry, `resolve_bound` because `resolve` re-looks-up
+by agent id and would reintroduce the gap, and `invalidate_bound` because id-keyed invalidation is not exact-bound.
+Each has a default that keeps every current implementation source-compatible; a registry that does not implement
+them is an explicit opt-out and refuses the R2f1a bound path rather than silently falling back to an unbound one.
+
+**Durable identity versus the use token.** These are deliberately different things and must not be conflated:
+
+| | Durable semantic identity | Opaque process-local use token |
+|---|---|---|
+| Value | `effect_digest`, `selection_digest`, `identity_fingerprint` | `EntryUseTokenV1` |
+| Derived from | canonical configuration bytes | the bound `Arc<Slot>` and `Arc<AgentEntry>` object identity plus a process-local counter |
+| Persisted | yes — snapshot V2, history rows, replay keys | **never** |
+| Compared across processes or restarts | yes | **never** |
+| Decides | drift, replay conflict, resume admissibility | same-slot linearization inside one process only |
+
+A drift decision that terminalizes a node is always made on the durable digests. The token never appears in a digest,
+fingerprint, projection, or persisted row, and a token mismatch is a linearization fault rather than a
+configuration-drift verdict.
+
+`bind_frozen_entry` takes the lease **before** reading the entry, obtains exactly one `Arc<AgentEntry>`, recomputes
+the canonical provider-effect digest and selection digest from that exact value, and compares both plus the identity
+fingerprint with the node's frozen identity. Because current `apply` publishes the replacement map before marking
+old slots retired, `is_retired()` alone is not a sufficient current-slot test. The bind loop therefore:
+
+1. loads one state snapshot and its slot, increments that slot's lease, and refuses/retries if it is already retired;
+2. loads exactly one entry Arc, then re-loads the registry state and requires that the same slot Arc is still mapped
+   under the id and is still not retired;
+3. drops the lease and retries on a mapping mismatch; otherwise the successful same-slot/entry observation is the
+   linearization point and the returned token owns both exact Arcs.
+
+A config-only entry swap that races the entry load linearizes on whichever immutable Arc was loaded; a slot
+replacement between the two state observations cannot escape on the not-yet-retired old slot. After successful
+linearization, later replacement is allowed to retire the mapping while the lease pins the old use. The remaining
 rules are:
 
 - A missing entry or any digest/fingerprint difference terminalizes that node as a typed pre-prompt
-  `configuration_drift` failure. It never re-resolves controls, mutates a fingerprint, rewrites the frozen spec,
-  checks out or configures a session, or calls the provider.
-- An unrelated registry edit that leaves the entire frozen selection tuple byte-identical is accepted; the digest,
-  not object identity, is the test.
-- On success, `FrozenEntryUseV1` is the sole source for the rest of that attempt. The candidate walk, the
+  `configuration_drift` failure carrying which digest drifted — `effect` or `selection`. It never re-resolves
+  controls, mutates a fingerprint, rewrites the frozen spec, checks out or configures a session, or calls the
+  provider.
+- An unrelated registry edit that leaves both frozen digests byte-identical is accepted; the digests, not object
+  identity, are the test. A `name`, `description`, `tags`, or `version` edit is therefore not drift.
+- On success, `FrozenEntryUseV1` is the sole source for the rest of that provider attempt. The selected candidate, the
   `SessionSpec`/`AgentOverride` model, effort, and mode, and the `configure_session`/`configure_turn` arguments all
-  read `use.entry` and `use.selection`. No code path in the attempt may call `entry_snapshot`, `effective_config`, or
-  any other registry read again.
-- Each per-candidate backend resolution is made through a use-bound call that carries `use.slot_generation`. If the
-  slot's entry generation advanced since the bind, the call returns typed drift and refuses before checkout,
-  configuration, and prompt. This is what makes the binding check-to-use rather than check-then-use: the observed
-  value and the used value are the same immutable value, and a reload between observation and use is detected instead
-  of silently consumed.
+  read `use.bound.entry` and `use.selection`. `resolve_bound` on the already-bound handle is the **only** further
+  registry call the attempt may make; no code path may call `resolve`, `entry_snapshot`, `configured_effective`, or
+  any other entry-reading accessor again. Because the attempt never re-reads `slot.entry`, a config-only reload
+  landing after the bind cannot reach it: the validated value is the used value.
+- Each candidate's backend resolution goes through `resolve_bound`, which resolves the backend of the exact bound
+  slot rather than re-looking-up by agent id, and initializes that backend from the same bound entry if needed.
+  `bind_entry_use` increments the lease before checking retirement and retries the current mapping if the chosen slot
+  was already retired or no longer mapped; the successful same-slot/entry revalidation is the linearization point. A
+  spawn-frozen reload landing
+  **after** it may mark the old slot retired and map a fresh slot, but the attempt deliberately does not require the
+  token to name the current mapping and does not convert `is_retired()` into drift. It finishes under the exact old
+  slot, entry, backend, and lease it bound. Thus the only two admissible race outcomes are use of A consistently, or
+  zero-effect digest drift when B won before the bind — never use of B under A's persisted identity.
+- A slot force-retired mid-turn by the existing drain grace is an ownership condition, not drift. It surfaces through
+  the existing backend error path with prompt-acceptance uncertainty sticky, and authorizes no retry, fallback, or
+  replacement attempt.
+- Retry invalidation is exact-bound: a node that invalidates its backend calls `invalidate_bound` with its own bound
+  handle, and retirement occurs only if both its exact slot and exact entry Arc are still current. Id-keyed
+  `invalidate` would retire whichever slot is mapped at call time, while a slot-only check would retire a warm slot
+  whose entry was swapped after the bind; either can disrupt newer work after an intervening reload.
 - Before any provider effect, the selected candidate is asserted to be a member of `frozen_candidates`. A selected
   model outside the frozen ordered set is a typed `provider_selection_out_of_set` refusal before checkout,
   configuration, and prompt — it is never written into `eff.model` or a checkout override.
 - The pre-acceptance fallback walk consumes `frozen_candidates` in frozen order. When the frozen primary `M` fails
-  before prompt acceptance, the next admissible candidate is the frozen `F1`; a reloaded `F2` is not in the frozen
-  set and refuses. Acceptance uncertainty stays sticky and no additional attempt is authorized.
-- Resume rebinds against the frozen identity persisted in snapshot V2. It never re-derives a selection from current
-  configuration.
-- Replay is identity-bound: an exactly equal persisted selection digest replays idempotently, and a different digest
-  or fingerprint for the same `(attempt_id, node_id)` is a persistence conflict, not last-writer-wins.
+  before prompt acceptance, it calls `invalidate_bound` on M's exact use, drops that use, and the next admissible
+  candidate `F1` takes a **new** bind and revalidates the same persisted digests before any effect. A reloaded `F2`
+  is not in the frozen set, and any intervening effect/selection reload is detected at that new bind. Acceptance
+  uncertainty stays sticky and no additional candidate is authorized unless the prior failure proved
+  pre-acceptance.
+- The run preflight cache key is `(agent, effect_digest, selection_digest)`, not agent alone. A successful decision
+  under one frozen provider identity can single-flight and replay only within that exact identity; a changed digest
+  cannot reuse it.
+- Resume rebinds against the frozen identity persisted in snapshot V2, including the provider-effect digest. It never
+  re-derives an effect or selection from current configuration.
+- Replay is identity-bound: an exactly equal persisted pair of effect and selection digests replays idempotently, and
+  a different effect digest, selection digest, or identity fingerprint for the same `(attempt_id, node_id)` is a
+  persistence conflict, not last-writer-wins.
+
+**Every path binds identically.** The bind is a property of a provider attempt, not of an entry point, so the same
+`bind_frozen_entry` → `resolve_bound` sequence owns every one of these:
+
+| Path | Binding obligation |
+|---|---|
+| Inline single-node execution | One bind per attempt before checkout, configuration, and prompt. |
+| Workflow dispatcher | One bind per node attempt; the dispatcher's non-spawning config discovery is the bind itself, not a separate `entry_snapshot` read. |
+| Preflight candidate walk | One bind per candidate provider attempt. A proven-pre-acceptance failure invalidates and drops that exact bound use; the next frozen candidate takes a fresh bind and revalidates both persisted digests before resolving a backend. |
+| Real turn after successful preflight | Takes its own fresh bind against the same persisted digests; it never reuses the preflight candidate's slot or a cache entry keyed only by agent. |
+| Retry | A retry is a new attempt and takes a new bind; it never reuses a stale bound handle across the retry boundary, and its invalidation is exact-bound. |
+| Resume | Rebinds against the persisted frozen identity before any effect; drift refuses that node without changing the frozen spec. |
+| Fresh and resumed batch children | Bind exactly as non-batch attempts do, with the same refusal ordering and zero provider/session effects on refusal. |
 
 This closes the admission-to-dispatch and observation-to-use hot-reload windows without freezing a live backend,
-adding provider retry or fallback behavior, or crossing into generation-drain work.
+adding provider retry or fallback behavior, inventing a registry generation API, or crossing into generation-drain
+work.
 
 All causal and reservation arithmetic is checked. Full node IDs remain accepted; graph-bound ordinal/digest references
 keep terminal and trigger payloads bounded, while exact node-key bytes are included in the history charge below.
@@ -743,20 +967,54 @@ frozen `LedgerAdmissionV1` disposition rather than from the execution surface's 
 |---|---|---|---|
 | `ServedPrimaryCommitted` | `DurablePrimaryTaskStore` | checkpoint terminal JSON, trigger, journal `NodeFinished`, sequence allocation, and start-row deletion in one durable transaction | authorized |
 | `OfflineHistoryCommitted` | `HistoryLedgerAdmitted` | the trigger and its triggering node terminal in one durable history transaction | authorized |
-| `OfflineTelemetryUnavailable { reason }` | `HistoryLedgerUnavailable`, or an attempted commit that failed with a typed ledger-unavailability reason | nothing durable; in-process linearization only | authorized, fail-open |
-| `PrimaryFailed` | the durable primary transaction failed, or a durable trigger/terminal conflict was detected | nothing | refused; global cancel and drain |
+| `OfflineTelemetryUnavailable { reason }` | `HistoryLedgerUnavailable`, or an attempted commit that failed with a reason the classifier below marks fail-open | nothing durable; in-process linearization only | authorized, fail-open |
+| `PrimaryFailed` | the durable primary transaction failed, or the commit failed with a fail-closed reason — `Collision`, the durable trigger/terminal conflict | nothing | refused; global cancel and drain |
 
 Rules:
 
 - With a healthy admitted offline ledger the barrier **must attempt** the durable commit and must not return the
   fail-open marker without attempting it. `fail_fast` cancellation, `fixed_grace` arming, and downstream structural
   terminalization all wait for that acknowledgement.
-- Only genuine optional-ledger unavailability may use the in-process marker: an admission-time
-  `HistoryLedgerUnavailable`, or a commit that fails with one of the existing bounded `LedgerUnavailableReason`
-  codes — permission, lock, migration/schema, corruption, I/O, or protected capacity. The reason is bounded and
+- Only genuine optional-ledger unavailability may use the in-process marker. The reason is bounded and
   low-cardinality; raw database text is never projected.
 - A durable conflict is not unavailability. A different trigger or a different triggering terminal already present
   for the same key is `PrimaryFailed`, matching the exact-replay-idempotent/conflict-refuses rule in §9.
+
+**Exhaustive reason classification.** "Every bounded reason falls open" and "collision must fail closed" cannot both
+hold, because `Collision` is itself a current `LedgerUnavailableReason` variant. The barrier therefore classifies the
+enum exhaustively rather than by prose, over the exact 14 variants that exist today:
+
+| `LedgerUnavailableReason` | Classification | Barrier result |
+|---|---|---|
+| `Open` | availability | `OfflineTelemetryUnavailable { reason }` — fail-open |
+| `Permission` | availability | `OfflineTelemetryUnavailable { reason }` — fail-open |
+| `ReadOnlyDatabase` | availability | `OfflineTelemetryUnavailable { reason }` — fail-open |
+| `ReadOnlyLock` | availability | `OfflineTelemetryUnavailable { reason }` — fail-open |
+| `ReadOnlyParent` | availability | `OfflineTelemetryUnavailable { reason }` — fail-open |
+| `AdvisoryLockUnsupported` | availability | `OfflineTelemetryUnavailable { reason }` — fail-open |
+| `AdvisoryLockIo` | availability | `OfflineTelemetryUnavailable { reason }` — fail-open |
+| `Locked` | availability | `OfflineTelemetryUnavailable { reason }` — fail-open |
+| `Migration` | availability | `OfflineTelemetryUnavailable { reason }` — fail-open |
+| `Schema` | availability | `OfflineTelemetryUnavailable { reason }` — fail-open |
+| `Corruption` | availability | `OfflineTelemetryUnavailable { reason }` — fail-open |
+| `Io` | availability | `OfflineTelemetryUnavailable { reason }` — fail-open |
+| `CapacityProtected` | capacity | `OfflineTelemetryUnavailable { reason }` — fail-open |
+| `Collision` | durable conflict | **`PrimaryFailed`** — fail-closed |
+
+Every current availability and capacity reason is fail-open; `Collision` **alone** is `PrimaryFailed`. This is exact
+rather than stylistic: current producers reserve `Collision` for identity, lineage, lease-ownership, reservation, or
+terminal replay conflicts, including — but not limited to — `TerminalWrite::Conflict`. It therefore means the
+ledger reached a state whose identity or ownership cannot be reconciled safely, not ordinary optional-ledger
+unavailability. Treating that as unavailability would let the barrier authorize targeted sibling cancellation while
+the durable trigger identity is rejected or ambiguous. A producer audit is part of acceptance: every current
+`Collision` construction must remain conflict/ownership-class, and any future use for mere availability must split
+to an availability variant rather than silently inherit fail-closed semantics.
+
+`Collision` therefore **cannot authorize targeted cancellation** under any policy. It takes the `PrimaryFailed` path:
+global cancel and drain, no targeted sibling token, no `telemetry_unavailable` fail-open marker, and no second
+ledger. The classifier is a total `match` with no wildcard arm, so a new `LedgerUnavailableReason` variant fails
+compilation until it is explicitly classified as fail-open or fail-closed. It is never silently defaulted in either
+direction.
 - `PrimaryFailed` globally cancels and drains without targeted policy action. A failed transaction leaves no
   write-once checkpoint, so there is no retry that attempts to attach a trigger to an existing terminal.
 - Optional history enrichment on a served durable attempt still occurs after primary ordering and cannot change the
@@ -951,21 +1209,30 @@ payload. The schema must therefore be honest about what SQLite physically stores
 `sqlite_autoindex` entry — so an accepted node ID spanning many pages is charged once and stored twice. `WITHOUT
 ROWID` makes the primary-key B-tree the table itself, giving **exactly one** physical copy of the key bytes.
 
-The single-copy property is an invariant, not an assumption:
+The single-copy property is an invariant, not an assumption. The correct metadata assertion is **not** that
+`PRAGMA index_list` is empty. For a `WITHOUT ROWID` table SQLite still reports the main primary-key B-tree through
+`index_list` with `origin='pk'`, so an emptiness assertion rejects exactly the schema it is meant to admit and no
+conforming implementation could pass its own schema gate. The invariant is:
 
 - this table has no secondary index, no additional `UNIQUE` constraint, and no indexed foreign key;
-- a schema-shape regression asserts that `sqlite_master.sql` for the table contains `WITHOUT ROWID` and that
-  `PRAGMA index_list(workflow_attempt_node_terminals)` is empty;
-- adding any index later requires re-deriving every charge below in the same change, and the regression fails until
-  that happens.
+- a schema-shape regression asserts that `sqlite_master.sql` for the table contains `WITHOUT ROWID`; that
+  `PRAGMA index_list(workflow_attempt_node_terminals)` reports **exactly one** entry, that entry has `origin='pk'`
+  `unique=1`, and `partial=0`, and no entry has any other origin; that `PRAGMA index_xinfo` reports the two key
+  columns in exact order — `attempt_id`, then `node_id` — with no additional key column; and that
+  `SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND tbl_name='workflow_attempt_node_terminals'` is **zero**,
+  proving the primary key has no separately rooted B-tree and is the table itself;
+- adding any index later adds a second `index_list` entry and a separate `sqlite_schema` root, so the regression
+  fails until every charge below is re-derived in the same change.
 
 #### Placeholder materialization
 
 At admission, create one placeholder node row per canonical graph node with its **full** key and a
 `MAX_NODE_TERMINAL_JSON_BYTES` terminal reserve. The placeholder is materialized at exactly its reserve size: its
-`terminal_json` is canonical filler of exactly `MAX_NODE_TERMINAL_JSON_BYTES` bytes. Replacing it with a real terminal
-therefore writes an equal-or-smaller payload into an already-allocated cell and cannot grow the row, split a page, or
-add an overflow page. The reserve is consumed at admission or not at all.
+`terminal_json` is canonical filler of exactly `MAX_NODE_TERMINAL_JSON_BYTES` bytes, and its `terminal_reserve` and
+`charged_bytes` integer columns are written at admission at their **final** values and never rewritten. Replacing the
+filler with a real terminal therefore writes an equal-or-smaller payload — a shorter TEXT also has an equal-or-smaller
+serial-type varint — into an already-allocated cell, so replacement cannot grow the row, split a page, or add an
+overflow page. The reserve is consumed at admission or not at all.
 
 #### Logical accounting
 
@@ -1000,71 +1267,117 @@ subtracts that stored value while cascading attachment/node rows by exact key. M
 verifies the new `WITHOUT ROWID` table and columns, rederives every stored and aggregate charge from authoritative
 rows using the equation above, and flips to `ready` in one transaction; restart repeats safely, and any mismatch is
 corruption rather than a rebaseline. The migration transaction is itself subject to the physical gate below and
-refuses while leaving `migrating` intact rather than exceeding the cap.
+rolls back while leaving `migrating` intact rather than exceeding the cap.
+
+This equation is a **logical accounting charge** over bounded column contents. It is deliberately not a page count
+and never stands in for one: physical admission for the platform ledger is decided by materialization and
+measurement below.
 
 #### Physical accounting for the platform ledger
 
-Materialize the same placeholder reserves before effects. The 128-MiB ceiling is a hard invariant and is not weakened
-here. The previous `2 * current_page_size * expected_node_count` term assumed a node ID small enough to sit inside a
-couple of pages and is replaced by an exact per-node page derivation:
-
-```text
-node_row_payload(id) = MAX_NODE_TERMINAL_JSON_BYTES
-                     + NODE_ROW_OVERHEAD_BYTES
-                     + id.as_bytes().len()
-
-node_row_physical(id) = ceil(node_row_payload(id) / current_page_size) * current_page_size
-                      + NODE_ROW_STRUCTURE_PAGES * current_page_size
-
-NODE_ROW_STRUCTURE_PAGES = 2   // interior B-tree growth and overflow-chain next-page pointers
-
-physical_request = attempt_charge
-                 + incoming permanent-identity charge
-                 + MAX_ATTEMPT_TERMINAL_JSON_BYTES        // the existing 8-KiB attempt-terminal bound
-                 + MAX_POLICY_TRIGGER_JSON_BYTES
-                 + sum over every canonical graph node of node_row_physical(node_id)
-                 + 4 * current_page_size
-```
+**No static formula predicts pages.** The previous `2 * current_page_size * expected_node_count` term and its
+replacement per-node `ceil(payload / page_size)` derivation are both removed, and no formula takes their place. Any
+static logical-to-page prediction for an uncapped `NodeId` is unsound: SQLite's index-format B-tree pages carry only
+a reduced embedded payload fraction, and the remainder spills into an overflow chain whose pages hold
+`usable_size - 4` bytes each, so a sufficiently long ID needs strictly more pages than `ceil(payload / page_size)`
+charges. The `4n`-pointer lemma that justified folding overflow pointers into two structure pages is false for the
+same reason and is deleted. R2f1a does not predict the page cost of a node row — it **materializes the rows and
+measures the result** under the physical controls that already exist.
 
 `MAX_ATTEMPT_TERMINAL_JSON_BYTES` is the existing `bridge_core::workflow_history::MAX_TERMINAL_JSON_BYTES`, renamed at
-its use sites so the attempt-terminal bound and the node-terminal bound can never be swapped in a formula.
+its use sites so the attempt-terminal bound and the node-terminal bound can never be swapped in an equation.
 
-The conservative argument for `node_row_physical`:
+**The existing hard controls are reused unchanged.** Current `bridge-store` already owns every physical control this
+needs, and R2f1a weakens none of them. These are preconditions of the reservation path, not optional post-hoc
+observations:
 
-1. **Exact key bytes.** `node_row_payload` includes the full `node_id` byte length, not a truncated or hashed form,
-   and the single-copy `WITHOUT ROWID` schema means one copy of those bytes is the whole physical cost of the key.
-2. **Record and B-tree rounding.** `NODE_ROW_OVERHEAD_BYTES` covers the bounded attempt-id key bytes, both integer
-   columns, the record header and serial-type array, and the cell header/pointer. Rounding the payload up to whole
-   pages is an over-charge for any row whose payload is not an exact page multiple.
-3. **Overflow.** A payload larger than the page's embedded-payload fraction spills into an overflow chain whose pages
-   are whole pages plus a four-byte next-page pointer each. Charging `ceil(payload / page_size)` whole pages plus two
-   structure pages covers both the reduced embedded fraction of an index-format B-tree page and every overflow
-   pointer, because the pointer overhead over `n` pages is `4n`, which is far below one extra page for any page size
-   SQLite supports.
-4. **Placeholder replacement.** The placeholder occupies the full reserve from admission, so terminal replacement
-   consumes no additional page and needs no separate rewrite provision beyond the existing terminal-rewrite headroom
-   pool.
-5. **Sidecar and journal headroom.** The gate reads current main-database plus live `-wal`, `-journal`, and `-shm`
-   bytes, subtracts reusable freelist bytes, and adds the existing 68-MiB disk-transaction headroom. Live sidecar
-   bytes are therefore counted directly and per-transaction journal/WAL page images are covered by that headroom;
-   `physical_request` covers only main-file expansion, which is exactly the term that was undercounted.
-6. **Retention.** Collection removes the oldest unpinned terminal summaries first, cascading their attachment and
-   node rows by exact key and crediting the exact stored attempt charge, so a long-ID attempt returns the same bytes
-   it consumed.
-7. **Mixed V1/V2.** Legacy V1 attempts contribute zero node rows and keep their V1 charge; a mixed allocation sums
-   both forms with one checked compare-and-debit, and the migration rederives from authoritative rows.
+| Control | Current value and effect |
+|---|---|
+| `MAX_CHARGED_BYTES` | 128 MiB aggregate ceiling over the main database plus live `-wal`, `-journal`, and `-shm` |
+| `HISTORY_SIDECAR_HEADROOM_BYTES` | 72 MiB, so the **main database ceiling is 56 MiB**, enforced as `page_count <= main_budget / page_size` |
+| `HISTORY_DISK_TRANSACTION_HEADROOM_BYTES` | 68 MiB rollback-journal reserve, so even a whole-database rewrite cannot cross the aggregate ceiling |
+| `PRAGMA max_page_count` | before schema migration or any history mutation, set and verify at no more than `floor(56 MiB / page_size)`; `SQLITE_FULL` at that ceiling maps to `capacity_protected` |
+| platform journal policy | force and re-verify `DELETE`, `TRUNCATE`, or `PERSIST`; refuse WAL/MEMORY/OFF, set `cache_spill=OFF` and `journal_size_limit=0`, and checkpoint the legacy WAL before admitting a write |
+| `history_growth_fits` | admission gate that subtracts reusable freelist bytes and adds the journal reserve |
+| `ensure_terminal_rewrite_headroom` | already materializes a real `zeroblob` and asserts a **measured** freelist postcondition rather than predicting pages |
 
-The result must remain at or below 128 MiB. Because the request now depends on exact node-id bytes, an attempt whose
-canonical graph carries node IDs near the cap can be refused at admission with the existing bounded
-`capacity_protected` reason. That is a data-dependent capacity refusal computed from exact bytes, before effects — it
-is **not** a `NodeId` length cap, is not a silent truncation, and does not relax the 128-MiB invariant. Configured
-stores enforce the same 128-MiB ceiling through the logical equation above, which charges the same exact key bytes.
+The last row is the precedent this repair follows: the proven pattern in current source is materialize-then-measure,
+expressed "solely as SQLite's durable freelist count".
 
-Crash/failpoint tests cover the V1-to-V2 allocation transition and every debit/credit boundary.
+**Pre-effect reservation transaction.** All of the following happens in one transaction, before any provider,
+session, checkout, or task effect:
+
+1. under the serialized platform-store ownership/lease, revalidate the descriptor-bound main database and live
+   `-wal`/`-journal`/`-shm` objects; re-read `page_size`, `page_count`, `freelist_count`, `max_page_count`, journal
+   mode, and cache-spill policy; and refuse unless the hard page ceiling, supported rollback-journal mode, and
+   existing aggregate-plus-transaction-headroom gate all still hold;
+2. derive the logical `attempt_charge` from the §"Logical accounting" equation and perform the checked
+   compare-and-debit against the allocation. This is an accounting charge, not a page prediction;
+3. gate with the existing `history_growth_fits(conn, attempt_charge)` before writing any row;
+4. materialize the attempt summary row, the attachment row, and **one full-size placeholder node row per canonical
+   graph node**, in canonical `NodeId` order, each carrying its exact full key bytes and an exactly
+   `MAX_NODE_TERMINAL_JSON_BYTES` filler payload. `SQLITE_FULL` from the hard ceiling is translated to the bounded
+   `capacity_protected` refusal rather than generic I/O;
+5. provision the node-terminal rewrite pool by extending the existing `ensure_terminal_rewrite_headroom` mechanism to
+   node rows, so a later placeholder replacement is served from proven-reusable pages;
+6. re-read the same PRAGMAs and descriptor-bound live sidecars and evaluate the authoritative postconditions **inside
+   the still-open transaction**;
+7. commit only if every postcondition holds; otherwise roll back. Immediately after commit, verify the aggregate
+   physical ceiling again; an impossible mismatch quarantines the ledger and fails the invariant rather than
+   rebaselining or authorizing another write.
+
+**Authoritative postconditions.** These are measured facts about the database, not derived predictions. Inside the
+transaction, after materialization:
+
+```text
+P1  page_count * page_size <= MAX_CHARGED_BYTES - HISTORY_SIDECAR_HEADROOM_BYTES     // 56 MiB main ceiling
+P2  freelist_count >= pages required to replace one full-size node terminal in place
+P3  every materialized placeholder is present with its exact full key and exact reserve length
+P4  the debited logical charge equals the sum of the stored per-attempt charges
+P5  max_page_count, rollback-journal mode, cache-spill policy, live sidecars, and the conservative
+    aggregate transaction-headroom gate still satisfy the existing 128-MiB physical regime
+```
+
+`PRAGMA page_count` is the authoritative main-file measure here because it is transaction-visible and already
+reflects every page this transaction allocated, including overflow pages for a long node ID. Filesystem size is not
+used mid-transaction, since the main file need not have been extended yet; the aggregate `-wal`/`-journal`/`-shm`
+concern is instead checked through the descriptor-bound live-sidecar measurement and owned by the pre-existing
+72-MiB sidecar headroom, 68-MiB journal reserve, 4-MiB framing margin, supported rollback-journal policy, and hard
+main-page ceiling. The page-count check is therefore not a measure-after-unsafe-write argument: `max_page_count`
+prevents main-file overrun while materialization is in flight, and the rollback-journal policy bounds the transient
+sidecar population before P1–P5 are evaluated.
+
+**Rollback and refusal.** If any postcondition fails, the entire reservation transaction rolls back: no placeholder,
+no summary row, no attachment, and no debit survives, and admission refuses with the existing bounded
+`capacity_protected` reason before effects. Because the outcome depends on the real page cost of the real key bytes,
+an attempt whose canonical graph carries node IDs too large for the remaining space is refused rather than admitted
+on a formula that undercounted it. That refusal is a data-dependent capacity refusal proved by measurement, before
+effects — it is **not** a `NodeId` length cap, is not a silent truncation, does not hash or shorten any ID, and does
+not weaken the 128-MiB invariant. The identical graph admits on a ledger with headroom.
+
+The surrounding properties are unchanged and remain true under measurement:
+
+1. **Exact key bytes.** The single-copy `WITHOUT ROWID` schema stores the full `node_id` bytes exactly once, so the
+   materialized row is the whole physical cost of the key.
+2. **Placeholder replacement.** The placeholder occupies its full reserve from admission and its integer columns are
+   final, so replacement writes an equal-or-smaller payload, adds no page, and draws only on the P2 pool.
+3. **Migration.** The V2 migration runs inside this same gate and rolls back leaving `migrating` intact rather than
+   exceeding the ceiling. It also rebuilds the accounting table, because the current
+   `accounting_version INTEGER NOT NULL CHECK(accounting_version=1)` constraint cannot admit version 2 in place.
+4. **Retention.** Collection removes the oldest unpinned terminal summaries first, cascading their attachment and
+   node rows by exact key and crediting the exact stored attempt charge, so a long-ID attempt returns the bytes it
+   consumed.
+5. **Mixed V1/V2.** Legacy V1 attempts contribute zero node rows and keep their V1 charge; a mixed allocation sums
+   both forms under one checked compare-and-debit.
+
+Configured stores are not platform ledgers and have no page gate; they enforce the same 128-MiB ceiling through the
+logical equation above, which charges the same exact key bytes.
+
+Crash/failpoint tests cover the V1-to-V2 allocation transition, the rollback path, and every debit/credit boundary.
 
 Add a bounded `policy_trigger_json` field to the attempt row, capped at `MAX_POLICY_TRIGGER_JSON_BYTES`. Exact replay
-is idempotent; a different terminal, trigger, or frozen provider-selection digest for the same key is a persistence
-conflict.
+is idempotent; a different terminal, trigger, frozen provider-effect digest, or frozen provider-selection digest for
+the same key is a persistence conflict.
 
 `AttemptTerminal` adds the trigger and accepts `completed_degraded`. `NodeCounts` derives from structured terminals:
 
@@ -1090,6 +1403,10 @@ Bump the persisted workflow snapshot to V2:
     "node_execution_identities": [
       {
         "node": { "sorted_ordinal": 0, "id_sha256": "..." },
+        "effect": {
+          "agent": "...",
+          "effect_digest": "..."
+        },
         "selection": {
           "agent": "...",
           "preflight": true,
@@ -1115,10 +1432,11 @@ Resume rules:
 - It seeds exact structured node terminals and degraded ancestry.
 - A seeded fail-fast failure is evaluated before the first admission wave.
 - Post-submit config/profile edits cannot change the resumed budget.
-- Every provider attempt rebinds through `bind_frozen_entry` against its persisted frozen provider selection,
-  including the preflight flag and the ordered fallback list. Drift fails that node before
-  checkout/configuration/prompt without changing the frozen spec, and the resumed attempt never re-derives a
-  selection from current configuration.
+- Every provider attempt rebinds through the lease-first `bind_frozen_entry` against its persisted frozen provider
+  effect and selection, including the preflight flag and the ordered fallback list. Either digest drifting fails that
+  node before checkout/configuration/prompt without changing the frozen spec, and the resumed attempt never re-derives
+  an effect or selection from current configuration. The opaque use token is process-local and is never restored from
+  a snapshot; a resumed attempt mints a new one at its bind.
 - The frozen `LedgerAdmissionV1` disposition is restored with the spec; a resumed attempt does not reselect a ledger.
 - V1 snapshot maps to `other / legacy_bounded_v1 / bounded_independent / degraded / manual_only_r2f1a`.
 - Legacy `ok=true` maps to `Completed/UnknownLegacy`.
@@ -1154,21 +1472,31 @@ Resume rules:
 1. Existing config omission remains valid and preserves current scheduling: no sibling policy cancellation, failed markers may reach synthesis, and all scheduled futures drain.
 2. The compatibility profile is now frozen bounded data, but R2f1a does not claim its outer bounds are enforced.
 3. Built-in review/design workflows receive explicit review profile declarations.
-4. New fingerprints intentionally differ because controls and per-node provider selection are calibration dimensions.
+4. New fingerprints intentionally differ because controls and both per-node provider-effect and provider-selection
+   identities are calibration dimensions.
 5. Existing task/checkpoint rows remain readable through Boolean fallback.
 6. New binaries read V1 and V2 snapshots; old binaries cannot resume V2 working tasks and may mark them interrupted.
 7. New task columns and journal fields are additive; old task readers still see the known `completed` status.
-8. Workflow-history accounting V2 uses the exact equations above; migration is transactional, idempotent,
+8. Workflow-history accounting V2 uses the exact logical equations above; migration is transactional, idempotent,
    schema-admitted, and rederives exact charges from authoritative rows. It creates the node-terminal table as
-   `WITHOUT ROWID` with no secondary index, verifies that shape before flipping to `ready`, and refuses inside the
-   physical gate rather than exceeding 128 MiB. Legacy rows receive zero node-evidence charge, and a mixed V1/V2
-   allocation sums both forms under one checked compare-and-debit.
+   `WITHOUT ROWID` with exactly one `unique=1`, `origin='pk'`, `partial=0` metadata entry, exact
+   `(attempt_id, node_id)` key order, and no separately rooted index; verifies that shape before flipping to `ready`;
+   rebuilds the accounting table whose current `CHECK(accounting_version=1)` constraint cannot admit version 2 in
+   place; and rolls back inside the hard page/journal/sidecar gate rather than exceeding the ceiling. No static page
+   formula participates: physical admission is decided by materializing the placeholders under `max_page_count` and
+   the rollback-journal regime, then measuring P1–P5. Legacy rows receive zero node-evidence charge, and a mixed
+   V1/V2 allocation sums both forms under one checked compare-and-debit.
 9. Rollback after the allocation migration or V2 working-task creation requires stopping the new binary and restoring the pre-migration database snapshot. There is no in-place down-migration.
 10. No migration infers timeout, policy trigger, cleanup completion, or degraded ancestry from legacy text.
 11. The node-terminal, policy-trigger, and controls JSON bounds are encoded-byte bounds produced by one canonical
     serializer. `MAX_NODE_TERMINAL_JSON_BYTES` is a new constant and never aliases the existing 8-KiB attempt-terminal
     `MAX_TERMINAL_JSON_BYTES`; the earlier 1,024-byte node reserve and 512-byte trigger reserve were unsound under
     JSON escaping and are superseded everywhere in this document.
+12. The additive `bind_entry_use`, `resolve_bound`, and `invalidate_bound` registry methods all carry defaults, so
+    every existing `AgentRegistry` implementation stays source-compatible. A registry that does not implement them is
+    an explicit opt-out whose nodes refuse the bound path; none silently falls back to an unbound resolve.
+13. `NodeCauseV1.evidence_overflow` is additive and defaults to `false`. It indicates encoder overflow separately and
+    never replaces a failure class or static code, so existing code/class vocabularies are unchanged.
 
 ## 11. Compile-correct build and ownership order
 
@@ -1178,13 +1506,17 @@ One owner changes:
 
 - `crates/bridge-core/src/execution_policy.rs`
 - `crates/bridge-core/src/lib.rs`
+- `crates/bridge-core/src/ports.rs`
 - `crates/bridge-workflow/src/graph.rs`
 - new `crates/bridge-workflow/src/fanout.rs`
 - run-spec serialization helpers
 
 Land the pure types, resolver, exact constants, the canonical terminal/trigger/controls serializer with its derived
-worst-case assertions, the frozen provider-selection digest, fingerprinting, and controller transition tests first.
-The workspace must compile before parallel work begins.
+worst-case assertions and bounded-evidence fallback, the frozen provider-effect and provider-selection digests with
+their exhaustive `AgentEntry` classification, the exhaustive `LedgerUnavailableReason` classifier, fingerprinting, and
+controller transition tests first. Stage 1 also lands the additive `AgentRegistry` bind methods and their defaults in
+`crates/bridge-core/src/ports.rs`, since Stage-2 and Stage-3 owners both depend on that signature. The workspace must
+compile before parallel work begins.
 
 ### Stage 2 — parallel siblings from the same frozen Stage-1 base
 
@@ -1199,6 +1531,7 @@ Each sibling owns disjoint paths, has an independently runnable test target, and
 After integrating all Stage-2 siblings, one owner changes the shared seams:
 
 - `crates/bridge-workflow/src/executor.rs`
+- `crates/bridge-registry/src/registry.rs`
 - `crates/bridge-coordinator/src/detached.rs`
 - `crates/bridge-coordinator/src/batch.rs`
 - `crates/bridge-coordinator/src/coordinator.rs`
@@ -1208,11 +1541,14 @@ After integrating all Stage-2 siblings, one owner changes the shared seams:
 - `crates/bridge-a2a-inbound/src/server.rs`
 - `crates/bridge-mcp/src/server.rs`
 
-This stage owns every fresh/resumed batch and non-batch entrypoint, freezing, the single-read `bind_frozen_entry`
+This stage owns every fresh/resumed batch and non-batch entrypoint, freezing, the lease-first `bind_frozen_entry`
 check-to-use path for every provider attempt, event widening, terminal ordering, the four-result trigger barrier,
 resume, projections, CLI/A2A/MCP overrides, and compile fixes. It also owns removing every remaining registry read
-inside an attempt, so no path can re-derive a model, effort, mode, preflight flag, or fallback candidate after the
-bind. These files must not be split among concurrent implementors.
+inside an attempt, so no path can re-derive a model, effort, mode, preflight flag, fallback candidate, or any other
+effect-bearing field after the bind, and converting retry invalidation to the exact-bound form. The concrete
+`bind_entry_use`/`resolve_bound`/`invalidate_bound` implementations in `crates/bridge-registry/src/registry.rs` are
+part of this stage because they must land with their only production callers. These files must not be split among
+concurrent implementors.
 
 ### Stage 4 — checked-in configs, docs, and aggregate gate
 
@@ -1246,33 +1582,82 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
 - Arbitrarily long accepted node IDs, high fan-in, ordinal overflow, node-ref mismatch, and dependency-set digest
   mismatch either retain exact graph-bound identity or refuse before effects; no bounded payload truncates an ID.
 
-#### Frozen provider selection and check-to-use binding
+#### Frozen provider effect, selection, and lease-first binding
 
 - The frozen selection round-trips agent, preflight flag, primary model, ordered fallback list, effort, and mode; the
   canonical digest is injective, so `["a|b"]` and `["a", "b"]` produce different digests, and reordering the fallback
   list changes the digest.
-- Paused downstream dispatch plus `high -> max`, `max -> high`, model, or mode reload refuses before that provider
-  attempt; an unrelated reload leaving the whole frozen tuple byte-identical proceeds. The same matrix covers retries
+- The frozen provider-effect digest round-trips and changes for a change to **each** ordinary-workflow
+  effect-bearing field individually — `kind`, `cmd`, `args`, `base_url`, `api_key_env`, `auth_method`,
+  `pre_authenticated`, `cwd`, `session_cwd`, `sandbox`, `watchdog`, `mcp`, and `mcp_delivery`. The selection digest
+  independently changes for `id`, `model`, `effort`, `mode`, `preflight`, or ordered `fallback_models`; the agent id
+  is also carried in `FrozenProviderEffectV1`. Neither digest changes for a `model_provider`,
+  `host_fallback_eligible`, `name`, `description`, `tags`, `version`, or `extensions` edit, and a source-boundary test
+  asserts those exclusions remain outside ordinary workflow execution. The effect digest never contains a
+  bearer value selected through `api_key_env`, only the env-var name. A separate non-disclosure fixture uses a
+  redaction-sensitive MCP environment value, proves changing it changes the digest, and proves its raw bytes appear
+  in no snapshot, history row, projection, diagnostic, or log artifact.
+- **W1's exact constructible state, red first:** freeze an API agent against endpoint A with env `X`, then hot-reload
+  only `base_url` to endpoint B (and separately only `api_key_env` to `Y`) before the queued node binds. Every
+  selection field stays byte-identical. The repaired path refuses with `configuration_drift{effect}` before resolve,
+  checkout, configuration, and prompt, and records zero provider effects. A selection-only digest passes this reload,
+  so the old identity fails the fixture red.
+- **The inherited fallback state, red first:** a queued preflight-enabled node freezes primary `M` with fallback
+  `F1`; a hot reload rewrites only `fallback_models` to `F2`. If the reload wins before M's bind, the repaired path
+  refuses on selection drift before resolve. If M binds first and then fails before prompt acceptance, its exact use
+  is invalidated and dropped; F1 takes a new bind. A reload that wins before that bind yields zero-effect selection
+  drift, while a reload after it leaves F1 consistently on the old bound identity. The path never observes or calls
+  F2. A separate invariant fixture injects an out-of-set candidate and proves `provider_selection_out_of_set`
+  refuses it before provider effect.
+- Paused downstream dispatch plus `high -> max`, `max -> high`, model, or mode reload **before the bind** refuses
+  before that provider attempt; the same reload after the bind leaves the attempt consistently on its old bound
+  values. An unrelated reload leaving both frozen digests byte-identical proceeds. The same matrix covers retries
   and resume.
-- **The blocker's exact constructible state, red first:** a queued preflight-enabled node freezes primary `M` with
-  fallback `F1`; a hot reload rewrites only `fallback_models` to `F2`; `M` fails before prompt acceptance. The
-  repaired path refuses `F2` as `provider_selection_out_of_set` before checkout, configuration, and prompt, and the
-  persisted identity, the selected candidate, and the configured model agree.
 - Toggling only `preflight` between admission and dispatch refuses; the old triple-only identity accepted it.
-- A reload landing **before** the bind refuses at the bind; a reload landing **between** the bind and the per-candidate
-  resolution refuses at the use-bound resolution through the slot generation token. Both record zero
-  checkout/configure/prompt effects.
-- Exactly one registry read occurs per provider attempt. A counter-backed regression asserts one `entry_snapshot`
-  observation per attempt and zero additional entry reads across the candidate walk, configuration, and prompt.
+- A reload landing **before** the bind refuses at the bind on a drifted digest and records zero
+  checkout/configure/prompt effects. A **spawn-frozen** reload landing between the bind and a provider effect retires
+  the old mapping but the held lease pins it, so the attempt completes on its bound old entry/backend and never
+  touches the replacement. A **config-only** reload landing in that same window is likewise inert: the attempt
+  continues on its bound entry, and a regression asserts the configured model/effort/mode equal the bound values,
+  not the reloaded ones. The race harness forces both linearization orders and admits only zero-effect drift or one
+  call whose complete effect and selection identity is the old frozen identity.
+- Exactly one registry bind occurs per provider attempt. A counter-backed regression asserts one `bind_entry_use`
+  for each preflight candidate and a separate bind for the real turn, retry, or resumed attempt, and **zero** unbound
+  `resolve`, `entry_snapshot`, or `configured_effective` calls after each bind; only `resolve_bound` on that attempt's
+  handle may follow.
+- The bind takes its lease **before** reading the entry: a regression drives a retirement concurrent with a bind and
+  asserts the bind either returns the old slot pinned before retirement, or observes retirement and retries the new
+  mapping before reading its entry. It never returns an unpinned entry or combines an entry and backend from
+  different slots.
+- A deterministic interleaving publishes the replacement state but pauses before setting the old slot's retired
+  flag. The bind must detect the slot-map mismatch and retry; an `is_retired()`-only implementation fails this red by
+  returning the no-longer-mapped old slot. A config-only same-slot swap on either side of the single entry load binds
+  one complete old or new entry Arc, never a mixed field set.
+- Durable identity and the use token stay separate: a regression asserts `EntryUseTokenV1` appears in no digest,
+  fingerprint, snapshot, history row, or projection, and that two bind calls yielding byte-identical entries produce
+  equal digests but distinct tokens.
+- An A→B→A reload completed before a bind is semantically admissible when both current digests again equal frozen A;
+  the new A slot receives a distinct use token. An A→B→A replacement during a bind cannot create slot ABA because
+  the state revalidation compares exact slot Arc identity, not only bytes or agent id.
+- Exact-bound invalidation: a node that invalidates after an intervening reload retires only when the exact slot and
+  entry Arc it used remain mapped; a regression asserts both a newly mapped slot and a config-swapped same slot
+  serving a sibling are untouched. Id-keyed and slot-only invalidation fail this red.
+- The run preflight cache is keyed by agent plus both frozen digests. Two nodes with the exact identity single-flight
+  and reuse one decision; a node whose effect or selection digest differs runs its own preflight and cannot consume
+  the prior decision.
+- A registry that does not implement the additive bind methods refuses the bound path with a typed error and never
+  falls back to an unbound `resolve`.
 - The pre-acceptance fallback walk consumes only frozen candidates in frozen order; a `preflight = false` node has a
   one-element candidate set and refuses any fallback.
-- Resume rebinds from the persisted frozen selection and never re-derives one from current configuration; a resumed
-  attempt under changed configuration refuses before effects.
-- Fresh and resumed batch children bind identically: batch fixed-grace refusal, profile freeze, selection freeze, Max
-  validation, V2 resume, and fingerprints match the non-batch surfaces and record zero provider/session effects on
-  refusal.
-- Conflicting replay of a different selection digest or identity fingerprint for the same `(attempt_id, node_id)`
-  refuses as a persistence conflict; byte-identical replay is idempotent.
+- Resume rebinds from the persisted frozen effect and selection and never re-derives either from current
+  configuration; a resumed attempt under changed configuration refuses before effects, including a change confined to
+  effect-only fields such as `base_url`.
+- Inline, dispatcher, each preflight candidate, the real post-preflight turn, retry, resume, and fresh/resumed
+  batch-child paths each bind exactly once per provider attempt: batch fixed-grace refusal, profile freeze, effect
+  and selection freeze, Max validation, V2 resume, and fingerprints match the non-batch surfaces and record zero
+  provider/session effects on refusal.
+- Conflicting replay of a different effect digest, selection digest, or identity fingerprint for the same
+  `(attempt_id, node_id)` refuses as a persistence conflict; byte-identical replay is idempotent.
 - No test path introduces a provider retry, fallback, or replacement attempt that current main does not already make.
 
 #### Terminal encoding bounds
@@ -1288,8 +1673,21 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
   64-hex dependency digest, and a maximum-length control-event id together stay within bound.
 - A constant test asserts `derived_worst_case <= constant` for the node terminal, policy trigger, and frozen controls,
   and asserts the canonical skeleton length is at most its declared ceiling.
-- The fail-closed control: an injected over-bound value produces the `terminal_encoding_overflow` minimal terminal,
-  which itself encodes within bound, and no over-bound row is ever written or admitted.
+- The fail-closed control: an injected over-bound value produces the bounded-evidence fallback, which itself encodes
+  at or below `MAX_NODE_TERMINAL_JSON_BYTES`, and no over-bound row is ever written or admitted.
+- **W5 evidence preservation, red first:** inject the overflow required by the fault-injection fixture and require the
+  result to encode within 2,048 bytes while preserving the **original** `failure_class` and static `code`, a
+  **nonempty** deepest-cause suffix, `evidence_overflow = true`, `cause_truncated` set when the cause was shortened,
+  sticky prompt acceptance, degraded ancestry, and trigger identity. The previous fallback dropped `deepest_cause`
+  and overwrote the code with `terminal_encoding_overflow`, so it fails this fixture red on both counts.
+- Overflow is indicated separately, not by class or code substitution: two distinct failure classes sharing one
+  static code both overflow and remain distinguishable, and `evidence_overflow` is the only differing signal against
+  their non-overflowing counterparts.
+- The retained suffix is budget-driven, not constant-driven: as the mandatory fields grow toward their ceilings the
+  retained suffix shrinks monotonically and the encoding stays within bound; with an empty cause the mandatory shape
+  encodes at or below 880 bytes.
+- The derived worst case including `evidence_overflow` is 1,978 bytes and the checked
+  `derived_worst_case <= MAX_NODE_TERMINAL_JSON_BYTES` assertion still holds with margin.
 - Round-trip: checkpoint, history row, journal `NodeFinished`, `TaskStatusDto`, MCP, A2A, and the offline artifact all
   carry the exact same canonical bytes for the same terminal.
 - No formula, column cap, or reserve anywhere still uses 1,024 for a node terminal or 512 for a policy trigger, and
@@ -1311,9 +1709,22 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
   terminal are durable **before** the sibling's cancellation token fires, and the attempt carries no
   `telemetry_unavailable` marker. The current sole offline result fails this fixture red on both counts.
 - **Genuinely unavailable:** an admission-time unavailable optional ledger, and separately a commit that fails with
-  each bounded `LedgerUnavailableReason` code, both return `OfflineTelemetryUnavailable { reason }`, still authorize
-  policy action, record the bounded reason with no raw database text, try no second ledger, and leave the workflow
-  outcome unchanged.
+  each of the thirteen fail-open `LedgerUnavailableReason` codes — `Open`, `Permission`, `ReadOnlyDatabase`,
+  `ReadOnlyLock`, `ReadOnlyParent`, `AdvisoryLockUnsupported`, `AdvisoryLockIo`, `Locked`, `Migration`, `Schema`,
+  `Corruption`, `Io`, `CapacityProtected` — return `OfflineTelemetryUnavailable { reason }`, still authorize policy
+  action, record the bounded reason with no raw database text, try no second ledger, and leave the workflow outcome
+  unchanged. `Collision` is explicitly excluded from this table and is covered by the fail-closed case below.
+- **Collision is fail-closed, red first:** seed a conflicting durable trigger or triggering terminal under the same
+  identity so the commit fails with `Collision`. The barrier returns `PrimaryFailed`, globally cancels and drains,
+  takes **no** targeted policy action, signals no sibling cancellation token, and sets no `telemetry_unavailable`
+  marker. The previous matrix returned `OfflineTelemetryUnavailable` and authorized targeted cancellation for this
+  same input, so it fails this fixture red.
+- The classifier is exhaustive and table-tested: every one of the fourteen current `LedgerUnavailableReason` variants
+  is asserted to be exactly one of fail-open or fail-closed, with no wildcard arm, and adding a variant fails
+  compilation until classified.
+- A source-level producer audit and targeted fixtures cover reservation identity, parent lineage, process lease,
+  replay, and terminal-write conflicts; every one maps to `Collision` and the fail-closed barrier result. A fixture
+  that injects an availability failure proves it maps to its specific fail-open reason instead of `Collision`.
 - A healthy admitted offline ledger never returns the fail-open marker without attempting the commit; a counter-backed
   regression asserts the attempt occurred.
 - **Primary failure:** a failed durable primary transaction returns `PrimaryFailed`, globally cancels and drains, and
@@ -1340,30 +1751,48 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
 
 ### Persistence, migration, and projection
 
-- Memory and SQLite round-trip frozen controls, frozen provider selections, trigger, every node terminal, ancestry,
-  and cleanup duration.
+- Memory and SQLite round-trip frozen controls, frozen provider effects and selections with both digests, trigger,
+  every node terminal, ancestry, and cleanup duration.
 - Exact replay succeeds; conflicting replay refuses.
 - Accounting-V2 migration is idempotent and the exact mixed V1/V2 row equation rederives under boundary capacity,
   retention, rollback-required, concurrent admission, and crash/failpoint fixtures.
 
 #### Arbitrary-node-ID physical accounting
 
-- Schema shape: `sqlite_master.sql` for `workflow_attempt_node_terminals` contains `WITHOUT ROWID` and
-  `PRAGMA index_list` on it is empty, so the compound key has exactly one physical copy.
+- **Schema shape, red first:** `sqlite_master.sql` for `workflow_attempt_node_terminals` contains `WITHOUT ROWID`;
+  `PRAGMA index_list` reports **exactly one** entry with `unique=1`, `origin='pk'`, and `partial=0` and no entry of
+  any other origin; `PRAGMA index_xinfo` reports exactly the key columns `attempt_id`, then `node_id`; and
+  `sqlite_schema` holds **zero** `type='index'` rows for the table, proving the primary key is the table itself with
+  no separately rooted B-tree. The previous empty-`index_list` assertion rejects exactly this intended schema, so it
+  fails this fixture red. Adding a secondary index or changing key order then proves rejection.
 - **Near-cap long-ID regression, red first:** an accepted node ID spanning many pages against a platform ledger close
-  to 128 MiB. The repaired `node_row_physical` charge either admits with the measured post-admission file size at or
-  below 128 MiB, or refuses before effects with bounded `capacity_protected`. The ordinary-rowid schema plus the
-  `2 * page_size * expected_node_count` term fails this fixture red by admitting an attempt whose real file exceeds
-  the cap.
-- The measured main-file growth after materializing placeholders is at or below the summed `node_row_physical`
-  charge, for short IDs, page-boundary IDs, single-overflow IDs, and multi-page IDs.
-- Replacing a full-size placeholder with a real terminal adds zero pages and never exceeds the reserve.
+  to its ceiling. Admission either commits with the measured post-materialization `page_count * page_size` at or
+  below the 56-MiB main-database budget, or rolls back entirely and refuses before effects with bounded
+  `capacity_protected`. The ordinary-rowid schema plus the `2 * page_size * expected_node_count` term fails this
+  fixture red by admitting an attempt whose real file exceeds the budget.
+- **No static page prediction survives:** a regression asserts that admission consults measured `page_count` and that
+  no `node_row_physical`, `NODE_ROW_STRUCTURE_PAGES`, or `ceil(payload / page_size)` term participates in the
+  decision. The specific falsifying case is covered directly — a 512-byte page database with a 1 MiB node ID, where
+  the deleted formula charged 2,055 pages while the node ID and terminal alone need at least 2,068 overflow pages —
+  and the repaired path decides it by measurement rather than arithmetic, in both the admit and refuse directions.
+- Postconditions are authoritative and checked at boundaries: short IDs, exact-page-boundary IDs, single-overflow
+  IDs, and multi-page IDs each satisfy P1–P5, with reserved page bytes, autovacuum on and off, a legacy
+  WAL-to-supported-rollback transition, each supported rollback journal mode, `cache_spill=OFF`, exact hard
+  `max_page_count`, live sidecars, and near-cap admission and refusal. A forced `SQLITE_FULL` at the hard page limit
+  is a bounded pre-effect `capacity_protected` refusal.
+- **Rollback evidence:** a refused reservation leaves no placeholder, summary row, attachment, debit, or partial
+  allocation, and the allocation accounting is byte-identical to its pre-admission state. A failpoint injected
+  between materialization and postcondition evaluation produces the same result.
+- Replacing a full-size placeholder with a real terminal adds zero pages, never exceeds the reserve, and draws only
+  on the provisioned reusable pool; the integer columns are unchanged by the replacement.
 - Retention of a long-ID attempt credits exactly the stored attempt charge and cascades its attachment and node rows
   by exact key, returning the allocation to its pre-admission accounting.
 - A refusal is a capacity refusal, never a `NodeId` length cap: the same graph admits on a ledger with headroom, and
   no path truncates, hashes, or rejects an ID for being long by itself.
 - Mixed V1/V2 allocations sum legacy zero-node charges with V2 node charges under one checked compare-and-debit, and
-  the migration refuses inside the physical gate while leaving `migrating` intact rather than exceeding 128 MiB.
+  the migration rolls back inside the physical gate while leaving `migrating` intact rather than exceeding the
+  ceiling. The migration rebuilds the accounting table rather than attempting to store version 2 under the current
+  `CHECK(accounting_version=1)` constraint.
 - Configured-store logical accounting charges the same exact key bytes and the same per-row overhead as the platform
   physical derivation.
 - Legacy checkpoint fallback never invents timeout or cleanup completion.
@@ -1414,9 +1843,10 @@ Also validate every changed checked-in example config and report exact passed/fa
 
 Require one fresh cumulative hard-read-only correctness review. The **implementation** review cap is one full review
 plus at most one targeted closure round for closed enumerable findings; if the second round exposes an open class,
-stop and escalate rather than extending the cap. This cap is unchanged and is separate from the design-review budget
-recorded in the dogfood evidence, which the operator extended once by exactly one targeted repair plus one closure
-review. Neither budget authorizes implementation before that design closure review returns.
+stop and escalate rather than extending the cap. This implementation cap is unchanged and is separate from the
+design-review budget recorded in the dogfood evidence, which the operator has extended per round; this revision is a
+further targeted repair of the same closed enumerable population and consumes no implementation budget. Neither
+budget authorizes implementation before the pending design closure review returns.
 
 Explicitly name as unexercised:
 
@@ -1449,24 +1879,27 @@ R2f1b must then land `preserve_after_cancel`, durable preserved-worktree custody
 
 ## 16. Closure-blocker repair and review disposition
 
-The operator-authorized Opus repair proposed bounded corrections for exactly the four blockers returned by the prior
-closure review. None crosses into R2f1b, and every non-goal in §14 is preserved. Sol closure review 2 accepted only
-the encoded-terminal reserve as closed and found five remaining blockers plus one deferred WRONG.
+Sol closure review 2 accepted the encoded-terminal reserve as closed, rejected five blockers, and deferred one WRONG.
+W6 was roadmap-only and was already applied to the program cursor at this revision's frozen base. This revision
+repairs the four remaining technical blockers and folds the deferred W5 correction. None crosses into R2f1b, and
+every non-goal in §14 is preserved.
 
 | Blocker | Repaired mechanism |
 |---|---|
-| 1 — provider-attempt identity was neither fully frozen nor use-bound: a reload rewriting only `fallback_models` let mutable resolution select `F2` while the persisted identity said `M` | §3 `FrozenProviderSelectionV1` freezes agent, preflight flag, primary model, the exact ordered fallback list, effort, and mode under an injective length-prefixed digest that feeds `identity_fingerprint` and both fingerprints. §5 replaces check-then-use with one `bind_frozen_entry` read per attempt whose exact validated `AgentEntry` and slot generation token are the same values consumed for candidate selection and configuration, refuses any candidate outside `frozen_candidates` before provider effect, and covers reload-before-bind, reload-between-observation-and-use, pre-acceptance fallback, resume, batch children, and conflicting replay. No provider retry or fallback beyond today's candidate walk is added. |
-| 2 — the allowed diagnostic could exceed the terminal reserve, since a 512-byte cause of quotes or backslashes escapes to 1,024 bytes alone | §3 defines one canonical serializer, proves the two-times escaping lemma over the sanitizer's output, derives a per-field worst case of 1,941 encoded bytes, and sets `MAX_NODE_TERMINAL_JSON_BYTES = 2_048` with the checked invariant `derived_worst_case <= constant`. `MAX_POLICY_TRIGGER_JSON_BYTES` rises from an equally unsound 512 to 1,024 by the same derivation. Construction is encoded-size-aware, truncates the deepest cause on a UTF-8 boundary with `cause_truncated`, and fails closed to a bounded `terminal_encoding_overflow` minimal terminal. §9, §10, and §12 carry the same constants through every checkpoint cap, logical charge, physical request, projection, and regression, and the name is kept distinct from the existing 8-KiB attempt-terminal bound. |
-| 3 — the platform physical charge undercounted arbitrary node IDs that SQLite duplicates between the row and its automatic index | §9 stores node terminals in a `WITHOUT ROWID` compound-primary-key table with no secondary index and an asserted schema shape, so the exact key bytes exist once. The `2 * page_size * expected_node_count` term is replaced by a per-node `ceil(payload / page_size)` page derivation over exact key bytes plus record/B-tree/overflow rounding, with placeholders materialized at full reserve so replacement adds no page, and a conservative argument covering sidecar/journal headroom, retention credit, and mixed V1/V2 migration. §12 adds a near-cap long-ID red/green regression. The `NodeId` contract is unchanged and the 128-MiB invariant is unchanged; a long-ID attempt that does not fit is a bounded `capacity_protected` refusal before effects, not an ID cap. |
-| 4 — healthy offline history was mislabeled unavailable and could cancel with no durable trigger | §6 replaces the three-variant barrier with `ServedPrimaryCommitted`, `OfflineHistoryCommitted`, `OfflineTelemetryUnavailable { reason }`, and `PrimaryFailed`, selected from the frozen `LedgerAdmissionV1` disposition recorded at admission in §5. A healthy admitted offline ledger must durably commit the trigger and its triggering terminal in one transaction before cancellation; only genuine bounded-reason unavailability may fall open to the in-process marker, and a durable conflict is `PrimaryFailed`. Trigger identity, crash ordering, and outcome/projection semantics are specified, and §12 adds healthy, unavailable, and primary-failure regressions with the healthy case red against the current sole offline result. |
+| W1 — provider identity did not cover the provider call: a tuple-identical hot reload of `base_url`, `api_key_env`, `kind`, command/args, sandbox, auth, MCP, or session location changed the call while passing a selection-only digest | §3 adds `FrozenProviderEffectV1`, a durable canonical digest over every ordinary-workflow effect field not already carried by the unchanged selection digest; exhaustive `AgentEntry` destructuring explicitly routes all fields to provider effect, selection, carried identifier, or excluded compatibility/R2d/presentation metadata, so a new field cannot be silently omitted. `identity_fingerprint` covers both digests. §5 replaces check-then-use with a lease-first, same-entry, bound-use contract: one bind per provider attempt takes the lease **before** reading the entry, validates both digests against that exact immutable value, and consumes that same value for candidate selection, configuration, and dispatch. A reload that wins before the bind yields zero-effect drift; a reload after the bind may retire the old mapping, but the lease pins that old slot and the attempt finishes consistently on it without re-reading the registry. Each preflight candidate and the real post-preflight turn takes its own bound use; exact-bound invalidation drops only the failed candidate's slot, the next candidate revalidates both digests, and the run cache is keyed by agent plus both digests. The binding covers inline, dispatcher, retry, resume, and fresh/resumed batch paths, refuses any candidate outside `frozen_candidates` before provider effect, and makes retry invalidation exact-bound. Current main exposes **no** registry generation or revision API, so the prior `RegistryEntryGenerationV1` was not implementable; §5 specifies the minimal additive `bind_entry_use`/`resolve_bound`/`invalidate_bound` replacement, each with a source-compatible default, and keeps durable digests strictly distinct from an opaque process-local `EntryUseTokenV1` that is never persisted or compared across processes. No provider retry or fallback beyond today's candidate walk is added. |
+| W2 — the required `WITHOUT ROWID` schema test always rejects the intended schema, because SQLite reports the main PK B-tree through `PRAGMA index_list` with `origin='pk'` | §9 replaces the false empty-`index_list` assertion with the correct metadata invariant: exactly one `index_list` entry with `unique=1`, `origin='pk'`, and `partial=0`; exact `index_xinfo` key order `(attempt_id, node_id)`; no entry of any other origin; and zero `type='index'` rows in `sqlite_schema` for the table, proving the primary key is the table itself with no separately rooted B-tree. §10 and §12 carry the same invariant through migration verification and a red-first schema-shape regression that also proves a secondary index or changed key order is rejected. |
+| W3 — the arbitrary-ID page formula was not a conservative physical bound: at a 512-byte page a 1 MiB node ID needs at least 2,068 overflow pages where the formula charged 2,055 total | §9 removes the formula rather than re-deriving it, together with `NODE_ROW_STRUCTURE_PAGES`, the `ceil(payload / page_size)` term, and the false `4n` lemma, because no static logical-to-page prediction is sound for an uncapped `NodeId` under SQLite's local-payload and overflow rules. R2f1a instead **materializes** every full-size placeholder inside the pre-effect reservation transaction and decides admission from measured postconditions — `page_count` against the existing 56-MiB main-database budget, the provisioned reusable-page pool, exact placeholder presence, charge equality, and the revalidated aggregate physical regime. The write is bounded *before* the post-check by the existing hard `max_page_count`, supported rollback-journal policy, `cache_spill=OFF`, descriptor-bound live-sidecar check, 68-MiB transaction reserve plus framing margin, and `history_growth_fits`; `SQLITE_FULL` maps to `capacity_protected`. Failure rolls the whole transaction back before effects, and a post-commit aggregate mismatch quarantines the ledger. §12 replaces every static-prediction test with measured-postcondition, boundary, hard-limit, sidecar, transition, and rollback regressions. The `NodeId` contract is unchanged — no cap, no truncation, no hashing — and the 128-MiB invariant is unchanged. |
+| W4 — `Collision` was simultaneously fail-open and fail-closed, since the normative rule required `PrimaryFailed` while the acceptance matrix said every bounded reason falls open | §6 adds an exhaustive classifier over the fourteen current `LedgerUnavailableReason` variants: all thirteen availability and capacity reasons are fail-open to `OfflineTelemetryUnavailable { reason }`; `Collision` **alone** is `PrimaryFailed` and cannot authorize targeted cancellation because current producers reserve it for identity, lineage, lease-ownership, reservation, or terminal replay conflict/ambiguity rather than optional-ledger unavailability. The classifier is a total `match` with no wildcard arm, so a new variant fails compilation until classified, and a producer audit prevents a future availability use from silently inheriting fail-closed semantics. §12 replaces the contradictory "each bounded reason" regression with the thirteen-variant fail-open table plus red-first reservation, lineage, lease, replay, and terminal-conflict cases. |
+| W5 (deferred) — the overflow fallback deliberately discarded the deepest cause and overwrote the failure code | §3 replaces `minimal_over_bound` with a bounded-evidence fallback that preserves the primary failure evidence — original `failure_class` and static `code` — retains the deepest UTF-8 suffix that fits the remaining measured budget, and indicates overflow **separately** through an additive `evidence_overflow` flag. The 2,048-byte proven bound is retained: the derived worst case becomes 1,978 bytes including the additive indicator, still under the checked `derived_worst_case <= constant` invariant, and the fail-closed control for a still-over-bound value is unchanged. §12 adds the red-first evidence-preservation regression. |
 
-Sol closure review 2 rejected the provider-effect identity, `WITHOUT ROWID` schema assertion, arbitrary-ID page
-bound, offline collision classification, and stale program cursor as blockers. It deferred only the theoretical
-overflow-fallback evidence loss and found no SMELL. The complete likelihood, impact, fix, regression, and
-BLOCKER/DEFER analysis is retained in the linked review record. No implementation, test, review approval, release,
-deployment, or operator effect is claimed. The cap is exhausted and this checkpoint is parked pending owner
-direction.
+The complete likelihood, impact, fix, regression, and BLOCKER/DEFER analysis for each finding is retained in the
+linked [review record](../reviews/2026-08-01-r2f1a-sol-closure-review-2.md). Every dependent type, digest, freeze
+order, schema and accounting clause, migration, resume and replay rule, projection, ownership stage, test, and
+compatibility clause in this document has been reconciled to the mechanisms above; no superseded formula, reserve,
+assertion, or barrier matrix remains stated as an alternative.
 
-The status fold reconciles the stale cursor without claiming review approval; four technical blockers remain.
+This document is a design checkpoint awaiting its closure review. No implementation, test result, review approval,
+release, deployment, or live operator effect is claimed, and no execution id, attempt id, artifact hash, or verdict
+exists for that pending review.
 
-R2F1A FOCUSED BOUNDARY: PARKED — SOL CLOSURE REVIEW 2 REJECT
+R2F1A FOCUSED BOUNDARY: AWAITING SOL CLOSURE REVIEW
