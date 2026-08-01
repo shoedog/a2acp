@@ -1,8 +1,7 @@
 # R2f1a focused implementation boundary — profiles, fan-out policy, and per-node control
 
-- **Status:** AWAITING SOL CLOSURE REVIEW — the four closed technical blockers from Sol/xhigh closure review 2 and
-  its deferred encoder finding are repaired below; the roadmap cursor reconciliation is already applied; no
-  implementation has started
+- **Status:** PARKED / SOL CLOSURE REVIEW 3 REJECT — four closed-enumerable blockers remain; the declared design
+  convergence cap is exhausted; owner direction is required before any repair, review, or implementation
 - **Frozen base:** `3f35ee6e07e9af314bb548b9d3ab694f3bba5fb1`
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Normative authority:** [`../specs/2026-07-20-r2f-owner-design.md`](../specs/2026-07-20-r2f-owner-design.md)
@@ -11,9 +10,10 @@
 - **Fable input:** `d612788847a9142172cb38080bc77568e23c89116f44153ec0376b17327ce8c0`
 - **Synthesis:** `644c2df21579bcb3dc9e07f347911f1516ebf61d6c0b9493433d117d83070a84`
 
-This document freezes the proposed source boundary for adversarial review. It narrows, but does not replace, the
-approved owner design and parent plan. It does not authorize implementation until its review findings are
-adjudicated and the status is advanced.
+This document records the rejected proposed source boundary. It narrows, but does not replace, the approved owner
+design and parent plan. Its contents are not implementation authority: closure review 3 rejected the checkpoint,
+and the status cannot advance until the four residual blockers are repaired and cumulatively approved under a new
+owner-authorized convergence round.
 
 ## Dogfood and synthesis evidence
 
@@ -122,10 +122,19 @@ slot-plus-entry invalidation and digest-keyed preflight cache, the complete hard
 metadata/column order, and the full current `Collision` producer family. These are bounded corrections to W1–W4,
 not a fresh implementation or a new provider repair.
 
-This revision repairs W1–W4, folds deferred W5, and reconciles the authoritative roadmap to the pending-review
-state. It is a design repair only: only this document and the roadmap cursor change. No source, test, configuration,
-prompt, generated artifact, implementation, review approval, release, deployment, or live operator effect is
-claimed, and no execution id, attempt id, artifact hash, or verdict yet exists for the pending Sol closure review.
+The candidate at commit `2bcbd524a39ebe7edb5928655681fbe7acad29e5` claimed to repair W1–W4, fold deferred
+W5, and reconcile the authoritative roadmap. It remained a design repair only: no source, test, configuration,
+prompt, generated artifact, implementation, release, deployment, or live operator effect was claimed.
+
+The one authorized Sol/xhigh closure review ran as execution `exec-f8111c2406f9cf397beecd38ea6fc18b`, attempt
+`attempt-60c2819ae1c8fd396fe3325a7e839d84`, against that clean commit, focused-artifact SHA-256
+`36a10dcb9e74e768cd857d5d182432741def4893b3290b443f4d4e5790e0cbbe`, and roadmap SHA-256
+`87f4ce2640c3f6a56fb722a652076759cf879aa2c72c7a5e9b75b48d54cc2e86`. Its 17,525-byte terminal artifact
+had SHA-256 `154417a11a82c989eaa7682f718e23fc16d9b124e899e8267b53a6a663a6016b`; the checked-in
+[`closure review 3 record`](../reviews/2026-08-01-r2f1a-sol-closure-review-3.md) differs only by the
+repository-standard final newline. The review returned `REJECT` with four closed-enumerable blocker `WRONG`
+findings and no `SMELL`. The declared round allowed one Sonnet/xhigh mining turn, one Opus/xhigh repair, and one
+Sol/xhigh closure review. That cap is exhausted, so the checkpoint is parked rather than silently repaired again.
 
 The pre-freeze docs gate ran `cargo run -p a2a-bridge -- validate --repo-hygiene` successfully in the scratch clone
 and reported **39 tracked artifacts / 7 validated example configs**. `git diff --check` and direct existence checks
@@ -1846,7 +1855,7 @@ plus at most one targeted closure round for closed enumerable findings; if the s
 stop and escalate rather than extending the cap. This implementation cap is unchanged and is separate from the
 design-review budget recorded in the dogfood evidence, which the operator has extended per round; this revision is a
 further targeted repair of the same closed enumerable population and consumes no implementation budget. Neither
-budget authorizes implementation before the pending design closure review returns.
+budget authorizes implementation while this design remains parked without cumulative approval.
 
 Explicitly name as unexercised:
 
@@ -1892,14 +1901,21 @@ every non-goal in §14 is preserved.
 | W4 — `Collision` was simultaneously fail-open and fail-closed, since the normative rule required `PrimaryFailed` while the acceptance matrix said every bounded reason falls open | §6 adds an exhaustive classifier over the fourteen current `LedgerUnavailableReason` variants: all thirteen availability and capacity reasons are fail-open to `OfflineTelemetryUnavailable { reason }`; `Collision` **alone** is `PrimaryFailed` and cannot authorize targeted cancellation because current producers reserve it for identity, lineage, lease-ownership, reservation, or terminal replay conflict/ambiguity rather than optional-ledger unavailability. The classifier is a total `match` with no wildcard arm, so a new variant fails compilation until classified, and a producer audit prevents a future availability use from silently inheriting fail-closed semantics. §12 replaces the contradictory "each bounded reason" regression with the thirteen-variant fail-open table plus red-first reservation, lineage, lease, replay, and terminal-conflict cases. |
 | W5 (deferred) — the overflow fallback deliberately discarded the deepest cause and overwrote the failure code | §3 replaces `minimal_over_bound` with a bounded-evidence fallback that preserves the primary failure evidence — original `failure_class` and static `code` — retains the deepest UTF-8 suffix that fits the remaining measured budget, and indicates overflow **separately** through an additive `evidence_overflow` flag. The 2,048-byte proven bound is retained: the derived worst case becomes 1,978 bytes including the additive indicator, still under the checked `derived_worst_case <= constant` invariant, and the fail-closed control for a still-over-bound value is unchanged. §12 adds the red-first evidence-preservation regression. |
 
-The complete likelihood, impact, fix, regression, and BLOCKER/DEFER analysis for each finding is retained in the
-linked [review record](../reviews/2026-08-01-r2f1a-sol-closure-review-2.md). Every dependent type, digest, freeze
-order, schema and accounting clause, migration, resume and replay rule, projection, ownership stage, test, and
-compatibility clause in this document has been reconciled to the mechanisms above; no superseded formula, reserve,
-assertion, or barrier matrix remains stated as an alternative.
+The complete likelihood, impact, fix, regression, and BLOCKER/DEFER analysis for the prior population is retained in
+the linked [closure review 2 record](../reviews/2026-08-01-r2f1a-sol-closure-review-2.md). Closure review 3 then
+source-validated the following residual population in this candidate:
 
-This document is a design checkpoint awaiting its closure review. No implementation, test result, review approval,
-release, deployment, or live operator effect is claimed, and no execution id, attempt id, artifact hash, or verdict
-exists for that pending review.
+| Residual blocker | Real-world condition, incorrect result, and bounded fix |
+|---|---|
+| WRONG W1-A — stale warm-API model | After an API backend is warm under model `M`, a reload removing the model reuses the slot; `configure_session(None)` cannot suppress the spawn-time default, so the provider still receives `M` while the frozen entry says no model. Plausible on supported warm reloads. Use tri-state session-model state or normatively force a fresh slot on every API model change. |
+| WRONG W1-B — credential-verifier digest | A low-entropy literal MCP environment credential is included in a persisted deterministic unkeyed digest, allowing an artifact reader who knows the other fields to enumerate the credential offline. Rare but a hard credential-custody failure. Use a domain-separated HMAC with separately held stable key and fail-closed resume, or use indirect credential names plus a nonsecret rotation identity. |
+| WRONG W3 — configured-store undercount | Configured shared stores charge exact key bytes plus fixed 256-byte overhead and no WAL reserve; arbitrary IDs can therefore consume more SQLite overflow/B-tree/WAL bytes than charged and cross the 128-MiB history allocation after admission. Rare near the boundary but violates hard custody. Materialize and debit measured table-local pages plus a conservative remaining-WAL reserve inside the serialized pre-effect transaction. |
+| WRONG W5 — mutually unsatisfiable fault-injection criterion | The specified fallback drops `dependency_set` and may change cause fields, while its mandatory forced-overflow test permits only `evidence_overflow` to differ, so no implementation can satisfy both requirements. The production overflow remains theoretical under the current size proof; the certain impact is a failed implementation acceptance gate. State that the flag is the only dedicated classifier and permit exactly the named dependency/cause fields to differ. |
 
-R2F1A FOCUSED BOUNDARY: AWAITING SOL CLOSURE REVIEW
+The full mechanism, source locations, likelihood, exposure, impact, fix cost, and fail-first evidence are retained in
+the linked [closure review 3 record](../reviews/2026-08-01-r2f1a-sol-closure-review-3.md). The population is
+closed-enumerable, but this round's cap is exhausted. A new owner-authorized bounded repair and cumulative closure
+review are required before implementation. No implementation, Rust test result, review approval, release,
+deployment, or live operator effect is claimed.
+
+R2F1A FOCUSED BOUNDARY: PARKED / SOL CLOSURE REVIEW 3 REJECT / OWNER DIRECTION REQUIRED
