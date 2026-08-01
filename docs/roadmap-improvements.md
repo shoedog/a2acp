@@ -30,7 +30,7 @@ This is a convenience index, not a second release cursor. Follow the linked focu
 | Track | Current state | Next or deferred boundary |
 |---|---|---|
 | R2f0a execution/attempt identity, ledger, and stats | **MERGED** by [PR #48](https://github.com/shoedog/a2acp/pull/48) at `2685ffb7`; final PR head `630b9cc9`; CI green | No release, deployment, live canary, or operator rebuild is implied by the merge. |
-| R2f liveness/takeover | **ACTIVE**; R2f0b is not started | R2f0b, R2f1a, R2f1b, R2f2, R2f3a, R2f3b, R2f3c, then R2f4. Open [#24](https://github.com/shoedog/a2acp/issues/24) and [#47](https://github.com/shoedog/a2acp/issues/47) remain inputs. GitHub #22 is closed as intake, but its failed-root/silent-sibling acceptance behavior remains R2f work. |
+| R2f liveness/takeover | **ACTIVE**; R2f0b is in progress with its [focused boundary](superpowers/plans/2026-07-30-r2f0b-focused-boundary.md) frozen and IN REVIEW — implementation candidate complete; deterministic/native verification and review pending | R2f0b, R2f1a, R2f1b, R2f2, R2f3a, R2f3b, R2f3c, then R2f4. Open [#24](https://github.com/shoedog/a2acp/issues/24) and [#47](https://github.com/shoedog/a2acp/issues/47) remain inputs. GitHub #22 is closed as intake, but its failed-root/silent-sibling acceptance behavior remains R2f work. |
 | R2e authenticated in-process fallback | **DEFERRED / policy-blocked** | Requires a separately approved authenticated attestation design; it is off the critical path. |
 | R2g stable ingress/release handoff | **QUEUED after R2f**; focused owner design not started | Stable local ingress, exact task/session/SSE affinity, side-by-side promotion/rollback, safe store ownership, and predecessor drain. |
 | R3 compatibility | R3a–R3c and R3d0–R3d3 **MERGED** | R3d4 trusted triggers and remote check publication, then R3d5 characterization/staged activation. Both are unstarted. |
@@ -72,7 +72,7 @@ roughly one non-trivial slice every few days to two weeks. Horizons below are ex
 and every near-term horizon assumes it competes with the reliability P0 for the same review budget.
 
 **Relationship to the reliability program (Track A — in progress, not owned here).**
-R2f0a is merged and R2f0b is next. After the remaining R2f work, the current queue is R2g stable ingress,
+R2f0a is merged and R2f0b is in progress from its frozen focused boundary. After the remaining R2f work, the current queue is R2g stable ingress,
 R3d4/R3d5 scheduling and staged activation, R3e OpenRouter, R3f OpenCode, then R4 reproducible release/promotion.
 Several items here have a hard
 **"resume-after"** dependency on Track A deliverables (the compatibility matrix, phase-specific errors,

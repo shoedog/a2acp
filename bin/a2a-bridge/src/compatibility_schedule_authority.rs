@@ -2064,10 +2064,6 @@ mod tests {
         }
     }
 
-    fn foundation_root() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compatibility")
-    }
-
     fn execution_for(
         binding: &FoundationProfileBindingV1,
         caps: EffectCapsV1,
@@ -2285,8 +2281,9 @@ mod tests {
 
     #[test]
     fn generated_sources_reopen_and_rederive_every_foundation_binding() {
-        let root = foundation_root();
-        let foundation = load_schedule_foundation(&root).unwrap();
+        let fixture = crate::compatibility_schedule::TestScheduleFoundation::new();
+        let root = fixture.root();
+        let foundation = load_schedule_foundation(root).unwrap();
 
         let scheduled_binding = &foundation.scheduled_profiles["codex-host-luna-low"];
         let scheduled_execution =
@@ -2294,7 +2291,7 @@ mod tests {
         let scheduled_authority = one_shot_authority_for_source();
         let scheduled_admission = admission_for(&scheduled_execution, scheduled_authority.clone());
         let scheduled = generate_scheduled_execution_source(
-            &root,
+            root,
             "codex-host-luna-low",
             scheduled_execution,
             scheduled_admission,
@@ -2302,11 +2299,11 @@ mod tests {
             TriggerKindV1::ManualCharacterization,
         )
         .unwrap();
-        validate_scheduled_execution_source(&root, &scheduled).unwrap();
+        validate_scheduled_execution_source(root, &scheduled).unwrap();
 
         let mut stale_hash = scheduled.clone();
         stale_hash.config_template_sha256 = digest('9');
-        assert!(validate_scheduled_execution_source(&root, &stale_hash)
+        assert!(validate_scheduled_execution_source(root, &stale_hash)
             .unwrap_err()
             .to_string()
             .contains("stale hash"));
@@ -2314,7 +2311,7 @@ mod tests {
         let mut rehashed_drift = scheduled;
         rehashed_drift.config_template_sha256 = digest('9');
         let rehashed_drift = seal_scheduled_execution_source(rehashed_drift).unwrap();
-        assert!(validate_scheduled_execution_source(&root, &rehashed_drift)
+        assert!(validate_scheduled_execution_source(root, &rehashed_drift)
             .unwrap_err()
             .to_string()
             .contains("rederived checked-in foundation"));
@@ -2325,14 +2322,14 @@ mod tests {
         let claimed_authority = one_shot_authority_for_source();
         let claimed_admission = admission_for(&claimed_execution, claimed_authority.clone());
         let claimed = generate_claimed_support_characterization_source(
-            &root,
+            root,
             "codex-host-bridge-gpt56-luna",
             claimed_execution,
             claimed_admission,
             claimed_authority,
         )
         .unwrap();
-        validate_claimed_support_characterization_source(&root, &claimed).unwrap();
+        validate_claimed_support_characterization_source(root, &claimed).unwrap();
 
         let mut wrong_exact_config = claimed;
         wrong_exact_config.pinned_config_sha256 = digest('9');
@@ -2352,7 +2349,7 @@ mod tests {
         let wrong_exact_config =
             seal_claimed_support_characterization_source(wrong_exact_config).unwrap();
         assert!(
-            validate_claimed_support_characterization_source(&root, &wrong_exact_config)
+            validate_claimed_support_characterization_source(root, &wrong_exact_config)
                 .unwrap_err()
                 .to_string()
                 .contains("exact pins drifted")
@@ -2361,14 +2358,15 @@ mod tests {
 
     #[test]
     fn source_generation_refuses_unknown_rows_and_caps_above_the_profile_maximum() {
-        let root = foundation_root();
-        let foundation = load_schedule_foundation(&root).unwrap();
+        let fixture = crate::compatibility_schedule::TestScheduleFoundation::new();
+        let root = fixture.root();
+        let foundation = load_schedule_foundation(root).unwrap();
         let binding = &foundation.scheduled_profiles["codex-host-luna-low"];
         let authority = one_shot_authority_for_source();
         let execution = execution_for(binding, binding.maximum_caps.clone());
         let admission = admission_for(&execution, authority.clone());
         assert!(generate_scheduled_execution_source(
-            &root,
+            root,
             "unknown-row",
             execution,
             admission,
@@ -2383,7 +2381,7 @@ mod tests {
         let authority = one_shot_authority_for_source();
         let admission = admission_for(&execution, authority.clone());
         assert!(generate_scheduled_execution_source(
-            &root,
+            root,
             "codex-host-luna-low",
             execution,
             admission,

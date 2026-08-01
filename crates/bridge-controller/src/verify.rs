@@ -242,13 +242,14 @@ pub type Runner<'a> = dyn Fn(&str, &[String]) -> std::io::Result<(i32, String)> 
 /// Run every configured command as its own container (sharing the per-repo cache volume), reading each
 /// container's exit code. Stops at the FIRST gate failure. Pure given an injected `runner`.
 /// Returns `VerifyOutcome::Skipped` when `profile` is `None` (`--lang none`) without spawning any container.
-pub fn run_verify(
+pub fn run_verify_recorded(
     cfg: &VerifyConfig,
     profile: Option<&bridge_core::profile::LanguageProfile>,
     clone: &bridge_core::SessionCwd,
     cache_vol: &str,
     runner: &Runner,
     max_bytes: usize,
+    recorder: &dyn bridge_core::attempt_activity::AttemptRecorder,
 ) -> VerifyOutcome {
     let profile = match profile {
         None => {
@@ -262,7 +263,9 @@ pub fn run_verify(
     let binding = profile.cache_binding(bridge_core::profile::CacheCtx::Verify, "", cache_vol);
     let image = profile.image.as_deref().unwrap_or(&cfg.image);
     let mut stopped_after_gate_failure = false;
-    for c in &profile.verify_commands {
+    let mut completed_count = 0_u64;
+    for (index, c) in profile.verify_commands.iter().enumerate() {
+        let ordinal = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
         if stopped_after_gate_failure {
             results.push(VerifyResult {
                 name: c.name.clone(),
@@ -274,6 +277,11 @@ pub fn run_verify(
             });
             continue;
         }
+        let _ = recorder.record(
+            bridge_core::attempt_activity::AttemptPhase::Verification,
+            bridge_core::attempt_activity::ActivityReason::GateStarted,
+            ordinal,
+        );
         let (prog, argv) = bridge_core::sandbox::compose_verify(
             cfg.runtime.as_deref(),
             image,
@@ -286,6 +294,11 @@ pub fn run_verify(
             Ok((e, o)) => (e, o, false),
             Err(e) => (-1, format!("verify: runner error: {e}"), true),
         };
+        let _ = recorder.record(
+            bridge_core::attempt_activity::AttemptPhase::Verification,
+            bridge_core::attempt_activity::ActivityReason::GateExited,
+            ordinal,
+        );
         let ok = exit == 0;
         let failure_class = classify_verify_failure(exit, &out, runner_error);
         results.push(VerifyResult {
@@ -296,6 +309,14 @@ pub fn run_verify(
             failure_class,
             output: truncate_output(&out, max_bytes),
         });
+        if ok {
+            completed_count = completed_count.saturating_add(1);
+            let _ = recorder.record(
+                bridge_core::attempt_activity::AttemptPhase::Verification,
+                bridge_core::attempt_activity::ActivityReason::CompletedSetGrowth,
+                completed_count,
+            );
+        }
         if c.gate && !ok {
             stopped_after_gate_failure = true;
         }
@@ -303,6 +324,24 @@ pub fn run_verify(
     VerifyOutcome::Ran(aggregate(results))
 }
 
+pub fn run_verify(
+    cfg: &VerifyConfig,
+    profile: Option<&bridge_core::profile::LanguageProfile>,
+    clone: &bridge_core::SessionCwd,
+    cache_vol: &str,
+    runner: &Runner,
+    max_bytes: usize,
+) -> VerifyOutcome {
+    run_verify_recorded(
+        cfg,
+        profile,
+        clone,
+        cache_vol,
+        runner,
+        max_bytes,
+        &bridge_core::attempt_activity::NoopAttemptRecorder,
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +580,57 @@ mod tests {
         match outcome {
             VerifyOutcome::Ran(v) => v,
             other => panic!("expected VerifyOutcome::Ran, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn r2f0b_recorded_verify_tracks_only_reached_gate_boundaries_and_successes() {
+        use bridge_core::attempt_activity::{
+            AttemptRecorder, SharedAttemptRecorder, SystemMonotonicClock,
+        };
+
+        let clone = bridge_core::SessionCwd::parse("/repo/private-sentinel").unwrap();
+        let runner = |_program: &str, argv: &[String]| -> std::io::Result<(i32, String)> {
+            if argv.last().is_some_and(|script| script.contains("clippy")) {
+                Ok((1, "private failure output".into()))
+            } else {
+                Ok((0, "private success output".into()))
+            }
+        };
+        let recorder = SharedAttemptRecorder::new(SystemMonotonicClock::start());
+        let verdict = unwrap_ran(run_verify_recorded(
+            &cfg(),
+            Some(&profile(
+                &[
+                    ("fmt", true),
+                    ("clippy", true),
+                    ("build", true),
+                    ("test", true),
+                ],
+                None,
+            )),
+            &clone,
+            "private-cache-sentinel",
+            &runner,
+            4096,
+            &recorder,
+        ));
+        assert!(!verdict.passed);
+        assert!(matches!(verdict.results[2].reach, VerifyReach::NotReached));
+        assert!(matches!(verdict.results[3].reach, VerifyReach::NotReached));
+
+        let tally = recorder.tally().expect("recorded verifier owns a tally");
+        assert_eq!(tally.meaningful_progress, 5);
+        assert_eq!(tally.activity, 0);
+        assert_eq!(tally.max_advance, 2);
+        let encoded = serde_json::to_string(&tally).unwrap();
+        for private in [
+            "private-sentinel",
+            "private failure output",
+            "fmt",
+            "clippy",
+        ] {
+            assert!(!encoded.contains(private), "activity leaked {private:?}");
         }
     }
 

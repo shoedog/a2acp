@@ -12,7 +12,7 @@ pub(crate) mod testpeer;
 use bridge_core::domain::{AuthContext, Part, PeerTaskId};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::TaskId;
-use bridge_core::ports::{Delegation, DelegationPort};
+use bridge_core::ports::{Delegation, DelegationPort, ProviderDispatchObserver};
 
 /// Real outbound A2A delegation: opens an SSE stream to a remote peer
 /// and returns `Delegation{events, peer_task}`. Implements `DelegationPort`.
@@ -48,6 +48,19 @@ impl DelegationPort for PeerDelegation {
     ) -> Result<Delegation, BridgeError> {
         let (events, peer_task) = A2aClient::new(&self.url, &self.auth, self.timeout)
             .open_stream(&parts)
+            .await?;
+        Ok(Delegation { events, peer_task })
+    }
+
+    async fn delegate_observed(
+        &self,
+        _auth: &AuthContext,
+        _local: &TaskId,
+        parts: Vec<Part>,
+        dispatched: ProviderDispatchObserver,
+    ) -> Result<Delegation, BridgeError> {
+        let (events, peer_task) = A2aClient::new(&self.url, &self.auth, self.timeout)
+            .open_stream_observed(&parts, &dispatched)
             .await?;
         Ok(Delegation { events, peer_task })
     }

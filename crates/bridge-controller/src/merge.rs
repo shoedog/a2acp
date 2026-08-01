@@ -1233,6 +1233,8 @@ mod git_tests {
             attempt_next: 1,
             forced_depth: None,
             resolved_lang: None,
+            activity_tally: None,
+            terminal_evidence_counts: None,
             phase,
             created_at_ms: 0,
             updated_at_ms: 0,

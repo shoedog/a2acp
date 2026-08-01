@@ -69,7 +69,8 @@ a2a-bridge run-workflow <id> \
 
 **Built-in workflow `<id>`s** (defined in `examples/a2a-bridge.containerized.toml` and
 `examples/a2a-bridge.multi-agent.toml`):
-`design` (2 clean-room architect lenses → synth), `code-review`, `spec-review`, `plan-review`.
+`design` (2 clean-room architect lenses → synth), `code-review` (one Sol/xhigh read-only risk-triaged pass),
+`spec-review`, `plan-review`.
 A workflow is just `[[workflows]]` + `[[workflows.nodes]]` in the config — copy one to make a variant
 (e.g. a codex-only `design`).
 
@@ -87,10 +88,10 @@ Clones the repo into a quarantine under `allowed_cwd_root`, runs the **warm** co
 (edit + fix turns share ONE container + session), build/test-verifies, reviews the diff, and hands off a
 branch for you to merge. The default `impl` agent is **codex (gpt-5.5, effort=high)**.
 
-The **review-the-diff** scales to the diff: **light** (1-reviewer, fast) for small diffs, **standard**
-(2-reviewer + a prism diff-slice) by default, and **thorough** (draft→refine double pass) for large code/infra
-diffs. Auto-sized from `git diff --numstat`; `--depth` forces a tier (persisted across `--resume`). Reviewers
-run host-side with prism code-nav (read-only).
+The shipped **review-the-diff** default is one host-side `gpt-5.6-sol`/`xhigh` hard-read-only review at every
+size tier. It completes correctness findings first, then revisits every WRONG/SMELL for real-world trigger
+conditions, likelihood, exposure, bounded repair cost, and blocker/defer value. Auto-sizing and `--depth` remain
+available for explicitly configured alternate tier workflows (persisted across `--resume`).
 
 **Land it (`merge`, ADR-0027).** Integrate an **Approved** run's commit into its source repo, re-authored to
 **you** (the operator), without touching your working checkout:

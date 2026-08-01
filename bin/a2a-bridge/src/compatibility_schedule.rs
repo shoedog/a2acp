@@ -585,6 +585,144 @@ fn validate_relative_path(label: &str, path: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
+#[cfg(test)]
+pub(super) struct TestScheduleFoundation {
+    _temp: tempfile::TempDir,
+    _trusted_temp: tempfile::TempDir,
+    root: PathBuf,
+    trusted_cwd: PathBuf,
+    missing_cwd: PathBuf,
+}
+
+#[cfg(test)]
+impl TestScheduleFoundation {
+    fn reseal_inventory(root: &Path) {
+        let policy: SchedulePolicyV1 =
+            toml::from_str(&std::fs::read_to_string(root.join("scheduling-policy.toml")).unwrap())
+                .unwrap();
+        validate_policy(&policy).unwrap();
+        let registry: ScheduledCaseRegistryV1 = toml::from_str(
+            &std::fs::read_to_string(root.join(&policy.scheduled_registry)).unwrap(),
+        )
+        .unwrap();
+        validate_registry(&registry, &policy).unwrap();
+        let production_manifest =
+            compatibility::validated_manifest_snapshot(&root.join(&policy.production_manifest))
+                .unwrap();
+        let floating =
+            compatibility_resolution::load_recipes(&root.join(&policy.floating_recipes)).unwrap();
+        let mut expected = BTreeMap::new();
+        for case in &registry.cases {
+            let (config_sha256, _, capture) = validate_config(root, case).unwrap();
+            let resolution_constraint_sha256 =
+                recipe_constraint_sha256(&floating.recipes, case).unwrap();
+            let profile = scheduled_profile(
+                &policy,
+                case,
+                config_sha256,
+                capture.sha256,
+                resolution_constraint_sha256,
+            )
+            .unwrap();
+            expected.insert(
+                (ProfileSourceKindV1::ScheduledAdvisory, case.id.clone()),
+                canonical_hash("scheduled characterization profile", &profile).unwrap(),
+            );
+        }
+        let support =
+            support_profiles(&policy, root, &production_manifest.bytes, &mut Vec::new()).unwrap();
+        for profile in support {
+            expected.insert(
+                (
+                    ProfileSourceKindV1::ClaimedSupportGate,
+                    profile.source_id.clone(),
+                ),
+                canonical_hash("claimed-support characterization profile", &profile).unwrap(),
+            );
+        }
+        let inventory_path = root.join(&policy.characterization_inventory);
+        let mut inventory: CharacterizationProfileInventoryV1 =
+            toml::from_str(&std::fs::read_to_string(&inventory_path).unwrap()).unwrap();
+        for profile in &mut inventory.profiles {
+            profile.profile_sha256 = expected
+                .get(&(profile.source_kind, profile.source_id.clone()))
+                .unwrap()
+                .clone();
+        }
+        std::fs::write(inventory_path, toml::to_string_pretty(&inventory).unwrap()).unwrap();
+    }
+
+    pub(super) fn new() -> Self {
+        fn copy_tree(source: &Path, destination: &Path) {
+            std::fs::create_dir_all(destination).unwrap();
+            for entry in std::fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let target = destination.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("compatibility");
+        copy_tree(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compatibility"),
+            &root,
+        );
+        let repository_root =
+            std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let trusted_temp = tempfile::Builder::new()
+            .prefix(".r2f0b-trusted-cwd-")
+            .tempdir_in(repository_root)
+            .unwrap();
+        let trusted_cwd = std::fs::canonicalize(trusted_temp.path()).unwrap();
+        let missing_cwd = trusted_cwd.with_file_name(format!(
+            "{}-missing",
+            trusted_cwd.file_name().unwrap().to_string_lossy()
+        ));
+        for relative in [
+            "scheduling-policy.toml",
+            "scheduled-cases.toml",
+            "manifest.toml",
+        ] {
+            let path = root.join(relative);
+            let source = std::fs::read_to_string(&path).unwrap();
+            let source = source.replace(
+                "/Users/wesleyjinks/code/a2a-bridge",
+                trusted_cwd.to_str().unwrap(),
+            );
+            std::fs::write(path, source).unwrap();
+        }
+        Self::reseal_inventory(&root);
+        Self {
+            _temp: temp,
+            _trusted_temp: trusted_temp,
+            root,
+            trusted_cwd,
+            missing_cwd,
+        }
+    }
+
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(super) fn configure_missing_trusted_cwd(&self) {
+        for relative in ["scheduled-cases.toml", "manifest.toml"] {
+            let path = self.root.join(relative);
+            let source = std::fs::read_to_string(&path).unwrap();
+            let source = source.replace(
+                self.trusted_cwd.to_str().unwrap(),
+                self.missing_cwd.to_str().unwrap(),
+            );
+            std::fs::write(path, source).unwrap();
+        }
+    }
+}
+
 fn resolve_trusted_session_cwd(
     label: &str,
     path: &Path,
@@ -2600,18 +2738,23 @@ pub(super) fn load_schedule_foundation(root: &Path) -> Result<LoadedScheduleFoun
 mod tests {
     use super::*;
 
-    fn fixture_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compatibility")
-    }
-
     #[test]
-    fn checked_in_foundation_has_no_effecting_entrypoint_and_exact_profile_sets() {
-        let loaded = load_schedule_foundation(&fixture_root()).unwrap();
+    fn r2f0b_private_foundation_uses_the_production_trusted_cwd_resolver() {
+        let fixture = TestScheduleFoundation::new();
+        let loaded = load_schedule_foundation(fixture.root()).unwrap();
         assert_eq!(loaded.scheduled_profile_count, 6);
         assert_eq!(loaded.claimed_support_profile_count, 4);
         assert!(local_file::valid_sha256(
             &loaded.profile_policy_bundle_sha256
         ));
+    }
+
+    #[test]
+    fn r2f0b_missing_trusted_cwd_is_rejected_by_the_production_resolver() {
+        let fixture = TestScheduleFoundation::new();
+        fixture.configure_missing_trusted_cwd();
+        let error = load_schedule_foundation(fixture.root()).unwrap_err();
+        assert!(error.to_string().contains("session cwd"));
     }
 
     #[test]

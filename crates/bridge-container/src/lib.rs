@@ -1565,6 +1565,10 @@ mod tests {
     use bridge_core::permission::TurnMeta;
     use bridge_core::ports::{BackendObservers, DiagnosticObserver, RichEventSink};
     use bridge_core::reaper::ReapAttemptFn;
+    use bridge_core::terminal_evidence::{
+        AcpChildLiveness, EvidenceCapability, EvidenceCompleteness, SharedTurnEvidence,
+        TerminalEvidenceSink, TurnEvidenceBinding,
+    };
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
@@ -1580,6 +1584,7 @@ mod tests {
         fail_prompt: AtomicBool,
         configured_turns: Mutex<Vec<(SessionId, TurnMeta)>>,
         call_order: Mutex<Vec<&'static str>>,
+        terminal_evidence_v1: bool,
         prompt_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         turn_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         cancel_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
@@ -1630,6 +1635,17 @@ mod tests {
             parts: Vec<Part>,
             observers: BackendObservers,
         ) -> Result<BackendStream, BridgeError> {
+            let capability = if self.terminal_evidence_v1 {
+                EvidenceCapability::V1
+            } else {
+                EvidenceCapability::Unsupported
+            };
+            observers.terminal_evidence.declare_capability(capability);
+            if self.terminal_evidence_v1 {
+                observers
+                    .terminal_evidence
+                    .record_child_liveness(AcpChildLiveness::Live);
+            }
             if let Some(sink) = observers.rich {
                 sink.record(bridge_core::orch::OrchEventKind::ToolCall {
                     tool_call_id: "tool-1".into(),
@@ -1648,6 +1664,7 @@ mod tests {
         count: AtomicUsize,
         fail: bool,
         fail_prompt: bool,
+        terminal_evidence_v1: AtomicBool,
         observed_count: AtomicUsize,
         last_argv: Mutex<Vec<String>>,
         last_acp_mcp: Mutex<Vec<bridge_core::mcp::McpServerSpec>>,
@@ -1756,6 +1773,7 @@ mod tests {
                 count: AtomicUsize::new(0),
                 fail,
                 fail_prompt: false,
+                terminal_evidence_v1: AtomicBool::new(false),
                 observed_count: AtomicUsize::new(0),
                 last_argv: Mutex::new(vec![]),
                 last_acp_mcp: Mutex::new(vec![]),
@@ -1800,6 +1818,7 @@ mod tests {
                 fail_prompt: AtomicBool::new(self.fail_prompt),
                 configured_turns: Mutex::new(Vec::new()),
                 call_order: Mutex::new(Vec::new()),
+                terminal_evidence_v1: self.terminal_evidence_v1.load(Ordering::SeqCst),
                 prompt_gate: self.prompt_gate.clone(),
                 turn_gate: self.turn_gate.clone(),
                 cancel_gate: self.cancel_gate.clone(),
@@ -2813,6 +2832,95 @@ mod tests {
         );
         assert_eq!(reap_calls.load(Ordering::SeqCst), 1);
         assert!(!resource_exists.load(Ordering::SeqCst));
+    }
+
+    fn dormant_evidence(label: &str) -> Arc<SharedTurnEvidence> {
+        Arc::new(SharedTurnEvidence::dormant(TurnEvidenceBinding {
+            generation: 1,
+            session_id: format!("session-{label}"),
+            turn_id: format!("turn-{label}"),
+            attempt_id: format!("attempt-{label}"),
+            marker_nonce: "00112233445566778899aabbccddeeff".into(),
+        }))
+    }
+
+    async fn assert_lazy_first_turn_observers_preserve_exact_evidence(warm: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(false);
+        spawn.terminal_evidence_v1.store(true, Ordering::SeqCst);
+        let be = if warm {
+            warm_backend(root, spawn, counting_reap().0).await
+        } else {
+            backend(root, spawn, counting_reap().0).await
+        };
+        let label = if warm { "warm-v1" } else { "cold-v1" };
+        let session = SessionId::parse(label).unwrap();
+        be.configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+        let sink = dormant_evidence(label);
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+        let mut stream = be
+            .prompt_with_observers(
+                &session,
+                vec![],
+                BackendObservers::new(observer, None).with_attempt_telemetry(
+                    Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder),
+                    sink.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        assert_eq!(sink.capability(), EvidenceCapability::V1);
+        assert!(sink.binding().is_some());
+        assert_eq!(sink.child_liveness(), AcpChildLiveness::Live);
+        if warm {
+            be.retire().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_first_turn_preserves_prompt_time_v1_and_exact_child_liveness() {
+        assert_lazy_first_turn_observers_preserve_exact_evidence(false).await;
+    }
+
+    #[tokio::test]
+    async fn warm_first_turn_preserves_prompt_time_v1_and_exact_child_liveness() {
+        assert_lazy_first_turn_observers_preserve_exact_evidence(true).await;
+    }
+
+    #[tokio::test]
+    async fn lazy_unsupported_inner_remains_unsupported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let spawn = CountingSpawn::new(false);
+        let be = backend(root, spawn, counting_reap().0).await;
+        let session = SessionId::parse("cold-unsupported").unwrap();
+        be.configure_session(&session, &spec_cwd(root))
+            .await
+            .unwrap();
+        let sink = dormant_evidence("cold-unsupported");
+        let observer = Arc::new(InMemoryDiagnosticObserver::new(16).unwrap());
+        let mut stream = be
+            .prompt_with_observers(
+                &session,
+                vec![],
+                BackendObservers::new(observer, None).with_attempt_telemetry(
+                    Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder),
+                    sink.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        sink.close();
+        assert_eq!(sink.capability(), EvidenceCapability::Unsupported);
+        assert_eq!(sink.observation().0, EvidenceCompleteness::Unsupported);
+        assert_eq!(sink.child_liveness(), AcpChildLiveness::Unknown);
     }
 
     #[tokio::test]

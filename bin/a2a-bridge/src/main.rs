@@ -1752,6 +1752,7 @@ fn run_verify_step(
     profile: Option<&bridge_core::profile::LanguageProfile>,
     clone_cwd: &bridge_core::SessionCwd,
     repo: &std::path::Path,
+    activity: &dyn bridge_core::attempt_activity::AttemptRecorder,
 ) -> verify::VerifyOutcome {
     let profile = match profile {
         None => {
@@ -1776,13 +1777,14 @@ fn run_verify_step(
                 profile.verify_commands.len(),
                 image
             );
-            let outcome = verify::run_verify(
+            let outcome = verify::run_verify_recorded(
                 vcfg,
                 Some(profile),
                 clone_cwd,
                 &cache_vol,
                 &docker_runner,
                 16 * 1024,
+                activity,
             );
             if let verify::VerifyOutcome::Ran(ref verdict) = outcome {
                 for r in &verdict.results {
@@ -2023,6 +2025,7 @@ async fn run_review_step(
     verify_outcome: &verify::VerifyOutcome,
     depth: review::Depth,
     slice: &dyn slice::SliceRunner,
+    telemetry: Arc<ImplementAttemptTelemetry>,
 ) -> (review::ReviewOutcome, String) {
     let rcfg = match review_cfg {
         None => return (review::ReviewOutcome::NotConfigured, String::new()),
@@ -2109,7 +2112,7 @@ async fn run_review_step(
     );
     let ctx = bridge_workflow::executor::WorkflowRunContext {
         session_cwd: Some(clone_cwd.clone()),
-        make_rich_sink: None,
+        make_rich_sink: Some(telemetry),
         ..bridge_workflow::executor::WorkflowRunContext::default()
     };
     let token = tokio_util::sync::CancellationToken::new();
@@ -2163,10 +2166,86 @@ async fn run_direct_implement_turn(
     runner: &dyn turn::TurnRunner,
     session: &bridge_core::ids::SessionId,
     parts: Vec<bridge_core::domain::Part>,
+    telemetry: &ImplementAttemptTelemetry,
 ) -> bool {
+    let turn = match telemetry.next_direct_turn(session) {
+        Ok(turn) => turn,
+        Err(error) => {
+            eprintln!("[implement] turn telemetry setup failed: {error:?}");
+            return false;
+        }
+    };
     runner
-        .run_turn_observed(session, parts, direct_diagnostic_observer())
+        .run_turn_with_telemetry(session, parts, direct_diagnostic_observer(), turn)
         .await
+}
+
+struct ImplementAttemptTelemetry {
+    factory: bridge_core::attempt_activity::AttemptTelemetrySinkFactory,
+    next_generation: std::sync::Mutex<u64>,
+}
+
+impl ImplementAttemptTelemetry {
+    fn new(attempt_id: &str) -> Arc<Self> {
+        Arc::new(Self {
+            factory: bridge_core::attempt_activity::AttemptTelemetrySinkFactory::new(attempt_id),
+            next_generation: std::sync::Mutex::new(1),
+        })
+    }
+
+    fn recorder(&self) -> Arc<dyn bridge_core::attempt_activity::AttemptRecorder> {
+        self.factory.recorder()
+    }
+
+    fn evidence(&self) -> Arc<bridge_core::terminal_evidence::WorkflowTurnEvidenceCollector> {
+        self.factory.evidence()
+    }
+
+    fn next_direct_turn(
+        &self,
+        session: &bridge_core::ids::SessionId,
+    ) -> Result<turn::RecordedTurnTelemetry, BridgeError> {
+        let generation = {
+            let mut next = self
+                .next_generation
+                .lock()
+                .map_err(|_| BridgeError::FrameError)?;
+            let current = *next;
+            match current.checked_add(1) {
+                Some(value) => *next = value,
+                None => self.factory.recorder().mark_overflowed(),
+            }
+            current
+        };
+        let turn_id = bridge_core::attestation::generate_turn_id()?;
+        let (activity, terminal_evidence) = self.factory.telemetry_for_exact_turn(
+            bridge_core::terminal_evidence::EvidenceCapability::Unsupported,
+            generation,
+            session.as_str(),
+            turn_id.as_str(),
+        )?;
+        Ok(turn::RecordedTurnTelemetry {
+            activity,
+            terminal_evidence,
+            turn_meta: Some(bridge_core::permission::TurnMeta {
+                context_id: bridge_core::ids::ContextId::parse(session.as_str().to_string())?,
+                generation,
+                op: bridge_core::ids::OperationId::parse(format!(
+                    "implement-provider-{generation}"
+                ))?,
+                turn_id,
+                requested_mode: bridge_core::attestation::HarvestSanitizationMode::Off,
+                prefix_attestation_request:
+                    bridge_core::attestation::PrefixAttestationRequest::Disabled,
+            }),
+        })
+    }
+}
+
+impl bridge_core::ports::RichEventSinkFactory for ImplementAttemptTelemetry {
+    fn make(&self, node: &bridge_core::ids::NodeId) -> Arc<dyn bridge_core::ports::RichEventSink> {
+        bridge_core::ports::RichEventSinkFactory::make(&self.factory, node)
+    }
 }
 
 struct ProdEffects<'a> {
@@ -2188,6 +2267,9 @@ struct ProdEffects<'a> {
     task: &'a str,
     base_sha: &'a str,
     task_id: &'a str,
+    telemetry: Arc<ImplementAttemptTelemetry>,
+    repository_ordinal: u64,
+    last_head_sha: Option<String>,
     /// Adaptive review depth: Auto = size-based; Forced overrides the auto-selection.
     depth: review::Depth,
 }
@@ -2195,7 +2277,14 @@ struct ProdEffects<'a> {
 #[async_trait::async_trait]
 impl tweak::TweakEffects for ProdEffects<'_> {
     async fn verify(&mut self, _attempt: u32) -> verify::VerifyOutcome {
-        run_verify_step(self.verify_cfg, self.profile, self.clone_cwd, self.repo)
+        let recorder = self.telemetry.recorder();
+        run_verify_step(
+            self.verify_cfg,
+            self.profile,
+            self.clone_cwd,
+            self.repo,
+            recorder.as_ref(),
+        )
     }
     async fn review(
         &mut self,
@@ -2203,6 +2292,15 @@ impl tweak::TweakEffects for ProdEffects<'_> {
         head_sha: &str,
         verify_outcome: &verify::VerifyOutcome,
     ) -> (review::ReviewOutcome, String) {
+        if self.last_head_sha.as_deref() != Some(head_sha) {
+            self.repository_ordinal = self.repository_ordinal.saturating_add(1);
+            self.last_head_sha = Some(head_sha.to_string());
+            let _ = self.telemetry.recorder().record(
+                bridge_core::attempt_activity::AttemptPhase::Checkout,
+                bridge_core::attempt_activity::ActivityReason::RepositoryOrdinal,
+                self.repository_ordinal,
+            );
+        }
         run_review_step(
             self.review_cfg,
             self.wf_map,
@@ -2216,10 +2314,16 @@ impl tweak::TweakEffects for ProdEffects<'_> {
             verify_outcome,
             self.depth,
             &slice::ProdSliceRunner,
+            self.telemetry.clone(),
         )
         .await
     }
-    async fn fix(&mut self, _attempt: u32, input: &str) -> bool {
+    async fn fix(&mut self, attempt: u32, input: &str) -> bool {
+        let _ = self.telemetry.recorder().record(
+            bridge_core::attempt_activity::AttemptPhase::Provider,
+            bridge_core::attempt_activity::ActivityReason::PhaseTransition,
+            u64::from(attempt).saturating_add(1),
+        );
         // Continue the SAME warm session — no new container, no new ACP session (the continuity).
         let template = self
             .fix_template
@@ -2230,7 +2334,16 @@ impl tweak::TweakEffects for ProdEffects<'_> {
         let parts = vec![bridge_core::domain::Part {
             text: bridge_workflow::template::render(template, &vars),
         }];
-        run_direct_implement_turn(self.runner, self.impl_session, parts).await
+        // Every fix turn is its own logical provider turn: a fresh bounded
+        // local scope keeps its resetting provider counters comparable while
+        // the attempt-global tally stays shared.
+        run_direct_implement_turn(
+            self.runner,
+            self.impl_session,
+            parts,
+            self.telemetry.as_ref(),
+        )
+        .await
     }
 }
 
@@ -2438,6 +2551,7 @@ async fn run_warm_loop(
     fix_template: Option<String>,
     prod_ckpt: &mut implement_resume::ProdCheckpoint,
     depth: review::Depth,
+    telemetry: Arc<ImplementAttemptTelemetry>,
 ) -> implement_resume::ImplementPhase {
     let final_ = {
         let mut effects = ProdEffects {
@@ -2454,6 +2568,9 @@ async fn run_warm_loop(
             task,
             base_sha,
             task_id,
+            telemetry: telemetry.clone(),
+            repository_ordinal: 0,
+            last_head_sha: None,
             depth,
         };
         tweak::run_tweak_loop(
@@ -2491,7 +2608,24 @@ async fn run_warm_loop(
     } else {
         implement_resume::ImplementPhase::LoopStopped
     };
-    implement_resume::write_terminal(clone, prod_ckpt.ck.clone(), terminal);
+    let _ = telemetry.recorder().record(
+        bridge_core::attempt_activity::AttemptPhase::TerminalStore,
+        bridge_core::attempt_activity::ActivityReason::ProducerTerminal,
+        1,
+    );
+    if let Some(terminal_checkpoint) =
+        implement_resume::write_terminal(clone, prod_ckpt.ck.clone(), terminal)
+    {
+        telemetry.evidence().close_all();
+        if let Some(tally) = telemetry.recorder().tally() {
+            implement_resume::write_attempt_telemetry(
+                clone,
+                terminal_checkpoint,
+                tally,
+                telemetry.evidence().counts(),
+            );
+        }
+    }
     let _ = runner.retire().await;
     terminal
 }
@@ -2834,10 +2968,14 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
     // `.git/A2A_TASK.md` (no task interpolation), so the prompt itself is small + ASCII regardless of task.
     let edit_vars: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     let edit_input = bridge_workflow::template::render(&warm_impl.edit_template, &edit_vars);
+    let telemetry = ImplementAttemptTelemetry::new(&task_id);
+    // The edit turn is the attempt's first logical provider turn and gets its
+    // own bounded local comparison scope off the shared attempt tally.
     let completed = run_direct_implement_turn(
         warm_runner.as_ref(),
         &warm_impl.impl_session,
         vec![bridge_core::domain::Part { text: edit_input }],
+        telemetry.as_ref(),
     )
     .await;
 
@@ -2924,6 +3062,8 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                             .map(|p| p.id.clone())
                             .unwrap_or_else(|| "none".to_string()),
                     ),
+                    activity_tally: None,
+                    terminal_evidence_counts: None,
                     phase: implement_resume::ImplementPhase::FirstCommitCreated,
                     created_at_ms: implement_resume::now_ms(),
                     updated_at_ms: implement_resume::now_ms(),
@@ -2960,6 +3100,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
                 fix_template,
                 &mut prod_ckpt,
                 depth,
+                telemetry,
             )
             .await;
             merge_after_loop(
@@ -3177,6 +3318,7 @@ async fn implement_resume_cmd(
         prod_ckpt.ck.forced_depth = depth.to_forced_str();
         let _ = implement_resume::save_checkpoint(&clone, &prod_ckpt.ck);
     }
+    let telemetry = ImplementAttemptTelemetry::new(&ck.task_id);
     let outcome_phase = run_warm_loop(
         &clone,
         &ck.source_repo,
@@ -3201,6 +3343,7 @@ async fn implement_resume_cmd(
         fix_template,
         &mut prod_ckpt,
         depth,
+        telemetry,
     )
     .await;
     merge_after_loop(
@@ -3809,6 +3952,20 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     };
     ctx.task_id = task_id;
     ctx.harvest_audit_store = harvest_audit_store;
+    let attempt_telemetry = Arc::new(
+        bridge_core::attempt_activity::AttemptTelemetrySinkFactory::new(
+            identity.attempt_id.as_str().to_string(),
+        ),
+    );
+    let activity_recorder = attempt_telemetry.recorder();
+    let terminal_evidence = attempt_telemetry.evidence();
+    ctx.make_rich_sink =
+        Some(attempt_telemetry as Arc<dyn bridge_core::ports::RichEventSinkFactory>);
+    let _ = activity_recorder.record(
+        bridge_core::attempt_activity::AttemptPhase::Configure,
+        bridge_core::attempt_activity::ActivityReason::PhaseTransition,
+        1,
+    );
 
     let workflow_started = std::time::Instant::now();
     let diagnostic_ctx = bridge_workflow::executor::WorkflowDiagnosticContext::in_memory(ctx);
@@ -3861,6 +4018,14 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     while let Some(item) = stream.next().await {
         match item {
             Ok(WorkflowEvent::NodeStarted { node }) => {
+                let ordinal = u64::from(completed_nodes)
+                    .saturating_add(u64::from(failed_nodes))
+                    .saturating_add(1);
+                let _ = activity_recorder.record(
+                    bridge_core::attempt_activity::AttemptPhase::Provider,
+                    bridge_core::attempt_activity::ActivityReason::PhaseTransition,
+                    ordinal,
+                );
                 eprintln!("[workflow] node {} started", node.as_str());
             }
             Ok(WorkflowEvent::NodeFinished {
@@ -3874,6 +4039,13 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                 } else {
                     failed_nodes = failed_nodes.saturating_add(1);
                 }
+                let completed_set =
+                    u64::from(completed_nodes).saturating_add(u64::from(failed_nodes));
+                let _ = activity_recorder.record(
+                    bridge_core::attempt_activity::AttemptPhase::Waiter,
+                    bridge_core::attempt_activity::ActivityReason::CompletedSetGrowth,
+                    completed_set,
+                );
                 eprintln!(
                     "[workflow] node {} {}",
                     node.as_str(),
@@ -3884,6 +4056,11 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                 disposition,
                 duration_ms,
             }) => {
+                let _ = activity_recorder.record(
+                    bridge_core::attempt_activity::AttemptPhase::Cleanup,
+                    bridge_core::attempt_activity::ActivityReason::PhaseTransition,
+                    1,
+                );
                 cleanup_disposition = disposition.as_str();
                 cleanup_ms = duration_ms;
             }
@@ -3908,6 +4085,109 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let work_ms = prefinal_ms.saturating_sub(cleanup_ms);
     let finalization_started = std::time::Instant::now();
 
+    // Resolve negotiated terminal evidence before publishing either the output
+    // or the process result. Unsupported legacy turns retain their stream
+    // outcome; a v1 resolution is authoritative for both durable and public
+    // projections.
+    let evidence_counts = terminal_evidence.counts();
+    let single_evidence = terminal_evidence.single_turn();
+    let (
+        evidence_capability,
+        evidence_version,
+        evidence_source,
+        evidence_complete,
+        producer_terminal,
+        final_message,
+        process_liveness,
+        resolved_reason,
+    ) = match single_evidence {
+        Some((
+            capability,
+            completeness,
+            producer,
+            final_presence,
+            drained,
+            child_liveness,
+            deliverable_final_present,
+        )) => {
+            let mut resolved_reason = None;
+            if capability == bridge_core::terminal_evidence::EvidenceCapability::V1 {
+                let resolved = bridge_core::terminal_evidence::resolve_terminal(
+                    bridge_core::terminal_evidence::TerminalObservation {
+                        capability,
+                        completeness,
+                        producer,
+                        final_presence,
+                        prompt_rpc: if terminal_outcome == "completed" {
+                            bridge_core::terminal_evidence::PromptRpcObservation::Resolved
+                        } else {
+                            bridge_core::terminal_evidence::PromptRpcObservation::RejectedAcceptedOrUncertain
+                        },
+                        ordered_notifications_drained: drained,
+                        deliverable_final_present,
+                        child_liveness,
+                    },
+                );
+                terminal_outcome = resolved.outcome.as_str();
+                resolved_reason = Some(resolved.reason.as_str());
+            }
+            (
+                match capability {
+                    bridge_core::terminal_evidence::EvidenceCapability::Unsupported => {
+                        "unsupported"
+                    }
+                    bridge_core::terminal_evidence::EvidenceCapability::MalformedAdvertisement
+                    | bridge_core::terminal_evidence::EvidenceCapability::V1 => "v1",
+                },
+                match capability {
+                    bridge_core::terminal_evidence::EvidenceCapability::Unsupported => "none",
+                    bridge_core::terminal_evidence::EvidenceCapability::MalformedAdvertisement
+                    | bridge_core::terminal_evidence::EvidenceCapability::V1 => "v1",
+                },
+                if completeness == bridge_core::terminal_evidence::EvidenceCompleteness::Complete {
+                    "adapter"
+                } else {
+                    "none"
+                },
+                completeness == bridge_core::terminal_evidence::EvidenceCompleteness::Complete,
+                match producer {
+                    bridge_core::terminal_evidence::ProducerTerminal::Unknown => "unknown",
+                    bridge_core::terminal_evidence::ProducerTerminal::Completed => "completed",
+                    bridge_core::terminal_evidence::ProducerTerminal::Interrupted => "interrupted",
+                    bridge_core::terminal_evidence::ProducerTerminal::Failed => "failed",
+                },
+                match final_presence {
+                    bridge_core::terminal_evidence::FinalPresence::Unknown => "unknown",
+                    bridge_core::terminal_evidence::FinalPresence::Nonempty => "nonempty",
+                    bridge_core::terminal_evidence::FinalPresence::Absent => "absent",
+                },
+                match child_liveness {
+                    bridge_core::terminal_evidence::AcpChildLiveness::Unknown => "unknown",
+                    bridge_core::terminal_evidence::AcpChildLiveness::Live => "live",
+                    bridge_core::terminal_evidence::AcpChildLiveness::Exited => "exited",
+                },
+                resolved_reason,
+            )
+        }
+        None => (
+            if evidence_counts.reached == 0 {
+                "not_applicable"
+            } else {
+                "unknown"
+            },
+            "none",
+            "none",
+            evidence_counts.reached == 0,
+            "unknown",
+            "unknown",
+            "unknown",
+            None,
+        ),
+    };
+    if terminal_outcome != "completed" {
+        ok = false;
+    }
+
     // Write output.
     let output_error = if let Some(out) = out_path {
         std::fs::write(&out, &output)
@@ -3924,11 +4204,27 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let finalization_ms =
         u64::try_from(finalization_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    // The primary offline result/output is published first; summary finalization cannot roll it back.
+    // The resolved result/output is published before summary finalization; a
+    // summary-store failure cannot roll back bytes already handed to the caller.
     if let Some(store) = history_store {
         let end_to_end_ms =
             u64::try_from(workflow_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let telemetry_complete = terminal_seen && offline_telemetry.reason().is_none();
+        let _ = activity_recorder.record(
+            bridge_core::attempt_activity::AttemptPhase::TerminalStore,
+            bridge_core::attempt_activity::ActivityReason::PhaseTransition,
+            1,
+        );
+        let telemetry_complete = terminal_seen
+            && offline_telemetry.reason().is_none()
+            && !evidence_counts.overflowed
+            && activity_recorder
+                .tally()
+                .is_some_and(|tally| !tally.overflowed);
+        let terminal_reason = if output_error.is_some() {
+            "output_write_failed"
+        } else {
+            resolved_reason.unwrap_or(terminal_outcome)
+        };
         let terminal = bridge_core::workflow_history::AttemptTerminal {
             completed_ms: bridge_core::task_store::system_wall_now_ms(),
             work_ms,
@@ -3938,19 +4234,15 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             cleanup_ms,
             finalization_ms,
             outcome: terminal_outcome.into(),
-            terminal_reason: if output_error.is_some() {
-                "output_write_failed"
-            } else {
-                terminal_outcome
-            }
-            .into(),
-            producer_terminal: "unknown".into(),
-            final_message: "unknown".into(),
-            process_liveness: "unknown".into(),
-            terminal_evidence_capability: "unsupported".into(),
-            terminal_evidence_version: "none".into(),
-            terminal_evidence_source: "none".into(),
-            terminal_evidence_complete: false,
+            terminal_reason: terminal_reason.into(),
+            producer_terminal: producer_terminal.into(),
+            final_message: final_message.into(),
+            process_liveness: process_liveness.into(),
+            terminal_evidence_capability: evidence_capability.into(),
+            terminal_evidence_version: evidence_version.into(),
+            terminal_evidence_source: evidence_source.into(),
+            terminal_evidence_complete: evidence_complete,
+            terminal_evidence_counts: evidence_counts,
             degraded: terminal_outcome != "completed" || !telemetry_complete,
             prompt_acceptance: "unknown".into(),
             cleanup_disposition: cleanup_disposition.into(),
@@ -3990,6 +4282,20 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             }
             Err(error) => Some(error.reason),
         };
+        if unavailable.is_none() {
+            if let Some(tally) = activity_recorder.tally() {
+                if let Err(error) =
+                    bridge_core::workflow_history::WorkflowHistoryStore::record_activity_tally(
+                        store.as_ref(),
+                        &identity.attempt_id,
+                        &tally,
+                    )
+                    .await
+                {
+                    eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
+                }
+            }
+        }
         if let Some(reason) = unavailable {
             eprintln!("telemetry_unavailable{{reason={}}}", reason.as_str());
         }
@@ -4852,6 +5158,19 @@ Send one unary message to a running a2a-bridge serve and print the response text
   --mode <m>      override the agent mode for this message
   --cwd <dir>     override the session cwd for this message";
 
+fn submit_failure_message(error: &serde_json::Value) -> &str {
+    error
+        .pointer("/data/deepest_cause")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            error
+                .pointer("/data/code")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| error.get("message").and_then(serde_json::Value::as_str))
+        .unwrap_or("request failed")
+}
+
 async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
     let identity = bridge_core::ids::AttemptIdentity::initial()?;
     println!("execution_id={}", identity.execution_id.as_str());
@@ -4915,7 +5234,7 @@ async fn submit_cmd(args: &[String]) -> Result<(), BoxError> {
     )
     .await?;
     if let Some(err) = v.get("error") {
-        return Err(format!("submit failed: {err}").into());
+        return Err(format!("submit failed: {}", submit_failure_message(err)).into());
     }
     let out = v["result"]["artifact"]["text"]
         .as_str()
@@ -5260,6 +5579,10 @@ fn require_config_path(explicit: Option<PathBuf>) -> Result<PathBuf, BoxError> {
 /// (no bridge repo needed at runtime). `(relative-output-path, contents)`.
 const INIT_PROMPTS: &[(&str, &str)] = &[
     (
+        "prompts/review-sol-risk.md",
+        include_str!("../../../prompts/review-sol-risk.md"),
+    ),
+    (
         "prompts/review-implement.md",
         include_str!("../../../prompts/review-implement.md"),
     ),
@@ -5330,15 +5653,16 @@ fn known_init_agents() -> [(&'static str, Option<&'static str>); 4] {
     ]
 }
 
-/// A TOML `[[agents]]` fragment for one known agent. `model`/`effort` are shown;
-/// `mode` is intentionally omitted (a bad `mode` HARD-fails session/set_mode).
+/// A TOML `[[agents]]` fragment for one known agent. The default Codex reviewer is
+/// deliberately pinned to Sol/xhigh/read-only; the other fragments retain their
+/// provider-appropriate defaults.
 fn agent_fragment(name: &str) -> &'static str {
     match name {
         "kiro" => {
             "\n# kiro: zero-auth local default (kiro-cli acp). ACP SDK 1.x can discover Kiro's\n# native model list, but cannot apply Kiro model pins unless the catalog marks\n# the agent `model_configurable: true`; leave model unpinned by default.\n[[agents]]\nid   = \"kiro\"\ncmd  = \"kiro-cli\"\nargs = [\"acp\"]\n"
         }
         "codex" => {
-            "\n# codex: gpt-5.5 with reasoning_effort. Run `codex login` first; the\n# existing login is ambient, so the bridge must not restart browser auth.\n[[agents]]\nid    = \"codex\"\ncmd   = \"codex-acp\"\npre_authenticated = true\nmodel = \"gpt-5.5\"\neffort = \"high\"\n"
+            "\n# codex: default code reviews use Sol/xhigh with a hard read-only sandbox. Run `codex login`\n# first; the existing login is ambient, so the bridge must not restart browser auth.\n[[agents]]\nid    = \"codex\"\ncmd   = \"codex-acp\"\npre_authenticated = true\nmodel = \"gpt-5.6-sol\"\neffort = \"xhigh\"\nmode = \"read-only\"\nargs = [\"-c\", \"sandbox_mode=\\\"read-only\\\"\", \"-c\", \"approval_policy=\\\"never\\\"\"]\n"
         }
         "claude" => {
             "\n# claude: subscription. `model` is validated against the advertised values and\n# applied. Fable ids are blocked by this bridge; use another advertised model.\n[[agents]]\nid    = \"claude\"\ncmd   = \"claude-agent-acp\"\nmodel = \"sonnet\"\n"
@@ -5354,6 +5678,11 @@ fn agent_fragment(name: &str) -> &'static str {
 /// All reference both `codex` and `claude`, so they're only emitted when both
 /// are selected (else `load_workflows` would fail on a missing agent at boot).
 const INIT_WORKFLOWS: &str = r#"
+[[prompts]]
+id = "review-sol-risk"
+file = "prompts/review-sol-risk.md"
+description = "single Sol review with real-world risk and repair triage"
+
 [[prompts]]
 id = "review-correctness"
 file = "prompts/review-correctness.md"
@@ -5424,43 +5753,23 @@ id = "design-synth"
 file = "prompts/design-synth.md"
 description = "design synthesis prompt"
 
-# ── Review workflows (two independent lenses + a synthesis) ──
+# ── Default code review: one Sol/xhigh pass with post-review risk/cost triage ──
 [[workflows]]
 id = "code-review"
 [[workflows.nodes]]
-id = "correctness"
+id = "review"
 agent = "codex"
-prompt = "review-correctness"
+prompt = "review-sol-risk"
 inputs = []
-[[workflows.nodes]]
-id = "architecture"
-agent = "claude"
-prompt = "review-architecture"
-inputs = []
-[[workflows.nodes]]
-id = "synth"
-agent = "claude"
-prompt = "review-synth"
-inputs = ["correctness", "architecture"]
 
-# ── implement-review (B2b-3a): two folded reviewers of the committed diff → synth verdict ──
+# ── implement-review: the same one-turn Sol/xhigh risk-triaged review ──
 [[workflows]]
 id = "implement-review"
 [[workflows.nodes]]
-id = "reviewer_codex"
+id = "review"
 agent = "codex"
-prompt = "review-implement"
+prompt = "review-sol-risk"
 inputs = []
-[[workflows.nodes]]
-id = "reviewer_claude"
-agent = "claude"
-prompt = "review-implement"
-inputs = []
-[[workflows.nodes]]
-id = "synth"
-agent = "claude"
-prompt = "review-implement-synth"
-inputs = ["reviewer_codex", "reviewer_claude"]
 
 [[workflows]]
 id = "spec-review"
@@ -7953,6 +8262,30 @@ mod cli_tests {
     use crate::turn::TurnRunner;
 
     #[test]
+    fn submit_failure_prefers_deepest_sanitized_cause_then_bounded_code() {
+        let diagnostic = serde_json::json!({
+            "message": "internal",
+            "data": {
+                "code": "provider.limit",
+                "deepest_cause": "quota window exhausted"
+            }
+        });
+        assert_eq!(
+            submit_failure_message(&diagnostic),
+            "quota window exhausted"
+        );
+        let code_only = serde_json::json!({
+            "message": "internal",
+            "data": { "code": "provider.limit" }
+        });
+        assert_eq!(submit_failure_message(&code_only), "provider.limit");
+        assert_eq!(
+            submit_failure_message(&serde_json::json!({ "message": "internal" })),
+            "internal"
+        );
+    }
+
+    #[test]
     fn turn_log_observer_enabled_for_traces_even_without_metrics() {
         let metrics = config::MetricsConfig {
             enabled: false,
@@ -8058,6 +8391,7 @@ mod cli_tests {
                     terminal_evidence_version: "none".into(),
                     terminal_evidence_source: "none".into(),
                     terminal_evidence_complete: false,
+                    terminal_evidence_counts: Default::default(),
                     degraded: true,
                     prompt_acceptance: "dispatch_uncertain".into(),
                     cleanup_disposition: "complete".into(),
@@ -8800,6 +9134,7 @@ inputs = []
         let session = bridge_core::ids::SessionId::parse("implement-observed").unwrap();
 
         for completed in [true, false] {
+            let telemetry = ImplementAttemptTelemetry::new("implement-observed-attempt");
             let runner = ObservedOnlyTurnRunner {
                 completed,
                 observed: std::sync::atomic::AtomicUsize::new(0),
@@ -8811,6 +9146,7 @@ inputs = []
                 vec![bridge_core::domain::Part {
                     text: "implement payload".into(),
                 }],
+                telemetry.as_ref(),
             )
             .await;
 
@@ -8823,7 +9159,335 @@ inputs = []
                     vec!["implement payload".to_string()]
                 )]
             );
+            let counts = telemetry.evidence().counts();
+            assert_eq!(counts.reached, 1);
+            assert_eq!(counts.valid, 0);
+            assert_eq!(counts.missing, 0);
+            assert_eq!(counts.invalid, 0);
         }
+    }
+
+    #[derive(Default)]
+    struct ReviewTelemetryState {
+        activity_owned: std::sync::atomic::AtomicBool,
+        evidence_bound: std::sync::atomic::AtomicBool,
+    }
+
+    struct ReviewTelemetryBackend {
+        state: Arc<ReviewTelemetryState>,
+    }
+
+    #[async_trait::async_trait]
+    impl bridge_core::ports::AgentBackend for ReviewTelemetryBackend {
+        async fn prompt(
+            &self,
+            _session: &bridge_core::ids::SessionId,
+            _parts: Vec<bridge_core::domain::Part>,
+        ) -> Result<bridge_core::ports::BackendStream, BridgeError> {
+            panic!("review must use the observer-bearing prompt seam")
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            _session: &bridge_core::ids::SessionId,
+            _parts: Vec<bridge_core::domain::Part>,
+            observers: bridge_core::ports::BackendObservers,
+        ) -> Result<bridge_core::ports::BackendStream, BridgeError> {
+            self.state.activity_owned.store(
+                observers
+                    .activity
+                    .record(
+                        bridge_core::attempt_activity::AttemptPhase::Provider,
+                        bridge_core::attempt_activity::ActivityReason::MessageDelta,
+                        1,
+                    )
+                    .is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.state.evidence_bound.store(
+                observers.terminal_evidence.binding().is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Ok(Box::pin(tokio_stream::iter(vec![
+                Ok(bridge_core::ports::Update::Text(
+                    "VERDICT: APPROVE\nSUMMARY: review telemetry reached".into(),
+                )),
+                Ok(bridge_core::ports::Update::Done {
+                    stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
+                }),
+            ])))
+        }
+
+        async fn cancel(&self, _session: &bridge_core::ids::SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct ReviewTelemetryLease;
+    impl bridge_core::ports::Lease for ReviewTelemetryLease {}
+
+    struct ReviewTelemetryRegistry {
+        backend: Arc<ReviewTelemetryBackend>,
+    }
+
+    #[async_trait::async_trait]
+    impl bridge_core::ports::AgentRegistry for ReviewTelemetryRegistry {
+        async fn resolve(
+            &self,
+            id: &bridge_core::ids::AgentId,
+        ) -> Result<bridge_core::ports::Resolved, BridgeError> {
+            assert_eq!(id.as_str(), "codex");
+            Ok(bridge_core::ports::Resolved {
+                entry: Arc::new(acp_entry("codex")),
+                backend: self.backend.clone(),
+                lease: Box::new(ReviewTelemetryLease),
+            })
+        }
+
+        fn default_id(&self) -> bridge_core::ids::AgentId {
+            bridge_core::ids::AgentId::parse("codex").unwrap()
+        }
+
+        async fn apply(
+            &self,
+            _snapshot: bridge_core::domain::RegistrySnapshot,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn list(&self) -> Vec<bridge_core::ids::AgentId> {
+            vec![self.default_id()]
+        }
+    }
+
+    struct NoReviewSlice;
+
+    #[async_trait::async_trait]
+    impl slice::SliceRunner for NoReviewSlice {
+        async fn produce(
+            &self,
+            _clone: &std::path::Path,
+            _base: &str,
+            _head: &str,
+            _prism: &std::path::Path,
+            _timeout: std::time::Duration,
+        ) -> Option<String> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn r2f0b_implement_review_uses_attempt_owned_activity_and_terminal_evidence() {
+        let state = Arc::new(ReviewTelemetryState::default());
+        let executor =
+            bridge_workflow::executor::WorkflowExecutor::new(Arc::new(ReviewTelemetryRegistry {
+                backend: Arc::new(ReviewTelemetryBackend {
+                    state: state.clone(),
+                }),
+            }));
+        let workflow_id = bridge_core::ids::WorkflowId::parse("implement-review").unwrap();
+        let graph = Arc::new(bridge_workflow::graph::WorkflowGraph {
+            id: workflow_id.clone(),
+            nodes: vec![bridge_workflow::graph::WorkflowNode {
+                id: bridge_core::ids::NodeId::parse("review").unwrap(),
+                agent: bridge_core::ids::AgentId::parse("codex").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: vec![],
+                retry: None,
+                harvest_sanitization: None,
+            }],
+            panel: None,
+        });
+        let workflows = std::collections::HashMap::from([(workflow_id.clone(), graph)]);
+        let review_cfg = Some(Ok(config::ReviewConfig {
+            workflow: workflow_id,
+            max_output_bytes: 16 * 1024,
+            timeout: std::time::Duration::from_secs(2),
+            slice_cmd: "/unused/prism".into(),
+            slice_timeout: std::time::Duration::from_millis(50),
+            slice_max_bytes: 1024,
+            light_max_lines: 1,
+            light_max_files: 1,
+            thorough_min_lines: 10,
+            thorough_min_files: 10,
+            default_depth: review::Depth::Forced(review::Tier::Standard),
+        }));
+        let directory = tempfile::tempdir().unwrap();
+        let clone_cwd =
+            bridge_core::SessionCwd::parse(&directory.path().to_string_lossy()).unwrap();
+        let telemetry = ImplementAttemptTelemetry::new("implement-review-attempt");
+
+        let (outcome, _) = run_review_step(
+            &review_cfg,
+            &workflows,
+            &executor,
+            "review task",
+            "base",
+            "head",
+            &clone_cwd,
+            "review-task",
+            1,
+            &verify::VerifyOutcome::NotConfigured,
+            review::Depth::Forced(review::Tier::Standard),
+            &NoReviewSlice,
+            telemetry.clone(),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            review::ReviewOutcome::Ran {
+                verdict: review::Verdict::Approve,
+                ..
+            }
+        ));
+        assert!(
+            state
+                .activity_owned
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "review activity must feed the implement attempt recorder"
+        );
+        assert!(
+            state
+                .evidence_bound
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "review terminal evidence must carry an attempt-owned binding"
+        );
+        assert_eq!(telemetry.evidence().counts().reached, 1);
+    }
+
+    /// Registry stub for effects tests that never dispatch a workflow node.
+    struct UnusedRegistry;
+
+    #[async_trait::async_trait]
+    impl bridge_core::ports::AgentRegistry for UnusedRegistry {
+        async fn resolve(
+            &self,
+            _id: &bridge_core::ids::AgentId,
+        ) -> Result<bridge_core::ports::Resolved, BridgeError> {
+            Err(BridgeError::UnknownAgent {
+                id: "unused".into(),
+            })
+        }
+
+        fn default_id(&self) -> bridge_core::ids::AgentId {
+            bridge_core::ids::AgentId::parse("unused").expect("fixed id is valid")
+        }
+
+        async fn apply(
+            &self,
+            _snapshot: bridge_core::domain::RegistrySnapshot,
+        ) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn list(&self) -> Vec<bridge_core::ids::AgentId> {
+            Vec::new()
+        }
+    }
+
+    /// Captures the classification each provider-turn advance receives through
+    /// the exact recorder the production fix path hands the turn runner.
+    struct ScopeProbeRunner {
+        turns: Vec<Vec<u64>>,
+        calls: std::sync::atomic::AtomicUsize,
+        kinds: std::sync::Mutex<Vec<bridge_core::attempt_activity::ActivityKind>>,
+    }
+
+    #[async_trait::async_trait]
+    impl turn::TurnRunner for ScopeProbeRunner {
+        async fn run_turn(
+            &self,
+            _session: &bridge_core::ids::SessionId,
+            _parts: Vec<bridge_core::domain::Part>,
+        ) -> bool {
+            panic!("production implement turns must use run_turn_recorded")
+        }
+
+        async fn run_turn_recorded(
+            &self,
+            _session: &bridge_core::ids::SessionId,
+            _parts: Vec<bridge_core::domain::Part>,
+            _observer: Arc<dyn bridge_core::ports::DiagnosticObserver>,
+            activity: Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
+        ) -> bool {
+            let index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            for advance in &self.turns[index] {
+                if let Some(observed) = activity.record(
+                    bridge_core::attempt_activity::AttemptPhase::Provider,
+                    bridge_core::attempt_activity::ActivityReason::MessageDelta,
+                    *advance,
+                ) {
+                    self.kinds.lock().unwrap().push(observed.kind);
+                }
+            }
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn r2f0b_each_warm_fix_turn_gets_its_own_bounded_local_scope() {
+        use bridge_core::attempt_activity::ActivityKind;
+        use tweak::TweakEffects;
+
+        let runner = ScopeProbeRunner {
+            // Edit-shaped first turn emits cumulative advance 100; the later fix
+            // turn resets its provider counters and emits 5 twice.
+            turns: vec![vec![100], vec![5, 5]],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            kinds: std::sync::Mutex::new(Vec::new()),
+        };
+        let executor = bridge_workflow::executor::WorkflowExecutor::new(Arc::new(UnusedRegistry));
+        let wf_map = std::collections::HashMap::new();
+        let verify_cfg = None;
+        let review_cfg = None;
+        let directory = tempfile::tempdir().unwrap();
+        let clone_cwd =
+            bridge_core::SessionCwd::parse(&directory.path().to_string_lossy()).unwrap();
+        let session = bridge_core::ids::SessionId::parse("implement-scope").unwrap();
+        let telemetry = ImplementAttemptTelemetry::new("scope-task");
+        let mut effects = ProdEffects {
+            verify_cfg: &verify_cfg,
+            profile: None,
+            review_cfg: &review_cfg,
+            wf_map: &wf_map,
+            executor: &executor,
+            runner: &runner,
+            impl_session: &session,
+            fix_template: Some("{{input}}".to_string()),
+            clone_cwd: &clone_cwd,
+            repo: directory.path(),
+            task: "task",
+            base_sha: "base",
+            task_id: "scope-task",
+            telemetry: telemetry.clone(),
+            repository_ordinal: 0,
+            last_head_sha: None,
+            depth: review::Depth::Auto,
+        };
+
+        assert!(effects.fix(1, "first").await);
+        assert!(effects.fix(2, "second").await);
+
+        let kinds = runner.kinds.lock().unwrap().clone();
+        assert_eq!(
+            kinds.as_slice(),
+            &[
+                ActivityKind::MeaningfulProgress,
+                ActivityKind::MeaningfulProgress,
+                ActivityKind::Activity,
+            ],
+            "a later smaller real advance in a fresh provider turn is meaningful progress; \
+             a duplicate within the same turn stays activity"
+        );
+        let tally = telemetry.recorder().tally().expect("attempt-global tally");
+        assert!(!tally.overflowed);
+        assert!(
+            tally.max_advance >= 105,
+            "the attempt tally accumulates across turns, got {}",
+            tally.max_advance
+        );
     }
 
     fn cr_entry(id: &str, mount: &str) -> AgentEntry {
@@ -10037,6 +10701,7 @@ cmd = "true"
             profile.as_ref(),
             &bridge_core::SessionCwd::parse("/tmp").unwrap(),
             std::path::Path::new("/tmp"),
+            &bridge_core::attempt_activity::NoopAttemptRecorder,
         );
         assert!(
             matches!(outcome, verify::VerifyOutcome::ConfigError),
@@ -10068,7 +10733,7 @@ cmd = "true"
             .load_workflows(dir.path())
             .unwrap();
         let workflow_id = bridge_core::ids::WorkflowId::parse("code-review").unwrap();
-        let node_id = bridge_core::ids::NodeId::parse("correctness").unwrap();
+        let node_id = bridge_core::ids::NodeId::parse("review").unwrap();
         let node = workflows
             .get(&workflow_id)
             .unwrap()
@@ -10078,8 +10743,13 @@ cmd = "true"
             .unwrap();
         assert_eq!(
             node.prompt_template,
-            include_str!("../../../prompts/review-correctness.md")
+            include_str!("../../../prompts/review-sol-risk.md")
         );
+        assert_eq!(node.agent.as_str(), "codex");
+        assert_eq!(workflows.get(&workflow_id).unwrap().nodes.len(), 1);
+        assert!(raw.contains("model = \"gpt-5.6-sol\""));
+        assert!(raw.contains("effort = \"xhigh\""));
+        assert!(raw.contains("mode = \"read-only\""));
     }
 
     #[test]
@@ -12249,6 +12919,7 @@ cmd = "cargo build --locked"
     fn reviewer_prompts_carry_line_by_line_and_git_archaeology() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../prompts");
         let reviewers = [
+            "review-sol-risk.md",
             "review-implement.md",
             "review-implement-refine.md",
             "review-correctness.md",

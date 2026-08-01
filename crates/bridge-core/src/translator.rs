@@ -186,13 +186,44 @@ impl Translator {
         turn_context: crate::ports::TurnContext,
         harvest_audit_store: Arc<dyn HarvestAuditStore>,
     ) -> Pin<Box<dyn Stream<Item = Result<Event, BridgeError>> + Send + 'a>> {
+        self.run_observed_with_attempt_telemetry(
+            backend,
+            store,
+            policy,
+            task,
+            session,
+            parts,
+            diagnostic,
+            turn_context,
+            harvest_audit_store,
+            Arc::new(crate::attempt_activity::NoopAttemptRecorder),
+            Arc::new(crate::terminal_evidence::SharedTurnEvidence::unsupported()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_observed_with_attempt_telemetry<'a>(
+        &self,
+        backend: &'a dyn AgentBackend,
+        store: &'a dyn SessionStore,
+        policy: &'a dyn PolicyEngine,
+        task: &'a TaskId,
+        session: &'a SessionId,
+        parts: Vec<Part>,
+        diagnostic: Arc<dyn DiagnosticObserver>,
+        turn_context: crate::ports::TurnContext,
+        harvest_audit_store: Arc<dyn HarvestAuditStore>,
+        activity: Arc<dyn crate::attempt_activity::AttemptRecorder>,
+        terminal_evidence: Arc<dyn crate::terminal_evidence::TerminalEvidenceSink>,
+    ) -> Pin<Box<dyn Stream<Item = Result<Event, BridgeError>> + Send + 'a>> {
         let max_chunk = self.max_chunk;
         Box::pin(async_stream::try_stream! {
             let mut stream = backend
                 .prompt_with_observers(
                     session,
                     parts,
-                    BackendObservers::diagnostic_only(diagnostic),
+                    BackendObservers::diagnostic_only(diagnostic)
+                        .with_attempt_telemetry(activity, terminal_evidence.clone()),
                 )
                 .await?;
             // Accumulated text awaiting flush as a Status chunk.
@@ -208,6 +239,19 @@ impl Translator {
                         artifact_text.push_str(&t);
                         acc.push_str(&t);
                         // Flush as many full chunks as the accumulator allows.
+                        while acc.chars().count() >= max_chunk {
+                            let chunk: String = acc.chars().take(max_chunk).collect();
+                            acc = acc.chars().skip(max_chunk).collect();
+                            yield Event::status(chunk);
+                        }
+                    }
+                    Ok(Update::FinalAnswer(t)) => {
+                        saw_text_delta = true;
+                        if !t.is_empty() {
+                            terminal_evidence.record_deliverable_final();
+                        }
+                        artifact_text.push_str(&t);
+                        acc.push_str(&t);
                         while acc.chars().count() >= max_chunk {
                             let chunk: String = acc.chars().take(max_chunk).collect();
                             acc = acc.chars().skip(max_chunk).collect();
@@ -291,10 +335,13 @@ impl Translator {
                     }
                 }
             }
-            // Stream ended without a terminal Done: flush any remaining text.
+            // A direct-unary producer must terminate with Done or a structured
+            // error. Preserve already-emitted commentary, then fail explicitly;
+            // clean EOF is never implicit completion.
             if !acc.is_empty() {
                 yield Event::status(acc);
             }
+            Err(BridgeError::MissingTerminal)?;
         })
     }
 }
@@ -797,25 +844,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_ends_without_done_flushes_trailing_text() {
-        // No Done frame: the trailing coalesced text must still flush as a Status event.
+    async fn stream_ends_without_done_flushes_then_reports_missing_terminal() {
+        // No Done frame: trailing commentary remains observable, but EOF is a
+        // typed terminal failure rather than an implicit success.
         let be = FakeBackend::new(vec![Ok(Update::Text("trailing".into()))]);
         let st = FakeStore::default();
         let pol = AutoApprove;
         let (t, s) = ids();
-        // Exercise Default for Translator and Event::text() here too.
-        let evs: Vec<Event> = Translator::default()
+        let evs = Translator::default()
             .run(&be, &st, &pol, &t, &s, vec![])
             .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].kind(), &EventKind::Status);
-        assert_eq!(evs[0].text(), "trailing");
-        // No Done => no Artifact emitted.
-        assert!(evs.iter().all(|e| e.kind() != &EventKind::Artifact));
+            .await;
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].as_ref().unwrap().kind(), &EventKind::Status);
+        assert_eq!(evs[0].as_ref().unwrap().text(), "trailing");
+        assert_eq!(evs[1].as_ref().unwrap_err(), &BridgeError::MissingTerminal);
+    }
+
+    #[tokio::test]
+    async fn r2f0b_commentary_text_does_not_prove_deliverable_final() {
+        let backend = FakeBackend::new(vec![
+            Ok(Update::Text("commentary only".into())),
+            Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
+            }),
+        ]);
+        let store = FakeStore::default();
+        let policy = AutoApprove;
+        let (task, session) = ids();
+        let evidence = Arc::new(crate::terminal_evidence::SharedTurnEvidence::unsupported());
+        let events = Translator::new()
+            .run_observed_with_attempt_telemetry(
+                &backend,
+                &store,
+                &policy,
+                &task,
+                &session,
+                vec![],
+                Arc::new(MarkerDiagnosticObserver),
+                default_turn_context(&task, &session),
+                Arc::new(NoopHarvestAuditStore),
+                Arc::new(crate::attempt_activity::NoopAttemptRecorder),
+                evidence.clone(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.into_iter().all(|event| event.is_ok()));
+        assert!(
+            !crate::terminal_evidence::TerminalEvidenceSink::deliverable_final_present(
+                evidence.as_ref(),
+            ),
+            "commentary must not manufacture final delivery"
+        );
+    }
+    #[tokio::test]
+    async fn r2f0b_commentary_then_failure_does_not_prove_direct_delivery() {
+        let backend = FakeBackend::new(vec![
+            Ok(Update::Text("commentary before failure".into())),
+            Err(BridgeError::AgentTimedOut),
+        ]);
+        let store = FakeStore::default();
+        let policy = AutoApprove;
+        let (task, session) = ids();
+        let evidence = Arc::new(crate::terminal_evidence::SharedTurnEvidence::unsupported());
+        let events = Translator::new()
+            .run_observed_with_attempt_telemetry(
+                &backend,
+                &store,
+                &policy,
+                &task,
+                &session,
+                vec![],
+                Arc::new(MarkerDiagnosticObserver),
+                default_turn_context(&task, &session),
+                Arc::new(NoopHarvestAuditStore),
+                Arc::new(crate::attempt_activity::NoopAttemptRecorder),
+                evidence.clone(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.last().is_some_and(Result::is_err));
+        assert!(
+            !crate::terminal_evidence::TerminalEvidenceSink::deliverable_final_present(
+                evidence.as_ref(),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn r2f0b_only_nonempty_final_answer_proves_direct_delivery() {
+        for (final_text, expected) in [("", false), ("answer", true)] {
+            let backend = FakeBackend::new(vec![
+                Ok(Update::Text("commentary".into())),
+                Ok(Update::FinalAnswer(final_text.into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
+                }),
+            ]);
+            let store = FakeStore::default();
+            let policy = AutoApprove;
+            let (task, session) = ids();
+            let evidence = Arc::new(crate::terminal_evidence::SharedTurnEvidence::unsupported());
+            let events = Translator::new()
+                .run_observed_with_attempt_telemetry(
+                    &backend,
+                    &store,
+                    &policy,
+                    &task,
+                    &session,
+                    vec![],
+                    Arc::new(MarkerDiagnosticObserver),
+                    default_turn_context(&task, &session),
+                    Arc::new(NoopHarvestAuditStore),
+                    Arc::new(crate::attempt_activity::NoopAttemptRecorder),
+                    evidence.clone(),
+                )
+                .collect::<Vec<_>>()
+                .await;
+            assert!(events.into_iter().all(|event| event.is_ok()));
+            assert_eq!(
+                crate::terminal_evidence::TerminalEvidenceSink::deliverable_final_present(
+                    evidence.as_ref(),
+                ),
+                expected,
+            );
+        }
     }
 
     #[tokio::test]
@@ -830,8 +985,21 @@ mod tests {
         let st = FakeStore::default();
         let pol = AutoApprove;
         let (t, s) = ids();
+        let evidence = Arc::new(crate::terminal_evidence::SharedTurnEvidence::unsupported());
         let evs: Vec<Event> = Translator::new()
-            .run(&be, &st, &pol, &t, &s, vec![])
+            .run_observed_with_attempt_telemetry(
+                &be,
+                &st,
+                &pol,
+                &t,
+                &s,
+                vec![],
+                Arc::new(MarkerDiagnosticObserver),
+                default_turn_context(&t, &s),
+                Arc::new(NoopHarvestAuditStore),
+                Arc::new(crate::attempt_activity::NoopAttemptRecorder),
+                evidence.clone(),
+            )
             .collect::<Vec<_>>()
             .await
             .into_iter()
@@ -840,6 +1008,12 @@ mod tests {
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].kind(), &EventKind::Artifact);
         assert_eq!(evs[0].text(), "ran_out_of_turns");
+        assert!(
+            !crate::terminal_evidence::TerminalEvidenceSink::deliverable_final_present(
+                evidence.as_ref(),
+            ),
+            "a bridge-synthetic stop reason is not delivered model text"
+        );
     }
 
     #[tokio::test]

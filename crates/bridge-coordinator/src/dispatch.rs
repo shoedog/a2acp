@@ -110,6 +110,33 @@ pub enum WarmCompletionExit<'a> {
     Error(&'a BridgeError),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetachedCleanupDisposition {
+    Complete,
+    Failed,
+    OwnerHeld,
+}
+
+/// Observable custody for one exact cleanup flight. Constructing this value
+/// transfers the warm claim before durable terminal publication; awaiting it is
+/// deliberately separate from response delivery.
+pub struct DetachedWarmCleanup {
+    task: Option<tokio::task::JoinHandle<Result<(), BridgeError>>>,
+    immediate: Option<DetachedCleanupDisposition>,
+}
+
+impl DetachedWarmCleanup {
+    pub async fn settle(self) -> DetachedCleanupDisposition {
+        if let Some(disposition) = self.immediate {
+            return disposition;
+        }
+        match self.task.expect("non-immediate cleanup owns a task").await {
+            Ok(Ok(())) => DetachedCleanupDisposition::Complete,
+            Ok(Err(_)) | Err(_) => DetachedCleanupDisposition::Failed,
+        }
+    }
+}
+
 /// One owner for the current warm turn's terminal state. `observe_exit` is
 /// synchronous so a structured failure arms expiry before any formatting,
 /// persistence, flush, lock, or other cancellation point.
@@ -205,6 +232,86 @@ impl WarmCompletionGuard {
         self.sm
             .record_usage(&self.ctx, self.generation, &self.op, usage)
             .await;
+    }
+
+    pub async fn transfer_cleanup_custody(mut self) -> DetachedWarmCleanup {
+        match self.action {
+            WarmCompletionAction::Finish => {
+                self.sm
+                    .finish_turn(&self.ctx, self.generation, &self.op)
+                    .await;
+                self.armed = false;
+                DetachedWarmCleanup {
+                    task: None,
+                    immediate: Some(DetachedCleanupDisposition::Complete),
+                }
+            }
+            WarmCompletionAction::Cancel => {
+                let result = self
+                    .sm
+                    .cancel_turn_current(&self.ctx, self.generation, &self.op)
+                    .await;
+                self.armed = false;
+                DetachedWarmCleanup {
+                    task: None,
+                    immediate: Some(if result.is_ok() {
+                        DetachedCleanupDisposition::Complete
+                    } else {
+                        DetachedCleanupDisposition::Failed
+                    }),
+                }
+            }
+            WarmCompletionAction::Expire => {
+                let claim = self
+                    .sm
+                    .begin_expire_current(&self.ctx, self.generation, &self.op)
+                    .await;
+                let Some(claim) = claim else {
+                    self.armed = false;
+                    return DetachedWarmCleanup {
+                        task: None,
+                        immediate: Some(DetachedCleanupDisposition::OwnerHeld),
+                    };
+                };
+                let flight = claim
+                    .into_flight()
+                    .expect("a fresh expiry claim owns one cleanup flight");
+                self.armed = false;
+                let diagnostic = self.diagnostic.clone();
+                let task = tokio::spawn(async move {
+                    let started = record_cleanup_transition(
+                        diagnostic.as_ref(),
+                        bridge_core::diagnostics::PhaseStatus::Started,
+                        "warm.teardown.release",
+                    )
+                    .await;
+                    let report = ExpiryClaim::join_flight(flight).await;
+                    started?;
+                    let (status, code) = if report.result.is_ok() {
+                        (
+                            bridge_core::diagnostics::PhaseStatus::Completed,
+                            "warm.teardown.released",
+                        )
+                    } else {
+                        (
+                            bridge_core::diagnostics::PhaseStatus::Failed,
+                            "warm.teardown.release_failed",
+                        )
+                    };
+                    let observation =
+                        record_cleanup_transition(diagnostic.as_ref(), status, code).await;
+                    match (report.result, observation) {
+                        (Err(primary), _) => Err(primary),
+                        (Ok(()), Err(observation)) => Err(observation),
+                        (Ok(()), Ok(())) => Ok(()),
+                    }
+                });
+                DetachedWarmCleanup {
+                    task: Some(task),
+                    immediate: None,
+                }
+            }
+        }
     }
 
     pub async fn complete(mut self) -> Result<(), BridgeError> {

@@ -7,7 +7,7 @@
 #   - per-agent creds: WRITABLE single-file copies in ~/.config/a2a-creds/{claude,codex}, and a
 #     one-time `kiro-cli login --use-device-flow` into the `a2a-kiro-data` volume.
 #
-# MUST-FIX (dual-review): for the still-containerized agents (kiro :ro, impl :rw), allowed_cwd_root is
+# MUST-FIX (review/implement): for the still-containerized agents (kiro :ro, impl :rw), allowed_cwd_root is
 # OPT-IN and MUST equal the mount root, or they ship with NO cwd gate; identical-path mount makes the
 # session/new cwd resolve inside the container. (claude+codex reviewers are host-side — not gated by this.)
 
@@ -15,22 +15,20 @@ default = "claude"
 
 allowed_cwd_root = "/Users/wesleyjinks/code"
 
-# B2b-3a: the review-the-diff run after `implement` commits + verifies. Two folded reviewers (codex+claude)
-# review `git diff base..HEAD` in the clone (read-only nav tools) -> a synth emits VERDICT: APPROVE|REJECT,
-# surfaced in the hand-off. ADVISORY (the operator accepts at merge). Absent -> skipped.
+# B2b-3a: the default review-the-diff is one Sol/xhigh hard-read-only pass. Its prompt first completes the
+# correctness review, then triages every finding by real-world reachability, likelihood, impact, bounded repair
+# cost, and blocker/defer value. ADVISORY (the operator accepts at merge). Absent -> skipped.
 [review]
-workflow = "implement-review"
-# Two thorough reviewers navigating + reviewing a REAL diff routinely exceed the 300s default and trip a
-# spurious timeout (looks like an agent failure but is just the bound). 1800s gives room (thorough does ~2×
-# passes) while still capping a runaway review (bridge agents are full coding agents). Raise further for very
-# large diffs.
+workflow = "implement-review-sol"
+# A full Sol/xhigh repository review can exceed the 300s default and trip a spurious timeout (which looks like
+# an agent failure but is just the bound). 1800s gives the single pass room while still capping a runaway review.
 timeout_secs = 1800
-# Light-tier thresholds: diffs at or under BOTH limits use <workflow>-light (implement-review-light by
-# convention) instead of the full two-reviewer workflow — faster and cheaper for small changes.
+# Light-tier thresholds: diffs at or under BOTH limits select <workflow>-light. The shipped Sol variants retain
+# one identical rigorous pass; custom configs may give the suffix a cheaper shape.
 light_max_lines = 15
 light_max_files = 2
 # Thorough-tier trigger: a diff at or above EITHER limit (LLOC over code/infra files only — docs, tests,
-# lockfiles, generated files, comments, blanks excluded) runs <workflow>-thorough (draft→refine ×2).
+# lockfiles, generated files, comments, blanks excluded) selects <workflow>-thorough.
 thorough_min_lines = 150
 thorough_min_files = 6
 # Default review depth when `--depth` is not given: auto | light | standard | thorough.
@@ -210,7 +208,9 @@ args = ["--repo", "{cwd}", "--lang", "auto", "--target-cache", "/Users/wesleyjin
 id  = "codex"
 cmd = "codex-acp"
 pre_authenticated = true # uses the host's existing codex login
-model = "gpt-5.5"   # reviewer pinned (dogfood)
+model = "gpt-5.6-sol"
+effort = "xhigh"
+mode = "read-only"
 args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
 [[agents.mcp]]
 name = "prism"
@@ -305,6 +305,11 @@ file = "../prompts/review-implement.md"
 description = "shared implement-review prompt"
 
 [[prompts]]
+id = "review-sol-risk"
+file = "../prompts/review-sol-risk.md"
+description = "single Sol review with real-world risk and repair triage"
+
+[[prompts]]
 id = "smoke-reply"
 file = "../prompts/smoke-reply.md"
 description = "one-line smoke reply prompt"
@@ -315,23 +320,39 @@ description = "one-line smoke reply prompt"
 [[workflows]]
 id = "code-review"
 [[workflows.nodes]]
-id = "correctness"
+id = "review"
 agent = "codex"
-prompt_file = "../prompts/review-correctness.md"
+prompt = "review-sol-risk"
 inputs = []
-[[workflows.nodes]]
-id = "architecture"
-agent = "claude"
-prompt_file = "../prompts/review-architecture.md"
-inputs = []
-[[workflows.nodes]]
-id = "synth"
-agent = "claude"
-prompt_file = "../prompts/review-synth.md"
-inputs = ["correctness", "architecture"]
 
-# ── implement-review (B2b-3a): two folded reviewers of the committed diff → synth verdict. Driven by
-#    `a2a-bridge implement` after the commit + verify (via the [review] block above). ──
+# Default implement-review variants all preserve the one-turn Sol/xhigh contract. Keeping the conventional
+# suffixes avoids silent fallback/warnings when adaptive depth selects light or thorough.
+[[workflows]]
+id = "implement-review-sol"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt = "review-sol-risk"
+inputs = []
+
+[[workflows]]
+id = "implement-review-sol-light"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt = "review-sol-risk"
+inputs = []
+
+[[workflows]]
+id = "implement-review-sol-thorough"
+[[workflows.nodes]]
+id = "review"
+agent = "codex"
+prompt = "review-sol-risk"
+inputs = []
+
+# ── Legacy opt-in implement-review: two folded reviewers of the committed diff → synth verdict. Retained for
+#    explicit operator selection; the [review] block above points to the single Sol workflow. ──
 [[workflows]]
 id = "implement-review"
 [[workflows.nodes]]

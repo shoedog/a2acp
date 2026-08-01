@@ -50,14 +50,16 @@ id    = "kiro"
 cmd   = "kiro-cli"
 args  = ["acp"]
 
-# codex: gpt-5.5 with reasoning_effort. The host `codex login` is ambient;
+# codex: the default code-review lane is Sol/xhigh in hard read-only mode. The host `codex login` is ambient;
 # do not restart the browser login flow during bridge initialization.
 [[agents]]
 id     = "codex"
 cmd    = "codex-acp"
 pre_authenticated = true
-model  = "gpt-5.5"
-effort = "high"
+model  = "gpt-5.6-sol"
+effort = "xhigh"
+mode   = "read-only"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
 
 # claude: subscription. `model` is validated against the advertised values and
 # applied. Fable-family model ids are blocked by this bridge; use another advertised model.
@@ -75,24 +77,14 @@ base_url    = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 model       = "gpt-4o-mini"
 
-# ── Review workflows: two independent reviewer lenses (codex + claude) + a synthesis ──
+# ── Default code review: one Sol/xhigh pass with post-review risk/cost triage ──
 [[workflows]]
 id = "code-review"
 [[workflows.nodes]]
-id = "correctness"
+id = "review"
 agent = "codex"
-prompt_file = "../prompts/review-correctness.md"
+prompt_file = "../prompts/review-sol-risk.md"
 inputs = []
-[[workflows.nodes]]
-id = "architecture"
-agent = "claude"
-prompt_file = "../prompts/review-architecture.md"
-inputs = []
-[[workflows.nodes]]
-id = "synth"
-agent = "claude"
-prompt_file = "../prompts/review-synth.md"
-inputs = ["correctness", "architecture"]
 
 [[workflows]]
 id = "spec-review"

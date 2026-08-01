@@ -16,7 +16,7 @@
 use crate::sse::{sse_events, SseStream};
 use bridge_core::domain::{Part, PeerTaskId};
 use bridge_core::error::BridgeError;
-use bridge_core::ports::DelegationStream;
+use bridge_core::ports::{DelegationStream, ProviderDispatchObserver};
 use bridge_core::translator::Event;
 use futures::StreamExt;
 use serde_json::{Map, Value};
@@ -143,6 +143,7 @@ impl A2aClient {
     /// SSE stream (G-C3).
     pub fn loopback(base_url: &str) -> Self {
         let http = reqwest::Client::builder()
+            .no_proxy()
             .build()
             .expect("reqwest client build");
         Self {
@@ -171,6 +172,15 @@ impl A2aClient {
         &self,
         parts: &[Part],
         opts: &SendOpts,
+    ) -> Result<reqwest::Response, ClientError> {
+        self.post_send_streaming_observed(parts, opts, None).await
+    }
+
+    async fn post_send_streaming_observed(
+        &self,
+        parts: &[Part],
+        opts: &SendOpts,
+        dispatched: Option<&ProviderDispatchObserver>,
     ) -> Result<reqwest::Response, ClientError> {
         let task_id = match &opts.task_id {
             TaskIdMode::Mint => Some(a2a::new_task_id()),
@@ -209,11 +219,11 @@ impl A2aClient {
             Some(serde_json::to_value(&req).map_err(ClientError::Decode)?),
         );
 
-        self.base_request()
-            .json(&rpc)
-            .send()
-            .await
-            .map_err(ClientError::Transport)
+        let request = self.base_request().json(&rpc);
+        if let Some(dispatched) = dispatched {
+            dispatched();
+        }
+        request.send().await.map_err(ClientError::Transport)
     }
 
     /// POST a `SendStreamingMessage` JSON-RPC request (peer path).
@@ -228,6 +238,21 @@ impl A2aClient {
             metadata: None,
         };
         self.post_send_streaming(parts, &opts)
+            .await
+            .map_err(|_| BridgeError::UpstreamA2aError)
+    }
+
+    pub async fn send_streaming_observed(
+        &self,
+        parts: &[Part],
+        dispatched: &ProviderDispatchObserver,
+    ) -> Result<reqwest::Response, BridgeError> {
+        let opts = SendOpts {
+            context_id: Some(a2a::new_context_id()),
+            task_id: TaskIdMode::None,
+            metadata: None,
+        };
+        self.post_send_streaming_observed(parts, &opts, Some(dispatched))
             .await
             .map_err(|_| BridgeError::UpstreamA2aError)
     }
@@ -361,7 +386,26 @@ impl A2aClient {
         &self,
         parts: &[Part],
     ) -> Result<(DelegationStream, watch::Receiver<Option<PeerTaskId>>), BridgeError> {
-        let resp = self.send_streaming(parts).await?;
+        self.open_stream_inner(parts, None).await
+    }
+
+    pub async fn open_stream_observed(
+        &self,
+        parts: &[Part],
+        dispatched: &ProviderDispatchObserver,
+    ) -> Result<(DelegationStream, watch::Receiver<Option<PeerTaskId>>), BridgeError> {
+        self.open_stream_inner(parts, Some(dispatched)).await
+    }
+
+    async fn open_stream_inner(
+        &self,
+        parts: &[Part],
+        dispatched: Option<&ProviderDispatchObserver>,
+    ) -> Result<(DelegationStream, watch::Receiver<Option<PeerTaskId>>), BridgeError> {
+        let resp = match dispatched {
+            Some(dispatched) => self.send_streaming_observed(parts, dispatched).await?,
+            None => self.send_streaming(parts).await?,
+        };
 
         if !resp.status().is_success() {
             return Err(BridgeError::UpstreamA2aError);

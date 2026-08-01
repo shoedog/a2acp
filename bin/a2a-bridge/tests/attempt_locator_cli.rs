@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -134,6 +134,100 @@ fn submit_flushes_locator_to_a_pipe_before_a_blocked_network_response() {
     child.wait().expect("reap blocked submit");
     release_sender.send(()).unwrap();
     server.join().unwrap();
+}
+
+#[test]
+fn submit_prints_locator_and_deepest_cause_then_exits_nonzero() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind error endpoint");
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept submit request");
+        stream.set_read_timeout(Some(WAIT)).unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).expect("read submit request");
+            assert!(read > 0, "submit request closed before its body");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .map(str::to_owned)
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .expect("submit request content length");
+            if request.len() >= header_end + content_length {
+                break;
+            }
+        }
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32603,
+                "message": "internal",
+                "data": {
+                    "code": "provider.limit",
+                    "deepest_cause": "sanitized provider cause"
+                }
+            }
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    });
+
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input.txt");
+    std::fs::write(&input, "hello").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+        .args([
+            "submit",
+            "--input",
+            input.to_str().unwrap(),
+            "--url",
+            &format!("http://{address}"),
+        ])
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy")
+        .env("NO_PROXY", "*")
+        .env("no_proxy", "*")
+        .output()
+        .expect("run submit error case");
+    server.join().unwrap();
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines = stdout.lines().map(str::to_owned).collect::<Vec<_>>();
+    assert!(lines.len() >= 2, "missing locator: {lines:?}");
+    assert_locator(&[lines[0].clone(), lines[1].clone()]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("submit failed: sanitized provider cause"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("provider.limit"),
+        "deepest cause must win: {stderr}"
+    );
 }
 
 #[test]

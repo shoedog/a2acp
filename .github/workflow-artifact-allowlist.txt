@@ -28,6 +28,7 @@ prompts/review-correctness.md
 prompts/review-implement-refine.md
 prompts/review-implement-synth.md
 prompts/review-implement.md
+prompts/review-sol-risk.md
 prompts/review-synth.md
 prompts/smoke-read.md
 prompts/smoke-reply.md

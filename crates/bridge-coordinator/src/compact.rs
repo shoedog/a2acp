@@ -30,7 +30,7 @@ pub async fn summarize_collect(
     let mut saw_done = false;
     while let Some(update) = stream.next().await {
         match update? {
-            Update::Text(t) => {
+            Update::Text(t) | Update::FinalAnswer(t) => {
                 if out.len() + t.len() > MAX_SUMMARY_BYTES {
                     return Err(BridgeError::MessageTooLarge);
                 }

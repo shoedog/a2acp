@@ -2,6 +2,9 @@
 use crate::config::ApiConfig;
 use crate::provider::{classify_http_error, MAX_ERROR_BODY_BYTES};
 use crate::wire::{ChatRequest, Message, SseAccumulator, ToolCall};
+use bridge_core::attempt_activity::{
+    ActivityReason, AttemptPhase, AttemptRecorder, NoopAttemptRecorder,
+};
 use bridge_core::catalog::is_blocked_model_id;
 use bridge_core::diagnostics::{
     diagnostic_timestamp_ms, DiagnosticFailureClass, DiagnosticPhase, DiagnosticRedactor,
@@ -287,12 +290,35 @@ impl ApiBackend {
     }
 }
 
+fn record_text_activity(recorder: &Arc<dyn AttemptRecorder>, high_water: &mut u64, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let delta = u64::try_from(text.chars().count()).unwrap_or(u64::MAX);
+    // Overflow is sticky and explicit: the local counter still saturates, but
+    // the attempt tally is marked incomplete instead of silently absorbing
+    // every later genuine increment at the saturated high water.
+    *high_water = match high_water.checked_add(delta) {
+        Some(next) => next,
+        None => {
+            recorder.mark_overflowed();
+            u64::MAX
+        }
+    };
+    let _ = recorder.record(
+        AttemptPhase::Provider,
+        ActivityReason::MessageDelta,
+        *high_water,
+    );
+}
+
 impl ApiBackend {
     async fn prompt_inner(
         &self,
         session: &SessionId,
         parts: Vec<Part>,
         rich_sink: Option<Arc<dyn RichEventSink>>,
+        activity_recorder: Arc<dyn AttemptRecorder>,
         diagnostic_observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<BackendStream, BridgeError> {
         let url = format!(
@@ -324,6 +350,7 @@ impl ApiBackend {
         )];
 
         let stream = async_stream::try_stream! {
+            let mut message_char_high_water = 0u64;
             lifecycle
                 .record(DiagnosticPhase::PromptStart, PhaseStatus::Started)
                 .await?;
@@ -454,7 +481,10 @@ impl ApiBackend {
                         while let Some(nl) = buf.find('\n') {
                             let line: String = buf.drain(..=nl).collect();
                             match acc.push_sse_line(&line) {
-                                Ok(Some(text)) => { yield Update::Text(text); }
+                                Ok(Some(text)) => {
+                                    record_text_activity(&activity_recorder, &mut message_char_high_water, &text);
+                                    yield Update::Text(text);
+                                }
                                 Ok(None) => {}
                                 Err(_) => {
                                     Err(lifecycle
@@ -477,7 +507,10 @@ impl ApiBackend {
                     // and a chunk-split partial "[DON" would falsely FrameError).
                     if !acc.is_done() && !buf.trim().is_empty() {
                         match acc.push_sse_line(&buf) {
-                            Ok(Some(text)) => { yield Update::Text(text); }
+                            Ok(Some(text)) => {
+                                record_text_activity(&activity_recorder, &mut message_char_high_water, &text);
+                                yield Update::Text(text);
+                            }
                             Ok(None) => {}
                             Err(_) => {
                                 Err(lifecycle
@@ -539,7 +572,10 @@ impl ApiBackend {
                                 .await)?
                         }
                     };
-                    if !p.text.is_empty() { yield Update::Text(p.text.clone()); }
+                    if !p.text.is_empty() {
+                        record_text_activity(&activity_recorder, &mut message_char_high_water, &p.text);
+                        yield Update::Text(p.text.clone());
+                    }
                     p
                 };
                 if parsed.tool_calls.is_empty() {
@@ -598,6 +634,7 @@ impl AgentBackend for ApiBackend {
             session,
             parts,
             None,
+            Arc::new(NoopAttemptRecorder),
             Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
         )
         .await
@@ -613,6 +650,7 @@ impl AgentBackend for ApiBackend {
             session,
             parts,
             Some(sink),
+            Arc::new(NoopAttemptRecorder),
             Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
         )
         .await
@@ -624,8 +662,14 @@ impl AgentBackend for ApiBackend {
         parts: Vec<Part>,
         observers: BackendObservers,
     ) -> Result<BackendStream, BridgeError> {
-        self.prompt_inner(session, parts, observers.rich, observers.diagnostic)
-            .await
+        self.prompt_inner(
+            session,
+            parts,
+            observers.rich,
+            observers.activity,
+            observers.diagnostic,
+        )
+        .await
     }
 
     async fn cancel(&self, session: &SessionId) -> Result<(), BridgeError> {
@@ -684,6 +728,48 @@ mod tests {
     use bridge_core::ports::{AgentBackend, DiagnosticObserver, PolicyEngine};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn text_activity_high_water_saturates_and_empty_text_is_neutral() {
+        let recorder: Arc<dyn AttemptRecorder> = Arc::new(NoopAttemptRecorder);
+        let mut high_water = u64::MAX - 1;
+        record_text_activity(&recorder, &mut high_water, "abc");
+        assert_eq!(high_water, u64::MAX);
+
+        record_text_activity(&recorder, &mut high_water, "");
+        assert_eq!(high_water, u64::MAX);
+    }
+
+    #[test]
+    fn r2f0b_api_text_counter_overflow_is_sticky_explicit() {
+        let recorder: Arc<dyn AttemptRecorder> =
+            Arc::new(bridge_core::attempt_activity::SharedAttemptRecorder::new(
+                bridge_core::attempt_activity::SystemMonotonicClock::start(),
+            ));
+        let mut high_water = u64::MAX - 1;
+        record_text_activity(&recorder, &mut high_water, "abc");
+        assert_eq!(high_water, u64::MAX, "the local counter still saturates");
+        let tally = recorder.tally().expect("tally");
+        assert!(
+            tally.overflowed,
+            "an API text-counter overflow must become sticky explicit incompleteness"
+        );
+    }
+
+    #[test]
+    fn r2f0b_api_bounded_text_counter_never_flags_overflow() {
+        let recorder: Arc<dyn AttemptRecorder> =
+            Arc::new(bridge_core::attempt_activity::SharedAttemptRecorder::new(
+                bridge_core::attempt_activity::SystemMonotonicClock::start(),
+            ));
+        let mut high_water = 0_u64;
+        record_text_activity(&recorder, &mut high_water, "abc");
+        record_text_activity(&recorder, &mut high_water, "de");
+        let tally = recorder.tally().expect("tally");
+        assert!(!tally.overflowed);
+        assert_eq!(tally.meaningful_progress, 2, "real growth stays progress");
+        assert_eq!(tally.max_advance, 5);
+    }
 
     struct InstallOrderObserver {
         installed: Arc<AtomicBool>,

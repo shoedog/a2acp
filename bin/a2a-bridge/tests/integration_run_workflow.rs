@@ -11,7 +11,10 @@
 //   4. `known_workflow_id_resolves_graph` — a temp config with one workflow → the
 //      graph is found and has the expected node count.
 
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::process::Command;
 use tempfile::tempdir;
 
 // The parse helper and cmd are private to main.rs; we test through a re-exported
@@ -190,7 +193,7 @@ fn known_workflow_id_resolves_graph() {
 }
 
 #[test]
-fn example_config_loads_three_nodes() {
+fn example_config_loads_single_sol_review_node() {
     // The shipped example/a2a-bridge.workflows.toml must parse (prompt files exist).
     // This test is a smoke-check that the example config and prompts/ are in sync.
     let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -227,7 +230,160 @@ fn example_config_loads_three_nodes() {
         .expect("code-review workflow must exist");
     assert_eq!(
         wf.nodes.len(),
-        3,
-        "code-review must have 3 nodes (codex, claude, synth)"
+        1,
+        "default code-review must have exactly one billable Sol reviewer"
     );
+    assert_eq!(wf.nodes[0]["id"], "review");
+    assert_eq!(wf.nodes[0]["agent"], "codex");
+    assert_eq!(wf.nodes[0]["prompt"], "review-sol-risk");
+}
+
+fn run_offline_legacy_success(
+    advertise_v1: bool,
+) -> (
+    std::process::Output,
+    bridge_core::workflow_history::AttemptTerminal,
+    String,
+) {
+    let directory = tempdir().unwrap();
+    let adapter = directory.path().join("missing-evidence-acp");
+    let initialize = if advertise_v1 {
+        r#"printf '{"jsonrpc":"2.0","result":{"protocolVersion":1,"agentCapabilities":{"_meta":{"a2a_bridge.turn_evidence.v1":true}},"authMethods":[],"agentInfo":{"name":"missing-evidence-acp","title":"Missing evidence fake","version":"1.0.0"}},"id":%s}\n' "$id""#
+    } else {
+        r#"printf '{"jsonrpc":"2.0","result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[],"agentInfo":{"name":"legacy-acp","title":"Legacy fake","version":"1.0.0"}},"id":%s}\n' "$id""#
+    };
+    let adapter_script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -E 's/^\{"jsonrpc":"2.0","id":([^,]+),"method".*/\1/')
+  case "$line" in
+    *'"method":"initialize"'*)
+      __INITIALIZE_RESPONSE__
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","result":{"sessionId":"offline-missing-evidence"},"id":%s}\n' "$id"
+      ;;
+    *'"method":"session/set_mode"'*|*'"method":"session/set_config_option"'*)
+      printf '{"jsonrpc":"2.0","result":{},"id":%s}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"offline-missing-evidence","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"FINAL"}}}}'
+      printf '{"jsonrpc":"2.0","result":{"stopReason":"end_turn"},"id":%s}\n' "$id"
+      ;;
+  esac
+done
+"#
+    .replace("__INITIALIZE_RESPONSE__", initialize);
+    fs::write(&adapter, adapter_script).unwrap();
+    let mut permissions = fs::metadata(&adapter).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&adapter, permissions).unwrap();
+
+    let prompt = directory.path().join("prompt.md");
+    fs::write(&prompt, "{{input}}").unwrap();
+    let input = directory.path().join("input.md");
+    fs::write(
+        &input,
+        "---\ntask-type: freeform\n---\nprovider-free input\n",
+    )
+    .unwrap();
+    let output_path = directory.path().join("result.md");
+    let store_path = directory.path().join("history.sqlite");
+    let config = directory.path().join("a2a-bridge.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"default = "fake"
+allowed_cwd_root = {root:?}
+
+[registry]
+allowed_cmds = [{adapter:?}]
+
+[[agents]]
+id = "fake"
+cmd = {adapter:?}
+pre_authenticated = true
+
+[store]
+path = {store:?}
+
+[[workflows]]
+id = "offline-v1"
+
+[[workflows.nodes]]
+id = "only"
+agent = "fake"
+prompt_file = {prompt:?}
+inputs = []
+
+[server]
+addr = "127.0.0.1:0"
+"#,
+            root = directory.path(),
+            adapter = adapter,
+            store = store_path,
+            prompt = prompt,
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_a2a-bridge"))
+        .args([
+            "run-workflow",
+            "offline-v1",
+            "--input",
+            input.to_str().unwrap(),
+            "--session-cwd",
+            directory.path().to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--out",
+            output_path.to_str().unwrap(),
+        ])
+        .current_dir(directory.path())
+        .output()
+        .expect("run provider-free offline workflow");
+
+    let connection = rusqlite::Connection::open(&store_path).unwrap();
+    let terminal_json: String = connection
+        .query_row(
+            "SELECT terminal_json FROM workflow_attempt_summaries WHERE status='terminal'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let terminal: bridge_core::workflow_history::AttemptTerminal =
+        serde_json::from_str(&terminal_json).unwrap();
+    let output_text = fs::read_to_string(output_path).unwrap();
+    (output, terminal, output_text)
+}
+
+#[test]
+fn offline_v1_resolution_controls_exit_after_a_legacy_success_stream() {
+    let (output, terminal, output_text) = run_offline_legacy_success(true);
+    assert_eq!(terminal.outcome, "failed");
+    assert_eq!(
+        terminal.terminal_reason,
+        "protocol_terminal_evidence_missing"
+    );
+    assert!(
+        !output.status.success(),
+        "offline public exit must follow resolved terminal truth; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output_text, "FINAL");
+}
+
+#[test]
+fn offline_unsupported_legacy_success_remains_completed() {
+    let (output, terminal, output_text) = run_offline_legacy_success(false);
+    assert!(
+        output.status.success(),
+        "unsupported legacy success must remain successful; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(terminal.outcome, "completed");
+    assert_eq!(terminal.terminal_evidence_capability, "unsupported");
+    assert_eq!(output_text, "FINAL");
 }

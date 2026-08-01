@@ -47,6 +47,14 @@ pub struct ImplementCheckpoint {
     #[serde(default)]
     pub resolved_lang: Option<String>,
 
+    // Bounded, content-free meaningful-progress summary. Written only after the terminal
+    // phase has been durably saved so telemetry failure cannot rewrite the outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_tally: Option<bridge_core::attempt_activity::ActivityTally>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_evidence_counts: Option<bridge_core::terminal_evidence::TerminalEvidenceCounts>,
+
     pub phase: ImplementPhase,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -121,11 +129,38 @@ impl crate::tweak::CheckpointSink for ProdCheckpoint {
 }
 
 /// Write a terminal phase (Approved/LoopStopped) directly (the loop never reports terminal).
-pub fn write_terminal(clone: &Path, mut ck: ImplementCheckpoint, phase: ImplementPhase) {
+pub fn write_terminal(
+    clone: &Path,
+    mut ck: ImplementCheckpoint,
+    phase: ImplementPhase,
+) -> Option<ImplementCheckpoint> {
     ck.phase = phase;
     ck.updated_at_ms = now_ms();
-    if let Err(e) = save_checkpoint(clone, &ck) {
-        eprintln!("[implement] terminal checkpoint save failed (non-fatal): {e}");
+    match save_checkpoint(clone, &ck) {
+        Ok(()) => Some(ck),
+        Err(e) => {
+            eprintln!("[implement] terminal checkpoint save failed (non-fatal): {e}");
+            None
+        }
+    }
+}
+
+// Best-effort telemetry attachment. The caller supplies a checkpoint returned by
+// `write_terminal`, proving terminal truth was saved before this second atomic write.
+pub fn write_attempt_telemetry(
+    clone: &Path,
+    mut terminal: ImplementCheckpoint,
+    tally: bridge_core::attempt_activity::ActivityTally,
+    terminal_evidence_counts: bridge_core::terminal_evidence::TerminalEvidenceCounts,
+) {
+    if tally.encoded_len() > bridge_core::attempt_activity::MAX_ATTACHMENT_ENCODING_BYTES {
+        eprintln!("[implement] activity tally exceeded its encoding bound (non-fatal)");
+        return;
+    }
+    terminal.activity_tally = Some(tally);
+    terminal.terminal_evidence_counts = Some(terminal_evidence_counts);
+    if let Err(e) = save_checkpoint(clone, &terminal) {
+        eprintln!("[implement] attempt telemetry save failed (non-fatal): {e}");
     }
 }
 
@@ -242,6 +277,8 @@ mod tests {
             attempt_next: 2,
             forced_depth: None,
             resolved_lang: None,
+            activity_tally: None,
+            terminal_evidence_counts: None,
             phase: ImplementPhase::InLoop,
             created_at_ms: 1,
             updated_at_ms: 2,
@@ -296,6 +333,44 @@ mod tests {
         assert_eq!(back.attempt_next, 2);
         assert_eq!(back.phase, ImplementPhase::InLoop);
         assert_eq!(back.loop_max_attempts, 3);
+    }
+
+    #[test]
+    fn r2f0b_terminal_checkpoint_persists_bounded_activity_after_terminal_truth() {
+        use bridge_core::attempt_activity::{
+            ActivityReason, AttemptPhase, AttemptRecorder, SharedAttemptRecorder,
+            SystemMonotonicClock,
+        };
+
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join(".git")).unwrap();
+        let recorder = SharedAttemptRecorder::new(SystemMonotonicClock::start());
+        let _ = recorder.record(
+            AttemptPhase::TerminalStore,
+            ActivityReason::ProducerTerminal,
+            1,
+        );
+        let tally = recorder.tally().unwrap();
+
+        let terminal = write_terminal(td.path(), sample(td.path()), ImplementPhase::Approved)
+            .expect("terminal truth saves first");
+        let terminal_only = load_checkpoint(td.path()).unwrap();
+        assert_eq!(terminal_only.phase, ImplementPhase::Approved);
+        assert!(terminal_only.activity_tally.is_none());
+
+        let counts = bridge_core::terminal_evidence::TerminalEvidenceCounts {
+            reached: 1,
+            ..bridge_core::terminal_evidence::TerminalEvidenceCounts::default()
+        };
+        write_attempt_telemetry(td.path(), terminal, tally, counts);
+        let persisted = load_checkpoint(td.path()).unwrap();
+        assert_eq!(persisted.phase, ImplementPhase::Approved);
+        assert_eq!(persisted.activity_tally, Some(tally));
+        assert_eq!(persisted.terminal_evidence_counts, Some(counts));
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(checkpoint_path(td.path())).unwrap()).unwrap();
+        assert_eq!(raw["terminal_evidence_counts"]["reached"], 1);
+        assert!(serde_json::to_vec(&persisted).unwrap().len() < 4096);
     }
 
     #[test]

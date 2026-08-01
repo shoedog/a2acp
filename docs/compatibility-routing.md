@@ -34,6 +34,10 @@ causing a fallback.
 | Requirements gathering, general brainstorming, analysis, or uncertainty grooming | Sol | high/xhigh | Opus for alternative framing; Fable for hard/complex ambiguity, contradiction, or synthesis |
 | Deadlock, data race, complex leak, transaction proof, critical algorithm proof, zero-downtime migration, or rare production failure | Sol | max | Fable adversarial lens when useful |
 
+For code, implementation, release, and full-branch review, the default is one Sol/xhigh hard-read-only turn. Finish
+the correctness pass before rating every WRONG/SMELL by concrete trigger conditions, likelihood, exposure, bounded
+repair cost, and blocker/defer value. Any independent second lens is a separate explicitly authorized turn.
+
 `max` is reserved for tightly connected evidence that benefits from depth over parallelism, for a genuine
 concurrency/transaction/critical-proof problem, or after high/xhigh failed to resolve the problem. Fable is
 reserved for hard or complex work. Haiku may dogfood the Claude/ACP path and handle small, sharply bounded

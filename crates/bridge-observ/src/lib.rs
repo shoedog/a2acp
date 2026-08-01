@@ -2007,6 +2007,7 @@ mod r2f0a_workflow_metric_tests {
                 terminal_evidence_version: "none".into(),
                 terminal_evidence_source: "none".into(),
                 terminal_evidence_complete: false,
+                terminal_evidence_counts: Default::default(),
                 degraded: false,
                 prompt_acceptance: "not_dispatched".into(),
                 cleanup_disposition: "complete".into(),

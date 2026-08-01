@@ -1,11 +1,13 @@
 //! bridge-core — domain core: Task/Session state machines, port traits, error model.
 
+pub mod attempt_activity;
 pub mod attestation;
 pub mod brief_lint;
 pub mod catalog;
 pub mod diagnostics;
 pub mod domain;
 pub mod error;
+pub mod failure_wire;
 pub mod harvest;
 pub mod ids;
 #[cfg(unix)]
@@ -29,6 +31,7 @@ pub mod session_fingerprint;
 pub mod task;
 pub mod task_spec;
 pub mod task_store;
+pub mod terminal_evidence;
 pub mod translator;
 pub mod workflow_history;
 

@@ -4,11 +4,12 @@
   correction, native verification, and final cumulative reviews complete at exact integrated code checkpoint
   `7b01ab4bae167d3640050dfda5de7e1478728497` on `agent/r2f0a-identity-ledger`, tree
   `7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e`; integrated native evidence is green and independent concurrent
-  Sol/xhigh and Fable/xhigh exact-head reviews both returned `APPROVE`; after this docs-only fold receives its own
-  verification/review, ready for PR/CI and merge; R2f0b is next only after merge and is not started
+  Sol/xhigh and Fable/xhigh exact-head reviews both returned `APPROVE`; R2f0b is now **IN PROGRESS** with its
+  focused boundary frozen and IN REVIEW — implementation candidate complete; deterministic/native verification and review pending
 - **Base:** `345941db91a7d898884bfe79e573433484ccafcc`
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Execution plan:** [`../plans/2026-07-11-r2f-phase-aware-liveness.md`](../plans/2026-07-11-r2f-phase-aware-liveness.md)
+- **R2f0b focused boundary:** [`../plans/2026-07-30-r2f0b-focused-boundary.md`](../plans/2026-07-30-r2f0b-focused-boundary.md)
 - **Review 1:** [`../reviews/2026-07-20-r2f-owner-design-sol-review-1.md`](../reviews/2026-07-20-r2f-owner-design-sol-review-1.md)
 - **Closure review 1:** [`../reviews/2026-07-20-r2f-owner-design-sol-closure-review-1.md`](../reviews/2026-07-20-r2f-owner-design-sol-closure-review-1.md)
 - **Failed closure re-review 2:**
@@ -42,9 +43,8 @@ decision surface now that every owner item is settled. Review 1 and closure revi
 review 5 approved the corrected design. R2f0a implementation, correction, native verification, and final cumulative
 reviews are complete at exact integrated checkpoint `7b01ab4bae167d3640050dfda5de7e1478728497`, tree
 `7d0b14aa1d39ca36fdc68a9ad69df4fc8442e64e`. The integrated native evidence is green and both independent
-exact-head reviews returned `APPROVE`; after this docs-only fold receives its own verification/review, PR/CI and
-merge remain pending. The failed null-final attempt remains incident
-evidence only, and R2f0b is not started.
+exact-head reviews returned `APPROVE`; PR #48 later merged R2f0a. The failed null-final attempt remains incident
+evidence only. R2f0b is now in progress from its frozen focused boundary; IN REVIEW — implementation candidate complete; deterministic/native verification and review pending.
 
 ## 1. Current-main facts
 
@@ -988,6 +988,7 @@ rollback-journal policy change only through a separate owner decision.
 
 No ignored live/provider test was forced. Locked-egress Linux could not fetch one missing `a2a-lf` dependency for
 the final six-line macOS test-only correction, so the artifact is not Linux proof. No GitHub CI, push, PR, merge,
-release, deployment, live canary, production-server change, or post-merge operator build is proved. After this
-docs-only fold receives its own verification/review, R2f0a is ready for PR/CI and merge. R2f0b remains next only
-after merge and is not started. This fold does not complete R2f overall, #22, #24, R2g, or R4.
+release, deployment, live canary, production-server change, or post-merge operator build is proved. At this
+historical checkpoint R2f0a was ready for PR/CI and merge and R2f0b had not started. PR #48 later merged R2f0a;
+R2f0b is now in progress from its frozen focused boundary, with IN REVIEW — implementation candidate complete; deterministic/native verification and review pending. This fold does
+not complete R2f overall, #22, #24, R2g, or R4.

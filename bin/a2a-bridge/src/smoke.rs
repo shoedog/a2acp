@@ -1568,7 +1568,7 @@ async fn drain_stream(
                     deadline_timeout: None,
                 };
             }
-            Ok(Update::Text(text)) => {
+            Ok(Update::Text(text) | Update::FinalAnswer(text)) => {
                 turn.text_bytes = turn.text_bytes.saturating_add(text.len() as u64);
                 if captured.len().saturating_add(text.len()) <= MAX_CAPTURED_TEXT_BYTES {
                     captured.extend_from_slice(text.as_bytes());

@@ -3566,20 +3566,8 @@ harvest_sanitization=\"attested_prefix_v1\"
             (
                 "examples/a2a-bridge.workflows.toml",
                 "code-review",
-                "correctness",
-                "prompts/review-correctness.md",
-            ),
-            (
-                "examples/a2a-bridge.workflows.toml",
-                "code-review",
-                "architecture",
-                "prompts/review-architecture.md",
-            ),
-            (
-                "examples/a2a-bridge.workflows.toml",
-                "code-review",
-                "synth",
-                "prompts/review-synth.md",
+                "review",
+                "prompts/review-sol-risk.md",
             ),
             (
                 "examples/a2a-bridge.workflows.toml",
@@ -3698,23 +3686,9 @@ harvest_sanitization=\"attested_prefix_v1\"
             (
                 "examples/a2a-bridge.workflows.toml",
                 "code-review",
-                "correctness",
+                "review",
                 "codex",
                 &[],
-            ),
-            (
-                "examples/a2a-bridge.workflows.toml",
-                "code-review",
-                "architecture",
-                "claude",
-                &[],
-            ),
-            (
-                "examples/a2a-bridge.workflows.toml",
-                "code-review",
-                "synth",
-                "claude",
-                &["correctness", "architecture"],
             ),
             (
                 "examples/a2a-bridge.workflows.toml",

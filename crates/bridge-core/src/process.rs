@@ -16,7 +16,10 @@ const BLOCKING_TERMINATE_POLL_INTERVAL: std::time::Duration = std::time::Duratio
 const BLOCKING_TERMINATE_REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcessStderrCursor(u64);
+pub struct ProcessStderrCursor {
+    line_sequence: u64,
+    byte_advance: u64,
+}
 
 #[derive(Clone)]
 struct CapturedStderrLine {
@@ -29,6 +32,7 @@ struct CapturedStderrLine {
 #[derive(Default)]
 struct ProcessStderrState {
     sequence: u64,
+    byte_advance: u64,
     lines: VecDeque<CapturedStderrLine>,
     redactor: DiagnosticRedactor,
     /// Monotonic fail-closed mode used when a process may still emit a
@@ -60,6 +64,10 @@ impl std::fmt::Debug for ProcessStderrRing {
             .field(
                 "line_count",
                 &state.as_ref().map_or(0, |state| state.sequence),
+            )
+            .field(
+                "byte_count",
+                &state.as_ref().map_or(0, |state| state.byte_advance),
             )
             .field(
                 "metadata_only",
@@ -115,11 +123,30 @@ impl ProcessStderrRing {
     }
 
     pub fn origin(&self) -> ProcessStderrCursor {
-        ProcessStderrCursor(0)
+        ProcessStderrCursor {
+            line_sequence: 0,
+            byte_advance: 0,
+        }
     }
 
     pub fn cursor(&self) -> ProcessStderrCursor {
-        ProcessStderrCursor(self.state.lock().map_or(0, |state| state.sequence))
+        self.state.lock().map_or(
+            ProcessStderrCursor {
+                line_sequence: 0,
+                byte_advance: 0,
+            },
+            |state| ProcessStderrCursor {
+                line_sequence: state.sequence,
+                byte_advance: state.byte_advance,
+            },
+        )
+    }
+
+    fn observe_read(&self, bytes: usize) {
+        let mut state = self.state.lock().expect("process stderr ring lock");
+        state.byte_advance = state
+            .byte_advance
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
     }
 
     fn push(&self, line: String, oversized: bool) {
@@ -169,12 +196,16 @@ impl ProcessStderrRing {
         include_retained_text: bool,
     ) -> ProcessStderrSnapshot {
         let state = self.state.lock().expect("process stderr ring lock");
-        let line_count = state.sequence.saturating_sub(cursor.0).min(u32::MAX as u64) as u32;
+        let line_count = state
+            .sequence
+            .saturating_sub(cursor.line_sequence)
+            .min(u32::MAX as u64) as u32;
+        let byte_count = state.byte_advance.saturating_sub(cursor.byte_advance);
         let retained_lines = if include_retained_text {
             state
                 .lines
                 .iter()
-                .filter(|line| line.sequence > cursor.0)
+                .filter(|line| line.sequence > cursor.line_sequence)
                 .map(|line| line.text.clone())
                 .collect()
         } else {
@@ -182,6 +213,7 @@ impl ProcessStderrRing {
         };
         ProcessStderrSnapshot {
             line_count,
+            byte_count,
             retained_lines,
         }
     }
@@ -190,6 +222,7 @@ impl ProcessStderrRing {
 #[derive(Clone)]
 pub struct ProcessStderrSnapshot {
     line_count: u32,
+    byte_count: u64,
     retained_lines: Vec<String>,
 }
 
@@ -197,6 +230,7 @@ impl std::fmt::Debug for ProcessStderrSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProcessStderrSnapshot")
             .field("line_count", &self.line_count)
+            .field("byte_count", &self.byte_count)
             .field("scope", &crate::diagnostics::StderrScope::Process)
             .field("retained_line_count", &self.retained_lines.len())
             .finish()
@@ -206,6 +240,10 @@ impl std::fmt::Debug for ProcessStderrSnapshot {
 impl ProcessStderrSnapshot {
     pub fn line_count(&self) -> u32 {
         self.line_count
+    }
+
+    pub fn byte_count(&self) -> u64 {
+        self.byte_count
     }
 
     pub fn scope(&self) -> crate::diagnostics::StderrScope {
@@ -437,6 +475,10 @@ async fn drain_stderr(mut stderr: ChildStderr, ring: ProcessStderrRing) {
             return;
         }
 
+        // Advance as soon as bytes cross the owned child pipe. Waiting for a
+        // newline or EOF can otherwise make a live, chatty child look idle.
+        ring.observe_read(read);
+
         for byte in &chunk[..read] {
             if *byte == b'\n' {
                 if !oversized && retained.last() == Some(&b'\r') {
@@ -665,6 +707,7 @@ mod tests {
 
         let snapshot = ring.best_effort_since(cursor);
         assert_eq!(snapshot.line_count(), 2);
+        assert_eq!(snapshot.byte_count(), 12);
         assert_eq!(snapshot.scope(), crate::diagnostics::StderrScope::Process);
         assert_eq!(snapshot.retained_lines(), &["new-a", "new-b"]);
     }

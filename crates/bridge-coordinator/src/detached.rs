@@ -415,6 +415,7 @@ struct TerminalSummaryBarrierInner {
     started: std::time::Instant,
     queue_ms: u64,
     completion: WorkflowCompletionGuard,
+    attempt_telemetry: Arc<bridge_core::attempt_activity::AttemptTelemetrySinkFactory>,
 }
 
 struct WorkflowCompletionGuard {
@@ -432,6 +433,8 @@ struct TerminalBarrierSettlement {
 struct TerminalProjectionCommit {
     seq: i64,
     telemetry_unavailable: Option<bridge_core::workflow_history::LedgerUnavailableReason>,
+    status: TaskRecordStatus,
+    output: String,
 }
 
 /// Detached progress sink: persists each event via the sequenced store methods
@@ -591,8 +594,14 @@ impl WorkflowSink for DetachedProgressSink {
             seq,
             phase: Phase::Live,
             kind: FrameKind::Terminal {
-                outcome: TerminalOutcome::from_workflow(&outcome),
-                output,
+                outcome: match commit.status {
+                    TaskRecordStatus::Completed => TerminalOutcome::Completed,
+                    TaskRecordStatus::Canceled => TerminalOutcome::Canceled,
+                    TaskRecordStatus::Failed
+                    | TaskRecordStatus::Interrupted
+                    | TaskRecordStatus::Working => TerminalOutcome::Failed,
+                },
+                output: commit.output,
             },
         });
         Ok(())
@@ -669,6 +678,62 @@ impl RichEventSinkFactory for DetachedRichSinkFactory {
     }
 }
 
+struct DetachedCompositeRichSink {
+    durable: Arc<dyn RichEventSink>,
+    attempt: Arc<dyn RichEventSink>,
+}
+
+#[async_trait::async_trait]
+impl RichEventSink for DetachedCompositeRichSink {
+    fn record(&self, kind: OrchEventKind) {
+        self.durable.record(kind.clone());
+        self.attempt.record(kind);
+    }
+
+    async fn flush(&self) -> Result<(), BridgeError> {
+        let durable = self.durable.flush().await;
+        let attempt = self.attempt.flush().await;
+        durable.and(attempt)
+    }
+
+    fn attempt_recorder(&self) -> Option<Arc<dyn bridge_core::attempt_activity::AttemptRecorder>> {
+        self.attempt
+            .attempt_recorder()
+            .or_else(|| self.durable.attempt_recorder())
+    }
+
+    fn terminal_evidence_for_turn(
+        &self,
+        capability: bridge_core::terminal_evidence::EvidenceCapability,
+        generation: u64,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>>, BridgeError>
+    {
+        if let Some(sink) = self
+            .attempt
+            .terminal_evidence_for_turn(capability, generation, session_id, turn_id)?
+        {
+            return Ok(Some(sink));
+        }
+        self.durable
+            .terminal_evidence_for_turn(capability, generation, session_id, turn_id)
+    }
+}
+
+struct DetachedCompositeRichSinkFactory {
+    durable: Arc<dyn RichEventSinkFactory>,
+    attempt: Arc<dyn RichEventSinkFactory>,
+}
+
+impl RichEventSinkFactory for DetachedCompositeRichSinkFactory {
+    fn make(&self, node: &NodeId) -> Arc<dyn RichEventSink> {
+        Arc::new(DetachedCompositeRichSink {
+            durable: self.durable.make(node),
+            attempt: self.attempt.make(node),
+        })
+    }
+}
 /// Drop guard: if the runner exits without finalizing (early return, error, or
 /// **panic**), finalize `Failed` (via `finalize_detached`) and remove the cancel token.
 /// `finalize_detached` writes the terminal through the SEQUENCED path (so `terminal_seq`
@@ -796,6 +861,195 @@ mod sink_tests {
             no_wait.end_to_end_ms
         );
     }
+    #[test]
+    fn served_terminal_barrier_projects_its_production_rich_sink_evidence() {
+        struct TestObserver;
+        impl bridge_core::ports::Observer for TestObserver {
+            fn record(&self, _: &bridge_core::ports::ObsEvent<'_>) {}
+        }
+
+        use bridge_core::terminal_evidence::{
+            EvidenceAcceptance, EvidenceCapability, FinalPresence, ProducerTerminal,
+            TurnEvidenceEnvelope, TURN_EVIDENCE_VERSION,
+        };
+
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let store: Arc<dyn TaskStore> = Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let barrier = workflow_terminal_summary_barrier(
+            None,
+            AttemptTelemetryState::default(),
+            store,
+            task,
+            identity,
+            Arc::new(TestObserver),
+            "served-evidence".into(),
+            std::time::Instant::now(),
+            0,
+        );
+        let rich = barrier
+            .rich_sink_factory()
+            .make(&bridge_core::ids::NodeId::parse("only").unwrap());
+        let sink = rich
+            .terminal_evidence_for_turn(EvidenceCapability::V1, 1, "bridge-session", "bridge-turn")
+            .unwrap()
+            .unwrap();
+        let binding = sink.binding().unwrap();
+        assert_eq!(
+            sink.accept(TurnEvidenceEnvelope {
+                version: TURN_EVIDENCE_VERSION.into(),
+                generation: binding.generation,
+                session_id: binding.session_id,
+                turn_id: binding.turn_id,
+                attempt_id: binding.attempt_id,
+                marker_nonce: binding.marker_nonce,
+                native_turn_id: "native-turn".into(),
+                sequence: 1,
+                producer: ProducerTerminal::Completed,
+                final_presence: FinalPresence::Nonempty,
+                ordered_notifications_drained: true,
+                complete: true,
+            }),
+            EvidenceAcceptance::Accepted,
+        );
+        sink.record_deliverable_final();
+        sink.close();
+
+        let mut terminal = measured_workflow_terminal(
+            std::time::Instant::now(),
+            0,
+            1,
+            "completed",
+            bridge_core::workflow_history::NodeCounts::default(),
+            true,
+            0,
+            0,
+            "complete",
+        );
+        apply_workflow_terminal_evidence(
+            &mut terminal,
+            TaskRecordStatus::Completed,
+            barrier.inner.attempt_telemetry.evidence().as_ref(),
+        );
+        assert_eq!(terminal.outcome, "completed");
+        assert_eq!(terminal.terminal_reason, "completed_final");
+        assert_eq!(terminal.terminal_evidence_capability, "v1");
+        assert!(terminal.terminal_evidence_complete);
+    }
+
+    #[tokio::test]
+    async fn served_projection_publishes_evidence_resolved_delivery_conflict() {
+        struct TestObserver;
+        impl bridge_core::ports::Observer for TestObserver {
+            fn record(&self, _: &bridge_core::ports::ObsEvent<'_>) {}
+        }
+
+        use bridge_core::terminal_evidence::{
+            EvidenceAcceptance, EvidenceCapability, FinalPresence, ProducerTerminal,
+            TurnEvidenceEnvelope, TURN_EVIDENCE_VERSION,
+        };
+
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let concrete_store = Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        concrete_store
+            .create_with_attempt_locator(
+                &make_task_record(task.as_str()),
+                &bridge_core::task_store::TaskAttemptLocator {
+                    identity: identity.clone(),
+                    telemetry_unavailable: None,
+                },
+            )
+            .await
+            .unwrap();
+        let store: Arc<dyn TaskStore> = concrete_store.clone();
+        let history = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        history
+            .reserve(&bridge_core::workflow_history::AttemptReservation {
+                identity: identity.clone(),
+                task_id: Some(task.clone()),
+                workflow: "served-evidence".into(),
+                task_class: "workflow".into(),
+                surface: bridge_core::workflow_history::ExecutionSurface::ServedTask,
+                policy: "r2f0b".into(),
+                workload_fingerprint: "delivery-conflict".into(),
+                started_ms: 1,
+                workload_fingerprint_complete: true,
+                prompt_acceptance: "dispatch_uncertain".into(),
+                pinned: false,
+            })
+            .await
+            .unwrap();
+        let barrier = workflow_terminal_summary_barrier(
+            Some(history.clone()),
+            AttemptTelemetryState::default(),
+            store.clone(),
+            task.clone(),
+            identity.clone(),
+            Arc::new(TestObserver),
+            "served-evidence".into(),
+            std::time::Instant::now(),
+            0,
+        );
+        let rich = barrier
+            .rich_sink_factory()
+            .make(&bridge_core::ids::NodeId::parse("only").unwrap());
+        let sink = rich
+            .terminal_evidence_for_turn(EvidenceCapability::V1, 1, "bridge-session", "bridge-turn")
+            .unwrap()
+            .unwrap();
+        let binding = sink.binding().unwrap();
+        assert_eq!(
+            sink.accept(TurnEvidenceEnvelope {
+                version: TURN_EVIDENCE_VERSION.into(),
+                generation: binding.generation,
+                session_id: binding.session_id,
+                turn_id: binding.turn_id,
+                attempt_id: binding.attempt_id,
+                marker_nonce: binding.marker_nonce,
+                native_turn_id: "native-turn".into(),
+                sequence: 1,
+                producer: ProducerTerminal::Completed,
+                final_presence: FinalPresence::Nonempty,
+                ordered_notifications_drained: true,
+                complete: true,
+            }),
+            EvidenceAcceptance::Accepted,
+        );
+        sink.close();
+
+        let hubs = Arc::new(Mutex::new(HashMap::new()));
+        finalize_detached_with_barrier(
+            &store,
+            &hubs,
+            &task,
+            TaskRecordStatus::Completed,
+            Some("ran_out_of_turns"),
+            None,
+            None,
+            Some(&barrier),
+            "complete",
+        )
+        .await
+        .unwrap();
+
+        let task_row = concrete_store.get(&task).await.unwrap().unwrap();
+        assert_eq!(task_row.status, TaskRecordStatus::Failed);
+        assert_eq!(
+            task_row.error.as_deref(),
+            Some("protocol_final_delivery_conflict")
+        );
+        let terminal = history
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(terminal.outcome, "failed");
+        assert_eq!(terminal.terminal_reason, "protocol_final_delivery_conflict");
+    }
+
     struct FailFirstNodeSink {
         calls: usize,
     }
@@ -1561,6 +1815,7 @@ mod sink_tests {
             terminal_evidence_version: "none".into(),
             terminal_evidence_source: "none".into(),
             terminal_evidence_complete: false,
+            terminal_evidence_counts: Default::default(),
             degraded: false,
             prompt_acceptance: "unknown".into(),
             cleanup_disposition: "complete".into(),
@@ -2352,6 +2607,10 @@ impl Drop for WorkflowCompletionGuard {
 }
 
 impl TerminalSummaryBarrier {
+    pub fn rich_sink_factory(&self) -> Arc<dyn bridge_core::ports::RichEventSinkFactory> {
+        self.inner.attempt_telemetry.clone()
+    }
+
     fn attempt_id(&self) -> &bridge_core::ids::AttemptId {
         &self.inner.identity.attempt_id
     }
@@ -2407,7 +2666,19 @@ impl TerminalSummaryBarrier {
             TaskRecordStatus::Interrupted => "interrupted",
             TaskRecordStatus::Working => "failed",
         };
-        let telemetry_complete = self.inner.telemetry.reason().is_none() && node_counts_complete;
+        let _ = self.inner.attempt_telemetry.recorder().record(
+            bridge_core::attempt_activity::AttemptPhase::TerminalStore,
+            bridge_core::attempt_activity::ActivityReason::ProducerTerminal,
+            1,
+        );
+        let activity_complete = self
+            .inner
+            .attempt_telemetry
+            .recorder()
+            .tally()
+            .is_some_and(|tally| !tally.overflowed);
+        let telemetry_complete =
+            self.inner.telemetry.reason().is_none() && node_counts_complete && activity_complete;
         let mut terminal = measured_workflow_terminal(
             self.inner.started,
             work_ms,
@@ -2419,8 +2690,12 @@ impl TerminalSummaryBarrier {
             cleanup_ms,
             cleanup_disposition,
         );
-        terminal.degraded = status != TaskRecordStatus::Completed || !telemetry_complete;
-        terminal.terminal_reason = "owner_finalized".to_owned();
+        apply_workflow_terminal_evidence(
+            &mut terminal,
+            status,
+            self.inner.attempt_telemetry.evidence().as_ref(),
+        );
+        terminal.degraded = terminal.outcome != "completed" || !terminal.telemetry_complete;
         terminal
     }
 
@@ -2490,6 +2765,23 @@ impl TerminalSummaryBarrier {
             false
         };
 
+        if summary_ready {
+            if let Some(tally) = self.inner.attempt_telemetry.recorder().tally() {
+                if let Some(history) = &self.inner.history {
+                    if let Err(error) = history
+                        .record_activity_tally(&self.inner.identity.attempt_id, &tally)
+                        .await
+                    {
+                        tracing::warn!(
+                            task = self.inner.task.as_str(),
+                            error = ?error,
+                            "workflow activity enrichment persistence failed"
+                        );
+                    }
+                }
+            }
+        }
+
         TerminalBarrierSettlement {
             telemetry_unavailable,
             projection_ready: summary_ready || marker_ready,
@@ -2516,6 +2808,11 @@ pub fn workflow_terminal_summary_barrier(
     queue_ms: u64,
 ) -> TerminalSummaryBarrier {
     let completion = WorkflowCompletionGuard::new(observer, identity.clone(), workflow);
+    let attempt_telemetry = Arc::new(
+        bridge_core::attempt_activity::AttemptTelemetrySinkFactory::new(
+            identity.attempt_id.as_str(),
+        ),
+    );
     TerminalSummaryBarrier {
         inner: Arc::new(TerminalSummaryBarrierInner {
             history,
@@ -2526,6 +2823,7 @@ pub fn workflow_terminal_summary_barrier(
             started,
             queue_ms,
             completion,
+            attempt_telemetry,
         }),
     }
 }
@@ -2550,6 +2848,8 @@ async fn commit_terminal_projection(
         return Ok(TerminalProjectionCommit {
             seq,
             telemetry_unavailable: None,
+            status,
+            output: result.or(error).unwrap_or("").to_string(),
         });
     };
 
@@ -2566,13 +2866,36 @@ async fn commit_terminal_projection(
                 .await
         }
     };
+    let projection_status = match terminal.outcome.as_str() {
+        "completed" => TaskRecordStatus::Completed,
+        "canceled" => TaskRecordStatus::Canceled,
+        "interrupted" => TaskRecordStatus::Interrupted,
+        _ => TaskRecordStatus::Failed,
+    };
+    let projection_result = if projection_status == TaskRecordStatus::Completed {
+        result
+    } else {
+        None
+    };
+    let projection_error = if matches!(
+        projection_status,
+        TaskRecordStatus::Failed | TaskRecordStatus::Interrupted
+    ) {
+        error.or(Some(terminal.terminal_reason.as_str()))
+    } else {
+        None
+    };
+    let projection_output = projection_result
+        .or(projection_error)
+        .unwrap_or("")
+        .to_string();
     let seq = store
         .set_terminal_sequenced_pending(
             task,
             operation_id,
-            status,
-            result,
-            error,
+            projection_status,
+            projection_result,
+            projection_error,
             ts,
             barrier.attempt_id(),
             &terminal,
@@ -2588,7 +2911,111 @@ async fn commit_terminal_projection(
     Ok(TerminalProjectionCommit {
         seq,
         telemetry_unavailable: settlement.telemetry_unavailable,
+        status: projection_status,
+        output: projection_output,
     })
+}
+
+fn apply_workflow_terminal_evidence(
+    terminal: &mut bridge_core::workflow_history::AttemptTerminal,
+    status: bridge_core::task_store::TaskRecordStatus,
+    evidence: &bridge_core::terminal_evidence::WorkflowTurnEvidenceCollector,
+) {
+    use bridge_core::terminal_evidence::{
+        resolve_terminal, EvidenceCapability, EvidenceCompleteness, FinalPresence,
+        ProducerTerminal, PromptRpcObservation, TerminalObservation,
+    };
+
+    let counts = evidence.counts();
+    terminal.terminal_evidence_counts = counts;
+    if counts.overflowed {
+        terminal.degraded = true;
+        terminal.telemetry_complete = false;
+    }
+    let Some((
+        capability,
+        completeness,
+        producer,
+        final_presence,
+        drained,
+        child_liveness,
+        deliverable_final_present,
+    )) = evidence.single_turn()
+    else {
+        terminal.producer_terminal = "unknown".into();
+        terminal.final_message = "unknown".into();
+        terminal.process_liveness = "unknown".into();
+        terminal.terminal_evidence_capability = if counts.reached == 0 {
+            "not_applicable"
+        } else {
+            "unknown"
+        }
+        .into();
+        terminal.terminal_evidence_version = "none".into();
+        terminal.terminal_evidence_source = "none".into();
+        terminal.terminal_evidence_complete = counts.reached == 0;
+        terminal.terminal_reason = "owner_finalized".into();
+        return;
+    };
+
+    terminal.producer_terminal = match producer {
+        ProducerTerminal::Unknown => "unknown",
+        ProducerTerminal::Completed => "completed",
+        ProducerTerminal::Interrupted => "interrupted",
+        ProducerTerminal::Failed => "failed",
+    }
+    .into();
+    terminal.final_message = match final_presence {
+        FinalPresence::Unknown => "unknown",
+        FinalPresence::Nonempty => "nonempty",
+        FinalPresence::Absent => "absent",
+    }
+    .into();
+    terminal.process_liveness = match child_liveness {
+        bridge_core::terminal_evidence::AcpChildLiveness::Unknown => "unknown",
+        bridge_core::terminal_evidence::AcpChildLiveness::Live => "live",
+        bridge_core::terminal_evidence::AcpChildLiveness::Exited => "exited",
+    }
+    .into();
+    terminal.terminal_evidence_capability = match capability {
+        EvidenceCapability::Unsupported => "unsupported",
+        EvidenceCapability::MalformedAdvertisement | EvidenceCapability::V1 => "v1",
+    }
+    .into();
+    terminal.terminal_evidence_version = match capability {
+        EvidenceCapability::Unsupported => "none",
+        EvidenceCapability::MalformedAdvertisement | EvidenceCapability::V1 => "v1",
+    }
+    .into();
+    terminal.terminal_evidence_source = if completeness == EvidenceCompleteness::Complete {
+        "adapter"
+    } else {
+        "none"
+    }
+    .into();
+    terminal.terminal_evidence_complete = completeness == EvidenceCompleteness::Complete;
+    terminal.telemetry_complete &= capability == EvidenceCapability::Unsupported
+        || completeness == EvidenceCompleteness::Complete;
+    terminal.terminal_reason = "owner_finalized".into();
+
+    if capability == EvidenceCapability::V1 {
+        let resolved = resolve_terminal(TerminalObservation {
+            capability,
+            completeness,
+            producer,
+            final_presence,
+            prompt_rpc: if status == bridge_core::task_store::TaskRecordStatus::Completed {
+                PromptRpcObservation::Resolved
+            } else {
+                PromptRpcObservation::RejectedAcceptedOrUncertain
+            },
+            ordered_notifications_drained: drained,
+            deliverable_final_present,
+            child_liveness,
+        });
+        terminal.outcome = resolved.outcome.as_str().into();
+        terminal.terminal_reason = resolved.reason.as_str().into();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2628,6 +3055,7 @@ pub(crate) fn measured_workflow_terminal(
         terminal_evidence_version: "none".into(),
         terminal_evidence_source: "none".into(),
         terminal_evidence_complete: false,
+        terminal_evidence_counts: Default::default(),
         degraded: outcome != "completed",
         prompt_acceptance: "unknown".into(),
         cleanup_disposition: cleanup_disposition.into(),
@@ -2728,14 +3156,14 @@ pub async fn finalize_detached_with_barrier(
         }
         // Publish the Terminal frame ONLY on a committed seq (durable-first).
         // Interrupted has no WorkflowOutcome analogue; the closest wire terminal is Failed.
-        let outcome = match status {
+        let outcome = match commit.status {
             TaskRecordStatus::Completed => TerminalOutcome::Completed,
             TaskRecordStatus::Canceled => TerminalOutcome::Canceled,
             TaskRecordStatus::Failed
             | TaskRecordStatus::Interrupted
             | TaskRecordStatus::Working => TerminalOutcome::Failed,
         };
-        let output = result.or(error).unwrap_or("").to_string();
+        let output = commit.output.clone();
         hub.publish(WorkflowProgressFrame {
             v: 1,
             seq: commit.seq,
@@ -2820,6 +3248,11 @@ pub fn spawn_detached_workflow_with_attempt_barriers(
     prompt_dispatch: Option<PromptDispatchBarrier>,
     terminal_barrier: Option<TerminalSummaryBarrier>,
 ) -> tokio::task::JoinHandle<bool> {
+    if ctx.make_rich_sink.is_none() {
+        if let Some(barrier) = terminal_barrier.as_ref() {
+            ctx.make_rich_sink = Some(barrier.rich_sink_factory());
+        }
+    }
     let deps = deps.clone();
     tokio::spawn(async move {
         let harvest_audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
@@ -2906,12 +3339,16 @@ pub fn spawn_detached_workflow_with_attempt_barriers(
             };
         let diagnostic_factory: Arc<dyn bridge_core::ports::DiagnosticObserverFactory> =
             Arc::new(diagnostic_factory);
-        ctx.make_rich_sink = Some(Arc::new(DetachedRichSinkFactory {
+        let durable: Arc<dyn RichEventSinkFactory> = Arc::new(DetachedRichSinkFactory {
             store: deps.task_store.clone(),
             task: task.clone(),
             op,
             hub: hub.clone(),
-        }));
+        });
+        ctx.make_rich_sink = Some(match ctx.make_rich_sink.take() {
+            Some(attempt) => Arc::new(DetachedCompositeRichSinkFactory { durable, attempt }),
+            None => durable,
+        });
         // M4 Slice 3a: the detached runner is the authoritative owner of every workflow
         // turn it emits. Overwrite any caller-supplied (or missing) task_id so detached /
         // batch / resume turn_log rows are always linked to the real task, never NULL or a
@@ -3324,6 +3761,7 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
             terminal_evidence_version: "none".into(),
             terminal_evidence_source: "none".into(),
             terminal_evidence_complete: false,
+            terminal_evidence_counts: Default::default(),
             degraded: true,
             prompt_acceptance: "unknown".into(),
             cleanup_disposition: "unknown".into(),
@@ -3828,6 +4266,7 @@ mod resume_tests {
         ObsEvent, Observer, Resolved, Update,
     };
     use bridge_core::task_store::{MemoryTaskStore, TaskRecord, TaskRecordStatus, TaskStore};
+    use bridge_core::workflow_history::WorkflowHistoryStore;
     use bridge_observ::{DropCounter, TurnLogObserver};
     use bridge_workflow::executor::WorkflowExecutor;
     use bridge_workflow::graph::{PanelConfig, RetryPolicy, WorkflowGraph, WorkflowNode};
@@ -4045,6 +4484,147 @@ mod resume_tests {
         }
     }
 
+    #[derive(Default)]
+    struct DetachedEvidenceState {
+        saw_binding: std::sync::atomic::AtomicBool,
+    }
+
+    struct DetachedEvidenceBackend {
+        state: Arc<DetachedEvidenceState>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for DetachedEvidenceBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            panic!("detached workflow must use prompt_with_observers")
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            observers
+                .rich
+                .as_ref()
+                .expect("detached workflow owns a durable rich sink")
+                .record(bridge_core::orch::OrchEventKind::Plan { entries: vec![] });
+            if let Some(binding) = observers.terminal_evidence.binding() {
+                self.state
+                    .saw_binding
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let acceptance = observers.terminal_evidence.accept(
+                    bridge_core::terminal_evidence::TurnEvidenceEnvelope {
+                        version: bridge_core::terminal_evidence::TURN_EVIDENCE_VERSION.into(),
+                        generation: binding.generation,
+                        session_id: binding.session_id,
+                        turn_id: binding.turn_id,
+                        attempt_id: binding.attempt_id,
+                        marker_nonce: binding.marker_nonce,
+                        native_turn_id: "native-detached".into(),
+                        sequence: 1,
+                        producer: bridge_core::terminal_evidence::ProducerTerminal::Completed,
+                        final_presence: bridge_core::terminal_evidence::FinalPresence::Nonempty,
+                        ordered_notifications_drained: true,
+                        complete: true,
+                    },
+                );
+                assert_eq!(
+                    acceptance,
+                    bridge_core::terminal_evidence::EvidenceAcceptance::Accepted
+                );
+            }
+            let _ = observers.activity.record(
+                bridge_core::attempt_activity::AttemptPhase::Provider,
+                bridge_core::attempt_activity::ActivityReason::MessageDelta,
+                5,
+            );
+            Ok(Box::pin(tokio_stream::iter(vec![
+                Ok(Update::FinalAnswer("FINAL".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
+                }),
+            ])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn terminal_evidence_capability(
+            &self,
+        ) -> bridge_core::terminal_evidence::EvidenceCapability {
+            bridge_core::terminal_evidence::EvidenceCapability::V1
+        }
+
+        fn bridge_owned_acp_child_liveness(
+            &self,
+        ) -> bridge_core::terminal_evidence::AcpChildLiveness {
+            bridge_core::terminal_evidence::AcpChildLiveness::Exited
+        }
+    }
+
+    struct DetachedEvidenceRegistry {
+        state: Arc<DetachedEvidenceState>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRegistry for DetachedEvidenceRegistry {
+        async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
+            Ok(Resolved {
+                entry: Arc::new(AgentEntry {
+                    id: id.clone(),
+                    cmd: Some("scripted".into()),
+                    base_url: None,
+                    api_key_env: None,
+                    args: vec![],
+                    kind: AgentKind::Acp,
+                    model_provider: None,
+                    model: None,
+                    effort: None,
+                    mode: None,
+                    preflight: false,
+                    fallback_models: vec![],
+                    cwd: None,
+                    session_cwd: None,
+                    sandbox: None,
+                    watchdog: None,
+                    auth_method: None,
+                    pre_authenticated: false,
+                    host_fallback_eligible: false,
+                    name: None,
+                    description: None,
+                    tags: vec![],
+                    version: None,
+                    mcp: vec![],
+                    mcp_delivery: Default::default(),
+                    extensions: Default::default(),
+                }),
+                backend: Arc::new(DetachedEvidenceBackend {
+                    state: self.state.clone(),
+                }),
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        fn default_id(&self) -> AgentId {
+            AgentId::parse("synth").unwrap()
+        }
+
+        async fn apply(&self, _snapshot: RegistrySnapshot) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn list(&self) -> Vec<AgentId> {
+            vec![AgentId::parse("synth").unwrap()]
+        }
+    }
     pub(super) struct SelectiveFailureStore {
         pub(super) inner: MemoryTaskStore,
         pub(super) fail_checkpoint: bool,
@@ -4387,6 +4967,30 @@ mod resume_tests {
         })
     }
 
+    fn two_provider_turn_graph() -> Arc<WorkflowGraph> {
+        Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("two-turns").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("first").unwrap(),
+                    agent: AgentId::parse("synth").unwrap(),
+                    prompt_template: "first {{input}}".into(),
+                    inputs: vec![],
+                    retry: None,
+                    harvest_sanitization: None,
+                },
+                WorkflowNode {
+                    id: NodeId::parse("second").unwrap(),
+                    agent: AgentId::parse("synth").unwrap(),
+                    prompt_template: "second {{first}}".into(),
+                    inputs: vec![NodeId::parse("first").unwrap()],
+                    retry: None,
+                    harvest_sanitization: None,
+                },
+            ],
+            panel: None,
+        })
+    }
     fn detached_deps_with_observer(
         store: Arc<dyn TaskStore>,
         observer: Arc<dyn Observer>,
@@ -4670,6 +5274,222 @@ mod resume_tests {
         );
     }
 
+    #[tokio::test]
+    async fn r2f0b_real_detached_spawn_composes_progress_and_attempt_telemetry() {
+        let state = Arc::new(DetachedEvidenceState::default());
+        let concrete_store = Arc::new(MemoryTaskStore::new());
+        let store: Arc<dyn TaskStore> = concrete_store.clone();
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        concrete_store
+            .create_with_attempt_locator(
+                &make_task_record(task.as_str()),
+                &bridge_core::task_store::TaskAttemptLocator {
+                    identity: identity.clone(),
+                    telemetry_unavailable: None,
+                },
+            )
+            .await
+            .unwrap();
+        let history = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        history
+            .reserve(&bridge_core::workflow_history::AttemptReservation {
+                identity: identity.clone(),
+                task_id: Some(task.clone()),
+                workflow: "retry-resume".into(),
+                task_class: "workflow".into(),
+                surface: bridge_core::workflow_history::ExecutionSurface::ServedTask,
+                policy: "r2f0b".into(),
+                workload_fingerprint: "detached-composition".into(),
+                started_ms: 1,
+                workload_fingerprint_complete: true,
+                prompt_acceptance: "dispatch_uncertain".into(),
+                pinned: false,
+            })
+            .await
+            .unwrap();
+        let graph = single_retry_graph();
+        let deps = DetachedDeps {
+            task_store: store.clone(),
+            executor: Some(Arc::new(WorkflowExecutor::new(Arc::new(
+                DetachedEvidenceRegistry {
+                    state: state.clone(),
+                },
+            )))),
+            workflows: Arc::new(HashMap::from([(graph.id.clone(), graph.clone())])),
+            workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
+            progress_hubs: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(ManualClock::new(100)),
+            observer: Arc::new(NoopObserver),
+            workflow_history: Some(Ok(history.clone())),
+        };
+        let hub = Arc::new(TaskProgressHub::new());
+        deps.progress_hubs
+            .lock()
+            .await
+            .insert(task.clone(), hub.clone());
+        let barrier = workflow_terminal_summary_barrier(
+            Some(history.clone()),
+            AttemptTelemetryState::default(),
+            store.clone(),
+            task.clone(),
+            identity.clone(),
+            Arc::new(NoopObserver),
+            "retry-resume".into(),
+            std::time::Instant::now(),
+            0,
+        );
+
+        let completed = spawn_detached_workflow_with_attempt_barriers(
+            &deps,
+            task.clone(),
+            "private detached prompt".into(),
+            graph,
+            identity.run_id().into(),
+            CancellationToken::new(),
+            HashMap::new(),
+            WorkflowRunContext::default(),
+            hub,
+            None,
+            Some(barrier),
+        )
+        .await
+        .unwrap();
+        assert!(completed);
+        assert!(state.saw_binding.load(std::sync::atomic::Ordering::SeqCst));
+
+        let terminal = history
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(terminal.outcome, "completed");
+        assert_eq!(terminal.terminal_reason, "completed_final");
+        assert_eq!(terminal.terminal_evidence_capability, "v1");
+        assert!(terminal.terminal_evidence_complete);
+        let tally = history
+            .activity_tally(&identity.attempt_id)
+            .await
+            .unwrap()
+            .expect("detached activity enrichment persisted");
+        assert!(tally.meaningful_progress > 0);
+        let journal = store.journal_from(&task, -1).await.unwrap();
+        assert!(journal
+            .iter()
+            .any(|event| matches!(event.kind, bridge_core::orch::OrchEventKind::Plan { .. })));
+
+        let encoded = serde_json::to_string(&(terminal, tally)).unwrap();
+        for private in [
+            "private detached prompt",
+            "native-detached",
+            identity.attempt_id.as_str(),
+        ] {
+            assert!(!encoded.contains(private), "activity leaked {private:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn r2f0b_real_detached_two_turn_projection_is_bounded_and_valid() {
+        let state = Arc::new(DetachedEvidenceState::default());
+        let concrete_store = Arc::new(MemoryTaskStore::new());
+        let store: Arc<dyn TaskStore> = concrete_store.clone();
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        concrete_store
+            .create_with_attempt_locator(
+                &make_task_record(task.as_str()),
+                &bridge_core::task_store::TaskAttemptLocator {
+                    identity: identity.clone(),
+                    telemetry_unavailable: None,
+                },
+            )
+            .await
+            .unwrap();
+        let history = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        history
+            .reserve(&bridge_core::workflow_history::AttemptReservation {
+                identity: identity.clone(),
+                task_id: Some(task.clone()),
+                workflow: "two-turns".into(),
+                task_class: "workflow".into(),
+                surface: bridge_core::workflow_history::ExecutionSurface::ServedTask,
+                policy: "r2f0b".into(),
+                workload_fingerprint: "two-turn-projection".into(),
+                started_ms: 1,
+                workload_fingerprint_complete: true,
+                prompt_acceptance: "dispatch_uncertain".into(),
+                pinned: false,
+            })
+            .await
+            .unwrap();
+        let graph = two_provider_turn_graph();
+        let deps = DetachedDeps {
+            task_store: store.clone(),
+            executor: Some(Arc::new(WorkflowExecutor::new(Arc::new(
+                DetachedEvidenceRegistry { state },
+            )))),
+            workflows: Arc::new(HashMap::from([(graph.id.clone(), graph.clone())])),
+            workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
+            progress_hubs: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(ManualClock::new(100)),
+            observer: Arc::new(NoopObserver),
+            workflow_history: Some(Ok(history.clone())),
+        };
+        let hub = Arc::new(TaskProgressHub::new());
+        deps.progress_hubs
+            .lock()
+            .await
+            .insert(task.clone(), hub.clone());
+        let barrier = workflow_terminal_summary_barrier(
+            Some(history.clone()),
+            AttemptTelemetryState::default(),
+            store,
+            task.clone(),
+            identity.clone(),
+            Arc::new(NoopObserver),
+            "two-turns".into(),
+            std::time::Instant::now(),
+            0,
+        );
+
+        let completed = spawn_detached_workflow_with_attempt_barriers(
+            &deps,
+            task,
+            "input".into(),
+            graph,
+            identity.run_id().into(),
+            CancellationToken::new(),
+            HashMap::new(),
+            WorkflowRunContext::default(),
+            hub,
+            None,
+            Some(barrier),
+        )
+        .await
+        .unwrap();
+        assert!(completed);
+
+        let terminal = history
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .expect("multi-turn attempt terminalized");
+        terminal.validate().unwrap();
+        assert_eq!(terminal.outcome, "completed");
+        assert_eq!(terminal.producer_terminal, "unknown");
+        assert_eq!(terminal.final_message, "unknown");
+        assert_eq!(terminal.terminal_evidence_capability, "unknown");
+        assert!(!terminal.terminal_evidence_complete);
+        let value = serde_json::to_value(&terminal).unwrap();
+        assert_eq!(value["terminal_evidence_counts"]["reached"], 2);
+        assert_eq!(value["terminal_evidence_counts"]["valid"], 2);
+        assert_eq!(value["terminal_evidence_counts"]["missing"], 0);
+        assert_eq!(value["terminal_evidence_counts"]["invalid"], 0);
+    }
     #[tokio::test]
     async fn spawn_detached_workflow_overwrites_ctx_task_id() {
         let store: Arc<dyn TaskStore> = Arc::new(MemoryTaskStore::new());

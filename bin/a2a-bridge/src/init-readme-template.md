@@ -55,17 +55,18 @@ no command).
   skipped with a warn if the agent advertises none. (Levels are model-dependent:
   Sonnet 4.6 / Opus 4.6 have no `xhigh`; codex tops out at `xhigh`.)
 - `mode` → `session/set_mode`, which **HARD-fails** on an invalid/unknown mode id
-  (modes are agent-native). This template omits `mode` deliberately; set it only
-  to a mode your agent actually advertises.
+  (modes are agent-native). The Codex review entry pins advertised `read-only`;
+  set another value only after checking `a2a-bridge models`.
 
 Auth failures generally surface on the FIRST request to an agent, not at serve
 boot.
 
 ## Review workflows
 
-`code-review`, `spec-review`, and `plan-review` each run two independent reviewer
-lenses (codex + claude) and a synthesis. They reference `codex` and `claude`, so
-they are only present if you scaffolded both.
+`code-review` defaults to one Sol/xhigh hard-read-only pass with post-review
+real-world risk and repair-cost triage. `spec-review` and `plan-review` retain
+independent codex + claude lenses plus synthesis. The bundle is currently emitted
+only when both agents are scaffolded because those latter workflows reference both.
 
 Workflow/batch/implement inputs are **typed task-specs** (YAML front-matter
 `task-type` + a markdown body) and are validated before dispatch. Scaffold one

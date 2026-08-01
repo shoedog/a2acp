@@ -304,7 +304,7 @@ async fn route_and_prompt(
         let mut texts = Vec::new();
         loop {
             match stream.next().await {
-                Some(Ok(Update::Text(t))) => texts.push(t),
+                Some(Ok(Update::Text(t) | Update::FinalAnswer(t))) => texts.push(t),
                 Some(Ok(Update::Permission(_))) => {
                     eprintln!("(note) {id} issued a permission request on a plain text prompt");
                 }
@@ -496,7 +496,7 @@ async fn drain_one_turn(
         let mut texts = Vec::new();
         loop {
             match stream.next().await {
-                Some(Ok(Update::Text(t))) => texts.push(t),
+                Some(Ok(Update::Text(t) | Update::FinalAnswer(t))) => texts.push(t),
                 Some(Ok(Update::Permission(_))) => {}
                 Some(Ok(Update::Usage(_))) => {}
                 Some(Ok(Update::Done { stop_reason, .. })) => return (texts.join(""), stop_reason),

@@ -52,4 +52,35 @@ pub trait TurnRunner: Send + Sync {
     ) -> bool {
         self.run_turn(session, parts).await
     }
+
+    async fn run_turn_recorded(
+        &self,
+        session: &bridge_core::ids::SessionId,
+        parts: Vec<bridge_core::domain::Part>,
+        observer: std::sync::Arc<dyn bridge_core::ports::DiagnosticObserver>,
+        _activity: std::sync::Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
+    ) -> bool {
+        self.run_turn_observed(session, parts, observer).await
+    }
+
+    async fn run_turn_with_telemetry(
+        &self,
+        session: &bridge_core::ids::SessionId,
+        parts: Vec<bridge_core::domain::Part>,
+        observer: std::sync::Arc<dyn bridge_core::ports::DiagnosticObserver>,
+        telemetry: RecordedTurnTelemetry,
+    ) -> bool {
+        let completed = self
+            .run_turn_recorded(session, parts, observer, telemetry.activity)
+            .await;
+        telemetry.terminal_evidence.close();
+        completed
+    }
+}
+
+#[derive(Clone)]
+pub struct RecordedTurnTelemetry {
+    pub activity: std::sync::Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
+    pub terminal_evidence: std::sync::Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
+    pub turn_meta: Option<bridge_core::permission::TurnMeta>,
 }

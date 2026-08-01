@@ -131,7 +131,7 @@ async fn run_round_trip() -> (Vec<String>, String) {
     let mut texts = Vec::new();
     loop {
         match stream.next().await {
-            Some(Ok(Update::Text(t))) => texts.push(t),
+            Some(Ok(Update::Text(t) | Update::FinalAnswer(t))) => texts.push(t),
             Some(Ok(Update::Usage(_))) => {}
             Some(Ok(Update::Permission(_))) => {
                 // A plain text prompt should not require a tool permission; the

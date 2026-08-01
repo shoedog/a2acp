@@ -19,14 +19,14 @@ use agent_client_protocol::schema::v1::{
     ContentBlock, CreateTerminalRequest, CreateTerminalResponse, EnvVariable, InitializeRequest,
     InitializeResponse, KillTerminalRequest, KillTerminalResponse, McpServer, McpServerStdio,
     NewSessionRequest, PermissionOption, PermissionOptionKind, PlanEntryPriority, PlanEntryStatus,
-    PromptRequest, ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest,
-    ReleaseTerminalResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-    SessionConfigValueId, SessionId as AgentSessionId, SessionModeState, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason,
-    TerminalOutputRequest, TerminalOutputResponse, TextContent, ToolCallContent, ToolCallLocation,
-    ToolCallStatus, ToolKind, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
-    WriteTextFileRequest, WriteTextFileResponse,
+    PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
+    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigId, SessionConfigOption, SessionConfigValueId, SessionId as AgentSessionId,
+    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionModeRequest, StopReason, TerminalOutputRequest, TerminalOutputResponse, TextContent,
+    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind, WaitForTerminalExitRequest,
+    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -42,6 +42,9 @@ use crate::model_effort::{
     caps_from_config_options, effort_level_name, effort_opt, is_blocked_model,
     is_unsupported_effort_error, model_id_effort, model_values, resolve_effort, resolve_model,
     resolve_model_state, EffortDecision, ModelDecision, ModelResolutionError, EFFORT_ORDER,
+};
+use bridge_core::attempt_activity::{
+    ActivityReason, AttemptPhase, AttemptRecorder, NoopAttemptRecorder,
 };
 use bridge_core::attestation::{
     nonce_hex, AttestedPrefixV1, CapabilityUnavailableReason, HarvestSanitizationMode,
@@ -80,6 +83,11 @@ use bridge_core::process::{
 use bridge_core::provider::{classify_acp_error_data, ProviderEvidence};
 use bridge_core::reaper::{
     production_reap_fn, ContainerStartState, ReapController, ReapFailure, ReapFn,
+};
+use bridge_core::terminal_evidence::{
+    EvidenceCapability, EvidenceCompleteness, SharedTurnEvidence, TerminalEvidenceSink,
+    TurnEvidenceBinding, TurnEvidenceEnvelope, TURN_EVIDENCE_CONTROL_PREFIX,
+    TURN_EVIDENCE_META_KEY, TURN_EVIDENCE_VERSION,
 };
 
 /// Default bound on the `initialize` handshake. A real agent that connects its
@@ -208,6 +216,48 @@ impl JsonRpcResponse for PrefixBeginTurnResponse {
         }
         agent_client_protocol::util::json_cast(&value)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EvidenceAwarePromptRequest {
+    #[serde(flatten)]
+    prompt: PromptRequest,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    meta: Option<std::collections::BTreeMap<String, TurnEvidenceBinding>>,
+}
+
+impl EvidenceAwarePromptRequest {
+    fn new(prompt: PromptRequest, binding: Option<TurnEvidenceBinding>) -> Self {
+        let meta = binding.map(|binding| {
+            std::collections::BTreeMap::from([(TURN_EVIDENCE_META_KEY.to_string(), binding)])
+        });
+        Self { prompt, meta }
+    }
+}
+
+impl JsonRpcMessage for EvidenceAwarePromptRequest {
+    fn matches_method(method: &str) -> bool {
+        method == "session/prompt"
+    }
+
+    fn method(&self) -> &str {
+        "session/prompt"
+    }
+
+    fn to_untyped_message(&self) -> Result<UntypedMessage, AcpError> {
+        UntypedMessage::new("session/prompt", self)
+    }
+
+    fn parse_message(method: &str, params: &impl Serialize) -> Result<Self, AcpError> {
+        if method != "session/prompt" {
+            return Err(AcpError::method_not_found());
+        }
+        agent_client_protocol::util::json_cast_params(params)
+    }
+}
+
+impl JsonRpcRequest for EvidenceAwarePromptRequest {
+    type Response = PromptResponse;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1092,6 +1142,35 @@ fn parse_sha256_hex(raw: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+fn terminal_evidence_capability_from_initialize(
+    response: &InitializeResponse,
+) -> EvidenceCapability {
+    let Ok(value) = serde_json::to_value(response) else {
+        return EvidenceCapability::Unsupported;
+    };
+    let advertisement = [
+        value.get("_meta"),
+        value
+            .get("agentCapabilities")
+            .and_then(|value| value.get("_meta")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_object)
+    .find_map(|meta| meta.get(TURN_EVIDENCE_VERSION));
+    match advertisement {
+        None => EvidenceCapability::Unsupported,
+        Some(value)
+            if value == &serde_json::Value::Bool(true)
+                || value.as_str() == Some("v1")
+                || value.as_u64() == Some(1) =>
+        {
+            EvidenceCapability::V1
+        }
+        Some(_) => EvidenceCapability::MalformedAdvertisement,
+    }
+}
+
 fn no_attestation_reason_from_wire(raw: &str) -> Option<NoAttestationReason> {
     Some(match raw {
         "sanitization_not_requested" => NoAttestationReason::SanitizationNotRequested,
@@ -1115,6 +1194,49 @@ fn no_attestation_reason_from_wire(raw: &str) -> Option<NoAttestationReason> {
 // holding it, so a non-async lock is correct and avoids `.await` in the handler.
 type UpdateSender = mpsc::UnboundedSender<TurnEvent>;
 type UpdateRegistry = Arc<StdMutex<HashMap<AgentSessionId, TurnRoute>>>;
+type EvidenceTombstoneKey = (AgentSessionId, String);
+type EvidenceTombstones = Arc<StdMutex<HashMap<EvidenceTombstoneKey, EvidenceTombstone>>>;
+
+#[derive(Clone)]
+struct EvidenceTombstone {
+    binding: TurnEvidenceBinding,
+    sink: Arc<dyn TerminalEvidenceSink>,
+}
+
+const MAX_EVIDENCE_TOMBSTONES: usize = 64;
+
+fn install_terminal_tombstone(
+    tombstones: &mut HashMap<EvidenceTombstoneKey, EvidenceTombstone>,
+    session_id: AgentSessionId,
+    binding: TurnEvidenceBinding,
+    sink: Arc<dyn TerminalEvidenceSink>,
+) -> bool {
+    let key = (session_id, binding.turn_id.clone());
+    if !tombstones.contains_key(&key) && tombstones.len() >= MAX_EVIDENCE_TOMBSTONES {
+        if let Some(expired) = tombstones.keys().next().cloned() {
+            tombstones.remove(&expired);
+        }
+    }
+    tombstones.insert(key, EvidenceTombstone { binding, sink });
+    true
+}
+
+fn matching_terminal_tombstone(
+    tombstones: &HashMap<EvidenceTombstoneKey, EvidenceTombstone>,
+    session_id: &AgentSessionId,
+    notification: &SessionNotification,
+) -> Option<(
+    Arc<dyn TerminalEvidenceSink>,
+    Result<TurnEvidenceEnvelope, EvidenceCompleteness>,
+)> {
+    tombstones
+        .iter()
+        .filter(|((candidate_session, _), _)| candidate_session == session_id)
+        .find_map(|(_, tombstone)| {
+            AcpBackend::parse_terminal_evidence_notification(notification, &tombstone.binding)
+                .map(|parsed| (Arc::clone(&tombstone.sink), parsed))
+        })
+}
 
 struct TurnRoute {
     tx: UpdateSender,
@@ -1129,6 +1251,217 @@ struct TurnRoute {
     /// post-response observer cannot be mistaken for live agent work.
     active: Arc<AtomicBool>,
     prefix_attestation: Option<PrefixTurnState>,
+    activity: Arc<TurnProgress>,
+    terminal_evidence: Option<Arc<dyn TerminalEvidenceSink>>,
+}
+
+struct TurnProgress {
+    recorder: Arc<dyn AttemptRecorder>,
+    message_advance: AtomicU64,
+    thought_advance: AtomicU64,
+    usage_components: StdMutex<[u64; 8]>,
+    tool_transitions: AtomicU64,
+    tool_states: StdMutex<HashMap<String, String>>,
+}
+
+impl TurnProgress {
+    fn new(recorder: Arc<dyn AttemptRecorder>) -> Self {
+        Self {
+            recorder,
+            message_advance: AtomicU64::new(0),
+            thought_advance: AtomicU64::new(0),
+            usage_components: StdMutex::new([0; 8]),
+            tool_transitions: AtomicU64::new(0),
+            tool_states: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn add(&self, slot: &AtomicU64, phase: AttemptPhase, reason: ActivityReason, amount: u64) {
+        // Overflow is sticky and explicit: a wrapped local counter would turn
+        // later genuine increments into small stale advances, so the counter
+        // saturates and the attempt tally is marked incomplete instead.
+        let advance = match slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(amount)
+        }) {
+            Ok(prior) => prior.saturating_add(amount),
+            Err(_) => {
+                slot.store(u64::MAX, Ordering::Relaxed);
+                self.recorder.mark_overflowed();
+                u64::MAX
+            }
+        };
+        let _ = self.recorder.record(phase, reason, advance);
+    }
+
+    fn message(&self, amount: usize) {
+        self.add(
+            &self.message_advance,
+            AttemptPhase::Provider,
+            ActivityReason::MessageDelta,
+            u64::try_from(amount).unwrap_or(u64::MAX),
+        );
+    }
+
+    fn thought(&self, amount: usize) {
+        self.add(
+            &self.thought_advance,
+            AttemptPhase::Provider,
+            ActivityReason::ThoughtDelta,
+            u64::try_from(amount).unwrap_or(u64::MAX),
+        );
+    }
+
+    fn usage(&self, usage: &bridge_core::orch::UsageSnapshot) {
+        let incoming = [
+            usage.used.unwrap_or(0),
+            usage.size.unwrap_or(0),
+            usage
+                .terminal
+                .as_ref()
+                .map_or(0, |value| value.total_tokens),
+            usage
+                .terminal
+                .as_ref()
+                .map_or(0, |value| value.input_tokens),
+            usage
+                .terminal
+                .as_ref()
+                .map_or(0, |value| value.output_tokens),
+            usage
+                .terminal
+                .as_ref()
+                .and_then(|value| value.thought_tokens)
+                .unwrap_or(0),
+            usage
+                .terminal
+                .as_ref()
+                .and_then(|value| value.cached_read_tokens)
+                .unwrap_or(0),
+            usage
+                .terminal
+                .as_ref()
+                .and_then(|value| value.cached_write_tokens)
+                .unwrap_or(0),
+        ];
+        let advance = self.usage_components.lock().map_or(0, |mut high_water| {
+            for (current, proposed) in high_water.iter_mut().zip(incoming) {
+                *current = (*current).max(proposed);
+            }
+            // Component summation uses checked arithmetic: an overflowed sum
+            // saturates and marks the attempt tally explicitly incomplete so
+            // it can never silently absorb a later genuine increment.
+            let mut sum = 0_u64;
+            for value in high_water.iter() {
+                match sum.checked_add(*value) {
+                    Some(next) => sum = next,
+                    None => {
+                        self.recorder.mark_overflowed();
+                        sum = u64::MAX;
+                        break;
+                    }
+                }
+            }
+            sum
+        });
+        let _ = self.recorder.record(
+            AttemptPhase::Provider,
+            ActivityReason::UsageHighWater,
+            advance,
+        );
+    }
+
+    fn tool_transition(&self, kind: &OrchEventKind) {
+        const MAX_TRACKED_TOOLS: usize = 64;
+        let (tool_call_id, status) = match kind {
+            OrchEventKind::ToolCall {
+                tool_call_id,
+                status,
+                ..
+            } => (tool_call_id, Some(status)),
+            OrchEventKind::ToolCallUpdate {
+                tool_call_id,
+                status,
+                ..
+            } => (tool_call_id, status.as_ref()),
+            _ => return,
+        };
+        let changed = status.is_some_and(|status| {
+            self.tool_states.lock().is_ok_and(|mut states| {
+                if states
+                    .get(tool_call_id)
+                    .is_some_and(|prior| prior == status)
+                {
+                    return false;
+                }
+                if states.contains_key(tool_call_id) || states.len() < MAX_TRACKED_TOOLS {
+                    states.insert(tool_call_id.clone(), status.clone());
+                    true
+                } else {
+                    false
+                }
+            })
+        });
+        let advance = if changed {
+            self.tool_transitions.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.tool_transitions.load(Ordering::Relaxed)
+        };
+        let _ = self
+            .recorder
+            .record(AttemptPhase::Tool, ActivityReason::ToolTransition, advance);
+    }
+}
+
+const OWNED_CHILD_OUTPUT_SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
+
+fn record_owned_child_output(
+    progress: &TurnProgress,
+    ring: &ProcessStderrRing,
+    cursor: ProcessStderrCursor,
+    observed_byte_count: &mut u64,
+) {
+    let byte_count = ring.metadata_since(cursor).byte_count();
+    if byte_count > *observed_byte_count {
+        *observed_byte_count = byte_count;
+        let _ = progress.recorder.record(
+            AttemptPhase::Adapter,
+            ActivityReason::OwnedChildOutput,
+            byte_count,
+        );
+    }
+}
+
+fn spawn_owned_child_output_sampler(
+    progress: Arc<TurnProgress>,
+    ring: ProcessStderrRing,
+    cursor: ProcessStderrCursor,
+) -> oneshot::Sender<()> {
+    let (done_tx, mut done_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(OWNED_CHILD_OUTPUT_SAMPLE_INTERVAL);
+        let mut observed_byte_count = 0;
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => record_owned_child_output(
+                    &progress,
+                    &ring,
+                    cursor,
+                    &mut observed_byte_count,
+                ),
+                _ = &mut done_rx => {
+                    record_owned_child_output(
+                        &progress,
+                        &ring,
+                        cursor,
+                        &mut observed_byte_count,
+                    );
+                    return;
+                }
+            }
+        }
+    });
+    done_tx
 }
 
 #[derive(Clone)]
@@ -1326,6 +1659,8 @@ fn bump_activity(w: &TurnWatch) {
 enum TurnEvent {
     /// A streamed chunk of the agent's textual response.
     Text(String),
+    /// A streamed assistant chunk explicitly qualified as a final answer.
+    FinalAnswer(String),
     /// A streamed context-window usage snapshot (ACP `usage_update`). Non-terminal,
     /// routed exactly like `Text`. [Slice 2]
     Usage(bridge_core::orch::UsageSnapshot),
@@ -1399,6 +1734,7 @@ struct AcpConn {
     /// closure registered in `connect`. `prompt` registers a `Sender` here
     /// BEFORE sending `session/prompt` and removes it once the turn ends.
     updates: UpdateRegistry,
+    terminal_tombstones: EvidenceTombstones,
 }
 
 // ── Per-bridge-session agent state ───────────────────────────────────────────
@@ -1672,6 +2008,7 @@ pub struct AcpBackend {
     /// early setup errors cannot leave stale metadata for a later turn.
     pending_turn_meta: StdMutex<HashMap<SessionId, TurnMeta>>,
     prefix_attestation_capability: PrefixAttestationCapability,
+    terminal_evidence_capability: EvidenceCapability,
     /// Policy engine that decides reverse `session/request_permission` requests.
     /// Defaults to an internal auto-approve impl (the deployed 3a policy); a
     /// caller (Task 6's `main`) threads a concrete engine via [`Self::with_policy`].
@@ -2945,6 +3282,8 @@ impl AcpBackend {
         // handler (below) and `prompt` (which registers/unregisters senders).
         let updates: UpdateRegistry = Arc::new(StdMutex::new(HashMap::new()));
         let updates_handler = Arc::clone(&updates);
+        let terminal_tombstones: EvidenceTombstones = Arc::new(StdMutex::new(HashMap::new()));
+        let tombstones_handler = Arc::clone(&terminal_tombstones);
 
         // Active policy engine for reverse `session/request_permission` requests.
         // Default = auto-approve (deployed 3a policy); `with_policy` swaps the
@@ -2975,16 +3314,64 @@ impl AcpBackend {
                 .on_receive_notification(
                     move |notif: SessionNotification, _cx| {
                         let updates = Arc::clone(&updates_handler);
+                        let tombstones = Arc::clone(&tombstones_handler);
                         async move {
                             let session_id = notif.session_id.clone();
                             let mut prefix_state = None;
+                            let mut terminal_state = None;
+                            let mut progress = None;
                             if let Ok(map) = updates.lock() {
                                 if let Some(route) = map.get(&session_id) {
                                     if let Some(w) = &route.watch {
                                         bump_activity(w);
                                     }
                                     prefix_state = route.prefix_attestation.clone();
+                                    terminal_state = route.terminal_evidence.clone();
+                                    progress = Some(Arc::clone(&route.activity));
                                 }
+                            }
+
+                            if let Some(state) = &terminal_state {
+                                if let Some(binding) = state.binding() {
+                                    if let Some(parsed) =
+                                        Self::parse_terminal_evidence_notification(&notif, &binding)
+                                    {
+                                        match parsed {
+                                            Ok(envelope) => {
+                                                let advance = u64::from(envelope.sequence);
+                                                let accepted = state.accept(envelope);
+                                                if matches!(
+                                                    accepted,
+                                                    bridge_core::terminal_evidence::EvidenceAcceptance::Accepted
+                                                        | bridge_core::terminal_evidence::EvidenceAcceptance::IdenticalReplay
+                                                ) {
+                                                    if let Some(progress) = &progress {
+                                                        let _ = progress.recorder.record(
+                                                            AttemptPhase::Adapter,
+                                                            ActivityReason::ProducerTerminal,
+                                                            advance,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(disposition) => state.reject(disposition),
+                                        }
+                                        return Ok(());
+                                    }
+                                }
+                            }
+
+                            let tombstone_match = tombstones.lock().ok().and_then(|tombstones| {
+                                matching_terminal_tombstone(&tombstones, &session_id, &notif)
+                            });
+                            if let Some((sink, parsed)) = tombstone_match {
+                                match parsed {
+                                    Ok(envelope) => {
+                                        let _ = sink.accept(envelope);
+                                    }
+                                    Err(disposition) => sink.reject(disposition),
+                                }
+                                return Ok(());
                             }
 
                             if let Some(state) = &prefix_state {
@@ -3017,6 +3404,13 @@ impl AcpBackend {
                                 }
                             }
 
+                            if let (Some(progress), Some(length)) =
+                                (progress.as_ref(), Self::thought_delta_len(&notif))
+                            {
+                                progress.thought(length);
+                                return Ok(());
+                            }
+
                             // Map rich updates first by borrow, then fall back to the
                             // value-consuming text/usage mapper. This handler stays
                             // try-send only: rich sink writes happen in the off-loop
@@ -3026,6 +3420,7 @@ impl AcpBackend {
                             } else {
                                 match Self::map_session_update(notif) {
                                     Some(Update::Text(text)) => Some(TurnEvent::Text(text)),
+                                    Some(Update::FinalAnswer(text)) => Some(TurnEvent::FinalAnswer(text)),
                                     Some(Update::Usage(snap)) => Some(TurnEvent::Usage(snap)),
                                     _ => None, // unmodeled / non-text (tolerant reader)
                                 }
@@ -3035,6 +3430,18 @@ impl AcpBackend {
                                 // std::Mutex: no await is held across the lock.
                                 if let Ok(map) = updates.lock() {
                                     if let Some(route) = map.get(&session_id) {
+                                        match &te {
+                                            TurnEvent::Text(text)
+                                            | TurnEvent::FinalAnswer(text) => route.activity.message(text.len()),
+                                            TurnEvent::Usage(usage) => {
+                                                route.activity.usage(usage);
+                                            }
+                                            TurnEvent::Rich(
+                                                kind @ (OrchEventKind::ToolCall { .. }
+                                                | OrchEventKind::ToolCallUpdate { .. }),
+                                            ) => route.activity.tool_transition(kind),
+                                            _ => {}
+                                        }
                                         let _ = route.tx.send(te);
                                     }
                                 }
@@ -3356,6 +3763,7 @@ impl AcpBackend {
                 .await?;
         }
 
+        let terminal_evidence_capability = terminal_evidence_capability_from_initialize(&resp);
         let prefix_attestation_capability = match config.prefix_attestation_transport {
             PrefixAttestationTransport::PackagedCodexAcpAttested => {
                 match tokio::time::timeout_at(
@@ -3422,6 +3830,7 @@ impl AcpBackend {
                 auth_methods: resp.auth_methods,
                 _shutdown: shutdown_tx,
                 updates,
+                terminal_tombstones,
             }),
             supervised: Arc::new(StdMutex::new(None)),
             stderr_ring: None,
@@ -3435,6 +3844,7 @@ impl AcpBackend {
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
             prefix_attestation_capability,
+            terminal_evidence_capability,
             policy,
             permission_registry,
             perm_timeout_ms,
@@ -4903,6 +5313,58 @@ impl AcpBackend {
         }
     }
 
+    fn parse_terminal_evidence_notification(
+        notif: &SessionNotification,
+        binding: &TurnEvidenceBinding,
+    ) -> Option<Result<TurnEvidenceEnvelope, EvidenceCompleteness>> {
+        let value = serde_json::to_value(notif).ok()?;
+        let update = value.get("update")?;
+        if update
+            .get("sessionUpdate")
+            .and_then(serde_json::Value::as_str)
+            != Some("agent_message_chunk")
+        {
+            return None;
+        }
+        let expected_message_id = format!("{TURN_EVIDENCE_CONTROL_PREFIX}{}", binding.turn_id);
+        if update.get("messageId").and_then(serde_json::Value::as_str)
+            != Some(expected_message_id.as_str())
+        {
+            return None;
+        }
+        let content_text = update
+            .get("content")
+            .and_then(|content| content.get("text"))
+            .and_then(serde_json::Value::as_str);
+        let Some(meta) = update.get("_meta").and_then(serde_json::Value::as_object) else {
+            return Some(Err(EvidenceCompleteness::Malformed));
+        };
+        if content_text != Some("") || meta.len() != 1 {
+            return Some(Err(EvidenceCompleteness::Malformed));
+        }
+        let Some(envelope) = meta.get(TURN_EVIDENCE_META_KEY) else {
+            return Some(Err(EvidenceCompleteness::Malformed));
+        };
+        Some(serde_json::from_value(envelope.clone()).map_err(|_| EvidenceCompleteness::Malformed))
+    }
+
+    fn thought_delta_len(notif: &SessionNotification) -> Option<usize> {
+        let value = serde_json::to_value(notif).ok()?;
+        let update = value.get("update")?;
+        (update
+            .get("sessionUpdate")
+            .and_then(serde_json::Value::as_str)
+            == Some("agent_thought_chunk"))
+        .then(|| {
+            update
+                .get("content")
+                .and_then(|content| content.get("text"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::len)
+        })
+        .flatten()
+    }
+
     fn parse_prefix_control_notification(
         notif: &SessionNotification,
         state: &PrefixTurnState,
@@ -5108,8 +5570,18 @@ impl AcpBackend {
     pub fn map_session_update(notif: SessionNotification) -> Option<Update> {
         match notif.update {
             SessionUpdate::AgentMessageChunk(chunk) => {
+                let final_answer = chunk
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("codex.phase"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("final_answer");
                 if let ContentBlock::Text(t) = chunk.content {
-                    return Some(Update::Text(t.text));
+                    return Some(if final_answer {
+                        Update::FinalAnswer(t.text)
+                    } else {
+                        Update::Text(t.text)
+                    });
                 }
                 None
             }
@@ -5226,6 +5698,8 @@ impl AcpBackend {
         parts: Vec<bridge_core::domain::Part>,
         rich_sink: Option<Arc<dyn RichEventSink>>,
         diagnostic_observer: Arc<dyn DiagnosticObserver>,
+        activity_recorder: Arc<dyn AttemptRecorder>,
+        terminal_evidence: Arc<dyn TerminalEvidenceSink>,
     ) -> Result<BackendStream, BridgeError> {
         let config_snapshot = self.session_config_snapshot(session)?;
         #[cfg(test)]
@@ -5264,6 +5738,15 @@ impl AcpBackend {
             .as_ref()
             .is_some_and(|(requested, _)| *requested);
         let prefix_state = prefix_meta.map(|(_, state)| state);
+        terminal_evidence.declare_capability(self.terminal_evidence_capability);
+        let evidence_binding = (self.terminal_evidence_capability == EvidenceCapability::V1)
+            .then(|| terminal_evidence.binding())
+            .flatten();
+        let terminal_state = Some(Arc::clone(&terminal_evidence));
+        let progress = Arc::new(TurnProgress::new(activity_recorder));
+        let _ = progress
+            .recorder
+            .record(AttemptPhase::Adapter, ActivityReason::PhaseTransition, 1);
 
         // (1) Mint/get the agent session id. Done OUTSIDE the turn lock so a
         // first-prompt's `session/new` doesn't hold the lock while awaiting.
@@ -5296,8 +5779,12 @@ impl AcpBackend {
         // stream yields chunks then Done, in order).
         let (tx, rx) = mpsc::unbounded_channel::<TurnEvent>();
         let done_sender = tx.clone();
-        let (registry, cx) = match self.conn.as_ref() {
-            Some(conn) => (Arc::clone(&conn.updates), conn.cx.clone()),
+        let (registry, cx, tombstones) = match self.conn.as_ref() {
+            Some(conn) => (
+                Arc::clone(&conn.updates),
+                conn.cx.clone(),
+                Arc::clone(&conn.terminal_tombstones),
+            ),
             None => {
                 return Err(lifecycle
                     .failure(
@@ -5397,10 +5884,15 @@ impl AcpBackend {
                     cancelled: Arc::new(AtomicBool::new(false)),
                     active: Arc::clone(&turn_active),
                     prefix_attestation: prefix_state.clone(),
+                    activity: Arc::clone(&progress),
+                    terminal_evidence: terminal_state.clone(),
                 },
             );
         }
-        let req = Self::prompt_request(agent_id.clone(), &parts);
+        let req = EvidenceAwarePromptRequest::new(
+            Self::prompt_request(agent_id.clone(), &parts),
+            evidence_binding,
+        );
 
         // Install a FRESH per-turn kill switch on the session: the external cancel
         // grace-watcher fires it to unblock a hung driver (see `cancel`). The
@@ -5447,6 +5939,7 @@ impl AcpBackend {
         // `turn_guard`, releasing the lock only when it finishes) and awaits the
         // `PromptResponse`; the SDK delivers chunks meanwhile via the handler.
         let registry_for_driver = Arc::clone(&registry);
+        let tombstones_for_driver = Arc::clone(&tombstones);
         let agent_id_for_driver = agent_id.clone();
         let supervised_for_driver = Arc::clone(&self.supervised);
         let container_for_driver = self.container_reap.clone();
@@ -5454,6 +5947,13 @@ impl AcpBackend {
         let unavailable_for_driver = Arc::clone(&self.unavailable);
         let dispatch_gate_for_driver = Arc::clone(&self.dispatch_gate);
         let stderr_ring_for_driver = self.stderr_ring.clone();
+        let child_output_sampler_done_tx =
+            stderr_ring_for_driver
+                .as_ref()
+                .zip(stderr_cursor)
+                .map(|(ring, cursor)| {
+                    spawn_owned_child_output_sampler(Arc::clone(&progress), ring.clone(), cursor)
+                });
         let kill_slot = Arc::clone(&entry.turn_kill);
         let turn_acceptance_for_driver = turn_acceptance;
         let grace = self.cancel_grace();
@@ -5579,6 +6079,7 @@ impl AcpBackend {
                     *slot = None;
                 }
                 drop(watchdog_done_tx);
+                drop(child_output_sampler_done_tx);
                 let _ = done_sender.send(TurnEvent::Failed(error));
                 return;
             }
@@ -5674,16 +6175,67 @@ impl AcpBackend {
             if let Some(state) = prefix_state.as_ref() {
                 state.close_control();
             }
+            if let Some(state) = terminal_state.as_ref() {
+                state.close();
+                if let Some(binding) = state.binding() {
+                    if let Ok(mut tombstones) = tombstones_for_driver.lock() {
+                        let _ = install_terminal_tombstone(
+                            &mut tombstones,
+                            agent_id_for_driver.clone(),
+                            binding,
+                            Arc::clone(state),
+                        );
+                    }
+                }
+            }
+            let _ =
+                progress
+                    .recorder
+                    .record(AttemptPhase::Adapter, ActivityReason::PhaseTransition, 2);
             drop(watchdog_done_tx);
+            drop(child_output_sampler_done_tx);
             // Clear the kill switch slot now the turn is ending (next turn installs
             // its own); avoids a stale notify firing across turns.
             if let Ok(mut slot) = kill_slot.lock() {
                 *slot = None;
             }
+            let observed_child_liveness = supervised_for_driver
+                .lock()
+                .ok()
+                .and_then(|mut child| {
+                    child
+                        .as_mut()
+                        .map(|child| match child.child_mut().try_wait() {
+                            Ok(None) => bridge_core::terminal_evidence::AcpChildLiveness::Live,
+                            Ok(Some(_)) => bridge_core::terminal_evidence::AcpChildLiveness::Exited,
+                            Err(_) => bridge_core::terminal_evidence::AcpChildLiveness::Unknown,
+                        })
+                })
+                .unwrap_or(bridge_core::terminal_evidence::AcpChildLiveness::Unknown);
+            if let Some(state) = terminal_state.as_ref() {
+                state.record_child_liveness(observed_child_liveness);
+            }
+            let child_advance = match observed_child_liveness {
+                bridge_core::terminal_evidence::AcpChildLiveness::Live => Some(1),
+                bridge_core::terminal_evidence::AcpChildLiveness::Exited => Some(2),
+                bridge_core::terminal_evidence::AcpChildLiveness::Unknown => None,
+            };
+            if let Some(advance) = child_advance {
+                let _ = progress.recorder.record(
+                    AttemptPhase::Adapter,
+                    ActivityReason::OwnedChildTransition,
+                    advance,
+                );
+            }
             let event = match outcome {
                 // Turn COMPLETED (incl. a real StopReason::Cancelled, which maps
                 // to Done{"cancelled"} — NOT an error). Emit the mapped Done.
                 Ok(resp) => {
+                    let _ = progress.recorder.record(
+                        AttemptPhase::Adapter,
+                        ActivityReason::ProducerTerminal,
+                        1,
+                    );
                     let stop_reason = AcpBackend::stop_reason_str(resp.stop_reason);
                     if let Err(error) = lifecycle
                         .record(
@@ -5753,6 +6305,17 @@ impl AcpBackend {
                     let stderr = stderr_ring_for_driver.as_ref().and_then(|ring| {
                         stderr_cursor.map(|cursor| lifecycle.stderr_snapshot_since(ring, cursor))
                     });
+                    if let (Some(ring), Some(cursor)) =
+                        (stderr_ring_for_driver.as_ref(), stderr_cursor)
+                    {
+                        let mut observed_line_count = 0;
+                        record_owned_child_output(
+                            &progress,
+                            ring,
+                            cursor,
+                            &mut observed_line_count,
+                        );
+                    }
                     let (class, code, summary, cause, retry_after_ms, reset_at_ms) = match failure {
                         PromptDriverFailure::Sdk(error) => {
                             let ProviderEvidence {
@@ -5845,6 +6408,9 @@ impl AcpBackend {
                         Some(TurnEvent::Text(t)) => {
                             return Some((Ok(Update::Text(t)), (rx, false, sink)));
                         }
+                        Some(TurnEvent::FinalAnswer(t)) => {
+                            return Some((Ok(Update::FinalAnswer(t)), (rx, false, sink)));
+                        }
                         Some(TurnEvent::Usage(snap)) => {
                             return Some((Ok(Update::Usage(snap)), (rx, false, sink)));
                         }
@@ -5875,6 +6441,8 @@ impl AgentBackend for AcpBackend {
             parts,
             None,
             Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+            Arc::new(NoopAttemptRecorder),
+            Arc::new(SharedTurnEvidence::unsupported()),
         )
         .await
     }
@@ -5890,6 +6458,8 @@ impl AgentBackend for AcpBackend {
             parts,
             Some(sink),
             Arc::new(bridge_core::diagnostics::NoopDiagnosticObserver::default()),
+            Arc::new(NoopAttemptRecorder),
+            Arc::new(SharedTurnEvidence::unsupported()),
         )
         .await
     }
@@ -5900,12 +6470,37 @@ impl AgentBackend for AcpBackend {
         parts: Vec<bridge_core::domain::Part>,
         observers: BackendObservers,
     ) -> Result<BackendStream, BridgeError> {
-        self.prompt_inner(session, parts, observers.rich, observers.diagnostic)
-            .await
+        self.prompt_inner(
+            session,
+            parts,
+            observers.rich,
+            observers.diagnostic,
+            observers.activity,
+            observers.terminal_evidence,
+        )
+        .await
     }
 
     fn prefix_attestation_capability(&self) -> PrefixAttestationCapability {
         self.prefix_attestation_capability.clone()
+    }
+
+    fn terminal_evidence_capability(&self) -> EvidenceCapability {
+        self.terminal_evidence_capability
+    }
+
+    fn bridge_owned_acp_child_liveness(&self) -> bridge_core::terminal_evidence::AcpChildLiveness {
+        let Ok(mut supervised) = self.supervised.lock() else {
+            return bridge_core::terminal_evidence::AcpChildLiveness::Unknown;
+        };
+        let Some(supervised) = supervised.as_mut() else {
+            return bridge_core::terminal_evidence::AcpChildLiveness::Unknown;
+        };
+        match supervised.child_mut().try_wait() {
+            Ok(None) => bridge_core::terminal_evidence::AcpChildLiveness::Live,
+            Ok(Some(_)) => bridge_core::terminal_evidence::AcpChildLiveness::Exited,
+            Err(_) => bridge_core::terminal_evidence::AcpChildLiveness::Unknown,
+        }
     }
 
     async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
@@ -7041,6 +7636,116 @@ mod tests {
     }
 
     #[test]
+    fn r2f0b_map_session_update_requires_exact_final_answer_phase() {
+        fn mapped(phase: Option<&str>) -> Update {
+            use agent_client_protocol::schema::v1::ContentChunk;
+
+            let mut meta = serde_json::Map::new();
+            if let Some(phase) = phase {
+                meta.insert(
+                    "codex.phase".into(),
+                    serde_json::Value::String(phase.into()),
+                );
+            }
+            let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new("payload")))
+                .message_id("message-id-does-not-prove-final")
+                .meta(meta);
+            AcpBackend::map_session_update(SessionNotification::new(
+                AgentSessionId::from("s"),
+                SessionUpdate::AgentMessageChunk(chunk),
+            ))
+            .expect("text chunk maps")
+        }
+
+        assert!(
+            matches!(mapped(Some("final_answer")), Update::FinalAnswer(text) if text == "payload")
+        );
+        for phase in [
+            None,
+            Some("commentary"),
+            Some("analysis"),
+            Some("FINAL_ANSWER"),
+        ] {
+            assert!(matches!(mapped(phase), Update::Text(text) if text == "payload"));
+        }
+    }
+
+    fn overflow_probe_recorder() -> Arc<
+        bridge_core::attempt_activity::SharedAttemptRecorder<
+            bridge_core::attempt_activity::SystemMonotonicClock,
+        >,
+    > {
+        Arc::new(bridge_core::attempt_activity::SharedAttemptRecorder::new(
+            bridge_core::attempt_activity::SystemMonotonicClock::start(),
+        ))
+    }
+
+    fn usage_snapshot(used: Option<u64>, size: Option<u64>) -> bridge_core::orch::UsageSnapshot {
+        bridge_core::orch::UsageSnapshot {
+            used,
+            size,
+            cost: None,
+            terminal: None,
+            at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn r2f0b_usage_component_sum_overflow_is_sticky_explicit() {
+        let recorder = overflow_probe_recorder();
+        let progress = TurnProgress::new(recorder.clone());
+        progress.usage(&usage_snapshot(Some(u64::MAX), Some(2)));
+        let tally = recorder.tally().expect("tally");
+        assert!(
+            tally.overflowed,
+            "an ACP usage component-sum overflow must become sticky explicit incompleteness"
+        );
+    }
+
+    #[test]
+    fn r2f0b_message_counter_overflow_is_sticky_explicit() {
+        let recorder = overflow_probe_recorder();
+        let progress = TurnProgress::new(recorder.clone());
+        progress.add(
+            &progress.message_advance,
+            AttemptPhase::Provider,
+            ActivityReason::MessageDelta,
+            u64::MAX,
+        );
+        progress.add(
+            &progress.message_advance,
+            AttemptPhase::Provider,
+            ActivityReason::MessageDelta,
+            2,
+        );
+        let tally = recorder.tally().expect("tally");
+        assert!(
+            tally.overflowed,
+            "a local provider counter overflow must become sticky explicit incompleteness"
+        );
+        assert_eq!(
+            tally.max_advance,
+            u64::MAX,
+            "the overflowed counter must not wrap into a fresh small advance"
+        );
+    }
+
+    #[test]
+    fn r2f0b_bounded_usage_components_never_flag_overflow() {
+        let recorder = overflow_probe_recorder();
+        let progress = TurnProgress::new(recorder.clone());
+        progress.usage(&usage_snapshot(Some(10), Some(20)));
+        progress.usage(&usage_snapshot(Some(10), Some(20)));
+        let tally = recorder.tally().expect("tally");
+        assert!(!tally.overflowed);
+        assert_eq!(
+            tally.meaningful_progress, 1,
+            "first bounded sum is progress"
+        );
+        assert_eq!(tally.activity, 1, "the identical snapshot stays activity");
+    }
+
+    #[test]
     fn map_session_update_maps_usage_to_update_usage_clock_free() {
         use agent_client_protocol::schema::v1::UsageUpdate;
 
@@ -7116,6 +7821,420 @@ mod tests {
             "content": {"type": "text", "text": ""},
             "_meta": meta,
         }))
+    }
+
+    fn terminal_binding() -> TurnEvidenceBinding {
+        TurnEvidenceBinding {
+            generation: 7,
+            session_id: "bridge-session".into(),
+            turn_id: "turn-evidence".into(),
+            attempt_id: "attempt-evidence".into(),
+            marker_nonce: "00112233445566778899aabbccddeeff".into(),
+        }
+    }
+
+    fn terminal_envelope() -> TurnEvidenceEnvelope {
+        let binding = terminal_binding();
+        TurnEvidenceEnvelope {
+            version: TURN_EVIDENCE_VERSION.into(),
+            generation: binding.generation,
+            session_id: binding.session_id,
+            turn_id: binding.turn_id,
+            attempt_id: binding.attempt_id,
+            marker_nonce: binding.marker_nonce,
+            native_turn_id: "native-turn".into(),
+            sequence: 1,
+            producer: bridge_core::terminal_evidence::ProducerTerminal::Completed,
+            final_presence: bridge_core::terminal_evidence::FinalPresence::Nonempty,
+            ordered_notifications_drained: true,
+            complete: true,
+        }
+    }
+
+    struct DeclarationGatedEvidence {
+        inner: SharedTurnEvidence,
+        declared: AtomicBool,
+    }
+
+    impl DeclarationGatedEvidence {
+        fn new(binding: TurnEvidenceBinding) -> Self {
+            Self {
+                inner: SharedTurnEvidence::dormant(binding),
+                declared: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl TerminalEvidenceSink for DeclarationGatedEvidence {
+        fn declare_capability(&self, capability: EvidenceCapability) {
+            self.inner.declare_capability(capability);
+            self.declared.store(true, Ordering::SeqCst);
+        }
+
+        fn binding(&self) -> Option<TurnEvidenceBinding> {
+            assert!(
+                self.declared.load(Ordering::SeqCst),
+                "the exact ACP inner must declare before reading the binding"
+            );
+            self.inner.binding()
+        }
+
+        fn accept(
+            &self,
+            envelope: TurnEvidenceEnvelope,
+        ) -> bridge_core::terminal_evidence::EvidenceAcceptance {
+            self.inner.accept(envelope)
+        }
+
+        fn reject(&self, disposition: EvidenceCompleteness) {
+            self.inner.reject(disposition);
+        }
+
+        fn close(&self) {
+            self.inner.close();
+        }
+
+        fn observation(
+            &self,
+        ) -> (
+            EvidenceCompleteness,
+            bridge_core::terminal_evidence::ProducerTerminal,
+            bridge_core::terminal_evidence::FinalPresence,
+            bool,
+        ) {
+            self.inner.observation()
+        }
+
+        fn capability(&self) -> EvidenceCapability {
+            self.inner.capability()
+        }
+
+        fn record_child_liveness(
+            &self,
+            liveness: bridge_core::terminal_evidence::AcpChildLiveness,
+        ) {
+            self.inner.record_child_liveness(liveness);
+        }
+
+        fn child_liveness(&self) -> bridge_core::terminal_evidence::AcpChildLiveness {
+            self.inner.child_liveness()
+        }
+
+        fn record_deliverable_final(&self) {
+            self.inner.record_deliverable_final();
+        }
+
+        fn deliverable_final_present(&self) -> bool {
+            self.inner.deliverable_final_present()
+        }
+    }
+
+    fn terminal_notification(envelope: serde_json::Value) -> SessionNotification {
+        let binding = terminal_binding();
+        prefix_notification(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": format!("{TURN_EVIDENCE_CONTROL_PREFIX}{}", binding.turn_id),
+            "content": {"type": "text", "text": ""},
+            "_meta": {(TURN_EVIDENCE_META_KEY): envelope},
+        }))
+    }
+
+    #[test]
+    fn r2f0b_tool_progress_counts_only_real_status_transitions() {
+        let progress = TurnProgress::new(Arc::new(NoopAttemptRecorder));
+        let started = OrchEventKind::ToolCall {
+            tool_call_id: "tool-1".into(),
+            title: "bounded".into(),
+            kind: "other".into(),
+            status: "pending".into(),
+            locations: Vec::new(),
+            content: None,
+        };
+        let duplicate = OrchEventKind::ToolCallUpdate {
+            tool_call_id: "tool-1".into(),
+            title: None,
+            kind: None,
+            status: Some("pending".into()),
+            locations: None,
+            content: None,
+        };
+        let statusless = OrchEventKind::ToolCallUpdate {
+            tool_call_id: "tool-1".into(),
+            title: Some("metadata-only".into()),
+            kind: None,
+            status: None,
+            locations: None,
+            content: None,
+        };
+        let completed = OrchEventKind::ToolCallUpdate {
+            tool_call_id: "tool-1".into(),
+            title: None,
+            kind: None,
+            status: Some("completed".into()),
+            locations: None,
+            content: None,
+        };
+
+        progress.tool_transition(&started);
+        progress.tool_transition(&duplicate);
+        progress.tool_transition(&statusless);
+        progress.tool_transition(&completed);
+
+        assert_eq!(progress.tool_transitions.load(Ordering::Relaxed), 2);
+        assert_eq!(progress.tool_states.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn r2f0b_owned_child_output_advances_while_child_is_still_live() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let recorder = Arc::new(bridge_core::attempt_activity::SharedAttemptRecorder::new(
+            bridge_core::attempt_activity::SystemMonotonicClock::start(),
+        ));
+        let progress = Arc::new(TurnProgress::new(recorder.clone()));
+        let mut child = Supervised::spawn(
+            "/bin/sh",
+            &[
+                "-c",
+                "echo READY; read _; printf first >&2; echo FRAGMENT; read _; printf '\n' >&2; echo NEWLINE; read _; printf second >&2; echo SECOND; read _",
+            ],
+            None,
+        )
+        .expect("spawn bridge-owned test child");
+        let ring = child.stderr_ring();
+        let cursor = ring.origin();
+        let done = spawn_owned_child_output_sampler(progress, ring.clone(), cursor);
+        let stdout = child.child_mut().stdout.take().unwrap();
+        let mut stdout = tokio::io::BufReader::new(stdout).lines();
+        assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("READY"));
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert_eq!(recorder.tally().unwrap().meaningful_progress, 0);
+        child
+            .child_mut()
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"fragment\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            stdout.next_line().await.unwrap().as_deref(),
+            Some("FRAGMENT")
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if recorder
+                    .tally()
+                    .is_some_and(|tally| tally.meaningful_progress > 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("output progress is observed before child completion");
+        assert!(child.child_mut().try_wait().unwrap().is_none());
+        assert_eq!(ring.metadata_since(cursor).line_count(), 0);
+        assert_eq!(ring.metadata_since(cursor).byte_count(), 5);
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert_eq!(recorder.tally().unwrap().meaningful_progress, 1);
+
+        child
+            .child_mut()
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"newline\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            stdout.next_line().await.unwrap().as_deref(),
+            Some("NEWLINE")
+        );
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert_eq!(ring.metadata_since(cursor).line_count(), 1);
+        assert_eq!(ring.metadata_since(cursor).byte_count(), 6);
+        assert_eq!(recorder.tally().unwrap().meaningful_progress, 2);
+
+        child
+            .child_mut()
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"second\n")
+            .await
+            .unwrap();
+        assert_eq!(stdout.next_line().await.unwrap().as_deref(), Some("SECOND"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if recorder.tally().unwrap().meaningful_progress == 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a distinct unterminated fragment advances monotonically");
+        assert_eq!(ring.metadata_since(cursor).byte_count(), 12);
+
+        child
+            .child_mut()
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"exit\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), child.child_mut().wait())
+            .await
+            .expect("child exits")
+            .expect("child wait succeeds");
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert_eq!(ring.metadata_since(cursor).line_count(), 2);
+        assert_eq!(ring.metadata_since(cursor).byte_count(), 12);
+        assert_eq!(
+            recorder.tally().unwrap().meaningful_progress,
+            3,
+            "EOF line publication must not recount already observed bytes"
+        );
+
+        drop(done);
+    }
+
+    #[test]
+    fn r2f0b_terminal_tombstones_are_bounded_by_exact_turn() {
+        let binding = terminal_binding();
+        let state = Arc::new(SharedTurnEvidence::unsupported());
+        state.configure_v1(binding.clone());
+        let sink: Arc<dyn TerminalEvidenceSink> = state;
+        let mut tombstones = HashMap::new();
+
+        for index in 0..MAX_EVIDENCE_TOMBSTONES {
+            assert!(install_terminal_tombstone(
+                &mut tombstones,
+                AgentSessionId::from(format!("agent-{index}")),
+                binding.clone(),
+                sink.clone(),
+            ));
+        }
+        assert_eq!(tombstones.len(), MAX_EVIDENCE_TOMBSTONES);
+        assert!(install_terminal_tombstone(
+            &mut tombstones,
+            AgentSessionId::from("agent-overflow"),
+            binding.clone(),
+            sink.clone(),
+        ));
+        assert!(tombstones.contains_key(&(
+            AgentSessionId::from("agent-overflow"),
+            binding.turn_id.clone(),
+        )));
+        assert_eq!(tombstones.len(), MAX_EVIDENCE_TOMBSTONES);
+        assert!(install_terminal_tombstone(
+            &mut tombstones,
+            AgentSessionId::from("agent-0"),
+            binding,
+            sink,
+        ));
+        assert_eq!(tombstones.len(), MAX_EVIDENCE_TOMBSTONES);
+    }
+
+    #[test]
+    fn r2f0b_prior_turn_evidence_stays_late_while_next_turn_is_active() {
+        let session_id = AgentSessionId::from("agent-session");
+        let prior_binding = terminal_binding();
+        let prior = Arc::new(SharedTurnEvidence::unsupported());
+        prior.configure_v1(prior_binding.clone());
+        prior.close();
+        assert_eq!(
+            prior.observation().0,
+            EvidenceCompleteness::Missing,
+            "the closed row is sealed before the late envelope"
+        );
+
+        let mut tombstones = HashMap::new();
+        assert!(install_terminal_tombstone(
+            &mut tombstones,
+            session_id.clone(),
+            prior_binding,
+            prior.clone(),
+        ));
+
+        let mut active_binding = terminal_binding();
+        active_binding.turn_id = "turn-next".into();
+        active_binding.attempt_id = "attempt-next".into();
+        let notification =
+            terminal_notification(serde_json::to_value(terminal_envelope()).unwrap());
+        assert!(
+            AcpBackend::parse_terminal_evidence_notification(&notification, &active_binding,)
+                .is_none()
+        );
+
+        let (sink, parsed) = matching_terminal_tombstone(&tombstones, &session_id, &notification)
+            .expect("the exact prior turn remains addressable");
+        let acceptance = sink.accept(parsed.expect("prior envelope remains well formed"));
+        assert_eq!(
+            acceptance,
+            bridge_core::terminal_evidence::EvidenceAcceptance::Rejected(
+                EvidenceCompleteness::Late,
+            ),
+        );
+        assert_eq!(
+            prior.observation().0,
+            EvidenceCompleteness::Missing,
+            "late classification cannot repair the sealed row"
+        );
+    }
+
+    #[test]
+    fn r2f0b_prompt_metadata_is_gated_and_terminal_envelope_is_exactly_correlated() {
+        let prompt = AcpBackend::prompt_request(
+            AgentSessionId::from("agent-session"),
+            &[bridge_core::domain::Part {
+                text: "hello".into(),
+            }],
+        );
+        let legacy = serde_json::to_value(&prompt).unwrap();
+        let unsupported =
+            serde_json::to_value(EvidenceAwarePromptRequest::new(prompt, None)).unwrap();
+        assert_eq!(
+            unsupported, legacy,
+            "unsupported prompt params stay byte-shape identical"
+        );
+
+        let binding = terminal_binding();
+        let prompt = AcpBackend::prompt_request(
+            AgentSessionId::from("agent-session"),
+            &[bridge_core::domain::Part {
+                text: "hello".into(),
+            }],
+        );
+        let negotiated = serde_json::to_value(EvidenceAwarePromptRequest::new(
+            prompt,
+            Some(binding.clone()),
+        ))
+        .unwrap();
+        assert_eq!(
+            negotiated["_meta"][TURN_EVIDENCE_META_KEY],
+            serde_json::to_value(&binding).unwrap()
+        );
+
+        let parsed = AcpBackend::parse_terminal_evidence_notification(
+            &terminal_notification(serde_json::to_value(terminal_envelope()).unwrap()),
+            &binding,
+        )
+        .expect("reserved terminal frame")
+        .expect("well-formed terminal envelope");
+        assert!(parsed.validates_for(&binding));
+
+        let malformed = AcpBackend::parse_terminal_evidence_notification(
+            &terminal_notification(serde_json::json!({"version": TURN_EVIDENCE_VERSION})),
+            &binding,
+        );
+        assert_eq!(malformed, Some(Err(EvidenceCompleteness::Malformed)));
     }
 
     #[test]
@@ -8585,6 +9704,38 @@ mod tests {
         assert_eq!(methods.len(), 1, "advertised auth method round-trips");
     }
 
+    #[test]
+    fn r2f0b_initialize_metadata_explicitly_negotiates_terminal_evidence_v1() {
+        let unsupported = InitializeResponse::new(ProtocolVersion::V1)
+            .agent_capabilities(AgentCapabilities::default());
+        assert_eq!(
+            terminal_evidence_capability_from_initialize(&unsupported),
+            EvidenceCapability::Unsupported
+        );
+
+        let mut wire = serde_json::to_value(unsupported).unwrap();
+        wire.as_object_mut().unwrap().insert(
+            "_meta".into(),
+            serde_json::json!({(TURN_EVIDENCE_VERSION): true}),
+        );
+        let advertised: InitializeResponse = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            terminal_evidence_capability_from_initialize(&advertised),
+            EvidenceCapability::V1
+        );
+
+        let mut malformed_wire = serde_json::to_value(&advertised).unwrap();
+        malformed_wire.as_object_mut().unwrap().insert(
+            "_meta".into(),
+            serde_json::json!({(TURN_EVIDENCE_VERSION): "v2"}),
+        );
+        let malformed: InitializeResponse = serde_json::from_value(malformed_wire).unwrap();
+        assert_eq!(
+            terminal_evidence_capability_from_initialize(&malformed),
+            EvidenceCapability::MalformedAdvertisement
+        );
+    }
+
     #[tokio::test]
     async fn connect_records_backend_declared_incapable_prefix_diagnostic() {
         let (client_side, agent_side) = Channel::duplex();
@@ -8981,6 +10132,7 @@ mod tests {
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
             prefix_attestation_capability: PrefixAttestationCapability::default(),
+            terminal_evidence_capability: EvidenceCapability::Unsupported,
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),
@@ -11354,6 +12506,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn negotiated_terminal_capability_is_declared_before_binding_lookup() {
+        let rec = Recorder::new("agent-sess-TERMINAL-DECLARATION");
+        let mut backend = connect_recording(rec).await;
+        backend.terminal_evidence_capability = EvidenceCapability::V1;
+        let evidence = Arc::new(DeclarationGatedEvidence::new(terminal_binding()));
+        let mut stream = backend
+            .prompt_with_observers(
+                &bkey("bridge-TERMINAL-DECLARATION"),
+                vec![],
+                BackendObservers::diagnostic_only(Arc::new(
+                    InMemoryDiagnosticObserver::new(32).unwrap(),
+                ))
+                .with_attempt_telemetry(
+                    Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder),
+                    evidence.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        assert!(evidence.declared.load(Ordering::SeqCst));
+        assert_eq!(evidence.capability(), EvidenceCapability::V1);
+        assert!(evidence.binding().is_some());
+    }
+
+    #[tokio::test]
     async fn synchronous_prompt_construction_failure_has_started_transition() {
         let rec = Recorder::new("agent-sess-PROMPT-SYNC-FAIL");
         let backend = connect_recording(rec).await;
@@ -11412,6 +12591,7 @@ mod tests {
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
             prefix_attestation_capability: PrefixAttestationCapability::default(),
+            terminal_evidence_capability: EvidenceCapability::Unsupported,
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),
@@ -14498,6 +15678,7 @@ mod tests {
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
             prefix_attestation_capability: PrefixAttestationCapability::default(),
+            terminal_evidence_capability: EvidenceCapability::Unsupported,
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),
@@ -15691,6 +16872,7 @@ mod tests {
             session_cfg: Arc::new(StdMutex::new(HashMap::new())),
             pending_turn_meta: StdMutex::new(HashMap::new()),
             prefix_attestation_capability: PrefixAttestationCapability::default(),
+            terminal_evidence_capability: EvidenceCapability::Unsupported,
             policy: Arc::new(StdMutex::new(
                 Arc::new(AutoApprovePolicy) as Arc<dyn PolicyEngine>
             )),

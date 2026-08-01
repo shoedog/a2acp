@@ -5,11 +5,13 @@
   `2685ffb78ef21c987b3f63f7aba1ddc096b01189`, final PR head
   `630b9cc9d7ae86c323b183763b3d4e83bdbfc792`, after integrated native verification and independent concurrent
   Sol/xhigh and Fable/xhigh `APPROVE` reviews. PR Build/Lint/Coverage, macOS store, Windows unsupported-target,
-  and CLA checks are green. R2f0b is the next slice and is not started.
+  and CLA checks are green. R2f0b is **IN REVIEW** with its implementation candidate complete;
+  deterministic/native verification and independent review remain pending.
 - **Prerequisite:** R2b structured diagnostics merged; may proceed independently of R2c–R2e afterward
 - **Program source:** [`../../bridge-reliability.md`](../../bridge-reliability.md)
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Focused owner design:** [`../specs/2026-07-20-r2f-owner-design.md`](../specs/2026-07-20-r2f-owner-design.md)
+- **R2f0b focused boundary:** [`2026-07-30-r2f0b-focused-boundary.md`](2026-07-30-r2f0b-focused-boundary.md)
 - **Queued process-deployment increment:** [`2026-07-20-r2g-stable-ingress.md`](2026-07-20-r2g-stable-ingress.md)
 - **Short-bound validation spike:**
   [`../spikes/2026-07-20-r2f-short-bound-validation.md`](../spikes/2026-07-20-r2f-short-bound-validation.md)
@@ -215,8 +217,7 @@ dependency for the final six-line macOS test-only correction, so that attempt is
 merged the integrated work at `2685ffb78ef21c987b3f63f7aba1ddc096b01189`; its final head
 `630b9cc9d7ae86c323b183763b3d4e83bdbfc792` passed Build/Lint/Coverage, macOS store, Windows unsupported-target,
 and CLA checks. The merge does not by itself prove a release, deployment, live canary, production-server update, or
-post-merge operator build. R2f0b is next and not started; R2f overall, the behavior retained from closed intake #22,
-open #24/#47, R2g, and R4 remain incomplete.
+post-merge operator build. R2f0b is now in progress from its frozen focused boundary, with IN REVIEW — implementation candidate complete; deterministic/native verification and review pending; R2f overall, the behavior retained from closed intake #22, open #24/#47, R2g, and R4 remain incomplete.
 
 - Mint and expose distinct `execution_id` and `attempt_id` before registry/session/provider effects. `execution_id`
   remains stable across served resume and operator takeover; every resume/takeover gets a new attempt id, ordinal,
@@ -250,6 +251,9 @@ open #24/#47, R2g, and R4 remain incomplete.
   a separate reviewed policy edit.
 
 ## R2f0b — Meaningful progress, terminal evidence, and recorder
+
+**Status:** IN PROGRESS — the [focused implementation boundary](2026-07-30-r2f0b-focused-boundary.md) is frozen
+from exact main `1a8cfc0`; IN REVIEW — implementation candidate complete; deterministic/native verification and review pending.
 
 - Add an append-only activity/progress/absolute-clock recorder with bounded low-cardinality phase/reason codes and no
   timeout behavior change. Capture phase transitions, agent updates, tool start/end, owned-child spawn/exit and

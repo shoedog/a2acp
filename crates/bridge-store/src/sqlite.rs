@@ -1797,7 +1797,8 @@ impl SqliteStore {
             let active = {
                 let mut statement = tx
                     .prepare(
-                        "SELECT attempt_id, prompt_acceptance, length(terminal_reserve)
+                        "SELECT attempt_id, prompt_acceptance, length(terminal_reserve),
+                                cleanup_pending
                          FROM workflow_attempt_summaries
                          WHERE status='active' ORDER BY attempt_id",
                     )
@@ -1808,6 +1809,7 @@ impl SqliteStore {
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, i64>(3)?,
                         ))
                     })
                     .map_err(|error| history_error(&error))?;
@@ -1816,7 +1818,10 @@ impl SqliteStore {
             };
 
             let mut candidate = None;
-            for (attempt_id, prompt_acceptance, terminal_reserve) in active {
+            for (attempt_id, prompt_acceptance, terminal_reserve, cleanup_pending) in active {
+                if history_persisted_bool(cleanup_pending)? {
+                    return Err(LedgerError::new(R::Corruption));
+                }
                 let parsed = bridge_core::ids::AttemptId::parse(attempt_id)
                     .map_err(|_| LedgerError::new(R::Corruption))?;
                 if excluded.contains(parsed.as_str()) {
@@ -1853,6 +1858,7 @@ impl SqliteStore {
                 terminal_evidence_version: "none".into(),
                 terminal_evidence_source: "none".into(),
                 terminal_evidence_complete: false,
+                terminal_evidence_counts: Default::default(),
                 degraded: true,
                 prompt_acceptance,
                 cleanup_disposition: "unknown".into(),
@@ -1882,8 +1888,8 @@ impl SqliteStore {
                      terminal_evidence_capability='unsupported',
                      terminal_evidence_version='none', terminal_evidence_source='none',
                      terminal_evidence_complete=0, telemetry_complete=0,
-                     terminal_json=?3, terminal_reserve=NULL
-                     WHERE attempt_id=?1 AND status='active'",
+                     terminal_json=?3, cleanup_pending=0, terminal_reserve=NULL
+                     WHERE attempt_id=?1 AND status='active' AND cleanup_pending=0",
                     rusqlite::params![attempt_id.as_str(), completed_ms, json],
                 )
                 .map_err(|error| history_error(&error))?;
@@ -2284,6 +2290,8 @@ impl SqliteStore {
                 outcome TEXT,
                 degraded INTEGER NOT NULL DEFAULT 0,
                 pinned INTEGER NOT NULL DEFAULT 0,
+                cleanup_pending INTEGER NOT NULL DEFAULT 0
+                    CHECK(cleanup_pending IN (0,1)),
                 charged_bytes INTEGER NOT NULL,
                 reservation_json TEXT NOT NULL,
                 terminal_json TEXT,
@@ -2292,6 +2300,9 @@ impl SqliteStore {
             CREATE TABLE IF NOT EXISTS workflow_history_attachment (
                 attempt_id TEXT PRIMARY KEY,
                 charged_bytes INTEGER NOT NULL CHECK(charged_bytes=1024),
+                activity_json TEXT,
+                activity_overflow INTEGER NOT NULL DEFAULT 0
+                    CHECK(activity_overflow IN (0,1)),
                 FOREIGN KEY (attempt_id) REFERENCES workflow_attempt_summaries(attempt_id)
                     ON DELETE CASCADE
             );
@@ -2816,7 +2827,7 @@ fn migrate_history_allocation(
             let victim: Option<String> = tx
                 .query_row(
                     "SELECT attempt_id FROM workflow_attempt_summaries
-                     WHERE status='terminal' AND pinned=0
+                     WHERE status='terminal' AND pinned=0 AND cleanup_pending=0
                      ORDER BY completed_ms, attempt_id LIMIT 1",
                     [],
                     |row| row.get(0),
@@ -2829,7 +2840,8 @@ fn migrate_history_allocation(
             };
             if tx.execute(
                 "DELETE FROM workflow_attempt_summaries
-                 WHERE attempt_id=?1 AND status='terminal' AND pinned=0",
+                 WHERE attempt_id=?1 AND status='terminal' AND pinned=0
+                   AND cleanup_pending=0",
                 rusqlite::params![victim],
             )? != 1
             {
@@ -2883,6 +2895,14 @@ fn migrate_workflow_history_columns(conn: &rusqlite::Connection) -> rusqlite::Re
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<std::collections::HashSet<_>, _>>()?;
     drop(stmt);
+    let cleanup_pending_added = !columns.contains("cleanup_pending");
+    let allocation_tag_absent: bool = conn.query_row(
+        "SELECT NOT EXISTS(
+             SELECT 1 FROM workflow_history_allocation WHERE singleton=1
+         )",
+        [],
+        |row| row.get(0),
+    )?;
     for (name, declaration) in [
         (
             "workload_fingerprint_complete",
@@ -2903,6 +2923,10 @@ fn migrate_workflow_history_columns(conn: &rusqlite::Connection) -> rusqlite::Re
         ("terminal_evidence_source", "TEXT NOT NULL DEFAULT 'none'"),
         ("terminal_evidence_complete", "INTEGER NOT NULL DEFAULT 0"),
         ("telemetry_complete", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "cleanup_pending",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(cleanup_pending IN (0,1))",
+        ),
         ("terminal_reserve", "BLOB"),
     ] {
         if columns.insert(name.to_owned()) {
@@ -2912,6 +2936,61 @@ fn migrate_workflow_history_columns(conn: &rusqlite::Connection) -> rusqlite::Re
             )?;
         }
     }
+    if cleanup_pending_added || allocation_tag_absent {
+        // Legacy terminal rows are protected first. Only a valid exact
+        // terminal proving that cleanup is already settled may become
+        // retention-eligible during this same migration transaction.
+        conn.execute(
+            "UPDATE workflow_attempt_summaries SET cleanup_pending=1
+             WHERE status='terminal'",
+            [],
+        )?;
+        let legacy_terminals = {
+            let mut statement = conn.prepare(
+                "SELECT attempt_id, terminal_json FROM workflow_attempt_summaries
+                 WHERE status='terminal'",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (attempt_id, terminal_json) in legacy_terminals {
+            let settled = terminal_json
+                .as_deref()
+                .and_then(|value| {
+                    serde_json::from_str::<bridge_core::workflow_history::AttemptTerminal>(value)
+                        .ok()
+                })
+                .is_some_and(|terminal| {
+                    terminal.validate().is_ok() && terminal.cleanup_disposition != "pending"
+                });
+            if settled {
+                conn.execute(
+                    "UPDATE workflow_attempt_summaries SET cleanup_pending=0
+                     WHERE attempt_id=?1 AND status='terminal' AND cleanup_pending=1",
+                    rusqlite::params![attempt_id],
+                )?;
+            }
+        }
+    }
+    let mut attachment_stmt = conn.prepare("PRAGMA table_info(workflow_history_attachment)")?;
+    let attachment_columns = attachment_stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
+    drop(attachment_stmt);
+    if !attachment_columns.contains("activity_json") {
+        conn.execute_batch(
+            "ALTER TABLE workflow_history_attachment ADD COLUMN activity_json TEXT;",
+        )?;
+    }
+    if !attachment_columns.contains("activity_overflow") {
+        conn.execute_batch(
+            "ALTER TABLE workflow_history_attachment ADD COLUMN activity_overflow INTEGER
+             NOT NULL DEFAULT 0 CHECK(activity_overflow IN (0,1));",
+        )?;
+    }
+
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_attempt_execution_ordinal
              ON workflow_attempt_summaries(execution_id, ordinal);
@@ -9560,7 +9639,8 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                     let mut statement = tx
                         .prepare(
                             "SELECT attempt_id, charged_bytes FROM workflow_attempt_summaries
-                         WHERE status='terminal' AND pinned=0 AND completed_ms < ?1
+                         WHERE status='terminal' AND pinned=0 AND cleanup_pending=0
+                           AND completed_ms < ?1
                          ORDER BY completed_ms, attempt_id LIMIT 1",
                         )
                         .map_err(|error| history_error(&error))?;
@@ -9581,7 +9661,8 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                     let changed = tx
                         .execute(
                             "DELETE FROM workflow_attempt_summaries
-                         WHERE attempt_id=?1 AND status='terminal' AND pinned=0",
+                         WHERE attempt_id=?1 AND status='terminal' AND pinned=0
+                           AND cleanup_pending=0",
                             rusqlite::params![attempt_id.as_str()],
                         )
                         .map_err(|error| history_error(&error))?;
@@ -9652,7 +9733,7 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                     let victim: Option<(String, i64)> = tx
                         .query_row(
                             "SELECT attempt_id, charged_bytes FROM workflow_attempt_summaries
-                         WHERE status='terminal' AND pinned=0
+                         WHERE status='terminal' AND pinned=0 AND cleanup_pending=0
                          ORDER BY completed_ms, attempt_id LIMIT 1",
                             [],
                             |record| Ok((record.get(0)?, record.get(1)?)),
@@ -9677,7 +9758,8 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                     let changed = tx
                         .execute(
                             "DELETE FROM workflow_attempt_summaries
-                         WHERE attempt_id=?1 AND status='terminal' AND pinned=0",
+                         WHERE attempt_id=?1 AND status='terminal' AND pinned=0
+                           AND cleanup_pending=0",
                             rusqlite::params![victim.as_str()],
                         )
                         .map_err(|e| history_error(&e))?;
@@ -9887,7 +9969,7 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
         bridge_core::workflow_history::LedgerError,
     > {
         use bridge_core::workflow_history::{
-            LedgerError, LedgerUnavailableReason as R, TerminalWrite,
+            AttemptTerminal, LedgerError, LedgerUnavailableReason as R, TerminalWrite,
         };
         terminal.validate()?;
         let _admission_lease = self.acquire_history_admission_lease()?;
@@ -9897,17 +9979,31 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|error| history_error(&error))?;
-            let existing: Option<(String, Option<String>, String, Option<i64>)> = tx
+            let existing: Option<(String, Option<String>, String, Option<i64>, i64)> = tx
                 .query_row(
                     "SELECT status, terminal_json, prompt_acceptance,
-                            length(terminal_reserve)
+                            length(terminal_reserve), cleanup_pending
                      FROM workflow_attempt_summaries WHERE attempt_id=?1",
                     rusqlite::params![id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(|error| history_error(&error))?;
-            let Some((status, prior, persisted_prompt_acceptance, terminal_reserve)) = existing
+            let Some((
+                status,
+                prior,
+                persisted_prompt_acceptance,
+                terminal_reserve,
+                cleanup_pending,
+            )) = existing
             else {
                 return Err(LedgerError::new(R::Schema));
             };
@@ -9920,7 +10016,20 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
             canonical.validate()?;
             let json =
                 serde_json::to_string(&canonical).map_err(|_| LedgerError::new(R::Schema))?;
+            let canonical_cleanup_pending = canonical.cleanup_disposition == "pending";
             if status == "terminal" {
+                let persisted_terminal = prior
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<AttemptTerminal>(value).ok())
+                    .ok_or_else(|| LedgerError::new(R::Corruption))?;
+                persisted_terminal
+                    .validate()
+                    .map_err(|_| LedgerError::new(R::Corruption))?;
+                if history_persisted_bool(cleanup_pending)?
+                    != (persisted_terminal.cleanup_disposition == "pending")
+                {
+                    return Err(LedgerError::new(R::Corruption));
+                }
                 let write = if prior.as_deref() == Some(json.as_str()) {
                     TerminalWrite::Replayed
                 } else {
@@ -9928,6 +10037,9 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                 };
                 tx.commit().map_err(|error| history_error(&error))?;
                 return Ok(write);
+            }
+            if history_persisted_bool(cleanup_pending)? {
+                return Err(LedgerError::new(R::Corruption));
             }
             let terminal_reserve = terminal_reserve
                 .map(u64::try_from)
@@ -9948,7 +10060,8 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                 process_liveness=?7, terminal_evidence_capability=?8,
                 terminal_evidence_version=?9, terminal_evidence_source=?10,
                 terminal_evidence_complete=?11, telemetry_complete=?12,
-                prompt_acceptance=?13, terminal_json=?14, terminal_reserve=NULL
+                prompt_acceptance=?13, terminal_json=?14, cleanup_pending=?15,
+                terminal_reserve=NULL
              WHERE attempt_id=?1 AND status='active'",
                     rusqlite::params![
                         id.as_str(),
@@ -9964,7 +10077,8 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                         canonical.terminal_evidence_complete,
                         canonical.telemetry_complete,
                         canonical.prompt_acceptance,
-                        json
+                        json,
+                        canonical_cleanup_pending
                     ],
                 )
                 .map_err(|error| history_error(&error))?;
@@ -9996,6 +10110,133 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn settle_cleanup(
+        &self,
+        id: &bridge_core::ids::AttemptId,
+        disposition: &str,
+    ) -> Result<
+        bridge_core::workflow_history::TerminalWrite,
+        bridge_core::workflow_history::LedgerError,
+    > {
+        use bridge_core::workflow_history::{
+            AttemptTerminal, LedgerError, LedgerUnavailableReason as R, TerminalWrite,
+        };
+        if !matches!(disposition, "complete" | "failed") {
+            return Err(LedgerError::new(R::Schema));
+        }
+        let _admission_lease = self.acquire_history_admission_lease()?;
+        self.checkpoint_and_verify_history_size()?;
+        let mut conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| history_error(&error))?;
+        let prior: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT terminal_json, cleanup_pending FROM workflow_attempt_summaries
+                 WHERE attempt_id=?1 AND status='terminal'",
+                rusqlite::params![id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| history_error(&error))?;
+        let Some((prior, cleanup_pending)) = prior else {
+            return Err(LedgerError::new(R::Schema));
+        };
+        let cleanup_pending = history_persisted_bool(cleanup_pending)?;
+        let mut terminal: AttemptTerminal =
+            serde_json::from_str(&prior).map_err(|_| LedgerError::new(R::Corruption))?;
+        terminal
+            .validate()
+            .map_err(|_| LedgerError::new(R::Corruption))?;
+        if terminal.cleanup_disposition == disposition {
+            if cleanup_pending {
+                return Err(LedgerError::new(R::Corruption));
+            }
+            tx.commit().map_err(|error| history_error(&error))?;
+            return Ok(TerminalWrite::Replayed);
+        }
+        if terminal.cleanup_disposition != "pending" {
+            if cleanup_pending {
+                return Err(LedgerError::new(R::Corruption));
+            }
+            tx.commit().map_err(|error| history_error(&error))?;
+            return Ok(TerminalWrite::Conflict);
+        }
+        if !cleanup_pending {
+            return Err(LedgerError::new(R::Corruption));
+        }
+        terminal.cleanup_disposition = disposition.to_owned();
+        terminal.validate()?;
+        let updated = serde_json::to_string(&terminal).map_err(|_| LedgerError::new(R::Schema))?;
+        let growth = u64::try_from(updated.len().saturating_sub(prior.len())).unwrap_or(u64::MAX);
+        if !self.history_growth_fits(&tx, growth)? {
+            return Err(LedgerError::new(R::CapacityProtected));
+        }
+        let changed = tx
+            .execute(
+                "UPDATE workflow_attempt_summaries
+                 SET terminal_json=?2, cleanup_pending=0
+                 WHERE attempt_id=?1 AND status='terminal' AND terminal_json=?3
+                   AND cleanup_pending=1",
+                rusqlite::params![id.as_str(), updated, prior],
+            )
+            .map_err(|error| history_error(&error))?;
+        if changed != 1 {
+            return Ok(TerminalWrite::Conflict);
+        }
+        tx.commit().map_err(|error| history_error(&error))?;
+        drop(conn);
+        self.checkpoint_after_committed_history_mutation("settle_cleanup");
+        Ok(TerminalWrite::Applied)
+    }
+
+    async fn record_activity_tally(
+        &self,
+        id: &bridge_core::ids::AttemptId,
+        tally: &bridge_core::attempt_activity::ActivityTally,
+    ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        let json = serde_json::to_string(tally).map_err(|_| LedgerError::new(R::Schema))?;
+        if json.len() > bridge_core::attempt_activity::MAX_ATTACHMENT_ENCODING_BYTES {
+            return Err(LedgerError::new(R::Schema));
+        }
+        let _admission_lease = self.acquire_history_admission_lease()?;
+        let conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
+        let changed = conn
+            .execute(
+                "UPDATE workflow_history_attachment
+                 SET activity_json=?2, activity_overflow=?3 WHERE attempt_id=?1",
+                rusqlite::params![id.as_str(), json, tally.overflowed],
+            )
+            .map_err(|error| history_error(&error))?;
+        if changed != 1 {
+            return Err(LedgerError::new(R::Schema));
+        }
+        Ok(())
+    }
+
+    async fn activity_tally(
+        &self,
+        id: &bridge_core::ids::AttemptId,
+    ) -> Result<
+        Option<bridge_core::attempt_activity::ActivityTally>,
+        bridge_core::workflow_history::LedgerError,
+    > {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        let conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
+        let json: Option<Option<String>> = conn
+            .query_row(
+                "SELECT activity_json FROM workflow_history_attachment WHERE attempt_id=?1",
+                rusqlite::params![id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| history_error(&error))?;
+        json.flatten()
+            .map(|value| serde_json::from_str(&value).map_err(|_| LedgerError::new(R::Corruption)))
+            .transpose()
     }
 
     async fn set_pinned(
@@ -10234,6 +10475,7 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
             outcome: Option<String>,
             degraded: i64,
             pinned: i64,
+            cleanup_pending: i64,
             reservation_json: String,
             terminal_json: Option<String>,
             authority_attempt_id: Option<String>,
@@ -10265,6 +10507,7 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                     summary.terminal_evidence_version, summary.terminal_evidence_source,
                     summary.terminal_evidence_complete, summary.telemetry_complete,
                     summary.outcome, summary.degraded, summary.pinned,
+                    summary.cleanup_pending,
                     summary.reservation_json, summary.terminal_json,
                     authority.attempt_id, authority.execution_id, authority.ordinal,
                     authority.task_id, authority.owner_surface, {disposition_projection}
@@ -10302,20 +10545,22 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                     outcome: row.get(23)?,
                     degraded: row.get(24)?,
                     pinned: row.get(25)?,
-                    reservation_json: row.get(26)?,
-                    terminal_json: row.get(27)?,
-                    authority_attempt_id: row.get(28)?,
-                    authority_execution_id: row.get(29)?,
-                    authority_ordinal: row.get(30)?,
-                    authority_task_id: row.get(31)?,
-                    authority_surface: row.get(32)?,
-                    authority_history_disposition: row.get(33)?,
+                    cleanup_pending: row.get(26)?,
+                    reservation_json: row.get(27)?,
+                    terminal_json: row.get(28)?,
+                    authority_attempt_id: row.get(29)?,
+                    authority_execution_id: row.get(30)?,
+                    authority_ordinal: row.get(31)?,
+                    authority_task_id: row.get(32)?,
+                    authority_surface: row.get(33)?,
+                    authority_history_disposition: row.get(34)?,
                 })
             })
             .optional()
             .map_err(|error| history_attempt_read_error(&error))?;
         row.map(|row| {
             let projected_pinned = persisted_bool(row.pinned)?;
+            let projected_cleanup_pending = persisted_bool(row.cleanup_pending)?;
             let mut reservation = validate_persisted_reservation(
                 PersistedReservationProjection {
                     attempt_id: &row.attempt_id,
@@ -10402,7 +10647,8 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
             reservation.validate().map_err(|_| corruption())?;
             match (row.status.as_str(), terminal.as_ref()) {
                 ("active", None) => {
-                    if row.completed_ms.is_some()
+                    if projected_cleanup_pending
+                        || row.completed_ms.is_some()
                         || row.outcome.is_some()
                         || row.producer_terminal != "unknown"
                         || row.final_message != "unknown"
@@ -10419,7 +10665,8 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                 }
                 ("terminal", Some(terminal)) => {
                     terminal.validate().map_err(|_| corruption())?;
-                    if row.completed_ms != Some(terminal.completed_ms)
+                    if projected_cleanup_pending != (terminal.cleanup_disposition == "pending")
+                        || row.completed_ms != Some(terminal.completed_ms)
                         || row.outcome.as_deref() != Some(terminal.outcome.as_str())
                         || persisted_bool(row.degraded)? != terminal.degraded
                         || row.producer_terminal != terminal.producer_terminal
@@ -10483,6 +10730,7 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
             workload_fingerprint_complete: i64,
             started_ms: i64,
             pinned: i64,
+            cleanup_pending: i64,
             reservation_json: String,
             terminal_json: String,
             completed_ms: i64,
@@ -10528,8 +10776,9 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                     summary.parent_attempt_id, summary.ordinal, summary.task_id,
                     summary.workflow, summary.task_class, summary.surface, summary.policy,
                     summary.workload_fingerprint, summary.workload_fingerprint_complete,
-                    summary.started_ms, summary.pinned, summary.reservation_json,
-                    summary.terminal_json, summary.completed_ms, summary.outcome,
+                    summary.started_ms, summary.pinned, summary.cleanup_pending,
+                    summary.reservation_json, summary.terminal_json,
+                    summary.completed_ms, summary.outcome,
                     summary.degraded, summary.prompt_acceptance, summary.producer_terminal,
                     summary.final_message, summary.process_liveness,
                     summary.terminal_evidence_capability,
@@ -10563,26 +10812,27 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                     workload_fingerprint_complete: row.get(10)?,
                     started_ms: row.get(11)?,
                     pinned: row.get(12)?,
-                    reservation_json: row.get(13)?,
-                    terminal_json: row.get(14)?,
-                    completed_ms: row.get(15)?,
-                    outcome: row.get(16)?,
-                    degraded: row.get(17)?,
-                    prompt_acceptance: row.get(18)?,
-                    producer_terminal: row.get(19)?,
-                    final_message: row.get(20)?,
-                    process_liveness: row.get(21)?,
-                    terminal_evidence_capability: row.get(22)?,
-                    terminal_evidence_version: row.get(23)?,
-                    terminal_evidence_source: row.get(24)?,
-                    terminal_evidence_complete: row.get(25)?,
-                    telemetry_complete: row.get(26)?,
-                    authority_attempt_id: row.get(27)?,
-                    authority_execution_id: row.get(28)?,
-                    authority_ordinal: row.get(29)?,
-                    authority_task_id: row.get(30)?,
-                    authority_surface: row.get(31)?,
-                    authority_history_disposition: row.get(32)?,
+                    cleanup_pending: row.get(13)?,
+                    reservation_json: row.get(14)?,
+                    terminal_json: row.get(15)?,
+                    completed_ms: row.get(16)?,
+                    outcome: row.get(17)?,
+                    degraded: row.get(18)?,
+                    prompt_acceptance: row.get(19)?,
+                    producer_terminal: row.get(20)?,
+                    final_message: row.get(21)?,
+                    process_liveness: row.get(22)?,
+                    terminal_evidence_capability: row.get(23)?,
+                    terminal_evidence_version: row.get(24)?,
+                    terminal_evidence_source: row.get(25)?,
+                    terminal_evidence_complete: row.get(26)?,
+                    telemetry_complete: row.get(27)?,
+                    authority_attempt_id: row.get(28)?,
+                    authority_execution_id: row.get(29)?,
+                    authority_ordinal: row.get(30)?,
+                    authority_task_id: row.get(31)?,
+                    authority_surface: row.get(32)?,
+                    authority_history_disposition: row.get(33)?,
                 })
             })
             .map_err(|error| history_migration_error(&error))?;
@@ -10631,6 +10881,9 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
             )
             .map_err(|_| corruption())?;
             terminal.validate().map_err(|_| corruption())?;
+            if persisted_bool(row.cleanup_pending)? != (terminal.cleanup_disposition == "pending") {
+                return Err(corruption());
+            }
 
             let legacy_conservative_prompt_projection = row.prompt_acceptance == "not_dispatched"
                 && terminal.prompt_acceptance == "unknown"
@@ -16798,6 +17051,7 @@ mod r2f0a_history_tests {
             terminal_evidence_version: "none".into(),
             terminal_evidence_source: "none".into(),
             terminal_evidence_complete: true,
+            terminal_evidence_counts: Default::default(),
             degraded: false,
             prompt_acceptance: "unknown".into(),
             cleanup_disposition: "complete".into(),
@@ -17908,6 +18162,7 @@ mod r2f0a_history_tests {
             terminal_evidence_version: "none".into(),
             terminal_evidence_source: "none".into(),
             terminal_evidence_complete: false,
+            terminal_evidence_counts: Default::default(),
             degraded: false,
             prompt_acceptance: "unknown".into(),
             cleanup_disposition: "complete".into(),
@@ -18879,6 +19134,260 @@ mod r2f0a_history_tests {
         assert_eq!(persisted.process_liveness, "exited");
         assert_eq!(persisted.terminal_evidence_capability, "unsupported");
         assert!(!persisted.terminal_evidence_complete);
+    }
+
+    #[tokio::test]
+    async fn activity_tally_and_cleanup_settlement_are_bounded_replay_safe_enrichment() {
+        use bridge_core::attempt_activity::{ActivityTally, ATTEMPT_PHASE_COUNT};
+        use bridge_core::workflow_history::TerminalWrite;
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let row = reservation();
+        store.reserve(&row).await.unwrap();
+        let tally = ActivityTally {
+            activity: 3,
+            meaningful_progress: 2,
+            phase_activity: [1; ATTEMPT_PHASE_COUNT],
+            last_elapsed_ms: 9,
+            last_progress_elapsed_ms: 8,
+            max_advance: 7,
+            overflowed: true,
+        };
+        store
+            .record_activity_tally(&row.identity.attempt_id, &tally)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .activity_tally(&row.identity.attempt_id)
+                .await
+                .unwrap(),
+            Some(tally)
+        );
+
+        let mut value = terminal();
+        value.cleanup_disposition = "pending".into();
+        store
+            .terminalize(&row.identity.attempt_id, &value)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .settle_cleanup(&row.identity.attempt_id, "complete")
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+        assert_eq!(
+            store
+                .settle_cleanup(&row.identity.attempt_id, "complete")
+                .await
+                .unwrap(),
+            TerminalWrite::Replayed
+        );
+        assert_eq!(
+            store
+                .settle_cleanup(&row.identity.attempt_id, "failed")
+                .await
+                .unwrap(),
+            TerminalWrite::Conflict
+        );
+        let mut settled = value.clone();
+        settled.cleanup_disposition = "complete".into();
+        assert_eq!(
+            store
+                .terminalize(&row.identity.attempt_id, &settled)
+                .await
+                .unwrap(),
+            TerminalWrite::Replayed
+        );
+        assert_eq!(
+            store
+                .terminalize(&row.identity.attempt_id, &value)
+                .await
+                .unwrap(),
+            TerminalWrite::Conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_pending_terminal_is_age_protected_until_exact_settlement() {
+        use bridge_core::workflow_history::{TerminalWrite, WorkflowHistoryStore, RETENTION_DAYS};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cleanup-pending-age.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let pending = reservation();
+        let pending_id = pending.identity.attempt_id.clone();
+        store.reserve(&pending).await.unwrap();
+        let mut pending_terminal = terminal();
+        pending_terminal.cleanup_disposition = "pending".into();
+        store
+            .terminalize(&pending_id, &pending_terminal)
+            .await
+            .unwrap();
+
+        let mut replacement = reservation();
+        replacement.started_ms = pending_terminal
+            .completed_ms
+            .saturating_add(RETENTION_DAYS * 24 * 60 * 60 * 1_000)
+            .saturating_add(1);
+        store.reserve(&replacement).await.unwrap();
+        assert!(
+            store.attempt(&pending_id).await.unwrap().is_some(),
+            "age retention must not delete unsettled cleanup custody"
+        );
+        let pending_projection: (i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT pinned, cleanup_pending FROM workflow_attempt_summaries
+                 WHERE attempt_id=?1",
+                rusqlite::params![pending_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending_projection, (0, 1));
+
+        assert_eq!(
+            store.settle_cleanup(&pending_id, "complete").await.unwrap(),
+            TerminalWrite::Applied
+        );
+        assert_eq!(
+            store.settle_cleanup(&pending_id, "complete").await.unwrap(),
+            TerminalWrite::Replayed
+        );
+        assert_eq!(
+            store.settle_cleanup(&pending_id, "failed").await.unwrap(),
+            TerminalWrite::Conflict
+        );
+        let settled_projection: (i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT pinned, cleanup_pending FROM workflow_attempt_summaries
+                 WHERE attempt_id=?1",
+                rusqlite::params![pending_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(settled_projection, (0, 0));
+
+        let mut later = reservation();
+        later.started_ms = replacement
+            .started_ms
+            .saturating_add(RETENTION_DAYS * 24 * 60 * 60 * 1_000)
+            .saturating_add(1);
+        store.reserve(&later).await.unwrap();
+        assert!(
+            store.attempt(&pending_id).await.unwrap().is_none(),
+            "exact settlement makes the old unpinned row retention-eligible"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_pending_plus_user_pins_returns_capacity_protected() {
+        use bridge_core::workflow_history::{
+            LedgerUnavailableReason as R, WorkflowHistoryStore, CONFIGURED_SLOT_CHARGE,
+            MAX_CHARGED_BYTES,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cleanup-pending-capacity.sqlite");
+        let store = SqliteStore::open_shared_history(&path).unwrap();
+        let pending = reservation();
+        let pending_id = pending.identity.attempt_id.clone();
+        store.reserve(&pending).await.unwrap();
+        let mut pending_terminal = terminal();
+        pending_terminal.cleanup_disposition = "pending".into();
+        store
+            .terminalize(&pending_id, &pending_terminal)
+            .await
+            .unwrap();
+
+        let production_slots = MAX_CHARGED_BYTES / CONFIGURED_SLOT_CHARGE;
+        let filler_slots = production_slots.saturating_sub(1);
+        {
+            let mut connection = store.conn.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "WITH RECURSIVE fill(n) AS (
+                         VALUES(1) UNION ALL SELECT n+1 FROM fill WHERE n<?1
+                     )
+                     INSERT INTO attempt_identities(
+                         attempt_id, execution_id, ordinal, owner_surface, history_disposition)
+                     SELECT printf('attempt-pinned-%018d', n),
+                            printf('exec-pinned-%021d', n), 0, 'offline', 1
+                     FROM fill",
+                    rusqlite::params![i64::try_from(filler_slots).unwrap()],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "WITH RECURSIVE fill(n) AS (
+                         VALUES(1) UNION ALL SELECT n+1 FROM fill WHERE n<?1
+                     )
+                     INSERT INTO workflow_attempt_summaries(
+                         attempt_id, execution_id, ordinal, workflow, task_class, surface,
+                         policy, workload_fingerprint, started_ms, status, prompt_acceptance,
+                         pinned, charged_bytes, reservation_json)
+                     SELECT printf('attempt-pinned-%018d', n),
+                            printf('exec-pinned-%021d', n), 0, 'fixture', 'fixture',
+                            'offline', 'r2f0b', 'shape-fixture', 1, 'active',
+                            'not_dispatched', 1, 16384, '{}'
+                     FROM fill",
+                    rusqlite::params![i64::try_from(filler_slots).unwrap()],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO workflow_history_attachment(attempt_id, charged_bytes)
+                     SELECT attempt_id, 1024 FROM workflow_attempt_summaries
+                     WHERE attempt_id LIKE 'attempt-pinned-%'",
+                    [],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "UPDATE workflow_history_allocation
+                     SET charged_bytes=?1, slots_used=?2 WHERE singleton=1",
+                    rusqlite::params![
+                        i64::try_from(production_slots * CONFIGURED_SLOT_CHARGE).unwrap(),
+                        i64::try_from(production_slots).unwrap()
+                    ],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        let incoming = reservation();
+        assert_eq!(
+            store.reserve(&incoming).await.unwrap_err().reason,
+            R::CapacityProtected,
+            "cleanup-pending and user-pinned rows are both capacity-protected"
+        );
+        let pending_projection: (i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT pinned, cleanup_pending FROM workflow_attempt_summaries
+                 WHERE attempt_id=?1",
+                rusqlite::params![pending_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending_projection, (0, 1));
+
+        store.settle_cleanup(&pending_id, "failed").await.unwrap();
+        store
+            .reserve(&incoming)
+            .await
+            .expect("settlement makes exactly the unpinned terminal row reclaimable");
+        assert!(store.attempt(&pending_id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -25067,6 +25576,36 @@ mod r2f0a_history_tests {
     }
 
     #[test]
+    fn configured_writer_additively_migrates_r2f0a_attachment_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("r2f0a-history.sqlite");
+        drop(SqliteStore::open_shared_history(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE workflow_history_attachment DROP COLUMN activity_json;
+             ALTER TABLE workflow_history_attachment DROP COLUMN activity_overflow;",
+        )
+        .unwrap();
+        drop(conn);
+
+        drop(SqliteStore::open_shared_history(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let columns = conn
+            .prepare("PRAGMA table_info(workflow_history_attachment)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .unwrap();
+        assert!(columns.contains("activity_json"));
+        assert!(columns.contains("activity_overflow"));
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[test]
     fn configured_read_only_reports_pre_history_task_store_as_migration_without_writes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("v0.2.1-read-only.sqlite");
@@ -27339,6 +27878,61 @@ mod r2f0a_history_tests {
     }
 
     #[tokio::test]
+    async fn legacy_pending_cleanup_is_protected_during_over_cap_migration() {
+        use bridge_core::workflow_history::WorkflowHistoryStore;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy-cleanup-pending.sqlite");
+        create_legacy_configured_capacity_fixture(&path, true, false);
+        let first = legacy_configured_fixture_identity(1);
+        let second = legacy_configured_fixture_identity(2);
+        let mut pending = legacy_configured_fixture_record(1, true).terminal.unwrap();
+        pending.cleanup_disposition = "pending".into();
+        pending.validate().unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE workflow_attempt_summaries SET terminal_json=?2
+                 WHERE attempt_id=?1",
+                rusqlite::params![
+                    first.attempt_id.as_str(),
+                    serde_json::to_string(&pending).unwrap()
+                ],
+            )
+            .unwrap();
+
+        let configured = SqliteStore::open_shared_history(&path).unwrap();
+        assert!(
+            configured
+                .attempt(&first.attempt_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "migration retention must preserve the oldest cleanup-pending row"
+        );
+        assert!(
+            configured
+                .attempt(&second.attempt_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "migration must instead collect the next oldest eligible row"
+        );
+        let projection: (i64, i64) = configured
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT pinned, cleanup_pending FROM workflow_attempt_summaries
+                 WHERE attempt_id=?1",
+                rusqlite::params![first.attempt_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(projection, (0, 1));
+    }
+
+    #[tokio::test]
     async fn r2f0a_b3_configured_lifecycle_ignores_shared_primary_main_and_pinned_wal() {
         use bridge_core::task_store::TaskStore;
         use bridge_core::workflow_history::{
@@ -27477,6 +28071,7 @@ mod r2f0a_history_tests {
                 terminal_evidence_version: "none".into(),
                 terminal_evidence_source: "none".into(),
                 terminal_evidence_complete: false,
+                terminal_evidence_counts: Default::default(),
                 degraded: true,
                 prompt_acceptance: "dispatch_uncertain".into(),
                 cleanup_disposition: "unknown".into(),

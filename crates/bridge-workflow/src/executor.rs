@@ -11,7 +11,7 @@ use bridge_core::error::BridgeError;
 use bridge_core::harvest::{
     commit_harvested_completion, CompletionBodyOrigin, HarvestAuditStore, NoopHarvestAuditStore,
 };
-use bridge_core::ids::{NodeId, OperationId, SessionId};
+use bridge_core::ids::{ContextId, NodeId, OperationId, SessionId};
 use bridge_core::orch::UsageSnapshot;
 use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
@@ -824,6 +824,7 @@ impl WorkflowExecutor {
         run_id: &str,
         ctx: &WorkflowRunContext,
         diagnostic_factory: &Arc<dyn DiagnosticObserverFactory>,
+        prompt_dispatch: &Option<PromptDispatchBarrier>,
         cancel: &CancellationToken,
         entry: Arc<AgentEntry>,
         cache: &PreflightCache,
@@ -858,6 +859,7 @@ impl WorkflowExecutor {
                     run_id,
                     ctx,
                     diagnostic_factory,
+                    prompt_dispatch,
                     cancel,
                     entry.clone(),
                     cleanup_tracker,
@@ -890,6 +892,7 @@ impl WorkflowExecutor {
         run_id: &str,
         ctx: &WorkflowRunContext,
         diagnostic_factory: &Arc<dyn DiagnosticObserverFactory>,
+        prompt_dispatch: &Option<PromptDispatchBarrier>,
         cancel: &CancellationToken,
         entry: Arc<AgentEntry>,
         cleanup_tracker: &WorkflowCleanupTracker,
@@ -1015,6 +1018,56 @@ impl WorkflowExecutor {
                 return Err(PreflightFailure::Canceled);
             }
 
+            let preflight_turn_id =
+                bridge_core::attestation::generate_turn_id().map_err(|error| {
+                    PreflightFailure::Hard {
+                        message: format!(
+                            "preflight failed to mint turn evidence correlation: {error:?}"
+                        ),
+                        failure_class: classify_failure(&error),
+                        retain_in_run_cache: false,
+                    }
+                })?;
+            let preflight_context =
+                ContextId::parse(session.as_str().to_string()).map_err(|error| {
+                    PreflightFailure::Hard {
+                        message: format!("preflight failed to bind context: {error:?}"),
+                        failure_class: classify_failure(&error),
+                        retain_in_run_cache: false,
+                    }
+                })?;
+            let preflight_op = OperationId::parse(format!(
+                "workflow-preflight-{}-{attempt_no}",
+                node.id.as_str()
+            ))
+            .map_err(|error| PreflightFailure::Hard {
+                message: format!("preflight failed to bind operation: {error:?}"),
+                failure_class: classify_failure(&error),
+                retain_in_run_cache: false,
+            })?;
+            resolved
+                .backend
+                .configure_turn(
+                    &session,
+                    TurnMeta {
+                        context_id: preflight_context,
+                        generation: u64::from(attempt_no),
+                        op: preflight_op,
+                        turn_id: preflight_turn_id.clone(),
+                        requested_mode: HarvestSanitizationMode::Off,
+                        prefix_attestation_request:
+                            bridge_core::attestation::PrefixAttestationRequest::Disabled,
+                    },
+                )
+                .await;
+            let rich_sink = ctx
+                .make_rich_sink
+                .as_ref()
+                .map(|factory| factory.make(&node.id));
+            let activity = rich_sink
+                .as_ref()
+                .and_then(|sink| sink.attempt_recorder())
+                .unwrap_or_else(|| Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder));
             let stream = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
@@ -1026,13 +1079,40 @@ impl WorkflowExecutor {
                     ).await;
                     return Err(PreflightFailure::Canceled);
                 }
-                result = resolved.backend.prompt_with_observers(
-                    &session,
-                    vec![Part {
-                        text: WORKFLOW_PREFLIGHT_PROMPT.to_string(),
-                    }],
-                    BackendObservers::diagnostic_only(diagnostic.clone()),
-                ) => result,
+                result = async {
+                    if let Some(barrier) = prompt_dispatch {
+                        barrier().await;
+                    }
+                    // Registration happens only after the durable prompt
+                    // barrier is polled. Preflight is a genuine provider turn,
+                    // so accepted or indeterminate work must participate in
+                    // the same bounded attempt evidence population as nodes.
+                    let terminal_evidence = match rich_sink.as_ref() {
+                        Some(sink) => sink
+                            .terminal_evidence_for_turn(
+                                resolved.backend.terminal_evidence_capability(),
+                                u64::from(attempt_no),
+                                session.as_str(),
+                                preflight_turn_id.as_str(),
+                            )?
+                            .unwrap_or_else(|| {
+                                Arc::new(
+                                    bridge_core::terminal_evidence::SharedTurnEvidence::unsupported(),
+                                )
+                            }),
+                        None => Arc::new(
+                            bridge_core::terminal_evidence::SharedTurnEvidence::unsupported(),
+                        ),
+                    };
+                    resolved.backend.prompt_with_observers(
+                        &session,
+                        vec![Part {
+                            text: WORKFLOW_PREFLIGHT_PROMPT.to_string(),
+                        }],
+                        BackendObservers::new(diagnostic.clone(), rich_sink.clone())
+                            .with_attempt_telemetry(activity.clone(), terminal_evidence),
+                    ).await
+                } => result,
             };
             if cancel.is_cancelled() {
                 cancel_and_forget_preflight_session(
@@ -1110,7 +1190,8 @@ impl WorkflowExecutor {
                 tokio::select! {
                     biased;
                     item = stream.next() => match item {
-                        Some(Ok(Update::Text(chunk))) => text.push_str(&chunk),
+                        Some(Ok(Update::Text(chunk) | Update::FinalAnswer(chunk))) =>
+                            text.push_str(&chunk),
                         Some(Ok(Update::Usage(mut next_usage))) => {
                             if let Some(previous) = &usage {
                                 next_usage.merge_missing_from(previous);
@@ -1293,6 +1374,7 @@ impl WorkflowExecutor {
                             run_id,
                             ctx,
                             diagnostic_factory,
+                            prompt_dispatch,
                             cancel,
                             entry.clone(),
                             preflight_cache,
@@ -1539,8 +1621,13 @@ impl WorkflowExecutor {
                     .make_rich_sink
                     .as_ref()
                     .map(|factory| factory.make(&node.id));
-
-                let mut stream = tokio::select! {
+                let activity = rich_sink
+                    .as_ref()
+                    .and_then(|sink| sink.attempt_recorder())
+                    .unwrap_or_else(|| {
+                        Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder)
+                    });
+                let (mut stream, terminal_evidence) = tokio::select! {
                     biased;
                     // Prompt-open is the ownership boundary. If the backend result
                     // and workflow cancellation are simultaneously ready, observe
@@ -1551,11 +1638,30 @@ impl WorkflowExecutor {
                         if let Some(barrier) = prompt_dispatch {
                             barrier().await;
                         }
-                        turn.backend.prompt_with_observers(
+                        let terminal_evidence = match rich_sink.as_ref() {
+                            Some(sink) => sink
+                                .terminal_evidence_for_turn(
+                                    turn.backend.terminal_evidence_capability(),
+                                    u64::from(attempt),
+                                    turn.session.as_str(),
+                                    obs_ctx.turn_id.as_str(),
+                                )?
+                                .unwrap_or_else(|| {
+                                    Arc::new(
+                                        bridge_core::terminal_evidence::SharedTurnEvidence::unsupported(),
+                                    )
+                                }),
+                            None => Arc::new(
+                                bridge_core::terminal_evidence::SharedTurnEvidence::unsupported(),
+                            ),
+                        };
+                        let stream = turn.backend.prompt_with_observers(
                             &turn.session,
                             parts,
-                            BackendObservers::new(diagnostic.clone(), rich_sink.clone()),
-                        ).await
+                            BackendObservers::new(diagnostic.clone(), rich_sink.clone())
+                                .with_attempt_telemetry(activity.clone(), terminal_evidence.clone()),
+                        ).await?;
+                        Ok::<_, BridgeError>((stream, terminal_evidence))
                     } => match s {
                         Ok(s) => s,
                         Err(e) => {
@@ -1686,6 +1792,20 @@ impl WorkflowExecutor {
                         // immediately to cancellation.
                         item = stream.next() => match item {
                             Some(Ok(Update::Text(t))) => {
+                                if ttft_val.is_none() && !t.is_empty() {
+                                    ttft_val = Some(turn_start.elapsed());
+                                }
+                                text.push_str(&t);
+                                if cancel.is_cancelled() {
+                                    ok = false;
+                                    text = format!("[node {} canceled]", node.id.as_str());
+                                    break NodeTurnExit::Canceled;
+                                }
+                            }
+                            Some(Ok(Update::FinalAnswer(t))) => {
+                                if !t.is_empty() {
+                                    terminal_evidence.record_deliverable_final();
+                                }
                                 if ttft_val.is_none() && !t.is_empty() {
                                     ttft_val = Some(turn_start.elapsed());
                                 }
@@ -2019,6 +2139,7 @@ impl WorkflowExecutor {
                             run_id,
                             ctx,
                             diagnostic_factory,
+                            prompt_dispatch,
                             cancel,
                             resolved.entry.clone(),
                             preflight_cache,
@@ -2242,17 +2363,42 @@ impl WorkflowExecutor {
                         .make_rich_sink
                         .as_ref()
                         .map(|factory| factory.make(&node.id));
-                    let mut stream = tokio::select! {
+                    let activity = rich_sink
+                        .as_ref()
+                        .and_then(|sink| sink.attempt_recorder())
+                        .unwrap_or_else(|| {
+                            Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder)
+                        });
+                    let (mut stream, terminal_evidence) = tokio::select! {
                         biased;
                         s = async {
                             if let Some(barrier) = prompt_dispatch {
                                 barrier().await;
                             }
-                            resolved.backend.prompt_with_observers(
+                            let terminal_evidence = match rich_sink.as_ref() {
+                                Some(sink) => sink
+                                    .terminal_evidence_for_turn(
+                                        resolved.backend.terminal_evidence_capability(),
+                                        u64::from(attempt),
+                                        session.as_str(),
+                                        obs_ctx_ref.turn_id.as_str(),
+                                    )?
+                                    .unwrap_or_else(|| {
+                                        Arc::new(
+                                            bridge_core::terminal_evidence::SharedTurnEvidence::unsupported(),
+                                        )
+                                    }),
+                                None => Arc::new(
+                                    bridge_core::terminal_evidence::SharedTurnEvidence::unsupported(),
+                                ),
+                            };
+                            let stream = resolved.backend.prompt_with_observers(
                                 &session,
                                 prompt_parts,
-                                BackendObservers::new(diagnostic.clone(), rich_sink.clone()),
-                            ).await
+                                BackendObservers::new(diagnostic.clone(), rich_sink.clone())
+                                    .with_attempt_telemetry(activity.clone(), terminal_evidence.clone()),
+                            ).await?;
+                            Ok::<_, BridgeError>((stream, terminal_evidence))
                         } => match s {
                             Ok(s) => s,
                             Err(e) => {
@@ -2372,6 +2518,23 @@ impl WorkflowExecutor {
                             biased;
                             item = stream.next() => match item {
                                 Some(Ok(Update::Text(t))) => {
+                                    if ttft_val.is_none() && !t.is_empty() {
+                                        if let Some(start) = turn_started {
+                                            ttft_val = Some(start.elapsed());
+                                        }
+                                    }
+                                    text.push_str(&t);
+                                    if cancel.is_cancelled() {
+                                        canceled_during_drain = true;
+                                        ok = false;
+                                        text = format!("[node {} canceled]", node.id.as_str());
+                                        break;
+                                    }
+                                }
+                                Some(Ok(Update::FinalAnswer(t))) => {
+                                    if !t.is_empty() {
+                                        terminal_evidence.record_deliverable_final();
+                                    }
                                     if ttft_val.is_none() && !t.is_empty() {
                                         if let Some(start) = turn_started {
                                             ttft_val = Some(start.elapsed());
@@ -3677,6 +3840,8 @@ mod tests {
         cleanups: Mutex<Vec<(&'static str, Arc<dyn DiagnosticObserver>)>>,
         calls: AtomicUsize,
         fail_first: bool,
+        final_answer: bool,
+        stream_failure: bool,
     }
 
     impl CompositePathBackend {
@@ -3686,6 +3851,19 @@ mod tests {
                 cleanups: Mutex::new(Vec::new()),
                 calls: AtomicUsize::new(0),
                 fail_first,
+                final_answer: true,
+                stream_failure: false,
+            }
+        }
+
+        fn commentary_only(stream_failure: bool) -> Self {
+            Self {
+                prompts: Mutex::new(Vec::new()),
+                cleanups: Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+                final_answer: false,
+                stream_failure,
             }
         }
     }
@@ -3714,13 +3892,20 @@ mod tests {
             if let Some(sink) = observers.rich {
                 sink.record(bridge_core::orch::OrchEventKind::Plan { entries: vec![] });
             }
-            Ok(Box::pin(tokio_stream::iter(vec![
-                Ok(Update::Text("OK".into())),
+            let text = if self.final_answer {
+                Update::FinalAnswer("OK".into())
+            } else {
+                Update::Text("OK".into())
+            };
+            let terminal = if self.stream_failure {
+                Err(BridgeError::FrameError)
+            } else {
                 Ok(Update::Done {
                     stop_reason: "end_turn".into(),
                     prefix_attestation: Default::default(),
-                }),
-            ])))
+                })
+            };
+            Ok(Box::pin(tokio_stream::iter(vec![Ok(text), terminal])))
         }
 
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
@@ -3966,6 +4151,80 @@ mod tests {
         assert!(Arc::ptr_eq(&made[0].2, &cleanups[0].1));
         assert_eq!(rich_sink.events.load(Ordering::SeqCst), 1);
         assert_eq!(rich_sink.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn r2f0b_cold_workflow_marks_only_genuine_final_answer_as_deliverable() {
+        let backend = Arc::new(CompositePathBackend::new(false));
+        let registry = Arc::new(CompositePathRegistry {
+            backend,
+            resolutions: Mutex::new(Vec::new()),
+        });
+        let telemetry = Arc::new(
+            bridge_core::attempt_activity::AttemptTelemetrySinkFactory::new("workflow-delivery"),
+        );
+        let context = WorkflowRunContext {
+            make_rich_sink: Some(telemetry.clone()),
+            ..WorkflowRunContext::default()
+        };
+
+        let events = WorkflowExecutor::new(registry)
+            .run_with_context(
+                one_node_graph(),
+                "input".into(),
+                "delivery-observed".into(),
+                CancellationToken::new(),
+                context,
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.iter().all(Result::is_ok));
+
+        let (capability, _, _, _, _, _, deliverable_final_present) = telemetry
+            .evidence()
+            .single_turn()
+            .expect("one production provider turn");
+        assert_eq!(
+            capability,
+            bridge_core::terminal_evidence::EvidenceCapability::Unsupported
+        );
+        assert!(deliverable_final_present);
+    }
+
+    #[tokio::test]
+    async fn r2f0b_cold_workflow_commentary_never_proves_delivery_even_on_failure() {
+        for stream_failure in [false, true] {
+            let backend = Arc::new(CompositePathBackend::commentary_only(stream_failure));
+            let registry = Arc::new(CompositePathRegistry {
+                backend,
+                resolutions: Mutex::new(Vec::new()),
+            });
+            let telemetry = Arc::new(
+                bridge_core::attempt_activity::AttemptTelemetrySinkFactory::new(
+                    "workflow-commentary",
+                ),
+            );
+            let context = WorkflowRunContext {
+                make_rich_sink: Some(telemetry.clone()),
+                ..WorkflowRunContext::default()
+            };
+
+            let _events = WorkflowExecutor::new(registry)
+                .run_with_context(
+                    one_node_graph(),
+                    "input".into(),
+                    format!("commentary-{stream_failure}"),
+                    CancellationToken::new(),
+                    context,
+                )
+                .collect::<Vec<_>>()
+                .await;
+            let (_, _, _, _, _, _, deliverable_final_present) = telemetry
+                .evidence()
+                .single_turn()
+                .expect("one production provider turn");
+            assert!(!deliverable_final_present);
+        }
     }
 
     #[tokio::test]
@@ -5561,6 +5820,7 @@ mod tests {
         let ctx = WorkflowRunContext::default();
         let cache: PreflightCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let cleanup_tracker = WorkflowCleanupTracker::default();
+        let prompt_dispatch = None;
 
         let first = executor
             .ensure_agent_preflight(
@@ -5569,6 +5829,7 @@ mod tests {
                 "preflight-fault",
                 &ctx,
                 &diagnostic_factory,
+                &prompt_dispatch,
                 &cancel,
                 Arc::new(registry.entry.clone()),
                 &cache,
@@ -5582,6 +5843,7 @@ mod tests {
                 "preflight-fault",
                 &ctx,
                 &diagnostic_factory,
+                &prompt_dispatch,
                 &cancel,
                 Arc::new(registry.entry.clone()),
                 &cache,
@@ -5772,6 +6034,11 @@ mod tests {
             invalidates: AtomicUsize::new(0),
         });
         let dispatcher = preflight_dispatcher(backend);
+        let telemetry = Arc::new(
+            bridge_core::attempt_activity::AttemptTelemetrySinkFactory::new(
+                "dispatcher-preflight-evidence",
+            ),
+        );
 
         let events = WorkflowExecutor::new(registry)
             .run_with_context_and_dispatcher(
@@ -5779,7 +6046,10 @@ mod tests {
                 "DIFF".into(),
                 "dispatcher-preflight".into(),
                 CancellationToken::new(),
-                WorkflowRunContext::default(),
+                WorkflowRunContext {
+                    make_rich_sink: Some(telemetry.clone()),
+                    ..WorkflowRunContext::default()
+                },
                 dispatcher.clone(),
             )
             .collect::<Vec<_>>()
@@ -5804,6 +6074,12 @@ mod tests {
         assert_eq!(
             dispatcher.checkout_models.lock().unwrap().clone(),
             vec![None]
+        );
+        telemetry.evidence().close_all();
+        assert_eq!(
+            telemetry.evidence().counts().reached,
+            2,
+            "the genuine preflight and real node prompt are both provider turns"
         );
     }
 
@@ -11430,8 +11706,16 @@ mod observability_tests {
                 })
             })
         };
-        let ctx = WorkflowDiagnosticContext::in_memory(WorkflowRunContext::default())
-            .with_prompt_dispatch_barrier(barrier);
+        let telemetry = Arc::new(
+            bridge_core::attempt_activity::AttemptTelemetrySinkFactory::new(
+                "workflow-barrier-evidence",
+            ),
+        );
+        let ctx = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+            make_rich_sink: Some(telemetry.clone()),
+            ..WorkflowRunContext::default()
+        })
+        .with_prompt_dispatch_barrier(barrier);
         let run = tokio::spawn(async move {
             executor
                 .run_with_diagnostic_context(
@@ -11452,9 +11736,15 @@ mod observability_tests {
             rec.prompts.lock().unwrap().is_empty(),
             "provider prompt must remain unpolled while the durable barrier is pending"
         );
+        assert_eq!(
+            telemetry.evidence().turn_count(),
+            0,
+            "a canceled or blocked barrier must not register a provider turn"
+        );
         release.add_permits(1);
         let events = run.await.unwrap();
         assert!(!rec.prompts.lock().unwrap().is_empty());
+        assert_eq!(telemetry.evidence().turn_count(), 1);
         assert!(matches!(
             events.last().unwrap().as_ref().unwrap(),
             WorkflowEvent::Terminal {

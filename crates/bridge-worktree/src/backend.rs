@@ -10,6 +10,7 @@ use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
     AgentBackend, BackendObservers, BackendStream, DiagnosticObserver, RichEventSink,
 };
+use bridge_core::terminal_evidence::{AcpChildLiveness, EvidenceCapability};
 use bridge_core::SessionCwd;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1280,6 +1281,14 @@ impl AgentBackend for WorktreeBackend {
         self.inner.capabilities()
     }
 
+    fn terminal_evidence_capability(&self) -> EvidenceCapability {
+        self.inner.terminal_evidence_capability()
+    }
+
+    fn bridge_owned_acp_child_liveness(&self) -> AcpChildLiveness {
+        self.inner.bridge_owned_acp_child_liveness()
+    }
+
     async fn retire(&self) -> Result<(), BridgeError> {
         {
             // Linearize the admission boundary with configure publication and
@@ -1393,6 +1402,8 @@ mod tests {
         retire_started_count: AtomicUsize,
         retire_started: Notify,
         composite_count: AtomicUsize,
+        evidence_v1: AtomicBool,
+        child_exited: AtomicBool,
         diagnostics: Mutex<Vec<Arc<dyn DiagnosticObserver>>>,
         rich_sinks: Mutex<Vec<Arc<dyn RichEventSink>>>,
     }
@@ -1480,6 +1491,22 @@ mod tests {
             Ok(Box::pin(tokio_stream::iter(Vec::<
                 Result<Update, BridgeError>,
             >::new())))
+        }
+
+        fn terminal_evidence_capability(&self) -> EvidenceCapability {
+            if self.rec.evidence_v1.load(Ordering::SeqCst) {
+                EvidenceCapability::V1
+            } else {
+                EvidenceCapability::Unsupported
+            }
+        }
+
+        fn bridge_owned_acp_child_liveness(&self) -> AcpChildLiveness {
+            if self.rec.child_exited.load(Ordering::SeqCst) {
+                AcpChildLiveness::Exited
+            } else {
+                AcpChildLiveness::Unknown
+            }
         }
 
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
@@ -1818,6 +1845,33 @@ mod tests {
         let seen_rich = rec.rich_sinks.lock().unwrap();
         assert_eq!(seen_rich.len(), 1);
         assert!(Arc::ptr_eq(&seen_rich[0], &rich));
+
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn stable_inner_capability_and_child_liveness_are_forwarded() {
+        let (backend, rec, tmp, _source, _cfg) = backend_fixture("stable-static-forwarding");
+
+        assert_eq!(
+            backend.terminal_evidence_capability(),
+            EvidenceCapability::Unsupported
+        );
+        assert_eq!(
+            backend.bridge_owned_acp_child_liveness(),
+            AcpChildLiveness::Unknown
+        );
+
+        rec.evidence_v1.store(true, Ordering::SeqCst);
+        rec.child_exited.store(true, Ordering::SeqCst);
+        assert_eq!(
+            backend.terminal_evidence_capability(),
+            EvidenceCapability::V1
+        );
+        assert_eq!(
+            backend.bridge_owned_acp_child_liveness(),
+            AcpChildLiveness::Exited
+        );
 
         std::fs::remove_dir_all(tmp).unwrap();
     }

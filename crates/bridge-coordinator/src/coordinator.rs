@@ -11,7 +11,7 @@ use bridge_core::domain::{AgentOverride, Effort, InjectRequest, Part, PermitDeci
 use bridge_core::error::BridgeError;
 #[cfg(test)]
 use bridge_core::ids::OperationId;
-use bridge_core::ids::{AgentId, BatchId, ContextId, TaskId, WorkflowId};
+use bridge_core::ids::{AgentId, BatchId, ContextId, SessionId, TaskId, WorkflowId};
 use bridge_core::orch::{AgentSessionCaps, TerminalUsage, UsageSnapshot};
 use bridge_core::permission::{PermKey, PermissionRegistry, PermissionResolution, TurnMeta};
 use bridge_core::ports::{
@@ -160,6 +160,123 @@ impl DirectAttemptHandle {
             });
     }
 
+    pub fn record_activity(
+        &mut self,
+        phase: bridge_core::attempt_activity::AttemptPhase,
+        reason: bridge_core::attempt_activity::ActivityReason,
+        advance: u64,
+    ) {
+        self.barrier.record_activity(phase, reason, advance);
+    }
+
+    pub fn activity_recorder(&self) -> Arc<dyn bridge_core::attempt_activity::AttemptRecorder> {
+        self.barrier.activity_recorder()
+    }
+
+    pub fn terminal_evidence_sink(
+        &self,
+    ) -> Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink> {
+        self.barrier.terminal_evidence_sink()
+    }
+
+    fn terminal_evidence_binding(
+        &self,
+        generation: u64,
+        session: &SessionId,
+        turn: &bridge_core::ids::TurnId,
+    ) -> Result<bridge_core::terminal_evidence::TurnEvidenceBinding, BridgeError> {
+        let nonce = bridge_core::attestation::generate_nonce()?;
+        Ok(bridge_core::terminal_evidence::TurnEvidenceBinding {
+            generation: generation.saturating_add(1),
+            session_id: session.as_str().to_string(),
+            turn_id: turn.as_str().to_string(),
+            attempt_id: self.identity.attempt_id.as_str().to_string(),
+            marker_nonce: bridge_core::attestation::nonce_hex(&nonce),
+        })
+    }
+
+    pub fn prepare_terminal_evidence(
+        &self,
+        generation: u64,
+        session: &SessionId,
+        turn: &bridge_core::ids::TurnId,
+    ) -> Result<(), BridgeError> {
+        self.barrier
+            .prepare_terminal_evidence(self.terminal_evidence_binding(generation, session, turn)?);
+        Ok(())
+    }
+
+    pub fn configure_terminal_evidence(
+        &self,
+        generation: u64,
+        session: &SessionId,
+        turn: &bridge_core::ids::TurnId,
+    ) -> Result<(), BridgeError> {
+        self.barrier.configure_terminal_evidence(
+            self.terminal_evidence_binding(generation, session, turn)?,
+        );
+        Ok(())
+    }
+
+    pub fn declare_terminal_evidence(
+        &self,
+        capability: bridge_core::terminal_evidence::EvidenceCapability,
+    ) {
+        self.terminal_evidence_sink().declare_capability(capability);
+    }
+
+    pub fn configure_malformed_terminal_evidence(&self) {
+        self.barrier.configure_malformed_terminal_evidence();
+    }
+
+    /// Switch this attempt to the bounded multi-provider terminal projection.
+    /// Every subsequently registered leg contributes to one truthful
+    /// reached/valid/missing/invalid count; exact producer/final evidence
+    /// projects only when exactly one leg was reached.
+    pub fn begin_multi_provider_terminal(&mut self) {
+        self.barrier.begin_multi_provider_terminal();
+    }
+
+    /// Mint one bounded evidence binding for a provider leg of a
+    /// multi-provider attempt (the bridge owns the generation floor here).
+    pub fn multi_provider_leg_binding(
+        &self,
+        generation: u64,
+        session: &SessionId,
+        turn: &bridge_core::ids::TurnId,
+    ) -> Result<bridge_core::terminal_evidence::TurnEvidenceBinding, BridgeError> {
+        self.terminal_evidence_binding(generation, session, turn)
+    }
+
+    /// One bounded observation scope plus one registered terminal-evidence
+    /// sink for a reached provider leg.
+    pub fn multi_provider_leg(
+        &self,
+        capability: bridge_core::terminal_evidence::EvidenceCapability,
+        binding: Option<bridge_core::terminal_evidence::TurnEvidenceBinding>,
+    ) -> (
+        Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
+        Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
+    ) {
+        self.barrier.multi_provider_leg(capability, binding)
+    }
+
+    pub fn multi_provider_leg_dispatch_observer(
+        &self,
+        capability: bridge_core::terminal_evidence::EvidenceCapability,
+        binding: Option<bridge_core::terminal_evidence::TurnEvidenceBinding>,
+    ) -> bridge_core::ports::ProviderDispatchObserver {
+        self.barrier
+            .multi_provider_leg_dispatch_observer(capability, binding)
+    }
+
+    pub fn seal_child_liveness(
+        &mut self,
+        liveness: bridge_core::terminal_evidence::AcpChildLiveness,
+    ) {
+        self.barrier.seal_child_liveness(liveness);
+    }
+
     pub async fn mark_prompt_dispatch(&mut self) -> Result<(), BridgeError> {
         match self.barrier.mark_prompt_dispatch().await {
             Ok(()) => Ok(()),
@@ -186,6 +303,54 @@ impl DirectAttemptHandle {
             .await
     }
 
+    /// Finish the direct attempt and return the exact terminal that became
+    /// durable so public result projections cannot reuse pre-resolution state.
+    pub async fn finish_resolved(
+        &mut self,
+        outcome: &'static str,
+        reason: &'static str,
+        degraded: bool,
+        cleanup_disposition: &'static str,
+    ) -> Result<bridge_core::workflow_history::AttemptTerminal, BridgeError> {
+        self.finish_with_completeness_resolved(outcome, reason, degraded, cleanup_disposition, true)
+            .await
+    }
+
+    pub async fn finish_with_detached_cleanup(
+        &mut self,
+        outcome: &'static str,
+        reason: &'static str,
+        degraded: bool,
+        cleanup: crate::dispatch::DetachedWarmCleanup,
+    ) -> Result<(), BridgeError> {
+        self.finish_with_completeness(outcome, reason, degraded, "pending", true)
+            .await?;
+        let settlement = self.barrier.cleanup_settlement().map_err(|error| {
+            BridgeError::DurableEvidenceUnavailable {
+                reason: error.reason.as_str(),
+            }
+        })?;
+        tokio::spawn(async move {
+            let disposition = cleanup.settle().await;
+            let value = match disposition {
+                crate::dispatch::DetachedCleanupDisposition::Complete => "complete",
+                crate::dispatch::DetachedCleanupDisposition::Failed => "failed",
+                crate::dispatch::DetachedCleanupDisposition::OwnerHeld => return,
+            };
+            match settlement.settle(value).await {
+                Ok(bridge_core::workflow_history::TerminalWrite::Applied)
+                | Ok(bridge_core::workflow_history::TerminalWrite::Replayed) => {}
+                Ok(bridge_core::workflow_history::TerminalWrite::Conflict) | Err(_) => {
+                    tracing::warn!(
+                        cleanup_disposition = value,
+                        "direct pending cleanup settlement failed"
+                    );
+                }
+            }
+        });
+        Ok(())
+    }
+
     pub async fn finish_with_completeness(
         &mut self,
         outcome: &'static str,
@@ -194,6 +359,25 @@ impl DirectAttemptHandle {
         cleanup_disposition: &'static str,
         telemetry_complete: bool,
     ) -> Result<(), BridgeError> {
+        self.finish_with_completeness_resolved(
+            outcome,
+            reason,
+            degraded,
+            cleanup_disposition,
+            telemetry_complete,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn finish_with_completeness_resolved(
+        &mut self,
+        outcome: &'static str,
+        reason: &'static str,
+        degraded: bool,
+        cleanup_disposition: &'static str,
+        telemetry_complete: bool,
+    ) -> Result<bridge_core::workflow_history::AttemptTerminal, BridgeError> {
         match self
             .barrier
             .finish(
@@ -219,11 +403,11 @@ impl DirectAttemptHandle {
                         work_seconds: terminal.work_ms as f64 / 1000.0,
                         end_to_end_seconds: terminal.end_to_end_ms as f64 / 1000.0,
                     });
-                Ok(())
+                Ok(terminal)
             }
-            Ok((bridge_core::workflow_history::TerminalWrite::Replayed, _)) => {
+            Ok((bridge_core::workflow_history::TerminalWrite::Replayed, terminal)) => {
                 self.stop_observation();
-                Ok(())
+                Ok(terminal)
             }
             Ok((bridge_core::workflow_history::TerminalWrite::Conflict, _)) => {
                 unreachable!("the shared direct barrier maps conflicts to a typed error")
@@ -1052,11 +1236,40 @@ impl Coordinator {
             )
             .await;
 
+        let (activity_recorder, terminal_evidence) = match attempt.as_ref() {
+            Some(attempt) => {
+                attempt.prepare_terminal_evidence(
+                    turn.generation.get(),
+                    &turn.session,
+                    &obs_ctx.turn_id,
+                )?;
+                let capability = turn.backend.terminal_evidence_capability();
+                match capability {
+                    bridge_core::terminal_evidence::EvidenceCapability::V1 => {
+                        attempt.declare_terminal_evidence(capability);
+                    }
+                    bridge_core::terminal_evidence::EvidenceCapability::MalformedAdvertisement => {
+                        attempt.configure_malformed_terminal_evidence();
+                    }
+                    bridge_core::terminal_evidence::EvidenceCapability::Unsupported => {}
+                }
+                (
+                    attempt.activity_recorder(),
+                    attempt.terminal_evidence_sink(),
+                )
+            }
+            None => (
+                Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder)
+                    as Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
+                Arc::new(bridge_core::terminal_evidence::SharedTurnEvidence::unsupported())
+                    as Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
+            ),
+        };
         let translator = Translator::new();
         let harvest_audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
             bridge_core::task_store::TaskStoreHarvestAuditStore::new(self.task_store.clone()),
         );
-        let mut events = translator.run_observed(
+        let mut events = translator.run_observed_with_attempt_telemetry(
             turn.backend.as_ref(),
             self.session_store.as_ref(),
             self.policy.as_ref(),
@@ -1066,8 +1279,13 @@ impl Coordinator {
             diagnostic,
             obs_ctx.clone(),
             harvest_audit_store,
+            activity_recorder,
+            terminal_evidence,
         );
         let mut collected = Vec::new();
+        // The backend records genuine provider message/thought deltas through the
+        // attempt telemetry port. Translated Status and Artifact events are delivery
+        // projections and cannot independently prove provider progress.
         let mut aborted = false;
         let mut prompt_polled = false;
         loop {
@@ -1131,6 +1349,11 @@ impl Coordinator {
                 }
                 _ => collected.push(ev),
             }
+        }
+        // Sample only the exact bridge-owned ACP child before cleanup custody
+        // moves. This observation never determines producer disposition.
+        if let Some(attempt) = attempt.as_mut() {
+            attempt.seal_child_liveness(turn.backend.bridge_owned_acp_child_liveness());
         }
         // Drop the translator stream BEFORE finishing (cancels the in-flight backend future on abort).
         drop(events);
@@ -1198,14 +1421,14 @@ impl Coordinator {
                 .map(|e| e.text())
                 .collect()
         };
-        let stop_reason = match events.iter().rev().find_map(|e| e.outcome()) {
+        let mut stop_reason = match events.iter().rev().find_map(|e| e.outcome()) {
             Some(TaskOutcome::Canceled) => "cancelled",
             Some(TaskOutcome::Failed) => "failed",
             Some(TaskOutcome::Completed) | None => "completed",
         }
         .to_string();
 
-        let outcome = events
+        let mut outcome = events
             .iter()
             .rev()
             .find_map(|e| {
@@ -1219,6 +1442,24 @@ impl Coordinator {
                 TaskOutcome::Canceled => TurnOutcome::Canceled,
             })
             .unwrap_or(TurnOutcome::Success);
+
+        if let Some(attempt) = attempt.as_mut() {
+            let (terminal_outcome, terminal_reason, degraded) = match outcome {
+                TurnOutcome::Success => ("completed", "completed", false),
+                TurnOutcome::Canceled => ("canceled", "canceled", true),
+                TurnOutcome::Failed(_) => ("failed", "prompt_failed", true),
+            };
+            let terminal = attempt
+                .finish_resolved(terminal_outcome, terminal_reason, degraded, "complete")
+                .await?;
+            stop_reason = terminal.terminal_reason;
+            outcome = match terminal.outcome.as_str() {
+                "completed" => TurnOutcome::Success,
+                "canceled" => TurnOutcome::Canceled,
+                _ => TurnOutcome::Failed(FailureClass::Other),
+            };
+        }
+
         self.observer.record(&ObsEvent::TurnFinished {
             ctx: &obs_ctx,
             latency: started.elapsed(),
@@ -1230,17 +1471,6 @@ impl Coordinator {
             usage: last_usage.as_ref(),
             fin: UsageFinalization::TurnFinal,
         });
-
-        if let Some(attempt) = attempt.as_mut() {
-            let (terminal_outcome, terminal_reason, degraded) = match outcome {
-                TurnOutcome::Success => ("completed", "completed", false),
-                TurnOutcome::Canceled => ("canceled", "canceled", true),
-                TurnOutcome::Failed(_) => ("failed", "prompt_failed", true),
-            };
-            attempt
-                .finish(terminal_outcome, terminal_reason, degraded, "complete")
-                .await?;
-        }
 
         Ok(TurnOutput {
             text: out_text,
@@ -1876,6 +2106,7 @@ mod tests {
         fail_release: std::sync::atomic::AtomicBool,
         release_gate: Option<Arc<Notify>>,
         configured_turns: Arc<StdMutex<Vec<(SessionId, TurnMeta)>>>,
+        terminal_evidence_capability: bridge_core::terminal_evidence::EvidenceCapability,
     }
 
     impl FakeBackend {
@@ -1887,7 +2118,16 @@ mod tests {
                 fail_release: std::sync::atomic::AtomicBool::new(false),
                 release_gate: None,
                 configured_turns: Arc::new(StdMutex::new(Vec::new())),
+                terminal_evidence_capability:
+                    bridge_core::terminal_evidence::EvidenceCapability::Unsupported,
             }
+        }
+
+        fn with_missing_v1_terminal_evidence() -> Self {
+            let mut backend = Self::new(None);
+            backend.terminal_evidence_capability =
+                bridge_core::terminal_evidence::EvidenceCapability::V1;
+            backend
         }
 
         fn with_blocked_release(release_gate: Arc<Notify>) -> Self {
@@ -1898,6 +2138,8 @@ mod tests {
                 fail_release: std::sync::atomic::AtomicBool::new(false),
                 release_gate: Some(release_gate),
                 configured_turns: Arc::new(StdMutex::new(Vec::new())),
+                terminal_evidence_capability:
+                    bridge_core::terminal_evidence::EvidenceCapability::Unsupported,
             }
         }
     }
@@ -1944,6 +2186,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((session.clone(), meta));
+        }
+
+        fn terminal_evidence_capability(
+            &self,
+        ) -> bridge_core::terminal_evidence::EvidenceCapability {
+            self.terminal_evidence_capability
         }
     }
 
@@ -2093,6 +2341,69 @@ mod tests {
                 .deltas
                 .iter()
                 .map(|d| Ok(Update::Text(d.clone())))
+                .collect();
+            updates.push(Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
+            }));
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    struct ProgressEvidenceBackend {
+        deltas: Vec<String>,
+        replay_last_advance: bool,
+    }
+
+    #[async_trait]
+    impl AgentBackend for ProgressEvidenceBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            panic!("coordinator must use prompt_with_observers")
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            let mut advance = 0_u64;
+            let _ = observers.activity.record(
+                bridge_core::attempt_activity::AttemptPhase::Provider,
+                bridge_core::attempt_activity::ActivityReason::MessageDelta,
+                advance,
+            );
+            for delta in &self.deltas {
+                advance = advance
+                    .saturating_add(u64::try_from(delta.chars().count()).unwrap_or(u64::MAX));
+                let _ = observers.activity.record(
+                    bridge_core::attempt_activity::AttemptPhase::Provider,
+                    bridge_core::attempt_activity::ActivityReason::MessageDelta,
+                    advance,
+                );
+            }
+            if self.replay_last_advance {
+                let _ = observers.activity.record(
+                    bridge_core::attempt_activity::AttemptPhase::Provider,
+                    bridge_core::attempt_activity::ActivityReason::MessageDelta,
+                    advance,
+                );
+            }
+
+            let mut updates: Vec<Result<Update, BridgeError>> = self
+                .deltas
+                .iter()
+                .cloned()
+                .map(Update::Text)
+                .map(Ok)
                 .collect();
             updates.push(Ok(Update::Done {
                 stop_reason: "end_turn".into(),
@@ -2456,10 +2767,11 @@ mod tests {
         let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
         let attempt_id = identity.attempt_id.clone();
 
-        coordinator
+        let output = coordinator
             .prompt_with_identity(prompt_params("hi"), identity)
             .await
             .unwrap();
+        assert_eq!(output.stop_reason, "completed");
 
         let row = history
             .attempt(&attempt_id)
@@ -2523,6 +2835,7 @@ mod tests {
                 terminal_evidence_version: "none".into(),
                 terminal_evidence_source: "none".into(),
                 terminal_evidence_complete: false,
+                terminal_evidence_counts: Default::default(),
                 degraded: false,
                 prompt_acceptance: "not_dispatched".into(),
                 cleanup_disposition: "complete".into(),
@@ -2853,6 +3166,40 @@ mod tests {
         let terminal = row.terminal.unwrap();
         assert_eq!(terminal.prompt_acceptance, "dispatch_uncertain");
         assert!(!terminal.telemetry_complete);
+    }
+
+    #[tokio::test]
+    async fn resolved_v1_failure_controls_public_mcp_stop_reason() {
+        let backend = Arc::new(FakeBackend::with_missing_v1_terminal_evidence());
+        let history = Arc::new(MemoryWorkflowHistoryStore::new());
+        let coordinator = coordinator_fixture_with_backend(Arc::new(HashMap::new()), backend)
+            .coordinator
+            .with_workflow_history(Ok(history.clone()));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let attempt_id = identity.attempt_id.clone();
+
+        let output = coordinator
+            .prompt_with_identity(prompt_params("hi"), identity)
+            .await
+            .expect("the resolved protocol failure remains a collected direct result");
+
+        assert_eq!(output.text, "ok");
+        assert_eq!(
+            output.stop_reason, "protocol_terminal_evidence_missing",
+            "the MCP projection must not retain the legacy completed stop reason"
+        );
+        let terminal = history
+            .attempt(&attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(terminal.outcome, "failed");
+        assert_eq!(
+            terminal.terminal_reason,
+            "protocol_terminal_evidence_missing"
+        );
     }
 
     #[tokio::test]
@@ -3814,7 +4161,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_falls_back_to_status_text_when_stream_ends_without_done() {
+    async fn r2f0b_real_coordinator_counts_only_genuine_provider_message_deltas() {
+        for (deltas, replay_last_advance, expected_progress) in [
+            (Vec::<String>::new(), false, 2),
+            (vec!["first".to_owned(), String::new()], true, 3),
+            (
+                vec!["first".to_owned(), String::new(), "second".to_owned()],
+                true,
+                4,
+            ),
+        ] {
+            let history = Arc::new(MemoryWorkflowHistoryStore::new());
+            let backend: Arc<dyn AgentBackend> = Arc::new(ProgressEvidenceBackend {
+                deltas,
+                replay_last_advance,
+            });
+            let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+                entry: entry(),
+                backend,
+                resolved: Arc::new(StdMutex::new(Vec::new())),
+            });
+            let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+            let coordinator = coordinator_fixture_with_registry(registry, clock)
+                .with_workflow_history(Ok(history.clone()));
+            let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+            let attempt_id = identity.attempt_id.clone();
+
+            coordinator
+                .prompt_with_identity(prompt_params("private progress prompt"), identity)
+                .await
+                .unwrap();
+
+            let tally = history
+                .activity_tally(&attempt_id)
+                .await
+                .unwrap()
+                .expect("real coordinator activity persisted");
+            assert_eq!(
+                tally.meaningful_progress, expected_progress,
+                "synthetic artifact, empty delta, or replay advanced progress"
+            );
+            assert!(!serde_json::to_string(&tally)
+                .unwrap()
+                .contains("private progress prompt"));
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_rejects_stream_eof_without_done() {
         let backend = Arc::new(NoDoneBackend {
             deltas: vec!["OAK".into(), "LEAF".into()],
         });
@@ -3826,9 +4220,10 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
         let coordinator = coordinator_fixture_with_registry(registry, clock);
 
-        let out = coordinator.prompt(prompt_params("hi")).await.unwrap();
-        assert_eq!(out.text, "OAKLEAF");
-        assert_eq!(out.stop_reason, "completed");
+        assert!(matches!(
+            coordinator.prompt(prompt_params("hi")).await,
+            Err(BridgeError::MissingTerminal)
+        ));
     }
 
     #[tokio::test]

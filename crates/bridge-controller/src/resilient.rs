@@ -89,13 +89,64 @@ impl turn::TurnRunner for ResilientWarm {
         parts: Vec<Part>,
         observer: Arc<dyn DiagnosticObserver>,
     ) -> bool {
+        self.run_turn_recorded(
+            session,
+            parts,
+            observer,
+            Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder),
+        )
+        .await
+    }
+
+    async fn run_turn_recorded(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+        observer: Arc<dyn DiagnosticObserver>,
+        activity: Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
+    ) -> bool {
+        self.run_turn_with_telemetry(
+            session,
+            parts,
+            observer,
+            turn::RecordedTurnTelemetry {
+                activity,
+                terminal_evidence: Arc::new(
+                    bridge_core::terminal_evidence::SharedTurnEvidence::unsupported(),
+                ),
+                turn_meta: None,
+            },
+        )
+        .await
+    }
+
+    async fn run_turn_with_telemetry(
+        &self,
+        session: &SessionId,
+        parts: Vec<Part>,
+        observer: Arc<dyn DiagnosticObserver>,
+        telemetry: turn::RecordedTurnTelemetry,
+    ) -> bool {
+        struct CloseEvidence(Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>);
+        impl Drop for CloseEvidence {
+            fn drop(&mut self) {
+                self.0.close();
+            }
+        }
+        let _close_evidence = CloseEvidence(telemetry.terminal_evidence.clone());
         loop {
             let backend = self.backend.lock().await.clone();
+            if let Some(meta) = telemetry.turn_meta.clone() {
+                backend.configure_turn(session, meta).await;
+            }
             let outcome = match backend
                 .prompt_with_observers(
                     session,
                     parts.clone(),
-                    BackendObservers::diagnostic_only(observer.clone()),
+                    BackendObservers::diagnostic_only(observer.clone()).with_attempt_telemetry(
+                        telemetry.activity.clone(),
+                        telemetry.terminal_evidence.clone(),
+                    ),
                 )
                 .await
             {
@@ -197,6 +248,7 @@ mod tests {
             BridgeError::CancelTimeout => "CancelTimeout",
             BridgeError::AgentTimedOut => "AgentTimedOut",
             BridgeError::FrameError => "FrameError",
+            BridgeError::MissingTerminal => "MissingTerminal",
             BridgeError::MessageTooLarge => "MessageTooLarge",
             BridgeError::AgentCrashed { .. } => "AgentCrashed",
             BridgeError::AgentFailure { .. } => "AgentFailure",
@@ -275,6 +327,7 @@ mod tests {
             (BridgeError::CancelTimeout, Death::Transient),
             (BridgeError::AgentTimedOut, Death::Fatal),
             (BridgeError::FrameError, Death::Transient),
+            (BridgeError::MissingTerminal, Death::Fatal),
             (BridgeError::MessageTooLarge, Death::Fatal),
             (BridgeError::agent_crashed("x"), Death::Transient),
             (structured(FailureDisposition::Fatal), Death::Fatal),
@@ -338,6 +391,10 @@ mod tests {
         scratch_write: Option<PathBuf>,
         scratch_absent: Option<(PathBuf, Arc<AtomicBool>)>,
         diagnostics: StdMutex<Vec<Arc<dyn DiagnosticObserver>>>,
+        activities: StdMutex<Vec<Arc<dyn bridge_core::attempt_activity::AttemptRecorder>>>,
+        terminal_evidence:
+            StdMutex<Vec<Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>>>,
+        turn_metas: StdMutex<Vec<bridge_core::permission::TurnMeta>>,
     }
 
     impl FakeBackend {
@@ -354,6 +411,9 @@ mod tests {
                 scratch_write: None,
                 scratch_absent: None,
                 diagnostics: StdMutex::new(Vec::new()),
+                activities: StdMutex::new(Vec::new()),
+                terminal_evidence: StdMutex::new(Vec::new()),
+                turn_metas: StdMutex::new(Vec::new()),
             }
         }
 
@@ -408,6 +468,11 @@ mod tests {
         ) -> Result<BackendStream, BridgeError> {
             assert!(observers.rich.is_none());
             self.diagnostics.lock().unwrap().push(observers.diagnostic);
+            self.activities.lock().unwrap().push(observers.activity);
+            self.terminal_evidence
+                .lock()
+                .unwrap()
+                .push(observers.terminal_evidence);
             self.prompt(session, parts).await
         }
 
@@ -423,6 +488,14 @@ mod tests {
         ) -> Result<(), BridgeError> {
             self.configured.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        async fn configure_turn(
+            &self,
+            _session: &SessionId,
+            meta: bridge_core::permission::TurnMeta,
+        ) {
+            self.turn_metas.lock().unwrap().push(meta);
         }
 
         async fn forget_session(&self, _session: &SessionId) {}
@@ -537,6 +610,146 @@ mod tests {
         assert_eq!(second_seen.len(), 1);
         assert!(Arc::ptr_eq(&first_seen[0], &observer));
         assert!(Arc::ptr_eq(&second_seen[0], &observer));
+    }
+
+    #[tokio::test]
+    async fn r2f0b_recorded_turn_reuses_one_activity_recorder_after_respawn() {
+        let first = Arc::new(FakeBackend::new(
+            BridgeError::agent_crashed("gone"),
+            true,
+            false,
+        ));
+        let second = Arc::new(FakeBackend::new(
+            BridgeError::agent_crashed("unused"),
+            false,
+            true,
+        ));
+        let runner = ResilientWarm::new(
+            first.clone(),
+            Arc::new(CountingRebuild {
+                count: Arc::new(AtomicUsize::new(0)),
+                next: second.clone(),
+            }),
+            session_spec(),
+            1,
+            noop_reset(),
+        );
+        let session = SessionId::parse("implement-recorded-test").unwrap();
+        let activity: Arc<dyn bridge_core::attempt_activity::AttemptRecorder> =
+            Arc::new(bridge_core::attempt_activity::SharedAttemptRecorder::new(
+                bridge_core::attempt_activity::SystemMonotonicClock::start(),
+            ));
+
+        assert!(
+            runner
+                .run_turn_recorded(
+                    &session,
+                    vec![Part { text: "fix".into() }],
+                    Arc::new(MarkerDiagnostic),
+                    activity.clone(),
+                )
+                .await
+        );
+
+        let first_seen = first.activities.lock().unwrap();
+        let second_seen = second.activities.lock().unwrap();
+        assert_eq!(first_seen.len(), 1);
+        assert_eq!(second_seen.len(), 1);
+        assert!(Arc::ptr_eq(&first_seen[0], &activity));
+        assert!(Arc::ptr_eq(&second_seen[0], &activity));
+    }
+
+    #[tokio::test]
+    async fn r2f0b_warm_respawn_reuses_exact_turn_evidence_and_metadata_then_seals_it() {
+        let first = Arc::new(FakeBackend::new(
+            BridgeError::agent_crashed("gone"),
+            true,
+            false,
+        ));
+        let second = Arc::new(FakeBackend::new(
+            BridgeError::agent_crashed("unused"),
+            false,
+            true,
+        ));
+        let runner = ResilientWarm::new(
+            first.clone(),
+            Arc::new(CountingRebuild {
+                count: Arc::new(AtomicUsize::new(0)),
+                next: second.clone(),
+            }),
+            session_spec(),
+            1,
+            noop_reset(),
+        );
+        let session = SessionId::parse("implement-telemetry-test").unwrap();
+        let activity: Arc<dyn bridge_core::attempt_activity::AttemptRecorder> =
+            Arc::new(bridge_core::attempt_activity::SharedAttemptRecorder::new(
+                bridge_core::attempt_activity::SystemMonotonicClock::start(),
+            ));
+        let binding = bridge_core::terminal_evidence::TurnEvidenceBinding {
+            generation: 4,
+            session_id: session.as_str().into(),
+            turn_id: "implement-turn-4".into(),
+            attempt_id: "implement-attempt".into(),
+            marker_nonce: "00112233445566778899aabbccddeeff".into(),
+        };
+        let concrete_evidence = Arc::new(
+            bridge_core::terminal_evidence::SharedTurnEvidence::dormant(binding),
+        );
+        bridge_core::terminal_evidence::TerminalEvidenceSink::declare_capability(
+            concrete_evidence.as_ref(),
+            bridge_core::terminal_evidence::EvidenceCapability::V1,
+        );
+        let evidence: Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink> =
+            concrete_evidence.clone();
+        let meta = bridge_core::permission::TurnMeta {
+            context_id: bridge_core::ids::ContextId::parse(session.as_str()).unwrap(),
+            generation: 4,
+            op: bridge_core::ids::OperationId::parse("implement-provider-4").unwrap(),
+            turn_id: bridge_core::ids::TurnId::parse("implement-turn-4").unwrap(),
+            requested_mode: bridge_core::attestation::HarvestSanitizationMode::Off,
+            prefix_attestation_request:
+                bridge_core::attestation::PrefixAttestationRequest::Disabled,
+        };
+
+        assert!(
+            runner
+                .run_turn_with_telemetry(
+                    &session,
+                    vec![Part { text: "fix".into() }],
+                    Arc::new(MarkerDiagnostic),
+                    crate::turn::RecordedTurnTelemetry {
+                        activity,
+                        terminal_evidence: evidence.clone(),
+                        turn_meta: Some(meta),
+                    },
+                )
+                .await
+        );
+
+        let first_evidence = first.terminal_evidence.lock().unwrap();
+        let second_evidence = second.terminal_evidence.lock().unwrap();
+        assert_eq!(first_evidence.len(), 1);
+        assert_eq!(second_evidence.len(), 1);
+        assert!(Arc::ptr_eq(&first_evidence[0], &evidence));
+        assert!(Arc::ptr_eq(&second_evidence[0], &evidence));
+        drop(first_evidence);
+        drop(second_evidence);
+        for backend in [&first, &second] {
+            let metas = backend.turn_metas.lock().unwrap();
+            assert_eq!(metas.len(), 1);
+            assert_eq!(metas[0].generation, 4);
+            assert_eq!(metas[0].turn_id.as_str(), "implement-turn-4");
+            assert_eq!(metas[0].op.as_str(), "implement-provider-4");
+        }
+        assert_eq!(
+            bridge_core::terminal_evidence::TerminalEvidenceSink::observation(
+                concrete_evidence.as_ref(),
+            )
+            .0,
+            bridge_core::terminal_evidence::EvidenceCompleteness::Missing,
+            "the attempt owner must seal negotiated evidence after the warm turn"
+        );
     }
 
     #[tokio::test]

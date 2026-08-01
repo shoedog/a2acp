@@ -1,14 +1,18 @@
 use bridge_api::{ApiBackend, ApiConfig};
+use bridge_core::attempt_activity::{
+    ActivityReason, AttemptActivity, AttemptPhase, AttemptRecorder,
+};
 use bridge_core::diagnostics::{
     DiagnosticFailureClass, DiagnosticPhase, FailureDiagnostic, FailureDisposition,
-    InMemoryDiagnosticObserver, PhaseStatus,
+    InMemoryDiagnosticObserver, NoopDiagnosticObserver, PhaseStatus,
 };
 use bridge_core::domain::Part;
 use bridge_core::error::BridgeError;
 use bridge_core::ids::SessionId;
 use bridge_core::ports::{AgentBackend, BackendObservers, Update};
+use bridge_core::terminal_evidence::SharedTurnEvidence;
 use futures::StreamExt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -374,4 +378,131 @@ async fn later_tool_round_send_failure_is_fatal_after_exactly_one_accepted_reque
     assert_eq!(diagnostic.code().as_str(), "api.prompt.send");
     assert_eq!(diagnostic.disposition(), FailureDisposition::Fatal);
     assert!(diagnostic.prompt_may_have_been_accepted());
+}
+
+#[derive(Default)]
+struct CapturingRecorder(Mutex<Vec<AttemptActivity>>);
+
+impl AttemptRecorder for CapturingRecorder {
+    fn record(
+        &self,
+        phase: AttemptPhase,
+        reason: ActivityReason,
+        advance: u64,
+    ) -> Option<AttemptActivity> {
+        let observation = AttemptActivity {
+            phase,
+            reason,
+            kind: bridge_core::attempt_activity::ActivityKind::MeaningfulProgress,
+            elapsed_ms: 0,
+            advance,
+        };
+        self.0.lock().unwrap().push(observation);
+        Some(observation)
+    }
+}
+
+async fn api_activity_turn(
+    backend: &ApiBackend,
+    session: &str,
+) -> (Vec<Update>, Vec<AttemptActivity>) {
+    let recorder = Arc::new(CapturingRecorder::default());
+    let mut stream = backend
+        .prompt_with_observers(
+            &SessionId::parse(session).unwrap(),
+            vec![Part { text: "hi".into() }],
+            BackendObservers::diagnostic_only(Arc::new(NoopDiagnosticObserver::default()))
+                .with_attempt_telemetry(
+                    recorder.clone(),
+                    Arc::new(SharedTurnEvidence::unsupported()),
+                ),
+        )
+        .await
+        .unwrap();
+    let mut updates = Vec::new();
+    while let Some(item) = stream.next().await {
+        if let Ok(update) = item {
+            updates.push(update);
+        }
+    }
+    let observations = recorder.0.lock().unwrap().clone();
+    (updates, observations)
+}
+
+#[tokio::test]
+async fn streaming_api_text_records_saturating_cumulative_character_progress() {
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hé\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"llo\"},\"finish_reason\":\"stop\"}]}\n\n";
+    let response = raw_response("200 OK", "text/event-stream", body.as_bytes(), body.len());
+    let backend = ApiBackend::new(ApiConfig::new(one_response_server(response).await));
+
+    let (_, observations) = api_activity_turn(&backend, "api-activity-stream").await;
+    assert_eq!(
+        observations
+            .iter()
+            .map(|observation| (observation.phase, observation.reason, observation.advance))
+            .collect::<Vec<_>>(),
+        vec![
+            (AttemptPhase::Provider, ActivityReason::MessageDelta, 2),
+            (AttemptPhase::Provider, ActivityReason::MessageDelta, 5),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn trailing_sse_text_records_message_progress_before_yield() {
+    let body =
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"tail\"},\"finish_reason\":\"stop\"}]}";
+    let response = raw_response("200 OK", "text/event-stream", body, body.len());
+    let backend = ApiBackend::new(ApiConfig::new(one_response_server(response).await));
+
+    let (updates, observations) = api_activity_turn(&backend, "api-activity-trailing").await;
+    assert!(updates
+        .iter()
+        .any(|update| matches!(update, Update::Text(text) if text == "tail")));
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].phase, AttemptPhase::Provider);
+    assert_eq!(observations[0].reason, ActivityReason::MessageDelta);
+    assert_eq!(observations[0].advance, 4);
+}
+
+#[tokio::test]
+async fn nonstream_api_text_records_message_progress_before_yield() {
+    let body = br#"{"choices":[{"message":{"content":"plain"},"finish_reason":"stop"}]}"#;
+    let response = raw_response("200 OK", "application/json", body, body.len());
+    let mut config = ApiConfig::new(one_response_server(response).await);
+    config.stream = false;
+    let backend = ApiBackend::new(config);
+
+    let (updates, observations) = api_activity_turn(&backend, "api-activity-nonstream").await;
+    assert!(updates
+        .iter()
+        .any(|update| matches!(update, Update::Text(text) if text == "plain")));
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].reason, ActivityReason::MessageDelta);
+    assert_eq!(observations[0].advance, 5);
+}
+
+#[tokio::test]
+async fn empty_tool_only_and_terminal_api_events_do_not_record_message_progress() {
+    let terminal_body =
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}]}\n\n";
+    let terminal_response = raw_response(
+        "200 OK",
+        "text/event-stream",
+        terminal_body,
+        terminal_body.len(),
+    );
+    let terminal_backend =
+        ApiBackend::new(ApiConfig::new(one_response_server(terminal_response).await));
+    let (_, terminal_observations) =
+        api_activity_turn(&terminal_backend, "api-activity-empty").await;
+    assert!(terminal_observations.is_empty());
+
+    let tool_body = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"get_current_time\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n";
+    let tool_response = raw_response("200 OK", "text/event-stream", tool_body, tool_body.len());
+    let mut tool_config = ApiConfig::new(one_response_server(tool_response).await);
+    tool_config.max_tool_rounds = 1;
+    let tool_backend = ApiBackend::new(tool_config);
+    let (_, tool_observations) = api_activity_turn(&tool_backend, "api-activity-tool").await;
+    assert!(tool_observations.is_empty());
 }

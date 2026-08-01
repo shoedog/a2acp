@@ -318,13 +318,18 @@ at `/root/.claude/settings.json:ro`; never mount the full host Claude settings o
 Provider capacity is not container health. Before a long full-branch review, check any operator-visible
 usage window as well as bridge preflight. For trusted own-repo reviews:
 
+- Default code, implementation, release, and full-branch review to one hard-read-only raw `gpt-5.6-sol` turn at
+  `xhigh`. First complete the correctness review; then revisit every WRONG/SMELL for concrete real-world trigger
+  conditions, likelihood, exposure, bounded fix cost, and blocker/defer value. Confirm the raw model, `xhigh`, and
+  read-only mode through `models` before billing. A second reviewer is a new explicit operator-selected turn, not
+  part of the default.
+
 - Use Fable at `xhigh` only when its usage window has headroom.
 - Claude Haiku may be dogfooded for a small, tightly specified Anthropic-model or Claude Code
   compatibility check. Do not assign it complex implementation, broad diagnosis, architecture, or a
   review expected to match Sonnet/Opus/Fable/Sol rigor.
-- When Claude is known to be near its usage limit, select the separately configured raw
-  `gpt-5.6-sol` model at `xhigh` before starting. Confirm both the raw id and `xhigh` in `models`; do not
-  reconstruct an effort-suffixed id by hand.
+- When an explicitly selected Claude lane is known to be near its usage limit, stop before dispatch and return to
+  the default separately configured raw `gpt-5.6-sol`/`xhigh` lane; do not reconstruct an effort-suffixed id by hand.
 - Reserve `max` for work where tightly connected evidence benefits from depth rather than parallelism:
   complex memory leaks, deadlocks/data races or related concurrency failures, transaction-safety proofs,
   critical algorithm correctness, zero-downtime migrations, rare production failures, or a problem that

@@ -2944,17 +2944,23 @@ fn local_kiro_source(
     session: SessionId,
     parts: Vec<Part>,
     diagnostic: Arc<dyn DiagnosticObserver>,
+    turn_id: Option<bridge_core::ids::TurnId>,
+    activity: Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
+    terminal_evidence: Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
 ) -> Source {
     let source_label = label.clone();
     // Build the stream by cloning Arc refs into a `'static + Send` stream.
     let stream: crate::fanout::EventStream = Box::pin(async_stream::stream! {
         let translator = Translator::new();
-        let turn_id = match mint_turn_id() {
-            Ok(turn_id) => turn_id,
-            Err(error) => {
-                yield Err(error);
-                return;
-            }
+        let turn_id = match turn_id {
+            Some(turn_id) => turn_id,
+            None => match mint_turn_id() {
+                Ok(turn_id) => turn_id,
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            },
         };
         let turn_context = bridge_core::ports::TurnContext {
             turn_id,
@@ -2972,7 +2978,7 @@ fn local_kiro_source(
             prompt_id: None,
             traceparent: None,
         };
-        let mut events = translator.run_observed(
+        let mut events = translator.run_observed_with_attempt_telemetry(
             backend.as_ref(),
             store.as_ref(),
             policy.as_ref(),
@@ -2982,6 +2988,8 @@ fn local_kiro_source(
             diagnostic,
             turn_context,
             Arc::new(bridge_core::harvest::NoopHarvestAuditStore),
+            activity,
+            terminal_evidence,
         );
         while let Some(ev) = events.next().await {
             // A fan-out SOURCE must never emit a terminal frame — the fan-out
@@ -3044,6 +3052,8 @@ fn spawn_fanout_producer(
             .await
             {
                 Ok((backend, lease)) => {
+                    // The streaming fan-out has no durable direct terminal, so
+                    // its local leg keeps inert attempt telemetry.
                     let src = local_kiro_source(
                         local_source_label,
                         backend.clone(),
@@ -3053,6 +3063,9 @@ fn spawn_fanout_producer(
                         session.clone(),
                         parts.clone(),
                         diagnostic,
+                        None,
+                        Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder),
+                        Arc::new(bridge_core::terminal_evidence::SharedTurnEvidence::unsupported()),
                     );
                     (src, Some(backend), Some(lease))
                 }
@@ -3673,6 +3686,8 @@ async fn unary_message(
     }
 
     let mut cleanup_disposition = "unknown";
+    let mut detached_cleanup: Option<bridge_coordinator::dispatch::DetachedWarmCleanup> = None;
+    let mut child_liveness = bridge_core::terminal_evidence::AcpChildLiveness::Unknown;
 
     let _ = srv.store.put(&routed.task, &routed.session).await;
 
@@ -3729,7 +3744,8 @@ async fn unary_message(
             // after the synchronous collect completes.
             let _guard = dispatch.guard;
             let mut warm = dispatch.warm_guard;
-            if let Some(meta) = dispatch.turn_meta.clone() {
+            let turn_meta = dispatch.turn_meta.clone();
+            if let Some(meta) = turn_meta.clone() {
                 dispatch
                     .backend
                     .configure_turn(&dispatch.session, meta)
@@ -3753,8 +3769,49 @@ async fn unary_message(
             let harvest_audit_store: Arc<dyn bridge_core::harvest::HarvestAuditStore> = Arc::new(
                 bridge_core::task_store::TaskStoreHarvestAuditStore::new(srv.task_store().clone()),
             );
+            let (activity_recorder, terminal_evidence) = match direct_history.as_ref() {
+                Some(history) => {
+                    let capability = dispatch.backend.terminal_evidence_capability();
+                    if let Some(meta) = turn_meta.as_ref() {
+                        if let Err(error) = history.prepare_terminal_evidence(
+                            meta.generation,
+                            &dispatch.session,
+                            &meta.turn_id,
+                        ) {
+                            return bridge_err_to_jsonrpc(id, &error);
+                        }
+                        match capability {
+                            bridge_core::terminal_evidence::EvidenceCapability::V1 => {
+                                history.declare_terminal_evidence(capability);
+                            }
+                            bridge_core::terminal_evidence::EvidenceCapability::MalformedAdvertisement => {
+                                history.configure_malformed_terminal_evidence();
+                            }
+                            bridge_core::terminal_evidence::EvidenceCapability::Unsupported => {}
+                        }
+                    } else {
+                        match capability {
+                            bridge_core::terminal_evidence::EvidenceCapability::V1
+                            | bridge_core::terminal_evidence::EvidenceCapability::MalformedAdvertisement => {
+                            history.configure_malformed_terminal_evidence();
+                            }
+                            bridge_core::terminal_evidence::EvidenceCapability::Unsupported => {}
+                        }
+                    }
+                    (
+                        history.activity_recorder(),
+                        history.terminal_evidence_sink(),
+                    )
+                }
+                None => (
+                    Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder)
+                        as Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
+                    Arc::new(bridge_core::terminal_evidence::SharedTurnEvidence::unsupported())
+                        as Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
+                ),
+            };
             let translator = Translator::new();
-            let mut events = translator.run_observed(
+            let mut events = translator.run_observed_with_attempt_telemetry(
                 dispatch.backend.as_ref(),
                 srv.store.as_ref(),
                 srv.policy().as_ref(),
@@ -3764,8 +3821,13 @@ async fn unary_message(
                 diagnostic,
                 dispatch.obs_ctx.clone(),
                 harvest_audit_store.clone(),
+                activity_recorder,
+                terminal_evidence,
             );
             let mut collected: Vec<Result<Event, BridgeError>> = Vec::new();
+            // The backend records genuine provider message/thought deltas through the
+            // attempt telemetry port. Translated Status and Artifact events are delivery
+            // projections and cannot independently prove provider progress.
             let mut prompt_polled = false;
             loop {
                 let ev = tokio::select! {
@@ -3826,16 +3888,23 @@ async fn unary_message(
                 collected.push(ev);
             }
             drop(events);
+            child_liveness = dispatch.backend.bridge_owned_acp_child_liveness();
             if let Some(mut warm) = warm.take() {
-                warm.observe_exit(WarmCompletionExit::Normal);
-                let cleanup_result = warm.complete().await;
-                cleanup_disposition = if cleanup_result.is_ok() {
-                    "complete"
+                if collected.iter().any(Result::is_err) {
+                    // Exact cleanup custody transfers before the durable failure
+                    // row is published. Settlement proceeds independently of the
+                    // unary response and updates only pending cleanup state.
+                    detached_cleanup = Some(warm.transfer_cleanup_custody().await);
+                    cleanup_disposition = "pending";
                 } else {
-                    "failed"
-                };
-                if let Err(cleanup_error) = cleanup_result {
-                    if collected.iter().all(Result::is_ok) {
+                    warm.observe_exit(WarmCompletionExit::Normal);
+                    let cleanup_result = warm.complete().await;
+                    cleanup_disposition = if cleanup_result.is_ok() {
+                        "complete"
+                    } else {
+                        "failed"
+                    };
+                    if let Err(cleanup_error) = cleanup_result {
                         collected.push(Err(cleanup_error));
                     }
                 }
@@ -3961,12 +4030,29 @@ async fn unary_message(
 
     // Surface a terminal error if the pipeline failed/suspended.
     if let Some(Err(e)) = collected.iter().find(|r| r.is_err()) {
+        let reason = if matches!(e, BridgeError::MissingTerminal) {
+            "protocol_missing_terminal"
+        } else {
+            "prompt_failed"
+        };
         if let Some(history) = direct_history.as_mut() {
-            if let Err(terminal_error) = history
-                .finish("failed", "prompt_failed", true, cleanup_disposition)
-                .await
-            {
-                tracing::warn!(error = ?terminal_error, "A2A direct finalization failed after prompt error");
+            history.seal_child_liveness(child_liveness);
+            let durable = match detached_cleanup.take() {
+                Some(cleanup) => {
+                    history
+                        .finish_with_detached_cleanup("failed", reason, true, cleanup)
+                        .await
+                }
+                None => {
+                    history
+                        .finish("failed", reason, true, cleanup_disposition)
+                        .await
+                }
+            };
+            // The ledger is the accepted-work authority. If it cannot publish
+            // terminal truth, that failure wins over the transient backend cause.
+            if let Err(terminal_error) = durable {
+                return bridge_err_to_jsonrpc(id, &terminal_error);
             }
         }
         return bridge_err_to_jsonrpc(id, e);
@@ -3999,24 +4085,31 @@ async fn unary_message(
     // The terminal state is Completed unless the translator emitted a terminal
     // outcome (a cancelled local turn -> Canceled); a backend error is handled
     // above as a JSON-RPC error.
-    let state = match events.iter().rev().find_map(|e| e.outcome()) {
+    let mut state = match events.iter().rev().find_map(|e| e.outcome()) {
         Some(TaskOutcome::Canceled) => "TASK_STATE_CANCELED",
         Some(TaskOutcome::Failed) => "TASK_STATE_FAILED",
         _ => "TASK_STATE_COMPLETED",
     };
 
     if let Some(history) = direct_history.as_mut() {
+        history.seal_child_liveness(child_liveness);
         let (outcome, reason, degraded) = match state {
             "TASK_STATE_COMPLETED" => ("completed", "completed", false),
             "TASK_STATE_CANCELED" => ("canceled", "canceled", true),
             _ => ("failed", "prompt_failed", true),
         };
-        if let Err(error) = history
-            .finish(outcome, reason, degraded, cleanup_disposition)
+        let terminal = match history
+            .finish_resolved(outcome, reason, degraded, cleanup_disposition)
             .await
         {
-            return bridge_err_to_jsonrpc(id, &error);
-        }
+            Ok(terminal) => terminal,
+            Err(error) => return bridge_err_to_jsonrpc(id, &error),
+        };
+        state = match terminal.outcome.as_str() {
+            "completed" => "TASK_STATE_COMPLETED",
+            "canceled" => "TASK_STATE_CANCELED",
+            _ => "TASK_STATE_FAILED",
+        };
     }
 
     let metadata = attempt_identity_metadata(&supplied_identity, None);
@@ -4044,12 +4137,32 @@ async fn unary_fanout_message(
     // Mark the task as fanout so Task 6 (cancel_task) can distinguish it.
     let _ = srv.store.set_fanout(&routed.task).await;
 
+    let agent_id = local_agent_id(&srv, &routed.target);
+    let diagnostic = direct_diagnostic_observer();
+
+    // Mint the local leg's turn identity and evidence binding before any
+    // session effect so an identity/entropy refusal stays a pre-effect
+    // refusal instead of leaving a configured session behind.
+    let local_leg = match direct_history.as_ref() {
+        Some(history) => {
+            let turn_id = match mint_turn_id() {
+                Ok(turn_id) => turn_id,
+                Err(error) => return bridge_err_to_jsonrpc(id, &error),
+            };
+            // Fan-out has no session-manager generation; the binding helper
+            // advances the bridge-minted floor to a valid generation.
+            match history.multi_provider_leg_binding(0, &routed.session, &turn_id) {
+                Ok(binding) => Some((turn_id, binding)),
+                Err(error) => return bridge_err_to_jsonrpc(id, &error),
+            }
+        }
+        None => None,
+    };
+
     // Resolve the local agent ONCE, apply its effective config, and HOLD its lease
     // (`_lease`) for the unary collect's lifetime so the slot can't retire mid-run.
     // A resolve/configure failure makes the local source a single labeled error frame.
-    let agent_id = local_agent_id(&srv, &routed.target);
-    let diagnostic = direct_diagnostic_observer();
-    let (kiro_source, kiro_backend, _lease) = match resolve_for_fanout(
+    let resolved = resolve_for_fanout(
         &srv,
         &agent_id,
         &routed.task,
@@ -4058,23 +4171,8 @@ async fn unary_fanout_message(
         routed.session_cwd.clone(),
         diagnostic.clone(),
     )
-    .await
-    {
-        Ok((backend, lease)) => {
-            let src = local_kiro_source(
-                srv.local_source_label.clone(),
-                backend.clone(),
-                srv.store.clone(),
-                srv.policy().clone(),
-                routed.task.clone(),
-                routed.session.clone(),
-                routed.parts.clone(),
-                diagnostic,
-            );
-            (src, Some(backend), Some(lease))
-        }
-        Err(e) => (Source::failed(&srv.local_source_label, e), None, None),
-    };
+    .await;
+    let kiro_backend = resolved.as_ref().ok().map(|(backend, _)| backend.clone());
 
     // Both sources are still lazy here. Persist the acceptance boundary before
     // opening delegation or polling the local provider source.
@@ -4103,13 +4201,65 @@ async fn unary_fanout_message(
             }
             return bridge_err_to_jsonrpc(id, &error);
         }
+        // Every provider leg registered from here on belongs to one bounded
+        // multi-provider terminal projection: exact producer/final evidence
+        // projects only when exactly one leg is reached.
+        history.begin_multi_provider_terminal();
     }
+
+    let (kiro_source, _lease) = match resolved {
+        Ok((backend, lease)) => {
+            let (leg_turn, leg_recorder, leg_evidence) = match (direct_history.as_ref(), local_leg)
+            {
+                (Some(history), Some((turn_id, binding))) => {
+                    let (recorder, evidence) = history
+                        .multi_provider_leg(backend.terminal_evidence_capability(), Some(binding));
+                    (Some(turn_id), recorder, evidence)
+                }
+                _ => (
+                    None,
+                    Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder)
+                        as Arc<dyn bridge_core::attempt_activity::AttemptRecorder>,
+                    Arc::new(bridge_core::terminal_evidence::SharedTurnEvidence::unsupported())
+                        as Arc<dyn bridge_core::terminal_evidence::TerminalEvidenceSink>,
+                ),
+            };
+            let src = local_kiro_source(
+                srv.local_source_label.clone(),
+                backend.clone(),
+                srv.store.clone(),
+                srv.policy().clone(),
+                routed.task.clone(),
+                routed.session.clone(),
+                routed.parts.clone(),
+                diagnostic,
+                leg_turn,
+                leg_recorder,
+                leg_evidence,
+            );
+            (src, Some(lease))
+        }
+        Err(e) => (Source::failed(&srv.local_source_label, e), None),
+    };
+
     // Build the peer source by opening delegation.
-    let peer_source = match srv
-        .delegation
-        .delegate(&routed.auth, &routed.task, routed.parts)
-        .await
-    {
+    let peer_delegation = match direct_history.as_ref() {
+        Some(history) => {
+            let dispatched = history.multi_provider_leg_dispatch_observer(
+                bridge_core::terminal_evidence::EvidenceCapability::Unsupported,
+                None,
+            );
+            srv.delegation
+                .delegate_observed(&routed.auth, &routed.task, routed.parts, dispatched)
+                .await
+        }
+        None => {
+            srv.delegation
+                .delegate(&routed.auth, &routed.task, routed.parts)
+                .await
+        }
+    };
+    let peer_source = match peer_delegation {
         Ok(d) => Source::from_stream("peer", d.events),
         Err(e) => Source::failed("peer", e),
     };
@@ -4165,7 +4315,7 @@ async fn unary_fanout_message(
         })
         .collect();
 
-    let state = match terminal_outcome {
+    let mut state = match terminal_outcome {
         TaskOutcome::Completed => a2a::TaskState::Completed,
         TaskOutcome::Failed => a2a::TaskState::Failed,
         TaskOutcome::Canceled => a2a::TaskState::Canceled,
@@ -4177,8 +4327,22 @@ async fn unary_fanout_message(
             TaskOutcome::Failed => ("failed", "prompt_failed", true),
             TaskOutcome::Canceled => ("canceled", "canceled", true),
         };
-        if let Err(error) = history.finish(outcome, reason, degraded, "unknown").await {
-            return bridge_err_to_jsonrpc(id, &error);
+        // The durable resolved terminal is authoritative for the public
+        // state: a single reached v1 leg's evidence resolution must not
+        // diverge from the wire response. Multi-leg and unsupported attempts
+        // pass their stream outcome through unchanged.
+        match history
+            .finish_resolved(outcome, reason, degraded, "unknown")
+            .await
+        {
+            Ok(terminal) => {
+                state = match terminal.outcome.as_str() {
+                    "completed" => a2a::TaskState::Completed,
+                    "canceled" => a2a::TaskState::Canceled,
+                    _ => a2a::TaskState::Failed,
+                };
+            }
+            Err(error) => return bridge_err_to_jsonrpc(id, &error),
         }
     }
 
@@ -4998,6 +5162,15 @@ fn jsonrpc_err(id: Value, code: i32, message: &str) -> Response {
         .into_response()
 }
 
+fn jsonrpc_err_data(id: Value, code: i32, message: &str, data: Value) -> Response {
+    Json(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message, "data": data }
+    }))
+    .into_response()
+}
+
 /// Map a `BridgeError` to a JSON-RPC error using its disposition: request-level
 /// rejections become INVALID_REQUEST; everything else (failed/suspended state)
 /// becomes INTERNAL with the error's display message.
@@ -5011,7 +5184,15 @@ fn bridge_err_to_jsonrpc(id: Value, e: &BridgeError) -> Response {
         // the wire gets a static category via `client_message()`.
         A2aDisposition::SetState(_) => {
             tracing::warn!(error = %e, "request failed (internal)");
-            jsonrpc_err(id, JSONRPC_INTERNAL, &e.client_message())
+            if let BridgeError::AgentFailure { diagnostic } = e {
+                let data = serde_json::to_value(
+                    bridge_core::failure_wire::FailureDiagnosticWire::from(diagnostic.as_ref()),
+                )
+                .expect("bounded failure wire serializes");
+                jsonrpc_err_data(id, JSONRPC_INTERNAL, &e.client_message(), data)
+            } else {
+                jsonrpc_err(id, JSONRPC_INTERNAL, &e.client_message())
+            }
         }
     }
 }
@@ -5574,6 +5755,167 @@ mod tests {
         }
     }
 
+    /// Provider-free v1 producer used to prove that the real unary router
+    /// threads the admitted attempt's telemetry ports into the backend prompt.
+    struct UnaryEvidenceBackend {
+        saw_binding: AtomicBool,
+        emit_evidence: bool,
+    }
+
+    impl UnaryEvidenceBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                saw_binding: AtomicBool::new(false),
+                emit_evidence: true,
+            })
+        }
+
+        fn without_evidence() -> Arc<Self> {
+            Arc::new(Self {
+                saw_binding: AtomicBool::new(false),
+                emit_evidence: false,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for UnaryEvidenceBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            panic!("direct unary must use prompt_with_observers")
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            if let Some(binding) = observers.terminal_evidence.binding() {
+                self.saw_binding.store(true, Ordering::SeqCst);
+                assert!(binding.validate(), "generated binding must be valid");
+                if self.emit_evidence {
+                    let acceptance = observers.terminal_evidence.accept(
+                        bridge_core::terminal_evidence::TurnEvidenceEnvelope {
+                            version: bridge_core::terminal_evidence::TURN_EVIDENCE_VERSION.into(),
+                            generation: binding.generation,
+                            session_id: binding.session_id,
+                            turn_id: binding.turn_id,
+                            attempt_id: binding.attempt_id,
+                            marker_nonce: binding.marker_nonce,
+                            native_turn_id: "native-unary-1".into(),
+                            sequence: 1,
+                            producer: bridge_core::terminal_evidence::ProducerTerminal::Completed,
+                            final_presence: bridge_core::terminal_evidence::FinalPresence::Nonempty,
+                            ordered_notifications_drained: true,
+                            complete: true,
+                        },
+                    );
+                    assert_eq!(
+                        acceptance,
+                        bridge_core::terminal_evidence::EvidenceAcceptance::Accepted
+                    );
+                }
+            }
+            let _ = observers.activity.record(
+                bridge_core::attempt_activity::AttemptPhase::Provider,
+                bridge_core::attempt_activity::ActivityReason::MessageDelta,
+                7,
+            );
+            Ok(Box::pin(tokio_stream::iter(vec![
+                Ok(Update::FinalAnswer("FINAL".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
+                }),
+            ])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn terminal_evidence_capability(
+            &self,
+        ) -> bridge_core::terminal_evidence::EvidenceCapability {
+            bridge_core::terminal_evidence::EvidenceCapability::V1
+        }
+
+        fn bridge_owned_acp_child_liveness(
+            &self,
+        ) -> bridge_core::terminal_evidence::AcpChildLiveness {
+            bridge_core::terminal_evidence::AcpChildLiveness::Exited
+        }
+    }
+
+    /// Provider-free source-delta producer used to prove that the real unary
+    /// collector does not reinterpret translated delivery events as progress.
+    struct UnaryProgressBackend {
+        deltas: Vec<String>,
+        replay_last_advance: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for UnaryProgressBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            panic!("direct unary must use prompt_with_observers")
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            let mut advance = 0_u64;
+            let _ = observers.activity.record(
+                bridge_core::attempt_activity::AttemptPhase::Provider,
+                bridge_core::attempt_activity::ActivityReason::MessageDelta,
+                advance,
+            );
+            for delta in &self.deltas {
+                advance = advance
+                    .saturating_add(u64::try_from(delta.chars().count()).unwrap_or(u64::MAX));
+                let _ = observers.activity.record(
+                    bridge_core::attempt_activity::AttemptPhase::Provider,
+                    bridge_core::attempt_activity::ActivityReason::MessageDelta,
+                    advance,
+                );
+            }
+            if self.replay_last_advance {
+                let _ = observers.activity.record(
+                    bridge_core::attempt_activity::AttemptPhase::Provider,
+                    bridge_core::attempt_activity::ActivityReason::MessageDelta,
+                    advance,
+                );
+            }
+
+            let mut updates: Vec<Result<Update, BridgeError>> = self
+                .deltas
+                .iter()
+                .cloned()
+                .map(Update::Text)
+                .map(Ok)
+                .collect();
+            updates.push(Ok(Update::Done {
+                stop_reason: "end_turn".into(),
+                prefix_attestation: Default::default(),
+            }));
+            Ok(Box::pin(tokio_stream::iter(updates)))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
     /// Backend whose turn ends with `Update::Done{stop_reason:STOP_REASON_CANCELLED}` (the
     /// ACP wire string for a user-cancelled turn). Used to prove the local producer
     /// reports `Canceled` (not `Completed`).
@@ -5945,6 +6287,16 @@ mod tests {
             _local: &TaskId,
             _parts: Vec<Part>,
         ) -> Result<Delegation, BridgeError> {
+            Err(BridgeError::UpstreamA2aError)
+        }
+        async fn delegate_observed(
+            &self,
+            _auth: &AuthContext,
+            _local: &TaskId,
+            _parts: Vec<Part>,
+            _dispatched: bridge_core::ports::ProviderDispatchObserver,
+        ) -> Result<Delegation, BridgeError> {
+            // This fake represents a local refusal before any outbound request.
             Err(BridgeError::UpstreamA2aError)
         }
         async fn cancel(&self, _peer_task: &PeerTaskId) -> Result<(), BridgeError> {
@@ -8524,6 +8876,274 @@ mod tests {
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["result"]["artifact"]["text"], "PONG");
     }
+    #[tokio::test]
+    async fn r2f0b_real_unary_router_persists_v1_evidence_and_activity() {
+        let backend = UnaryEvidenceBackend::new();
+        let history = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        let coordinator = coordinator_over_with_workflow_history(
+            FakeRegistry::single("kiro", backend.clone()),
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            None,
+            std::collections::HashMap::new(),
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+            Ok(history.clone()),
+        );
+        let server = Arc::new(InboundServer::from_coordinator(
+            coordinator,
+            Arc::new(AlwaysKiro),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "kiro",
+        ));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let response = router(server)
+            .oneshot(raw_post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": identity.execution_id.as_str(),
+                    "message": {
+                        "taskId": identity.execution_id.as_str(),
+                        "contextId": "r2f0b-unary-v1",
+                        "text": "private prompt sentinel",
+                        "metadata": {
+                            "a2a-bridge.execution_id": identity.execution_id.as_str(),
+                            "a2a-bridge.attempt_id": identity.attempt_id.as_str()
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert!(body.get("error").is_none(), "{body}");
+
+        let row = history
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .expect("real unary attempt exists");
+        let terminal = row.terminal.expect("real unary attempt terminalized");
+        assert!(backend.saw_binding.load(Ordering::SeqCst));
+        assert_eq!(terminal.terminal_evidence_capability, "v1");
+        assert_eq!(terminal.producer_terminal, "completed");
+        assert_eq!(terminal.final_message, "nonempty");
+        assert_eq!(terminal.outcome, "completed");
+        let tally = history
+            .activity_tally(&identity.attempt_id)
+            .await
+            .unwrap()
+            .expect("activity enrichment persisted");
+        assert!(tally.meaningful_progress > 0);
+
+        let encoded = serde_json::to_string(&(terminal, tally)).unwrap();
+        for private in [
+            "private prompt sentinel",
+            "native-unary-1",
+            identity.attempt_id.as_str(),
+        ] {
+            assert!(!encoded.contains(private), "activity leaked {private:?}");
+        }
+
+        let unsupported_history =
+            Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        let coordinator = coordinator_over_with_workflow_history(
+            FakeRegistry::single("kiro", FakeBackend::new()),
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            None,
+            std::collections::HashMap::new(),
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+            Ok(unsupported_history.clone()),
+        );
+        let server = Arc::new(InboundServer::from_coordinator(
+            coordinator,
+            Arc::new(AlwaysKiro),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "kiro",
+        ));
+        let unsupported_identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let response = router(server)
+            .oneshot(raw_post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": unsupported_identity.execution_id.as_str(),
+                    "message": {
+                        "taskId": unsupported_identity.execution_id.as_str(),
+                        "text": "ping",
+                        "metadata": {
+                            "a2a-bridge.execution_id": unsupported_identity.execution_id.as_str(),
+                            "a2a-bridge.attempt_id": unsupported_identity.attempt_id.as_str()
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert!(body.get("error").is_none(), "{body}");
+        assert_eq!(
+            body["result"]["task"]["state"], "TASK_STATE_COMPLETED",
+            "unsupported legacy success must retain its public completed state"
+        );
+        let terminal = unsupported_history
+            .attempt(&unsupported_identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(terminal.terminal_evidence_capability, "unsupported");
+        assert_eq!(terminal.producer_terminal, "unknown");
+        assert_eq!(terminal.final_message, "unknown");
+    }
+
+    #[tokio::test]
+    async fn r2f0b_real_unary_projects_resolved_v1_failure_state() {
+        let backend = UnaryEvidenceBackend::without_evidence();
+        let history = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        let coordinator = coordinator_over_with_workflow_history(
+            FakeRegistry::single("kiro", backend.clone()),
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            None,
+            std::collections::HashMap::new(),
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            None,
+            None,
+            None,
+            Ok(history.clone()),
+        );
+        let server = Arc::new(InboundServer::from_coordinator(
+            coordinator,
+            Arc::new(AlwaysKiro),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "kiro",
+        ));
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let response = router(server)
+            .oneshot(raw_post_request(
+                methods::SEND_MESSAGE,
+                json!({
+                    "taskId": identity.execution_id.as_str(),
+                    "message": {
+                        "taskId": identity.execution_id.as_str(),
+                        "contextId": "r2f0b-unary-missing-v1",
+                        "text": "provider-free missing evidence",
+                        "metadata": {
+                            "a2a-bridge.execution_id": identity.execution_id.as_str(),
+                            "a2a-bridge.attempt_id": identity.attempt_id.as_str()
+                        }
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+
+        assert!(body.get("error").is_none(), "{body}");
+        assert_eq!(
+            body["result"]["task"]["state"], "TASK_STATE_FAILED",
+            "the A2A response must not retain the legacy completed state"
+        );
+        assert!(backend.saw_binding.load(Ordering::SeqCst));
+        let terminal = history
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(terminal.outcome, "failed");
+        assert_eq!(
+            terminal.terminal_reason,
+            "protocol_terminal_evidence_missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn r2f0b_real_unary_counts_only_genuine_provider_message_deltas() {
+        for (deltas, replay_last_advance, expected_progress) in [
+            (Vec::<String>::new(), false, 2),
+            (vec!["first".to_owned(), String::new()], true, 3),
+            (
+                vec!["first".to_owned(), String::new(), "second".to_owned()],
+                true,
+                4,
+            ),
+        ] {
+            let backend = Arc::new(UnaryProgressBackend {
+                deltas,
+                replay_last_advance,
+            });
+            let history =
+                Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+            let coordinator = coordinator_over_with_workflow_history(
+                FakeRegistry::single("kiro", backend),
+                Arc::new(FakeStore::default()),
+                Arc::new(AutoApprove),
+                None,
+                std::collections::HashMap::new(),
+                Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+                None,
+                None,
+                None,
+                Ok(history.clone()),
+            );
+            let server = Arc::new(InboundServer::from_coordinator(
+                coordinator,
+                Arc::new(AlwaysKiro),
+                Arc::new(AlwaysGrant),
+                "http://localhost:8080",
+                Arc::new(NoDelegation),
+                "kiro",
+            ));
+            let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+            let response = router(server)
+                .oneshot(raw_post_request(
+                    methods::SEND_MESSAGE,
+                    json!({
+                        "taskId": identity.execution_id.as_str(),
+                        "message": {
+                            "taskId": identity.execution_id.as_str(),
+                            "text": "private progress prompt",
+                            "metadata": {
+                                "a2a-bridge.execution_id": identity.execution_id.as_str(),
+                                "a2a-bridge.attempt_id": identity.attempt_id.as_str()
+                            }
+                        }
+                    }),
+                ))
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+            assert!(body.get("error").is_none(), "{body}");
+
+            let tally = history
+                .activity_tally(&identity.attempt_id)
+                .await
+                .unwrap()
+                .expect("real unary activity persisted");
+            assert_eq!(
+                tally.meaningful_progress, expected_progress,
+                "synthetic artifact, empty delta, or replay advanced progress"
+            );
+            assert!(!serde_json::to_string(&tally)
+                .unwrap()
+                .contains("private progress prompt"));
+        }
+    }
 
     #[tokio::test]
     async fn direct_unary_and_streaming_thread_resolution_observer_into_prompt() {
@@ -8724,7 +9344,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unary_send_message_falls_back_to_status_text_without_done() {
+    async fn unary_send_message_rejects_clean_eof_without_done() {
         let srv = build(NoDoneBackend::new(vec!["AL", "PHA"]), Arc::new(AlwaysGrant));
         let resp = router(srv)
             .oneshot(post_request(
@@ -8737,15 +9357,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
         let v: Value = serde_json::from_str(&body).unwrap();
-        assert!(v.get("error").is_none(), "expected no error: {body}");
-        assert_eq!(v["result"]["task"]["state"], "TASK_STATE_COMPLETED");
-        // No-Done local streams intentionally duplicate the post-coalescing Status
-        // text into artifact.text so unary callers still receive a final answer.
-        assert_eq!(v["result"]["artifact"]["text"], "ALPHA");
-        assert_eq!(v["result"]["status"], json!(["ALPHA"]));
+        assert_eq!(v["error"]["code"], JSONRPC_INTERNAL);
+        assert_eq!(v["error"]["message"], "protocol missing terminal event");
         assert!(
-            v["result"].get("artifacts").is_none(),
-            "single-source unary shape must remain unchanged: {body}"
+            v.get("result").is_none(),
+            "clean EOF cannot synthesize success: {body}"
         );
     }
 
@@ -9752,6 +10368,225 @@ mod tests {
         );
     }
 
+    /// A v1-capable local fan-out leg that records one genuine provider message
+    /// advance through the attempt telemetry port but never supplies a terminal
+    /// evidence envelope.
+    struct FanoutEvidenceBackend;
+
+    #[async_trait::async_trait]
+    impl AgentBackend for FanoutEvidenceBackend {
+        async fn prompt(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+        ) -> Result<BackendStream, BridgeError> {
+            panic!("the fan-out local leg must use prompt_with_observers")
+        }
+
+        async fn prompt_with_observers(
+            &self,
+            _session: &SessionId,
+            _parts: Vec<Part>,
+            observers: BackendObservers,
+        ) -> Result<BackendStream, BridgeError> {
+            let _ = observers.activity.record(
+                bridge_core::attempt_activity::AttemptPhase::Provider,
+                bridge_core::attempt_activity::ActivityReason::MessageDelta,
+                2,
+            );
+            Ok(Box::pin(tokio_stream::iter(vec![
+                Ok(Update::Text("KA".into())),
+                Ok(Update::Done {
+                    stop_reason: "end_turn".into(),
+                    prefix_attestation: Default::default(),
+                }),
+            ])))
+        }
+
+        async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        fn terminal_evidence_capability(
+            &self,
+        ) -> bridge_core::terminal_evidence::EvidenceCapability {
+            bridge_core::terminal_evidence::EvidenceCapability::V1
+        }
+    }
+
+    /// The outbound request crossed its local dispatch boundary, then the
+    /// response path failed before a peer task/stream could be returned.
+    struct DispatchedThenFailedDelegation;
+
+    #[async_trait::async_trait]
+    impl DelegationPort for DispatchedThenFailedDelegation {
+        async fn delegate(
+            &self,
+            _auth: &AuthContext,
+            _local: &TaskId,
+            _parts: Vec<Part>,
+        ) -> Result<Delegation, BridgeError> {
+            panic!("fan-out must use the observed outbound dispatch boundary")
+        }
+
+        async fn delegate_observed(
+            &self,
+            _auth: &AuthContext,
+            _local: &TaskId,
+            _parts: Vec<Part>,
+            dispatched: bridge_core::ports::ProviderDispatchObserver,
+        ) -> Result<Delegation, BridgeError> {
+            dispatched();
+            Err(BridgeError::UpstreamA2aError)
+        }
+
+        async fn cancel(&self, _peer_task: &PeerTaskId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn r2f0b_unary_fanout_terminal_records_truthful_multi_provider_evidence() {
+        // Both provider legs are reached: the v1-capable local backend and the
+        // peer. The durable direct terminal must record bounded per-leg counts
+        // and keep attempt-level producer/final unknown — never a false
+        // `unsupported`/`reached=0` row without local progress.
+        let deleg = FakeDelegation::new(vec![Ok(Event::artifact("PA"))], Some("p1"));
+        let history = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        let observer = Arc::new(WorkflowLifecycleObserver::default());
+        let srv = build_fanout_with_history(
+            Arc::new(FanoutEvidenceBackend),
+            history.clone(),
+            observer,
+            Arc::new(FanoutSkillRoute),
+            deleg,
+        );
+
+        let resp = router(srv)
+            .oneshot(post_request(methods::SEND_MESSAGE, fanout_params(), "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("error").is_none(), "expected no error: {body}");
+        assert_eq!(
+            v["result"]["status"]["state"], "TASK_STATE_COMPLETED",
+            "fan-out success policy is unchanged: {body}"
+        );
+
+        let rows = history.completed_between(0, i64::MAX).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let terminal = &rows[0].terminal;
+        assert_eq!(terminal.outcome, "completed");
+        assert_eq!(
+            terminal.terminal_evidence_counts.reached, 2,
+            "both provider legs were reached: {terminal:?}"
+        );
+        assert_eq!(
+            terminal.terminal_evidence_counts.missing, 1,
+            "the negotiated v1 local leg supplied no envelope: {terminal:?}"
+        );
+        assert_eq!(terminal.terminal_evidence_counts.valid, 0);
+        assert_eq!(terminal.terminal_evidence_counts.invalid, 0);
+        assert_eq!(
+            terminal.terminal_evidence_capability, "unknown",
+            "a multi-provider attempt cannot claim one adapter capability"
+        );
+        assert_eq!(terminal.producer_terminal, "unknown");
+        assert_eq!(terminal.final_message, "unknown");
+        assert!(!terminal.terminal_evidence_complete);
+
+        let tally = history
+            .activity_tally(&rows[0].reservation.identity.attempt_id)
+            .await
+            .unwrap()
+            .expect("attempt tally recorded");
+        assert!(
+            tally.max_advance >= 2,
+            "the local leg's provider progress must reach the attempt tally: {tally:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn r2f0b_unary_fanout_single_reached_leg_projects_exact_evidence() {
+        // Delegation fails before the peer leg opens, so exactly one provider
+        // turn is reached; its exact v1 evidence contract applies: negotiated
+        // v1 with no envelope is the bounded missing-evidence protocol failure.
+        let history = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        let observer = Arc::new(WorkflowLifecycleObserver::default());
+        let srv = build_fanout_with_history(
+            Arc::new(FanoutEvidenceBackend),
+            history.clone(),
+            observer,
+            Arc::new(FanoutSkillRoute),
+            Arc::new(NoDelegation),
+        );
+
+        let resp = router(srv)
+            .oneshot(post_request(methods::SEND_MESSAGE, fanout_params(), "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("error").is_none(), "expected no error: {body}");
+        assert_eq!(
+            v["result"]["status"]["state"], "TASK_STATE_FAILED",
+            "single-leg v1 missing evidence resolves to the bounded protocol failure: {body}"
+        );
+
+        let rows = history.completed_between(0, i64::MAX).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let terminal = &rows[0].terminal;
+        assert_eq!(terminal.outcome, "failed");
+        assert_eq!(
+            terminal.terminal_reason,
+            "protocol_terminal_evidence_missing"
+        );
+        assert_eq!(terminal.terminal_evidence_capability, "v1");
+        assert_eq!(terminal.terminal_evidence_version, "v1");
+        assert_eq!(terminal.terminal_evidence_source, "none");
+        assert!(!terminal.terminal_evidence_complete);
+        assert_eq!(terminal.terminal_evidence_counts.reached, 1);
+        assert_eq!(terminal.terminal_evidence_counts.missing, 1);
+        assert_eq!(terminal.producer_terminal, "unknown");
+        assert_eq!(terminal.final_message, "unknown");
+    }
+
+    #[tokio::test]
+    async fn r2f0b_unary_fanout_counts_peer_dispatched_before_response_loss() {
+        let history = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        let observer = Arc::new(WorkflowLifecycleObserver::default());
+        let srv = build_fanout_with_history(
+            Arc::new(FanoutEvidenceBackend),
+            history.clone(),
+            observer,
+            Arc::new(FanoutSkillRoute),
+            Arc::new(DispatchedThenFailedDelegation),
+        );
+
+        let resp = router(srv)
+            .oneshot(post_request(methods::SEND_MESSAGE, fanout_params(), "1.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert!(value.get("error").is_none(), "expected task result: {body}");
+
+        let rows = history.completed_between(0, i64::MAX).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let terminal = &rows[0].terminal;
+        assert_eq!(
+            terminal.terminal_evidence_counts.reached, 2,
+            "the local turn and the dispatched peer request are both reached provider legs"
+        );
+        assert_eq!(terminal.terminal_evidence_counts.missing, 1);
+        assert_eq!(terminal.terminal_evidence_capability, "unknown");
+        assert!(!terminal.terminal_evidence_complete);
+    }
+
     #[tokio::test]
     async fn unary_single_source_response_unchanged() {
         // Regression: plain (non-fanout) unary SendMessage still returns the legacy shape.
@@ -10294,6 +11129,9 @@ mod tests {
             SessionId::parse("session-usage").unwrap(),
             vec![Part { text: "go".into() }],
             direct_diagnostic_observer(),
+            None,
+            Arc::new(bridge_core::attempt_activity::NoopAttemptRecorder),
+            Arc::new(bridge_core::terminal_evidence::SharedTurnEvidence::unsupported()),
         );
 
         let out: Vec<Result<Event, BridgeError>> = source.stream.collect().await;
@@ -11280,6 +12118,7 @@ mod tests {
         error: BridgeError,
         prompt_open: bool,
         releases: AtomicUsize,
+        release_gate: Mutex<Option<oneshot::Receiver<()>>>,
         release_completed: tokio::sync::Notify,
         cancels: AtomicUsize,
         cancel_completed: tokio::sync::Notify,
@@ -11333,6 +12172,10 @@ mod tests {
 
         async fn release_session_checked(&self, _session: &SessionId) -> Result<(), BridgeError> {
             self.releases.fetch_add(1, Ordering::SeqCst);
+            let gate = self.release_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
             self.release_completed.notify_waiters();
             Ok(())
         }
@@ -11348,7 +12191,7 @@ mod tests {
                     disposition: FailureDisposition::Fatal,
                     code: "ignored".to_owned(),
                     summary: "bounded test failure".to_owned(),
-                    causes: Vec::new(),
+                    causes: vec!["deepest sanitized cause".to_owned()],
                     stderr_observed: false,
                     stderr_line_count: 0,
                     stderr_scope: None,
@@ -11407,6 +12250,7 @@ mod tests {
             error,
             prompt_open: false,
             releases: AtomicUsize::new(0),
+            release_gate: Mutex::new(None),
             release_completed: tokio::sync::Notify::new(),
             cancels: AtomicUsize::new(0),
             cancel_completed: tokio::sync::Notify::new(),
@@ -11707,6 +12551,7 @@ mod tests {
                 error: warm_structured_failure(DiagnosticFailureClass::AgentProcess),
                 prompt_open,
                 releases: AtomicUsize::new(0),
+                release_gate: Mutex::new(None),
                 release_completed: tokio::sync::Notify::new(),
                 cancels: AtomicUsize::new(0),
                 cancel_completed: tokio::sync::Notify::new(),
@@ -11812,14 +12657,139 @@ mod tests {
                 .await
                 .unwrap();
             let _ = body_string(response).await;
+            let context_id = ContextId::parse(context).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if backend.releases.load(Ordering::SeqCst) == 1
+                        && sm.status(&context_id).await.is_none()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("structured-failure cleanup must settle");
             assert_eq!(backend.releases.load(Ordering::SeqCst), 1, "{method}");
-            assert!(
-                sm.status(&ContextId::parse(context).unwrap())
-                    .await
-                    .is_none(),
-                "{method} must not return the structured-failure session to Idle"
-            );
         }
+    }
+
+    #[tokio::test]
+    async fn unary_structured_failure_returns_before_held_cleanup_then_settles_pending_once() {
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let (release_tx, release_rx) = oneshot::channel();
+        let backend = Arc::new(WarmErrorBackend {
+            error: warm_structured_failure(DiagnosticFailureClass::Transport),
+            prompt_open: false,
+            releases: AtomicUsize::new(0),
+            release_gate: Mutex::new(Some(release_rx)),
+            release_completed: tokio::sync::Notify::new(),
+            cancels: AtomicUsize::new(0),
+            cancel_completed: tokio::sync::Notify::new(),
+        });
+        let registry: Arc<dyn AgentRegistry> = FakeRegistry::with_entries(
+            "a",
+            vec![(bare_entry("a"), backend.clone() as Arc<dyn AgentBackend>)],
+        );
+        let history = Arc::new(bridge_core::workflow_history::MemoryWorkflowHistoryStore::new());
+        let coordinator = bridge_coordinator::Coordinator::new(
+            Arc::new(crate::session_manager::SessionManager::new(
+                registry.clone(),
+                std::time::Duration::from_secs(60),
+            )),
+            None,
+            Arc::new(std::collections::HashMap::new()),
+            Arc::new(bridge_core::task_store::MemoryTaskStore::new()),
+            Arc::new(FakeStore::default()),
+            Arc::new(AutoApprove),
+            registry,
+            Arc::new(bridge_coordinator::clock::SystemClock),
+            None,
+            None,
+            Arc::new(bridge_observ::NoopObserver),
+            3,
+        )
+        .with_workflow_history(Ok(history.clone()));
+        let server = Arc::new(InboundServer::from_coordinator(
+            Arc::new(coordinator),
+            Arc::new(RegistryRoute {
+                default: AgentId::parse("a").unwrap(),
+            }),
+            Arc::new(AlwaysGrant),
+            "http://localhost:8080",
+            Arc::new(NoDelegation),
+            "a",
+        ));
+        let request = post_request(
+            methods::SEND_MESSAGE,
+            json!({
+                "message": {
+                    "taskId": identity.execution_id.as_str(),
+                    "contextId": "ctx-held-cleanup",
+                    "text": "go",
+                    "metadata": {
+                        "a2a-bridge.agent": "a",
+                        "a2a-bridge.execution_id": identity.execution_id.as_str(),
+                        "a2a-bridge.attempt_id": identity.attempt_id.as_str()
+                    }
+                }
+            }),
+            "1.0",
+        );
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            router(server).oneshot(request),
+        )
+        .await
+        .expect("unary error delivery must not wait for held cleanup")
+        .unwrap();
+        let body = body_string(response).await;
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            value["error"]["data"]["deepest_cause"],
+            "deepest sanitized cause"
+        );
+        assert!(
+            !body.contains("bounded test failure"),
+            "raw summary leaked: {body}"
+        );
+        let pending = history
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(pending.cleanup_disposition, "pending");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while backend.releases.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached owner must start the exact cleanup flight");
+        assert_eq!(backend.releases.load(Ordering::SeqCst), 1);
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let settled = history
+                    .attempt(&identity.attempt_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .terminal
+                    .unwrap();
+                if settled.cleanup_disposition == "complete" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached cleanup must settle the exact pending row");
+        assert_eq!(backend.releases.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -14548,6 +15518,7 @@ mod tests {
             terminal_evidence_version: "none".into(),
             terminal_evidence_source: "none".into(),
             terminal_evidence_complete: false,
+            terminal_evidence_counts: Default::default(),
             degraded: true,
             prompt_acceptance: "unknown".into(),
             cleanup_disposition: "unknown".into(),

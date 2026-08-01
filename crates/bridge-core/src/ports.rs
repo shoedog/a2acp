@@ -23,6 +23,7 @@ pub const STOP_REASON_CANCELLED: &str = "cancelled";
 #[derive(Debug)]
 pub enum Update {
     Text(String),
+    FinalAnswer(String),
     Permission(PermissionRequest),
     Usage(crate::orch::UsageSnapshot),
     Done {
@@ -59,6 +60,25 @@ impl Update {
 pub trait RichEventSink: Send + Sync {
     fn record(&self, kind: crate::orch::OrchEventKind);
     async fn flush(&self) -> Result<(), BridgeError>;
+
+    fn attempt_recorder(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::attempt_activity::AttemptRecorder>> {
+        None
+    }
+
+    fn terminal_evidence_for_turn(
+        &self,
+        _capability: crate::terminal_evidence::EvidenceCapability,
+        _generation: u64,
+        _session_id: &str,
+        _turn_id: &str,
+    ) -> Result<
+        Option<std::sync::Arc<dyn crate::terminal_evidence::TerminalEvidenceSink>>,
+        BridgeError,
+    > {
+        Ok(None)
+    }
 }
 
 pub trait RichEventSinkFactory: Send + Sync {
@@ -94,6 +114,8 @@ pub trait DiagnosticObserverFactory: Send + Sync {
 pub struct BackendObservers {
     pub diagnostic: std::sync::Arc<dyn DiagnosticObserver>,
     pub rich: Option<std::sync::Arc<dyn RichEventSink>>,
+    pub activity: std::sync::Arc<dyn crate::attempt_activity::AttemptRecorder>,
+    pub terminal_evidence: std::sync::Arc<dyn crate::terminal_evidence::TerminalEvidenceSink>,
 }
 
 impl BackendObservers {
@@ -101,11 +123,28 @@ impl BackendObservers {
         diagnostic: std::sync::Arc<dyn DiagnosticObserver>,
         rich: Option<std::sync::Arc<dyn RichEventSink>>,
     ) -> Self {
-        Self { diagnostic, rich }
+        Self {
+            diagnostic,
+            rich,
+            activity: std::sync::Arc::new(crate::attempt_activity::NoopAttemptRecorder),
+            terminal_evidence: std::sync::Arc::new(
+                crate::terminal_evidence::SharedTurnEvidence::unsupported(),
+            ),
+        }
     }
 
     pub fn diagnostic_only(diagnostic: std::sync::Arc<dyn DiagnosticObserver>) -> Self {
         Self::new(diagnostic, None)
+    }
+
+    pub fn with_attempt_telemetry(
+        mut self,
+        activity: std::sync::Arc<dyn crate::attempt_activity::AttemptRecorder>,
+        terminal_evidence: std::sync::Arc<dyn crate::terminal_evidence::TerminalEvidenceSink>,
+    ) -> Self {
+        self.activity = activity;
+        self.terminal_evidence = terminal_evidence;
+        self
     }
 }
 
@@ -149,6 +188,16 @@ pub trait AgentBackend: Send + Sync {
     /// conservative: unsupported backends keep all text once sanitization is enabled.
     fn prefix_attestation_capability(&self) -> PrefixAttestationCapability {
         PrefixAttestationCapability::default()
+    }
+
+    fn terminal_evidence_capability(&self) -> crate::terminal_evidence::EvidenceCapability {
+        crate::terminal_evidence::EvidenceCapability::Unsupported
+    }
+
+    /// Synchronously sample only the exact bridge-owned ACP child. This is
+    /// independent terminal evidence and never determines producer disposition.
+    fn bridge_owned_acp_child_liveness(&self) -> crate::terminal_evidence::AcpChildLiveness {
+        crate::terminal_evidence::AcpChildLiveness::Unknown
     }
 
     /// Stash per-turn metadata for the NEXT prompt on this session (Slice 9 — lets the reverse permission
@@ -239,6 +288,11 @@ pub struct Delegation {
     pub peer_task: tokio::sync::watch::Receiver<Option<PeerTaskId>>,
 }
 
+/// Idempotent notification that an outbound provider request crossed its
+/// local dispatch boundary. A transport failure after this callback cannot
+/// prove that the remote provider did not accept the request.
+pub type ProviderDispatchObserver = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// Delegation port — streams tasks to a downstream agent.
 #[async_trait::async_trait]
 pub trait DelegationPort: Send + Sync {
@@ -248,6 +302,16 @@ pub trait DelegationPort: Send + Sync {
         local_task: &TaskId,
         parts: Vec<Part>,
     ) -> Result<Delegation, BridgeError>;
+    async fn delegate_observed(
+        &self,
+        auth: &AuthContext,
+        local_task: &TaskId,
+        parts: Vec<Part>,
+        dispatched: ProviderDispatchObserver,
+    ) -> Result<Delegation, BridgeError> {
+        dispatched();
+        self.delegate(auth, local_task, parts).await
+    }
     async fn cancel(&self, peer_task: &PeerTaskId) -> Result<(), BridgeError>;
 }
 

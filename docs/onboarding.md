@@ -137,9 +137,11 @@ serve boot.
 
 ## Review workflows
 
-`code-review`, `spec-review`, and `plan-review` each run two independent reviewer
-lenses (codex + claude) plus a synthesis node. They reference `codex` and
-`claude`, so `init` only emits them when both are scaffolded.
+The default `code-review` is one `gpt-5.6-sol`/`xhigh` hard-read-only pass. It finishes correctness analysis
+before assigning every WRONG/SMELL real-world trigger conditions, likelihood, exposure, repair cost, and a
+blocker/defer recommendation. `spec-review` and `plan-review` retain their independent codex + claude lenses and
+synthesis. `init` currently emits the review bundle when both agents are scaffolded because those latter workflows
+still reference both.
 
 `--input` is a **typed task-spec** (E7): a file (or `-` for stdin) with YAML front-matter
 declaring `task-type:` + a markdown body (`## Acceptance Criteria`, …), validated before dispatch.
@@ -166,18 +168,14 @@ regardless of size — depth never licenses a shallower read.
 
 ### Adaptive depth (the `implement` review-the-diff)
 
-`implement`'s review-the-diff scales the *number* of passes (not per-reviewer
-rigor) to the committed diff size:
+`implement` still resolves light/standard/thorough workflow ids from the committed diff size, but the shipped
+containerized default binds all three ids to the same single Sol/xhigh risk-triaged pass. This preserves one
+billable reviewer while allowing an operator to configure alternate tier shapes explicitly:
 
-- **light** (diff ≤ `[review].light_max_lines` AND ≤ `light_max_files`): one
-  reviewer + a verdict synth — fast on the tweak loop's small fixes.
-- **standard** (default): two diverse reviewers + a synth, plus a **prism
-  diff-slice** (defect-focused: blast radius, taint paths, missing symmetry)
-  written to `<clone>/.git/a2a-bridge/review-slices/…` and handed to the reviewers
-  as a reference file.
-- **thorough** (diff ≥ `[review].thorough_min_lines` OR ≥ `thorough_min_files`): a
-  draft→refine double pass for large code/infra diffs — each reviewer drafts,
-  then refines its own draft with fresh eyes, before the synth.
+- **light / standard / thorough (shipped default):** one Sol/xhigh reviewer, read-only, with direct
+  `VERDICT: APPROVE|REJECT` output and no synthesis turn.
+- **custom tiers:** may add slices, independent lenses, or draft/refine passes, but each extra provider turn needs
+  explicit cost authorization and a separately declared convergence cap.
 
 Auto-selected from `git diff --numstat` each attempt; override with
 `a2a-bridge implement … --depth auto|light|standard|thorough`. A forced depth is

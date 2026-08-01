@@ -4,10 +4,19 @@ default = "codex"
 id = "codex"
 cmd = "codex-acp"
 pre_authenticated = true
+model = "gpt-5.6-sol"
+effort = "xhigh"
+mode = "read-only"
+args = ["-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
 
 [[agents]]
 id = "claude"
 cmd = "claude-agent-acp"
+
+[[prompts]]
+id = "review-sol-risk"
+file = "../prompts/review-sol-risk.md"
+description = "single Sol review with real-world risk and repair triage"
 
 [[prompts]]
 id = "review-correctness"
@@ -58,22 +67,10 @@ description = "plan-review synthesis prompt"
 id = "code-review"
 
 [[workflows.nodes]]
-id = "correctness"
+id = "review"
 agent = "codex"
-prompt = "review-correctness"
+prompt = "review-sol-risk"
 inputs = []
-
-[[workflows.nodes]]
-id = "architecture"
-agent = "claude"
-prompt = "review-architecture"
-inputs = []
-
-[[workflows.nodes]]
-id = "synth"
-agent = "claude"
-prompt = "review-synth"
-inputs = ["correctness", "architecture"]
 
 # spec-review: rigor (completeness/ambiguity) + soundness (design) -> synth.
 # Feed a design spec as the input; agents do not explore, so inline all context.

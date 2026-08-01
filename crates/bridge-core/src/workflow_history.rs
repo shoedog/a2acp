@@ -230,6 +230,8 @@ pub struct AttemptTerminal {
     pub terminal_evidence_version: String,
     pub terminal_evidence_source: String,
     pub terminal_evidence_complete: bool,
+    #[serde(default)]
+    pub terminal_evidence_counts: crate::terminal_evidence::TerminalEvidenceCounts,
     pub degraded: bool,
     pub prompt_acceptance: String,
     pub cleanup_disposition: String,
@@ -264,7 +266,21 @@ impl AttemptTerminal {
                     && !self.terminal_evidence_complete
             }
             "v1" => {
-                self.terminal_evidence_version == "v1" && self.terminal_evidence_source == "adapter"
+                self.terminal_evidence_version == "v1"
+                    && ((self.terminal_evidence_source == "adapter"
+                        && self.terminal_evidence_complete)
+                        || (self.terminal_evidence_source == "none"
+                            && !self.terminal_evidence_complete
+                            && self.producer_terminal == "unknown"
+                            && self.final_message == "unknown"))
+            }
+            "unknown" => {
+                self.terminal_evidence_version == "none"
+                    && self.terminal_evidence_source == "none"
+                    && !self.terminal_evidence_complete
+                    && self.producer_terminal == "unknown"
+                    && self.final_message == "unknown"
+                    && self.terminal_evidence_counts.reached > 1
             }
             _ => false,
         };
@@ -289,7 +305,7 @@ impl AttemptTerminal {
             )
             || !matches!(
                 self.terminal_evidence_capability.as_str(),
-                "not_applicable" | "unsupported" | "v1"
+                "not_applicable" | "unsupported" | "unknown" | "v1"
             )
             || !matches!(self.terminal_evidence_version.as_str(), "none" | "v1")
             || !matches!(self.terminal_evidence_source.as_str(), "none" | "adapter")
@@ -299,8 +315,9 @@ impl AttemptTerminal {
             )
             || !matches!(
                 self.cleanup_disposition.as_str(),
-                "complete" | "failed" | "not_needed" | "unknown"
+                "pending" | "complete" | "failed" | "not_needed" | "unknown"
             )
+            || !self.terminal_evidence_counts.validate()
             || !evidence_coherent
         {
             return Err(LedgerError::new(LedgerUnavailableReason::Schema));
@@ -399,6 +416,28 @@ pub trait WorkflowHistoryStore: Send + Sync {
         id: &AttemptId,
         terminal: &AttemptTerminal,
     ) -> Result<TerminalWrite, LedgerError>;
+    /// Settle the one post-terminal cleanup transition. Only
+    /// `pending -> complete|failed` is legal; identical replay is idempotent.
+    async fn settle_cleanup(
+        &self,
+        _id: &AttemptId,
+        _disposition: &str,
+    ) -> Result<TerminalWrite, LedgerError> {
+        Err(LedgerError::new(LedgerUnavailableReason::Schema))
+    }
+    async fn record_activity_tally(
+        &self,
+        _id: &AttemptId,
+        _tally: &crate::attempt_activity::ActivityTally,
+    ) -> Result<(), LedgerError> {
+        Ok(())
+    }
+    async fn activity_tally(
+        &self,
+        _id: &AttemptId,
+    ) -> Result<Option<crate::attempt_activity::ActivityTally>, LedgerError> {
+        Ok(None)
+    }
     /// Change incident-retention protection for one exact durable attempt.
     /// Returns true only when the requested state changed.
     async fn set_pinned(&self, id: &AttemptId, pinned: bool) -> Result<bool, LedgerError>;
@@ -441,6 +480,10 @@ pub struct DirectAttemptBarrier {
     store: std::sync::Arc<dyn WorkflowHistoryStore>,
     identity: AttemptIdentity,
     started: std::time::Instant,
+    scopes: crate::attempt_activity::AttemptScopeOwner,
+    terminal_evidence: std::sync::Arc<crate::terminal_evidence::SharedTurnEvidence>,
+    multi_provider_legs: std::sync::Arc<crate::terminal_evidence::WorkflowTurnEvidenceCollector>,
+    multi_provider: bool,
     prompt_acceptance: &'static str,
     prompt_barrier_failed: bool,
     prepared_terminal: Option<AttemptTerminal>,
@@ -463,6 +506,18 @@ impl DirectAttemptBarrier {
             store,
             identity: reservation.identity,
             started: std::time::Instant::now(),
+            scopes: crate::attempt_activity::AttemptScopeOwner::new(std::sync::Arc::new(
+                crate::attempt_activity::SharedAttemptRecorder::new(
+                    crate::attempt_activity::SystemMonotonicClock::start(),
+                ),
+            )),
+            terminal_evidence: std::sync::Arc::new(
+                crate::terminal_evidence::SharedTurnEvidence::unsupported(),
+            ),
+            multi_provider_legs: std::sync::Arc::new(
+                crate::terminal_evidence::WorkflowTurnEvidenceCollector::default(),
+            ),
+            multi_provider: false,
             prompt_acceptance: "not_dispatched",
             prompt_barrier_failed: false,
             prepared_terminal: None,
@@ -475,6 +530,114 @@ impl DirectAttemptBarrier {
         &self.identity
     }
 
+    pub fn with_recorder(
+        mut self,
+        recorder: std::sync::Arc<dyn crate::attempt_activity::AttemptRecorder>,
+    ) -> Self {
+        self.scopes = crate::attempt_activity::AttemptScopeOwner::new(recorder);
+        self
+    }
+
+    pub fn activity_recorder(
+        &self,
+    ) -> std::sync::Arc<dyn crate::attempt_activity::AttemptRecorder> {
+        self.scopes.recorder()
+    }
+
+    /// Switch this attempt's terminal to the bounded multi-provider
+    /// projection: exact producer/final evidence projects only when exactly
+    /// one provider leg was reached; otherwise the durable row keeps unknown
+    /// evidence plus truthful bounded per-leg counts.
+    pub fn begin_multi_provider_terminal(&mut self) {
+        self.multi_provider = true;
+    }
+
+    /// One bounded observation scope plus one registered terminal-evidence
+    /// sink for a reached provider leg of a multi-provider attempt.
+    pub fn multi_provider_leg(
+        &self,
+        capability: crate::terminal_evidence::EvidenceCapability,
+        binding: Option<crate::terminal_evidence::TurnEvidenceBinding>,
+    ) -> (
+        std::sync::Arc<dyn crate::attempt_activity::AttemptRecorder>,
+        std::sync::Arc<dyn crate::terminal_evidence::TerminalEvidenceSink>,
+    ) {
+        (
+            self.scopes.turn_scope(),
+            self.multi_provider_legs.register(capability, binding),
+        )
+    }
+
+    /// Build one idempotent dispatch-boundary observer for a provider leg.
+    /// The collector owns the registered sink, so a response-side transport
+    /// failure cannot erase the conservative reached-leg fact.
+    pub fn multi_provider_leg_dispatch_observer(
+        &self,
+        capability: crate::terminal_evidence::EvidenceCapability,
+        binding: Option<crate::terminal_evidence::TurnEvidenceBinding>,
+    ) -> crate::ports::ProviderDispatchObserver {
+        let legs = self.multi_provider_legs.clone();
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::sync::Arc::new(move || {
+            if !fired.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let _ = legs.register(capability, binding.clone());
+            }
+        })
+    }
+
+    pub fn terminal_evidence_sink(
+        &self,
+    ) -> std::sync::Arc<dyn crate::terminal_evidence::TerminalEvidenceSink> {
+        self.terminal_evidence.clone()
+    }
+
+    pub fn prepare_terminal_evidence(
+        &self,
+        binding: crate::terminal_evidence::TurnEvidenceBinding,
+    ) {
+        self.terminal_evidence.prepare_binding(binding);
+    }
+
+    pub fn configure_terminal_evidence(
+        &self,
+        binding: crate::terminal_evidence::TurnEvidenceBinding,
+    ) {
+        self.terminal_evidence.configure_v1(binding);
+    }
+
+    pub fn configure_malformed_terminal_evidence(&self) {
+        self.terminal_evidence.configure_malformed_advertisement();
+    }
+
+    pub fn seal_terminal_evidence(&self) {
+        crate::terminal_evidence::TerminalEvidenceSink::close(self.terminal_evidence.as_ref());
+    }
+
+    pub fn record_activity(
+        &mut self,
+        phase: crate::attempt_activity::AttemptPhase,
+        reason: crate::attempt_activity::ActivityReason,
+        advance: u64,
+    ) -> crate::attempt_activity::AttemptActivity {
+        self.scopes
+            .recorder()
+            .record(phase, reason, advance)
+            .unwrap_or(crate::attempt_activity::AttemptActivity {
+                phase,
+                reason,
+                kind: crate::attempt_activity::ActivityKind::Activity,
+                elapsed_ms: 0,
+                advance,
+            })
+    }
+
+    pub fn seal_child_liveness(&mut self, liveness: crate::terminal_evidence::AcpChildLiveness) {
+        crate::terminal_evidence::TerminalEvidenceSink::record_child_liveness(
+            self.terminal_evidence.as_ref(),
+            liveness,
+        );
+    }
+
     pub async fn mark_prompt_dispatch(&mut self) -> Result<(), LedgerError> {
         match self
             .store
@@ -483,6 +646,11 @@ impl DirectAttemptBarrier {
         {
             Ok(()) => {
                 self.prompt_acceptance = "dispatch_uncertain";
+                self.record_activity(
+                    crate::attempt_activity::AttemptPhase::Provider,
+                    crate::attempt_activity::ActivityReason::PhaseTransition,
+                    1,
+                );
                 Ok(())
             }
             Err(error) => {
@@ -502,6 +670,131 @@ impl DirectAttemptBarrier {
         _telemetry_complete: bool,
     ) -> AttemptTerminal {
         let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // Multi-provider attempts read their sealed per-leg aggregation; the
+        // single-provider path keeps its one attempt-owned sink.
+        let mut counts = if self.multi_provider {
+            self.multi_provider_legs.close_all();
+            self.multi_provider_legs.counts()
+        } else {
+            crate::terminal_evidence::TerminalEvidenceCounts::default()
+        };
+        let single_leg = if self.multi_provider {
+            self.multi_provider_legs.single_turn()
+        } else {
+            None
+        };
+        let (
+            capability,
+            completeness,
+            producer,
+            final_presence,
+            ordered_notifications_drained,
+            deliverable_final_present,
+            child_liveness,
+        ) = if self.multi_provider {
+            match single_leg {
+                // Exactly one reached provider leg: its exact evidence
+                // projects through the unchanged single-turn contract.
+                Some((
+                    capability,
+                    completeness,
+                    producer,
+                    final_presence,
+                    drained,
+                    child_liveness,
+                    deliverable_final_present,
+                )) => (
+                    capability,
+                    completeness,
+                    producer,
+                    final_presence,
+                    drained,
+                    deliverable_final_present,
+                    child_liveness,
+                ),
+                // Zero or several reached legs: producer/final stay unknown
+                // and the failed-outcome resolution behaves exactly like the
+                // legacy unsupported single sink.
+                None => (
+                    crate::terminal_evidence::EvidenceCapability::Unsupported,
+                    crate::terminal_evidence::EvidenceCompleteness::Unsupported,
+                    crate::terminal_evidence::ProducerTerminal::Unknown,
+                    crate::terminal_evidence::FinalPresence::Unknown,
+                    false,
+                    false,
+                    crate::terminal_evidence::AcpChildLiveness::Unknown,
+                ),
+            }
+        } else {
+            let capability = crate::terminal_evidence::TerminalEvidenceSink::capability(
+                self.terminal_evidence.as_ref(),
+            );
+            let (completeness, producer, final_presence, ordered_notifications_drained) =
+                crate::terminal_evidence::TerminalEvidenceSink::observation(
+                    self.terminal_evidence.as_ref(),
+                );
+            (
+                capability,
+                completeness,
+                producer,
+                final_presence,
+                ordered_notifications_drained,
+                crate::terminal_evidence::TerminalEvidenceSink::deliverable_final_present(
+                    self.terminal_evidence.as_ref(),
+                ),
+                crate::terminal_evidence::TerminalEvidenceSink::child_liveness(
+                    self.terminal_evidence.as_ref(),
+                ),
+            )
+        };
+        if !self.multi_provider && self.prompt_acceptance == "dispatch_uncertain" {
+            counts.reached = 1;
+            match completeness {
+                crate::terminal_evidence::EvidenceCompleteness::Complete => counts.valid = 1,
+                crate::terminal_evidence::EvidenceCompleteness::Missing => counts.missing = 1,
+                crate::terminal_evidence::EvidenceCompleteness::Malformed
+                | crate::terminal_evidence::EvidenceCompleteness::Mismatched
+                | crate::terminal_evidence::EvidenceCompleteness::Late
+                | crate::terminal_evidence::EvidenceCompleteness::Conflict => counts.invalid = 1,
+                crate::terminal_evidence::EvidenceCompleteness::Unsupported => {}
+            }
+        }
+        let should_resolve = capability == crate::terminal_evidence::EvidenceCapability::V1
+            || (outcome == "failed" && self.prompt_acceptance != "not_dispatched");
+        let resolution = should_resolve.then(|| {
+            crate::terminal_evidence::resolve_terminal(
+                crate::terminal_evidence::TerminalObservation {
+                    capability,
+                    completeness,
+                    producer,
+                    final_presence,
+                    prompt_rpc: if self.prompt_acceptance == "not_dispatched" {
+                        crate::terminal_evidence::PromptRpcObservation::RejectedBeforeAcceptance
+                    } else if outcome == "failed" {
+                        crate::terminal_evidence::PromptRpcObservation::RejectedAcceptedOrUncertain
+                    } else {
+                        crate::terminal_evidence::PromptRpcObservation::Resolved
+                    },
+                    ordered_notifications_drained,
+                    deliverable_final_present,
+                    child_liveness,
+                },
+            )
+        });
+        // Attempt-level aggregate rows (multi-provider without exactly one
+        // reached leg) cannot claim one adapter's capability: zero reached
+        // legs are `not_applicable`; several stay `unknown` with counts.
+        let aggregate_legs = self.multi_provider && single_leg.is_none();
+        let effective_outcome = resolution
+            .as_ref()
+            .map_or(outcome, |resolved| resolved.outcome.as_str());
+        let effective_reason = if self.prompt_barrier_failed {
+            "prompt_barrier_failed"
+        } else {
+            resolution
+                .as_ref()
+                .map_or(reason, |resolved| resolved.reason.as_str())
+        };
         // Direct owners currently observe only the admission-to-terminal clock.
         // It is valid end-to-end evidence, but it cannot be relabeled as provider
         // work or split into checkout/configure/cleanup/finalization phases. Keep
@@ -514,20 +807,66 @@ impl DirectAttemptBarrier {
             cancellation_ms: 0,
             cleanup_ms: 0,
             finalization_ms: 0,
-            outcome: outcome.into(),
-            terminal_reason: if self.prompt_barrier_failed {
-                "prompt_barrier_failed".into()
+            outcome: effective_outcome.into(),
+            terminal_reason: effective_reason.into(),
+            producer_terminal: match producer {
+                crate::terminal_evidence::ProducerTerminal::Unknown => "unknown",
+                crate::terminal_evidence::ProducerTerminal::Completed => "completed",
+                crate::terminal_evidence::ProducerTerminal::Interrupted => "interrupted",
+                crate::terminal_evidence::ProducerTerminal::Failed => "failed",
+            }
+            .into(),
+            final_message: match final_presence {
+                crate::terminal_evidence::FinalPresence::Unknown => "unknown",
+                crate::terminal_evidence::FinalPresence::Nonempty => "nonempty",
+                crate::terminal_evidence::FinalPresence::Absent => "absent",
+            }
+            .into(),
+            process_liveness: match child_liveness {
+                crate::terminal_evidence::AcpChildLiveness::Unknown => "unknown",
+                crate::terminal_evidence::AcpChildLiveness::Live => "live",
+                crate::terminal_evidence::AcpChildLiveness::Exited => "exited",
+            }
+            .into(),
+            terminal_evidence_capability: if aggregate_legs {
+                if counts.reached == 0 {
+                    "not_applicable"
+                } else {
+                    "unknown"
+                }
             } else {
-                reason.into()
+                match capability {
+                    crate::terminal_evidence::EvidenceCapability::Unsupported => "unsupported",
+                    crate::terminal_evidence::EvidenceCapability::MalformedAdvertisement
+                    | crate::terminal_evidence::EvidenceCapability::V1 => "v1",
+                }
+            }
+            .into(),
+            terminal_evidence_version: if aggregate_legs {
+                "none"
+            } else {
+                match capability {
+                    crate::terminal_evidence::EvidenceCapability::Unsupported => "none",
+                    crate::terminal_evidence::EvidenceCapability::MalformedAdvertisement
+                    | crate::terminal_evidence::EvidenceCapability::V1 => "v1",
+                }
+            }
+            .into(),
+            terminal_evidence_source: if !aggregate_legs
+                && completeness == crate::terminal_evidence::EvidenceCompleteness::Complete
+            {
+                "adapter"
+            } else {
+                "none"
+            }
+            .into(),
+            terminal_evidence_complete: if aggregate_legs {
+                counts.reached == 0
+            } else {
+                completeness == crate::terminal_evidence::EvidenceCompleteness::Complete
             },
-            producer_terminal: "unknown".into(),
-            final_message: "unknown".into(),
-            process_liveness: "unknown".into(),
-            terminal_evidence_capability: "unsupported".into(),
-            terminal_evidence_version: "none".into(),
-            terminal_evidence_source: "none".into(),
-            terminal_evidence_complete: false,
-            degraded: degraded || self.prompt_barrier_failed,
+            terminal_evidence_counts: counts,
+            degraded: degraded || self.prompt_barrier_failed || counts.overflowed,
             prompt_acceptance: self.prompt_acceptance.into(),
             cleanup_disposition: cleanup_disposition.into(),
             node_counts: NodeCounts::default(),
@@ -548,6 +887,7 @@ impl DirectAttemptBarrier {
         if self.terminalized {
             return Err(LedgerError::new(LedgerUnavailableReason::Collision));
         }
+        self.seal_terminal_evidence();
         // The first terminal summary is the retry identity. A store error can be
         // ambiguous (the commit may have succeeded), and Drop is also a retry
         // path, so every later write must use these exact bytes rather than
@@ -566,6 +906,11 @@ impl DirectAttemptBarrier {
                 terminal
             }
         };
+        self.record_activity(
+            crate::attempt_activity::AttemptPhase::TerminalStore,
+            crate::attempt_activity::ActivityReason::ProducerTerminal,
+            1,
+        );
         match self
             .store
             .terminalize(&self.identity.attempt_id, &terminal)
@@ -573,6 +918,15 @@ impl DirectAttemptBarrier {
         {
             write @ (TerminalWrite::Applied | TerminalWrite::Replayed) => {
                 self.terminalized = true;
+                // The terminal row is primary truth. Activity is optional
+                // enrichment and is attempted only after that truth commits.
+                let _ = self
+                    .store
+                    .record_activity_tally(
+                        &self.identity.attempt_id,
+                        &self.scopes.recorder().tally().unwrap_or_default(),
+                    )
+                    .await;
                 Ok((write, terminal))
             }
             TerminalWrite::Conflict => {
@@ -580,6 +934,35 @@ impl DirectAttemptBarrier {
                 Err(LedgerError::new(LedgerUnavailableReason::Collision))
             }
         }
+    }
+
+    pub fn cleanup_settlement(&self) -> Result<DirectCleanupSettlement, LedgerError> {
+        if !self.terminalized
+            || self
+                .prepared_terminal
+                .as_ref()
+                .is_none_or(|terminal| terminal.cleanup_disposition != "pending")
+        {
+            return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+        }
+        Ok(DirectCleanupSettlement {
+            store: self.store.clone(),
+            attempt_id: self.identity.attempt_id.clone(),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct DirectCleanupSettlement {
+    store: std::sync::Arc<dyn WorkflowHistoryStore>,
+    attempt_id: AttemptId,
+}
+
+impl DirectCleanupSettlement {
+    pub async fn settle(&self, disposition: &str) -> Result<TerminalWrite, LedgerError> {
+        self.store
+            .settle_cleanup(&self.attempt_id, disposition)
+            .await
     }
 }
 
@@ -608,6 +991,9 @@ impl Drop for DirectAttemptBarrier {
 pub struct MemoryWorkflowHistoryStore {
     rows: std::sync::Mutex<
         std::collections::BTreeMap<String, (AttemptReservation, Option<AttemptTerminal>)>,
+    >,
+    activity: std::sync::Mutex<
+        std::collections::BTreeMap<String, crate::attempt_activity::ActivityTally>,
     >,
 }
 
@@ -747,6 +1133,70 @@ impl WorkflowHistoryStore for MemoryWorkflowHistoryStore {
         }
     }
 
+    async fn settle_cleanup(
+        &self,
+        id: &AttemptId,
+        disposition: &str,
+    ) -> Result<TerminalWrite, LedgerError> {
+        if !matches!(disposition, "complete" | "failed") {
+            return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+        }
+        let mut rows = self
+            .rows
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
+        let (_, terminal) = rows
+            .get_mut(id.as_str())
+            .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        let terminal = terminal
+            .as_mut()
+            .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        if terminal.cleanup_disposition == disposition {
+            return Ok(TerminalWrite::Replayed);
+        }
+        if terminal.cleanup_disposition != "pending" {
+            return Ok(TerminalWrite::Conflict);
+        }
+        terminal.cleanup_disposition = disposition.to_owned();
+        terminal.validate()?;
+        Ok(TerminalWrite::Applied)
+    }
+
+    async fn record_activity_tally(
+        &self,
+        id: &AttemptId,
+        tally: &crate::attempt_activity::ActivityTally,
+    ) -> Result<(), LedgerError> {
+        if tally.encoded_len() > crate::attempt_activity::MAX_ATTACHMENT_ENCODING_BYTES {
+            return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+        }
+        if !self
+            .rows
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?
+            .contains_key(id.as_str())
+        {
+            return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+        }
+        self.activity
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?
+            .insert(id.as_str().to_owned(), *tally);
+        Ok(())
+    }
+
+    async fn activity_tally(
+        &self,
+        id: &AttemptId,
+    ) -> Result<Option<crate::attempt_activity::ActivityTally>, LedgerError> {
+        Ok(self
+            .activity
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?
+            .get(id.as_str())
+            .copied())
+    }
+
     async fn set_pinned(&self, id: &AttemptId, pinned: bool) -> Result<bool, LedgerError> {
         let mut rows = self
             .rows
@@ -802,6 +1252,7 @@ impl WorkflowHistoryStore for MemoryWorkflowHistoryStore {
                 terminal_evidence_version: "none".into(),
                 terminal_evidence_source: "none".into(),
                 terminal_evidence_complete: false,
+                terminal_evidence_counts: Default::default(),
                 degraded: true,
                 prompt_acceptance: reservation.prompt_acceptance.clone(),
                 cleanup_disposition: "unknown".into(),
@@ -1152,6 +1603,7 @@ mod tests {
                 terminal_evidence_version: "none".into(),
                 terminal_evidence_source: "none".into(),
                 terminal_evidence_complete: false,
+                terminal_evidence_counts: Default::default(),
                 degraded: false,
                 prompt_acceptance: "not_dispatched".into(),
                 cleanup_disposition: "complete".into(),
@@ -1293,6 +1745,7 @@ mod tests {
         fail_reserve: std::sync::atomic::AtomicBool,
         fail_prompt: std::sync::atomic::AtomicBool,
         fail_terminal: std::sync::atomic::AtomicBool,
+        fail_activity: std::sync::atomic::AtomicBool,
         commit_then_fail_terminal: std::sync::atomic::AtomicBool,
     }
 
@@ -1341,6 +1794,20 @@ mod tests {
                 return Err(LedgerError::new(LedgerUnavailableReason::Io));
             }
             self.inner.terminalize(id, terminal).await
+        }
+
+        async fn record_activity_tally(
+            &self,
+            id: &AttemptId,
+            tally: &crate::attempt_activity::ActivityTally,
+        ) -> Result<(), LedgerError> {
+            if self
+                .fail_activity
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(LedgerError::new(LedgerUnavailableReason::Io));
+            }
+            self.inner.record_activity_tally(id, tally).await
         }
 
         async fn set_pinned(&self, id: &AttemptId, pinned: bool) -> Result<bool, LedgerError> {
@@ -1414,6 +1881,35 @@ mod tests {
             assert!(terminal.degraded);
             assert!(!terminal.telemetry_complete);
             assert_eq!(terminal.prompt_acceptance, "unknown");
+
+            let activity_store = std::sync::Arc::new(OneShotFaultStore::default());
+            let reservation = served_reservation(AttemptIdentity::initial().unwrap(), surface);
+            let attempt_id = reservation.identity.attempt_id.clone();
+            let mut barrier =
+                DirectAttemptBarrier::admit(activity_store.clone(), reservation, "caller_aborted")
+                    .await
+                    .unwrap();
+            barrier.record_activity(
+                crate::attempt_activity::AttemptPhase::Provider,
+                crate::attempt_activity::ActivityReason::MessageDelta,
+                1,
+            );
+            activity_store
+                .fail_activity
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            barrier
+                .finish("completed", "completed", false, "complete", true)
+                .await
+                .unwrap();
+            let terminal = activity_store
+                .attempt(&attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .terminal
+                .unwrap();
+            assert_eq!(terminal.outcome, "completed");
+            assert_eq!(terminal.terminal_reason, "completed");
 
             let terminal_store = std::sync::Arc::new(OneShotFaultStore::default());
             let reservation = served_reservation(AttemptIdentity::initial().unwrap(), surface);
@@ -1682,5 +2178,183 @@ mod tests {
         assert_eq!(value.excluded["telemetry_incomplete"], 1);
         assert_eq!(value.excluded["workload_fingerprint_incomplete"], 1);
         assert_eq!(value.excluded["non_monotonic"], 1);
+    }
+
+    fn multi_provider_binding(attempt_id: &str) -> crate::terminal_evidence::TurnEvidenceBinding {
+        crate::terminal_evidence::TurnEvidenceBinding {
+            generation: 1,
+            session_id: "bridge-session".into(),
+            turn_id: "turn-leg-1".into(),
+            attempt_id: attempt_id.into(),
+            marker_nonce: "00112233445566778899aabbccddeeff".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn r2f0b_plain_unary_counts_only_a_reached_provider_turn() {
+        for dispatched in [false, true] {
+            let store = std::sync::Arc::new(MemoryWorkflowHistoryStore::new());
+            let reservation = served_reservation(
+                AttemptIdentity::initial().unwrap(),
+                ExecutionSurface::DirectUnary,
+            );
+            let mut barrier = DirectAttemptBarrier::admit(store, reservation, "caller_aborted")
+                .await
+                .unwrap();
+            if dispatched {
+                barrier.mark_prompt_dispatch().await.unwrap();
+            }
+
+            let (_, terminal) = barrier
+                .finish("completed", "completed", false, "not_needed", true)
+                .await
+                .unwrap();
+            assert_eq!(
+                terminal.terminal_evidence_counts.reached,
+                u32::from(dispatched),
+                "plain unary provider reachability must follow the durable dispatch boundary"
+            );
+            assert_eq!(terminal.terminal_evidence_counts.valid, 0);
+            assert_eq!(terminal.terminal_evidence_counts.missing, 0);
+            assert_eq!(terminal.terminal_evidence_counts.invalid, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn r2f0b_multi_provider_zero_reached_legs_terminal_is_not_applicable() {
+        let store = std::sync::Arc::new(MemoryWorkflowHistoryStore::new());
+        let reservation = served_reservation(
+            AttemptIdentity::initial().unwrap(),
+            ExecutionSurface::DirectUnary,
+        );
+        let mut barrier = DirectAttemptBarrier::admit(store, reservation, "caller_aborted")
+            .await
+            .unwrap();
+        barrier.mark_prompt_dispatch().await.unwrap();
+        barrier.begin_multi_provider_terminal();
+
+        let (_, terminal) = barrier
+            .finish("failed", "prompt_failed", true, "unknown", true)
+            .await
+            .unwrap();
+        assert_eq!(terminal.terminal_evidence_capability, "not_applicable");
+        assert_eq!(terminal.terminal_evidence_version, "none");
+        assert_eq!(terminal.terminal_evidence_source, "none");
+        assert!(terminal.terminal_evidence_complete);
+        assert_eq!(terminal.terminal_evidence_counts.reached, 0);
+        assert_eq!(terminal.producer_terminal, "unknown");
+        assert_eq!(terminal.final_message, "unknown");
+        assert_eq!(terminal.outcome, "failed");
+        assert_eq!(
+            terminal.terminal_reason, "protocol_terminal_unknown",
+            "the accepted-failed resolution is unchanged from the legacy single sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn r2f0b_multi_provider_two_reached_legs_keep_unknown_with_bounded_counts() {
+        let store = std::sync::Arc::new(MemoryWorkflowHistoryStore::new());
+        let reservation = served_reservation(
+            AttemptIdentity::initial().unwrap(),
+            ExecutionSurface::DirectUnary,
+        );
+        let attempt_id = reservation.identity.attempt_id.clone();
+        let mut barrier = DirectAttemptBarrier::admit(store, reservation, "caller_aborted")
+            .await
+            .unwrap();
+        barrier.mark_prompt_dispatch().await.unwrap();
+        barrier.begin_multi_provider_terminal();
+        let (_scope_a, _leg_a) = barrier.multi_provider_leg(
+            crate::terminal_evidence::EvidenceCapability::V1,
+            Some(multi_provider_binding(attempt_id.as_str())),
+        );
+        let (_scope_b, _leg_b) = barrier.multi_provider_leg(
+            crate::terminal_evidence::EvidenceCapability::Unsupported,
+            None,
+        );
+
+        let (_, terminal) = barrier
+            .finish("completed", "completed", false, "unknown", true)
+            .await
+            .unwrap();
+        assert_eq!(terminal.outcome, "completed", "fan-out policy unchanged");
+        assert_eq!(terminal.terminal_evidence_capability, "unknown");
+        assert_eq!(terminal.terminal_evidence_version, "none");
+        assert_eq!(terminal.terminal_evidence_source, "none");
+        assert!(!terminal.terminal_evidence_complete);
+        assert_eq!(terminal.terminal_evidence_counts.reached, 2);
+        assert_eq!(terminal.terminal_evidence_counts.missing, 1);
+        assert_eq!(terminal.terminal_evidence_counts.valid, 0);
+        assert_eq!(terminal.terminal_evidence_counts.invalid, 0);
+        assert_eq!(terminal.producer_terminal, "unknown");
+        assert_eq!(terminal.final_message, "unknown");
+    }
+
+    #[tokio::test]
+    async fn r2f0b_multi_provider_single_reached_leg_projects_exact_evidence_and_scope() {
+        let store = std::sync::Arc::new(MemoryWorkflowHistoryStore::new());
+        let reservation = served_reservation(
+            AttemptIdentity::initial().unwrap(),
+            ExecutionSurface::DirectUnary,
+        );
+        let attempt_id = reservation.identity.attempt_id.clone();
+        let mut barrier = DirectAttemptBarrier::admit(store.clone(), reservation, "caller_aborted")
+            .await
+            .unwrap();
+        barrier.mark_prompt_dispatch().await.unwrap();
+        barrier.begin_multi_provider_terminal();
+        let binding = multi_provider_binding(attempt_id.as_str());
+        let (scope, leg) = barrier.multi_provider_leg(
+            crate::terminal_evidence::EvidenceCapability::V1,
+            Some(binding.clone()),
+        );
+        let _ = scope.record(
+            crate::attempt_activity::AttemptPhase::Provider,
+            crate::attempt_activity::ActivityReason::MessageDelta,
+            3,
+        );
+        assert_eq!(
+            leg.accept(crate::terminal_evidence::TurnEvidenceEnvelope {
+                version: crate::terminal_evidence::TURN_EVIDENCE_VERSION.into(),
+                generation: binding.generation,
+                session_id: binding.session_id,
+                turn_id: binding.turn_id,
+                attempt_id: binding.attempt_id,
+                marker_nonce: binding.marker_nonce,
+                native_turn_id: "native-leg".into(),
+                sequence: 1,
+                producer: crate::terminal_evidence::ProducerTerminal::Completed,
+                final_presence: crate::terminal_evidence::FinalPresence::Nonempty,
+                ordered_notifications_drained: true,
+                complete: true,
+            }),
+            crate::terminal_evidence::EvidenceAcceptance::Accepted,
+        );
+        leg.record_deliverable_final();
+
+        let (_, terminal) = barrier
+            .finish("completed", "completed", false, "unknown", true)
+            .await
+            .unwrap();
+        assert_eq!(terminal.outcome, "completed");
+        assert_eq!(terminal.terminal_reason, "completed_final");
+        assert_eq!(terminal.terminal_evidence_capability, "v1");
+        assert_eq!(terminal.terminal_evidence_version, "v1");
+        assert_eq!(terminal.terminal_evidence_source, "adapter");
+        assert!(terminal.terminal_evidence_complete);
+        assert_eq!(terminal.terminal_evidence_counts.reached, 1);
+        assert_eq!(terminal.terminal_evidence_counts.valid, 1);
+        assert_eq!(terminal.producer_terminal, "completed");
+        assert_eq!(terminal.final_message, "nonempty");
+
+        let tally = store
+            .activity_tally(&attempt_id)
+            .await
+            .unwrap()
+            .expect("attempt tally recorded");
+        assert!(
+            tally.max_advance >= 3,
+            "the leg scope feeds the shared attempt tally: {tally:?}"
+        );
     }
 }

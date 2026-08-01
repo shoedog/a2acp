@@ -57,6 +57,8 @@ pub enum BridgeError {
     AgentTimedOut,
     #[error("frame error")]
     FrameError,
+    #[error("protocol missing terminal event")]
+    MissingTerminal,
     #[error("message too large")]
     MessageTooLarge,
     #[error("empty final agent message")]
@@ -121,7 +123,7 @@ pub fn warm_session_survivability(error: &BridgeError) -> WarmSessionSurvivabili
             | DiagnosticFailureClass::Canceled
             | DiagnosticFailureClass::Unknown => WarmSessionSurvivability::Expire,
         },
-        BridgeError::EmptyFinal => WarmSessionSurvivability::Expire,
+        BridgeError::EmptyFinal | BridgeError::MissingTerminal => WarmSessionSurvivability::Expire,
         _ => WarmSessionSurvivability::PreserveOwnerBehavior,
     }
 }

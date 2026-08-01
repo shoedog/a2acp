@@ -3597,10 +3597,6 @@ mod tests {
         }
     }
 
-    fn foundation_root() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compatibility")
-    }
-
     fn foundation_execution(
         binding: &FoundationProfileBindingV1,
     ) -> crate::compatibility_schedule_schema::CaseExecutionFingerprintRecordV1 {
@@ -4269,14 +4265,15 @@ mod tests {
         manual_proposal_for_source(capability, trusted_root, requested_cwd, digest('f'))
     }
 
-    fn claimed_source_fixture() -> (
+    fn claimed_source_fixture(
+        root: &Path,
+    ) -> (
         AuthorityStateModelV1,
         ClaimedSupportCharacterizationSourceV1,
         AuthorityEnvironmentV1,
         CharacterizationAdmissionRequestV1,
     ) {
-        let root = foundation_root();
-        let foundation = load_schedule_foundation(&root).unwrap();
+        let foundation = load_schedule_foundation(root).unwrap();
         let (case_id, binding) = foundation.claimed_support_profiles.iter().next().unwrap();
         let execution = foundation_execution(binding);
         let authorization = authorization_for(
@@ -4301,21 +4298,22 @@ mod tests {
             ),
         );
         let source = generate_claimed_support_characterization_source(
-            &root, case_id, execution, admission, authority,
+            root, case_id, execution, admission, authority,
         )
         .unwrap();
         (state, source, environment, request)
     }
 
-    fn standing_source_fixture() -> (
+    fn standing_source_fixture(
+        root: &Path,
+    ) -> (
         AuthorityStateModelV1,
         ScheduledExecutionSourceV1,
         AuthorityEnvironmentV1,
         StandingAdmissionRequestV1,
         FoundationProfileBindingV1,
     ) {
-        let root = foundation_root();
-        let foundation = load_schedule_foundation(&root).unwrap();
+        let foundation = load_schedule_foundation(root).unwrap();
         let (case_id, binding) = foundation.scheduled_profiles.iter().next().unwrap();
         let execution = foundation_execution(binding);
         let characterization_authority =
@@ -4387,7 +4385,7 @@ mod tests {
             ),
         );
         let source = generate_scheduled_execution_source(
-            &root,
+            root,
             case_id,
             execution,
             admission,
@@ -5136,13 +5134,15 @@ mod tests {
 
     #[test]
     fn claimed_support_one_shot_reselects_foundation_effects_and_revocation() {
-        let (state, source, environment, request) = claimed_source_fixture();
+        let fixture = crate::compatibility_schedule::TestScheduleFoundation::new();
+        let root = fixture.root();
+        let (state, source, environment, request) = claimed_source_fixture(root);
         let mut wrong_effects = request.clone();
         wrong_effects.allowed_effects.clear();
         assert!(
             rederive_claimed_support_characterization_source_against_state(
                 &state,
-                &foundation_root(),
+                root,
                 &source,
                 "freshness-claimed".into(),
                 &environment,
@@ -5156,7 +5156,7 @@ mod tests {
         assert!(
             rederive_claimed_support_characterization_source_against_state(
                 &revoked,
-                &foundation_root(),
+                root,
                 &source,
                 "freshness-claimed".into(),
                 &environment,
@@ -5168,7 +5168,7 @@ mod tests {
 
         let selected = rederive_claimed_support_characterization_source_against_state(
             &state,
-            &foundation_root(),
+            root,
             &source,
             "freshness-claimed".into(),
             &environment,
@@ -5216,12 +5216,14 @@ mod tests {
 
     #[test]
     fn scheduled_standing_reselects_exact_grant_and_ledger_policy() {
-        let (state, source, environment, request, _binding) = standing_source_fixture();
+        let fixture = crate::compatibility_schedule::TestScheduleFoundation::new();
+        let root = fixture.root();
+        let (state, source, environment, request, _binding) = standing_source_fixture(root);
         let mut wrong_effects = request.clone();
         wrong_effects.allowed_effects.clear();
         assert!(rederive_scheduled_standing_source_against_state(
             &state,
-            &foundation_root(),
+            root,
             &source,
             "freshness-scheduled".into(),
             &environment,
@@ -5233,7 +5235,7 @@ mod tests {
         revoked.rollback_provider_authority().unwrap();
         assert!(rederive_scheduled_standing_source_against_state(
             &revoked,
-            &foundation_root(),
+            root,
             &source,
             "freshness-scheduled".into(),
             &environment,
@@ -5254,7 +5256,7 @@ mod tests {
         let session = begin_admission_transaction(&locks).unwrap();
         let selected = session
             .rederive_scheduled_standing_source(
-                &foundation_root(),
+                root,
                 &source,
                 "freshness-scheduled".into(),
                 &environment,
@@ -5286,7 +5288,9 @@ mod tests {
 
     #[test]
     fn completed_work_reuses_for_standing_and_manual_authority_without_new_effects() {
-        let (state, source, environment, request, binding) = standing_source_fixture();
+        let fixture = crate::compatibility_schedule::TestScheduleFoundation::new();
+        let root = fixture.root();
+        let (state, source, environment, request, binding) = standing_source_fixture(root);
         let (_state_temp, scheduler) = state_root();
         let (_action_temp, trusted_root, requested_cwd) = action_bindings();
         let locks = scheduler
@@ -5300,7 +5304,7 @@ mod tests {
         let session = begin_admission_transaction(&locks).unwrap();
         let selected = session
             .rederive_scheduled_standing_source(
-                &foundation_root(),
+                root,
                 &source,
                 "freshness-reuse".into(),
                 &environment,
@@ -5374,7 +5378,7 @@ mod tests {
             second_trigger,
         );
         let second_source = generate_scheduled_execution_source(
-            &foundation_root(),
+            root,
             &source.source.row_id,
             source.case_execution.clone(),
             second_admission,
@@ -5387,7 +5391,7 @@ mod tests {
         let session = begin_admission_transaction(&locks).unwrap();
         let selected = session
             .rederive_scheduled_standing_source(
-                &foundation_root(),
+                root,
                 &second_source,
                 "freshness-reuse".into(),
                 &second_environment,
@@ -5569,7 +5573,9 @@ mod tests {
 
     #[test]
     fn r3d_manual_uses_manual_effect_authority_and_only_active_grant_headroom() {
-        let (state, _source, environment, _request, binding) = standing_source_fixture();
+        let fixture = crate::compatibility_schedule::TestScheduleFoundation::new();
+        let root = fixture.root();
+        let (state, _source, environment, _request, binding) = standing_source_fixture(root);
         let input = foundation_execution(&binding).input;
         let execution = seal_case_execution_fingerprint(input.clone()).unwrap();
         let manual = derive_manual_admission(

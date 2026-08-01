@@ -2011,6 +2011,7 @@ mod tests {
 
     #[test]
     fn final_fence_rederives_scheduled_claimed_support_and_manual_sources() {
+        let fixture = crate::compatibility_schedule::TestScheduleFoundation::new();
         struct FixedNonce;
         impl ManualNonceSource for FixedNonce {
             fn fill(&self, output: &mut [u8]) -> Result<(), BoxError> {
@@ -2019,8 +2020,8 @@ mod tests {
             }
         }
 
-        let foundation_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compatibility");
-        let foundation = load_schedule_foundation(&foundation_root).unwrap();
+        let foundation_root = fixture.root();
+        let foundation = load_schedule_foundation(foundation_root).unwrap();
 
         let (scheduled_case, scheduled_binding) =
             foundation.scheduled_profiles.iter().next().unwrap();
@@ -2038,7 +2039,7 @@ mod tests {
             "freshness-scheduled",
         );
         let scheduled = generate_scheduled_execution_source(
-            &foundation_root,
+            foundation_root,
             scheduled_case,
             scheduled_ids.case_execution.clone(),
             scheduled_ids.admission_attempt.clone(),
@@ -2048,7 +2049,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             rederive_scheduled_identities(
-                &foundation_root,
+                foundation_root,
                 &scheduled,
                 "freshness-scheduled".into(),
             )
@@ -2056,7 +2057,7 @@ mod tests {
             scheduled_ids
         );
         let scheduled_context = rederive_scheduled_ledger_context(
-            &foundation_root,
+            foundation_root,
             &scheduled,
             "freshness-scheduled".into(),
         )
@@ -2086,7 +2087,7 @@ mod tests {
             "freshness-characterize",
         );
         let claimed = generate_claimed_support_characterization_source(
-            &foundation_root,
+            foundation_root,
             claimed_case,
             claimed_ids.case_execution.clone(),
             claimed_ids.admission_attempt.clone(),
@@ -2095,7 +2096,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             rederive_claimed_support_identities(
-                &foundation_root,
+                foundation_root,
                 &claimed,
                 "freshness-characterize".into(),
             )
@@ -2103,7 +2104,7 @@ mod tests {
             claimed_ids
         );
         let claimed_context = rederive_claimed_support_ledger_context(
-            &foundation_root,
+            foundation_root,
             &claimed,
             "freshness-characterize".into(),
         )
