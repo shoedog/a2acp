@@ -1,6 +1,7 @@
 # R2f1a focused implementation boundary — profiles, fan-out policy, and per-node control
 
-- **Status:** AWAITING SOL CLOSURE REVIEW — the four closed blockers are repaired in this document; no implementation
+- **Status:** PARKED — Sol/xhigh closure review 2 rejected five blockers; the required cursor reconciliation is
+  applied below, four technical blockers remain, the authorized design round is exhausted, and no implementation
   has started
 - **Frozen base:** `3f35ee6e07e9af314bb548b9d3ab694f3bba5fb1`
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
@@ -84,7 +85,24 @@ image `sha256:c4be66eb232809a1ab411d37fea6f660418db3e42b5b53b8be796329f998cb00`.
 has SHA-256 `3e46f43e6fa1f0b4fdd04c12fadd4c1adbd73d0f5d33d2f7b6910a22c358e3b2`. The repair edited only this
 document: no source, test, prompt, configuration, generated artifact, or roadmap surface changed, and no build, test,
 review approval, release, deployment, or operator effect is claimed. No execution id, attempt id, artifact hash, or
-verdict yet exists for the pending Sol review, and none is recorded here.
+verdict existed for the then-pending Sol review.
+
+The one authorized Sol/xhigh closure review ran as execution `exec-93cba8dc1634cca58db99cfc1b004d03`, attempt
+`attempt-14a5a8523118657b99ab193e0734b1cc`, against clean commit
+`ff62b1030f1c611a58e4b75aadb5c3b468b7eb9d` and focused-artifact SHA-256
+`3e1a959514f12ba6d09892f5ca5a7cd56bcb841602385e917a061d4c94deb28b`. Its 15,985-byte terminal artifact
+had SHA-256 `871931e92fe3906d34f3995448074fc2f2161b565cecbc2b29a164c34a00c967`; the checked-in
+[`review record`](../reviews/2026-08-01-r2f1a-sol-closure-review-2.md) differs only by the repository-standard final
+newline. The review closed the encoded-terminal reserve, deferred the theoretical overflow-fallback evidence loss,
+and rejected five blockers: provider-effect identity remains incomplete, the proposed `WITHOUT ROWID` metadata
+assertion is false, the arbitrary-ID page formula is not conservative, `Collision` is simultaneously fail-open and
+fail-closed, and the authoritative roadmap still directs a fresh freeze followed by implementation. It found no
+SMELL and classified the remaining population as closed enumerable. The authorized repair/review cap is exhausted;
+implementation and another repair or review round remain unauthorized pending owner direction.
+
+The same evidence-reconciliation fold removes the stale roadmap instruction identified as W6; that custody-only
+correction has no follow-up reviewer approval. The four provider/SQLite/collision design blockers and deferred
+overflow-fallback item remain parked.
 
 ## 1. Frozen authority and slice boundary
 
@@ -1429,11 +1447,11 @@ R2f1b may begin only after:
 
 R2f1b must then land `preserve_after_cancel`, durable preserved-worktree custody, retained resource capabilities, joined cleanup ownership, collateral reporting, and survival tests before enabling fixed-grace expiry, warning snapshots, or the absolute work cutoff.
 
-## 16. Closure-blocker repair disposition
+## 16. Closure-blocker repair and review disposition
 
-The operator-authorized targeted repair closes exactly the four blockers returned by the closure review. Each is a
-bounded design correction inside the existing frozen slice; none crosses into R2f1b, and every non-goal in §14 is
-preserved.
+The operator-authorized Opus repair proposed bounded corrections for exactly the four blockers returned by the prior
+closure review. None crosses into R2f1b, and every non-goal in §14 is preserved. Sol closure review 2 accepted only
+the encoded-terminal reserve as closed and found five remaining blockers plus one deferred WRONG.
 
 | Blocker | Repaired mechanism |
 |---|---|
@@ -1442,7 +1460,13 @@ preserved.
 | 3 — the platform physical charge undercounted arbitrary node IDs that SQLite duplicates between the row and its automatic index | §9 stores node terminals in a `WITHOUT ROWID` compound-primary-key table with no secondary index and an asserted schema shape, so the exact key bytes exist once. The `2 * page_size * expected_node_count` term is replaced by a per-node `ceil(payload / page_size)` page derivation over exact key bytes plus record/B-tree/overflow rounding, with placeholders materialized at full reserve so replacement adds no page, and a conservative argument covering sidecar/journal headroom, retention credit, and mixed V1/V2 migration. §12 adds a near-cap long-ID red/green regression. The `NodeId` contract is unchanged and the 128-MiB invariant is unchanged; a long-ID attempt that does not fit is a bounded `capacity_protected` refusal before effects, not an ID cap. |
 | 4 — healthy offline history was mislabeled unavailable and could cancel with no durable trigger | §6 replaces the three-variant barrier with `ServedPrimaryCommitted`, `OfflineHistoryCommitted`, `OfflineTelemetryUnavailable { reason }`, and `PrimaryFailed`, selected from the frozen `LedgerAdmissionV1` disposition recorded at admission in §5. A healthy admitted offline ledger must durably commit the trigger and its triggering terminal in one transaction before cancellation; only genuine bounded-reason unavailability may fall open to the in-process marker, and a durable conflict is `PrimaryFailed`. Trigger identity, crash ordering, and outcome/projection semantics are specified, and §12 adds healthy, unavailable, and primary-failure regressions with the healthy case red against the current sole offline result. |
 
-The status is advanced only to awaiting review. No implementation, test, review approval, release, deployment, or
-operator effect is claimed by this repair.
+Sol closure review 2 rejected the provider-effect identity, `WITHOUT ROWID` schema assertion, arbitrary-ID page
+bound, offline collision classification, and stale program cursor as blockers. It deferred only the theoretical
+overflow-fallback evidence loss and found no SMELL. The complete likelihood, impact, fix, regression, and
+BLOCKER/DEFER analysis is retained in the linked review record. No implementation, test, review approval, release,
+deployment, or operator effect is claimed. The cap is exhausted and this checkpoint is parked pending owner
+direction.
 
-R2F1A FOCUSED BOUNDARY: AWAITING SOL CLOSURE REVIEW
+The status fold reconciles the stale cursor without claiming review approval; four technical blockers remain.
+
+R2F1A FOCUSED BOUNDARY: PARKED — SOL CLOSURE REVIEW 2 REJECT
