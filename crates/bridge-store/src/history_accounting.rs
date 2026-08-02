@@ -639,6 +639,9 @@ pub(crate) fn sqlite_error(error: &rusqlite::Error) -> LedgerError {
             rusqlite::ErrorCode::DiskFull => R::CapacityProtected,
             rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => R::Locked,
             rusqlite::ErrorCode::ReadOnly => R::ReadOnlyDatabase,
+            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
+                R::Corruption
+            }
             _ => R::Io,
         };
         return LedgerError::with_sqlite_codes(reason, raw.code as i32, raw.extended_code);

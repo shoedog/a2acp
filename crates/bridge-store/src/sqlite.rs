@@ -8276,16 +8276,19 @@ fn prevalidate_tagged_history_path(
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     history_prevalidation_pause(path)?;
     let canonical_path = canonical_history_path(path)?;
-    if expected_kind == Some(HistoryAllocationKind::Configured) {
-        prevalidate_configured_history_modes(&canonical_path)?;
+    if expected_kind == Some(HistoryAllocationKind::Configured)
+        && !prevalidate_configured_history_modes(&canonical_path)?
+    {
+        return Ok(None);
     }
     let Some(actual_kind) = probe_history_allocation_kind(&canonical_path)? else {
         return Ok(None);
     };
     if actual_kind == HistoryAllocationKind::Configured
         && expected_kind != Some(HistoryAllocationKind::Configured)
+        && !prevalidate_configured_history_modes(&canonical_path)?
     {
-        prevalidate_configured_history_modes(&canonical_path)?;
+        return Ok(None);
     }
     validate_history_allocation_path(
         &canonical_path,
@@ -8302,16 +8305,20 @@ fn prevalidate_tagged_history_path(
 
 fn prevalidate_configured_history_modes(
     path: &std::path::Path,
-) -> Result<(), bridge_core::workflow_history::LedgerError> {
-    let metadata = std::fs::metadata(path).map_err(|error| {
-        history_io_error_with_permission(
-            &error,
-            bridge_core::workflow_history::LedgerUnavailableReason::Open,
-            bridge_core::workflow_history::LedgerUnavailableReason::Permission,
-        )
-    })?;
+) -> Result<bool, bridge_core::workflow_history::LedgerError> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(history_io_error_with_permission(
+                &error,
+                bridge_core::workflow_history::LedgerUnavailableReason::Open,
+                bridge_core::workflow_history::LedgerUnavailableReason::Permission,
+            ));
+        }
+    };
     if metadata.len() == 0 {
-        return Ok(());
+        return Ok(true);
     }
     let connection = rusqlite::Connection::open_with_flags(
         path,
@@ -8327,7 +8334,8 @@ fn prevalidate_configured_history_modes(
     // The journal mode is part of the configured proof too. Reading it through
     // the no-create connection cannot transition modes or create business rows.
     crate::history_accounting::journal_regime(&connection)?;
-    crate::history_accounting::validate_only_main_writable_database(&connection)
+    crate::history_accounting::validate_only_main_writable_database(&connection)?;
+    Ok(true)
 }
 
 fn probe_history_allocation_kind_snapshot(
