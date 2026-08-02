@@ -1,11 +1,16 @@
 use async_trait::async_trait;
+use bridge_core::diagnostics::{
+    DiagnosticFailureClass, DiagnosticPhase, DiagnosticRedactor, FailureDiagnostic,
+    FailureDiagnosticInput, FailureDisposition,
+};
 use bridge_core::domain::{AgentEntry, AgentKind, Part, RegistrySnapshot};
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
     freeze_direct_checkout_v1, freeze_node_execution_identity_v1, freeze_provider_attempt_v1,
     freeze_worktree_checkout_v1, resolve_execution_policy_v1, BoundMcpDeliveryPayloadV1,
     BoundSessionSpecV1, ExecutionPolicyInvocationV1, FanOutPolicyV1,
-    FrozenProviderLogicalSessionV1, HistoryAllocationKindV1, LedgerAdmissionV1, PolicyActivationV1,
+    FrozenProviderLogicalSessionV1, HistoryAllocationKindV1, LedgerAdmissionV1,
+    NodeCleanupDispositionV1, NodePrimaryDispositionV1, NodeTerminalV1, PolicyActivationV1,
     PolicyNodeRefV1, ProviderFreezeInputV1, SynthesisModeV1, WorkflowControlDefaultsV1,
     WorktreeCheckoutInputV1,
 };
@@ -908,4 +913,183 @@ async fn v2_durable_fail_fast_barrier_precedes_policy_cancel_and_publishes_exact
         bridge_core::execution_policy::NodePrimaryDispositionV1::CanceledPolicy
     );
     assert_eq!(calls.policy_cancels.load(Ordering::SeqCst), 1);
+}
+
+struct TerminalEvidenceBackend {
+    prompt_error: Option<BridgeError>,
+    cleanup_error: Option<BridgeError>,
+}
+
+#[async_trait]
+impl AgentBackend for TerminalEvidenceBackend {
+    async fn prompt(
+        &self,
+        _session: &SessionId,
+        _parts: Vec<Part>,
+    ) -> Result<BackendStream, BridgeError> {
+        if let Some(error) = &self.prompt_error {
+            return Err(error.clone());
+        }
+        Ok(Box::pin(tokio_stream::iter(vec![
+            Ok(Update::Text("OK".into())),
+            Ok(Update::done("end_turn")),
+        ])))
+    }
+
+    async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        Ok(())
+    }
+
+    async fn configure_bound_session(
+        &self,
+        _session: &SessionId,
+        _spec: &BoundSessionSpecV1,
+    ) -> Result<(), BridgeError> {
+        Ok(())
+    }
+
+    async fn forget_session_observed(
+        &self,
+        _session: &SessionId,
+        _observer: Arc<dyn bridge_core::ports::DiagnosticObserver>,
+    ) -> Result<(), BridgeError> {
+        self.cleanup_error.clone().map_or(Ok(()), Err)
+    }
+}
+
+fn accepted_prompt_failure() -> BridgeError {
+    BridgeError::agent_failure(
+        FailureDiagnostic::build_static_code(
+            FailureDiagnosticInput {
+                failed_phase: DiagnosticPhase::PromptStart,
+                last_completed_phase: Some(DiagnosticPhase::ConfigApply),
+                class: DiagnosticFailureClass::Transport,
+                disposition: FailureDisposition::Fatal,
+                code: String::new(),
+                summary: "bounded prompt-open failure".into(),
+                causes: vec!["outer cause".into(), "deepest cause".into()],
+                stderr_observed: false,
+                stderr_line_count: 0,
+                stderr_scope: None,
+                stderr_tail: None,
+                stderr_redaction: None,
+                retry_after_ms: None,
+                reset_at_ms: None,
+                prompt_may_have_been_accepted: true,
+            },
+            "test.node.prompt_open",
+            &DiagnosticRedactor::default(),
+        )
+        .unwrap(),
+    )
+}
+
+async fn execute_terminal_evidence_case(
+    prompt_error: Option<BridgeError>,
+    cleanup_error: Option<BridgeError>,
+) -> NodeTerminalV1 {
+    let entry = Arc::new(entry());
+    let run_spec = Arc::new(frozen_worktree_run(&entry));
+    run_spec.validate().unwrap();
+    let calls = Arc::new(Calls::default());
+    let registry = Arc::new(BoundOnlyRegistry {
+        entry,
+        backend: Arc::new(TerminalEvidenceBackend {
+            prompt_error,
+            cleanup_error,
+        }),
+        slot: Arc::new(()),
+        calls,
+        fail_preflight_ordinal: None,
+    });
+    let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+        session_cwd: run_spec.requested_session_cwd.clone(),
+        ..WorkflowRunContext::default()
+    })
+    .with_frozen_run_spec(run_spec.clone(), None)
+    .unwrap();
+    let events = WorkflowExecutor::new(registry)
+        .run_with_diagnostic_context(
+            Arc::new(run_spec.graph.clone()),
+            "review this".into(),
+            "bound-terminal-evidence-run".into(),
+            CancellationToken::new(),
+            context,
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let terminal_json = events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::NodeFinished {
+                terminal_json: Some(terminal_json),
+                ..
+            } => Some(terminal_json),
+            _ => None,
+        })
+        .expect("V2 emits one canonical node terminal");
+    NodeTerminalV1::decode_canonical(terminal_json.as_bytes()).unwrap()
+}
+
+#[tokio::test]
+async fn v2_node_terminal_records_successful_cleanup_before_publication() {
+    let terminal = execute_terminal_evidence_case(None, None).await;
+    assert_eq!(terminal.primary, NodePrimaryDispositionV1::Completed);
+    assert_eq!(
+        terminal.cleanup.disposition,
+        NodeCleanupDispositionV1::Complete
+    );
+    assert!(terminal.cause.is_none());
+}
+
+#[tokio::test]
+async fn v2_node_terminal_records_cleanup_failure_and_bounded_cause() {
+    let terminal = execute_terminal_evidence_case(None, Some(BridgeError::StoreFailure)).await;
+    assert_eq!(terminal.primary, NodePrimaryDispositionV1::Failed);
+    assert_eq!(
+        terminal.cleanup.disposition,
+        NodeCleanupDispositionV1::Failed
+    );
+    let cause = terminal.cause.expect("cleanup failure retains a cause");
+    assert_eq!(cause.failure_class, DiagnosticFailureClass::Persistence);
+    assert_eq!(cause.code.as_str(), "bridge.store_failure");
+}
+
+#[tokio::test]
+async fn v2_node_terminal_preserves_diagnostic_class_code_cause_and_prompt_acceptance() {
+    let terminal = execute_terminal_evidence_case(Some(accepted_prompt_failure()), None).await;
+    assert_eq!(terminal.primary, NodePrimaryDispositionV1::Failed);
+    assert_eq!(
+        terminal.cleanup.disposition,
+        NodeCleanupDispositionV1::Complete
+    );
+    assert!(terminal.prompt_may_have_been_accepted);
+    let cause = terminal.cause.expect("diagnostic failure retains a cause");
+    assert_eq!(cause.failure_class, DiagnosticFailureClass::Transport);
+    assert_eq!(cause.code.as_str(), "test.node.prompt_open");
+    assert_eq!(cause.deepest_cause.as_deref(), Some("deepest cause"));
+}
+
+#[tokio::test]
+async fn v2_node_terminal_keeps_primary_diagnostic_when_cleanup_also_fails() {
+    let terminal = execute_terminal_evidence_case(
+        Some(accepted_prompt_failure()),
+        Some(BridgeError::StoreFailure),
+    )
+    .await;
+    assert_eq!(terminal.primary, NodePrimaryDispositionV1::Failed);
+    assert_eq!(
+        terminal.cleanup.disposition,
+        NodeCleanupDispositionV1::Failed
+    );
+    assert!(terminal.prompt_may_have_been_accepted);
+    let cause = terminal
+        .cause
+        .expect("the primary diagnostic remains authoritative");
+    assert_eq!(cause.failure_class, DiagnosticFailureClass::Transport);
+    assert_eq!(cause.code.as_str(), "test.node.prompt_open");
+    assert_eq!(cause.deepest_cause.as_deref(), Some("deepest cause"));
 }

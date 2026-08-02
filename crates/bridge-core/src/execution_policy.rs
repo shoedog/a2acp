@@ -330,6 +330,92 @@ pub struct NodeCauseV1 {
     pub dependency_set: Option<DependencySetRefV1>,
 }
 
+impl NodeCauseV1 {
+    /// Convert one bridge-owned failure into the bounded evidence carried by a
+    /// V2 node terminal. Structured agent diagnostics retain their exact closed
+    /// class/code and deepest sanitized cause. Every legacy bridge error maps
+    /// exhaustively to a static code and a client-safe cause; neither `Debug`
+    /// text nor provider/process detail enters durable evidence.
+    #[must_use]
+    pub fn from_bridge_error(error: &crate::error::BridgeError) -> Self {
+        use crate::diagnostics::{DiagnosticCode, DiagnosticFailureClass as Class};
+        use crate::error::BridgeError;
+
+        if let BridgeError::AgentFailure { diagnostic } = error {
+            return Self {
+                failure_class: diagnostic.class(),
+                code: diagnostic.code().clone(),
+                deepest_cause: diagnostic
+                    .causes()
+                    .last()
+                    .cloned()
+                    .or_else(|| Some(diagnostic.summary().to_owned())),
+                cause_truncated: false,
+                evidence_overflow: false,
+                dependency_set: None,
+            };
+        }
+
+        let (failure_class, code) = match error {
+            BridgeError::A2aVersionMismatch => (Class::Protocol, "bridge.a2a_version_mismatch"),
+            BridgeError::InvalidRequest { .. } => (Class::Config, "bridge.invalid_request"),
+            BridgeError::IdentityUnavailable => (Class::Persistence, "bridge.identity_unavailable"),
+            BridgeError::DurableEvidenceUnavailable { .. } => {
+                (Class::Persistence, "bridge.durable_evidence_unavailable")
+            }
+            BridgeError::TaskNotFound => (Class::Config, "bridge.task_not_found"),
+            BridgeError::SessionNotFound => (Class::Unknown, "bridge.session_not_found"),
+            BridgeError::ConfigMismatch { .. } => (Class::Config, "bridge.config_mismatch"),
+            BridgeError::ConfigReseedRequired { .. } => {
+                (Class::Config, "bridge.config_reseed_required")
+            }
+            BridgeError::BoundSessionUnsupported => {
+                (Class::Config, "bridge.bound_session_unsupported")
+            }
+            BridgeError::BindUnsupported => (Class::Config, "bridge.bind_unsupported"),
+            BridgeError::SessionExpired => (Class::Unknown, "bridge.session_expired"),
+            BridgeError::HandleBusy => (Class::Unknown, "bridge.handle_busy"),
+            BridgeError::AuthRequired { .. } => (Class::Authentication, "bridge.auth_required"),
+            BridgeError::PermissionRequired { .. } => (Class::Config, "bridge.permission_required"),
+            BridgeError::PermissionDenied => (Class::Config, "bridge.permission_denied"),
+            BridgeError::AgentNotAuthenticated => {
+                (Class::Authentication, "bridge.agent_not_authenticated")
+            }
+            BridgeError::ModelNotAvailable => (Class::Model, "bridge.model_not_available"),
+            BridgeError::CancelTimeout => (Class::Timeout, "bridge.cancel_timeout"),
+            BridgeError::AgentTimedOut => (Class::Timeout, "bridge.agent_timed_out"),
+            BridgeError::FrameError => (Class::Transport, "bridge.frame_error"),
+            BridgeError::MissingTerminal => (Class::Protocol, "bridge.missing_terminal"),
+            BridgeError::MessageTooLarge => (Class::Protocol, "bridge.message_too_large"),
+            BridgeError::EmptyFinal => (Class::Protocol, "bridge.empty_final"),
+            BridgeError::AgentCrashed { .. } => (Class::AgentProcess, "bridge.agent_crashed"),
+            BridgeError::AgentFailure { .. } => unreachable!("handled above"),
+            BridgeError::AgentOverloaded => (Class::Overloaded, "bridge.agent_overloaded"),
+            BridgeError::UpstreamA2aError => (Class::Transport, "bridge.upstream_a2a_error"),
+            BridgeError::StoreFailure => (Class::Persistence, "bridge.store_failure"),
+            BridgeError::HarvestAuditPersistFailed { .. } => {
+                (Class::Persistence, "bridge.harvest_audit_persist_failed")
+            }
+            BridgeError::InvalidStateTransition => {
+                (Class::Protocol, "bridge.invalid_state_transition")
+            }
+            BridgeError::UnknownAgent { .. } => (Class::Config, "bridge.unknown_agent"),
+            BridgeError::ConfigInvalid { .. } => (Class::Config, "bridge.config_invalid"),
+            BridgeError::TaskSpecInvalid { .. } => (Class::Config, "bridge.task_spec_invalid"),
+        };
+        let deepest_cause = error.client_message();
+        Self {
+            failure_class,
+            code: DiagnosticCode::build(code, &crate::diagnostics::DiagnosticRedactor::default())
+                .expect("bridge-owned node terminal codes are static and bounded"),
+            deepest_cause: (!deepest_cause.is_empty()).then_some(deepest_cause),
+            cause_truncated: false,
+            evidence_overflow: false,
+            dependency_set: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeTerminalV1 {
     pub schema_version: u16,

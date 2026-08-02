@@ -17,7 +17,7 @@ use bridge_core::domain::{
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
     freeze_provider_attempt_v1, BoundProviderEffectV1, BoundSessionSpecV1,
-    FrozenNodeExecutionIdentityV1, FrozenProviderLogicalSessionV1, LedgerAdmissionV1,
+    FrozenNodeExecutionIdentityV1, FrozenProviderLogicalSessionV1, LedgerAdmissionV1, NodeCauseV1,
     NodeCleanupDispositionV1, NodeCleanupV1, NodePrimaryDispositionV1, NodeTerminalV1,
     PolicyNodeRefV1, ProviderEffectKeyV1, ProviderFreezeInputV1, Sha256HexV1,
     EXECUTION_POLICY_SCHEMA_V1,
@@ -415,6 +415,7 @@ struct NodeRunOutput {
     ok: bool,
     usage: Option<UsageSnapshot>,
     disposition: NodeDisposition,
+    primary_error: Option<BridgeError>,
     harvest: NodeHarvestMeta,
 }
 
@@ -473,6 +474,7 @@ fn node_run_output(
         ok,
         usage,
         disposition,
+        primary_error: None,
         // attempt=0 denotes a pre-attempt synthetic exit, not a real
         // backend prompt attempt.
         harvest: node_harvest_meta(
@@ -540,17 +542,69 @@ struct WorkflowCleanupState {
     observed: u32,
     failed: bool,
     intervals: Vec<(std::time::Instant, std::time::Instant)>,
+    nodes: BTreeMap<NodeId, NodeCleanupState>,
+}
+
+#[derive(Default)]
+struct NodeCleanupState {
+    observed: u32,
+    failed: bool,
+    intervals: Vec<(std::time::Instant, std::time::Instant)>,
+    failure: Option<BridgeError>,
 }
 
 impl WorkflowCleanupTracker {
-    fn record(&self, started: std::time::Instant, finished: std::time::Instant, succeeded: bool) {
+    fn record(
+        &self,
+        node: &NodeId,
+        started: std::time::Instant,
+        finished: std::time::Instant,
+        result: &Result<(), BridgeError>,
+    ) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.observed = state.observed.saturating_add(1);
-        state.failed |= !succeeded;
+        state.failed |= result.is_err();
         state.intervals.push((started, finished));
+        let node_state = state.nodes.entry(node.clone()).or_default();
+        node_state.observed = node_state.observed.saturating_add(1);
+        node_state.failed |= result.is_err();
+        node_state.intervals.push((started, finished));
+        if node_state.failure.is_none() {
+            node_state.failure = result.as_ref().err().cloned();
+        }
+    }
+
+    fn node_observation(&self, node: &NodeId) -> (NodeCleanupV1, Option<BridgeError>) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(node_state) = state.nodes.get(node) else {
+            return (
+                NodeCleanupV1 {
+                    disposition: NodeCleanupDispositionV1::NotNeeded,
+                    duration_ms: 0,
+                },
+                None,
+            );
+        };
+        let disposition = if node_state.failed {
+            NodeCleanupDispositionV1::Failed
+        } else if node_state.observed == 0 {
+            NodeCleanupDispositionV1::NotNeeded
+        } else {
+            NodeCleanupDispositionV1::Complete
+        };
+        (
+            NodeCleanupV1 {
+                disposition,
+                duration_ms: interval_union_ms(node_state.intervals.clone()),
+            },
+            node_state.failure.clone(),
+        )
     }
 
     fn observation(&self) -> (WorkflowCleanupDisposition, u64) {
@@ -565,29 +619,31 @@ impl WorkflowCleanupTracker {
         } else {
             WorkflowCleanupDisposition::Complete
         };
-        let mut intervals = state.intervals.clone();
-        intervals.sort_unstable_by_key(|(started, _)| *started);
-        let mut total = std::time::Duration::ZERO;
-        if let Some((mut current_start, mut current_end)) = intervals.first().copied() {
-            for (started, finished) in intervals.into_iter().skip(1) {
-                if started <= current_end {
-                    current_end = current_end.max(finished);
-                } else {
-                    total = total.saturating_add(current_end.duration_since(current_start));
-                    current_start = started;
-                    current_end = finished;
-                }
-            }
-            total = total.saturating_add(current_end.duration_since(current_start));
-        }
-        (
-            disposition,
-            u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
-        )
+        let duration_ms = interval_union_ms(state.intervals.clone());
+        (disposition, duration_ms)
     }
 }
 
+fn interval_union_ms(mut intervals: Vec<(std::time::Instant, std::time::Instant)>) -> u64 {
+    intervals.sort_unstable_by_key(|(started, _)| *started);
+    let mut total = std::time::Duration::ZERO;
+    if let Some((mut current_start, mut current_end)) = intervals.first().copied() {
+        for (started, finished) in intervals.into_iter().skip(1) {
+            if started <= current_end {
+                current_end = current_end.max(finished);
+            } else {
+                total = total.saturating_add(current_end.duration_since(current_start));
+                current_start = started;
+                current_end = finished;
+            }
+        }
+        total = total.saturating_add(current_end.duration_since(current_start));
+    }
+    u64::try_from(total.as_millis()).unwrap_or(u64::MAX)
+}
+
 async fn cleanup_warm_turn(
+    node: &NodeId,
     cleanup: Box<dyn NodeTurnCleanup>,
     exit: NodeTurnExit,
     observer: Arc<dyn DiagnosticObserver>,
@@ -595,7 +651,7 @@ async fn cleanup_warm_turn(
 ) -> Result<(), BridgeError> {
     let started = std::time::Instant::now();
     let result = cleanup.on_exit_observed(exit, observer).await;
-    tracker.record(started, std::time::Instant::now(), result.is_ok());
+    tracker.record(node, started, std::time::Instant::now(), &result);
     result
 }
 
@@ -844,6 +900,7 @@ enum ColdCleanupAction {
 }
 
 async fn cleanup_cold_session(
+    node: &NodeId,
     backend: &Arc<dyn AgentBackend>,
     session: &SessionId,
     observer: &Arc<dyn DiagnosticObserver>,
@@ -863,11 +920,12 @@ async fn cleanup_cold_session(
                 .await
         }
     };
-    tracker.record(started, std::time::Instant::now(), result.is_ok());
+    tracker.record(node, started, std::time::Instant::now(), &result);
     result
 }
 
 async fn cancel_and_forget_preflight_session(
+    node: &NodeId,
     backend: &Arc<dyn AgentBackend>,
     session: &SessionId,
     observer: &Arc<dyn DiagnosticObserver>,
@@ -875,6 +933,7 @@ async fn cancel_and_forget_preflight_session(
 ) {
     let _ = backend.cancel_observed(session, observer.clone()).await;
     let _ = cleanup_cold_session(
+        node,
         backend,
         session,
         observer,
@@ -1515,6 +1574,7 @@ impl WorkflowExecutor {
                 biased;
                 _ = cancel.cancelled() => {
                     let _ = cleanup_cold_session(
+                        &node.id,
                         attempt_use.backend(),
                         &session,
                         &diagnostic,
@@ -1527,6 +1587,7 @@ impl WorkflowExecutor {
             };
             if let Err(error) = configure_result {
                 let _ = cleanup_cold_session(
+                    &node.id,
                     attempt_use.backend(),
                     &session,
                     &diagnostic,
@@ -1558,6 +1619,7 @@ impl WorkflowExecutor {
             }
             if cancel.is_cancelled() {
                 let _ = cleanup_cold_session(
+                    &node.id,
                     attempt_use.backend(),
                     &session,
                     &diagnostic,
@@ -1622,6 +1684,7 @@ impl WorkflowExecutor {
                 biased;
                 _ = cancel.cancelled() => {
                     cancel_and_forget_preflight_session(
+                        &node.id,
                         attempt_use.backend(),
                         &session,
                         &diagnostic,
@@ -1666,6 +1729,7 @@ impl WorkflowExecutor {
             };
             if cancel.is_cancelled() {
                 cancel_and_forget_preflight_session(
+                    &node.id,
                     attempt_use.backend(),
                     &session,
                     &diagnostic,
@@ -1685,6 +1749,7 @@ impl WorkflowExecutor {
                     };
                     if may_have_been_accepted {
                         cancel_and_forget_preflight_session(
+                            &node.id,
                             attempt_use.backend(),
                             &session,
                             &diagnostic,
@@ -1693,6 +1758,7 @@ impl WorkflowExecutor {
                         .await;
                     } else {
                         let _ = cleanup_cold_session(
+                            &node.id,
                             attempt_use.backend(),
                             &session,
                             &diagnostic,
@@ -1773,6 +1839,7 @@ impl WorkflowExecutor {
                     },
                     _ = cancel.cancelled() => {
                         cancel_and_forget_preflight_session(
+                            &node.id,
                             attempt_use.backend(),
                             &session,
                             &diagnostic,
@@ -1785,6 +1852,7 @@ impl WorkflowExecutor {
 
             let cleanup_error = if replay_barrier {
                 cancel_and_forget_preflight_session(
+                    &node.id,
                     attempt_use.backend(),
                     &session,
                     &diagnostic,
@@ -1794,6 +1862,7 @@ impl WorkflowExecutor {
                 None
             } else {
                 cleanup_cold_session(
+                    &node.id,
                     attempt_use.backend(),
                     &session,
                     &diagnostic,
@@ -2056,6 +2125,7 @@ impl WorkflowExecutor {
                 };
                 if cancel.is_cancelled() {
                     let cleanup = cleanup_warm_turn(
+                        &node.id,
                         turn.cleanup,
                         NodeTurnExit::Normal,
                         diagnostic.clone(),
@@ -2104,6 +2174,7 @@ impl WorkflowExecutor {
                     Ok(request) => request,
                     Err(error) => {
                         let cleanup = cleanup_warm_turn(
+                            &node.id,
                             turn.cleanup,
                             NodeTurnExit::Normal,
                             diagnostic.clone(),
@@ -2242,6 +2313,7 @@ impl WorkflowExecutor {
                             let text = format!("[node {} failed: {:?}]", node.id.as_str(), e);
                             let fail_out = TurnOutcome::Failed(classify_failure(&e));
                             let _ = cleanup_warm_turn(
+                                &node.id,
                                 turn.cleanup,
                                 NodeTurnExit::Error(e),
                                 diagnostic.clone(),
@@ -2288,6 +2360,7 @@ impl WorkflowExecutor {
                             }
                         }
                         let cleanup = cleanup_warm_turn(
+                            &node.id,
                             turn.cleanup,
                             NodeTurnExit::Canceled,
                             diagnostic.clone(),
@@ -2495,20 +2568,30 @@ impl WorkflowExecutor {
                 let exit_was_normal = matches!(&exit, NodeTurnExit::Normal);
                 let exit_agent_crashed =
                     matches!(&exit, NodeTurnExit::Error(BridgeError::AgentCrashed { .. }));
+                let mut primary_error = match &exit {
+                    NodeTurnExit::Error(error) => Some(error.clone()),
+                    NodeTurnExit::Normal | NodeTurnExit::Canceled => None,
+                };
                 let mut node_outcome = match &exit {
                     NodeTurnExit::Canceled => TurnOutcome::Canceled,
                     NodeTurnExit::Error(error) => TurnOutcome::Failed(classify_failure(error)),
                     NodeTurnExit::Normal if ok => TurnOutcome::Success,
                     NodeTurnExit::Normal => TurnOutcome::Failed(FailureClass::Other),
                 };
-                let cleanup_result =
-                    cleanup_warm_turn(turn.cleanup, exit, diagnostic.clone(), cleanup_tracker)
-                        .await;
+                let cleanup_result = cleanup_warm_turn(
+                    &node.id,
+                    turn.cleanup,
+                    exit,
+                    diagnostic.clone(),
+                    cleanup_tracker,
+                )
+                .await;
                 if let Err(error) = cleanup_result {
                     if !had_primary_failure {
                         ok = false;
                         text = format!("[node {} cleanup failed: {:?}]", node.id.as_str(), error);
                         node_outcome = TurnOutcome::Failed(classify_failure(&error));
+                        primary_error = Some(error);
                     }
                     // Otherwise the operation observer recorded bounded teardown
                     // evidence and the earlier backend/rich failure remains primary.
@@ -2553,6 +2636,7 @@ impl WorkflowExecutor {
                     ok,
                     usage: last_usage,
                     disposition,
+                    primary_error,
                     harvest: node_harvest_meta_from_context(
                         obs_ctx.clone(),
                         node,
@@ -2599,6 +2683,7 @@ impl WorkflowExecutor {
                 text: String,
                 usage: Option<UsageSnapshot>,
                 failure_class: FailureClass,
+                error: Option<BridgeError>,
             },
             Transient {
                 err: BridgeError,
@@ -2619,7 +2704,14 @@ impl WorkflowExecutor {
         ctx.observer
             .record(&ObsEvent::NodeStarted { ctx: &node_obs_ctx });
 
-        let (final_text, final_ok, final_usage, final_node_outcome, final_harvest) = 'node_loop: {
+        let (
+            final_text,
+            final_ok,
+            final_usage,
+            final_node_outcome,
+            final_harvest,
+            final_primary_error,
+        ) = 'node_loop: {
             let mut attempt = 1_u32;
             loop {
                 if cancel.is_cancelled() {
@@ -2638,6 +2730,7 @@ impl WorkflowExecutor {
                             PrefixAttestationStatus::default(),
                             CompletionBodyOrigin::BridgeSyntheticCancellation,
                         )?,
+                        None,
                     );
                 }
 
@@ -2702,6 +2795,7 @@ impl WorkflowExecutor {
                                     text: format!("[node {} failed: {message}]", node.id.as_str()),
                                     usage: None,
                                     failure_class,
+                                    error: None,
                                 };
                             }
                         };
@@ -2722,6 +2816,7 @@ impl WorkflowExecutor {
                                     ),
                                     usage: None,
                                     failure_class: classify_failure(&error),
+                                    error: Some(error),
                                 };
                             }
                         };
@@ -2758,6 +2853,7 @@ impl WorkflowExecutor {
                                         text: format!("[node {} failed: {:?}]", node.id.as_str(), error),
                                         usage: None,
                                         failure_class: classify_failure(&error),
+                                        error: Some(error),
                                     };
                                 }
                             },
@@ -2798,6 +2894,7 @@ impl WorkflowExecutor {
                                         text: format!("[node {} failed: {:?}]", node.id.as_str(), error),
                                         usage: None,
                                         failure_class: classify_failure(&error),
+                                        error: Some(error),
                                     };
                                 }
                             },
@@ -2843,6 +2940,7 @@ impl WorkflowExecutor {
                                     text: format!("[node {} failed: {message}]", node.id.as_str()),
                                     usage: None,
                                     failure_class,
+                                    error: None,
                                 };
                             }
                         };
@@ -2862,6 +2960,7 @@ impl WorkflowExecutor {
                                         ),
                                         usage: None,
                                         failure_class: classify_failure(&error),
+                                        error: Some(error),
                                     };
                                 }
                             };
@@ -2904,6 +3003,7 @@ impl WorkflowExecutor {
                                 ColdCleanupAction::Forget
                             };
                             let cleanup_allows_retry = cleanup_cold_session(
+                                &node.id,
                                 attempt_use.backend(),
                                 &session,
                                 &diagnostic,
@@ -2920,6 +3020,7 @@ impl WorkflowExecutor {
                             };
                         }
                         let _ = cleanup_cold_session(
+                            &node.id,
                             attempt_use.backend(),
                             &session,
                             &diagnostic,
@@ -2931,10 +3032,12 @@ impl WorkflowExecutor {
                             text: format!("[node {} failed: configure {:?}]", node.id.as_str(), e),
                             usage: None,
                             failure_class: classify_failure(&e),
+                            error: Some(e),
                         };
                     }
                     if cancel.is_cancelled() {
                         match cleanup_cold_session(
+                            &node.id,
                             attempt_use.backend(),
                             &session,
                             &diagnostic,
@@ -2968,6 +3071,7 @@ impl WorkflowExecutor {
                                     ),
                                     usage: None,
                                     failure_class: classify_failure(&error),
+                                    error: Some(error),
                                 };
                             }
                         }
@@ -2982,6 +3086,7 @@ impl WorkflowExecutor {
                         Ok(request) => request,
                         Err(e) => {
                             let _ = cleanup_cold_session(
+                                &node.id,
                                 attempt_use.backend(),
                                 &session,
                                 &diagnostic,
@@ -2993,6 +3098,7 @@ impl WorkflowExecutor {
                                 text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
                                 usage: None,
                                 failure_class: classify_failure(&e),
+                                error: Some(e),
                             };
                         }
                     };
@@ -3085,6 +3191,7 @@ impl WorkflowExecutor {
                                         ColdCleanupAction::Forget
                                     };
                                     let cleanup_allows_retry = cleanup_cold_session(
+                                        &node.id,
                                         attempt_use.backend(),
                                         &session,
                                         &diagnostic,
@@ -3102,6 +3209,7 @@ impl WorkflowExecutor {
                                     };
                                 }
                                 let _ = cleanup_cold_session(
+                                    &node.id,
                                     attempt_use.backend(),
                                     &session,
                                     &diagnostic,
@@ -3113,6 +3221,7 @@ impl WorkflowExecutor {
                                     text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
                                     usage: None,
                                     failure_class: classify_failure(&e),
+                                    error: Some(e),
                                 };
                             }
                         },
@@ -3138,6 +3247,7 @@ impl WorkflowExecutor {
                                 .await
                                 .err();
                             let cleanup_error = cleanup_cold_session(
+                                &node.id,
                                 attempt_use.backend(),
                                 &session,
                                 &diagnostic,
@@ -3156,6 +3266,7 @@ impl WorkflowExecutor {
                                         ),
                                         usage: None,
                                         failure_class: classify_failure(&error),
+                                        error: Some(error),
                                     };
                                 }
                                 None => {
@@ -3304,6 +3415,7 @@ impl WorkflowExecutor {
                                 usage = None;
                             } else {
                                 let _ = cleanup_cold_session(
+                                    &node.id,
                                     attempt_use.backend(),
                                     &session,
                                     &diagnostic,
@@ -3326,12 +3438,14 @@ impl WorkflowExecutor {
                                     ),
                                     usage: None,
                                     failure_class: FailureClass::Other,
+                                    error: Some(e),
                                 };
                             }
                         }
                     }
                     if canceled_during_drain {
                         let cleanup_error = cleanup_cold_session(
+                            &node.id,
                             attempt_use.backend(),
                             &session,
                             &diagnostic,
@@ -3357,6 +3471,7 @@ impl WorkflowExecutor {
                                     ),
                                     usage,
                                     failure_class: classify_failure(&error),
+                                    error: Some(error),
                                 };
                             }
                             None => {
@@ -3402,6 +3517,7 @@ impl WorkflowExecutor {
                         )
                         .await;
                         let _ = cleanup_cold_session(
+                            &node.id,
                             attempt_use.backend(),
                             &session,
                             &diagnostic,
@@ -3426,6 +3542,7 @@ impl WorkflowExecutor {
                                 ColdCleanupAction::Forget
                             };
                             let cleanup_allows_retry = cleanup_cold_session(
+                                &node.id,
                                 attempt_use.backend(),
                                 &session,
                                 &diagnostic,
@@ -3443,6 +3560,7 @@ impl WorkflowExecutor {
                         }
                         let fc = classify_failure(&e);
                         let _ = cleanup_cold_session(
+                            &node.id,
                             attempt_use.backend(),
                             &session,
                             &diagnostic,
@@ -3466,9 +3584,11 @@ impl WorkflowExecutor {
                             text,
                             usage,
                             failure_class: fc,
+                            error: Some(e),
                         };
                     }
                     let cleanup = cleanup_cold_session(
+                        &node.id,
                         attempt_use.backend(),
                         &session,
                         &diagnostic,
@@ -3504,6 +3624,7 @@ impl WorkflowExecutor {
                                     ),
                                     usage,
                                     failure_class: classify_failure(&error),
+                                    error: Some(error),
                                 }
                             }
                         }
@@ -3524,6 +3645,7 @@ impl WorkflowExecutor {
                             text,
                             usage,
                             failure_class: FailureClass::Other,
+                            error: None,
                         }
                     }
                 };
@@ -3549,6 +3671,7 @@ impl WorkflowExecutor {
                             usage,
                             TurnOutcome::Canceled,
                             attempt_harvest.clone(),
+                            None,
                         );
                     }
                     Attempt::Ok { text, usage } => {
@@ -3571,12 +3694,14 @@ impl WorkflowExecutor {
                             usage,
                             TurnOutcome::Success,
                             attempt_harvest.clone(),
+                            None,
                         );
                     }
                     Attempt::Fatal {
                         text,
                         usage,
                         failure_class,
+                        error,
                     } => {
                         let fail_out = TurnOutcome::Failed(failure_class);
                         if let (Some(obs_ctx), Some(start)) = (obs_ctx_opt.as_ref(), turn_started) {
@@ -3592,7 +3717,14 @@ impl WorkflowExecutor {
                                 fin: UsageFinalization::TurnFinal,
                             });
                         }
-                        break 'node_loop (text, false, usage, fail_out, attempt_harvest.clone());
+                        break 'node_loop (
+                            text,
+                            false,
+                            usage,
+                            fail_out,
+                            attempt_harvest.clone(),
+                            error,
+                        );
                     }
                     Attempt::EmptyFinal { usage } => {
                         let fail_out =
@@ -3620,6 +3752,7 @@ impl WorkflowExecutor {
                             usage,
                             fail_out,
                             attempt_harvest.clone(),
+                            Some(BridgeError::EmptyFinal),
                         );
                     }
                     Attempt::Transient {
@@ -3671,6 +3804,7 @@ impl WorkflowExecutor {
                                             PrefixAttestationStatus::default(),
                                             CompletionBodyOrigin::BridgeSyntheticCancellation,
                                         )?,
+                                        None,
                                     );
                                 }
                                 _ = tokio::time::sleep(retry.backoff_for(attempt)) => {}
@@ -3688,6 +3822,7 @@ impl WorkflowExecutor {
                                 usage,
                                 fail_out,
                                 attempt_harvest.clone(),
+                                Some(err),
                             );
                         }
                         break 'node_loop (
@@ -3699,6 +3834,7 @@ impl WorkflowExecutor {
                             usage,
                             fail_out,
                             attempt_harvest.clone(),
+                            Some(err),
                         );
                     }
                 }
@@ -3716,6 +3852,7 @@ impl WorkflowExecutor {
             ok: final_ok,
             usage: final_usage,
             disposition,
+            primary_error: final_primary_error,
             harvest: final_harvest,
         })
     }
@@ -4188,6 +4325,7 @@ impl WorkflowExecutor {
                         ok,
                         usage,
                         disposition,
+                        primary_error,
                         harvest,
                     } = raw_output;
                     // §18-7 Off-mode audit exemption: with zero runnable enabled
@@ -4241,8 +4379,20 @@ impl WorkflowExecutor {
                     } else {
                         raw_text
                     };
+                    let (cleanup, cleanup_error) = cleanup_tracker.node_observation(&node_id);
+                    let terminal_error = primary_error.as_ref().or(cleanup_error.as_ref());
                     let primary = match disposition {
                         NodeDisposition::Completed => NodePrimaryDispositionV1::Completed,
+                        NodeDisposition::Failed
+                            if terminal_error.is_some_and(|error| match error {
+                                BridgeError::AgentTimedOut | BridgeError::CancelTimeout => true,
+                                BridgeError::AgentFailure { diagnostic } => diagnostic.class()
+                                    == bridge_core::diagnostics::DiagnosticFailureClass::Timeout,
+                                _ => false,
+                            }) =>
+                        {
+                            NodePrimaryDispositionV1::TimedOut
+                        }
                         NodeDisposition::Failed => NodePrimaryDispositionV1::Failed,
                         NodeDisposition::Canceled
                             if policy_canceled.contains(node_id.as_str()) =>
@@ -4256,12 +4406,16 @@ impl WorkflowExecutor {
                         terminal: NodeTerminalV1 {
                             schema_version: EXECUTION_POLICY_SCHEMA_V1,
                             primary,
-                            cleanup: NodeCleanupV1 {
-                                disposition: NodeCleanupDispositionV1::NotNeeded,
-                                duration_ms: 0,
-                            },
-                            cause: None,
-                            prompt_may_have_been_accepted: false,
+                            cleanup,
+                            cause: terminal_error.map(NodeCauseV1::from_bridge_error),
+                            prompt_may_have_been_accepted: primary_error.as_ref().is_some_and(
+                                |error| match error {
+                                    BridgeError::AgentFailure { diagnostic } => {
+                                        diagnostic.prompt_may_have_been_accepted()
+                                    }
+                                    _ => false,
+                                },
+                            ),
                             degraded_ancestry: false,
                             policy_trigger_id: None,
                         },
@@ -4453,22 +4607,37 @@ mod tests {
     #[test]
     fn cleanup_duration_is_the_union_of_overlapping_intervals() {
         let tracker = WorkflowCleanupTracker::default();
+        let node = NodeId::parse("cleanup-node").unwrap();
         let base = std::time::Instant::now();
-        tracker.record(base, base + std::time::Duration::from_millis(30), true);
         tracker.record(
-            base + std::time::Duration::from_millis(10),
-            base + std::time::Duration::from_millis(40),
-            false,
+            &node,
+            base,
+            base + std::time::Duration::from_millis(30),
+            &Ok(()),
         );
         tracker.record(
+            &node,
+            base + std::time::Duration::from_millis(10),
+            base + std::time::Duration::from_millis(40),
+            &Err(BridgeError::StoreFailure),
+        );
+        tracker.record(
+            &node,
             base + std::time::Duration::from_millis(60),
             base + std::time::Duration::from_millis(70),
-            true,
+            &Ok(()),
         );
 
         assert_eq!(
             tracker.observation(),
             (WorkflowCleanupDisposition::Failed, 50)
+        );
+        assert_eq!(
+            tracker.node_observation(&node).0,
+            NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::Failed,
+                duration_ms: 50,
+            }
         );
     }
 
