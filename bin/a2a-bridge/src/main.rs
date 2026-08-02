@@ -185,6 +185,7 @@ SUBCOMMANDS:
   mcp                 Serve external-controller MCP over stdio; managed-agent loopback is refused.
                       [--config <path>] [--store <path>]
   task-spec           Inspect or validate typed task-spec inputs. schema | template | input
+  provider-effect-key Provision the separately held V2 commitment key. create --out <absolute-new-path>
   prompt              Inspect the named prompt registry ([[prompts]]). list | show <id>  [--config <f>]
   containers          List / reap this config's managed containers (crash-orphan cleanup).  list | reap
   submit              Send a unary message.  [skill] --input <file> [--context <id>] [--agent <id>] [--model <m>] [--effort <e>] [--mode <m>] [--cwd <dir>]
@@ -270,6 +271,13 @@ usage: a2a-bridge task-spec schema [type]
 Inspect and validate typed task-spec inputs. Use `task-spec schema` to discover valid
 task types and `task-spec template <type>` to scaffold one.";
 
+const PROVIDER_EFFECT_KEY_USAGE: &str = "\
+usage: a2a-bridge provider-effect-key create --out <absolute-new-path>
+
+Create one new 32-byte provider-effect commitment key from the operating-system CSPRNG. The
+destination parent must already be an owner-private canonical directory. Existing files and links
+are never overwritten, and key bytes are never printed.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TopSubcommand {
     RunWorkflow,
@@ -288,6 +296,7 @@ enum TopSubcommand {
     Validate,
     Mcp,
     TaskSpec,
+    ProviderEffectKey,
     Prompt,
     Doctor,
     Smoke,
@@ -315,6 +324,7 @@ fn parse_top_subcommand(raw_args: &[String]) -> TopSubcommand {
         Some("validate") => TopSubcommand::Validate,
         Some("mcp") => TopSubcommand::Mcp,
         Some("task-spec") => TopSubcommand::TaskSpec,
+        Some("provider-effect-key") => TopSubcommand::ProviderEffectKey,
         Some("prompt") => TopSubcommand::Prompt,
         Some("doctor") => TopSubcommand::Doctor,
         Some("smoke") => TopSubcommand::Smoke,
@@ -353,6 +363,7 @@ fn dispatcher_help(sub: &TopSubcommand, raw_args: &[String]) -> Option<&'static 
         TopSubcommand::Compatibility => Some(compatibility::USAGE),
         TopSubcommand::Smoke => Some(SMOKE_USAGE),
         TopSubcommand::FallbackPlan => Some(fallback_plan::USAGE),
+        TopSubcommand::ProviderEffectKey => Some(PROVIDER_EFFECT_KEY_USAGE),
         _ => None,
     }
 }
@@ -7875,6 +7886,58 @@ fn task_spec_cmd(args: &[String]) -> Result<(), BoxError> {
     }
 }
 
+fn provider_effect_key_cmd(args: &[String]) -> Result<(), BoxError> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        println!("{PROVIDER_EFFECT_KEY_USAGE}");
+        return Ok(());
+    }
+    if args.first().map(String::as_str) != Some("create") {
+        return Err(
+            format!("provider-effect-key: expected `create`\n{PROVIDER_EFFECT_KEY_USAGE}").into(),
+        );
+    }
+    let mut output: Option<std::path::PathBuf> = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--out" => {
+                if output.is_some() {
+                    return Err(format!(
+                        "provider-effect-key create: duplicate --out\n{PROVIDER_EFFECT_KEY_USAGE}"
+                    )
+                    .into());
+                }
+                index += 1;
+                output = Some(
+                    args.get(index)
+                        .ok_or_else(|| {
+                            format!(
+                                "provider-effect-key create: --out needs a path\n{PROVIDER_EFFECT_KEY_USAGE}"
+                            )
+                        })?
+                        .into(),
+                );
+            }
+            other => {
+                return Err(format!(
+                    "provider-effect-key create: unknown argument {other:?}\n{PROVIDER_EFFECT_KEY_USAGE}"
+                )
+                .into())
+            }
+        }
+        index += 1;
+    }
+    let output = output.ok_or_else(|| {
+        format!("provider-effect-key create: missing --out\n{PROVIDER_EFFECT_KEY_USAGE}")
+    })?;
+    config::create_provider_effect_key_file(&output)?;
+    println!("created provider-effect key at {}", output.display());
+    Ok(())
+}
+
 type ServeHistoryStores = (
     Arc<dyn bridge_core::task_store::TaskStore>,
     Result<
@@ -7964,6 +8027,7 @@ async fn main() -> Result<(), BoxError> {
         TopSubcommand::Validate => return validate_cmd(&raw_args[2..]),
         TopSubcommand::Mcp => return mcp_cmd(&raw_args[2..]).await,
         TopSubcommand::TaskSpec => return task_spec_cmd(&raw_args[2..]),
+        TopSubcommand::ProviderEffectKey => return provider_effect_key_cmd(&raw_args[2..]),
         TopSubcommand::Prompt => return prompt_cmd(&raw_args[2..]),
         TopSubcommand::Doctor => return doctor::doctor_cmd(&raw_args[2..]),
         TopSubcommand::Smoke => return smoke::smoke_cmd(&raw_args[2..]).await,
@@ -7978,7 +8042,7 @@ async fn main() -> Result<(), BoxError> {
         // would otherwise be swallowed and the default served).
         TopSubcommand::Unknown(other) => {
             return Err(format!(
-                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | compatibility | smoke | fallback-plan | implement | merge | containers | workflow-stats | submit | task | task-spec | prompt | session | init | validate | doctor | help)"
+                "a2a-bridge: unknown subcommand {other:?} (expected: serve | mcp | run-workflow | run-batch | batch | models | compatibility | smoke | fallback-plan | implement | merge | containers | workflow-stats | submit | task | task-spec | provider-effect-key | prompt | session | init | validate | doctor | help)"
             )
             .into());
         }

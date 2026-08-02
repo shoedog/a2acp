@@ -71,6 +71,297 @@ pub struct StoreConfig {
     pub resume_attempt_cap: Option<u32>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityToml {
+    pub provider_effect_key_file: String,
+}
+
+fn provider_effect_key_error(message: impl Into<String>) -> ConfigError {
+    ConfigError::Registry(format!("provider-effect key custody: {}", message.into()))
+}
+
+fn path_is_at_or_below(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
+}
+
+fn path_is_in_repository(path: &Path) -> bool {
+    path.ancestors().any(|ancestor| {
+        ancestor.join(".git").exists()
+            || (ancestor.join("HEAD").is_file()
+                && ancestor.join("objects").is_dir()
+                && ancestor.join("refs").is_dir())
+    })
+}
+
+fn reject_provider_effect_key_aliases(
+    canonical_path: &Path,
+    forbidden_roots: &[PathBuf],
+    forbidden_files: &[PathBuf],
+) -> Result<(), ConfigError> {
+    if path_is_in_repository(canonical_path) {
+        return Err(provider_effect_key_error(
+            "path must be outside every Git repository",
+        ));
+    }
+    for root in forbidden_roots {
+        if path_is_at_or_below(canonical_path, root)
+            || std::fs::canonicalize(root)
+                .ok()
+                .is_some_and(|root| path_is_at_or_below(canonical_path, &root))
+        {
+            return Err(provider_effect_key_error(
+                "path overlaps a forbidden projected or evidence root",
+            ));
+        }
+    }
+    for file in forbidden_files {
+        if canonical_path == file
+            || std::fs::canonicalize(file)
+                .ok()
+                .is_some_and(|file| canonical_path == file)
+        {
+            return Err(provider_effect_key_error(
+                "path aliases a configured durable artifact",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_private_provider_effect_key_parent(
+    path: &Path,
+) -> Result<(std::fs::File, std::ffi::CString), ConfigError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| provider_effect_key_error("path has no parent directory"))?;
+    let canonical_parent = std::fs::canonicalize(parent)
+        .map_err(|_| provider_effect_key_error("parent directory is unavailable"))?;
+    if canonical_parent != parent {
+        return Err(provider_effect_key_error(
+            "path must use its absolute canonical spelling",
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(&canonical_parent)
+        .map_err(|_| provider_effect_key_error("parent directory is unavailable"))?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(provider_effect_key_error(
+            "parent must be an owner-private directory",
+        ));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| provider_effect_key_error("path has no file name"))?;
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| provider_effect_key_error("file name contains a NUL byte"))?;
+    let directory = std::fs::File::open(&canonical_parent)
+        .map_err(|_| provider_effect_key_error("parent directory cannot be opened"))?;
+    Ok((directory, name))
+}
+
+/// Open and load one existing provider-effect key after ordinary config
+/// validation. `forbidden_roots` are containment boundaries (session,
+/// evidence, output, allowed cwd, container mounts); `forbidden_files` are
+/// exact durable artifacts such as the configured SQLite database.
+#[cfg(unix)]
+pub fn load_provider_effect_key_file(
+    path: &Path,
+    forbidden_roots: &[PathBuf],
+    forbidden_files: &[PathBuf],
+) -> Result<bridge_core::execution_policy::ProviderEffectKeyV1, ConfigError> {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|_| provider_effect_key_error("file is unavailable"))?;
+    if canonical != path {
+        return Err(provider_effect_key_error(
+            "path must use its absolute canonical spelling",
+        ));
+    }
+    reject_provider_effect_key_aliases(&canonical, forbidden_roots, forbidden_files)?;
+    let (directory, name) = open_private_provider_effect_key_parent(&canonical)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(provider_effect_key_error(
+            "file cannot be opened without following links",
+        ));
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let before = file
+        .metadata()
+        .map_err(|_| provider_effect_key_error("file metadata is unavailable"))?;
+    if !before.is_file()
+        || before.nlink() != 1
+        || before.uid() != unsafe { libc::geteuid() }
+        || before.mode() & 0o077 != 0
+        || before.mode() & 0o400 == 0
+        || before.len() != 32
+    {
+        return Err(provider_effect_key_error(
+            "file must be one owner-readable, owner-only, 32-byte regular file",
+        ));
+    }
+    let mut bytes = [0_u8; 32];
+    file.read_exact(&mut bytes)
+        .map_err(|_| provider_effect_key_error("file cannot be read completely"))?;
+    let mut extra = [0_u8; 1];
+    if file
+        .read(&mut extra)
+        .map_err(|_| provider_effect_key_error("file cannot be read completely"))?
+        != 0
+    {
+        bytes.fill(0);
+        return Err(provider_effect_key_error("file is not exactly 32 bytes"));
+    }
+    let after = file
+        .metadata()
+        .map_err(|_| provider_effect_key_error("file metadata is unavailable after read"))?;
+    let current = std::fs::symlink_metadata(&canonical)
+        .map_err(|_| provider_effect_key_error("file path changed during read"))?;
+    if !current.file_type().is_file()
+        || (
+            before.dev(),
+            before.ino(),
+            before.mode(),
+            before.nlink(),
+            before.len(),
+        ) != (
+            after.dev(),
+            after.ino(),
+            after.mode(),
+            after.nlink(),
+            after.len(),
+        )
+        || (before.dev(), before.ino()) != (current.dev(), current.ino())
+        || path_is_in_repository(&canonical)
+    {
+        bytes.fill(0);
+        return Err(provider_effect_key_error(
+            "file identity or custody changed during read",
+        ));
+    }
+    let key = bridge_core::execution_policy::ProviderEffectKeyV1::from_bytes(bytes);
+    bytes.fill(0);
+    Ok(key)
+}
+
+#[cfg(not(unix))]
+pub fn load_provider_effect_key_file(
+    _path: &Path,
+    _forbidden_roots: &[PathBuf],
+    _forbidden_files: &[PathBuf],
+) -> Result<bridge_core::execution_policy::ProviderEffectKeyV1, ConfigError> {
+    Err(provider_effect_key_error(
+        "this platform has no reviewed no-follow custody implementation",
+    ))
+}
+
+#[cfg(unix)]
+pub fn create_provider_effect_key_file(path: &Path) -> Result<(), ConfigError> {
+    use ring::rand::SecureRandom as _;
+    use std::io::Write as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(provider_effect_key_error(
+            "create path must be a normalized absolute path",
+        ));
+    }
+    if path_is_in_repository(path) {
+        return Err(provider_effect_key_error(
+            "create path must be outside every Git repository",
+        ));
+    }
+    let (directory, name) = open_private_provider_effect_key_parent(path)?;
+    let mut bytes = [0_u8; 32];
+    if ring::rand::SystemRandom::new().fill(&mut bytes).is_err() {
+        return Err(provider_effect_key_error("operating-system CSPRNG failed"));
+    }
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        bytes.fill(0);
+        return Err(provider_effect_key_error(
+            "destination already exists or cannot be created safely",
+        ));
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let create_result = (|| -> Result<(), ConfigError> {
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+            return Err(provider_effect_key_error("cannot apply owner-only mode"));
+        }
+        file.write_all(&bytes)
+            .map_err(|_| provider_effect_key_error("cannot write the complete key"))?;
+        file.sync_all()
+            .map_err(|_| provider_effect_key_error("cannot sync the key file"))?;
+        let opened = file
+            .metadata()
+            .map_err(|_| provider_effect_key_error("created file metadata is unavailable"))?;
+        let current = std::fs::symlink_metadata(path)
+            .map_err(|_| provider_effect_key_error("created path is unavailable"))?;
+        if !current.file_type().is_file()
+            || opened.nlink() != 1
+            || opened.uid() != unsafe { libc::geteuid() }
+            || opened.mode() & 0o777 != 0o600
+            || opened.len() != 32
+            || (opened.dev(), opened.ino()) != (current.dev(), current.ino())
+            || path_is_in_repository(path)
+        {
+            return Err(provider_effect_key_error(
+                "created file failed its final custody check",
+            ));
+        }
+        directory
+            .sync_all()
+            .map_err(|_| provider_effect_key_error("cannot sync the key directory"))?;
+        Ok(())
+    })();
+    bytes.fill(0);
+    if let Err(error) = create_result {
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        let _ = directory.sync_all();
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn create_provider_effect_key_file(_path: &Path) -> Result<(), ConfigError> {
+    Err(provider_effect_key_error(
+        "this platform has no reviewed no-follow custody implementation",
+    ))
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegationConfig {
@@ -223,6 +514,8 @@ pub struct RegistryConfig {
     pub delegation: Option<DelegationConfig>,
     #[serde(default)]
     pub store: Option<StoreConfig>,
+    #[serde(default)]
+    pub security: Option<SecurityToml>,
     #[serde(default)]
     pub workflows: Vec<WorkflowToml>,
     #[serde(default)]
@@ -1374,6 +1667,30 @@ impl RegistryConfig {
         Ok(cfg)
     }
 
+    /// Pure syntax validation for the separately held provider-effect key.
+    /// Runtime custody checks deliberately happen only at an effect-bearing
+    /// entrypoint, never during `validate` or ordinary TOML parsing.
+    pub fn provider_effect_key_path(&self) -> Result<Option<PathBuf>, ConfigError> {
+        let Some(security) = &self.security else {
+            return Ok(None);
+        };
+        let path = PathBuf::from(&security.provider_effect_key_file);
+        if security.provider_effect_key_file.is_empty()
+            || !path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
+        {
+            return Err(ConfigError::Registry(
+                "[security].provider_effect_key_file must be a normalized absolute path".into(),
+            ));
+        }
+        Ok(Some(path))
+    }
+
     pub fn batch_config(&self) -> Result<Option<BatchConfig>, ConfigError> {
         let Some(batch) = &self.batch else {
             return Ok(None);
@@ -2124,6 +2441,138 @@ cmd = "codex"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_effect_key_path_parses_without_touching_the_file() {
+        let raw = "default=\"x\"\n[[agents]]\nid=\"x\"\ncmd=\"echo\"\n\
+                   [security]\nprovider_effect_key_file=\"/definitely/not/read/provider-effect.key\"\n\
+                   [server]\n";
+        let config = RegistryConfig::parse(raw).unwrap();
+        assert_eq!(
+            config.provider_effect_key_path().unwrap().as_deref(),
+            Some(Path::new("/definitely/not/read/provider-effect.key"))
+        );
+    }
+
+    #[test]
+    fn provider_effect_key_path_rejects_relative_or_parent_components_without_io() {
+        for path in ["relative.key", "/absolute/../aliased.key"] {
+            let raw = format!(
+                "default=\"x\"\n[[agents]]\nid=\"x\"\ncmd=\"echo\"\n\
+                 [security]\nprovider_effect_key_file=\"{path}\"\n[server]\n"
+            );
+            let config = RegistryConfig::parse(&raw).unwrap();
+            assert!(
+                config.provider_effect_key_path().is_err(),
+                "accepted {path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn provider_effect_key_fixture(
+        name: &str,
+        bytes: &[u8],
+    ) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let canonical_temp = std::fs::canonicalize(temp.path()).unwrap();
+        let secret_root = canonical_temp.join("secret-state");
+        std::fs::create_dir(&secret_root).unwrap();
+        std::fs::set_permissions(&secret_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = secret_root.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (temp, secret_root, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_effect_key_loader_accepts_only_the_pinned_owner_private_file() {
+        let (_temp, _root, path) = provider_effect_key_fixture("provider.key", &[7_u8; 32]);
+        let key = load_provider_effect_key_file(&path, &[], &[]).unwrap();
+        assert_eq!(format!("{key:?}"), "ProviderEffectKeyV1([REDACTED])");
+        assert_eq!(key.key_id().as_str().len(), 64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_effect_key_loader_rejects_wrong_shape_links_modes_and_aliases() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_short_temp, _short_root, short) =
+            provider_effect_key_fixture("short.key", &[1_u8; 31]);
+        assert!(load_provider_effect_key_file(&short, &[], &[]).is_err());
+
+        let (_mode_temp, _mode_root, permissive) =
+            provider_effect_key_fixture("permissive.key", &[2_u8; 32]);
+        std::fs::set_permissions(&permissive, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(load_provider_effect_key_file(&permissive, &[], &[]).is_err());
+
+        let (_link_temp, link_root, target) =
+            provider_effect_key_fixture("target.key", &[3_u8; 32]);
+        let symlink = link_root.join("symlink.key");
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+        assert!(load_provider_effect_key_file(&symlink, &[], &[]).is_err());
+        let hardlink = link_root.join("hardlink.key");
+        std::fs::hard_link(&target, &hardlink).unwrap();
+        assert!(load_provider_effect_key_file(&target, &[], &[]).is_err());
+        assert!(load_provider_effect_key_file(&hardlink, &[], &[]).is_err());
+
+        let (_forbidden_temp, forbidden_root, forbidden) =
+            provider_effect_key_fixture("forbidden.key", &[4_u8; 32]);
+        assert!(load_provider_effect_key_file(
+            &forbidden,
+            std::slice::from_ref(&forbidden_root),
+            &[]
+        )
+        .is_err());
+        assert!(
+            load_provider_effect_key_file(&forbidden, &[], std::slice::from_ref(&forbidden))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_effect_key_loader_rejects_repository_custody() {
+        let (_temp, root, path) = provider_effect_key_fixture("repo.key", &[5_u8; 32]);
+        std::fs::create_dir(root.join(".git")).unwrap();
+        assert!(load_provider_effect_key_file(&path, &[], &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_effect_key_creator_is_no_clobber_complete_and_owner_private() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let canonical_temp = std::fs::canonicalize(temp.path()).unwrap();
+        let root = canonical_temp.join("secret-state");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("provider.key");
+
+        create_provider_effect_key_file(&path).unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.len(), 32);
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        let first = std::fs::read(&path).unwrap();
+        assert!(load_provider_effect_key_file(&path, &[], &[]).is_ok());
+
+        assert!(create_provider_effect_key_file(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+
+        let target = root.join("target");
+        std::fs::write(&target, b"unchanged").unwrap();
+        let link = root.join("link.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(create_provider_effect_key_file(&link).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+    }
 
     fn vc(runtime: Option<&str>) -> VerifyConfig {
         VerifyConfig {
