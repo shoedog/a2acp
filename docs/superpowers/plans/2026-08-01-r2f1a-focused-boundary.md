@@ -1,7 +1,6 @@
 # R2f1a focused implementation boundary — profiles, fan-out policy, and per-node control
 
-- **Status:** PARKED — SOL/XHIGH CLOSURE REVIEW 5 REJECT / ONE CLOSED-ENUMERABLE BLOCKER / CAP EXHAUSTED /
-  IMPLEMENTATION UNAUTHORIZED
+- **Status:** OWNER-AUTHORIZED WORKTREE CORRECTION / R2F1A IMPLEMENTATION IN PROGRESS
 - **Frozen base:** `3f35ee6e07e9af314bb548b9d3ab694f3bba5fb1`
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Normative authority:** [`../specs/2026-07-20-r2f-owner-design.md`](../specs/2026-07-20-r2f-owner-design.md)
@@ -10,12 +9,12 @@
 - **Fable input:** `d612788847a9142172cb38080bc77568e23c89116f44153ec0376b17327ce8c0`
 - **Synthesis:** `644c2df21579bcb3dc9e07f347911f1516ebf61d6c0b9493433d117d83070a84`
 
-This document records the repaired proposed source boundary. It narrows, but does not replace, the approved owner
-design and parent plan. Its contents are not implementation authority. Closure review 4 rejected the prior exact
-clean repair commit on two closed-enumerable blockers. The owner then authorized one bounded repair of exactly that
-population, deterministic documentation gates, and one cumulative Sol/xhigh closure review. A rejection parks this
-checkpoint; it does not authorize another repair, review, implementation, live gate, release, deployment, or
-operator effect.
+This document records the repaired source boundary. It narrows, but does not replace, the approved owner design and
+parent plan. The historical closure-review caps and verdicts below remain exact evidence. After closure review 5
+parked the checkpoint on one closed-enumerable worktree-identity blocker, the owner explicitly authorized the full
+worktree correction and R2f1a implementation. That authorization supersedes only the parked/implementation-
+unauthorized cursor; it does not rewrite the historical verdict, authorize another provider review or live case, or
+authorize release, deployment, or running-operator mutation.
 
 ## Dogfood and synthesis evidence
 
@@ -197,6 +196,13 @@ final newline and has SHA-256 `47718d2cbb5f56b06d2a9e6c6f3bc54afbdb1e229a2741eca
 after the proposed provider-effect bind, so the frozen cwd/MCP bytes, the actual worktree delivery, isolation, and
 resume identity cannot all be true. W1/W1-B remain `PARTIAL`; W1-A and W2-W6 are `FIXED`. The defect is
 closed-enumerable around that shipped decorator, but the declared cap is exhausted.
+
+The owner subsequently selected the full correction rather than the narrower V2-with-worktrees refusal and
+authorized implementation. The correction is bounded to the source/derived-checkout composition described in §3,
+§5, §11, and §12: freeze the complete logical-session checkout matrix from the persisted workflow attempt identity,
+make the final inner cwd and MCP delivery part of each attempt effect, and make `WorktreeBackend` consume the bound
+source and target without deriving either from process-run state. No additional review or billable/provider turn is
+implied by that authorization.
 
 ## 1. Frozen authority and slice boundary
 
@@ -600,15 +606,48 @@ pub struct FrozenProviderEffectV1 {
     pub secret_commitment_key_id: Option<Sha256HexV1>,
 }
 
+/// Finite session identities that current execution can actually mint. Retries reuse the
+/// selected Execute row because current executor retries reuse one logical node SessionId.
+pub enum FrozenProviderLogicalSessionV1 {
+    Preflight { candidate_ordinal: u16 },
+    Execute { candidate_ordinal: u16 },
+}
+
+pub enum FrozenCheckoutEffectV1 {
+    Direct {
+        source_cwd: SessionCwd,
+        effective_cwd: SessionCwd,
+    },
+    Worktree {
+        source_cwd: SessionCwd,
+        canonical_source_cwd: SessionCwd,
+        canonical_worktree_root: SessionCwd,
+        worktree_owner: String,
+        target_cwd: SessionCwd,
+        checkout_digest: Sha256HexV1,
+    },
+}
+
+pub struct FrozenProviderAttemptIdentityV1 {
+    pub logical_session: FrozenProviderLogicalSessionV1,
+    pub checkout: FrozenCheckoutEffectV1,
+    pub effect: FrozenProviderEffectV1,
+    pub attempt_fingerprint: Sha256HexV1,
+}
+
 pub struct FrozenNodeExecutionIdentityV1 {
     pub node: PolicyNodeRefV1,
-    pub effect: FrozenProviderEffectV1,
     pub selection: FrozenProviderSelectionV1,
+    /// Canonically ordered: candidate ordinal, then Preflight before Execute. A
+    /// preflight-disabled selection has only Execute { candidate_ordinal: 0 }.
+    pub provider_attempts: Vec<FrozenProviderAttemptIdentityV1>,
     pub identity_fingerprint: Sha256HexV1,
 }
 
 pub struct WorkflowRunSpecV1 {
     pub schema_version: u16,
+    /// High-entropy durable authority supplied by the coordinator before freeze.
+    pub attempt_id: AttemptId,
     pub graph: WorkflowGraph,
     pub controls: FrozenWorkflowControlsV1,
     /// Normalized per-request override after allowed-root validation; absence is distinct.
@@ -650,6 +689,12 @@ those are request/run effects and cannot be reconstructed from `AgentEntry` alon
 | checkout, isolation, and session location | raw `cwd`, raw `session_cwd`, resolved `effective_session_cwd`, `sandbox`, `watchdog` |
 | tool surface offered to the agent | `mcp` with exact server/argument/environment order, public source descriptors, keyed template commitments, keyed exact-delivery commitments, and the managed-depth marker, plus `mcp_delivery` |
 
+The checkout/session-location group also commits the complete `FrozenCheckoutEffectV1`. For `Direct`, source and
+effective cwd are carried explicitly. For `Worktree`, it commits the lexical source supplied by the request, its
+canonical repository path, canonical configured root, stable owner, exact derived target, logical-session kind, and
+`checkout_digest`. The final `effective_session_cwd` is the direct effective cwd or exact worktree target. MCP
+templates are resolved from that final value, so the agent session and its tools cannot point at different trees.
+
 `id` is carried beside `effect_digest` in `FrozenProviderEffectV1` and is also part of `selection_digest`.
 `model`, `effort`, `mode`, `preflight`, and `fallback_models` are carried by that separate selection digest rather
 than redundantly changing both digests. `model_provider` is consumed by compatibility resolution only;
@@ -661,13 +706,14 @@ builder destructures `AgentEntry` with no `..` rest pattern and explicitly route
 selection, carried identifier, or excluded-by-source-boundary metadata. Adding a field fails compilation until it is
 classified. The ambient bearer selected by `api_key_env` is never read or hashed; only its configured variable name
 participates. The exhaustive builder also receives a required `ProviderFreezeContextV1` containing the immutable
-operator-launch cwd and the already validated request override; this is how it classifies effects that are not
-fields of `AgentEntry`. MCP commands, arguments, and environment values alter the delivered tool surface, but they
+operator-launch cwd, persisted `AttemptId`, already validated request override, and immutable worktree enablement,
+canonical root, and stable owner; this is how it classifies effects that are not fields of `AgentEntry`. MCP
+commands, arguments, and environment values alter the delivered tool surface, but they
 enter durable identity only through the secret-silent keyed commitments below. No raw MCP command, argument,
 environment value, key path, or key byte is persisted, projected, or logged by this identity mechanism.
 
-**One effective cwd, selected once.** `effective_session_cwd` is resolved during pre-effect run-spec construction,
-separately for each node's bound entry, with exactly this precedence:
+**One source cwd and a finite final-cwd matrix, selected once.** The source cwd is resolved during pre-effect
+run-spec construction, separately for each node's bound entry, with exactly this precedence:
 
 ```text
 validated requested_session_cwd
@@ -684,15 +730,26 @@ task, history, registry, session, or provider effects. `requested_session_cwd` p
 `WorkflowRunSpecV1`; every node identity preserves its resolved effective value because entries may have different
 fallbacks when the request is absent.
 
-Existing sandbox/worktree containment code may still canonicalize a separately held host source object to validate
-or mount it, but that security result cannot silently replace the frozen delivery text. Where a container needs a
-canonical host mount source, composition separates that source from the container destination/session cwd and uses
-the frozen effective path for the latter. No post-freeze `canonicalize`, spawn helper, or backend default may change
-the bytes supplied to `SessionSpec.cwd` or `{cwd}` substitution. This deliberately gives ordinary workflow identity
-textual path semantics; R2d remains the separate object-identity boundary.
+The injected checkout planner performs the existing read-only Git/source/root classification before freeze. For an
+enabled host-ACP Git source, it creates no checkout: it canonicalizes the source and configured root for containment,
+then derives a bounded target name from a versioned, length-prefixed SHA-256 encoding of persisted `AttemptId`,
+graph-bound node ref, candidate ordinal, logical-session kind, lexical and canonical source, canonical root, stable
+owner, and checkout-schema version. `run.instance_id`, PID, host, lease, and process-local session text are excluded.
+The frozen matrix contains `Preflight { candidate_ordinal }` and `Execute { candidate_ordinal }` for every candidate
+that current preflight may select; with preflight disabled it contains only `Execute { candidate_ordinal: 0 }`.
+Current real retries reuse one node SessionId, so they rebind and recreate/reuse that same execution row rather than
+minting an unpersisted checkout. A new retry/session behavior would require a new schema row before use.
 
-`SessionSpec.cwd` is always `Some(node.effect.effective_session_cwd)` on the V2 path. Neither the executor nor a
-backend may fall back again to entry configuration. Resume with no new request envelope uses the persisted value.
+Sandbox/container composition may likewise canonicalize a separately held host source object before freeze, but
+that security result cannot silently replace the frozen destination/delivery text. After freeze, no
+`canonicalize`, legacy `resolve_worktree`, spawn helper, or backend default may change the bytes supplied to
+`SessionSpec.cwd` or `{cwd}` substitution. Direct ordinary workflow identity retains textual path semantics; a
+worktree row deliberately includes both lexical source and canonical source/root custody. R2d remains the separate
+general object-identity boundary.
+
+`SessionSpec.cwd` is always `Some(attempt.effect.effective_session_cwd)` on the V2 path. Neither the executor nor a
+backend may fall back again to entry configuration or derive another checkout. Resume with no new request envelope
+uses the persisted value.
 If a resume surface does supply a new cwd field, its explicit absence/presence and normalized bytes must equal the
 persisted request field or the resume refuses with a pre-effect persistence conflict. V1 keeps the legacy
 `TaskRecord.session_cwd` path only for V1 compatibility.
@@ -950,23 +1007,30 @@ Order:
 4. Validate field combinations and true-omission semantics.
 5. Validate the DAG, references, acyclicity, and exactly one terminal.
 6. Resolve the profile and checked arithmetic.
-7. Validate and freeze the optional request cwd, capture one absolute operator-launch cwd, and inspect each effective
+7. Validate and freeze the optional request cwd, capture one absolute operator-launch cwd and the durable
+   `AttemptId`, and inspect each effective
    configured provider entry — every ordinary-workflow effect field in §3 plus the selection tuple of agent,
    preflight flag, model, ordered fallback list, effort, and mode — without resolving, checking out, configuring, or
    spawning a backend.
-8. Resolve each node's effective session cwd with the closed precedence above; resolve its exact ordered MCP delivery
-   once from that cwd and the immutable entry; reject any invalid source/key/delivery before effects.
-9. Validate Max qualification.
-10. Validate retry counts and critical-path retry backoff.
-11. Freeze each node's complete `FrozenProviderEffectV1` and `FrozenProviderSelectionV1`, compute the canonical
-    MCP-delivery, provider-effect, and selection digests, and the graph-bound execution-identity fingerprint over
-    all of them, then construct the controls fingerprint and control-inclusive workload fingerprint from those
-    frozen values.
-12. Select the one authoritative ledger, reject unsupported configured-history physical modes, and record its
+8. Resolve each node's source cwd with the closed precedence above. Through the injected read-only checkout planner,
+   classify every reachable logical session exhaustively as direct or worktree before any checkout/backend effect.
+   For an enabled host-ACP Git source, canonicalize and gate the source/root and derive the exact target from the
+   persisted attempt id, graph-bound node ref, candidate ordinal, logical-session kind, source/root, owner, and
+   checkout schema version. For disabled worktrees, unsupported backend kinds, or a non-Git source, freeze `Direct`.
+9. Resolve each attempt row's exact ordered MCP delivery once from its final effective cwd and immutable entry;
+   reject any invalid checkout/source/key/delivery before effects.
+10. Validate Max qualification.
+11. Validate retry counts and critical-path retry backoff.
+12. Freeze each node's complete, canonically ordered `FrozenProviderAttemptIdentityV1` matrix and
+    `FrozenProviderSelectionV1`, compute every checkout, MCP-delivery, provider-effect, selection, attempt, and
+    graph-bound node fingerprint, then construct the controls fingerprint and control-inclusive workload fingerprint
+    from those frozen values.
+13. Select the one authoritative ledger, reject unsupported configured-history physical modes, and record its
     `LedgerAdmissionV1` disposition in the frozen run spec, so no
     later barrier has to guess whether an offline history ledger was healthy.
-13. Refuse inactive production behavior, including `fixed_grace` in R2f1a.
-14. Only then create task/history rows, mutate context-cancel maps, construct/lookup a registry, create sessions, or contact a provider.
+14. Refuse inactive production behavior, including `fixed_grace` in R2f1a.
+15. Only then create task/history rows, mutate context-cancel maps, construct/lookup a registry, create/check out
+    worktrees, create sessions, or contact a provider.
 
 All arithmetic uses checked operations. `work_cutoff_ms + 70_000` must fit the persisted monotonic representation. Retry `max_attempts` becomes explicitly `1..=1024`; zero no longer means one. Zero backoff remains legal. Compute the maximum cumulative retry backoff on a DAG path, not the sum across parallel branches; it must be less than the frozen work cutoff.
 
@@ -976,8 +1040,8 @@ At admission, persist:
 - the optional normalized requested session cwd;
 - their fingerprint;
 - the control-inclusive workload fingerprint;
-- the complete per-node frozen execution identities, including effective session cwd, MCP delivery digest, each `FrozenProviderEffectV1` and
-  `FrozenProviderSelectionV1` with both digests and the combined identity fingerprint;
+- the complete per-node frozen execution identities, including every logical-session checkout, final effective cwd,
+  MCP delivery digest, `FrozenProviderEffectV1`, `FrozenProviderSelectionV1`, and attempt/node fingerprint;
 - the frozen `LedgerAdmissionV1` disposition;
 - task class and policy version `r2f1a`;
 - expected node count and bounded node-evidence reservation.
@@ -1049,6 +1113,8 @@ pub struct BoundEntryUseV1 {
 /// Non-serializable effect material handed to `resolve_bound`/`configure_session`.
 /// Its digest fields must equal the persisted frozen identity before any use.
 pub struct BoundProviderEffectV1 {
+    pub logical_session: FrozenProviderLogicalSessionV1,
+    pub checkout: FrozenCheckoutEffectV1,
     pub effective_session_cwd: SessionCwd,
     pub mcp_delivery_digest: Sha256HexV1,
     pub effect_digest: Sha256HexV1,
@@ -1076,12 +1142,15 @@ pub struct EntryUseTokenV1(/* private */);
 
 struct FrozenEntryUseV1 {
     bound: BoundEntryUseV1,
-    effect: FrozenProviderEffectV1,         // the frozen value, carried alongside for comparison
+    attempt: FrozenProviderAttemptIdentityV1, // frozen checkout + effect, carried for comparison
     selection: FrozenProviderSelectionV1,   // the frozen value, carried alongside for use
     bound_effect: BoundProviderEffectV1,    // exact committed bytes; secret-silent and never persisted
 }
 
-fn bind_frozen_entry(node: &FrozenNodeExecutionIdentityV1)
+fn bind_frozen_entry(
+    node: &FrozenNodeExecutionIdentityV1,
+    logical_session: &FrozenProviderLogicalSessionV1,
+)
     -> Result<FrozenEntryUseV1, ConfigurationDriftV1>;
 ```
 
@@ -1105,9 +1174,10 @@ A drift decision that terminalizes a node is always made on the durable digests.
 fingerprint, projection, or persisted row, and a token mismatch is a linearization fault rather than a
 configuration-drift verdict.
 
-`bind_frozen_entry` takes the lease **before** reading the entry, obtains exactly one `Arc<AgentEntry>`, resolves the
-exact MCP delivery from that value and the node's already frozen effective cwd, recomputes the MCP-delivery,
-provider-effect, and selection digests, and compares all three plus the identity fingerprint with the node's frozen
+`bind_frozen_entry` selects exactly one persisted logical-session row, takes the lease **before** reading the entry,
+obtains exactly one `Arc<AgentEntry>`, and revalidates the checkout inputs without deriving a target. It resolves the
+exact MCP delivery from that value and the attempt row's already frozen final cwd, recomputes the checkout,
+MCP-delivery, provider-effect, selection, attempt, and node digests, and compares all of them with the frozen
 identity. The `BoundMcpDeliveryV1` returned is the exact byte source later handed to the backend. Because current
 `apply` publishes the replacement map before marking
 old slots retired, `is_retired()` alone is not a sufficient current-slot test. The bind loop therefore:
@@ -1989,6 +2059,9 @@ After integrating all Stage-2 siblings, one owner changes the shared seams:
 - `crates/bridge-coordinator/src/params.rs`
 - `crates/bridge-coordinator/src/session_manager.rs`
 - `crates/bridge-api/src/backend.rs`
+- `crates/bridge-worktree/src/provider_path.rs`
+- `crates/bridge-worktree/src/backend.rs`
+- `crates/bridge-worktree/src/lib.rs`
 - `bin/a2a-bridge/src/main.rs`
 - `crates/bridge-a2a-inbound/src/server.rs`
 - `crates/bridge-mcp/src/server.rs`
@@ -2001,7 +2074,12 @@ effect-bearing field after the bind, and converting retry invalidation to the ex
 `bind_entry_use`/`resolve_bound`/`invalidate_bound` implementations in `crates/bridge-registry/src/registry.rs` are
 part of this stage because they must land with their only production callers. It owns the native-MCP effect-keyed
 backend subslots plus `main.rs`/container/ACP composition changes that consume `BoundMcpDeliveryV1` without a second
-cwd resolution or substitution. This stage also owns the API-local
+cwd resolution or substitution. It also replaces V2 worktree path derivation with bound checkout consumption:
+`WorktreeBackend::configure_bound_session` accepts only the persisted source/target pair, verifies exact sidecar and
+source/root custody, creates/reuses that exact target, and forwards the same bound target/delivery to the inner
+backend. Its legacy `configure_session` path remains V1-only. Volatile `run.instance_id` may identify current
+liveness/cleanup custody in the sidecar but never participates in V2 target, checkout digest, cache, replay, or
+resume identity. This stage also owns the API-local
 `Unconfigured | ExplicitNone | ExplicitSome` session-model transition, so bound `None` cannot fall through to a
 stale spawn default. These files must not be split among
 concurrent implementors.
@@ -2062,6 +2140,15 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
   delivery that produced the persisted MACs; there is no second substitution call. A literal with no `{cwd}` keeps
   identical delivery bytes but still changes effect identity because session cwd changed. A same-cwd request with
   a different raw spelling that normalizes to the same `SessionCwd` is the negative control and remains identical.
+- **W1/W1-B worktree composition, red first:** enable worktrees for a host ACP Git source with both a public and a
+  referenced-secret MCP `{cwd}` value. Freeze every preflight-candidate row and every candidate's execution row.
+  Assert that persisted source cwd, canonical source/root, exact target, final `SessionSpec.cwd`, outbound MCP bytes,
+  delivery commitment, attempt/node/cache/workload identity, and actual `git worktree add` destination agree byte for
+  byte. Preflight rows are distinct from execution rows; retries reuse the selected execution target. Restart with a
+  different `run.instance_id` and require exact persisted-target recreation/reuse or a typed pre-effect refusal.
+  Disabled worktrees and non-Git sources freeze `Direct`; same-effect replay is idempotent; a changed source/root/
+  owner/target/sidecar is drift; canonical-equivalent source spelling remains stable. A source guard rejects V2
+  calls to `resolve_worktree` or any post-bind target/MCP renderer.
 - Cwd precedence is table-tested for request override, `entry.session_cwd`, `entry.cwd`, and launch-cwd fallback.
   Relative static values resolve against the captured launch cwd even if process cwd changes later. Absence versus
   presence is preserved in the run spec; entries with different static fallbacks produce different per-node
@@ -2485,10 +2572,10 @@ of that closed population is:
 | WRONG W3 — configured-store undercount | §9 deletes the fixed 256-byte row overhead and measures every allocation-owned table/index page through bundled `dbstat` after exact materialization. A persisted closed ticket population reserves every remaining lifecycle mutation; WAL commits move the full reserve to sticky debt until a complete reset, and rollback journals retain one transient maximum. Root attribution keeps unrelated primary/authority pages outside the configured history allocation while accounting for every history leaf/interior/overflow page and its journal frame, including inside a mixed atomic admission. Because `dbstat` omits pointer-map/freelist/header pages, the ticket applies the proved `D(R) = 3R + 2` structural bound to the pre/post history-root union and forbids transient allocation churn. Each transaction remeasures, rebases outstanding tickets, and rolls back before commit if the component sum exceeds 128 MiB or page growth exceeds the ticket proof. §12 covers 512-byte/1-MiB ID, auto-vacuum structure, many-short-ID, pinned-reader, root isolation, index/trigger classification, unsupported journal modes, arithmetic, migration, retention, and failpoints without capping or hashing `NodeId`. |
 | WRONG W5 — impossible injected comparison | §3 and §12 now say `evidence_overflow` is the only dedicated classifier, not the only changed field. A test-only smaller internal limit forces the otherwise unreachable fallback and permits exactly flag `false -> true`, dependency `Some -> None`, a deepest nonempty UTF-8 suffix, and monotonic `cause_truncated`; every other field is byte-identical and explicitly destructured. Forbidden changes or a still-over-bound output fail before persistence. |
 
-The newly declared cap permits deterministic documentation gates followed by exactly one fresh cumulative Sol/xhigh
-closure review of the clean repair commit. It permits no second repair/review loop. Until that review approves, no
-implementation, Rust test result, release, deployment, or live operator effect is authorized or claimed; a rejection
-parks this document again.
+The historical cap permitted deterministic documentation gates followed by exactly one fresh cumulative Sol/xhigh
+closure review of that clean repair commit. It permitted no second repair/review loop, and the rejection therefore
+parked that exact checkpoint. The later owner authorization recorded below reopens correction and implementation
+only; it does not retroactively change this cap or verdict.
 
 Closure review 4 marked W1-A, W2, W4, W5, and W6 `FIXED`, retained W1/W1-B and W3 as `PARTIAL`, and rejected the
 following exact residual population:
@@ -2506,14 +2593,36 @@ record. The owner then opened one further closed-population round. This revision
 | WRONG W1/W1-B — effective request cwd and delivered MCP bytes were not committed | §§3/5 add normalized `requested_session_cwd` to `WorkflowRunSpecV1` and resolved `effective_session_cwd` plus `mcp_delivery_digest` to every provider effect/identity. One closed resolver applies request → entry session cwd → entry cwd → captured launch cwd. The same bound effect supplies non-optional `SessionSpec.cwd`, exact post-substitution ACP/native MCP bytes, redaction, cache, replay, and resume through additive `BoundSessionSpecV1`; V2 never uses static ACP templates. ACP conversion does no second substitution; process-start native backends are keyed by complete effect, container children consume the per-session bound argv, and Kiro uses immutable content-addressed config names so cwd A cannot overwrite or reuse B's delivery. §12's served and fresh/resumed batch A/B controls require distinct identities/cache entries, committed-to-delivered byte equality, pre-effect replay conflict, same-normalized-cwd equality, no transient entry stamping, symlink-spelling stability, all three delivery channels, and a no-template delivery negative control. |
 | WRONG W3 — FULL auto-vacuum escaped `D(R)=3R+2` | §9 limits the configured root-attributed proof to `NONE` and `INCREMENTAL` without vacuum. The serialized connection rechecks mode after `BEGIN IMMEDIATE` and before the first mutation; migration checks before DDL. FULL/unknown is a typed unsupported-configuration refusal outside optional-ledger fail-open, and an authorizer plus exhaustive source guard prohibits bridge-owned incremental vacuum while V2 is active. §12 retains the exact bundled-SQLite fragmented FULL fixture as fail-first proof of the old formula, then requires open/admission/retention/migration to refuse byte-clean before authority/task/provider effects, with NONE/INCREMENTAL positives and an incremental-vacuum negative. |
 
-This repair remains design-only and has not run a Rust behavior test. Its pre-freeze deterministic gates passed:
+That repair remained design-only and had not run a Rust behavior test. Its pre-freeze deterministic gates passed:
 `git diff --check`, direct existence checks for every changed-document target, and
 `cargo run -p a2a-bridge -- validate --repo-hygiene` (**39 tracked artifacts / 7 validated example configs**).
 That command reused the scratch clone's dev build; it is not provider or Rust behavior evidence. Closure review 5
 accepted the two intended local mechanisms but found the post-bind worktree transformation above. Its complete
 likelihood, exposure, impact, bounded corrections, cost, and fail-first matrix are retained in the linked review.
-The round cap is exhausted and permits no repair, review replay/fallback, implementation, compatibility/live case,
-release, deployment, or operator mutation. This exact artifact and evidence are parked pending separate owner
+The round cap was exhausted and permitted no repair, review replay/fallback, implementation, compatibility/live case,
+release, deployment, or operator mutation. That exact artifact and evidence were parked pending separate owner
 direction.
 
-R2F1A FOCUSED BOUNDARY: PARKED / SOL CLOSURE REVIEW 5 REJECT / CAP EXHAUSTED / IMPLEMENTATION UNAUTHORIZED
+### Owner-authorized closure-5 correction
+
+The owner has now supplied that separate direction: implement the full bounded correction and continue R2f1a. The
+persisted `AttemptId` plus graph-bound node ref and finite `Preflight { candidate_ordinal }` / `Execute {
+candidate_ordinal }` logical-session matrix replace volatile process-run/session derivation as checkout authority.
+Each row carries its direct or worktree source/target, final cwd, exact delivery commitment, effect digest, and
+attempt fingerprint. Current real retries reuse one execution SessionId and therefore the same persisted execution
+row; no retry-grid expansion or behavioral retry is added.
+
+For an enabled host-ACP Git source, the target name is a versioned SHA-256 derivation over the canonical encoding of
+persisted attempt id, node ref, candidate ordinal, logical-session kind, lexical and canonical source, canonical
+root, and stable owner. `run.instance_id`, PID, host, and lease are excluded. They remain ephemeral sidecar custody
+facts. Before checkout, resume must match the complete persisted row and current immutable worktree configuration;
+an existing exact target may be reused/recreated only after sidecar/source/lease checks, while any mismatch refuses
+without checkout, session, or provider effect. `WorktreeBackend::configure_bound_session` consumes the target and
+delivery; it cannot call legacy `resolve_worktree`, re-render MCP, or substitute another cwd.
+
+This closes the constructible outcome from closure review 5 without disabling the optional feature: agent and MCP
+operate on the same persisted worktree, replay/cache identity names the bytes actually delivered, and a restart
+cannot silently move the checkout. Historical review 5 remains `REJECT` evidence against `f509657…`; implementation
+must supply the red/green matrix above plus the complete R2f1a suite before this slice can claim acceptance.
+
+R2F1A FOCUSED BOUNDARY: OWNER-AUTHORIZED WORKTREE CORRECTION / IMPLEMENTATION IN PROGRESS
