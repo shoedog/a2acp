@@ -2,11 +2,12 @@ use async_trait::async_trait;
 use bridge_core::domain::{AgentEntry, AgentKind, Part, RegistrySnapshot};
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
-    freeze_node_execution_identity_v1, freeze_provider_attempt_v1, freeze_worktree_checkout_v1,
-    resolve_execution_policy_v1, BoundMcpDeliveryPayloadV1, BoundSessionSpecV1,
-    ExecutionPolicyInvocationV1, FrozenProviderLogicalSessionV1, HistoryAllocationKindV1,
-    LedgerAdmissionV1, PolicyActivationV1, PolicyNodeRefV1, ProviderFreezeInputV1,
-    WorkflowControlDefaultsV1, WorktreeCheckoutInputV1,
+    freeze_direct_checkout_v1, freeze_node_execution_identity_v1, freeze_provider_attempt_v1,
+    freeze_worktree_checkout_v1, resolve_execution_policy_v1, BoundMcpDeliveryPayloadV1,
+    BoundSessionSpecV1, ExecutionPolicyInvocationV1, FanOutPolicyV1,
+    FrozenProviderLogicalSessionV1, HistoryAllocationKindV1, LedgerAdmissionV1, PolicyActivationV1,
+    PolicyNodeRefV1, ProviderFreezeInputV1, SynthesisModeV1, WorkflowControlDefaultsV1,
+    WorktreeCheckoutInputV1,
 };
 use bridge_core::ids::{AgentId, AttemptId, NodeId, SessionId, WorkflowId};
 use bridge_core::mcp::{McpDelivery, McpServerSpec};
@@ -40,11 +41,59 @@ struct Calls {
     legacy_configures: AtomicUsize,
     main_prompts: AtomicUsize,
     fail_main_prompts: AtomicUsize,
+    policy_cancels: AtomicUsize,
+    synth_prompts: AtomicUsize,
     bound_specs: Mutex<Vec<BoundSessionSpecV1>>,
 }
 
 struct RecordingBackend {
     calls: Arc<Calls>,
+}
+
+struct FanoutBackend {
+    calls: Arc<Calls>,
+}
+
+#[async_trait]
+impl AgentBackend for FanoutBackend {
+    async fn prompt(
+        &self,
+        _session: &SessionId,
+        parts: Vec<Part>,
+    ) -> Result<BackendStream, BridgeError> {
+        let prompt = parts
+            .iter()
+            .map(|part| part.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if prompt.contains("FAIL_ROOT") {
+            return Err(BridgeError::AgentOverloaded);
+        }
+        if prompt.contains("SLOW_ROOT") {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        if prompt.contains("SYNTH_NODE") {
+            self.calls.synth_prompts.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(Box::pin(tokio_stream::iter(vec![
+            Ok(Update::Text("OK".into())),
+            Ok(Update::done("end_turn")),
+        ])))
+    }
+
+    async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        self.calls.policy_cancels.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn configure_bound_session(
+        &self,
+        _session: &SessionId,
+        spec: &BoundSessionSpecV1,
+    ) -> Result<(), BridgeError> {
+        self.calls.bound_specs.lock().unwrap().push(spec.clone());
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -313,6 +362,89 @@ fn frozen_worktree_run_with_retry(
 
 fn frozen_worktree_run(entry: &AgentEntry) -> WorkflowRunSpecV1 {
     frozen_worktree_run_with_retry(entry, None)
+}
+
+fn frozen_fail_fast_run(entry: &AgentEntry) -> WorkflowRunSpecV1 {
+    let attempt_id = AttemptId::parse("attempt-33333333333333333333333333333333").unwrap();
+    let source_cwd = SessionCwd::parse("/repo/source").unwrap();
+    let nodes = vec![
+        WorkflowNode {
+            id: NodeId::parse("fail-root").unwrap(),
+            agent: entry.id.clone(),
+            prompt_template: "FAIL_ROOT".into(),
+            inputs: vec![],
+            retry: None,
+            harvest_sanitization: None,
+        },
+        WorkflowNode {
+            id: NodeId::parse("slow-root").unwrap(),
+            agent: entry.id.clone(),
+            prompt_template: "SLOW_ROOT".into(),
+            inputs: vec![],
+            retry: None,
+            harvest_sanitization: None,
+        },
+        WorkflowNode {
+            id: NodeId::parse("synth").unwrap(),
+            agent: entry.id.clone(),
+            prompt_template: "SYNTH_NODE {{fail-root}} {{slow-root}}".into(),
+            inputs: vec![
+                NodeId::parse("fail-root").unwrap(),
+                NodeId::parse("slow-root").unwrap(),
+            ],
+            retry: None,
+            harvest_sanitization: None,
+        },
+    ];
+    let graph = WorkflowGraph {
+        id: WorkflowId::parse("fail-fast-review").unwrap(),
+        nodes: nodes.clone(),
+        panel: None,
+        controls: Some(WorkflowControlDefaultsV1 {
+            fan_out: Some(FanOutPolicyV1::FailFast),
+            synthesis: Some(SynthesisModeV1::Strict),
+            ..WorkflowControlDefaultsV1::default()
+        }),
+    };
+    let identities = nodes
+        .iter()
+        .enumerate()
+        .map(|(ordinal, node)| {
+            let node_ref =
+                PolicyNodeRefV1::from_node_id(u32::try_from(ordinal).unwrap(), node.id.as_str());
+            let logical_session = FrozenProviderLogicalSessionV1::Execute {
+                candidate_ordinal: 0,
+            };
+            let provider = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+                entry,
+                overrides: None,
+                node: node_ref.clone(),
+                logical_session,
+                checkout: freeze_direct_checkout_v1(source_cwd.clone()),
+                provider_effect_key: None,
+            })
+            .unwrap();
+            freeze_node_execution_identity_v1(node_ref, vec![provider]).unwrap()
+        })
+        .collect();
+    let controls = resolve_execution_policy_v1(
+        graph.controls.as_ref().unwrap(),
+        &ExecutionPolicyInvocationV1::default(),
+        false,
+        PolicyActivationV1::Production,
+    )
+    .unwrap();
+    WorkflowRunSpecV1::build(
+        attempt_id,
+        graph,
+        controls,
+        Some(source_cwd),
+        identities,
+        LedgerAdmissionV1::HistoryLedgerUnavailable {
+            reason: bridge_core::workflow_history::LedgerUnavailableReason::Open.into(),
+        },
+    )
+    .unwrap()
 }
 
 async fn execute_bound(
@@ -592,4 +724,59 @@ async fn v2_refuses_legacy_dispatcher_before_any_unbound_read_or_checkout() {
     assert_eq!(calls.binds.load(Ordering::SeqCst), 0);
     assert_eq!(calls.bound_resolves.load(Ordering::SeqCst), 0);
     assert!(calls.bound_specs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn v2_fail_fast_cancels_running_sibling_and_never_admits_synthesis() {
+    let entry = Arc::new(entry());
+    let run_spec = Arc::new(frozen_fail_fast_run(&entry));
+    run_spec.validate().unwrap();
+    let calls = Arc::new(Calls::default());
+    let backend: Arc<dyn AgentBackend> = Arc::new(FanoutBackend {
+        calls: calls.clone(),
+    });
+    let registry = Arc::new(BoundOnlyRegistry {
+        entry,
+        backend,
+        slot: Arc::new(()),
+        calls: calls.clone(),
+        fail_preflight_ordinal: None,
+    });
+    let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+        session_cwd: run_spec.requested_session_cwd.clone(),
+        ..WorkflowRunContext::default()
+    })
+    .with_frozen_run_spec(run_spec.clone(), None)
+    .unwrap();
+    let executor = WorkflowExecutor::new(registry);
+    let stream = executor.run_with_diagnostic_context(
+        Arc::new(run_spec.graph.clone()),
+        "review this".into(),
+        "bound-fail-fast-run".into(),
+        CancellationToken::new(),
+        context,
+    );
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.collect::<Vec<_>>(),
+    )
+    .await
+    .expect("fail-fast execution must drain")
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+
+    assert_eq!(calls.policy_cancels.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.synth_prompts.load(Ordering::SeqCst), 0);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        WorkflowEvent::NodeStarted { node } if node.as_str() == "synth"
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(WorkflowEvent::Terminal {
+            outcome: WorkflowOutcome::Failed,
+            ..
+        })
+    ));
 }

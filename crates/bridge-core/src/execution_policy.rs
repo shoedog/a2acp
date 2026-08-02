@@ -1070,6 +1070,28 @@ impl From<crate::workflow_history::LedgerUnavailableReason> for BoundedLedgerRea
     }
 }
 
+impl From<BoundedLedgerReasonV1> for crate::workflow_history::LedgerUnavailableReason {
+    fn from(value: BoundedLedgerReasonV1) -> Self {
+        use crate::workflow_history::LedgerUnavailableReason as Target;
+        match value {
+            BoundedLedgerReasonV1::Open => Target::Open,
+            BoundedLedgerReasonV1::Permission => Target::Permission,
+            BoundedLedgerReasonV1::ReadOnlyDatabase => Target::ReadOnlyDatabase,
+            BoundedLedgerReasonV1::ReadOnlyLock => Target::ReadOnlyLock,
+            BoundedLedgerReasonV1::ReadOnlyParent => Target::ReadOnlyParent,
+            BoundedLedgerReasonV1::AdvisoryLockUnsupported => Target::AdvisoryLockUnsupported,
+            BoundedLedgerReasonV1::AdvisoryLockIo => Target::AdvisoryLockIo,
+            BoundedLedgerReasonV1::Locked => Target::Locked,
+            BoundedLedgerReasonV1::Migration => Target::Migration,
+            BoundedLedgerReasonV1::Schema => Target::Schema,
+            BoundedLedgerReasonV1::Corruption => Target::Corruption,
+            BoundedLedgerReasonV1::Io => Target::Io,
+            BoundedLedgerReasonV1::CapacityProtected => Target::CapacityProtected,
+            BoundedLedgerReasonV1::Collision => Target::Collision,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "admission", rename_all = "snake_case")]
 pub enum LedgerAdmissionV1 {

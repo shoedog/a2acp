@@ -1,5 +1,9 @@
 //! WorkflowExecutor — runs a validated DAG over the registry. Each node: configure_session
 //! → prompt → concatenate Update::Text into the node output. Cancel via token.
+use crate::fanout::{
+    classify_offline_barrier_error_v1, FanOutControllerV1, PolicyActionV1,
+    PolicyTriggerBarrierResultV1, ReadyNodeTerminalV1,
+};
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::run_spec::WorkflowRunSpecV1;
 use crate::template::render;
@@ -13,8 +17,10 @@ use bridge_core::domain::{
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
     freeze_provider_attempt_v1, BoundProviderEffectV1, BoundSessionSpecV1,
-    FrozenNodeExecutionIdentityV1, FrozenProviderLogicalSessionV1, ProviderEffectKeyV1,
-    ProviderFreezeInputV1, Sha256HexV1,
+    FrozenNodeExecutionIdentityV1, FrozenProviderLogicalSessionV1, LedgerAdmissionV1,
+    NodeCleanupDispositionV1, NodeCleanupV1, NodePrimaryDispositionV1, NodeTerminalV1,
+    PolicyNodeRefV1, ProviderEffectKeyV1, ProviderFreezeInputV1, Sha256HexV1,
+    EXECUTION_POLICY_SCHEMA_V1,
 };
 use bridge_core::harvest::{
     commit_harvested_completion, CompletionBodyOrigin, HarvestAuditStore, NoopHarvestAuditStore,
@@ -30,8 +36,8 @@ use bridge_core::ports::{
 };
 use bridge_core::SessionCwd;
 use futures::stream::FuturesUnordered;
-use futures::StreamExt;
-use std::collections::{HashMap, HashSet};
+use futures::{FutureExt, StreamExt};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -3937,6 +3943,25 @@ impl WorkflowExecutor {
             let preflight_cache: PreflightCache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let mut scheduled: HashSet<String> = HashSet::new();
             let mut stop_scheduling = false; // set on cancel: drain in-flight, schedule nothing new
+            let mut node_cancels = BTreeMap::<NodeId, CancellationToken>::new();
+            let mut policy_canceled = HashSet::<String>::new();
+            let mut node_terminals = BTreeMap::<NodeId, NodeTerminalV1>::new();
+            let mut node_refs = BTreeMap::<NodeId, PolicyNodeRefV1>::new();
+            let mut fanout_controller = frozen_authority
+                .as_ref()
+                .map(|authority| FanOutControllerV1::new(authority.run_spec.controls.fan_out.clone()));
+            if let Some(authority) = frozen_authority.as_ref() {
+                for node in &graph.nodes {
+                    let identity = match authority.node_identity(node) {
+                        Ok(identity) => identity,
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    };
+                    node_refs.insert(node.id.clone(), identity.node.clone());
+                }
+            }
 
             // Push every not-done/not-scheduled node whose inputs are all done.
             // Returns the node ids newly scheduled (so the caller can emit NodeStarted).
@@ -3986,7 +4011,9 @@ impl WorkflowExecutor {
                                 }
                                 let node = n.clone();
                                 let run_id = run_id.clone();
-                                let cancel = cancel.clone();
+                                let node_cancel = cancel.child_token();
+                                node_cancels.insert(n.id.clone(), node_cancel.clone());
+                                let cancel = node_cancel;
                                 let wf_id = graph.id.as_str().to_string();
                                 let ctx = ctx.clone();
                                 let diagnostic_factory = diagnostic_factory.clone();
@@ -4025,88 +4052,180 @@ impl WorkflowExecutor {
             for node in schedule_ready!() {
                 yield Ok(WorkflowEvent::NodeStarted { node });
             }
-            while let Some((node_id, raw_output)) = inflight.next().await {
-                let raw_output = match raw_output {
-                    Ok(output) => output,
-                    Err(error) => {
-                        yield Err(error);
-                        return;
-                    }
+            loop {
+                let workflow_cancel_observable_before_wait = cancel.is_cancelled();
+                let Some(first) = inflight.next().await else {
+                    break;
                 };
-                let NodeRunOutput {
-                    text: raw_text,
-                    ok,
-                    usage,
-                    disposition,
-                    harvest,
-                } = raw_output;
-                // §18-7 Off-mode audit exemption: with zero runnable enabled
-                // nodes there is no audit commit at all — Off mode is the §7.1
-                // identity, so the raw body IS the effective body, and no
-                // KeptOff decision is minted only to be discarded by a noop
-                // store. When any runnable node enables the feature, EVERY
-                // completion of the run (enabled and Off nodes alike, §18-4
-                // regardless of `ok`) commits its bundle before release.
-                let text = if audit_required {
-                    let committed = match commit_harvested_completion(
-                        &harvest.context,
-                        harvest.mode,
-                        &harvest.capability,
-                        &harvest.producer_id,
-                        harvest.origin,
-                        raw_text,
-                        harvest.status.clone(),
-                        ctx.harvest_audit_store.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(committed) => committed,
+                let mut ready = vec![first];
+                while let Some(Some(next)) = inflight.next().now_or_never() {
+                    ready.push(next);
+                }
+                ready.sort_by(|left, right| left.0.cmp(&right.0));
+
+                let mut completed = Vec::with_capacity(ready.len());
+                let mut ready_terminals = Vec::with_capacity(ready.len());
+                for (node_id, raw_output) in ready {
+                    node_cancels.remove(&node_id);
+                    let raw_output = match raw_output {
+                        Ok(output) => output,
                         Err(error) => {
-                            yield Err(BridgeError::from(error));
+                            yield Err(error);
                             return;
                         }
                     };
-                    if let Some(factory) = &ctx.make_rich_sink {
-                        let sink = factory.make(&node_id);
-                        sink.record(bridge_core::orch::OrchEventKind::HarvestSanitizationDecision {
-                            audit_id: committed.audit_id.clone(),
-                            run_id: harvest.context.session_id.as_str().to_string(),
-                            node_id: node_id.as_str().to_string(),
-                            attempt_id: harvest.context.attempt,
-                            producer_id: harvest.producer_id.clone(),
-                            mode: committed.decision.mode,
-                            decision: committed.decision.decision,
-                            reason: committed.decision.reason.clone(),
-                        });
-                        if let Err(error) = sink.flush().await {
-                            tracing::warn!(
-                                node = node_id.as_str(),
-                                audit_id = committed.audit_id.as_str(),
-                                error = ?error,
-                                "harvest sanitization decision event flush failed"
-                            );
+                    let NodeRunOutput {
+                        text: raw_text,
+                        ok,
+                        usage,
+                        disposition,
+                        harvest,
+                    } = raw_output;
+                    // §18-7 Off-mode audit exemption: with zero runnable enabled
+                    // nodes there is no audit commit at all — Off mode is the §7.1
+                    // identity, so the raw body IS the effective body, and no
+                    // KeptOff decision is minted only to be discarded by a noop
+                    // store. When any runnable node enables the feature, EVERY
+                    // completion of the run (enabled and Off nodes alike, §18-4
+                    // regardless of `ok`) commits its bundle before release.
+                    let text = if audit_required {
+                        let committed = match commit_harvested_completion(
+                            &harvest.context,
+                            harvest.mode,
+                            &harvest.capability,
+                            &harvest.producer_id,
+                            harvest.origin,
+                            raw_text,
+                            harvest.status.clone(),
+                            ctx.harvest_audit_store.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(committed) => committed,
+                            Err(error) => {
+                                yield Err(BridgeError::from(error));
+                                return;
+                            }
+                        };
+                        if let Some(factory) = &ctx.make_rich_sink {
+                            let sink = factory.make(&node_id);
+                            sink.record(bridge_core::orch::OrchEventKind::HarvestSanitizationDecision {
+                                audit_id: committed.audit_id.clone(),
+                                run_id: harvest.context.session_id.as_str().to_string(),
+                                node_id: node_id.as_str().to_string(),
+                                attempt_id: harvest.context.attempt,
+                                producer_id: harvest.producer_id.clone(),
+                                mode: committed.decision.mode,
+                                decision: committed.decision.decision,
+                                reason: committed.decision.reason.clone(),
+                            });
+                            if let Err(error) = sink.flush().await {
+                                tracing::warn!(
+                                    node = node_id.as_str(),
+                                    audit_id = committed.audit_id.as_str(),
+                                    error = ?error,
+                                    "harvest sanitization decision event flush failed"
+                                );
+                            }
+                        }
+                        committed.effective_body
+                    } else {
+                        raw_text
+                    };
+                    let primary = match disposition {
+                        NodeDisposition::Completed => NodePrimaryDispositionV1::Completed,
+                        NodeDisposition::Failed => NodePrimaryDispositionV1::Failed,
+                        NodeDisposition::Canceled
+                            if policy_canceled.contains(node_id.as_str()) =>
+                        {
+                            NodePrimaryDispositionV1::CanceledPolicy
+                        }
+                        NodeDisposition::Canceled => NodePrimaryDispositionV1::CanceledWorkflow,
+                    };
+                    ready_terminals.push(ReadyNodeTerminalV1 {
+                        node: node_id.clone(),
+                        terminal: NodeTerminalV1 {
+                            schema_version: EXECUTION_POLICY_SCHEMA_V1,
+                            primary,
+                            cleanup: NodeCleanupV1 {
+                                disposition: NodeCleanupDispositionV1::NotNeeded,
+                                duration_ms: 0,
+                            },
+                            cause: None,
+                            prompt_may_have_been_accepted: false,
+                            degraded_ancestry: false,
+                            policy_trigger_id: None,
+                        },
+                    });
+                    completed.push((node_id, text, ok, usage, disposition));
+                }
+
+                let mut action = PolicyActionV1::None;
+                if let (Some(controller), Some(authority)) =
+                    (fanout_controller.as_mut(), frozen_authority.as_ref())
+                {
+                    let selection = match controller.finalize_ready_batch(
+                        &authority.run_spec.attempt_id,
+                        ready_terminals,
+                        &node_refs,
+                        workflow_cancel_observable_before_wait,
+                    ) {
+                        Ok(selection) => selection,
+                        Err(_) => {
+                            yield Err(BridgeError::InvalidStateTransition);
+                            return;
+                        }
+                    };
+                    for ready in selection.terminals {
+                        node_terminals.insert(ready.node, ready.terminal);
+                    }
+                    if selection.trigger.is_some() {
+                        let barrier = match authority.run_spec.ledger_admission {
+                            LedgerAdmissionV1::HistoryLedgerUnavailable { reason } => {
+                                classify_offline_barrier_error_v1(reason.into())
+                            }
+                            LedgerAdmissionV1::DurablePrimaryTaskStore
+                            | LedgerAdmissionV1::HistoryLedgerAdmitted { .. } => {
+                                PolicyTriggerBarrierResultV1::PrimaryFailed
+                            }
+                        };
+                        action = controller.acknowledge_barrier(barrier, cancel.is_cancelled());
+                    }
+                    stop_scheduling |= controller.admission_stopped();
+                } else {
+                    for ready in ready_terminals {
+                        node_terminals.insert(ready.node, ready.terminal);
+                    }
+                }
+
+                match action {
+                    PolicyActionV1::CancelRunningSiblings => {
+                        for (node, token) in &node_cancels {
+                            policy_canceled.insert(node.as_str().to_owned());
+                            token.cancel();
                         }
                     }
-                    committed.effective_body
-                } else {
-                    raw_text
-                };
-                yield Ok(WorkflowEvent::NodeFinished {
-                    node: node_id.clone(),
-                    ok,
-                    output: text.clone(),
-                    usage: usage.clone(),
-                });
-                done.insert(node_id.as_str().to_string());
-                dispositions.insert(node_id.as_str().to_string(), disposition);
-                outputs.insert(node_id.as_str().to_string(), (text, ok, usage));
+                    PolicyActionV1::GlobalCancelAndDrain => cancel.cancel(),
+                    PolicyActionV1::None | PolicyActionV1::ArmManualGrace { .. } => {}
+                }
+
+                for (node_id, text, ok, usage, disposition) in completed {
+                    yield Ok(WorkflowEvent::NodeFinished {
+                        node: node_id.clone(),
+                        ok,
+                        output: text.clone(),
+                        usage: usage.clone(),
+                    });
+                    done.insert(node_id.as_str().to_string());
+                    dispositions.insert(node_id.as_str().to_string(), disposition);
+                    outputs.insert(node_id.as_str().to_string(), (text, ok, usage));
+                }
                 if cancel.is_cancelled() {
                     // Stop scheduling NEW nodes, but keep draining so every already-in-flight
                     // sibling completes its run_node cancel branch (backend.cancel() +
                     // forget_session()). Do NOT `break` — that drops in-flight futures
                     // mid-cleanup → stranded ACP sessions (dual-review blocker).
                     stop_scheduling = true;
-                    continue;
                 }
                 for node in schedule_ready!() {
                     yield Ok(WorkflowEvent::NodeStarted { node });
