@@ -509,6 +509,51 @@ pub fn structured_node_counts_v1<'a>(
     Ok(counts)
 }
 
+pub fn structured_history_reservation_v1(
+    reservation: bridge_core::workflow_history::AttemptReservation,
+    run_spec: &bridge_workflow::run_spec::WorkflowRunSpecV1,
+) -> Result<bridge_core::workflow_history::AttemptReservationV2, BridgeError> {
+    let mut nodes = run_spec
+        .graph
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    nodes.sort();
+    let expected_node_count =
+        u32::try_from(nodes.len()).map_err(|_| BridgeError::InvalidStateTransition)?;
+    let nodes = nodes
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, node)| {
+            Ok(bridge_core::workflow_history::HistoryNodeReservationV1 {
+                node,
+                sorted_ordinal: u32::try_from(ordinal)
+                    .map_err(|_| BridgeError::InvalidStateTransition)?,
+            })
+        })
+        .collect::<Result<Vec<_>, BridgeError>>()?;
+    let controls_json = String::from_utf8(
+        run_spec
+            .controls
+            .encode_canonical()
+            .map_err(|_| BridgeError::InvalidStateTransition)?,
+    )
+    .map_err(|_| BridgeError::InvalidStateTransition)?;
+    let structured = bridge_core::workflow_history::AttemptReservationV2 {
+        schema_version: bridge_core::workflow_history::WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1,
+        reservation,
+        controls_json,
+        controls_fingerprint: run_spec.controls_fingerprint.clone(),
+        expected_node_count,
+        nodes,
+    };
+    structured
+        .validate()
+        .map_err(|_| BridgeError::InvalidStateTransition)?;
+    Ok(structured)
+}
+
 /// Detached progress sink: persists each event via the sequenced store methods
 /// (durable-first), then publishes a `WorkflowProgressFrame` to the task's
 /// in-memory `TaskProgressHub`. A durable-write `Err` propagates (aborts the
@@ -616,6 +661,44 @@ impl WorkflowSink for DetachedProgressSink {
             }
             None => return Err(BridgeError::StoreFailure),
         };
+        if let (Some(terminal_json), Some(barrier)) =
+            (terminal_json, self.terminal_barrier.as_ref())
+        {
+            if let Some(history) = barrier.inner.history.as_ref() {
+                let result = history
+                    .commit_node_terminal_v2(
+                        barrier.attempt_id(),
+                        &node_id,
+                        terminal_json,
+                        policy_trigger_json,
+                    )
+                    .await;
+                let unavailable = match result {
+                    Ok(
+                        bridge_core::workflow_history::TerminalWrite::Applied
+                        | bridge_core::workflow_history::TerminalWrite::Replayed,
+                    ) => None,
+                    Ok(bridge_core::workflow_history::TerminalWrite::Conflict) => {
+                        Some(bridge_core::workflow_history::LedgerUnavailableReason::Collision)
+                    }
+                    Err(error) => Some(error.reason),
+                };
+                if let Some(reason) = unavailable {
+                    barrier.inner.telemetry.record(reason);
+                    barrier.inner.observer().record_workflow(
+                        &bridge_core::ports::WorkflowObsEvent::TelemetryUnavailable { reason },
+                    );
+                    let _ = self
+                        .store
+                        .mark_attempt_telemetry_unavailable(
+                            &self.task,
+                            barrier.attempt_id(),
+                            reason,
+                        )
+                        .await;
+                }
+            }
+        }
         self.hub.publish(WorkflowProgressFrame {
             v: 1,
             seq,
@@ -2037,6 +2120,7 @@ mod sink_tests {
             prompt_acceptance: "unknown".into(),
             cleanup_disposition: "complete".into(),
             node_counts: NodeCounts::default(),
+            policy_trigger_json: None,
             phase_durations: Vec::new(),
             telemetry_complete: true,
             monotonic_clock: true,
@@ -2910,6 +2994,23 @@ impl TerminalSummaryBarrier {
                 (NodeCounts::default(), false)
             }
         };
+        let (policy_trigger_json, trigger_complete) = match self
+            .inner
+            .task_store
+            .workflow_task_evidence(&self.inner.task)
+            .await
+        {
+            Ok(evidence) => (evidence.policy_trigger_json, true),
+            Err(error) => {
+                tracing::warn!(
+                    task = self.inner.task.as_str(),
+                    error = ?error,
+                    "workflow trigger finalization failed"
+                );
+                self.inner.telemetry.record(R::Io);
+                (None, false)
+            }
+        };
         let outcome = workflow_outcome.as_str();
         let _ = self.inner.attempt_telemetry.recorder().record(
             bridge_core::attempt_activity::AttemptPhase::TerminalStore,
@@ -2922,8 +3023,10 @@ impl TerminalSummaryBarrier {
             .recorder()
             .tally()
             .is_some_and(|tally| !tally.overflowed);
-        let telemetry_complete =
-            self.inner.telemetry.reason().is_none() && node_counts_complete && activity_complete;
+        let telemetry_complete = self.inner.telemetry.reason().is_none()
+            && node_counts_complete
+            && trigger_complete
+            && activity_complete;
         let mut terminal = measured_workflow_terminal(
             self.inner.started,
             work_ms,
@@ -2940,6 +3043,7 @@ impl TerminalSummaryBarrier {
             workflow_outcome,
             self.inner.attempt_telemetry.evidence().as_ref(),
         );
+        terminal.policy_trigger_json = policy_trigger_json;
         terminal.degraded = terminal.outcome != "completed" || !terminal.telemetry_complete;
         terminal
     }
@@ -3332,6 +3436,7 @@ pub(crate) fn measured_workflow_terminal(
         prompt_acceptance: "unknown".into(),
         cleanup_disposition: cleanup_disposition.into(),
         node_counts,
+        policy_trigger_json: None,
         phase_durations: vec![
             bridge_core::workflow_history::PhaseDuration {
                 phase: "queue".into(),
@@ -4265,211 +4370,220 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
         else {
             continue;
         };
-        let (workflow_outcome, node_counts, prompt_acceptance, cleanup_disposition) =
-            if let Some(run_spec) = run_spec.as_ref() {
-                let terminal_evidence =
-                    match deps.task_store.node_terminal_evidence(&record.id).await {
-                        Ok(evidence)
-                            if evidence.len() == checkpoints.len()
-                                && evidence.len() == graph.nodes.len() =>
-                        {
-                            evidence
-                        }
-                        Ok(_) => {
-                            tracing::warn!(
-                                task = record.id.as_str(),
-                                "checkpoint reconciliation: incomplete V2 terminal map"
-                            );
-                            safe_to_interrupt = false;
-                            continue;
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                task = record.id.as_str(),
-                                error = ?error,
-                                "checkpoint reconciliation: V2 terminal evidence read failed"
-                            );
-                            safe_to_interrupt = false;
-                            continue;
-                        }
-                    };
-                let mut terminals = std::collections::BTreeMap::new();
-                let mut valid = true;
-                for evidence in terminal_evidence {
-                    let terminal =
-                        match bridge_core::execution_policy::NodeTerminalV1::decode_canonical(
-                            evidence.terminal_json.as_bytes(),
-                        ) {
-                            Ok(terminal) => terminal,
-                            Err(_) => {
-                                valid = false;
-                                break;
-                            }
-                        };
-                    let checkpoint_ok = checkpoints
-                        .iter()
-                        .find(|(node, ..)| node == &evidence.node)
-                        .map(|(_, _, checkpoint_ok, _)| *checkpoint_ok);
-                    if checkpoint_ok
-                        != Some(matches!(
-                            terminal.primary,
-                            bridge_core::execution_policy::NodePrimaryDispositionV1::Completed
-                        ))
-                        || terminals.insert(evidence.node, terminal).is_some()
-                    {
+        let (
+            workflow_outcome,
+            node_counts,
+            prompt_acceptance,
+            cleanup_disposition,
+            policy_trigger_json,
+        ) = if let Some(run_spec) = run_spec.as_ref() {
+            let terminal_evidence = match deps.task_store.node_terminal_evidence(&record.id).await {
+                Ok(evidence)
+                    if evidence.len() == checkpoints.len()
+                        && evidence.len() == graph.nodes.len() =>
+                {
+                    evidence
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        task = record.id.as_str(),
+                        "checkpoint reconciliation: incomplete V2 terminal map"
+                    );
+                    safe_to_interrupt = false;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        task = record.id.as_str(),
+                        error = ?error,
+                        "checkpoint reconciliation: V2 terminal evidence read failed"
+                    );
+                    safe_to_interrupt = false;
+                    continue;
+                }
+            };
+            let mut terminals = std::collections::BTreeMap::new();
+            let mut valid = true;
+            for evidence in terminal_evidence {
+                let terminal = match bridge_core::execution_policy::NodeTerminalV1::decode_canonical(
+                    evidence.terminal_json.as_bytes(),
+                ) {
+                    Ok(terminal) => terminal,
+                    Err(_) => {
                         valid = false;
                         break;
                     }
-                }
-                if !valid || terminals.len() != graph.nodes.len() {
-                    tracing::warn!(
-                        task = record.id.as_str(),
-                        "checkpoint reconciliation: corrupt V2 terminal map"
-                    );
-                    safe_to_interrupt = false;
-                    continue;
-                }
-                let task_evidence = match deps.task_store.workflow_task_evidence(&record.id).await {
-                    Ok(evidence) => evidence,
-                    Err(error) => {
-                        tracing::warn!(
-                            task = record.id.as_str(),
-                            error = ?error,
-                            "checkpoint reconciliation: V2 task evidence read failed"
-                        );
-                        safe_to_interrupt = false;
-                        continue;
-                    }
                 };
-                if task_evidence.workflow_outcome.is_some() {
-                    tracing::warn!(
-                        task = record.id.as_str(),
-                        "checkpoint reconciliation: V2 terminal projection already pending"
-                    );
-                    safe_to_interrupt = false;
-                    continue;
-                }
-                let mut ordered_nodes: Vec<_> = graph.nodes.iter().collect();
-                ordered_nodes.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-                let node_refs: std::collections::BTreeMap<_, _> = ordered_nodes
-                    .into_iter()
-                    .zip(&run_spec.node_execution_identities)
-                    .map(|(node, identity)| (node.id.clone(), identity.node.clone()))
-                    .collect();
-                let valid_trigger = match task_evidence.policy_trigger_json {
-                    Some(encoded) => {
-                        bridge_core::execution_policy::PolicyTriggerV1::decode_canonical(
-                            encoded.as_bytes(),
-                        )
-                        .ok()
-                        .is_some_and(|trigger| {
-                            let mut controller = bridge_workflow::fanout::FanOutControllerV1::new(
-                                run_spec.controls.fan_out.clone(),
-                            );
-                            controller
-                                .restore_committed_trigger(
-                                    &run_spec.attempt_id,
-                                    trigger,
-                                    &terminals,
-                                    &node_refs,
-                                )
-                                .is_ok()
-                        })
-                    }
-                    None => terminals
-                        .values()
-                        .all(|terminal| terminal.policy_trigger_id.is_none()),
-                };
-                if !valid_trigger {
-                    tracing::warn!(
-                        task = record.id.as_str(),
-                        "checkpoint reconciliation: corrupt V2 policy trigger evidence"
-                    );
-                    safe_to_interrupt = false;
-                    continue;
-                }
-                let Some(terminal_node_evidence) = terminals.get(&terminal_node.id) else {
-                    safe_to_interrupt = false;
-                    continue;
-                };
-                let outcome = match terminal_node_evidence.primary {
-                    bridge_core::execution_policy::NodePrimaryDispositionV1::Completed
-                        if terminal_node_evidence.degraded_ancestry =>
-                    {
-                        bridge_core::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded
-                    }
-                    bridge_core::execution_policy::NodePrimaryDispositionV1::Completed => {
-                        bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed
-                    }
-                    bridge_core::execution_policy::NodePrimaryDispositionV1::CanceledWorkflow
-                    | bridge_core::execution_policy::NodePrimaryDispositionV1::CanceledPolicy
-                    | bridge_core::execution_policy::NodePrimaryDispositionV1::CanceledNode => {
-                        bridge_core::execution_policy::WorkflowDurableOutcomeV1::Canceled
-                    }
-                    _ => bridge_core::execution_policy::WorkflowDurableOutcomeV1::Failed,
-                };
-                let counts = match structured_node_counts_v1(terminals.values()) {
-                    Ok(counts) => counts,
-                    Err(error) => {
-                        tracing::warn!(
-                            task = record.id.as_str(),
-                            error = ?error,
-                            "checkpoint reconciliation: V2 node counts invalid"
-                        );
-                        safe_to_interrupt = false;
-                        continue;
-                    }
-                };
-                let prompt_acceptance = if terminals
-                    .values()
-                    .any(|terminal| terminal.prompt_may_have_been_accepted)
+                let checkpoint_ok = checkpoints
+                    .iter()
+                    .find(|(node, ..)| node == &evidence.node)
+                    .map(|(_, _, checkpoint_ok, _)| *checkpoint_ok);
+                if checkpoint_ok
+                    != Some(matches!(
+                        terminal.primary,
+                        bridge_core::execution_policy::NodePrimaryDispositionV1::Completed
+                    ))
+                    || terminals.insert(evidence.node, terminal).is_some()
                 {
-                    "dispatch_uncertain"
-                } else {
-                    "unknown"
-                };
-                let cleanup_disposition = if terminals.values().any(|terminal| {
-                    terminal.cleanup.disposition
-                        == bridge_core::execution_policy::NodeCleanupDispositionV1::Failed
-                }) {
-                    "failed"
-                } else if terminals.values().any(|terminal| {
-                    terminal.cleanup.disposition
-                        == bridge_core::execution_policy::NodeCleanupDispositionV1::UnknownLegacy
-                }) {
-                    "unknown"
-                } else {
-                    "complete"
-                };
-                (outcome, counts, prompt_acceptance, cleanup_disposition)
-            } else {
-                (
-                    if *ok {
-                        bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed
-                    } else {
-                        bridge_core::execution_policy::WorkflowDurableOutcomeV1::Failed
-                    },
-                    NodeCounts {
-                        completed: u32::try_from(
-                            checkpoints
-                                .iter()
-                                .filter(|(_, _, success, _)| *success)
-                                .count(),
-                        )
-                        .unwrap_or(u32::MAX),
-                        failed: u32::try_from(
-                            checkpoints
-                                .iter()
-                                .filter(|(_, _, success, _)| !*success)
-                                .count(),
-                        )
-                        .unwrap_or(u32::MAX),
-                        ..NodeCounts::default()
-                    },
-                    "unknown",
-                    "unknown",
-                )
+                    valid = false;
+                    break;
+                }
+            }
+            if !valid || terminals.len() != graph.nodes.len() {
+                tracing::warn!(
+                    task = record.id.as_str(),
+                    "checkpoint reconciliation: corrupt V2 terminal map"
+                );
+                safe_to_interrupt = false;
+                continue;
+            }
+            let task_evidence = match deps.task_store.workflow_task_evidence(&record.id).await {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    tracing::warn!(
+                        task = record.id.as_str(),
+                        error = ?error,
+                        "checkpoint reconciliation: V2 task evidence read failed"
+                    );
+                    safe_to_interrupt = false;
+                    continue;
+                }
             };
+            if task_evidence.workflow_outcome.is_some() {
+                tracing::warn!(
+                    task = record.id.as_str(),
+                    "checkpoint reconciliation: V2 terminal projection already pending"
+                );
+                safe_to_interrupt = false;
+                continue;
+            }
+            let mut ordered_nodes: Vec<_> = graph.nodes.iter().collect();
+            ordered_nodes.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+            let node_refs: std::collections::BTreeMap<_, _> = ordered_nodes
+                .into_iter()
+                .zip(&run_spec.node_execution_identities)
+                .map(|(node, identity)| (node.id.clone(), identity.node.clone()))
+                .collect();
+            let policy_trigger_json = task_evidence.policy_trigger_json;
+            let valid_trigger = match policy_trigger_json.as_deref() {
+                Some(encoded) => bridge_core::execution_policy::PolicyTriggerV1::decode_canonical(
+                    encoded.as_bytes(),
+                )
+                .ok()
+                .is_some_and(|trigger| {
+                    let mut controller = bridge_workflow::fanout::FanOutControllerV1::new(
+                        run_spec.controls.fan_out.clone(),
+                    );
+                    controller
+                        .restore_committed_trigger(
+                            &run_spec.attempt_id,
+                            trigger,
+                            &terminals,
+                            &node_refs,
+                        )
+                        .is_ok()
+                }),
+                None => terminals
+                    .values()
+                    .all(|terminal| terminal.policy_trigger_id.is_none()),
+            };
+            if !valid_trigger {
+                tracing::warn!(
+                    task = record.id.as_str(),
+                    "checkpoint reconciliation: corrupt V2 policy trigger evidence"
+                );
+                safe_to_interrupt = false;
+                continue;
+            }
+            let Some(terminal_node_evidence) = terminals.get(&terminal_node.id) else {
+                safe_to_interrupt = false;
+                continue;
+            };
+            let outcome = match terminal_node_evidence.primary {
+                bridge_core::execution_policy::NodePrimaryDispositionV1::Completed
+                    if terminal_node_evidence.degraded_ancestry =>
+                {
+                    bridge_core::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded
+                }
+                bridge_core::execution_policy::NodePrimaryDispositionV1::Completed => {
+                    bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed
+                }
+                bridge_core::execution_policy::NodePrimaryDispositionV1::CanceledWorkflow
+                | bridge_core::execution_policy::NodePrimaryDispositionV1::CanceledPolicy
+                | bridge_core::execution_policy::NodePrimaryDispositionV1::CanceledNode => {
+                    bridge_core::execution_policy::WorkflowDurableOutcomeV1::Canceled
+                }
+                _ => bridge_core::execution_policy::WorkflowDurableOutcomeV1::Failed,
+            };
+            let counts = match structured_node_counts_v1(terminals.values()) {
+                Ok(counts) => counts,
+                Err(error) => {
+                    tracing::warn!(
+                        task = record.id.as_str(),
+                        error = ?error,
+                        "checkpoint reconciliation: V2 node counts invalid"
+                    );
+                    safe_to_interrupt = false;
+                    continue;
+                }
+            };
+            let prompt_acceptance = if terminals
+                .values()
+                .any(|terminal| terminal.prompt_may_have_been_accepted)
+            {
+                "dispatch_uncertain"
+            } else {
+                "unknown"
+            };
+            let cleanup_disposition = if terminals.values().any(|terminal| {
+                terminal.cleanup.disposition
+                    == bridge_core::execution_policy::NodeCleanupDispositionV1::Failed
+            }) {
+                "failed"
+            } else if terminals.values().any(|terminal| {
+                terminal.cleanup.disposition
+                    == bridge_core::execution_policy::NodeCleanupDispositionV1::UnknownLegacy
+            }) {
+                "unknown"
+            } else {
+                "complete"
+            };
+            (
+                outcome,
+                counts,
+                prompt_acceptance,
+                cleanup_disposition,
+                policy_trigger_json,
+            )
+        } else {
+            (
+                if *ok {
+                    bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed
+                } else {
+                    bridge_core::execution_policy::WorkflowDurableOutcomeV1::Failed
+                },
+                NodeCounts {
+                    completed: u32::try_from(
+                        checkpoints
+                            .iter()
+                            .filter(|(_, _, success, _)| *success)
+                            .count(),
+                    )
+                    .unwrap_or(u32::MAX),
+                    failed: u32::try_from(
+                        checkpoints
+                            .iter()
+                            .filter(|(_, _, success, _)| !*success)
+                            .count(),
+                    )
+                    .unwrap_or(u32::MAX),
+                    ..NodeCounts::default()
+                },
+                "unknown",
+                "unknown",
+                None,
+            )
+        };
         let status = match workflow_outcome {
             bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed
             | bridge_core::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded => {
@@ -4528,6 +4642,7 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
             prompt_acceptance: prompt_acceptance.into(),
             cleanup_disposition: cleanup_disposition.into(),
             node_counts,
+            policy_trigger_json,
             phase_durations: Vec::new(),
             telemetry_complete: false,
             monotonic_clock: false,
@@ -5103,8 +5218,34 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
                 prompt_acceptance: "not_dispatched".into(),
                 pinned: false,
             };
+            let structured_reservation = match authority
+                .as_ref()
+                .map(|authority| {
+                    structured_history_reservation_v1(reservation.clone(), &authority.run_spec)
+                })
+                .transpose()
+            {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    tracing::warn!(task = task.as_str(), error = ?error, "resume scan: structured history reservation invalid");
+                    let _ = finalize_detached(
+                        &deps.task_store,
+                        &deps.progress_hubs,
+                        &task,
+                        TaskRecordStatus::Interrupted,
+                        None,
+                        Some("not resumable: structured history reservation invalid"),
+                        None,
+                    )
+                    .await;
+                    return;
+                }
+            };
             let telemetry_unavailable = match &deps.workflow_history {
-                Some(Ok(history)) => match history.reserve(&reservation).await {
+                Some(Ok(history)) => match match structured_reservation.as_ref() {
+                    Some(structured) => history.reserve_v2(structured).await,
+                    None => history.reserve(&reservation).await,
+                } {
                     Ok(()) => {
                         summary_history = Some(history.clone());
                         None

@@ -4193,24 +4193,60 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     // Optional history remains fail-open except for identity collision. The final unpublished
     // run spec records the actual disposition before any session/provider effect.
     let offline_telemetry = bridge_coordinator::detached::AttemptTelemetryState::default();
-    let history_store = match selected_history {
-        Ok(store) => {
-            let reservation = bridge_core::workflow_history::AttemptReservation {
-                identity: identity.clone(),
-                task_id: None,
-                workflow: workflow_id.clone(),
-                task_class: "workflow".into(),
-                surface: bridge_core::workflow_history::ExecutionSurface::Offline,
-                policy: "r2f1a".into(),
-                workload_fingerprint: authority.run_spec.workload_fingerprint.clone(),
-                started_ms: bridge_core::task_store::system_wall_now_ms(),
-                workload_fingerprint_complete: true,
-                prompt_acceptance: "not_dispatched".into(),
-                pinned: false,
-            };
-            match bridge_core::workflow_history::WorkflowHistoryStore::reserve(
+    let history_store =
+        match selected_history {
+            Ok(store) => {
+                let reservation = bridge_core::workflow_history::AttemptReservation {
+                    identity: identity.clone(),
+                    task_id: None,
+                    workflow: workflow_id.clone(),
+                    task_class: "workflow".into(),
+                    surface: bridge_core::workflow_history::ExecutionSurface::Offline,
+                    policy: "r2f1a".into(),
+                    workload_fingerprint: authority.run_spec.workload_fingerprint.clone(),
+                    started_ms: bridge_core::task_store::system_wall_now_ms(),
+                    workload_fingerprint_complete: true,
+                    prompt_acceptance: "not_dispatched".into(),
+                    pinned: false,
+                };
+                let mut nodes = authority
+                    .run_spec
+                    .graph
+                    .nodes
+                    .iter()
+                    .map(|node| node.id.clone())
+                    .collect::<Vec<_>>();
+                nodes.sort();
+                let expected_node_count = u32::try_from(nodes.len())
+                    .map_err(|_| "run-workflow: structured node roster exceeds u32")?;
+                let nodes = nodes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ordinal, node)| {
+                        Ok(bridge_core::workflow_history::HistoryNodeReservationV1 {
+                            node,
+                            sorted_ordinal: u32::try_from(ordinal)
+                                .map_err(|_| "run-workflow: structured node ordinal exceeds u32")?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, &str>>()?;
+                let controls_json =
+                    String::from_utf8(authority.run_spec.controls.encode_canonical().map_err(
+                        |error| format!("run-workflow: controls encoding failed: {error}"),
+                    )?)
+                    .map_err(|_| "run-workflow: controls encoding was not UTF-8")?;
+                let structured_reservation = bridge_core::workflow_history::AttemptReservationV2 {
+                    schema_version:
+                        bridge_core::workflow_history::WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1,
+                    reservation,
+                    controls_json,
+                    controls_fingerprint: authority.run_spec.controls_fingerprint.clone(),
+                    expected_node_count,
+                    nodes,
+                };
+                match bridge_core::workflow_history::WorkflowHistoryStore::reserve_v2(
                 store.as_ref(),
-                &reservation,
+                &structured_reservation,
             )
             .await
             {
@@ -4240,13 +4276,13 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                     None
                 }
             }
-        }
-        Err(error) => {
-            offline_telemetry.record(error.reason);
-            eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
-            None
-        }
-    };
+            }
+            Err(error) => {
+                offline_telemetry.record(error.reason);
+                eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
+                None
+            }
+        };
 
     let (harvest_audit_store, harvest_audit_path) = run_workflow_harvest_audit_store(
         &admission_cfg,
@@ -4320,6 +4356,63 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         }
         None => diagnostic_ctx,
     };
+    let diagnostic_ctx = match history_store.as_ref() {
+        Some(store) => {
+            let trigger_store = store.clone();
+            let attempt_id = identity.attempt_id.clone();
+            let trigger_telemetry = offline_telemetry.clone();
+            let barrier: bridge_workflow::executor::PolicyTriggerBarrier = Arc::new(
+                move |checkpoint: bridge_workflow::executor::PolicyTriggerCheckpointV1| {
+                    let trigger_store = trigger_store.clone();
+                    let attempt_id = attempt_id.clone();
+                    let trigger_telemetry = trigger_telemetry.clone();
+                    Box::pin(async move {
+                        match bridge_core::workflow_history::WorkflowHistoryStore::commit_node_terminal_v2(
+                            trigger_store.as_ref(),
+                            &attempt_id,
+                            &checkpoint.node,
+                            &checkpoint.terminal_json,
+                            Some(&checkpoint.policy_trigger_json),
+                        )
+                        .await
+                        {
+                            Ok(
+                                bridge_core::workflow_history::TerminalWrite::Applied
+                                | bridge_core::workflow_history::TerminalWrite::Replayed,
+                            ) => bridge_workflow::fanout::PolicyTriggerBarrierResultV1::OfflineHistoryCommitted,
+                            Ok(bridge_core::workflow_history::TerminalWrite::Conflict) => {
+                                bridge_workflow::fanout::PolicyTriggerBarrierResultV1::PrimaryFailed
+                            }
+                            Err(error)
+                                if error.reason
+                                    == bridge_core::workflow_history::LedgerUnavailableReason::Collision =>
+                            {
+                                bridge_workflow::fanout::PolicyTriggerBarrierResultV1::PrimaryFailed
+                            }
+                            Err(error) => {
+                                trigger_telemetry.record(error.reason);
+                                eprintln!(
+                                    "telemetry_unavailable{{reason={}}}",
+                                    error.reason.as_str()
+                                );
+                                bridge_workflow::fanout::PolicyTriggerBarrierResultV1::OfflineTelemetryUnavailable {
+                                    reason: error.reason,
+                                }
+                            }
+                        }
+                    }) as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = bridge_workflow::fanout::PolicyTriggerBarrierResultV1,
+                                > + Send,
+                        >,
+                    >
+                },
+            );
+            diagnostic_ctx.with_policy_trigger_barrier(barrier)
+        }
+        None => diagnostic_ctx,
+    };
     let diagnostic_ctx = diagnostic_ctx
         .with_frozen_run_spec(authority.run_spec, authority.provider_effect_key)
         .map_err(|error| format!("run-workflow: frozen authority refused: {error:?}"))?;
@@ -4385,6 +4478,37 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                     node.as_str(),
                     if node_ok { "ok" } else { "failed" }
                 );
+                if let (Some(store), Some(terminal_json)) =
+                    (history_store.as_ref(), terminal_json.as_deref())
+                {
+                    let persisted =
+                        bridge_core::workflow_history::WorkflowHistoryStore::commit_node_terminal_v2(
+                            store.as_ref(),
+                            &identity.attempt_id,
+                            &node,
+                            terminal_json,
+                            node_policy_trigger_json.as_deref(),
+                        )
+                        .await;
+                    match persisted {
+                        Ok(
+                            bridge_core::workflow_history::TerminalWrite::Applied
+                            | bridge_core::workflow_history::TerminalWrite::Replayed,
+                        ) => {}
+                        Ok(bridge_core::workflow_history::TerminalWrite::Conflict) => {
+                            offline_telemetry.record(
+                                bridge_core::workflow_history::LedgerUnavailableReason::Collision,
+                            );
+                            eprintln!("telemetry_unavailable{{reason=collision}}");
+                            structured_evidence_invalid = true;
+                        }
+                        Err(error) => {
+                            offline_telemetry.record(error.reason);
+                            eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
+                            structured_evidence_invalid = true;
+                        }
+                    }
+                }
                 if let Some(terminal_json) = terminal_json {
                     let node_json = serde_json::to_string(node.as_str())
                         .unwrap_or_else(|_| "\"invalid-node\"".into());
@@ -4649,6 +4773,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                     ..bridge_core::workflow_history::NodeCounts::default()
                 },
             ),
+            policy_trigger_json: policy_trigger_json.clone(),
             phase_durations: vec![
                 bridge_core::workflow_history::PhaseDuration {
                     phase: "work".into(),
@@ -8869,6 +8994,7 @@ mod cli_tests {
                         completed: 1,
                         ..NodeCounts::default()
                     },
+                    policy_trigger_json: None,
                     phase_durations: Vec::new(),
                     telemetry_complete: false,
                     monotonic_clock: true,

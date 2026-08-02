@@ -277,6 +277,7 @@ async fn missing_v1_evidence_and_pending_cleanup_are_truthful_and_settle_once() 
         prompt_acceptance: "dispatch_uncertain".into(),
         cleanup_disposition: "pending".into(),
         node_counts: NodeCounts::default(),
+        policy_trigger_json: None,
         phase_durations: Vec::new(),
         telemetry_complete: false,
         monotonic_clock: true,

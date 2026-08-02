@@ -245,6 +245,7 @@ fn run_offline_legacy_success(
     std::process::Output,
     bridge_core::workflow_history::AttemptTerminal,
     String,
+    bridge_core::workflow_history::AttemptStructuredEvidenceV1,
 ) {
     let directory = tempdir().unwrap();
     let adapter = directory.path().join("missing-evidence-acp");
@@ -345,22 +346,62 @@ addr = "127.0.0.1:0"
         .expect("run provider-free offline workflow");
 
     let connection = rusqlite::Connection::open(&store_path).unwrap();
-    let terminal_json: String = connection
+    let (attempt_id, terminal_json, evidence_schema_version, reservation_json): (
+        String,
+        String,
+        i64,
+        String,
+    ) = connection
         .query_row(
-            "SELECT terminal_json FROM workflow_attempt_summaries WHERE status='terminal'",
+            "SELECT attempt_id, terminal_json, evidence_schema_version, structured_reservation_json
+             FROM workflow_attempt_summaries WHERE status='terminal'",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
+    assert_eq!(
+        evidence_schema_version,
+        i64::from(bridge_core::workflow_history::WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1),
+    );
     let terminal: bridge_core::workflow_history::AttemptTerminal =
         serde_json::from_str(&terminal_json).unwrap();
+    let reservation: bridge_core::workflow_history::AttemptReservationV2 =
+        serde_json::from_str(&reservation_json).unwrap();
+    let mut node_statement = connection
+        .prepare(
+            "SELECT node_id, terminal_json
+             FROM workflow_attempt_node_terminals
+             WHERE attempt_id=?1 ORDER BY node_id",
+        )
+        .unwrap();
+    let node_terminals = node_statement
+        .query_map([attempt_id], |row| {
+            let node_id: String = row.get(0)?;
+            Ok(bridge_core::workflow_history::HistoryNodeTerminalV1 {
+                node: bridge_core::ids::NodeId::parse(node_id).unwrap(),
+                sorted_ordinal: 0,
+                terminal_json: row.get(1)?,
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     let output_text = fs::read_to_string(output_path).unwrap();
-    (output, terminal, output_text)
+    (
+        output,
+        terminal.clone(),
+        output_text,
+        bridge_core::workflow_history::AttemptStructuredEvidenceV1 {
+            reservation,
+            node_terminals,
+            policy_trigger_json: terminal.policy_trigger_json.clone(),
+        },
+    )
 }
 
 #[test]
 fn offline_v1_resolution_controls_exit_after_a_legacy_success_stream() {
-    let (output, terminal, output_text) = run_offline_legacy_success(true);
+    let (output, terminal, output_text, structured) = run_offline_legacy_success(true);
     assert_eq!(terminal.outcome, "failed");
     assert_eq!(
         terminal.terminal_reason,
@@ -373,11 +414,22 @@ fn offline_v1_resolution_controls_exit_after_a_legacy_success_stream() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output_text, "FINAL");
+    assert_eq!(structured.reservation.expected_node_count, 1);
+    assert_eq!(structured.node_terminals.len(), 1);
+    let node = bridge_core::execution_policy::NodeTerminalV1::decode_canonical(
+        structured.node_terminals[0].terminal_json.as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        node.primary,
+        bridge_core::execution_policy::NodePrimaryDispositionV1::Completed,
+    );
+    assert!(node.cause.is_none());
 }
 
 #[test]
 fn offline_unsupported_legacy_success_remains_completed() {
-    let (output, terminal, output_text) = run_offline_legacy_success(false);
+    let (output, terminal, output_text, structured) = run_offline_legacy_success(false);
     assert!(
         output.status.success(),
         "unsupported legacy success must remain successful; stdout={} stderr={}",
@@ -387,19 +439,30 @@ fn offline_unsupported_legacy_success_remains_completed() {
     assert_eq!(terminal.outcome, "completed");
     assert_eq!(terminal.terminal_evidence_capability, "unsupported");
     assert_eq!(output_text, "FINAL");
+    assert_eq!(structured.reservation.expected_node_count, 1);
+    assert_eq!(structured.node_terminals.len(), 1);
+    assert_eq!(structured.node_terminals[0].node.as_str(), "only");
     let stderr = String::from_utf8(output.stderr).unwrap();
-    let structured = stderr
+    let structured_stderr = stderr
         .lines()
         .find_map(|line| {
             line.strip_prefix("node_terminal{node=\"only\",terminal_json=")
                 .and_then(|value| value.strip_suffix('}'))
         })
         .expect("offline stderr must retain the exact bounded node terminal");
-    let decoded =
-        bridge_core::execution_policy::NodeTerminalV1::decode_canonical(structured.as_bytes())
-            .unwrap();
+    let decoded = bridge_core::execution_policy::NodeTerminalV1::decode_canonical(
+        structured_stderr.as_bytes(),
+    )
+    .unwrap();
     assert_eq!(
         decoded.primary,
         bridge_core::execution_policy::NodePrimaryDispositionV1::Completed
+    );
+    assert_eq!(
+        decoded,
+        bridge_core::execution_policy::NodeTerminalV1::decode_canonical(
+            structured.node_terminals[0].terminal_json.as_bytes(),
+        )
+        .unwrap(),
     );
 }

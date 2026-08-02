@@ -1841,6 +1841,74 @@ impl SqliteStore {
                 tx.commit().map_err(|error| history_error(&error))?;
                 break;
             };
+            let (node_counts, policy_trigger_json) =
+                if let Some(evidence) = load_structured_history_evidence(&tx, &attempt_id)? {
+                    use bridge_core::execution_policy::{
+                        NodeCleanupDispositionV1, NodeCleanupV1, NodePrimaryDispositionV1,
+                        NodeTerminalV1, EXECUTION_POLICY_SCHEMA_V1,
+                    };
+
+                    let committed = evidence
+                        .node_terminals
+                        .iter()
+                        .map(|terminal| terminal.node.clone())
+                        .collect::<HashSet<_>>();
+                    let placeholder = bridge_core::workflow_history::node_terminal_placeholder_v1();
+                    let interrupted = NodeTerminalV1 {
+                        schema_version: EXECUTION_POLICY_SCHEMA_V1,
+                        primary: NodePrimaryDispositionV1::InterruptedLegacy,
+                        cleanup: NodeCleanupV1 {
+                            disposition: NodeCleanupDispositionV1::UnknownLegacy,
+                            duration_ms: 0,
+                        },
+                        cause: None,
+                        prompt_may_have_been_accepted: prompt_acceptance != "not_dispatched",
+                        degraded_ancestry: false,
+                        policy_trigger_id: None,
+                    };
+                    let interrupted_json = String::from_utf8(
+                        interrupted
+                            .encode_canonical()
+                            .map_err(|_| LedgerError::new(R::Corruption))?,
+                    )
+                    .map_err(|_| LedgerError::new(R::Corruption))?;
+                    for admitted in &evidence.reservation.nodes {
+                        if committed.contains(&admitted.node) {
+                            continue;
+                        }
+                        let changed = tx
+                            .execute(
+                                "UPDATE workflow_attempt_node_terminals
+                                 SET terminal_json=?3
+                                 WHERE attempt_id=?1 AND node_id=?2 AND terminal_json=?4
+                                   AND terminal_reserve=2048",
+                                rusqlite::params![
+                                    attempt_id.as_str(),
+                                    admitted.node.as_str(),
+                                    interrupted_json,
+                                    placeholder
+                                ],
+                            )
+                            .map_err(|error| history_error(&error))?;
+                        if changed != 1 {
+                            return Err(LedgerError::new(R::Corruption));
+                        }
+                    }
+                    let complete = load_structured_history_evidence(&tx, &attempt_id)?
+                        .ok_or_else(|| LedgerError::new(R::Corruption))?;
+                    if complete.node_terminals.len()
+                        != complete.reservation.expected_node_count as usize
+                    {
+                        return Err(LedgerError::new(R::Corruption));
+                    }
+                    validate_structured_history_coherence(&attempt_id, &complete, false)?;
+                    (
+                        structured_history_node_counts(&complete)?,
+                        complete.policy_trigger_json,
+                    )
+                } else {
+                    (NodeCounts::default(), None)
+                };
             let terminal = AttemptTerminal {
                 completed_ms,
                 work_ms: 0,
@@ -1862,7 +1930,8 @@ impl SqliteStore {
                 degraded: true,
                 prompt_acceptance,
                 cleanup_disposition: "unknown".into(),
-                node_counts: NodeCounts::default(),
+                node_counts,
+                policy_trigger_json,
                 phase_durations: Vec::new(),
                 telemetry_complete: false,
                 monotonic_clock: false,
@@ -2295,7 +2364,14 @@ impl SqliteStore {
                 charged_bytes INTEGER NOT NULL,
                 reservation_json TEXT NOT NULL,
                 terminal_json TEXT,
-                terminal_reserve BLOB
+                terminal_reserve BLOB,
+                evidence_schema_version INTEGER NOT NULL DEFAULT 0
+                    CHECK(evidence_schema_version IN (0,1)),
+                structured_reservation_json TEXT,
+                controls_json TEXT,
+                controls_fingerprint TEXT,
+                expected_node_count INTEGER,
+                policy_trigger_json TEXT
             );
             CREATE TABLE IF NOT EXISTS workflow_history_attachment (
                 attempt_id TEXT PRIMARY KEY,
@@ -2333,6 +2409,15 @@ impl SqliteStore {
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 reserve BLOB NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS workflow_attempt_node_terminals (
+                attempt_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                terminal_json TEXT NOT NULL,
+                terminal_reserve INTEGER NOT NULL CHECK(terminal_reserve=2048),
+                PRIMARY KEY(attempt_id, node_id),
+                FOREIGN KEY(attempt_id) REFERENCES workflow_attempt_summaries(attempt_id)
+                    ON DELETE CASCADE
+            ) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS idx_workflow_attempt_terminal
                 ON workflow_attempt_summaries(status, completed_ms, pinned);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_attempt_execution_ordinal
@@ -2928,6 +3013,15 @@ fn migrate_workflow_history_columns(conn: &rusqlite::Connection) -> rusqlite::Re
             "INTEGER NOT NULL DEFAULT 0 CHECK(cleanup_pending IN (0,1))",
         ),
         ("terminal_reserve", "BLOB"),
+        (
+            "evidence_schema_version",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(evidence_schema_version IN (0,1))",
+        ),
+        ("structured_reservation_json", "TEXT"),
+        ("controls_json", "TEXT"),
+        ("controls_fingerprint", "TEXT"),
+        ("expected_node_count", "INTEGER"),
+        ("policy_trigger_json", "TEXT"),
     ] {
         if columns.insert(name.to_owned()) {
             conn.execute(
@@ -9658,11 +9752,303 @@ fn validate_persisted_reservation(
     Ok(reservation)
 }
 
-#[async_trait::async_trait]
-impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
-    async fn reserve(
+fn validate_structured_history_coherence(
+    id: &bridge_core::ids::AttemptId,
+    evidence: &bridge_core::workflow_history::AttemptStructuredEvidenceV1,
+    require_complete: bool,
+) -> Result<(), bridge_core::workflow_history::LedgerError> {
+    use bridge_core::execution_policy::{
+        ControlEventIdV1, FanOutPolicyNameV1, FanOutPolicyV1, FrozenWorkflowControlsV1,
+        NodePrimaryDispositionV1, NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1,
+    };
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+
+    if evidence.reservation.reservation.identity.attempt_id != *id
+        || (require_complete
+            && evidence.node_terminals.len() != evidence.reservation.expected_node_count as usize)
+    {
+        return Err(LedgerError::new(R::Corruption));
+    }
+    let controls: FrozenWorkflowControlsV1 =
+        serde_json::from_str(&evidence.reservation.controls_json)
+            .map_err(|_| LedgerError::new(R::Corruption))?;
+    let trigger = evidence
+        .policy_trigger_json
+        .as_deref()
+        .map(|encoded| {
+            PolicyTriggerV1::decode_canonical(encoded.as_bytes())
+                .map_err(|_| LedgerError::new(R::Corruption))
+        })
+        .transpose()?;
+    let mut trigger_mentions = 0_usize;
+    let mut selected_terminal_valid = false;
+    let mut qualifying_failure = false;
+    for persisted in &evidence.node_terminals {
+        let admitted = evidence
+            .reservation
+            .node(&persisted.node)
+            .ok_or_else(|| LedgerError::new(R::Corruption))?;
+        if admitted.sorted_ordinal != persisted.sorted_ordinal {
+            return Err(LedgerError::new(R::Corruption));
+        }
+        let terminal = NodeTerminalV1::decode_canonical(persisted.terminal_json.as_bytes())
+            .map_err(|_| LedgerError::new(R::Corruption))?;
+        qualifying_failure |= matches!(
+            terminal.primary,
+            NodePrimaryDispositionV1::Failed | NodePrimaryDispositionV1::TimedOut
+        );
+        if let Some(trigger_id) = terminal.policy_trigger_id.as_ref() {
+            trigger_mentions = trigger_mentions.saturating_add(1);
+            if let Some(trigger) = trigger.as_ref() {
+                selected_terminal_valid |= trigger_id == &trigger.id
+                    && trigger.node
+                        == PolicyNodeRefV1::from_node_id(
+                            persisted.sorted_ordinal,
+                            persisted.node.as_str(),
+                        )
+                    && matches!(
+                        terminal.primary,
+                        NodePrimaryDispositionV1::Failed | NodePrimaryDispositionV1::TimedOut
+                    );
+            }
+        }
+    }
+    match trigger {
+        Some(trigger) => {
+            let expected_grace = match controls.fan_out {
+                FanOutPolicyV1::FixedGrace { grace_ms } => Some(grace_ms),
+                FanOutPolicyV1::BoundedIndependent | FanOutPolicyV1::FailFast => None,
+            };
+            if matches!(controls.fan_out, FanOutPolicyV1::BoundedIndependent)
+                || trigger.id != ControlEventIdV1::for_attempt(id, 0)
+                || trigger.policy != FanOutPolicyNameV1::from(&controls.fan_out)
+                || trigger.grace_ms != expected_grace
+                || trigger_mentions != 1
+                || !selected_terminal_valid
+            {
+                return Err(LedgerError::new(R::Corruption));
+            }
+        }
+        None => {
+            if trigger_mentions != 0
+                || (require_complete
+                    && qualifying_failure
+                    && !matches!(controls.fan_out, FanOutPolicyV1::BoundedIndependent))
+            {
+                return Err(LedgerError::new(R::Corruption));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn structured_history_node_counts(
+    evidence: &bridge_core::workflow_history::AttemptStructuredEvidenceV1,
+) -> Result<bridge_core::workflow_history::NodeCounts, bridge_core::workflow_history::LedgerError> {
+    use bridge_core::execution_policy::{
+        NodeCleanupDispositionV1 as Cleanup, NodePrimaryDispositionV1 as Primary, NodeTerminalV1,
+    };
+    use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R, NodeCounts};
+
+    let mut counts = NodeCounts::default();
+    for persisted in &evidence.node_terminals {
+        let terminal = NodeTerminalV1::decode_canonical(persisted.terminal_json.as_bytes())
+            .map_err(|_| LedgerError::new(R::Corruption))?;
+        let counter = match terminal.primary {
+            Primary::Completed => Some(&mut counts.completed),
+            Primary::Failed | Primary::TimedOut => Some(&mut counts.failed),
+            Primary::CanceledWorkflow | Primary::CanceledPolicy | Primary::CanceledNode => {
+                Some(&mut counts.canceled)
+            }
+            Primary::SkippedDependency | Primary::NotStartedPolicy | Primary::InterruptedLegacy => {
+                None
+            }
+            Primary::Deadline => return Err(LedgerError::new(R::Corruption)),
+        };
+        if let Some(counter) = counter {
+            *counter = counter
+                .checked_add(1)
+                .ok_or_else(|| LedgerError::new(R::Corruption))?;
+        }
+        if matches!(
+            terminal.cleanup.disposition,
+            Cleanup::Failed | Cleanup::UnknownLegacy
+        ) {
+            counts.cleanup_partial = counts
+                .cleanup_partial
+                .checked_add(1)
+                .ok_or_else(|| LedgerError::new(R::Corruption))?;
+        }
+    }
+    Ok(counts)
+}
+
+fn load_structured_history_evidence(
+    conn: &rusqlite::Connection,
+    id: &bridge_core::ids::AttemptId,
+) -> Result<
+    Option<bridge_core::workflow_history::AttemptStructuredEvidenceV1>,
+    bridge_core::workflow_history::LedgerError,
+> {
+    use bridge_core::workflow_history::{
+        AttemptReservationV2, AttemptStructuredEvidenceV1, HistoryNodeTerminalV1, LedgerError,
+        LedgerUnavailableReason as R, WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1,
+    };
+
+    let persisted: Option<(
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    )> = conn
+        .query_row(
+            "SELECT evidence_schema_version, reservation_json,
+                    structured_reservation_json, controls_json, controls_fingerprint,
+                    expected_node_count, policy_trigger_json
+             FROM workflow_attempt_summaries WHERE attempt_id=?1",
+            rusqlite::params![id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            if sqlite_persisted_value_is_invalid(&error) {
+                LedgerError::new(R::Corruption)
+            } else {
+                history_error(&error)
+            }
+        })?;
+    let Some((
+        schema_version,
+        reservation_json,
+        structured_json,
+        controls_json,
+        controls_fingerprint,
+        expected_node_count,
+        policy_trigger_json,
+    )) = persisted
+    else {
+        return Ok(None);
+    };
+    let node_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM workflow_attempt_node_terminals WHERE attempt_id=?1",
+            rusqlite::params![id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| history_error(&error))?;
+    if schema_version == 0 {
+        if structured_json.is_some()
+            || controls_json.is_some()
+            || controls_fingerprint.is_some()
+            || expected_node_count.is_some()
+            || policy_trigger_json.is_some()
+            || node_count != 0
+        {
+            return Err(LedgerError::new(R::Corruption));
+        }
+        return Ok(None);
+    }
+    if schema_version != i64::from(WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1) {
+        return Err(LedgerError::new(R::Corruption));
+    }
+    let structured_json = structured_json.ok_or_else(|| LedgerError::new(R::Corruption))?;
+    let structured: AttemptReservationV2 =
+        serde_json::from_str(&structured_json).map_err(|_| LedgerError::new(R::Corruption))?;
+    structured
+        .validate()
+        .map_err(|_| LedgerError::new(R::Corruption))?;
+    let canonical_structured =
+        serde_json::to_string(&structured).map_err(|_| LedgerError::new(R::Corruption))?;
+    let canonical_reservation = serde_json::to_string(&structured.reservation)
+        .map_err(|_| LedgerError::new(R::Corruption))?;
+    if canonical_structured != structured_json
+        || canonical_reservation != reservation_json
+        || controls_json.as_deref() != Some(structured.controls_json.as_str())
+        || controls_fingerprint.as_deref() != Some(structured.controls_fingerprint.as_str())
+        || expected_node_count != Some(i64::from(structured.expected_node_count))
+        || structured.reservation.identity.attempt_id != *id
+        || node_count != i64::from(structured.expected_node_count)
+    {
+        return Err(LedgerError::new(R::Corruption));
+    }
+
+    let rows = {
+        let mut statement = conn
+            .prepare(
+                "SELECT node_id, terminal_json, terminal_reserve
+                 FROM workflow_attempt_node_terminals
+                 WHERE attempt_id=?1 ORDER BY node_id",
+            )
+            .map_err(|error| history_error(&error))?;
+        let rows = statement
+            .query_map(rusqlite::params![id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|error| history_error(&error))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            if sqlite_persisted_value_is_invalid(&error) {
+                LedgerError::new(R::Corruption)
+            } else {
+                history_error(&error)
+            }
+        })?
+    };
+    if rows.len() != structured.nodes.len() {
+        return Err(LedgerError::new(R::Corruption));
+    }
+    let placeholder = bridge_core::workflow_history::node_terminal_placeholder_v1();
+    let mut node_terminals = Vec::with_capacity(rows.len());
+    for (persisted, admitted) in rows.into_iter().zip(&structured.nodes) {
+        let (node, terminal_json, terminal_reserve) = persisted;
+        if node != admitted.node.as_str()
+            || terminal_reserve
+                != i64::try_from(bridge_core::execution_policy::MAX_NODE_TERMINAL_JSON_BYTES)
+                    .map_err(|_| LedgerError::new(R::Corruption))?
+        {
+            return Err(LedgerError::new(R::Corruption));
+        }
+        if terminal_json == placeholder {
+            continue;
+        }
+        bridge_core::execution_policy::NodeTerminalV1::decode_canonical(terminal_json.as_bytes())
+            .map_err(|_| LedgerError::new(R::Corruption))?;
+        node_terminals.push(HistoryNodeTerminalV1 {
+            node: admitted.node.clone(),
+            sorted_ordinal: admitted.sorted_ordinal,
+            terminal_json,
+        });
+    }
+    let evidence = AttemptStructuredEvidenceV1 {
+        reservation: structured,
+        node_terminals,
+        policy_trigger_json,
+    };
+    validate_structured_history_coherence(id, &evidence, false)?;
+    Ok(Some(evidence))
+}
+
+impl SqliteStore {
+    async fn reserve_history_internal(
         &self,
         row: &bridge_core::workflow_history::AttemptReservation,
+        structured: Option<&bridge_core::workflow_history::AttemptReservationV2>,
     ) -> Result<(), bridge_core::workflow_history::LedgerError> {
         use bridge_core::workflow_history::{
             LedgerError, LedgerUnavailableReason as R, HISTORY_ATTACHMENT_CHARGE,
@@ -9671,8 +10057,43 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
             RETENTION_DAYS,
         };
         row.validate()?;
+        if structured.is_some_and(|structured| structured.reservation != *row) {
+            return Err(LedgerError::new(R::Schema));
+        }
+        if let Some(structured) = structured {
+            structured.validate()?;
+        }
         let reservation_json =
             serde_json::to_string(row).map_err(|_| LedgerError::new(R::Schema))?;
+        let structured_reservation_json = structured
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| LedgerError::new(R::Schema))?;
+        let node_placeholder =
+            structured.map(|_| bridge_core::workflow_history::node_terminal_placeholder_v1());
+        let structured_payload_precheck = structured
+            .map(|structured| {
+                let fixed = structured_reservation_json
+                    .as_ref()
+                    .map_or(0_u64, |value| value.len() as u64)
+                    .checked_add(structured.controls_json.len() as u64)
+                    .and_then(|value| {
+                        value.checked_add(structured.controls_fingerprint.len() as u64)
+                    })
+                    .ok_or_else(|| LedgerError::new(R::Schema))?;
+                structured.nodes.iter().try_fold(fixed, |total, node| {
+                    total
+                        .checked_add(node.node.as_str().len() as u64)
+                        .and_then(|value| {
+                            value.checked_add(
+                                bridge_core::execution_policy::MAX_NODE_TERMINAL_JSON_BYTES as u64,
+                            )
+                        })
+                        .ok_or_else(|| LedgerError::new(R::Schema))
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
         let _admission_lease = self.acquire_history_admission_lease()?;
         #[cfg(test)]
         history_transaction_pause(
@@ -10006,7 +10427,8 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                             <= MAX_CHARGED_BYTES
                     };
                 let physical_charge = RESERVED_ROW_CHARGE
-                    .saturating_add(incoming_identities.saturating_mul(PERMANENT_IDENTITY_CHARGE));
+                    .saturating_add(incoming_identities.saturating_mul(PERMANENT_IDENTITY_CHARGE))
+                    .saturating_add(structured_payload_precheck);
                 let page_size: i64 = tx
                     .query_row("PRAGMA page_size", [], |record| record.get(0))
                     .map_err(|error| history_error(&error))?;
@@ -10119,8 +10541,11 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                 attempt_id, execution_id, parent_attempt_id, ordinal, task_id,
                 workflow, task_class, surface, policy, workload_fingerprint,
                 workload_fingerprint_complete, started_ms, status, prompt_acceptance,
-                pinned, charged_bytes, reservation_json, terminal_reserve)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'active',?13,?14,?15,?16,zeroblob(?17))",
+                pinned, charged_bytes, reservation_json, terminal_reserve,
+                evidence_schema_version, structured_reservation_json, controls_json,
+                controls_fingerprint, expected_node_count, policy_trigger_json)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'active',?13,?14,?15,?16,
+                    zeroblob(?17),?18,?19,?20,?21,?22,NULL)",
                     rusqlite::params![
                         row.identity.attempt_id.as_str(),
                         row.identity.execution_id.as_str(),
@@ -10140,10 +10565,48 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                         reservation_json,
                         i64::try_from(MAX_TERMINAL_JSON_BYTES)
                             .map_err(|_| LedgerError::new(R::Schema))?,
+                        structured.map_or(0_i64, |_| {
+                            i64::from(
+                                bridge_core::workflow_history::WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1,
+                            )
+                        }),
+                        structured_reservation_json.as_deref(),
+                        structured.map(|value| value.controls_json.as_str()),
+                        structured.map(|value| value.controls_fingerprint.as_str()),
+                        structured.map(|value| i64::from(value.expected_node_count)),
                     ],
                 );
                 match result {
                     Ok(_) => {
+                        if let Some(structured) = structured {
+                            let placeholder = node_placeholder
+                                .as_deref()
+                                .ok_or_else(|| LedgerError::new(R::Schema))?;
+                            let mut insert = tx
+                                .prepare(
+                                    "INSERT INTO workflow_attempt_node_terminals(
+                                         attempt_id, node_id, terminal_json, terminal_reserve)
+                                     VALUES(?1, ?2, ?3, ?4)",
+                                )
+                                .map_err(|error| history_error(&error))?;
+                            for node in &structured.nodes {
+                                let changed = insert
+                                    .execute(rusqlite::params![
+                                        row.identity.attempt_id.as_str(),
+                                        node.node.as_str(),
+                                        placeholder,
+                                        i64::try_from(
+                                            bridge_core::execution_policy::MAX_NODE_TERMINAL_JSON_BYTES
+                                        )
+                                        .map_err(|_| LedgerError::new(R::Schema))?,
+                                    ])
+                                    .map_err(|error| history_error(&error))?;
+                                if changed != 1 {
+                                    return Err(LedgerError::new(R::Corruption));
+                                }
+                            }
+                            drop(insert);
+                        }
                         tx.execute(
                             "INSERT INTO workflow_history_attachment(attempt_id, charged_bytes)
                          VALUES(?1, ?2)",
@@ -10154,6 +10617,9 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                             ],
                         )
                         .map_err(|error| history_error(&error))?;
+                        if !self.history_growth_fits(&tx, 0)? {
+                            return Err(LedgerError::new(R::CapacityProtected));
+                        }
                         self.debit_configured_slot(&tx)?;
                         self.ensure_terminal_rewrite_headroom(&tx)?;
                         #[cfg(test)]
@@ -10208,6 +10674,178 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
                 Err(error)
             }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
+    async fn reserve(
+        &self,
+        row: &bridge_core::workflow_history::AttemptReservation,
+    ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        self.reserve_history_internal(row, None).await
+    }
+
+    async fn reserve_v2(
+        &self,
+        row: &bridge_core::workflow_history::AttemptReservationV2,
+    ) -> Result<(), bridge_core::workflow_history::LedgerError> {
+        row.validate()?;
+        self.reserve_history_internal(&row.reservation, Some(row))
+            .await
+    }
+
+    async fn commit_node_terminal_v2(
+        &self,
+        id: &bridge_core::ids::AttemptId,
+        node: &bridge_core::ids::NodeId,
+        terminal_json: &str,
+        policy_trigger_json: Option<&str>,
+    ) -> Result<
+        bridge_core::workflow_history::TerminalWrite,
+        bridge_core::workflow_history::LedgerError,
+    > {
+        use bridge_core::execution_policy::{
+            ControlEventIdV1, FanOutPolicyNameV1, FanOutPolicyV1, FrozenWorkflowControlsV1,
+            NodePrimaryDispositionV1, NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1,
+        };
+        use bridge_core::workflow_history::{
+            LedgerError, LedgerUnavailableReason as R, TerminalWrite,
+        };
+
+        let terminal = NodeTerminalV1::decode_canonical(terminal_json.as_bytes())
+            .map_err(|_| LedgerError::new(R::Schema))?;
+        let trigger = policy_trigger_json
+            .map(|encoded| {
+                PolicyTriggerV1::decode_canonical(encoded.as_bytes())
+                    .map_err(|_| LedgerError::new(R::Schema))
+            })
+            .transpose()?;
+        if terminal.policy_trigger_id.as_ref() != trigger.as_ref().map(|value| &value.id) {
+            return Err(LedgerError::new(R::Schema));
+        }
+
+        let _admission_lease = self.acquire_history_admission_lease()?;
+        self.checkpoint_and_verify_history_size()?;
+        let mut conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| history_error(&error))?;
+        let evidence = load_structured_history_evidence(&tx, id)?
+            .ok_or_else(|| LedgerError::new(R::Schema))?;
+        let admitted = evidence
+            .reservation
+            .node(node)
+            .ok_or_else(|| LedgerError::new(R::Schema))?;
+        let controls: FrozenWorkflowControlsV1 =
+            serde_json::from_str(&evidence.reservation.controls_json)
+                .map_err(|_| LedgerError::new(R::Corruption))?;
+        if let Some(trigger) = trigger.as_ref() {
+            let expected_grace = match controls.fan_out {
+                FanOutPolicyV1::FixedGrace { grace_ms } => Some(grace_ms),
+                FanOutPolicyV1::BoundedIndependent | FanOutPolicyV1::FailFast => None,
+            };
+            if matches!(controls.fan_out, FanOutPolicyV1::BoundedIndependent)
+                || !matches!(
+                    terminal.primary,
+                    NodePrimaryDispositionV1::Failed | NodePrimaryDispositionV1::TimedOut
+                )
+                || trigger.id != ControlEventIdV1::for_attempt(id, 0)
+                || trigger.node
+                    != PolicyNodeRefV1::from_node_id(admitted.sorted_ordinal, node.as_str())
+                || trigger.policy != FanOutPolicyNameV1::from(&controls.fan_out)
+                || trigger.grace_ms != expected_grace
+            {
+                return Err(LedgerError::new(R::Schema));
+            }
+        }
+        if evidence
+            .policy_trigger_json
+            .as_deref()
+            .is_some_and(|persisted| policy_trigger_json.is_some_and(|value| value != persisted))
+        {
+            tx.commit().map_err(|error| history_error(&error))?;
+            return Ok(TerminalWrite::Conflict);
+        }
+
+        let persisted: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT terminal_json, terminal_reserve
+                 FROM workflow_attempt_node_terminals
+                 WHERE attempt_id=?1 AND node_id=?2",
+                rusqlite::params![id.as_str(), node.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| history_error(&error))?;
+        let Some((persisted_terminal, terminal_reserve)) = persisted else {
+            return Err(LedgerError::new(R::Corruption));
+        };
+        if terminal_reserve
+            != i64::try_from(bridge_core::execution_policy::MAX_NODE_TERMINAL_JSON_BYTES)
+                .map_err(|_| LedgerError::new(R::Corruption))?
+        {
+            return Err(LedgerError::new(R::Corruption));
+        }
+        let placeholder = bridge_core::workflow_history::node_terminal_placeholder_v1();
+        if persisted_terminal != placeholder {
+            let write = if persisted_terminal == terminal_json
+                && policy_trigger_json
+                    .is_none_or(|value| evidence.policy_trigger_json.as_deref() == Some(value))
+            {
+                TerminalWrite::Replayed
+            } else {
+                TerminalWrite::Conflict
+            };
+            tx.commit().map_err(|error| history_error(&error))?;
+            return Ok(write);
+        }
+        if !self.history_growth_fits(&tx, 0)? {
+            return Err(LedgerError::new(R::CapacityProtected));
+        }
+        if let Some(trigger_json) = policy_trigger_json {
+            let changed = tx
+                .execute(
+                    "UPDATE workflow_attempt_summaries
+                     SET policy_trigger_json=?2
+                     WHERE attempt_id=?1 AND status='active'
+                       AND evidence_schema_version=1
+                       AND (policy_trigger_json IS NULL OR policy_trigger_json=?2)",
+                    rusqlite::params![id.as_str(), trigger_json],
+                )
+                .map_err(|error| history_error(&error))?;
+            if changed != 1 {
+                return Ok(TerminalWrite::Conflict);
+            }
+        }
+        let changed = tx
+            .execute(
+                "UPDATE workflow_attempt_node_terminals
+                 SET terminal_json=?3
+                 WHERE attempt_id=?1 AND node_id=?2 AND terminal_json=?4
+                   AND terminal_reserve=2048",
+                rusqlite::params![id.as_str(), node.as_str(), terminal_json, placeholder],
+            )
+            .map_err(|error| history_error(&error))?;
+        if changed != 1 {
+            return Ok(TerminalWrite::Conflict);
+        }
+        tx.commit().map_err(|error| history_error(&error))?;
+        drop(conn);
+        self.checkpoint_after_committed_history_mutation("commit_node_terminal_v2");
+        Ok(TerminalWrite::Applied)
+    }
+
+    async fn structured_evidence_v2(
+        &self,
+        id: &bridge_core::ids::AttemptId,
+    ) -> Result<
+        Option<bridge_core::workflow_history::AttemptStructuredEvidenceV1>,
+        bridge_core::workflow_history::LedgerError,
+    > {
+        use bridge_core::workflow_history::{LedgerError, LedgerUnavailableReason as R};
+        let conn = self.conn.lock().map_err(|_| LedgerError::new(R::Io))?;
+        load_structured_history_evidence(&conn, id)
     }
 
     async fn mark_prompt_acceptance(
@@ -10267,6 +10905,14 @@ impl bridge_core::workflow_history::WorkflowHistoryStore for SqliteStore {
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|error| history_error(&error))?;
+            if let Some(evidence) = load_structured_history_evidence(&tx, id)? {
+                validate_structured_history_coherence(id, &evidence, true)?;
+                if structured_history_node_counts(&evidence)? != terminal.node_counts
+                    || evidence.policy_trigger_json != terminal.policy_trigger_json
+                {
+                    return Err(LedgerError::new(R::Schema));
+                }
+            }
             let existing: Option<(String, Option<String>, String, Option<i64>, i64)> = tx
                 .query_row(
                     "SELECT status, terminal_json, prompt_acceptance,
@@ -11505,7 +12151,7 @@ mod tests {
         ControlEventIdV1, FanOutPolicyNameV1, NodeCleanupDispositionV1, NodeCleanupV1,
         NodePrimaryDispositionV1, NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1,
     };
-    use bridge_core::ids::{AttemptId, BatchId, ContextId, SessionId, TaskId, TurnId};
+    use bridge_core::ids::{AttemptId, BatchId, ContextId, NodeId, SessionId, TaskId, TurnId};
     use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
     use bridge_core::ports::{FailureClass, SessionStore, TraceParent, TurnContext, TurnOutcome};
     use bridge_core::task_store::{
@@ -13550,6 +14196,7 @@ mod tests {
             prompt_acceptance: "not_dispatched".into(),
             cleanup_disposition: "complete".into(),
             node_counts: Default::default(),
+            policy_trigger_json: None,
             phase_durations: Vec::new(),
             telemetry_complete: true,
             monotonic_clock: true,
@@ -17481,6 +18128,332 @@ mod r2f0a_history_tests {
         }
     }
 
+    #[test]
+    fn structured_history_node_schema_stores_each_uncapped_node_key_once() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type='table' AND name='workflow_attempt_node_terminals'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sql.to_ascii_uppercase().contains("WITHOUT ROWID"));
+
+        let indexes = {
+            let mut statement = conn
+                .prepare("PRAGMA index_list(workflow_attempt_node_terminals)")
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(indexes.len(), 1);
+        let (index_name, unique, origin, partial) = &indexes[0];
+        assert_eq!((*unique, origin.as_str(), *partial), (1, "pk", 0));
+
+        let key_columns = {
+            let mut statement = conn
+                .prepare(&format!("PRAGMA index_xinfo({index_name})"))
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let key_columns = key_columns
+            .into_iter()
+            .filter(|(_, _, key)| *key == 1)
+            .map(|(seq, name, _)| (seq, name))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            key_columns,
+            vec![
+                (0, Some("attempt_id".to_owned())),
+                (1, Some("node_id".to_owned()))
+            ]
+        );
+        let separately_rooted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='index' AND tbl_name='workflow_attempt_node_terminals'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(separately_rooted, 0);
+    }
+
+    fn structured_history_reservation() -> bridge_core::workflow_history::AttemptReservationV2 {
+        use bridge_core::execution_policy::{
+            resolve_execution_policy_v1, ExecutionPolicyInvocationV1, FanOutPolicyV1,
+            PolicyActivationV1, WorkflowControlDefaultsV1,
+        };
+        use bridge_core::workflow_history::{
+            AttemptReservationV2, HistoryNodeReservationV1, WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1,
+        };
+
+        let controls = resolve_execution_policy_v1(
+            &WorkflowControlDefaultsV1 {
+                fan_out: Some(FanOutPolicyV1::FailFast),
+                ..WorkflowControlDefaultsV1::default()
+            },
+            &ExecutionPolicyInvocationV1::default(),
+            false,
+            PolicyActivationV1::Production,
+        )
+        .unwrap();
+        AttemptReservationV2 {
+            schema_version: WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1,
+            reservation: reservation(),
+            controls_json: String::from_utf8(controls.encode_canonical().unwrap()).unwrap(),
+            controls_fingerprint: "controls-a".into(),
+            expected_node_count: 2,
+            nodes: vec![
+                HistoryNodeReservationV1 {
+                    node: NodeId::parse("root").unwrap(),
+                    sorted_ordinal: 0,
+                },
+                HistoryNodeReservationV1 {
+                    node: NodeId::parse("synth").unwrap(),
+                    sorted_ordinal: 1,
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_structured_history_reservation_and_node_commit_are_atomic() {
+        use bridge_core::execution_policy::{
+            ControlEventIdV1, FanOutPolicyNameV1, NodeCleanupDispositionV1, NodeCleanupV1,
+            NodePrimaryDispositionV1, NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1,
+            EXECUTION_POLICY_SCHEMA_V1,
+        };
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let reservation = structured_history_reservation();
+        let attempt = reservation.reservation.identity.attempt_id.clone();
+        store.reserve_v2(&reservation).await.unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            let rows: Vec<(String, i64, i64)> = conn
+                .prepare(
+                    "SELECT node_id, length(terminal_json), terminal_reserve
+                     FROM workflow_attempt_node_terminals
+                     WHERE attempt_id=?1 ORDER BY node_id",
+                )
+                .unwrap()
+                .query_map(rusqlite::params![attempt.as_str()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("root".into(), 2_048, 2_048),
+                    ("synth".into(), 2_048, 2_048)
+                ]
+            );
+        }
+
+        let empty = store
+            .structured_evidence_v2(&attempt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty.reservation, reservation);
+        assert!(empty.node_terminals.is_empty());
+        assert!(empty.policy_trigger_json.is_none());
+
+        let root = NodeId::parse("root").unwrap();
+        let trigger = PolicyTriggerV1 {
+            schema_version: EXECUTION_POLICY_SCHEMA_V1,
+            id: ControlEventIdV1::for_attempt(&attempt, 0),
+            node: PolicyNodeRefV1::from_node_id(0, root.as_str()),
+            policy: FanOutPolicyNameV1::FailFast,
+            grace_ms: None,
+        };
+        let node_terminal = NodeTerminalV1 {
+            schema_version: EXECUTION_POLICY_SCHEMA_V1,
+            primary: NodePrimaryDispositionV1::Failed,
+            cleanup: NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::Complete,
+                duration_ms: 1,
+            },
+            cause: None,
+            prompt_may_have_been_accepted: true,
+            degraded_ancestry: false,
+            policy_trigger_id: Some(trigger.id.clone()),
+        };
+        let terminal_json = String::from_utf8(node_terminal.encode_canonical().unwrap()).unwrap();
+        let trigger_json = String::from_utf8(trigger.encode_canonical().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .commit_node_terminal_v2(&attempt, &root, &terminal_json, Some(&trigger_json),)
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+        assert_eq!(
+            store
+                .commit_node_terminal_v2(&attempt, &root, &terminal_json, Some(&trigger_json),)
+                .await
+                .unwrap(),
+            TerminalWrite::Replayed
+        );
+        let evidence = store
+            .structured_evidence_v2(&attempt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.node_terminals.len(), 1);
+        assert_eq!(evidence.node_terminals[0].node, root);
+        assert_eq!(evidence.node_terminals[0].terminal_json, terminal_json);
+        assert_eq!(
+            evidence.policy_trigger_json.as_deref(),
+            Some(trigger_json.as_str())
+        );
+
+        let mut summary = terminal();
+        summary.outcome = "failed".into();
+        summary.terminal_reason = "failed".into();
+        summary.policy_trigger_json = Some(trigger_json.clone());
+        summary.node_counts = NodeCounts {
+            failed: 1,
+            ..NodeCounts::default()
+        };
+        assert_eq!(
+            store
+                .terminalize(&attempt, &summary)
+                .await
+                .unwrap_err()
+                .reason,
+            bridge_core::workflow_history::LedgerUnavailableReason::Corruption,
+            "the attempt summary cannot outrun an admitted node placeholder"
+        );
+
+        let synth = NodeId::parse("synth").unwrap();
+        let synth_terminal = NodeTerminalV1 {
+            schema_version: EXECUTION_POLICY_SCHEMA_V1,
+            primary: NodePrimaryDispositionV1::Completed,
+            cleanup: NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::Complete,
+                duration_ms: 1,
+            },
+            cause: None,
+            prompt_may_have_been_accepted: true,
+            degraded_ancestry: true,
+            policy_trigger_id: None,
+        };
+        let synth_json = String::from_utf8(synth_terminal.encode_canonical().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .commit_node_terminal_v2(&attempt, &synth, &synth_json, None)
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+        summary.node_counts.completed = 1;
+        assert_eq!(
+            store.terminalize(&attempt, &summary).await.unwrap(),
+            TerminalWrite::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_boot_reconciliation_completes_structured_map_and_retains_trigger() {
+        use bridge_core::execution_policy::{
+            ControlEventIdV1, FanOutPolicyNameV1, NodeCleanupDispositionV1, NodeCleanupV1,
+            NodePrimaryDispositionV1, NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1,
+            EXECUTION_POLICY_SCHEMA_V1,
+        };
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let reservation = structured_history_reservation();
+        let attempt = reservation.reservation.identity.attempt_id.clone();
+        store.reserve_v2(&reservation).await.unwrap();
+        let root = NodeId::parse("root").unwrap();
+        let trigger = PolicyTriggerV1 {
+            schema_version: EXECUTION_POLICY_SCHEMA_V1,
+            id: ControlEventIdV1::for_attempt(&attempt, 0),
+            node: PolicyNodeRefV1::from_node_id(0, root.as_str()),
+            policy: FanOutPolicyNameV1::FailFast,
+            grace_ms: None,
+        };
+        let root_terminal = NodeTerminalV1 {
+            schema_version: EXECUTION_POLICY_SCHEMA_V1,
+            primary: NodePrimaryDispositionV1::Failed,
+            cleanup: NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::Complete,
+                duration_ms: 1,
+            },
+            cause: None,
+            prompt_may_have_been_accepted: true,
+            degraded_ancestry: false,
+            policy_trigger_id: Some(trigger.id.clone()),
+        };
+        let terminal_json = String::from_utf8(root_terminal.encode_canonical().unwrap()).unwrap();
+        let trigger_json = String::from_utf8(trigger.encode_canonical().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .commit_node_terminal_v2(&attempt, &root, &terminal_json, Some(&trigger_json),)
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+
+        assert_eq!(store.interrupt_active(3_000).await.unwrap(), 1);
+        let evidence = store
+            .structured_evidence_v2(&attempt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.node_terminals.len(), 2);
+        let synth = evidence
+            .node_terminals
+            .iter()
+            .find(|terminal| terminal.node.as_str() == "synth")
+            .unwrap();
+        let synth = NodeTerminalV1::decode_canonical(synth.terminal_json.as_bytes()).unwrap();
+        assert_eq!(synth.primary, NodePrimaryDispositionV1::InterruptedLegacy);
+        assert_eq!(
+            synth.cleanup.disposition,
+            NodeCleanupDispositionV1::UnknownLegacy
+        );
+        assert_eq!(
+            evidence.policy_trigger_json.as_deref(),
+            Some(trigger_json.as_str())
+        );
+        let attempt_row = store.attempt(&attempt).await.unwrap().unwrap();
+        let terminal = attempt_row.terminal.unwrap();
+        assert_eq!(terminal.outcome, "interrupted");
+        assert_eq!(terminal.node_counts.failed, 1);
+        assert_eq!(
+            terminal.policy_trigger_json.as_deref(),
+            Some(trigger_json.as_str())
+        );
+    }
+
     fn reservation_with_ids(execution_id: &str, attempt_id: &str) -> AttemptReservation {
         let mut row = reservation();
         row.identity = bridge_core::ids::AttemptIdentity {
@@ -17656,6 +18629,7 @@ mod r2f0a_history_tests {
                 completed: 1,
                 ..NodeCounts::default()
             },
+            policy_trigger_json: None,
             phase_durations: vec![],
             telemetry_complete: true,
             monotonic_clock: true,
@@ -18767,6 +19741,7 @@ mod r2f0a_history_tests {
                 completed: 2,
                 ..NodeCounts::default()
             },
+            policy_trigger_json: None,
             phase_durations: vec![],
             telemetry_complete: true,
             monotonic_clock: true,
@@ -28673,6 +29648,7 @@ mod r2f0a_history_tests {
                 prompt_acceptance: "dispatch_uncertain".into(),
                 cleanup_disposition: "unknown".into(),
                 node_counts: NodeCounts::default(),
+                policy_trigger_json: None,
                 phase_durations: Vec::new(),
                 telemetry_complete: false,
                 monotonic_clock: false,

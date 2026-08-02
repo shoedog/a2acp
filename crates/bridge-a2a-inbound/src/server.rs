@@ -15626,6 +15626,7 @@ mod tests {
             prompt_acceptance: "unknown".into(),
             cleanup_disposition: "unknown".into(),
             node_counts: bridge_core::workflow_history::NodeCounts::default(),
+            policy_trigger_json: None,
             phase_durations: Vec::new(),
             telemetry_complete: false,
             monotonic_clock: true,
@@ -16078,6 +16079,7 @@ mod tests {
                 failed: 1,
                 ..Default::default()
             },
+            policy_trigger_json: None,
             phase_durations: Vec::new(),
             telemetry_complete: true,
             monotonic_clock: true,

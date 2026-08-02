@@ -329,6 +329,8 @@ pub struct AttemptTerminal {
     pub prompt_acceptance: String,
     pub cleanup_disposition: String,
     pub node_counts: NodeCounts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_trigger_json: Option<String>,
     pub phase_durations: Vec<PhaseDuration>,
     pub telemetry_complete: bool,
     pub monotonic_clock: bool,
@@ -377,6 +379,9 @@ impl AttemptTerminal {
             }
             _ => false,
         };
+        let policy_trigger_valid = self.policy_trigger_json.as_deref().is_none_or(|encoded| {
+            crate::execution_policy::PolicyTriggerV1::decode_canonical(encoded.as_bytes()).is_ok()
+        });
         if self.completed_ms <= 0
             || dims.iter().any(|v| !bounded(v, MAX_DIMENSION_LEN))
             || !matches!(
@@ -416,6 +421,7 @@ impl AttemptTerminal {
             )
             || !self.terminal_evidence_counts.validate()
             || !evidence_coherent
+            || !policy_trigger_valid
         {
             return Err(LedgerError::new(LedgerUnavailableReason::Schema));
         }
@@ -993,6 +999,7 @@ impl DirectAttemptBarrier {
             prompt_acceptance: self.prompt_acceptance.into(),
             cleanup_disposition: cleanup_disposition.into(),
             node_counts: NodeCounts::default(),
+            policy_trigger_json: None,
             phase_durations: Vec::new(),
             telemetry_complete: false,
             monotonic_clock: true,
@@ -1488,6 +1495,9 @@ impl WorkflowHistoryStore for MemoryWorkflowHistoryStore {
             .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
         if let Some(attempt) = structured.get(id.as_str()) {
             Self::validate_complete_structured_attempt(id, attempt)?;
+            if terminal.policy_trigger_json != attempt.policy_trigger_json {
+                return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+            }
         }
         let (reservation, persisted) = rows
             .get_mut(id.as_str())
@@ -1605,11 +1615,84 @@ impl WorkflowHistoryStore for MemoryWorkflowHistoryStore {
             .rows
             .lock()
             .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
+        let mut structured = self
+            .structured
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
         let mut changed = 0_u64;
         for (reservation, terminal) in rows.values_mut() {
             if terminal.is_some() || excluded.contains(reservation.identity.attempt_id.as_str()) {
                 continue;
             }
+            let (node_counts, policy_trigger_json) = if let Some(attempt) =
+                structured.get_mut(reservation.identity.attempt_id.as_str())
+            {
+                use crate::execution_policy::{
+                    NodeCleanupDispositionV1 as Cleanup, NodeCleanupV1,
+                    NodePrimaryDispositionV1 as Primary, NodeTerminalV1,
+                    EXECUTION_POLICY_SCHEMA_V1,
+                };
+
+                let interrupted = NodeTerminalV1 {
+                    schema_version: EXECUTION_POLICY_SCHEMA_V1,
+                    primary: Primary::InterruptedLegacy,
+                    cleanup: NodeCleanupV1 {
+                        disposition: Cleanup::UnknownLegacy,
+                        duration_ms: 0,
+                    },
+                    cause: None,
+                    prompt_may_have_been_accepted: reservation.prompt_acceptance
+                        != "not_dispatched",
+                    degraded_ancestry: false,
+                    policy_trigger_id: None,
+                };
+                let interrupted_json = String::from_utf8(
+                    interrupted
+                        .encode_canonical()
+                        .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?,
+                )
+                .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+                for slot in attempt.node_terminals.values_mut() {
+                    if slot.is_none() {
+                        *slot = Some(interrupted_json.clone());
+                    }
+                }
+                let mut counts = NodeCounts::default();
+                for encoded in attempt.node_terminals.values().flatten() {
+                    let terminal = NodeTerminalV1::decode_canonical(encoded.as_bytes())
+                        .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+                    let counter = match terminal.primary {
+                        Primary::Completed => Some(&mut counts.completed),
+                        Primary::Failed | Primary::TimedOut => Some(&mut counts.failed),
+                        Primary::CanceledWorkflow
+                        | Primary::CanceledPolicy
+                        | Primary::CanceledNode => Some(&mut counts.canceled),
+                        Primary::SkippedDependency
+                        | Primary::NotStartedPolicy
+                        | Primary::InterruptedLegacy => None,
+                        Primary::Deadline => {
+                            return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+                        }
+                    };
+                    if let Some(counter) = counter {
+                        *counter = counter
+                            .checked_add(1)
+                            .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
+                    }
+                    if matches!(
+                        terminal.cleanup.disposition,
+                        Cleanup::Failed | Cleanup::UnknownLegacy
+                    ) {
+                        counts.cleanup_partial = counts
+                            .cleanup_partial
+                            .checked_add(1)
+                            .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
+                    }
+                }
+                (counts, attempt.policy_trigger_json.clone())
+            } else {
+                (NodeCounts::default(), None)
+            };
             *terminal = Some(AttemptTerminal {
                 completed_ms,
                 work_ms: 0,
@@ -1631,7 +1714,8 @@ impl WorkflowHistoryStore for MemoryWorkflowHistoryStore {
                 degraded: true,
                 prompt_acceptance: reservation.prompt_acceptance.clone(),
                 cleanup_disposition: "unknown".into(),
-                node_counts: NodeCounts::default(),
+                node_counts,
+                policy_trigger_json,
                 phase_durations: Vec::new(),
                 telemetry_complete: false,
                 monotonic_clock: false,
@@ -2108,6 +2192,7 @@ mod tests {
             TerminalWrite::Applied
         );
         summary.node_counts.completed = 1;
+        summary.policy_trigger_json = Some(trigger_json);
         assert_eq!(
             store
                 .terminalize(&identity.attempt_id, &summary)
@@ -2115,6 +2200,47 @@ mod tests {
                 .unwrap(),
             TerminalWrite::Applied
         );
+    }
+
+    #[tokio::test]
+    async fn memory_boot_reconciliation_completes_structured_placeholders() {
+        use crate::execution_policy::{
+            NodeCleanupDispositionV1, NodePrimaryDispositionV1, NodeTerminalV1,
+        };
+
+        let store = MemoryWorkflowHistoryStore::new();
+        let identity = AttemptIdentity::initial().unwrap();
+        let reservation = structured_reservation(identity.clone());
+        store.reserve_v2(&reservation).await.unwrap();
+        assert_eq!(store.interrupt_active(3_000).await.unwrap(), 1);
+
+        let evidence = store
+            .structured_evidence_v2(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.node_terminals.len(), 2);
+        for persisted in &evidence.node_terminals {
+            let terminal =
+                NodeTerminalV1::decode_canonical(persisted.terminal_json.as_bytes()).unwrap();
+            assert_eq!(
+                terminal.primary,
+                NodePrimaryDispositionV1::InterruptedLegacy
+            );
+            assert_eq!(
+                terminal.cleanup.disposition,
+                NodeCleanupDispositionV1::UnknownLegacy
+            );
+        }
+        let terminal = store
+            .attempt(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal
+            .unwrap();
+        assert_eq!(terminal.outcome, "interrupted");
+        assert!(terminal.policy_trigger_json.is_none());
     }
 
     #[tokio::test]
@@ -2178,6 +2304,7 @@ mod tests {
                     completed: 1,
                     ..NodeCounts::default()
                 },
+                policy_trigger_json: None,
                 phase_durations: Vec::new(),
                 telemetry_complete: true,
                 monotonic_clock: true,

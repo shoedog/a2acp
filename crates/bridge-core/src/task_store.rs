@@ -4312,6 +4312,7 @@ mod tests {
             prompt_acceptance: "not_dispatched".into(),
             cleanup_disposition: "complete".into(),
             node_counts: Default::default(),
+            policy_trigger_json: None,
             phase_durations: Vec::new(),
             telemetry_complete: true,
             monotonic_clock: true,

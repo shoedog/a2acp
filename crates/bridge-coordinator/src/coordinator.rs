@@ -1659,8 +1659,20 @@ impl Coordinator {
             prompt_acceptance: "not_dispatched".into(),
             pinned: false,
         };
+        let structured_reservation = admitted
+            .as_ref()
+            .map(|authority| {
+                crate::detached::structured_history_reservation_v1(
+                    reservation.clone(),
+                    &authority.run_spec,
+                )
+            })
+            .transpose()?;
         let (history, telemetry_unavailable) = match &self.workflow_history {
-            Some(Ok(history)) => match history.reserve(&reservation).await {
+            Some(Ok(history)) => match match structured_reservation.as_ref() {
+                Some(structured) => history.reserve_v2(structured).await,
+                None => history.reserve(&reservation).await,
+            } {
                 Ok(()) => (Some(history.clone()), None),
                 Err(error)
                     if error.reason
@@ -2956,6 +2968,7 @@ mod tests {
                 prompt_acceptance: "not_dispatched".into(),
                 cleanup_disposition: "complete".into(),
                 node_counts: bridge_core::workflow_history::NodeCounts::default(),
+                policy_trigger_json: None,
                 phase_durations: vec![bridge_core::workflow_history::PhaseDuration {
                     phase: "work".into(),
                     duration_ms: 1_000,

@@ -2015,6 +2015,7 @@ mod r2f0a_workflow_metric_tests {
                     completed: 1,
                     ..bridge_core::workflow_history::NodeCounts::default()
                 },
+                policy_trigger_json: None,
                 phase_durations: Vec::new(),
                 telemetry_complete: true,
                 monotonic_clock: true,
