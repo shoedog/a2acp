@@ -1,7 +1,8 @@
 # R2f1a focused implementation boundary — profiles, fan-out policy, and per-node control
 
-- **Status:** PARKED — SOL CLOSURE REVIEW 4 REJECT / CAP EXHAUSTED / IMPLEMENTATION UNAUTHORIZED — the one
-  authorized cumulative review found two closed-enumerable blockers; no further repair or review is authorized
+- **Status:** REPAIRED — SOL/XHIGH CLOSURE REVIEW 5 PENDING / IMPLEMENTATION UNAUTHORIZED — one separately
+  authorized bounded repair closes the two closure-review-4 blockers; this round permits one cumulative review and
+  no second repair/review loop
 - **Frozen base:** `3f35ee6e07e9af314bb548b9d3ab694f3bba5fb1`
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Normative authority:** [`../specs/2026-07-20-r2f-owner-design.md`](../specs/2026-07-20-r2f-owner-design.md)
@@ -11,9 +12,11 @@
 - **Synthesis:** `644c2df21579bcb3dc9e07f347911f1516ebf61d6c0b9493433d117d83070a84`
 
 This document records the repaired proposed source boundary. It narrows, but does not replace, the approved owner
-design and parent plan. Its contents are not implementation authority: closure review 4 rejected the exact clean
-repair commit, and the owner-authorized convergence cap is exhausted. The two residual blockers below must remain
-parked until a separately authorized bounded repair/review round.
+design and parent plan. Its contents are not implementation authority. Closure review 4 rejected the prior exact
+clean repair commit on two closed-enumerable blockers. The owner then authorized one bounded repair of exactly that
+population, deterministic documentation gates, and one cumulative Sol/xhigh closure review. A rejection parks this
+checkpoint; it does not authorize another repair, review, implementation, live gate, release, deployment, or
+operator effect.
 
 ## Dogfood and synthesis evidence
 
@@ -169,6 +172,14 @@ request cwd and `{cwd}`-resolved MCP delivery bytes are not committed into provi
 auto-vacuum can relocate an unrelated tail page and rewrite more pointer-map pages than `D(R)=3R+2` reserves. The
 review classified both as closed-enumerable with bounded fixes, but the declared cap permits neither fix here.
 
+The owner subsequently authorized one new bounded round: repair exactly those two findings, run deterministic
+documentation gates, and dispatch exactly one cumulative Sol/xhigh closure review. The repair freezes one resolved
+effective session cwd per node into snapshot V2 and provider identity, derives the exact MCP delivery bytes from
+that value once, and makes those same bound bytes the only session/MCP delivery source. It also rejects configured-
+history `auto_vacuum=FULL` before any durable or provider effect and permits `INCREMENTAL` only while the bridge-
+owned connection cannot execute incremental vacuum. This authorization does not extend to implementation, a second
+repair/review loop, Rust behavioral evidence, a compatibility case, release, deployment, or operator mutation.
+
 ## 1. Frozen authority and slice boundary
 
 D1–D11 remain settled:
@@ -208,7 +219,7 @@ R2f1a does not ship any production timer. In particular, a production execution 
 | Production fixed grace | Refuse it before effects in R2f1a. Accepting it while arming no expiry would implement neither fixed grace nor a bounded policy. |
 | Trigger selection | Drain the currently ready completion batch, sort by `NodeId`, and select the lowest qualifying failed/timed-out node. Raw `FuturesUnordered` delivery order is not durable determinism. |
 | Run-spec persistence | Persist the fully resolved controls in snapshot V2. Do not re-resolve checked-in constants from declarations on resume. |
-| Provider-effect and selection freeze | Freeze two distinct canonical digests per node whose combined identity covers every ordinary-workflow provider input: a **provider-effect digest** over the spawn, checkout, credential, session, watchdog, and MCP fields, and a **selection digest** over the agent, preflight flag, primary model, exact ordered fallback candidate list, effort, and mode. Freezing only the selection tuple leaves the provider call itself mutable — a tuple-identical hot reload of `base_url` or `api_key_env` passes a selection-only digest — and is rejected. Fields used only by compatibility resolution, guarded R2d fallback, or presentation are explicitly excluded by source boundary. |
+| Provider-effect and selection freeze | Freeze two distinct canonical digests per node whose combined identity covers every ordinary-workflow provider input: a **provider-effect digest** over the spawn, checkout, credential, session, watchdog, effective session cwd, and exact resolved MCP-delivery fields, and a **selection digest** over the agent, preflight flag, primary model, exact ordered fallback candidate list, effort, and mode. Freezing only the configured entry or selection tuple leaves the call mutable: a tuple-identical hot reload of `base_url`/`api_key_env`, or request cwd A versus B under one `{cwd}` template, can change the provider call while passing the old digest. Fields used only by compatibility resolution, guarded R2d fallback, or presentation are explicitly excluded by source boundary. |
 | Check-to-use binding | Lease-first, same-entry, bound-use. One bind per provider attempt takes a registry **lease** before reading the entry, yields exactly one immutable `Arc<AgentEntry>`, validates both frozen digests against that value, and is the sole source consumed for candidate selection, configuration, and dispatch. Re-reading the registry between validation and use is forbidden. There is no registry generation or revision API on current main; §5 specifies the minimal additive replacement and keeps the durable digests distinct from an opaque process-local use token. |
 | Fingerprint compatibility | Always include canonical resolved controls and every per-node provider-selection digest in new R2f1a workload fingerprints. Preserving the old hash would conflate pre-policy and bounded-policy calibration populations. |
 | `completed_degraded` task status | Keep `tasks.status = completed`; persist an additive `workflow_outcome = completed_degraded`. Do not introduce an old-binary-unknown task-status token. |
@@ -562,6 +573,10 @@ pub struct FrozenProviderSelectionV1 {
 /// This is semantic identity: it is persisted, replayed, and compared across processes.
 pub struct FrozenProviderEffectV1 {
     pub agent: AgentId,
+    /// Absolute, lexically normalized path bytes actually supplied to the session.
+    pub effective_session_cwd: SessionCwd,
+    /// Commits the exact ordered, post-substitution MCP bytes for the selected delivery channel.
+    pub mcp_delivery_digest: Sha256HexV1,
     pub effect_digest: Sha256HexV1,
     /// Present exactly when the entry carries one or more MCP environment values.
     pub secret_commitment_key_id: Option<Sha256HexV1>,
@@ -578,6 +593,8 @@ pub struct WorkflowRunSpecV1 {
     pub schema_version: u16,
     pub graph: WorkflowGraph,
     pub controls: FrozenWorkflowControlsV1,
+    /// Normalized per-request override after allowed-root validation; absence is distinct.
+    pub requested_session_cwd: Option<SessionCwd>,
     pub node_execution_identities: Vec<FrozenNodeExecutionIdentityV1>,
     pub ledger_admission: LedgerAdmissionV1,
     pub controls_fingerprint: String,
@@ -604,14 +621,16 @@ same hole exists for `api_key_env`, `kind`, `cmd`/`args`, `cwd`, `session_cwd`, 
 
 **Provider-effect digest.** `effect_digest` is SHA-256 over a canonical, injective, length-prefixed encoding of every
 current `AgentEntry` field that can alter ordinary-workflow backend selection, spawn, checkout, credentials, session
-mint, watchdog behavior, or MCP prompt transport and is not already carried by the selection digest:
+mint, watchdog behavior, or MCP prompt transport and is not already carried by the selection digest. It additionally
+binds the resolved per-node `effective_session_cwd` and exact ordered post-substitution MCP delivery commitments;
+those are request/run effects and cannot be reconstructed from `AgentEntry` alone:
 
 | Effect group | Fields |
 |---|---|
 | backend construction and transport | `kind`, `cmd`, `args`, `base_url` |
 | credentials and authentication | `api_key_env` (the variable **name** only, never its value), `auth_method`, `pre_authenticated` |
-| checkout, isolation, and session location | `cwd`, `session_cwd`, `sandbox`, `watchdog` |
-| tool surface offered to the agent | `mcp` with exact server/argument/environment order, public source descriptors, and keyed value commitments, plus `mcp_delivery` |
+| checkout, isolation, and session location | raw `cwd`, raw `session_cwd`, resolved `effective_session_cwd`, `sandbox`, `watchdog` |
+| tool surface offered to the agent | `mcp` with exact server/argument/environment order, public source descriptors, keyed template commitments, keyed exact-delivery commitments, and the managed-depth marker, plus `mcp_delivery` |
 
 `id` is carried beside `effect_digest` in `FrozenProviderEffectV1` and is also part of `selection_digest`.
 `model`, `effort`, `mode`, `preflight`, and `fallback_models` are carried by that separate selection digest rather
@@ -623,9 +642,48 @@ authorization edit cannot manufacture R2f1a drift. The classification is exhaust
 builder destructures `AgentEntry` with no `..` rest pattern and explicitly routes each field to provider effect,
 selection, carried identifier, or excluded-by-source-boundary metadata. Adding a field fails compilation until it is
 classified. The ambient bearer selected by `api_key_env` is never read or hashed; only its configured variable name
-participates. MCP environment values alter the delivered tool surface, but they enter durable identity only through
-the secret-silent keyed commitment below. No raw MCP command, argument, environment value, key path, or key byte is
-persisted, projected, or logged by this identity mechanism.
+participates. The exhaustive builder also receives a required `ProviderFreezeContextV1` containing the immutable
+operator-launch cwd and the already validated request override; this is how it classifies effects that are not
+fields of `AgentEntry`. MCP commands, arguments, and environment values alter the delivered tool surface, but they
+enter durable identity only through the secret-silent keyed commitments below. No raw MCP command, argument,
+environment value, key path, or key byte is persisted, projected, or logged by this identity mechanism.
+
+**One effective cwd, selected once.** `effective_session_cwd` is resolved during pre-effect run-spec construction,
+separately for each node's bound entry, with exactly this precedence:
+
+```text
+validated requested_session_cwd
+  ?? entry.session_cwd
+  ?? entry.cwd
+  ?? operator_launch_cwd
+```
+
+The request value is already an absolute, lexically normalized `SessionCwd`. A configured absolute value is parsed
+the same way; a configured relative value (including `.`) is joined to the absolute launch cwd captured once when
+the operator/one-shot command starts and then lexically normalized. The resolver does not consult the filesystem,
+follow a symlink, re-read `current_dir`, or claim R2d-style object identity. Invalid/overflowing values refuse before
+task, history, registry, session, or provider effects. `requested_session_cwd` preserves absence versus presence in
+`WorkflowRunSpecV1`; every node identity preserves its resolved effective value because entries may have different
+fallbacks when the request is absent.
+
+Existing sandbox/worktree containment code may still canonicalize a separately held host source object to validate
+or mount it, but that security result cannot silently replace the frozen delivery text. Where a container needs a
+canonical host mount source, composition separates that source from the container destination/session cwd and uses
+the frozen effective path for the latter. No post-freeze `canonicalize`, spawn helper, or backend default may change
+the bytes supplied to `SessionSpec.cwd` or `{cwd}` substitution. This deliberately gives ordinary workflow identity
+textual path semantics; R2d remains the separate object-identity boundary.
+
+`SessionSpec.cwd` is always `Some(node.effect.effective_session_cwd)` on the V2 path. Neither the executor nor a
+backend may fall back again to entry configuration. Resume with no new request envelope uses the persisted value.
+If a resume surface does supply a new cwd field, its explicit absence/presence and normalized bytes must equal the
+persisted request field or the resume refuses with a pre-effect persistence conflict. V1 keeps the legacy
+`TaskRecord.session_cwd` path only for V1 compatibility.
+
+V2 also removes the current `run-workflow`/served/batch technique of stamping a request cwd into cloned
+`AgentEntry.session_cwd`. The configured raw field remains immutable and participates only at its declared fallback
+precedence. The request travels solely in `ProviderFreezeContextV1`, is persisted separately, and produces each
+node's effective value. Otherwise resume would compare a transiently rewritten entry against the unstamped current
+registry and could not distinguish operator configuration from a per-request override.
 
 **Typed MCP environment values and secret-silent commitment.** The current `EnvToml { name, value }` and
 `McpServerSpec.env: Vec<(String, String)>` make a literal value both delivery data and potential credential material.
@@ -648,10 +706,56 @@ retains today's `{cwd}` substitution. `value_from_env` is a nonempty environment
 template syntax, and is resolved exactly once while constructing the immutable `AgentEntry`; missing, non-Unicode,
 or empty input refuses the snapshot. `SecretString` has secret-silent `Debug`/display/serialization behavior. The
 same immutable source bytes held by the bound entry are used for commitment and delivery: referenced secrets are
-delivered directly, while public literals undergo only the already-frozen `{cwd}` substitution. No later `std::env`
-read may change a referenced value between validation and provider use. Reload re-resolves into a new
-entry, so a changed referenced value is ordinary provider-effect drift. Existing literal syntax remains valid, but
-the type and operator docs no longer call it a credential channel.
+delivered directly, while every public MCP argument/environment literal is substituted once with the frozen
+`effective_session_cwd`. No later `std::env` read or second template expansion may change a referenced or public
+value between validation and provider use. Reload re-resolves into a new entry, so a changed referenced value is
+ordinary provider-effect drift. Existing literal syntax remains valid, but the type and operator docs no longer call
+it a credential channel.
+
+The resolver produces one cloneable but non-serializable `BoundMcpDeliveryV1` beside the durable commitments. Its
+custom `Debug` reports only channel, digest, and counts. It contains the exact ordered
+server/command/argument/environment bytes after `{cwd}` substitution and after the reserved managed-depth
+environment marker is normalized, plus the exact channel representation: already-rendered ACP servers,
+Codex-native argv suffix, or Kiro-native agent name and JSON bytes. It is created from the exact immutable entry and
+frozen cwd used to recompute `effect_digest`; those bytes, not the templates, are passed to the selected adapter.
+
+An additive `AgentBackend::configure_bound_session(session, &BoundSessionSpecV1)` carries the ordinary
+`SessionSpec` plus `Arc<BoundMcpDeliveryV1>`. Its default is a typed `BoundSessionUnsupported` refusal, so existing
+backends and exhaustive `SessionSpec` struct literals remain source-compatible while no V2 caller can fall back
+silently. V1 alone continues to call `configure_session` and may use legacy static `AcpConfig.mcp`. Production ACP,
+container, native, API, and worktree backends implement the additive method for V2; API's explicitly empty delivery
+still requires the method and cannot bypass effect verification. ACP stashes the bound value beside cwd/config, and
+mint converts its already-rendered server tuple directly to wire types. It performs no substitution and does not
+consult static MCP config on the V2 path. The container backend's per-session `prepare_inner` consumes the same
+bound Codex-native argv suffix. Host native spawn receives the same value through `resolve_bound`. Thus every
+currently distinct delivery seam has one explicit V2 input and no backend has to reconstruct it.
+
+ACP delivery remains per session. Native delivery is process-start input, so a native backend is reusable only for
+the exact `mcp_delivery_digest`: the bound registry subslot is keyed by the complete provider-effect digest (which
+includes effective cwd and delivery bytes), and `resolve_bound` either returns that exact subslot or cold-spawns it
+from `BoundMcpDeliveryV1`. A backend spawned for cwd A cannot serve cwd B, and a config-only slot reuse cannot share a
+native MCP child across different effect keys. Retirement/invalidation drains every keyed backend owned by the
+slot, while exact-bound invalidation names only the keyed backend used by the failing attempt. This is a bounded
+adapter-process partition, not a provider retry or fallback. It preserves served cross-repository native-MCP use
+without delivering a static operator cwd under a per-request session identity.
+
+That registry subslot rule applies to an `AgentKind::Acp` backend whose Codex/Kiro native MCP is fixed when the
+adapter process starts, including a read-only sandbox child. `ContainerRwBackend` remains one outer session manager:
+its actual native child is already minted per `BoundSessionSpecV1`, and `prepare_inner` consumes the bound argv for
+that child. API/worktree/ACP-protocol delivery likewise stays session-scoped. This classification is exhaustive over
+`AgentKind × McpDelivery` and fails compilation when either enum gains a variant.
+
+Kiro's current stable `~/.kiro/agents/a2a-mcp-<agent>.json` would defeat that partition: spawning effect B can
+overwrite the path still named by effect A. V2 first hashes a versioned Kiro-render domain, every constant rendered
+field, and the canonical post-substitution public server tuple (excluding only the name derived next), derives
+`a2a-mcp-v2-<full-hex-tuple-digest>` from it, renders that exact name into the final JSON, and commits both the
+name/argv and final JSON bytes in `mcp_delivery_digest`. Any future renderer change must bump that domain. The bridge creates
+the owner-only content-addressed file atomically without overwrite; an existing regular file is reusable only after
+exact byte equality, otherwise spawn refuses. The file is made owner-read-only after file and parent sync and is not
+automatically unlinked by one backend, so a concurrent process with the same delivery cannot lose its named config.
+Kiro secret references remain forbidden, so this immutable cache contains only schema-declared public delivery
+bytes. A separately reviewed custody command may later reap unreachable V2 files; normal retirement never mutates a
+possibly shared name.
 
 `SecretFromEnv` is admitted only when the resolved delivery is `McpDelivery::Acp`. Current `CodexNative` renders MCP
 values in process arguments and `KiroNative` writes them into native settings; those channels remain public-literal
@@ -662,11 +766,18 @@ delivery custody, not a claim that a deliberately hostile adapter cannot inspect
 
 Every MCP environment value is keyed before it enters durable identity, including a declared-public literal. This
 defense-in-depth rule closes the offline oracle even when an old or mistaken config put a low-entropy credential in
-`value`; the bridge does not try to infer entropy or secrecy from names or bytes. For each binding, compute
-`HMAC-SHA256(K, domain || schema || agent || server_ordinal || env_ordinal || env_name || source_kind ||
-source_name_if_any || source_value_bytes)` with injective length prefixes. The canonical provider-effect encoding
-contains the public server/env order and source descriptor plus that 32-byte MAC, never the configured or resolved
-value. `effect_digest` remains SHA-256 over the resulting secret-silent canonical effect encoding.
+`value`; the bridge does not try to infer entropy or secrecy from names or bytes. For each environment binding,
+compute `HMAC-SHA256(K, domain || schema || agent || server_ordinal || env_ordinal || env_name || source_kind ||
+source_name_if_any || template_bytes || exact_delivery_bytes)` with injective length prefixes and distinct template
+and delivery domains. Public MCP names, commands, and arguments—including their template and exact delivered bytes—
+enter the ephemeral canonical SHA input directly; their schema declares them public, and no raw copy is persisted.
+The canonical provider-effect encoding contains the public server/env order and source descriptor plus each 32-byte
+environment template/delivery MAC, never a configured or resolved environment value. The exact
+`effective_session_cwd` is independently encoded even when no MCP field contains `{cwd}`. `mcp_delivery_digest`
+covers the complete ordered delivery including public command/argument bytes, environment MACs, and the managed-
+depth marker; `effect_digest` remains SHA-256 over that digest plus the resulting secret-silent canonical effect
+encoding. The bridge-generated fixed managed-depth marker is public domain-separated input and does not by itself
+require `K`.
 
 `K` is an operator-provisioned, exactly 32-byte random provider-effect key named by
 `[security].provider_effect_key_file`. The bridge opens that existing regular file descriptor-relatively/no-follow
@@ -707,8 +818,9 @@ froze and what a candidate must belong to; the effect digest is what the registr
 whose selection is satisfied by an entry that has been re-pointed at another endpoint must fail on the effect digest,
 and a projection must be able to say which of the two drifted.
 
-`identity_fingerprint` is SHA-256 over the node reference, `effect_digest`, and `selection_digest`, so either a
-selection change or a provider-effect change always changes the node identity. All three are durable semantic
+`identity_fingerprint` is SHA-256 over the node reference, resolved `effective_session_cwd`, `mcp_delivery_digest`,
+`effect_digest`, and `selection_digest`, so a request-cwd, delivered-tool, selection, or other provider-effect change
+always changes the node identity. All three digests are durable semantic
 identity: canonical over configuration bytes, persisted in snapshot V2, and meaningful across processes and restarts.
 They are never derived from a pointer, address, counter, or other process-local value — §5 keeps that concern in a
 strictly separate opaque token.
@@ -820,28 +932,33 @@ Order:
 4. Validate field combinations and true-omission semantics.
 5. Validate the DAG, references, acyclicity, and exactly one terminal.
 6. Resolve the profile and checked arithmetic.
-7. Inspect the effective configured provider entry — every ordinary-workflow effect field in §3 plus the selection tuple of
-   agent, preflight flag, model, ordered fallback list, effort, and mode — without resolving, checking out,
-   configuring, or spawning a backend.
-8. Validate Max qualification.
-9. Validate retry counts and critical-path retry backoff.
-10. Freeze each node's complete `FrozenProviderEffectV1` and `FrozenProviderSelectionV1`, compute the canonical
-    provider-effect digest, the canonical selection digest, and the graph-bound execution-identity fingerprint over
-    both, then construct the controls fingerprint and control-inclusive workload fingerprint from those frozen
-    values.
-11. Select the one authoritative ledger and record its `LedgerAdmissionV1` disposition in the frozen run spec, so no
+7. Validate and freeze the optional request cwd, capture one absolute operator-launch cwd, and inspect each effective
+   configured provider entry — every ordinary-workflow effect field in §3 plus the selection tuple of agent,
+   preflight flag, model, ordered fallback list, effort, and mode — without resolving, checking out, configuring, or
+   spawning a backend.
+8. Resolve each node's effective session cwd with the closed precedence above; resolve its exact ordered MCP delivery
+   once from that cwd and the immutable entry; reject any invalid source/key/delivery before effects.
+9. Validate Max qualification.
+10. Validate retry counts and critical-path retry backoff.
+11. Freeze each node's complete `FrozenProviderEffectV1` and `FrozenProviderSelectionV1`, compute the canonical
+    MCP-delivery, provider-effect, and selection digests, and the graph-bound execution-identity fingerprint over
+    all of them, then construct the controls fingerprint and control-inclusive workload fingerprint from those
+    frozen values.
+12. Select the one authoritative ledger, reject unsupported configured-history physical modes, and record its
+    `LedgerAdmissionV1` disposition in the frozen run spec, so no
     later barrier has to guess whether an offline history ledger was healthy.
-12. Refuse inactive production behavior, including `fixed_grace` in R2f1a.
-13. Only then create task/history rows, mutate context-cancel maps, construct/lookup a registry, create sessions, or contact a provider.
+13. Refuse inactive production behavior, including `fixed_grace` in R2f1a.
+14. Only then create task/history rows, mutate context-cancel maps, construct/lookup a registry, create sessions, or contact a provider.
 
 All arithmetic uses checked operations. `work_cutoff_ms + 70_000` must fit the persisted monotonic representation. Retry `max_attempts` becomes explicitly `1..=1024`; zero no longer means one. Zero backoff remains legal. Compute the maximum cumulative retry backoff on a DAG path, not the sum across parallel branches; it must be less than the frozen work cutoff.
 
 At admission, persist:
 
 - the complete frozen controls;
+- the optional normalized requested session cwd;
 - their fingerprint;
 - the control-inclusive workload fingerprint;
-- the complete per-node frozen execution identities, including each `FrozenProviderEffectV1` and
+- the complete per-node frozen execution identities, including effective session cwd, MCP delivery digest, each `FrozenProviderEffectV1` and
   `FrozenProviderSelectionV1` with both digests and the combined identity fingerprint;
 - the frozen `LedgerAdmissionV1` disposition;
 - task class and policy version `r2f1a`;
@@ -897,17 +1014,42 @@ fn bind_entry_use(&self, id: &AgentId) -> Option<BoundEntryUseV1> { None }
 async fn resolve_bound(
     &self,
     bound: &BoundEntryUseV1,
+    effect: &BoundProviderEffectV1,
     observer: Arc<dyn DiagnosticObserver>,
 ) -> Result<Arc<dyn AgentBackend>, BridgeError>;
 
-/// Additive on `AgentRegistry`; retires the bound slot only while both that exact slot and
-/// exact entry Arc are still mapped for its id. Default no-op.
-async fn invalidate_bound(&self, bound: &BoundEntryUseV1) {}
+/// Additive on `AgentRegistry`; retires only the exact keyed backend used by this effect while
+/// its exact slot and entry Arc are still mapped for the id. Default no-op.
+async fn invalidate_bound(&self, bound: &BoundEntryUseV1, effect_digest: &Sha256HexV1) {}
 
 pub struct BoundEntryUseV1 {
     pub entry: Arc<AgentEntry>,   // the exact immutable value validated AND used
     pub lease: Box<dyn Lease>,    // pins the slot through replacement and normal drain
     pub use_token: EntryUseTokenV1,
+}
+
+/// Non-serializable effect material handed to `resolve_bound`/`configure_session`.
+/// Its digest fields must equal the persisted frozen identity before any use.
+pub struct BoundProviderEffectV1 {
+    pub effective_session_cwd: SessionCwd,
+    pub mcp_delivery_digest: Sha256HexV1,
+    pub effect_digest: Sha256HexV1,
+    pub delivery: BoundMcpDeliveryV1,
+}
+
+/// In-memory only; the delivery has secret-silent Debug and no durable serializer.
+pub struct BoundSessionSpecV1 {
+    pub session: SessionSpec,
+    pub provider_effect: Arc<BoundProviderEffectV1>,
+}
+
+/// Additive AgentBackend method. The default returns BoundSessionUnsupported.
+async fn configure_bound_session(
+    &self,
+    _session: &SessionId,
+    _spec: &BoundSessionSpecV1,
+) -> Result<(), BridgeError> {
+    Err(BridgeError::BoundSessionUnsupported)
 }
 
 /// Opaque, process-local, non-durable. Identifies the exact bound slot and entry object
@@ -918,6 +1060,7 @@ struct FrozenEntryUseV1 {
     bound: BoundEntryUseV1,
     effect: FrozenProviderEffectV1,         // the frozen value, carried alongside for comparison
     selection: FrozenProviderSelectionV1,   // the frozen value, carried alongside for use
+    bound_effect: BoundProviderEffectV1,    // exact committed bytes; secret-silent and never persisted
 }
 
 fn bind_frozen_entry(node: &FrozenNodeExecutionIdentityV1)
@@ -944,9 +1087,11 @@ A drift decision that terminalizes a node is always made on the durable digests.
 fingerprint, projection, or persisted row, and a token mismatch is a linearization fault rather than a
 configuration-drift verdict.
 
-`bind_frozen_entry` takes the lease **before** reading the entry, obtains exactly one `Arc<AgentEntry>`, recomputes
-the canonical provider-effect digest and selection digest from that exact value, and compares both plus the identity
-fingerprint with the node's frozen identity. Because current `apply` publishes the replacement map before marking
+`bind_frozen_entry` takes the lease **before** reading the entry, obtains exactly one `Arc<AgentEntry>`, resolves the
+exact MCP delivery from that value and the node's already frozen effective cwd, recomputes the MCP-delivery,
+provider-effect, and selection digests, and compares all three plus the identity fingerprint with the node's frozen
+identity. The `BoundMcpDeliveryV1` returned is the exact byte source later handed to the backend. Because current
+`apply` publishes the replacement map before marking
 old slots retired, `is_retired()` alone is not a sufficient current-slot test. The bind loop therefore:
 
 1. loads one state snapshot and its slot, increments that slot's lease, and refuses/retries if it is already retired;
@@ -967,8 +1112,9 @@ rules are:
 - An unrelated registry edit that leaves both frozen digests byte-identical is accepted; the digests, not object
   identity, are the test. A `name`, `description`, `tags`, or `version` edit is therefore not drift.
 - On success, `FrozenEntryUseV1` is the sole source for the rest of that provider attempt. The selected candidate, the
-  `SessionSpec`/`AgentOverride` model, effort, and mode, and the `configure_session`/`configure_turn` arguments all
-  read `use.bound.entry` and `use.selection`. `resolve_bound` on the already-bound handle is the **only** further
+  `SessionSpec` effective cwd, `AgentOverride` model, effort, and mode, MCP delivery, and the
+  `configure_session`/`configure_turn` arguments all read `use.effect`, `use.bound_effect`, and `use.selection`.
+  `resolve_bound` on the already-bound handle/effect is the **only** further
   registry call the attempt may make; no code path may call `resolve`, `entry_snapshot`, `configured_effective`, or
   any other entry-reading accessor again. Because the attempt never re-reads `slot.entry`, a config-only reload
   landing after the bind cannot reach it: the validated value is the used value.
@@ -980,7 +1126,9 @@ rules are:
   was first spawned, while `Some(B)` selects B. This rule is API-local and does not force a new registry slot or
   weaken the config-only warm-reuse contract.
 - Each candidate's backend resolution goes through `resolve_bound`, which resolves the backend of the exact bound
-  slot rather than re-looking-up by agent id, and initializes that backend from the same bound entry if needed.
+  slot rather than re-looking-up by agent id, and initializes that backend from the same bound entry/effective-cwd/
+  delivery tuple if needed. ACP delivery is session-local. CodexNative/KiroNative backend reuse is keyed by the
+  complete effect digest; two effective cwd or native-delivery digests can never share one spawned child.
   `bind_entry_use` increments the lease before checking retirement and retries the current mapping if the chosen slot
   was already retired or no longer mapped; the successful same-slot/entry revalidation is the linearization point. A
   spawn-frozen reload landing
@@ -1004,11 +1152,13 @@ rules are:
   is not in the frozen set, and any intervening effect/selection reload is detected at that new bind. Acceptance
   uncertainty stays sticky and no additional candidate is authorized unless the prior failure proved
   pre-acceptance.
-- The run preflight cache key is `(agent, effect_digest, selection_digest)`, not agent alone. A successful decision
+- The run preflight cache key is `(agent, effect_digest, selection_digest)`, not agent alone. Because the effect
+  digest contains effective cwd and exact MCP delivery, a successful decision
   under one frozen provider identity can single-flight and replay only within that exact identity; a changed digest
   cannot reuse it.
-- Resume rebinds against the frozen identity persisted in snapshot V2, including the provider-effect digest. It never
-  re-derives an effect or selection from current configuration.
+- Resume rebinds against the frozen identity persisted in snapshot V2, including requested/effective cwd, MCP
+  delivery, and provider-effect digests. It re-resolves only to verify and obtain the exact bound delivery bytes; it
+  never replaces the frozen effect, cwd, or selection from current configuration.
 - Replay is identity-bound: an exactly equal persisted pair of effect and selection digests replays idempotently, and
   a different effect digest, selection digest, or identity fingerprint for the same `(attempt_id, node_id)` is a
   persistence conflict, not last-writer-wins.
@@ -1412,13 +1562,39 @@ refuses before SQL. Let `H` be the freshly measured count of allocation-owned pa
 
 `dbstat` deliberately omits shared structural pages, so `R + 2` is not a proof: at 512-byte pages an auto-vacuum
 database with one 1-MiB value has 2,138 pages while `dbstat` reports only 2,116, 2,115 of them for the owning table.
-The closed mutation SQL therefore uses no temporary table, DDL, `VACUUM`, or insert-then-delete allocation churn;
-every roster page it allocates or frees appears in the pre/post union. For any such root union, reserve
-`D(R) = 3 * R + 2` dirty pages: `R` for every pre/post roster page, at most `R` distinct auto-vacuum pointer-map
-pages, at most `R + 1` distinct freelist trunk/leaf pages, and one database-header page. The future history-only WAL
-ticket is consequently `W(D(3 * H + 2)) = 32 + (9 * H + 8) * frame_bytes`, with checked arithmetic. A larger root
-transition or any SQL plan outside the closed no-churn shape rolls back as `capacity_protected`; it is never learned
-after commit.
+Before relying on any structural multiplier, configured-history admission and migration therefore enforce a closed
+auto-vacuum policy:
+
+- `PRAGMA main.auto_vacuum=NONE` is admitted;
+- `INCREMENTAL` is admitted only with bridge-owned `incremental_vacuum` prohibited while configured history V2 is
+  active; and
+- `FULL` and every unknown value are typed unsupported-configuration refusals before task/history/session/provider
+  effects. They do not enter the optional-ledger `Schema` fail-open classifier.
+
+For an existing configured database, opener/freeze first uses a no-create, read-only, no-follow connection to read
+`main.auto_vacuum` before opening the read-write store, applying write pragmas, creating schema, or creating a
+primary task row. FULL/unknown therefore refuses without changing database-file bytes or any bridge business row;
+SQLite's read-only lock/shm housekeeping is not misrepresented as byte-for-byte directory custody. An absent path
+may proceed to ordinary fresh creation, whose SQLite default is then checked rather than assumed and before schema.
+
+The authoritative check runs again on the serialized configured-store connection after `BEGIN IMMEDIATE` and before
+the first history/authority SQL statement, and migration performs it before setting `migrating` or executing DDL.
+Because `BEGIN IMMEDIATE` excludes a concurrent mode-changing writer, the in-transaction value is the value
+governing commit. Every configured-history write rechecks it; read-only/open-time success is not cached as authority.
+The bridge installs one connection authorizer (and keeps a source-level exhaustive production call-site guard) that
+rejects `PRAGMA incremental_vacuum` while V2 configured history is active. A future maintenance implementation must
+add a separately reviewed whole-relocation ticket or remain rejected. No bridge path issues `VACUUM` or changes
+`auto_vacuum`; a database changed while closed is rejected at its next open/admission.
+
+With FULL relocation excluded and incremental vacuum unexecutable, SQLite does not relocate an unrelated tail page
+at history commit. The closed mutation SQL also uses no temporary table, DDL, `VACUUM`, or insert-then-delete
+allocation churn; every roster page it allocates or frees appears in the pre/post union. For any such root union,
+reserve `D(R) = 3 * R + 2` dirty pages: `R` for every pre/post roster page, at most `R` distinct pointer-map pages
+whose entries describe those roster pages, at most `R + 1` distinct freelist trunk/leaf pages, and one database-
+header page. This proof applies only to admitted NONE/INCREMENTAL-without-vacuum modes; it makes no claim about FULL.
+The future history-only WAL ticket is consequently `W(D(3 * H + 2)) = 32 + (9 * H + 8) * frame_bytes`, with checked
+arithmetic. A larger root transition or any SQL plan outside the closed no-churn shape rolls back as
+`capacity_protected`; it is never learned after commit.
 
 Admission uses its own exact closed history ticket because arbitrary IDs can make its page growth much larger than a
 post-admission lifecycle mutation. Measure roster pages as `H0` before the transaction's first write and `H1` after
@@ -1470,8 +1646,9 @@ can escape that formula. Serialized writers keep the maximum applicable future `
 is larger and proves the component sum before commit. Only roster-page records are attributed to that reserve;
 explicit authority/locator records remain primary-store custody. The reserve does not become debt. In rollback mode
 `future_wal_reserve_bytes = wal_debt_bytes = 0`; in WAL mode `transient_journal_reserve_bytes = 0`.
-`MEMORY`, `OFF`, an unknown mode, a writable attached database, missing `dbstat`, or inability to restore the prior
-connection-local spill setting refuses configured-history admission before provider effects.
+`MEMORY`, `OFF`, an unknown journal mode, FULL/unknown auto-vacuum, an executable incremental-vacuum path, a writable
+attached database, missing `dbstat`, or inability to restore the prior connection-local spill setting refuses
+configured-history admission before provider effects.
 
 The V2 configured invariant is component-exact:
 
@@ -1627,11 +1804,14 @@ Bump the persisted workflow snapshot to V2:
     "schema_version": 1,
     "graph": {},
     "controls": {},
+    "requested_session_cwd": "/trusted/repo",
     "node_execution_identities": [
       {
         "node": { "sorted_ordinal": 0, "id_sha256": "..." },
         "effect": {
           "agent": "...",
+          "effective_session_cwd": "/trusted/repo",
+          "mcp_delivery_digest": "...",
           "effect_digest": "...",
           "secret_commitment_key_id": null
         },
@@ -1657,6 +1837,9 @@ Bump the persisted workflow snapshot to V2:
 Resume rules:
 
 - V2 verifies the controls fingerprint and uses the frozen controls verbatim.
+- V2 verifies requested-cwd absence/presence and bytes, uses each persisted effective cwd verbatim for
+  `SessionSpec`, and rebinds exact MCP delivery bytes to its persisted delivery/effect digests. It never consults
+  `TaskRecord.session_cwd`, entry cwd fallbacks, process current directory, or a template renderer after the bind.
 - It seeds exact structured node terminals and degraded ancestry.
 - A seeded fail-fast failure is evaluated before the first admission wave.
 - Post-submit config/profile edits cannot change the resumed budget.
@@ -1712,7 +1895,9 @@ Resume rules:
    creates the closed mutation-ticket table; and rebuilds the accounting table whose current
    `CHECK(accounting_version=1)` constraint cannot admit version 2 in place. Configured migration remeasures the
    exact allocation-owned `dbstat` roots and derives future WAL reserve, sticky debt, and transient journal reserve;
-   platform migration remains inside the hard page/journal/sidecar gate and measures P1–P5. Either rolls back before
+   platform migration remains inside the hard page/journal/sidecar gate and measures P1–P5. Configured migration
+   first reads `main.auto_vacuum` and refuses FULL/unknown before setting `migrating` or executing DDL; NONE and
+   INCREMENTAL-with-vacuum-prohibited proceed under the rechecked transaction policy. Either rolls back before
    effects while leaving `migrating` intact on a capacity failure. No static page formula participates. Legacy rows
    receive no invented node evidence or future ticket, but their real history-owned pages remain charged.
 9. Rollback after the allocation migration or V2 working-task creation requires stopping the new binary and restoring the pre-migration database snapshot. There is no in-place down-migration.
@@ -1730,6 +1915,12 @@ Resume rules:
     `value_from_env` is mutually exclusive and secret-bearing. Every literal or referenced MCP environment value is
     nevertheless HMAC-committed before durable identity. A V2 working snapshot records the commitment key id;
     resume under a missing or different key refuses before effects rather than migrating the digest silently.
+15. V2 snapshots add requested cwd plus each node's exact effective cwd and MCP-delivery digest. A V2 executor never
+    consumes the legacy mutable `WorkflowRunContext.session_cwd`; V1 alone retains that fallback. A native-MCP
+    backend is effect-keyed so cwd A and B cannot share spawn-time delivery bytes.
+16. Configured-history V2 supports `auto_vacuum=NONE` and `INCREMENTAL` without incremental vacuum. FULL/unknown is
+    a pre-effect unsupported configuration, not optional telemetry unavailability. Platform-ledger whole-file
+    custody is unchanged; this restriction is specific to the configured root-attributed `D(R)` proof.
 
 ## 11. Compile-correct build and ownership order
 
@@ -1747,8 +1938,9 @@ One owner changes:
 Land the pure types, resolver, typed MCP environment sources and secret-silent debug boundary, exact constants, the
 canonical terminal/trigger/controls serializer with its derived
 worst-case assertions and bounded-evidence fallback, the frozen provider-effect and provider-selection digests with
-their exhaustive `AgentEntry` classification, the exhaustive `LedgerUnavailableReason` classifier, fingerprinting, and
-controller transition tests first. Stage 1 also lands the additive `AgentRegistry` bind methods and their defaults in
+their exhaustive `AgentEntry` plus freeze-context classification, the pure effective-cwd/MCP-delivery resolver, the
+exhaustive `LedgerUnavailableReason` classifier, fingerprinting, and controller transition tests first. Stage 1 also
+lands the additive `AgentRegistry` bind methods and their defaults in
 `crates/bridge-core/src/ports.rs`, since Stage-2 and Stage-3 owners both depend on that signature. The workspace must
 compile before parallel work begins.
 
@@ -1757,9 +1949,15 @@ compile before parallel work begins.
 - **Configuration owner:** `bin/a2a-bridge/src/config.rs`, `[security].provider_effect_key_file`, typed MCP
   source resolution, key-custody validation, and config-only tests.
 - **Controller owner:** `crates/bridge-workflow/src/fanout.rs` and fake/manual state-machine tests, without touching executor integration.
-- **Persistence owner:** `crates/bridge-core/src/task_store.rs`, `workflow_history.rs`, `orch.rs`, and `crates/bridge-store/src/sqlite.rs`.
+- **Persistence owner:** `crates/bridge-core/src/task_store.rs`, `workflow_history.rs`, `orch.rs`, and
+  `crates/bridge-store/src/sqlite.rs`, plus the root `Cargo.toml` solely to add rusqlite's existing `hooks` feature.
+  This owner installs the configured FULL/unknown auto-vacuum refusal and `incremental_vacuum` authorizer, owns
+  migration ordering, and supplies the NONE/INCREMENTAL physical-accounting fixtures. No other owner edits the
+  workspace rusqlite declaration.
 
-Each sibling owns disjoint paths, has an independently runnable test target, and does not modify manifests, roadmap, generated files, executor integration, or serving adapters.
+Each sibling owns disjoint paths and has an independently runnable test target. Configuration and controller do not
+modify manifests; persistence has only the feature exception above. None modifies the roadmap, generated files,
+executor integration, or serving adapters.
 
 ### Stage 3 — single integration owner
 
@@ -1783,7 +1981,9 @@ resume, projections, CLI/A2A/MCP overrides, and compile fixes. It also owns remo
 inside an attempt, so no path can re-derive a model, effort, mode, preflight flag, fallback candidate, or any other
 effect-bearing field after the bind, and converting retry invalidation to the exact-bound form. The concrete
 `bind_entry_use`/`resolve_bound`/`invalidate_bound` implementations in `crates/bridge-registry/src/registry.rs` are
-part of this stage because they must land with their only production callers. This stage also owns the API-local
+part of this stage because they must land with their only production callers. It owns the native-MCP effect-keyed
+backend subslots plus `main.rs`/container/ACP composition changes that consume `BoundMcpDeliveryV1` without a second
+cwd resolution or substitution. This stage also owns the API-local
 `Unconfigured | ExplicitNone | ExplicitSome` session-model transition, so bound `None` cannot fall through to a
 stale spawn default. These files must not be split among
 concurrent implementors.
@@ -1835,6 +2035,41 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
   bearer value selected through `api_key_env`, only the env-var name. A separate non-disclosure fixture uses a
   redaction-sensitive MCP environment value, proves changing it changes the digest, and proves its raw bytes appear
   in no snapshot, history row, projection, diagnostic, debug string, or log artifact.
+- **W1/W1-B effective-cwd state, red first:** submit the same immutable served workflow and, separately, fresh and
+  resumed batch children against normalized cwd A then cwd B with public MCP argument and environment templates such
+  as `{cwd}/tools` and `ROOT={cwd}/tools`. The reviewed design gave both attempts one effect/identity and one
+  preflight-cache key while delivering different ACP bytes. V2 requires distinct MCP-delivery/effect/identity/
+  workload fingerprints, a cache miss, and a pre-effect replay conflict for a reused `(attempt_id,node_id)`. Capture
+  the actual `SessionSpec.cwd` and ACP `session/new` server bytes and require byte equality with the one bound
+  delivery that produced the persisted MACs; there is no second substitution call. A literal with no `{cwd}` keeps
+  identical delivery bytes but still changes effect identity because session cwd changed. A same-cwd request with
+  a different raw spelling that normalizes to the same `SessionCwd` is the negative control and remains identical.
+- Cwd precedence is table-tested for request override, `entry.session_cwd`, `entry.cwd`, and launch-cwd fallback.
+  Relative static values resolve against the captured launch cwd even if process cwd changes later. Absence versus
+  presence is preserved in the run spec; entries with different static fallbacks produce different per-node
+  effective values. A request outside `allowed_cwd_root`, or a malformed/overflowing request or static value,
+  refuses before task/history/registry/provider counters; this does not invent a general allowed-root restriction
+  for unsandboxed static entry paths that current configuration admits.
+- Served, `run-workflow`, fresh batch, and resumed batch source guards prove that no V2 path rewrites
+  `AgentEntry.session_cwd` with request data. A configured fallback edit is provider-effect drift; a request override
+  remains the separate persisted request/effective field and takes precedence without mutating registry state.
+- ACP, CodexNative, and KiroNative each receive the same exact bound server bytes committed by
+  `mcp_delivery_digest`. Native cwd A/B attempts resolve different backend effect keys and process identities; a
+  paused A child cannot be reused for B. Exact-bound invalidation of A leaves B live. Managed-depth marker order and
+  value are part of the commitment. A source-level guard rejects calls to the old substitution/render helpers below
+  `bind_frozen_entry`.
+- ACP V2 mint must receive `configure_bound_session(BoundSessionSpecV1)`, ignore `AcpConfig.mcp`, and serialize the
+  already-rendered tuple without calling `substituted_for_managed_agent`; using legacy `configure_session` is a typed
+  pre-prompt refusal, not a static-config fallback. Container Codex and host Codex consume the identical committed
+  argv suffix.
+  Kiro A/B deliveries derive distinct full-digest agent names and immutable JSON files; hold A's child open while B
+  spawns and prove A's file bytes/name and later tool surface remain unchanged. Existing-name wrong bytes, a link,
+  wrong owner/mode, interrupted create/sync, or a truncated file refuses before child spawn. Equal content reuses the
+  same name without rewriting it.
+- A symlink-spelled cwd fixture proves the sandbox may canonicalize a separate host source for containment/mounting
+  while ACP `session/new`, container destination/cwd, and every MCP channel retain the one frozen lexical path. A
+  source guard rejects post-freeze delivery calls to `canonicalize` as well as the old template renderers. This is
+  text identity only and does not assert the symlink still names the same object at action time.
 - MCP env parsing requires exactly one of `value`/`value_from_env`; empty names, both/neither sources, missing or
   non-Unicode referenced values, template syntax in a reference name, and any MCP-env-bearing entry without the exact
   32-byte owner-private key refuse before registry/provider effects. A public literal retains `{cwd}` substitution;
@@ -1899,7 +2134,7 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
 - Exact-bound invalidation: a node that invalidates after an intervening reload retires only when the exact slot and
   entry Arc it used remain mapped; a regression asserts both a newly mapped slot and a config-swapped same slot
   serving a sibling are untouched. Id-keyed and slot-only invalidation fail this red.
-- The run preflight cache is keyed by agent plus both frozen digests. Two nodes with the exact identity single-flight
+- The run preflight cache is keyed by agent plus both frozen digests. Two nodes with the exact cwd/delivery identity single-flight
   and reuse one decision; a node whose effect or selection digest differs runs its own preflight and cannot consume
   the prior decision.
 - A registry that does not implement the additive bind methods refuses the bound path with a typed error and never
@@ -2014,8 +2249,9 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
 
 ### Persistence, migration, and projection
 
-- Memory and SQLite round-trip frozen controls, frozen provider effects and selections with both digests, the
-  provider-effect key ID and per-binding value MACs, trigger, every node terminal, ancestry, and cleanup duration.
+- Memory and SQLite round-trip frozen controls, requested cwd, every node's effective cwd and exact MCP-delivery
+  digest, frozen provider effects and selections with all digests, the provider-effect key ID and per-binding
+  template/delivery MACs, trigger, every node terminal, ancestry, and cleanup duration.
 - Provider-effect key creation obtains 32 bytes from the OS CSPRNG, creates one owner-private file atomically, emits
   no bytes, refuses an existing file/link, and at every injected write/sync failure leaves either no destination or
   one complete valid key. Doctor refuses wrong length, wrong ownership/mode, multiple links, no-follow failure, a
@@ -2044,11 +2280,11 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
   decision. The specific falsifying case is covered directly — a 512-byte page database with a 1 MiB node ID, where
   the deleted formula charged 2,055 pages while the node ID and terminal alone need at least 2,068 overflow pages —
   and the repaired path decides it by measurement rather than arithmetic, in both the admit and refuse directions.
-- **Configured long-ID/WAL regression, red first:** in an otherwise empty 512-byte-page configured store, materialize
-  a 1-MiB-ID placeholder and assert `dbstat` charges every allocation-owned leaf/interior/overflow page plus the
-  exact closed mutation-ticket population. With `auto_vacuum=FULL`, separately assert the fixture has more than two
-  non-`dbstat` pages and that `D(R) = 3 * R + 2` covers its roster, pointer-map, freelist, and header page population;
-  this fails the former `R + 2` proof red. Seed the old logical allocation to
+- **Configured long-ID/WAL regression, red first:** in otherwise empty 512-byte-page configured stores using
+  `auto_vacuum=NONE` and, separately, `INCREMENTAL` without vacuum, materialize a 1-MiB-ID placeholder and assert
+  `dbstat` charges every allocation-owned leaf/interior/overflow page plus the exact closed mutation-ticket
+  population. Assert that `D(R) = 3 * R + 2` covers the roster-associated pointer-map, freelist, and header pages;
+  this fails the former `R + 2` proof red without claiming FULL support. Seed the old logical allocation to
   `MAX_CHARGED_BYTES - old_proposed_charge`; the old `exact ID + 256` equation admits while measured history pages
   plus WAL reserve exceed the cap, and V2 rolls the whole admission back. Repeat with many short IDs and a reader
   pinning WAL: admission itself creates charged debt, each later committed history mutation transfers its full ticket
@@ -2057,8 +2293,20 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
   next committed history mutation may replace the stale-epoch debt with its own ticket; a bookkeeping-only clear is
   forbidden. A near-cap store consumes its permanently reserved retention ticket and successfully removes one
   eligible attempt without exceeding the cap. Unrelated primary tables/frames neither add to measured history pages
-  nor erase the debt. The same fixtures cover each supported rollback-journal mode, `cache_spill=OFF` restoration, and refusal
-  for MEMORY/OFF/unknown mode or unavailable `dbstat`.
+  nor erase the debt. The same fixtures cover each supported rollback-journal mode, `cache_spill=OFF` restoration,
+  and refusal for MEMORY/OFF/unknown journal mode or unavailable `dbstat`.
+- **W3 FULL relocation, red first:** against the exact bundled SQLite, construct a 512-byte configured database with
+  `auto_vacuum=FULL`, a small history roster, and a fragmented unrelated primary B-tree whose tail non-root interior
+  page points to children/overflow pages in more than `R` pointer-map regions. In a control copy without the repaired
+  gate, free a lower history page and inspect committed WAL/journal page numbers; require relocation of the tail page
+  and more than `R` distinct child pointer-map writes. This is dependency-behavior evidence for why the old formula
+  is false, not an acceptance path. The production opener, fresh admission, retention, and V1-to-V2 migration each
+  refuse the FULL original with static code `configured_history_auto_vacuum_full_unsupported` before any schema,
+  history, authority, task, session, or provider mutation, and byte/digest snapshots prove the database is unchanged.
+  `NONE` and `INCREMENTAL` without vacuum are the positive controls. An attempted `PRAGMA incremental_vacuum`
+  through every bridge-owned SQL/maintenance surface while V2 configured history is active is authorizer-refused
+  before a page change; a source guard proves no unclassified production issuer exists. Reopen after changing the
+  database to FULL while the bridge is stopped refuses again rather than relying on cached open-time state.
 - **Root attribution and mixed-admission regression:** grow `attempt_identities`, `task_attempt_locators`, and their
   accepted index roots without changing history; the history charge and future tickets remain byte-identical and a
   small admissible history reservation still fits. Then admit one served attempt (authority update) and one direct
@@ -2082,7 +2330,8 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
   unclassified allocation-namespace object fails schema admission. These controls make the ticket bound executable
   rather than a comment.
 - Postconditions are authoritative and checked at boundaries: short IDs, exact-page-boundary IDs, single-overflow
-  IDs, and multi-page IDs each satisfy P1–P5, with reserved page bytes, autovacuum on and off, a legacy
+  IDs, and multi-page IDs each satisfy P1–P5, with reserved page bytes, auto-vacuum NONE and INCREMENTAL-without-
+  vacuum, explicit FULL refusal, a legacy
   WAL-to-supported-rollback transition, each supported rollback journal mode, `cache_spill=OFF`, exact hard
   `max_page_count`, live sidecars, and near-cap admission and refusal. A forced `SQLITE_FULL` at the hard page limit
   is a bounded pre-effect `capacity_protected` refusal.
@@ -2232,7 +2481,19 @@ following exact residual population:
 | WRONG W3 — FULL auto-vacuum escapes `D(R)=3R+2` | Rare but constructible boundary state: retention frees a history page while FULL auto-vacuum relocates an unrelated fragmented tail interior page; SQLite rewrites pointer-map entries for its distributed children/overflow pointers, which is not bounded by history-root union `R`. Near 128 MiB this can underreserve WAL/journal custody. Fail closed on `auto_vacuum=FULL` for configured-history admission/migration; permit `NONE`, and `INCREMENTAL` only while vacuum operations are prohibited or separately ticketed. Retaining FULL support requires a new relocation proof or exact dirty-page instrumentation. |
 
 The complete likelihood, exposure, impact, repair cost, and fail-first evidence is retained in the linked closure-4
-record. The population is closed-enumerable, but the design-review cap is exhausted: no repair, second review,
-implementation, release, deployment, or operator mutation is authorized by this checkpoint.
+record. The owner then opened one further closed-population round. This revision repairs exactly those two items:
 
-R2F1A FOCUSED BOUNDARY: PARKED / SOL CLOSURE REVIEW 4 REJECT / CAP EXHAUSTED / IMPLEMENTATION UNAUTHORIZED
+| Closure-4 blocker | Repaired mechanism and exact acceptance evidence |
+|---|---|
+| WRONG W1/W1-B — effective request cwd and delivered MCP bytes were not committed | §§3/5 add normalized `requested_session_cwd` to `WorkflowRunSpecV1` and resolved `effective_session_cwd` plus `mcp_delivery_digest` to every provider effect/identity. One closed resolver applies request → entry session cwd → entry cwd → captured launch cwd. The same bound effect supplies non-optional `SessionSpec.cwd`, exact post-substitution ACP/native MCP bytes, redaction, cache, replay, and resume through additive `BoundSessionSpecV1`; V2 never uses static ACP templates. ACP conversion does no second substitution; process-start native backends are keyed by complete effect, container children consume the per-session bound argv, and Kiro uses immutable content-addressed config names so cwd A cannot overwrite or reuse B's delivery. §12's served and fresh/resumed batch A/B controls require distinct identities/cache entries, committed-to-delivered byte equality, pre-effect replay conflict, same-normalized-cwd equality, no transient entry stamping, symlink-spelling stability, all three delivery channels, and a no-template delivery negative control. |
+| WRONG W3 — FULL auto-vacuum escaped `D(R)=3R+2` | §9 limits the configured root-attributed proof to `NONE` and `INCREMENTAL` without vacuum. The serialized connection rechecks mode after `BEGIN IMMEDIATE` and before the first mutation; migration checks before DDL. FULL/unknown is a typed unsupported-configuration refusal outside optional-ledger fail-open, and an authorizer plus exhaustive source guard prohibits bridge-owned incremental vacuum while V2 is active. §12 retains the exact bundled-SQLite fragmented FULL fixture as fail-first proof of the old formula, then requires open/admission/retention/migration to refuse byte-clean before authority/task/provider effects, with NONE/INCREMENTAL positives and an incremental-vacuum negative. |
+
+This repair remains design-only and has not run a Rust behavior test. Its pre-freeze deterministic gates passed:
+`git diff --check`, direct existence checks for every changed-document target, and
+`cargo run -p a2a-bridge -- validate --repo-hygiene` (**39 tracked artifacts / 7 validated example configs**).
+That command reused the scratch clone's dev build; it is not provider or Rust behavior evidence. Exactly one
+cumulative Sol/xhigh closure review remains required. The round cap permits no second repair, review
+replay/fallback, implementation, compatibility/live case, release, deployment, or operator mutation. A rejecting
+review parks this exact artifact and its retained evidence.
+
+R2F1A FOCUSED BOUNDARY: REPAIRED / SOL CLOSURE REVIEW 5 PENDING / IMPLEMENTATION UNAUTHORIZED
