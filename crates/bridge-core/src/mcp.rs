@@ -16,6 +16,125 @@ pub const MANAGED_MCP_CALL_DEPTH_ENV: &str = "A2A_BRIDGE_MCP_CALL_DEPTH";
 
 const FIRST_MANAGED_MCP_CALL_DEPTH: &str = "1";
 
+/// Immutable resolved secret material. It has no serializer and never exposes its value through
+/// `Debug` or `Display`; adapter delivery must call the explicit value accessor on its source.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Result<Self, &'static str> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err("secret environment value must be non-empty");
+        }
+        Ok(Self(value))
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecretString([REDACTED])")
+    }
+}
+
+impl std::fmt::Display for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+/// Source and once-resolved bytes for one MCP environment value. Public literals retain cwd
+/// templating; referenced secrets are never template-expanded after resolution.
+#[derive(Clone, PartialEq, Eq)]
+pub enum McpEnvValueSourceV1 {
+    PublicLiteral(String),
+    SecretFromEnv {
+        variable: String,
+        resolved: SecretString,
+    },
+}
+
+impl std::fmt::Debug for McpEnvValueSourceV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PublicLiteral(value) => formatter
+                .debug_struct("PublicLiteral")
+                .field("bytes", &value.len())
+                .finish(),
+            Self::SecretFromEnv { variable, resolved } => formatter
+                .debug_struct("SecretFromEnv")
+                .field("variable", variable)
+                .field("resolved", resolved)
+                .finish(),
+        }
+    }
+}
+
+impl From<String> for McpEnvValueSourceV1 {
+    fn from(value: String) -> Self {
+        Self::PublicLiteral(value)
+    }
+}
+
+impl From<&str> for McpEnvValueSourceV1 {
+    fn from(value: &str) -> Self {
+        Self::PublicLiteral(value.to_owned())
+    }
+}
+
+impl McpEnvValueSourceV1 {
+    #[must_use]
+    pub fn delivery_value(&self, cwd: &str) -> String {
+        match self {
+            Self::PublicLiteral(value) => substitute_cwd(value, cwd),
+            Self::SecretFromEnv { resolved, .. } => resolved.expose().to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub fn resolved_value(&self) -> &str {
+        match self {
+            Self::PublicLiteral(value) => value,
+            Self::SecretFromEnv { resolved, .. } => resolved.expose(),
+        }
+    }
+
+    #[must_use]
+    pub fn source_kind(&self) -> &'static str {
+        match self {
+            Self::PublicLiteral(_) => "public_literal",
+            Self::SecretFromEnv { .. } => "secret_from_env",
+        }
+    }
+
+    #[must_use]
+    pub fn source_name(&self) -> Option<&str> {
+        match self {
+            Self::PublicLiteral(_) => None,
+            Self::SecretFromEnv { variable, .. } => Some(variable),
+        }
+    }
+
+    #[must_use]
+    pub fn is_secret(&self) -> bool {
+        matches!(self, Self::SecretFromEnv { .. })
+    }
+
+    fn substituted(&self, cwd: &str) -> Self {
+        match self {
+            Self::PublicLiteral(value) => Self::PublicLiteral(substitute_cwd(value, cwd)),
+            Self::SecretFromEnv { variable, resolved } => Self::SecretFromEnv {
+                variable: variable.clone(),
+                resolved: resolved.clone(),
+            },
+        }
+    }
+}
+
 /// A single MCP server to offer an agent. Vendor-neutral — no ACP SDK types — so `bridge-core`
 /// stays SDK-free and the same spec feeds every delivery channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,8 +142,8 @@ pub struct McpServerSpec {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
-    /// Ordered (name, value) env pairs; values may contain `{cwd}`.
-    pub env: Vec<(String, String)>,
+    /// Ordered (name, typed value source) env pairs. Only public literals may contain `{cwd}`.
+    pub env: Vec<(String, McpEnvValueSourceV1)>,
 }
 
 impl McpServerSpec {
@@ -38,7 +157,7 @@ impl McpServerSpec {
             env: self
                 .env
                 .iter()
-                .map(|(k, v)| (k.clone(), substitute_cwd(v, cwd)))
+                .map(|(k, v)| (k.clone(), v.substituted(cwd)))
                 .collect(),
         }
     }
@@ -53,7 +172,7 @@ impl McpServerSpec {
             .retain(|(name, _)| !name.eq_ignore_ascii_case(MANAGED_MCP_CALL_DEPTH_ENV));
         delivered.env.push((
             MANAGED_MCP_CALL_DEPTH_ENV.to_string(),
-            FIRST_MANAGED_MCP_CALL_DEPTH.to_string(),
+            FIRST_MANAGED_MCP_CALL_DEPTH.into(),
         ));
         delivered
     }
@@ -88,7 +207,7 @@ pub fn env_redaction_values(specs: &[McpServerSpec], cwd: &str) -> Vec<String> {
     specs
         .iter()
         .flat_map(|server| server.env.iter())
-        .flat_map(|(_, value)| [value.clone(), substitute_cwd(value, cwd)])
+        .flat_map(|(_, value)| [value.resolved_value().to_owned(), value.delivery_value(cwd)])
         .collect()
 }
 
@@ -162,7 +281,7 @@ pub fn render_codex_mcp_args(mcp: &[McpServerSpec], cwd: &str) -> Vec<String> {
         out.push(format!("{p}.args=[{args}]"));
         for (k, v) in &s.env {
             out.push("-c".to_string());
-            out.push(format!("{p}.env.{k}={}", toml_str(v)));
+            out.push(format!("{p}.env.{k}={}", toml_str(v.resolved_value())));
         }
         out.push("-c".to_string());
         out.push(format!(
@@ -194,7 +313,11 @@ pub fn render_kiro_agent_config(mcp: &[McpServerSpec], cwd: &str, agent_name: &s
         entry.insert("command".into(), json!(s.command));
         entry.insert("args".into(), json!(s.args));
         if !s.env.is_empty() {
-            let env: Map<String, Value> = s.env.into_iter().map(|(k, v)| (k, json!(v))).collect();
+            let env: Map<String, Value> = s
+                .env
+                .into_iter()
+                .map(|(k, v)| (k, json!(v.resolved_value())))
+                .collect();
             entry.insert("env".into(), Value::Object(env));
         }
         servers.insert(s.name.clone(), Value::Object(entry));
@@ -281,7 +404,8 @@ mod tests {
         let s = spec.substituted("/repo");
         assert_eq!(s.command, "/opt/prism");
         assert_eq!(s.args, vec!["--repo".to_string(), "/repo".to_string()]);
-        assert_eq!(s.env, vec![("ROOT".to_string(), "/repo/src".to_string())]);
+        assert_eq!(s.env[0].0, "ROOT");
+        assert_eq!(s.env[0].1.resolved_value(), "/repo/src");
     }
 
     #[test]

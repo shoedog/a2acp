@@ -25,6 +25,19 @@ pub const DEFAULT_WORK_CUTOFF_MS: u64 = 7_200_000;
 pub const CLEANUP_TAIL_MS: u64 = 60_000;
 pub const REPORTING_TAIL_MS: u64 = 10_000;
 pub const MAX_QUALIFICATION_REASON_BYTES: usize = 512;
+pub const MAX_STATIC_CODE_BYTES: usize = 64;
+pub const MAX_DEEPEST_CAUSE_BYTES: usize = 512;
+pub const MAX_CONTROL_EVENT_ID_BYTES: usize = 128;
+pub const MAX_CLOSED_TOKEN_BYTES: usize = 32;
+pub const NODE_TERMINAL_SKELETON_CEILING_BYTES: usize = 352;
+pub const POLICY_TRIGGER_SKELETON_CEILING_BYTES: usize = 160;
+pub const MAX_NODE_TERMINAL_JSON_BYTES: usize = 2_048;
+pub const MAX_POLICY_TRIGGER_JSON_BYTES: usize = 1_024;
+pub const MAX_CONTROLS_JSON_BYTES: usize = 4_096;
+const DERIVED_NODE_TERMINAL_WORST_CASE_BYTES: usize = 1_978;
+const DERIVED_POLICY_TRIGGER_WORST_CASE_BYTES: usize = 550;
+const _: () = assert!(DERIVED_NODE_TERMINAL_WORST_CASE_BYTES <= MAX_NODE_TERMINAL_JSON_BYTES);
+const _: () = assert!(DERIVED_POLICY_TRIGGER_WORST_CASE_BYTES <= MAX_POLICY_TRIGGER_JSON_BYTES);
 const MAX_WORKTREE_OWNER_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +224,292 @@ impl FrozenWorkflowControlsV1 {
             .and_then(|value| value.checked_add(self.profile.reporting_tail_ms))
             .ok_or(ExecutionPolicyError::ArithmeticOverflow)
     }
+
+    pub fn encode_canonical(&self) -> Result<Vec<u8>, ExecutionPolicyError> {
+        let encoded = serde_json::to_vec(self)
+            .map_err(|_| ExecutionPolicyError::InvalidStructuredEvidence)?;
+        if encoded.len() > MAX_CONTROLS_JSON_BYTES {
+            return Err(ExecutionPolicyError::StructuredEvidenceOverBound);
+        }
+        Ok(encoded)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct ControlEventIdV1(String);
+
+impl std::fmt::Debug for ControlEventIdV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("ControlEventIdV1")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl ControlEventIdV1 {
+    pub fn parse(value: impl Into<String>) -> Result<Self, ExecutionPolicyError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > MAX_CONTROL_EVENT_ID_BYTES
+            || value.chars().any(char::is_control)
+        {
+            return Err(ExecutionPolicyError::InvalidControlEventId);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn for_attempt(attempt_id: &AttemptId, ordinal: u32) -> Self {
+        Self(format!("{}:policy:{ordinal}", attempt_id.as_str()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ControlEventIdV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodePrimaryDispositionV1 {
+    Completed,
+    Failed,
+    TimedOut,
+    CanceledWorkflow,
+    CanceledPolicy,
+    CanceledNode,
+    SkippedDependency,
+    NotStartedPolicy,
+    InterruptedLegacy,
+    Deadline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeCleanupDispositionV1 {
+    Complete,
+    Failed,
+    NotNeeded,
+    UnknownLegacy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCleanupV1 {
+    pub disposition: NodeCleanupDispositionV1,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencySetRefV1 {
+    pub count: u32,
+    pub sorted_node_refs_sha256: Sha256HexV1,
+}
+
+pub type NodeFailureClassV1 = crate::diagnostics::DiagnosticFailureClass;
+pub type StaticBoundedCodeV1 = crate::diagnostics::DiagnosticCode;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCauseV1 {
+    pub failure_class: NodeFailureClassV1,
+    pub code: StaticBoundedCodeV1,
+    pub deepest_cause: Option<String>,
+    pub cause_truncated: bool,
+    pub evidence_overflow: bool,
+    pub dependency_set: Option<DependencySetRefV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeTerminalV1 {
+    pub schema_version: u16,
+    pub primary: NodePrimaryDispositionV1,
+    pub cleanup: NodeCleanupV1,
+    pub cause: Option<NodeCauseV1>,
+    pub prompt_may_have_been_accepted: bool,
+    pub degraded_ancestry: bool,
+    pub policy_trigger_id: Option<ControlEventIdV1>,
+}
+
+fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ExecutionPolicyError> {
+    serde_json::to_vec(value).map_err(|_| ExecutionPolicyError::InvalidStructuredEvidence)
+}
+
+fn remove_first_scalar(value: &mut String) -> bool {
+    let Some(first) = value.chars().next() else {
+        return false;
+    };
+    value.drain(..first.len_utf8());
+    true
+}
+
+fn shorten_terminal_cause(value: &mut NodeTerminalV1) -> bool {
+    let Some(cause) = value.cause.as_mut() else {
+        return false;
+    };
+    let Some(deepest) = cause.deepest_cause.as_mut() else {
+        return false;
+    };
+    if remove_first_scalar(deepest) {
+        true
+    } else {
+        cause.deepest_cause = None;
+        true
+    }
+}
+
+impl NodeTerminalV1 {
+    fn normalize(mut self) -> Result<Self, ExecutionPolicyError> {
+        if self.schema_version != EXECUTION_POLICY_SCHEMA_V1 {
+            return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+        }
+        if let Some(cause) = self.cause.as_mut() {
+            let original = cause.deepest_cause.clone();
+            cause.deepest_cause = original.as_deref().map(|value| {
+                crate::diagnostics::DiagnosticRedactor::default()
+                    .sanitize_stderr_line(value, MAX_DEEPEST_CAUSE_BYTES)
+            });
+            if cause.deepest_cause != original {
+                cause.cause_truncated = true;
+            }
+        }
+        Ok(self)
+    }
+
+    pub fn encode_canonical(&self) -> Result<Vec<u8>, ExecutionPolicyError> {
+        let mut value = self.clone().normalize()?;
+        let mut encoded = canonical_json(&value)?;
+        if encoded.len() <= MAX_NODE_TERMINAL_JSON_BYTES {
+            return Ok(encoded);
+        }
+
+        if let Some(cause) = value.cause.as_mut() {
+            cause.cause_truncated = true;
+        }
+        while encoded.len() > MAX_NODE_TERMINAL_JSON_BYTES && shorten_terminal_cause(&mut value) {
+            encoded = canonical_json(&value)?;
+        }
+        if encoded.len() <= MAX_NODE_TERMINAL_JSON_BYTES {
+            return Ok(encoded);
+        }
+
+        if let Some(cause) = value.cause.as_mut() {
+            cause.evidence_overflow = true;
+            cause.dependency_set = None;
+        }
+        encoded = canonical_json(&value)?;
+        while encoded.len() > MAX_NODE_TERMINAL_JSON_BYTES && shorten_terminal_cause(&mut value) {
+            encoded = canonical_json(&value)?;
+        }
+        if encoded.len() > MAX_NODE_TERMINAL_JSON_BYTES {
+            return Err(ExecutionPolicyError::StructuredEvidenceOverBound);
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, ExecutionPolicyError> {
+        if bytes.len() > MAX_NODE_TERMINAL_JSON_BYTES {
+            return Err(ExecutionPolicyError::StructuredEvidenceOverBound);
+        }
+        let value: Self = serde_json::from_slice(bytes)
+            .map_err(|_| ExecutionPolicyError::InvalidStructuredEvidence)?;
+        if value.encode_canonical()? != bytes {
+            return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+        }
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FanOutPolicyNameV1 {
+    BoundedIndependent,
+    FailFast,
+    FixedGrace,
+}
+
+impl From<&FanOutPolicyV1> for FanOutPolicyNameV1 {
+    fn from(value: &FanOutPolicyV1) -> Self {
+        match value {
+            FanOutPolicyV1::BoundedIndependent => Self::BoundedIndependent,
+            FanOutPolicyV1::FailFast => Self::FailFast,
+            FanOutPolicyV1::FixedGrace { .. } => Self::FixedGrace,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyTriggerV1 {
+    pub schema_version: u16,
+    pub id: ControlEventIdV1,
+    pub node: PolicyNodeRefV1,
+    pub policy: FanOutPolicyNameV1,
+    pub grace_ms: Option<u64>,
+}
+
+impl PolicyTriggerV1 {
+    fn validate(&self) -> Result<(), ExecutionPolicyError> {
+        let grace_valid = match (self.policy, self.grace_ms) {
+            (FanOutPolicyNameV1::FixedGrace, Some(value)) => value > 0,
+            (FanOutPolicyNameV1::FixedGrace, None) => false,
+            (_, None) => true,
+            (_, Some(_)) => false,
+        };
+        if self.schema_version != EXECUTION_POLICY_SCHEMA_V1 || !grace_valid {
+            return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+        }
+        Ok(())
+    }
+
+    pub fn encode_canonical(&self) -> Result<Vec<u8>, ExecutionPolicyError> {
+        self.validate()?;
+        let encoded = canonical_json(self)?;
+        if encoded.len() > MAX_POLICY_TRIGGER_JSON_BYTES {
+            return Err(ExecutionPolicyError::StructuredEvidenceOverBound);
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode_canonical(bytes: &[u8]) -> Result<Self, ExecutionPolicyError> {
+        if bytes.len() > MAX_POLICY_TRIGGER_JSON_BYTES {
+            return Err(ExecutionPolicyError::StructuredEvidenceOverBound);
+        }
+        let value: Self = serde_json::from_slice(bytes)
+            .map_err(|_| ExecutionPolicyError::InvalidStructuredEvidence)?;
+        if value.encode_canonical()? != bytes {
+            return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+        }
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRuntimeOutcomeV1 {
+    Completed,
+    CompletedDegraded,
+    Failed,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowDurableOutcomeV1 {
+    Completed,
+    CompletedDegraded,
+    Failed,
+    Canceled,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +570,12 @@ pub enum ExecutionPolicyError {
     ProviderSelectionOutOfSet,
     #[error("provider-attempt identity matrix is incomplete or non-canonical")]
     ProviderAttemptMatrixInvalid,
+    #[error("control event id is invalid")]
+    InvalidControlEventId,
+    #[error("canonical structured evidence exceeded its encoded bound")]
+    StructuredEvidenceOverBound,
+    #[error("canonical structured evidence is invalid")]
+    InvalidStructuredEvidence,
 }
 
 fn max_qualification(
@@ -919,7 +1224,9 @@ fn encode_servers(servers: &[McpServerSpec]) -> Vec<u8> {
         canonical.extend_from_slice(&(server.env.len() as u64).to_be_bytes());
         for (name, value) in &server.env {
             push_bytes(&mut canonical, name.as_bytes());
-            push_bytes(&mut canonical, value.as_bytes());
+            push_bytes(&mut canonical, value.source_kind().as_bytes());
+            push_option(&mut canonical, value.source_name());
+            push_bytes(&mut canonical, value.resolved_value().as_bytes());
         }
     }
     canonical
@@ -980,11 +1287,7 @@ fn freeze_delivery(
                 b"a2a-bridge/kiro-mcp-content/v1",
                 &encode_servers(&delivered),
             )?;
-            let agent_name = format!(
-                "a2a-mcp-{}-{}",
-                entry.id.as_str(),
-                &content_key.as_str()[..16]
-            );
+            let agent_name = format!("a2a-mcp-v2-{}", content_key.as_str());
             let json = render_kiro_agent_config(&entry.mcp, cwd.as_str(), &agent_name);
             BoundMcpDeliveryPayloadV1::KiroNative { agent_name, json }
         }

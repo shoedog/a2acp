@@ -2483,7 +2483,9 @@ impl AcpBackend {
                     McpServerStdio::new(s.name, s.command).args(s.args).env(
                         s.env
                             .into_iter()
-                            .map(|(name, value)| EnvVariable::new(name, value))
+                            .map(|(name, value)| {
+                                EnvVariable::new(name, value.resolved_value().to_owned())
+                            })
                             .collect(),
                     ),
                 )
@@ -11439,7 +11441,7 @@ mod tests {
                 name: "secret-server".to_owned(),
                 command: "secret-server".to_owned(),
                 args: Vec::new(),
-                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned())],
+                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned().into())],
             }],
             diagnostic_redactor: DiagnosticRedactor::new([TEMPLATE]),
             ..test_config()
@@ -11484,7 +11486,7 @@ mod tests {
                 name: "secret-server".to_owned(),
                 command: "secret-server".to_owned(),
                 args: Vec::new(),
-                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned())],
+                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned().into())],
             }],
             diagnostic_redactor: DiagnosticRedactor::new([TEMPLATE]),
             ..test_config()
@@ -11545,7 +11547,7 @@ mod tests {
                 name: "secret-server".to_owned(),
                 command: "secret-server".to_owned(),
                 args: Vec::new(),
-                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned())],
+                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned().into())],
             }],
             diagnostic_redactor: DiagnosticRedactor::new([TEMPLATE]),
             ..test_config()
@@ -11621,7 +11623,7 @@ mod tests {
                 name: "secret-server".to_owned(),
                 command: "secret-server".to_owned(),
                 args: Vec::new(),
-                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned())],
+                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned().into())],
             }],
             diagnostic_redactor: DiagnosticRedactor::new([TEMPLATE]),
             ..test_config()
@@ -11699,7 +11701,7 @@ mod tests {
                 name: "secret-server".to_owned(),
                 command: "secret-server".to_owned(),
                 args: Vec::new(),
-                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned())],
+                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned().into())],
             }],
             diagnostic_redactor: DiagnosticRedactor::new([TEMPLATE]),
             ..test_config()
@@ -11787,7 +11789,7 @@ mod tests {
                 name: "secret-server".to_owned(),
                 command: "secret-server".to_owned(),
                 args: Vec::new(),
-                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned())],
+                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned().into())],
             }],
             diagnostic_redactor: DiagnosticRedactor::new([TEMPLATE]),
             ..test_config()
@@ -11928,7 +11930,7 @@ mod tests {
                 name: "secret-server".to_owned(),
                 command: "secret-server".to_owned(),
                 args: Vec::new(),
-                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned())],
+                env: vec![("TOKEN".to_owned(), TEMPLATE.to_owned().into())],
             }],
             diagnostic_redactor: DiagnosticRedactor::new([TEMPLATE]),
             ..test_config()

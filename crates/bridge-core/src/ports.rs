@@ -616,6 +616,67 @@ pub struct Resolved {
     pub lease: Box<dyn Lease>,
 }
 
+/// Opaque process-local identity for one exact registry slot and immutable entry object. It is
+/// intentionally non-serializable and never participates in durable provider fingerprints.
+pub struct EntryUseTokenV1 {
+    slot: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    entry_identity: usize,
+    serial: u64,
+}
+
+impl std::fmt::Debug for EntryUseTokenV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EntryUseTokenV1")
+            .field("serial", &self.serial)
+            .field("identity", &"[PROCESS-LOCAL]")
+            .finish()
+    }
+}
+
+impl EntryUseTokenV1 {
+    #[must_use]
+    pub fn new<T>(slot: std::sync::Arc<T>, entry: &std::sync::Arc<AgentEntry>, serial: u64) -> Self
+    where
+        T: std::any::Any + Send + Sync,
+    {
+        Self {
+            slot,
+            entry_identity: std::sync::Arc::as_ptr(entry) as usize,
+            serial,
+        }
+    }
+
+    #[must_use]
+    pub fn downcast_slot<T>(&self) -> Option<std::sync::Arc<T>>
+    where
+        T: std::any::Any + Send + Sync,
+    {
+        self.slot.clone().downcast::<T>().ok()
+    }
+
+    #[must_use]
+    pub fn matches_entry(&self, entry: &std::sync::Arc<AgentEntry>) -> bool {
+        self.entry_identity == std::sync::Arc::as_ptr(entry) as usize
+    }
+}
+
+pub struct BoundEntryUseV1 {
+    pub entry: std::sync::Arc<AgentEntry>,
+    pub lease: Box<dyn Lease>,
+    pub use_token: EntryUseTokenV1,
+}
+
+impl std::fmt::Debug for BoundEntryUseV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundEntryUseV1")
+            .field("agent", &self.entry.id)
+            .field("use_token", &self.use_token)
+            .finish_non_exhaustive()
+    }
+}
+
 #[async_trait::async_trait]
 pub trait AgentRegistry: Send + Sync {
     /// Resolve (and lazily spawn) a backend for the given agent id. [§4.5]
@@ -628,6 +689,29 @@ pub trait AgentRegistry: Send + Sync {
         _observer: std::sync::Arc<dyn DiagnosticObserver>,
     ) -> Result<Resolved, BridgeError> {
         self.resolve(id).await
+    }
+    /// Lease and read one exact immutable entry without spawning a backend. `None` is an explicit
+    /// opt-out for registries that cannot provide the bound V2 contract.
+    fn bind_entry_use(&self, _id: &crate::ids::AgentId) -> Option<BoundEntryUseV1> {
+        None
+    }
+    /// Resolve the backend owned by the exact slot already captured in `bound`. The default
+    /// refuses; it must never re-look-up by agent id.
+    async fn resolve_bound(
+        &self,
+        _bound: &BoundEntryUseV1,
+        _effect: &crate::execution_policy::BoundProviderEffectV1,
+        _observer: std::sync::Arc<dyn DiagnosticObserver>,
+    ) -> Result<std::sync::Arc<dyn AgentBackend>, BridgeError> {
+        Err(BridgeError::BindUnsupported)
+    }
+    /// Retire only the exact backend subslot selected by this bound use. Compatibility registries
+    /// have no bound subslots and intentionally do nothing.
+    async fn invalidate_bound(
+        &self,
+        _bound: &BoundEntryUseV1,
+        _effect_digest: &crate::execution_policy::Sha256HexV1,
+    ) {
     }
     /// Return the default agent id for this registry.
     fn default_id(&self) -> crate::ids::AgentId;

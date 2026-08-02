@@ -261,6 +261,7 @@ mod tests {
             BridgeError::ConfigMismatch { .. } => "ConfigMismatch",
             BridgeError::ConfigReseedRequired { .. } => "ConfigReseedRequired",
             BridgeError::BoundSessionUnsupported => "BoundSessionUnsupported",
+            BridgeError::BindUnsupported => "BindUnsupported",
             BridgeError::SessionExpired => "SessionExpired",
             BridgeError::HandleBusy => "HandleBusy",
             BridgeError::TaskSpecInvalid { .. } => "TaskSpecInvalid",

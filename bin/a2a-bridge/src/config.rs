@@ -737,7 +737,10 @@ pub struct McpToml {
 #[serde(deny_unknown_fields)]
 pub struct EnvToml {
     pub name: String,
-    pub value: String,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub value_from_env: Option<String>,
 }
 
 /// Convert + validate `[[agents.mcp]]` into domain `McpServerSpec`s: non-empty/unique names, a
@@ -748,6 +751,12 @@ fn is_toml_bare_key(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn is_environment_reference(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn is_direct_bridge_mcp_loopback(command: &str, args: &[String]) -> bool {
@@ -824,9 +833,48 @@ fn build_mcp_specs(
                     m.name, e.name
                 )));
             }
-            validate_cwd_template(&e.value)
-                .map_err(|x| err(format!("mcp {:?} env {:?}: {x}", m.name, e.name)))?;
-            env.push((e.name.clone(), e.value.clone()));
+            let source = match (&e.value, &e.value_from_env) {
+                (Some(value), None) => {
+                    validate_cwd_template(value).map_err(|x| {
+                        err(format!("mcp {:?} env {:?}: {x}", m.name, e.name))
+                    })?;
+                    bridge_core::mcp::McpEnvValueSourceV1::PublicLiteral(value.clone())
+                }
+                (None, Some(variable)) if is_environment_reference(variable) => {
+                    let value = std::env::var(variable).map_err(|_| {
+                        err(format!(
+                            "mcp {:?} env {:?}: referenced environment variable is missing or non-Unicode",
+                            m.name, e.name
+                        ))
+                    })?;
+                    let resolved = bridge_core::mcp::SecretString::new(value).map_err(|message| {
+                        err(format!("mcp {:?} env {:?}: {message}", m.name, e.name))
+                    })?;
+                    bridge_core::mcp::McpEnvValueSourceV1::SecretFromEnv {
+                        variable: variable.clone(),
+                        resolved,
+                    }
+                }
+                (None, Some(_)) => {
+                    return Err(err(format!(
+                        "mcp {:?} env {:?}: value_from_env must be a non-empty environment variable name",
+                        m.name, e.name
+                    )))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(err(format!(
+                        "mcp {:?} env {:?}: set exactly one of value or value_from_env",
+                        m.name, e.name
+                    )))
+                }
+                (None, None) => {
+                    return Err(err(format!(
+                        "mcp {:?} env {:?}: set exactly one of value or value_from_env",
+                        m.name, e.name
+                    )))
+                }
+            };
+            env.push((e.name.clone(), source));
         }
         out.push(McpServerSpec {
             name: m.name.clone(),
@@ -1665,6 +1713,17 @@ impl RegistryConfig {
                 !mcp.is_empty(),
                 id.as_str(),
             )?;
+            if !matches!(mcp_delivery, bridge_core::mcp::McpDelivery::Acp)
+                && mcp
+                    .iter()
+                    .flat_map(|server| &server.env)
+                    .any(|(_, value)| value.is_secret())
+            {
+                return Err(ConfigError::Registry(format!(
+                    "agent {:?}: value_from_env MCP bindings require mcp_delivery=\"acp\"",
+                    id.as_str()
+                )));
+            }
             // kiro MCP is host-only: the bridge writes ~/.kiro/agents/<name>.json on the HOST and points
             // kiro at it via `--agent`; a containerized kiro has its own home, so the config wouldn't reach
             // it (ADR-0028). Reject the combination rather than silently delivering nothing.
@@ -4510,6 +4569,48 @@ path = "/tmp/x.db"
     }
 
     #[test]
+    fn mcp_value_from_env_resolves_once_and_is_secret_silent_for_acp() {
+        const VARIABLE: &str = "A2A_BRIDGE_TEST_MCP_SECRET_R2F1A";
+        const SECRET: &str = "typed-secret-alpha";
+        std::env::set_var(VARIABLE, SECRET);
+        let raw = format!(
+            "default=\"claude\"\n[[agents]]\nid=\"claude\"\ncmd=\"claude-agent-acp\"\n\
+             [[agents.mcp]]\nname=\"private\"\ncommand=\"/opt/private\"\n\
+             [[agents.mcp.env]]\nname=\"TOKEN\"\nvalue_from_env=\"{VARIABLE}\"\n[server]\n"
+        );
+        let snapshot = RegistryConfig::parse(&raw)
+            .unwrap()
+            .into_snapshot()
+            .unwrap();
+        std::env::remove_var(VARIABLE);
+        let source = &snapshot.entries[0].mcp[0].env[0].1;
+        assert!(source.is_secret());
+        assert_eq!(source.delivery_value("/repo"), SECRET);
+        assert!(!format!("{source:?}").contains(SECRET));
+    }
+
+    #[test]
+    fn mcp_value_from_env_rejects_native_delivery_and_ambiguous_sources() {
+        const VARIABLE: &str = "A2A_BRIDGE_TEST_MCP_SECRET_R2F1A_NATIVE";
+        std::env::set_var(VARIABLE, "native-secret");
+        let native = format!(
+            "default=\"codex\"\n[[agents]]\nid=\"codex\"\ncmd=\"codex-acp\"\n\
+             [[agents.mcp]]\nname=\"private\"\ncommand=\"/opt/private\"\n\
+             [[agents.mcp.env]]\nname=\"TOKEN\"\nvalue_from_env=\"{VARIABLE}\"\n[server]\n"
+        );
+        let result = RegistryConfig::parse(&native).and_then(RegistryConfig::into_snapshot);
+        std::env::remove_var(VARIABLE);
+        assert!(result.is_err());
+
+        let both = "default=\"claude\"\n[[agents]]\nid=\"claude\"\ncmd=\"claude-agent-acp\"\n\
+                    [[agents.mcp]]\nname=\"private\"\ncommand=\"/opt/private\"\n\
+                    [[agents.mcp.env]]\nname=\"TOKEN\"\nvalue=\"public\"\nvalue_from_env=\"NOPE\"\n[server]\n";
+        assert!(RegistryConfig::parse(both)
+            .and_then(RegistryConfig::into_snapshot)
+            .is_err());
+    }
+
+    #[test]
     fn build_mcp_specs_rejects_bad_inputs() {
         // duplicate name
         assert!(
@@ -4547,7 +4648,8 @@ path = "/tmp/x.db"
         let mut reserved = mcp_toml("wrapped", "/opt/wrapper", &[]);
         reserved.env.push(super::EnvToml {
             name: "a2a_bridge_mcp_call_depth".into(),
-            value: "0".into(),
+            value: Some("0".into()),
+            value_from_env: None,
         });
         let err = super::build_mcp_specs(&[reserved], "reviewer")
             .unwrap_err()

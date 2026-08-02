@@ -67,6 +67,7 @@ pub(crate) use bridge_controller::{
 };
 
 use std::collections::BTreeSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,7 +84,7 @@ use bridge_policy::{
     auth::AlwaysGrant,
     permission::{AutoPolicy, DeferPolicy},
 };
-use bridge_registry::registry::{ObservedSpawnFn, Registry, SpawnFn};
+use bridge_registry::registry::{BoundObservedSpawnFn, Registry, SpawnFn};
 use bridge_store::sqlite::SqliteStore;
 use config::{FileConfigSource, RegistryConfig, ServerConfig};
 use route::SkillRoute;
@@ -449,11 +450,22 @@ fn acp_prefix_attestation_transport(
 /// agent runs the runtime (docker) wrapping the agent cli; a raw agent runs `cmd`+`args` directly
 /// (Slice A compat). BOTH `SpawnFn` closures (run-workflow + serve) call this, so the two paths can't
 /// diverge. Unit-tested below; the Docker acceptance gate then proves it end-to-end.
+#[cfg(test)]
 fn acp_program_argv(
     entry: &AgentEntry,
     container_name: Option<&str>,
     labels: &[(String, String)],
     mcp_cwd: &str,
+) -> Result<(String, Vec<String>), BridgeError> {
+    acp_program_argv_bound(entry, container_name, labels, mcp_cwd, None)
+}
+
+fn acp_program_argv_bound(
+    entry: &AgentEntry,
+    container_name: Option<&str>,
+    labels: &[(String, String)],
+    mcp_cwd: &str,
+    delivery: Option<&bridge_core::execution_policy::BoundMcpDeliveryV1>,
 ) -> Result<(String, Vec<String>), BridgeError> {
     let cmd = entry.cmd.as_deref().ok_or(BridgeError::ConfigInvalid {
         reason: format!("acp agent {} missing cmd", entry.id.as_str()),
@@ -462,7 +474,28 @@ fn acp_program_argv(
     // `--agent <name>` pointing at the agent-config the bridge writes in `acp_spawn_inputs`. claude
     // (Acp) gets MCP via the session/new param, not here. Empty `mcp` → unchanged args.
     use bridge_core::mcp::McpDelivery;
-    let args = if entry.mcp.is_empty() {
+    let args = if let Some(delivery) = delivery {
+        use bridge_core::execution_policy::BoundMcpDeliveryPayloadV1 as Payload;
+        match (entry.mcp_delivery, delivery.payload()) {
+            (McpDelivery::Acp, Payload::Acp(_)) => entry.args.clone(),
+            (McpDelivery::CodexNative, Payload::CodexNative(suffix)) => {
+                let mut args = entry.args.clone();
+                args.extend(suffix.iter().cloned());
+                args
+            }
+            (McpDelivery::KiroNative, Payload::KiroNative { agent_name, .. }) => {
+                let mut args = entry.args.clone();
+                args.push("--agent".to_string());
+                args.push(agent_name.clone());
+                args
+            }
+            _ => {
+                return Err(BridgeError::ConfigMismatch {
+                    field: "bound_mcp_delivery",
+                });
+            }
+        }
+    } else if entry.mcp.is_empty() {
         entry.args.clone()
     } else {
         match entry.mcp_delivery {
@@ -523,6 +556,84 @@ fn write_kiro_agent_config(entry: &AgentEntry, cwd: &str) -> Result<(), BridgeEr
     Ok(())
 }
 
+fn write_bound_kiro_agent_config(agent_name: &str, json: &str) -> Result<(), BridgeError> {
+    let digest = agent_name
+        .strip_prefix("a2a-mcp-v2-")
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or(BridgeError::ConfigMismatch {
+            field: "bound_kiro_agent_name",
+        })?;
+    let _ = digest;
+    let home = std::env::var("HOME").map_err(|_| BridgeError::ConfigInvalid {
+        reason: "kiro MCP delivery needs $HOME to locate ~/.kiro/agents".into(),
+    })?;
+    let dir = std::path::Path::new(&home).join(".kiro").join("agents");
+    std::fs::create_dir_all(&dir).map_err(|error| BridgeError::ConfigInvalid {
+        reason: format!("kiro agents dir {dir:?}: {error}"),
+    })?;
+    let path = dir.join(format!("{agent_name}.json"));
+
+    let verify_existing = || -> Result<(), BridgeError> {
+        let metadata =
+            std::fs::symlink_metadata(&path).map_err(|error| BridgeError::ConfigInvalid {
+                reason: format!("inspect bound kiro agent config {path:?}: {error}"),
+            })?;
+        if !metadata.file_type().is_file() {
+            return Err(BridgeError::ConfigInvalid {
+                reason: format!("bound kiro agent config {path:?} is not a regular file"),
+            });
+        }
+        let existing = std::fs::read(&path).map_err(|error| BridgeError::ConfigInvalid {
+            reason: format!("read bound kiro agent config {path:?}: {error}"),
+        })?;
+        if existing != json.as_bytes() {
+            return Err(BridgeError::ConfigMismatch {
+                field: "bound_kiro_agent_config",
+            });
+        }
+        Ok(())
+    };
+    if path.exists() {
+        return verify_existing();
+    }
+
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    match options.open(&path) {
+        Ok(mut file) => {
+            file.write_all(json.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|error| BridgeError::ConfigInvalid {
+                    reason: format!("write bound kiro config {path:?}: {error}"),
+                })?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o400))
+                .map_err(|error| BridgeError::ConfigInvalid {
+                    reason: format!("make bound kiro config owner-read-only: {error}"),
+                })?;
+            file.sync_all()
+                .map_err(|error| BridgeError::ConfigInvalid {
+                    reason: format!("sync bound kiro config {path:?}: {error}"),
+                })?;
+            std::fs::File::open(&dir)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| BridgeError::ConfigInvalid {
+                    reason: format!("sync kiro agents dir {dir:?}: {error}"),
+                })?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => verify_existing(),
+        Err(error) => Err(BridgeError::ConfigInvalid {
+            reason: format!("publish bound kiro config {path:?}: {error}"),
+        }),
+    }
+}
+
 /// Build `(program, argv, AcpConfig)` for a `kind=acp` agent, attaching the `:ro` container reaper when the
 /// sandbox is `access=ro` (owner-scoped name `a2a-ro-<owner>-<nonce>` + a `docker rm -f` reap_fn). Shared by
 /// BOTH spawn factories (`make_spawn_fn` + `serve`) so the `:ro` naming/reaping can't diverge.
@@ -532,7 +643,17 @@ fn acp_spawn_inputs(
     owner_config_path: &std::path::Path,
     run: &bridge_core::run_identity::RunHandle,
 ) -> Result<(String, Vec<String>, bridge_acp::acp_backend::AcpConfig), BridgeError> {
-    acp_spawn_inputs_with_cwd_binding(entry, cwd, owner_config_path, run, false)
+    acp_spawn_inputs_with_cwd_binding(entry, cwd, owner_config_path, run, false, None)
+}
+
+fn acp_spawn_inputs_bound(
+    entry: &AgentEntry,
+    cwd: PathBuf,
+    owner_config_path: &std::path::Path,
+    run: &bridge_core::run_identity::RunHandle,
+    effect: &bridge_core::execution_policy::BoundProviderEffectV1,
+) -> Result<(String, Vec<String>, bridge_acp::acp_backend::AcpConfig), BridgeError> {
+    acp_spawn_inputs_with_cwd_binding(entry, cwd, owner_config_path, run, false, Some(effect))
 }
 
 fn acp_spawn_inputs_with_cwd_binding(
@@ -541,6 +662,7 @@ fn acp_spawn_inputs_with_cwd_binding(
     owner_config_path: &std::path::Path,
     run: &bridge_core::run_identity::RunHandle,
     preserve_object_cwd: bool,
+    bound_effect: Option<&bridge_core::execution_policy::BoundProviderEffectV1>,
 ) -> Result<(String, Vec<String>, bridge_acp::acp_backend::AcpConfig), BridgeError> {
     use bridge_core::domain::MountAccess;
     // Increment A: a `:ro` reader carries the run-id in its name (no same-owner concurrent clash) + the
@@ -550,7 +672,17 @@ fn acp_spawn_inputs_with_cwd_binding(
     // possibly stale) entry. Canonicalize the cwd used for MCP `{cwd}` so the agent deterministically
     // hits the warmed entry (warm the SAME canonical path). The `:rw` implementor already does this via
     // `rw_canon`. Falls back to the raw cwd if canonicalize fails (e.g. unit tests, missing dir).
-    let mcp_cwd = if preserve_object_cwd {
+    let mcp_cwd = if let Some(effect) = bound_effect {
+        let frozen = effect.frozen();
+        if cwd.as_os_str() != std::ffi::OsStr::new(frozen.effect.effective_session_cwd.as_str())
+            || frozen.effect.mcp_delivery_digest != *effect.delivery().digest()
+        {
+            return Err(BridgeError::ConfigMismatch {
+                field: "bound_provider_effect",
+            });
+        }
+        frozen.effect.effective_session_cwd.as_str().to_owned()
+    } else if preserve_object_cwd {
         if !cwd.is_absolute() {
             return Err(BridgeError::ConfigInvalid {
                 reason: "pinned host composition cwd must be absolute".into(),
@@ -570,9 +702,21 @@ fn acp_spawn_inputs_with_cwd_binding(
     if matches!(
         entry.mcp_delivery,
         bridge_core::mcp::McpDelivery::KiroNative
-    ) && !entry.mcp.is_empty()
-    {
-        write_kiro_agent_config(entry, &mcp_cwd)?;
+    ) {
+        if let Some(effect) = bound_effect {
+            let bridge_core::execution_policy::BoundMcpDeliveryPayloadV1::KiroNative {
+                agent_name,
+                json,
+            } = effect.delivery().payload()
+            else {
+                return Err(BridgeError::ConfigMismatch {
+                    field: "bound_mcp_delivery",
+                });
+            };
+            write_bound_kiro_agent_config(agent_name, json)?;
+        } else if !entry.mcp.is_empty() {
+            write_kiro_agent_config(entry, &mcp_cwd)?;
+        }
     }
     let (ro_name, labels) = match entry
         .sandbox
@@ -601,7 +745,13 @@ fn acp_spawn_inputs_with_cwd_binding(
         }
         None => (None, Vec::new()),
     };
-    let (program, argv) = acp_program_argv(entry, ro_name.as_deref(), &labels, &mcp_cwd)?;
+    let (program, argv) = acp_program_argv_bound(
+        entry,
+        ro_name.as_deref(),
+        &labels,
+        &mcp_cwd,
+        bound_effect.map(bridge_core::execution_policy::BoundProviderEffectV1::delivery),
+    )?;
     let container = ro_name.map(|name| {
         bridge_acp::acp_backend::ContainerReap::production(
             entry
@@ -1089,8 +1239,8 @@ fn make_spawn_fn(
     perm_timeout_ms: u64,
     worktree_cfg: Option<WorktreeRuntimeCfg>,
     host_process_cwd: Option<HostProcessCwd>,
-) -> ObservedSpawnFn {
-    Arc::new(move |entry: Arc<AgentEntry>, observer| {
+) -> BoundObservedSpawnFn {
+    Arc::new(move |entry: Arc<AgentEntry>, bound_effect, observer| {
         let policy = Arc::clone(&policy_for_spawn);
         let owner_config_path = owner_config_path.clone();
         let run = run.clone();
@@ -1116,9 +1266,17 @@ fn make_spawn_fn(
                     });
                 }
             }
-            let cwd = match host_process_cwd.as_ref() {
-                Some(pinned) => pinned.acp_session_cwd.clone(),
-                None => {
+            let cwd = match (host_process_cwd.as_ref(), bound_effect.as_ref()) {
+                (Some(_), Some(_)) => {
+                    return Err(BridgeError::ConfigMismatch {
+                        field: "guarded_bound_provider_effect",
+                    });
+                }
+                (Some(pinned), None) => pinned.acp_session_cwd.clone(),
+                (None, Some(effect)) => {
+                    PathBuf::from(effect.frozen().effect.effective_session_cwd.as_str())
+                }
+                (None, None) => {
                     let resolved = resolve_static_session_cwd(
                         entry.session_cwd.as_deref(),
                         entry.cwd.as_deref(),
@@ -1145,7 +1303,10 @@ fn make_spawn_fn(
                             &owner_config_path,
                             &run,
                             true,
+                            None,
                         )
+                    } else if let Some(effect) = bound_effect.as_deref() {
+                        acp_spawn_inputs_bound(&entry, cwd, &owner_config_path, &run, effect)
                     } else {
                         acp_spawn_inputs(&entry, cwd, &owner_config_path, &run)
                     };
@@ -2385,7 +2546,10 @@ fn apply_lsp_env(specs: &mut [bridge_core::mcp::McpServerSpec], env: &[(String, 
         // old static config listed CARGO_* before LSP_MCP_LOG). Profile values WIN on key conflicts.
         let profile_keys: std::collections::HashSet<&str> =
             env.iter().map(|(k, _)| k.as_str()).collect();
-        let mut merged: Vec<(String, String)> = env.to_vec();
+        let mut merged: Vec<(String, bridge_core::mcp::McpEnvValueSourceV1)> = env
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone().into()))
+            .collect();
         merged.extend(
             lsp.env
                 .iter()
@@ -2951,7 +3115,7 @@ async fn implement_cmd(args: &[String]) -> Result<(), BoxError> {
         None,
     );
     let registry = Arc::new(
-        bridge_registry::registry::Registry::new_observed(snapshot, spawn)
+        bridge_registry::registry::Registry::new_bound_observed(snapshot, spawn)
             .map_err(|e| format!("implement: registry: {e:?}"))?,
     );
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
@@ -3280,7 +3444,7 @@ async fn implement_resume_cmd(
         None,
     );
     let registry = Arc::new(
-        bridge_registry::registry::Registry::new_observed(snapshot, spawn)
+        bridge_registry::registry::Registry::new_bound_observed(snapshot, spawn)
             .map_err(|e| format!("implement --resume: registry: {e:?}"))?,
     );
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
@@ -3929,7 +4093,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         None,
     );
     let registry = Arc::new(
-        bridge_registry::registry::Registry::new_observed(snapshot, spawn)
+        bridge_registry::registry::Registry::new_bound_observed(snapshot, spawn)
             .map_err(|e| format!("run-workflow: registry init error: {e:?}"))?,
     );
     let executor = bridge_workflow::executor::WorkflowExecutor::new(
@@ -6270,7 +6434,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     let policy = make_policy(&cfg.server);
     let perm_registry = PermissionRegistry::new();
     let perm_timeout = permission_timeout_ms(&cfg.server);
-    let spawn: ObservedSpawnFn = make_spawn_fn(
+    let spawn: BoundObservedSpawnFn = make_spawn_fn(
         Arc::clone(&policy) as Arc<dyn PolicyEngine>,
         config_path.clone(),
         run.clone(),
@@ -6290,7 +6454,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
             &bridge_core::liveness::FsLeaseProbe,
         );
     }
-    let registry = Arc::new(Registry::new_observed(snapshot, spawn)?);
+    let registry = Arc::new(Registry::new_bound_observed(snapshot, spawn)?);
 
     let base = config_path
         .parent()
@@ -7880,7 +8044,7 @@ async fn main() -> Result<(), BoxError> {
     //    for the backend's lifetime, and applies the configured mode/model after
     //    each `session/new`. `model`/`mode` here are the per-MINT FALLBACK; the
     //    per-session `configure_session` overrides them at dispatch (Task 6).
-    let spawn: ObservedSpawnFn = make_spawn_fn(
+    let spawn: BoundObservedSpawnFn = make_spawn_fn(
         Arc::clone(&policy) as Arc<dyn PolicyEngine>,
         config_path.clone(),
         run.clone(),
@@ -7927,7 +8091,7 @@ async fn main() -> Result<(), BoxError> {
         .map(|e| (e.id.as_str().to_string(), e.clone()))
         .collect();
     // Registry::new VALIDATES the snapshot → boot fails loud on bad config (spec §7).
-    let registry = Arc::new(Registry::new_observed(snapshot, spawn)?);
+    let registry = Arc::new(Registry::new_bound_observed(snapshot, spawn)?);
 
     // 6. Reconcile loop — consume `watch()` and `apply()` each new snapshot so
     //    on-disk edits hot-reload the live registry. The watch stream is held for
@@ -9745,7 +9909,7 @@ inputs = []
         // The fake adapter does not implement ACP; only its already-composed argv is under test.
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            spawn(std::sync::Arc::new(entry), observer),
+            spawn(std::sync::Arc::new(entry), None, observer),
         )
         .await;
 
@@ -10046,6 +10210,51 @@ inputs = []
         claude.mcp = codex.mcp.clone();
         let (_p, argv) = acp_program_argv(&claude, None, &[], "/repo/z").unwrap();
         assert!(!argv.iter().any(|a| a == "-c"), "no -c for Acp: {argv:?}");
+    }
+
+    #[test]
+    fn bound_codex_argv_consumes_the_frozen_delivery_without_rerendering() {
+        use bridge_core::execution_policy::{
+            freeze_direct_checkout_v1, freeze_provider_attempt_v1, FrozenProviderLogicalSessionV1,
+            PolicyNodeRefV1, ProviderFreezeInputV1,
+        };
+        use bridge_core::mcp::{McpDelivery, McpServerSpec};
+
+        let mut codex = acp_entry("codex");
+        codex.cmd = Some("/usr/bin/not-the-packaged-wrapper".into());
+        codex.mcp_delivery = McpDelivery::CodexNative;
+        codex.mcp = vec![McpServerSpec {
+            name: "prism".into(),
+            command: "/opt/prism".into(),
+            args: vec!["--repo".into(), "{cwd}".into()],
+            env: vec![],
+        }];
+        let bundle = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+            entry: &codex,
+            overrides: None,
+            node: PolicyNodeRefV1::from_node_id(0, "node"),
+            logical_session: FrozenProviderLogicalSessionV1::Execute {
+                candidate_ordinal: 0,
+            },
+            checkout: freeze_direct_checkout_v1(
+                bridge_core::SessionCwd::parse("/persisted-worktree").unwrap(),
+            ),
+            provider_effect_key: None,
+        })
+        .unwrap();
+
+        codex.mcp[0].args[1] = "/mutated-template".into();
+        let (_program, argv) = acp_program_argv_bound(
+            &codex,
+            None,
+            &[],
+            "/wrong-late-cwd",
+            Some(bundle.bound.delivery()),
+        )
+        .unwrap();
+        assert!(argv.iter().any(|arg| arg.contains("/persisted-worktree")));
+        assert!(!argv.iter().any(|arg| arg.contains("/wrong-late-cwd")));
+        assert!(!argv.iter().any(|arg| arg.contains("/mutated-template")));
     }
 
     #[test]
@@ -12892,7 +13101,7 @@ cmd = "cargo build --locked"
             None,
             None,
         );
-        bridge_registry::registry::Registry::new_observed(snap, spawn)
+        bridge_registry::registry::Registry::new_bound_observed(snap, spawn)
             .expect("containerized config (incl. the impl container_rw agent) validates");
     }
 
@@ -12975,7 +13184,10 @@ cmd = "cargo build --locked"
             name: "lsp".into(),
             command: "/usr/local/bin/lsp-mcp".into(),
             args: vec![],
-            env,
+            env: env
+                .into_iter()
+                .map(|(name, value)| (name, value.into()))
+                .collect(),
         }
     }
 
@@ -13006,17 +13218,17 @@ cmd = "cargo build --locked"
         assert!(lsp
             .env
             .iter()
-            .any(|(k, v)| k == "LSP_MCP_LOG" && v == "/log"));
+            .any(|(k, v)| k == "LSP_MCP_LOG" && v.resolved_value() == "/log"));
         assert!(
             lsp.env
                 .iter()
-                .any(|(k, v)| k == "CARGO_HOME" && v == "/cargo"),
+                .any(|(k, v)| k == "CARGO_HOME" && v.resolved_value() == "/cargo"),
             "profile must override existing CARGO_HOME"
         );
         assert!(
             lsp.env
                 .iter()
-                .any(|(k, v)| k == "CARGO_NET_OFFLINE" && v == "true"),
+                .any(|(k, v)| k == "CARGO_NET_OFFLINE" && v.resolved_value() == "true"),
             "profile must add CARGO_NET_OFFLINE"
         );
         // EXACT order: profile env first (CARGO_*), then the config's non-overridden entry (LSP_MCP_LOG),

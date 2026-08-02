@@ -1,3 +1,3 @@
 pub mod registry;
 
-pub use registry::{ObservedSpawnFn, Registry, SpawnFn};
+pub use registry::{BoundObservedSpawnFn, ObservedSpawnFn, Registry, SpawnFn};

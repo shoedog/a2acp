@@ -1,8 +1,8 @@
 // Agent registry — implemented in Task 3 (resolve), Task 4 (apply), Task 5 (retirement).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
+use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -16,7 +16,10 @@ use bridge_core::diagnostics::{
 use bridge_core::domain::{AgentEntry, AgentKind, RegistrySnapshot};
 use bridge_core::error::BridgeError;
 use bridge_core::ids::AgentId;
-use bridge_core::ports::{AgentBackend, AgentRegistry, DiagnosticObserver, Lease, Resolved};
+use bridge_core::ports::{
+    AgentBackend, AgentRegistry, BoundEntryUseV1, DiagnosticObserver, EntryUseTokenV1, Lease,
+    Resolved,
+};
 
 /// Factory that lazily spawns a backend for a slot's entry. Injected so the
 /// registry stays adapter-agnostic (real impl wires the ACP adapter; tests fake it).
@@ -37,6 +40,20 @@ pub type ObservedSpawnFn = Arc<
         + Sync,
 >;
 
+/// Bound-aware lazy backend factory. The persisted provider effect is supplied only when
+/// process-start delivery is part of V2 identity (currently host/sandbox ACP with Codex- or
+/// Kiro-native MCP). Existing constructors remain source-compatible through `ObservedSpawnFn`;
+/// production V2 wiring opts into this factory explicitly.
+pub type BoundObservedSpawnFn = Arc<
+    dyn Fn(
+            Arc<AgentEntry>,
+            Option<Arc<bridge_core::execution_policy::BoundProviderEffectV1>>,
+            Arc<dyn DiagnosticObserver>,
+        ) -> BoxFuture<'static, Result<Arc<dyn AgentBackend>, BridgeError>>
+        + Send
+        + Sync,
+>;
+
 /// Default grace before a lease-draining retirement task force-retires a backend
 /// whose leases never reach zero (e.g. a stuck in-flight prompt). [spec §7]
 pub(crate) const DEFAULT_RETIRE_GRACE: Duration = Duration::from_secs(30);
@@ -45,12 +62,56 @@ pub(crate) const DEFAULT_RETIRE_GRACE: Duration = Duration::from_secs(30);
 /// behavior and use a long force deadline only as a leaked-lease backstop.
 const INVALIDATE_RETIRE_GRACE: Duration = Duration::from_secs(3600);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundBackendScope {
+    SharedSessionScoped,
+    EffectKeyedProcess,
+}
+
+fn bound_backend_scope(
+    entry: &AgentEntry,
+    delivery: &bridge_core::execution_policy::BoundMcpDeliveryPayloadV1,
+) -> Result<BoundBackendScope, BridgeError> {
+    use bridge_core::execution_policy::BoundMcpDeliveryPayloadV1 as Payload;
+    use bridge_core::mcp::McpDelivery;
+
+    let channel_matches = matches!(
+        (entry.mcp_delivery, delivery),
+        (McpDelivery::Acp, Payload::Acp(_))
+            | (McpDelivery::CodexNative, Payload::CodexNative(_))
+            | (McpDelivery::KiroNative, Payload::KiroNative { .. })
+    );
+    if !channel_matches {
+        return Err(BridgeError::ConfigMismatch {
+            field: "bound_mcp_delivery",
+        });
+    }
+
+    Ok(match (entry.kind, entry.mcp_delivery) {
+        (AgentKind::Acp, McpDelivery::Acp) => BoundBackendScope::SharedSessionScoped,
+        (AgentKind::Acp, McpDelivery::CodexNative | McpDelivery::KiroNative) => {
+            BoundBackendScope::EffectKeyedProcess
+        }
+        (AgentKind::Api, McpDelivery::Acp)
+        | (AgentKind::Api, McpDelivery::CodexNative)
+        | (AgentKind::Api, McpDelivery::KiroNative)
+        | (AgentKind::ContainerRw, McpDelivery::Acp)
+        | (AgentKind::ContainerRw, McpDelivery::CodexNative)
+        | (AgentKind::ContainerRw, McpDelivery::KiroNative) => {
+            BoundBackendScope::SharedSessionScoped
+        }
+    })
+}
+
 /// One registry slot: the (swappable) entry config, the lazily-spawned backend,
 /// a retired flag (set by reconcile in T4/T5), the active-lease counter, and a
 /// lease-drop wakeup so the T5 retirement task can drain without polling.
 pub(crate) struct Slot {
     pub entry: ArcSwap<AgentEntry>,
     pub backend: OnceCell<Arc<dyn AgentBackend>>,
+    /// Process-start native MCP delivery is immutable for a child. Partition those children by
+    /// the complete frozen provider-effect digest so two effective cwds can never alias.
+    pub bound_backends: SyncMutex<HashMap<String, Arc<OnceCell<Arc<dyn AgentBackend>>>>>,
     pub retired: Arc<AtomicBool>,
     pub leases: Arc<AtomicUsize>,
     /// Notified on every lease drop so the detached retirement task wakes the
@@ -63,6 +124,7 @@ impl Slot {
         Arc::new(Self {
             entry: ArcSwap::from_pointee(entry),
             backend: OnceCell::new(),
+            bound_backends: SyncMutex::new(HashMap::new()),
             retired: Arc::new(AtomicBool::new(false)),
             leases: Arc::new(AtomicUsize::new(0)),
             lease_notify: Arc::new(Notify::new()),
@@ -110,11 +172,15 @@ impl Lease for LeaseGuard {
 /// Runtime-mutable agent registry: lazy-spawns backends and hands out leases.
 pub struct Registry {
     state: ArcSwap<State>,
-    spawn: ObservedSpawnFn,
+    spawn: BoundObservedSpawnFn,
+    bound_aware_spawn: bool,
     write_lock: Mutex<()>,
     /// Grace deadline for the lease-draining retirement task: if a retired slot's
     /// leases don't reach zero within this window, the backend is force-retired.
     grace: Duration,
+    /// Process-local discriminator for opaque bound-use tokens. This is not durable identity;
+    /// it only makes diagnostics and accidental token substitution easier to distinguish.
+    next_bound_use: AtomicU64,
 }
 
 /// Shared snapshot validation: rejects duplicate ids, disallowed cmds, and a
@@ -273,6 +339,15 @@ impl Registry {
         Self::with_grace_observed(snap, spawn, DEFAULT_RETIRE_GRACE)
     }
 
+    /// Build a registry whose factory consumes the exact frozen provider effect for V2 native
+    /// process-start delivery. Legacy resolutions call the same factory with `None`.
+    pub fn new_bound_observed(
+        snap: RegistrySnapshot,
+        spawn: BoundObservedSpawnFn,
+    ) -> Result<Self, BridgeError> {
+        Self::with_grace_bound_observed(snap, spawn, DEFAULT_RETIRE_GRACE)
+    }
+
     /// Like [`Registry::new`] but with an explicit lease-drain grace deadline.
     /// Tests use a short grace so the force-retire path is exercised quickly.
     pub fn with_grace(
@@ -290,6 +365,26 @@ impl Registry {
         spawn: ObservedSpawnFn,
         grace: Duration,
     ) -> Result<Self, BridgeError> {
+        let compatibility: BoundObservedSpawnFn =
+            Arc::new(move |entry, _effect, observer| spawn(entry, observer));
+        Self::build(snap, compatibility, false, grace)
+    }
+
+    /// Bound-aware form with an explicit lease-drain grace, primarily for exact subslot tests.
+    pub fn with_grace_bound_observed(
+        snap: RegistrySnapshot,
+        spawn: BoundObservedSpawnFn,
+        grace: Duration,
+    ) -> Result<Self, BridgeError> {
+        Self::build(snap, spawn, true, grace)
+    }
+
+    fn build(
+        snap: RegistrySnapshot,
+        spawn: BoundObservedSpawnFn,
+        bound_aware_spawn: bool,
+        grace: Duration,
+    ) -> Result<Self, BridgeError> {
         validate(&snap)?;
         let slots = snap
             .entries
@@ -302,8 +397,10 @@ impl Registry {
                 default: snap.default,
             }),
             spawn,
+            bound_aware_spawn,
             write_lock: Mutex::new(()),
             grace,
+            next_bound_use: AtomicU64::new(1),
         })
     }
 
@@ -361,7 +458,7 @@ impl Registry {
                 .backend
                 .get_or_try_init(|| {
                     initialized_in_closure.store(true, SeqCst);
-                    (self.spawn)(entry_for_spawn.clone(), observer_for_spawn)
+                    (self.spawn)(entry_for_spawn.clone(), None, observer_for_spawn)
                 })
                 .await
             {
@@ -411,25 +508,52 @@ impl Registry {
     /// MUST treat repeat/concurrent `retire()` as idempotent.
     fn spawn_retirement(slot: Arc<Slot>, grace: Duration) {
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + grace;
-            loop {
-                if slot.leases.load(SeqCst) == 0 {
-                    break;
-                }
-                // Register the wakeup BEFORE re-checking the count: this closes the
-                // lost-wakeup window where a lease drops (and notifies) between our
-                // load above and our registration here.
-                let notified = slot.lease_notify.notified();
-                if slot.leases.load(SeqCst) == 0 {
-                    break;
-                }
-                tokio::select! {
-                    _ = notified => {}
-                    _ = tokio::time::sleep_until(deadline) => break, // grace → force retire
-                }
-            }
+            Self::wait_for_slot_drain(&slot, grace).await;
             if let Some(b) = slot.backend.get() {
                 let _ = b.retire().await;
+            }
+            let keyed: Vec<_> = slot
+                .bound_backends
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .cloned()
+                .collect();
+            for cell in keyed {
+                if let Some(backend) = cell.get() {
+                    let _ = backend.retire().await;
+                }
+            }
+        });
+    }
+
+    async fn wait_for_slot_drain(slot: &Slot, grace: Duration) {
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if slot.leases.load(SeqCst) == 0 {
+                break;
+            }
+            // Register before re-checking to close the lost-wakeup window.
+            let notified = slot.lease_notify.notified();
+            if slot.leases.load(SeqCst) == 0 {
+                break;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+    }
+
+    fn spawn_keyed_retirement(
+        slot: Arc<Slot>,
+        backend: Arc<OnceCell<Arc<dyn AgentBackend>>>,
+        grace: Duration,
+    ) {
+        tokio::spawn(async move {
+            Self::wait_for_slot_drain(&slot, grace).await;
+            if let Some(backend) = backend.get() {
+                let _ = backend.retire().await;
             }
         });
     }
@@ -448,6 +572,189 @@ impl AgentRegistry for Registry {
         observer: Arc<dyn DiagnosticObserver>,
     ) -> Result<Resolved, BridgeError> {
         self.resolve_with_observer(id, observer).await
+    }
+
+    fn bind_entry_use(&self, id: &AgentId) -> Option<BoundEntryUseV1> {
+        loop {
+            // Capture one exact slot from one immutable state snapshot. The lease is acquired
+            // before inspecting `retired`, matching `resolve_with_observer` and closing the
+            // zero-lease retirement window.
+            let slot = {
+                let state = self.state.load();
+                state.slots.get(id).cloned()
+            }?;
+            let lease = LeaseGuard::new(
+                slot.leases.clone(),
+                slot.lease_notify.clone(),
+                slot.retired.clone(),
+            );
+            if slot.retired.load(SeqCst) {
+                drop(lease);
+                continue;
+            }
+
+            // ArcSwap yields an immutable entry object. A config-only reload may publish a new
+            // object on the same slot after this load; that is fine because the bound use owns
+            // this exact Arc and `resolve_bound` must initialize from it.
+            let entry = slot.entry.load_full();
+
+            // Revalidate that this exact slot is still the live mapping after both the lease and
+            // entry capture. A replacing reload sets `retired` synchronously after its state swap;
+            // either mismatch causes a retry without returning a mixed-generation token.
+            let still_live = {
+                let state = self.state.load();
+                state
+                    .slots
+                    .get(id)
+                    .is_some_and(|mapped| Arc::ptr_eq(mapped, &slot))
+            } && !slot.retired.load(SeqCst);
+            if !still_live {
+                drop(lease);
+                continue;
+            }
+
+            let serial = self.next_bound_use.fetch_add(1, SeqCst);
+            return Some(BoundEntryUseV1 {
+                use_token: EntryUseTokenV1::new(slot, &entry, serial),
+                entry,
+                lease: Box::new(lease),
+            });
+        }
+    }
+
+    async fn resolve_bound(
+        &self,
+        bound: &BoundEntryUseV1,
+        effect: &bridge_core::execution_policy::BoundProviderEffectV1,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+        let Some(slot) = bound.use_token.downcast_slot::<Slot>() else {
+            return Err(BridgeError::BindUnsupported);
+        };
+        if !bound.use_token.matches_entry(&bound.entry)
+            || effect.frozen().effect.agent != bound.entry.id
+            || effect.frozen().effect.mcp_delivery_digest != *effect.delivery().digest()
+            || effect.frozen().effect.effective_session_cwd
+                != *effect.frozen().checkout.effective_cwd()
+        {
+            return Err(BridgeError::ConfigMismatch {
+                field: "bound_provider_effect",
+            });
+        }
+
+        Self::observe_resolve(&observer, PhaseStatus::Started, None).await?;
+        let initialized_here = Arc::new(AtomicBool::new(false));
+        let initialized_in_closure = initialized_here.clone();
+        let entry_for_spawn = bound.entry.clone();
+        let observer_for_spawn = observer.clone();
+        let scope = bound_backend_scope(&bound.entry, effect.delivery().payload())?;
+        if matches!(scope, BoundBackendScope::EffectKeyedProcess) && !self.bound_aware_spawn {
+            Self::observe_resolve(
+                &observer,
+                PhaseStatus::Failed,
+                Some("backend.bound_spawn_unsupported"),
+            )
+            .await?;
+            return Err(BridgeError::BindUnsupported);
+        }
+        let keyed_cell = if matches!(scope, BoundBackendScope::EffectKeyedProcess) {
+            let key = effect.frozen().effect.effect_digest.as_str().to_owned();
+            Some(
+                slot.bound_backends
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(OnceCell::new()))
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let cell = keyed_cell.as_deref().unwrap_or(&slot.backend);
+        let bound_effect = matches!(scope, BoundBackendScope::EffectKeyedProcess)
+            .then(|| Arc::new(effect.clone()));
+        let backend = match cell
+            .get_or_try_init(|| {
+                initialized_in_closure.store(true, SeqCst);
+                (self.spawn)(entry_for_spawn, bound_effect, observer_for_spawn)
+            })
+            .await
+        {
+            Ok(backend) => backend.clone(),
+            Err(error) => {
+                Self::observe_resolve(
+                    &observer,
+                    PhaseStatus::Failed,
+                    Some("backend.initialize_failed"),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+
+        // The lease captured by `bind_entry_use` keeps this exact slot alive. Do not reject a
+        // later retirement here: a reload after binding must not redirect or abort the already
+        // admitted provider effect.
+        let code = (!initialized_here.load(SeqCst)).then_some("backend.reused");
+        Self::observe_resolve(&observer, PhaseStatus::Completed, code).await?;
+        Ok(backend)
+    }
+
+    async fn invalidate_bound(
+        &self,
+        bound: &BoundEntryUseV1,
+        effect_digest: &bridge_core::execution_policy::Sha256HexV1,
+    ) {
+        let Some(slot) = bound.use_token.downcast_slot::<Slot>() else {
+            return;
+        };
+        if !bound.use_token.matches_entry(&bound.entry) {
+            return;
+        }
+
+        let _guard = self.write_lock.lock().await;
+        let current = self.state.load_full();
+        let still_exact = current
+            .slots
+            .get(&bound.entry.id)
+            .is_some_and(|mapped| Arc::ptr_eq(mapped, &slot))
+            && Arc::ptr_eq(&slot.entry.load_full(), &bound.entry)
+            && !slot.retired.load(SeqCst);
+        if !still_exact {
+            return;
+        }
+
+        use bridge_core::mcp::McpDelivery;
+        let effect_keyed = match (bound.entry.kind, bound.entry.mcp_delivery) {
+            (AgentKind::Acp, McpDelivery::CodexNative | McpDelivery::KiroNative) => true,
+            (AgentKind::Acp, McpDelivery::Acp)
+            | (AgentKind::Api, McpDelivery::Acp)
+            | (AgentKind::Api, McpDelivery::CodexNative)
+            | (AgentKind::Api, McpDelivery::KiroNative)
+            | (AgentKind::ContainerRw, McpDelivery::Acp)
+            | (AgentKind::ContainerRw, McpDelivery::CodexNative)
+            | (AgentKind::ContainerRw, McpDelivery::KiroNative) => false,
+        };
+        if effect_keyed {
+            let removed = slot
+                .bound_backends
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(effect_digest.as_str());
+            if let Some(backend) = removed {
+                Self::spawn_keyed_retirement(slot, backend, INVALIDATE_RETIRE_GRACE);
+            }
+            return;
+        }
+
+        let mut next = current.slots.clone();
+        next.insert(bound.entry.id.clone(), Slot::new((*bound.entry).clone()));
+        self.state.store(Arc::new(State {
+            slots: next,
+            default: current.default.clone(),
+        }));
+        slot.retired.store(true, SeqCst);
+        Self::spawn_retirement(slot, INVALIDATE_RETIRE_GRACE);
     }
 
     fn default_id(&self) -> AgentId {
@@ -611,6 +918,7 @@ mod tests {
     use bridge_core::mcp::{McpDelivery, McpServerSpec};
     use bridge_core::ports::{BackendStream, DiagnosticObserver, Update};
     use std::collections::BTreeMap;
+    use std::sync::Mutex as StdMutex;
 
     // A backend that records its `retire()` calls into a shared counter, so
     // reconcile tests can assert that removed/replaced backends were retired.
@@ -745,6 +1053,397 @@ mod tests {
         let mut s = api_snap();
         s.entries[0].base_url = None;
         assert!(validate(&s).is_err());
+    }
+
+    #[tokio::test]
+    async fn bound_use_resolves_the_exact_entry_arc_after_config_only_reload() {
+        use bridge_core::diagnostics::NoopDiagnosticObserver;
+        use bridge_core::execution_policy::{
+            freeze_direct_checkout_v1, freeze_provider_attempt_v1, FrozenProviderLogicalSessionV1,
+            PolicyNodeRefV1, ProviderFreezeInputV1,
+        };
+
+        let spawned_models = Arc::new(StdMutex::new(Vec::new()));
+        let captured = spawned_models.clone();
+        let spawn: SpawnFn = Arc::new(move |entry| {
+            let captured = captured.clone();
+            Box::pin(async move {
+                captured.lock().unwrap().push(entry.model.clone());
+                Ok(Arc::new(FakeBackend {
+                    retired: Arc::new(AtomicUsize::new(0)),
+                }) as Arc<dyn AgentBackend>)
+            })
+        });
+        let mut initial = snapshot(&["a"]);
+        initial.entries[0].model = Some("model-a".into());
+        let registry = Registry::new(initial, spawn).unwrap();
+        let id = AgentId::parse("a").unwrap();
+        let bound = registry
+            .bind_entry_use(&id)
+            .expect("bound registry support");
+
+        let bundle = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+            entry: &bound.entry,
+            overrides: None,
+            node: PolicyNodeRefV1::from_node_id(0, "node"),
+            logical_session: FrozenProviderLogicalSessionV1::Execute {
+                candidate_ordinal: 0,
+            },
+            checkout: freeze_direct_checkout_v1(bridge_core::SessionCwd::parse("/repo").unwrap()),
+            provider_effect_key: None,
+        })
+        .unwrap();
+
+        let mut reloaded = snapshot(&["a"]);
+        reloaded.entries[0].model = Some("model-b".into());
+        registry.apply(reloaded).await.unwrap();
+        registry
+            .resolve_bound(
+                &bound,
+                &bundle.bound,
+                Arc::new(NoopDiagnosticObserver::default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bound.entry.model.as_deref(), Some("model-a"));
+        assert_eq!(
+            spawned_models.lock().unwrap().as_slice(),
+            &[Some("model-a".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_use_survives_replacing_reload_without_redirecting_to_new_slot() {
+        use bridge_core::diagnostics::NoopDiagnosticObserver;
+        use bridge_core::execution_policy::{
+            freeze_direct_checkout_v1, freeze_provider_attempt_v1, FrozenProviderLogicalSessionV1,
+            PolicyNodeRefV1, ProviderFreezeInputV1,
+        };
+
+        let spawned_args = Arc::new(StdMutex::new(Vec::new()));
+        let captured = spawned_args.clone();
+        let spawn: SpawnFn = Arc::new(move |entry| {
+            let captured = captured.clone();
+            Box::pin(async move {
+                captured.lock().unwrap().push(entry.args.clone());
+                Ok(Arc::new(FakeBackend {
+                    retired: Arc::new(AtomicUsize::new(0)),
+                }) as Arc<dyn AgentBackend>)
+            })
+        });
+        let mut initial = snapshot(&["a"]);
+        initial.entries[0].args = vec!["old".into()];
+        let registry = Registry::new(initial, spawn).unwrap();
+        let id = AgentId::parse("a").unwrap();
+        let bound = registry
+            .bind_entry_use(&id)
+            .expect("bound registry support");
+        let bundle = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+            entry: &bound.entry,
+            overrides: None,
+            node: PolicyNodeRefV1::from_node_id(0, "node"),
+            logical_session: FrozenProviderLogicalSessionV1::Execute {
+                candidate_ordinal: 0,
+            },
+            checkout: freeze_direct_checkout_v1(bridge_core::SessionCwd::parse("/repo").unwrap()),
+            provider_effect_key: None,
+        })
+        .unwrap();
+
+        let mut replacement = snapshot(&["a"]);
+        replacement.entries[0].args = vec!["new".into()];
+        registry.apply(replacement).await.unwrap();
+        registry
+            .resolve_bound(
+                &bound,
+                &bundle.bound,
+                Arc::new(NoopDiagnosticObserver::default()),
+            )
+            .await
+            .unwrap();
+
+        assert!(bound.lease.is_retired());
+        assert_eq!(spawned_args.lock().unwrap().as_slice(), &[vec!["old"]]);
+    }
+
+    #[tokio::test]
+    async fn bound_use_rejects_an_effect_for_a_different_agent() {
+        use bridge_core::diagnostics::NoopDiagnosticObserver;
+        use bridge_core::execution_policy::{
+            freeze_direct_checkout_v1, freeze_provider_attempt_v1, FrozenProviderLogicalSessionV1,
+            PolicyNodeRefV1, ProviderFreezeInputV1,
+        };
+
+        let spawn: SpawnFn = Arc::new(|_entry| {
+            Box::pin(async move {
+                Ok(Arc::new(FakeBackend {
+                    retired: Arc::new(AtomicUsize::new(0)),
+                }) as Arc<dyn AgentBackend>)
+            })
+        });
+        let registry = Registry::new(snapshot(&["a", "b"]), spawn).unwrap();
+        let bound_a = registry
+            .bind_entry_use(&AgentId::parse("a").unwrap())
+            .expect("bound registry support");
+        let entry_b = registry
+            .entry_snapshot(&AgentId::parse("b").unwrap())
+            .unwrap();
+        let bundle_b = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+            entry: &entry_b,
+            overrides: None,
+            node: PolicyNodeRefV1::from_node_id(0, "node"),
+            logical_session: FrozenProviderLogicalSessionV1::Execute {
+                candidate_ordinal: 0,
+            },
+            checkout: freeze_direct_checkout_v1(bridge_core::SessionCwd::parse("/repo").unwrap()),
+            provider_effect_key: None,
+        })
+        .unwrap();
+
+        let result = registry
+            .resolve_bound(
+                &bound_a,
+                &bundle_b.bound,
+                Arc::new(NoopDiagnosticObserver::default()),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(BridgeError::ConfigMismatch {
+                field: "bound_provider_effect"
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn bound_native_delivery_uses_effect_keyed_backend_subslots() {
+        use bridge_core::diagnostics::NoopDiagnosticObserver;
+        use bridge_core::execution_policy::{
+            freeze_direct_checkout_v1, freeze_provider_attempt_v1, FrozenProviderLogicalSessionV1,
+            PolicyNodeRefV1, ProviderFreezeInputV1,
+        };
+
+        let spawned = Arc::new(StdMutex::new(Vec::new()));
+        let captured = spawned.clone();
+        let spawn: BoundObservedSpawnFn = Arc::new(move |_entry, effect, _observer| {
+            let captured = captured.clone();
+            Box::pin(async move {
+                let effect = effect.expect("native V2 spawn receives its bound effect");
+                let args = match effect.delivery().payload() {
+                    bridge_core::execution_policy::BoundMcpDeliveryPayloadV1::CodexNative(args) => {
+                        args.clone()
+                    }
+                    other => panic!("expected Codex-native delivery, got {other:?}"),
+                };
+                captured.lock().unwrap().push((
+                    effect.frozen().effect.effect_digest.clone(),
+                    effect.frozen().effect.effective_session_cwd.clone(),
+                    args,
+                ));
+                Ok(Arc::new(FakeBackend {
+                    retired: Arc::new(AtomicUsize::new(0)),
+                }) as Arc<dyn AgentBackend>)
+            })
+        });
+        let mut initial = snapshot(&["a"]);
+        initial.entries[0].mcp_delivery = McpDelivery::CodexNative;
+        initial.entries[0].mcp = vec![McpServerSpec {
+            name: "repo-nav".into(),
+            command: "repo-nav-mcp".into(),
+            args: vec!["--cwd".into(), "{cwd}".into()],
+            env: vec![],
+        }];
+        let registry = Registry::new_bound_observed(initial, spawn).unwrap();
+        let id = AgentId::parse("a").unwrap();
+
+        let freeze = |bound: &BoundEntryUseV1, cwd: &str| {
+            freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+                entry: &bound.entry,
+                overrides: None,
+                node: PolicyNodeRefV1::from_node_id(0, "node"),
+                logical_session: FrozenProviderLogicalSessionV1::Execute {
+                    candidate_ordinal: 0,
+                },
+                checkout: freeze_direct_checkout_v1(bridge_core::SessionCwd::parse(cwd).unwrap()),
+                provider_effect_key: None,
+            })
+            .unwrap()
+        };
+
+        let bound_a = registry.bind_entry_use(&id).unwrap();
+        let effect_a = freeze(&bound_a, "/repo-a");
+        registry
+            .resolve_bound(
+                &bound_a,
+                &effect_a.bound,
+                Arc::new(NoopDiagnosticObserver::default()),
+            )
+            .await
+            .unwrap();
+
+        let bound_b = registry.bind_entry_use(&id).unwrap();
+        let effect_b = freeze(&bound_b, "/repo-b");
+        registry
+            .resolve_bound(
+                &bound_b,
+                &effect_b.bound,
+                Arc::new(NoopDiagnosticObserver::default()),
+            )
+            .await
+            .unwrap();
+
+        let bound_a_again = registry.bind_entry_use(&id).unwrap();
+        let effect_a_again = freeze(&bound_a_again, "/repo-a");
+        registry
+            .resolve_bound(
+                &bound_a_again,
+                &effect_a_again.bound,
+                Arc::new(NoopDiagnosticObserver::default()),
+            )
+            .await
+            .unwrap();
+
+        let spawned = spawned.lock().unwrap();
+        assert_eq!(spawned.len(), 2);
+        assert_eq!(spawned[0].1.as_str(), "/repo-a");
+        assert_eq!(spawned[1].1.as_str(), "/repo-b");
+        assert_ne!(spawned[0].0, spawned[1].0);
+        assert!(spawned[0].2.iter().any(|arg| arg.contains("/repo-a")));
+        assert!(spawned[1].2.iter().any(|arg| arg.contains("/repo-b")));
+    }
+
+    #[tokio::test]
+    async fn bound_native_delivery_refuses_a_legacy_spawn_factory() {
+        use bridge_core::diagnostics::NoopDiagnosticObserver;
+        use bridge_core::execution_policy::{
+            freeze_direct_checkout_v1, freeze_provider_attempt_v1, FrozenProviderLogicalSessionV1,
+            PolicyNodeRefV1, ProviderFreezeInputV1,
+        };
+
+        let mut initial = snapshot(&["a"]);
+        initial.entries[0].mcp_delivery = McpDelivery::CodexNative;
+        let registry =
+            Registry::new(initial, counting_spawn(Arc::new(AtomicUsize::new(0)), 0)).unwrap();
+        let bound = registry
+            .bind_entry_use(&AgentId::parse("a").unwrap())
+            .unwrap();
+        let bundle = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+            entry: &bound.entry,
+            overrides: None,
+            node: PolicyNodeRefV1::from_node_id(0, "node"),
+            logical_session: FrozenProviderLogicalSessionV1::Execute {
+                candidate_ordinal: 0,
+            },
+            checkout: freeze_direct_checkout_v1(bridge_core::SessionCwd::parse("/repo").unwrap()),
+            provider_effect_key: None,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            registry
+                .resolve_bound(
+                    &bound,
+                    &bundle.bound,
+                    Arc::new(NoopDiagnosticObserver::default()),
+                )
+                .await,
+            Err(BridgeError::BindUnsupported)
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalidate_bound_evicts_only_the_named_native_effect() {
+        use bridge_core::diagnostics::NoopDiagnosticObserver;
+        use bridge_core::execution_policy::{
+            freeze_direct_checkout_v1, freeze_provider_attempt_v1, FrozenProviderLogicalSessionV1,
+            PolicyNodeRefV1, ProviderFreezeInputV1,
+        };
+
+        let spawned = Arc::new(StdMutex::new(Vec::new()));
+        let retired = Arc::new(AtomicUsize::new(0));
+        let spawn: BoundObservedSpawnFn = {
+            let spawned = spawned.clone();
+            let retired = retired.clone();
+            Arc::new(move |_entry, effect, _observer| {
+                let spawned = spawned.clone();
+                let retired = retired.clone();
+                Box::pin(async move {
+                    spawned.lock().unwrap().push(
+                        effect
+                            .expect("native effect")
+                            .frozen()
+                            .effect
+                            .effect_digest
+                            .clone(),
+                    );
+                    Ok(Arc::new(FakeBackend { retired }) as Arc<dyn AgentBackend>)
+                })
+            })
+        };
+        let mut initial = snapshot(&["a"]);
+        initial.entries[0].mcp_delivery = McpDelivery::CodexNative;
+        let registry = Registry::new_bound_observed(initial, spawn).unwrap();
+        let id = AgentId::parse("a").unwrap();
+        let freeze = |bound: &BoundEntryUseV1, cwd: &str| {
+            freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+                entry: &bound.entry,
+                overrides: None,
+                node: PolicyNodeRefV1::from_node_id(0, "node"),
+                logical_session: FrozenProviderLogicalSessionV1::Execute {
+                    candidate_ordinal: 0,
+                },
+                checkout: freeze_direct_checkout_v1(bridge_core::SessionCwd::parse(cwd).unwrap()),
+                provider_effect_key: None,
+            })
+            .unwrap()
+        };
+
+        let bound_a = registry.bind_entry_use(&id).unwrap();
+        let effect_a = freeze(&bound_a, "/repo-a");
+        let bound_b = registry.bind_entry_use(&id).unwrap();
+        let effect_b = freeze(&bound_b, "/repo-b");
+        for (bound, effect) in [(&bound_a, &effect_a), (&bound_b, &effect_b)] {
+            registry
+                .resolve_bound(
+                    bound,
+                    &effect.bound,
+                    Arc::new(NoopDiagnosticObserver::default()),
+                )
+                .await
+                .unwrap();
+        }
+
+        registry
+            .invalidate_bound(&bound_a, &effect_a.frozen.effect.effect_digest)
+            .await;
+        drop(bound_a);
+        let bound_a2 = registry.bind_entry_use(&id).unwrap();
+        let effect_a2 = freeze(&bound_a2, "/repo-a");
+        registry
+            .resolve_bound(
+                &bound_a2,
+                &effect_a2.bound,
+                Arc::new(NoopDiagnosticObserver::default()),
+            )
+            .await
+            .unwrap();
+        registry
+            .resolve_bound(
+                &bound_b,
+                &effect_b.bound,
+                Arc::new(NoopDiagnosticObserver::default()),
+            )
+            .await
+            .unwrap();
+
+        let spawned = spawned.lock().unwrap().clone();
+        assert_eq!(spawned.len(), 3, "A, B, then replacement A only");
+        assert_eq!(spawned[0], spawned[2]);
+        assert_ne!(spawned[0], spawned[1]);
+        drop(bound_a2);
+        drop(bound_b);
+        await_retired(&retired, 1).await;
+        assert_eq!(retired.load(SeqCst), 1, "B remains live");
     }
 
     // --- B1 sandbox validate invariants (S1/S3/S4/S5/S6) ----------------------

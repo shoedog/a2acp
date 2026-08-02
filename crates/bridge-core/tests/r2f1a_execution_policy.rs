@@ -1,16 +1,19 @@
+use bridge_core::diagnostics::{DiagnosticCode, DiagnosticFailureClass, DiagnosticRedactor};
 use bridge_core::domain::{AgentEntry, AgentKind, EffectiveConfig, Effort, Part};
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
     freeze_direct_checkout_v1, freeze_node_execution_identity_v1, freeze_provider_attempt_v1,
     freeze_worktree_checkout_v1, resolve_execution_policy_v1, BoundMcpDeliveryPayloadV1,
-    BoundSessionSpecV1, ExecutionPolicyError, ExecutionPolicyInvocationV1, FanOutPolicyV1,
-    FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1, LivenessProfileIdV1,
-    PolicyActivationV1, PolicyNodeRefV1, ProfileSelectionSourceV1, ProviderEffectKeyV1,
-    ProviderFreezeInputV1, SynthesisModeV1, TaskClassV1, WorkflowControlDefaultsV1,
-    WorktreeCheckoutInputV1, PROFILE_LEGACY_BOUNDED_V1, PROFILE_REVIEW_HIGH_XHIGH_V1,
+    BoundSessionSpecV1, ControlEventIdV1, ExecutionPolicyError, ExecutionPolicyInvocationV1,
+    FanOutPolicyNameV1, FanOutPolicyV1, FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1,
+    LivenessProfileIdV1, NodeCauseV1, NodeCleanupDispositionV1, NodeCleanupV1,
+    NodePrimaryDispositionV1, NodeTerminalV1, PolicyActivationV1, PolicyNodeRefV1, PolicyTriggerV1,
+    ProfileSelectionSourceV1, ProviderEffectKeyV1, ProviderFreezeInputV1, SynthesisModeV1,
+    TaskClassV1, WorkflowControlDefaultsV1, WorktreeCheckoutInputV1, MAX_NODE_TERMINAL_JSON_BYTES,
+    MAX_POLICY_TRIGGER_JSON_BYTES, PROFILE_LEGACY_BOUNDED_V1, PROFILE_REVIEW_HIGH_XHIGH_V1,
 };
 use bridge_core::ids::{AgentId, AttemptId, SessionId};
-use bridge_core::mcp::{McpDelivery, McpServerSpec};
+use bridge_core::mcp::{McpDelivery, McpEnvValueSourceV1, McpServerSpec, SecretString};
 use bridge_core::ports::{AgentBackend, BackendStream};
 use bridge_core::SessionCwd;
 use std::collections::BTreeMap;
@@ -331,6 +334,76 @@ fn preflight_disabled_identity_has_one_execute_row_and_no_retry_rows() {
     ));
 }
 
+#[test]
+fn terminal_canonical_encoding_bounds_escape_expansion_and_keeps_failure_identity() {
+    let cause_text = format!("🌞 deepest {}", "\\\"".repeat(260));
+    let terminal = NodeTerminalV1 {
+        schema_version: 1,
+        primary: NodePrimaryDispositionV1::Failed,
+        cleanup: NodeCleanupV1 {
+            disposition: NodeCleanupDispositionV1::Failed,
+            duration_ms: u64::MAX,
+        },
+        cause: Some(NodeCauseV1 {
+            failure_class: DiagnosticFailureClass::ContainerCredentials,
+            code: DiagnosticCode::build("container.credentials", &DiagnosticRedactor::default())
+                .unwrap(),
+            deepest_cause: Some(cause_text),
+            cause_truncated: false,
+            evidence_overflow: false,
+            dependency_set: None,
+        }),
+        prompt_may_have_been_accepted: true,
+        degraded_ancestry: true,
+        policy_trigger_id: None,
+    };
+    let encoded = terminal.encode_canonical().unwrap();
+    assert!(encoded.len() <= MAX_NODE_TERMINAL_JSON_BYTES);
+    assert!(std::str::from_utf8(&encoded).unwrap().contains("🌞"));
+    assert!(!std::str::from_utf8(&encoded).unwrap().contains("\\ud83c"));
+    let decoded = NodeTerminalV1::decode_canonical(&encoded).unwrap();
+    let cause = decoded.cause.unwrap();
+    assert_eq!(
+        cause.failure_class,
+        DiagnosticFailureClass::ContainerCredentials
+    );
+    assert_eq!(cause.code.as_str(), "container.credentials");
+    assert!(cause.cause_truncated);
+}
+
+#[test]
+fn policy_trigger_has_a_bounded_validated_control_identity() {
+    let trigger = PolicyTriggerV1 {
+        schema_version: 1,
+        id: ControlEventIdV1::parse("attempt-11111111111111111111111111111111:policy:0").unwrap(),
+        node: PolicyNodeRefV1::from_node_id(0, "review-node"),
+        policy: FanOutPolicyNameV1::FailFast,
+        grace_ms: None,
+    };
+    let encoded = trigger.encode_canonical().unwrap();
+    assert!(encoded.len() <= MAX_POLICY_TRIGGER_JSON_BYTES);
+    assert_eq!(
+        PolicyTriggerV1::decode_canonical(&encoded).unwrap(),
+        trigger
+    );
+    assert!(ControlEventIdV1::parse("x".repeat(129)).is_err());
+}
+
+#[test]
+fn typed_mcp_secret_source_is_immutable_and_secret_silent() {
+    let secret = McpEnvValueSourceV1::SecretFromEnv {
+        variable: "TEST_MCP_SECRET".into(),
+        resolved: SecretString::new("alpha{cwd}omega").unwrap(),
+    };
+    let debug = format!("{secret:?}");
+    assert!(debug.contains("TEST_MCP_SECRET"));
+    assert!(!debug.contains("alpha"));
+    assert_eq!(secret.delivery_value("/repo"), "alpha{cwd}omega");
+
+    let public = McpEnvValueSourceV1::from("alpha{cwd}omega");
+    assert_eq!(public.delivery_value("/repo"), "alpha/repoomega");
+}
+
 fn provider_freeze_input<'a>(
     entry: &'a AgentEntry,
     checkout: FrozenCheckoutEffectV1,
@@ -379,10 +452,10 @@ fn bound_provider_attempt_commits_and_delivers_the_worktree_target_without_secre
     };
     assert_eq!(servers[0].args[1], checkout.effective_cwd().as_str());
     assert_eq!(
-        servers[0].env[0].1,
+        servers[0].env[0].1.resolved_value(),
         format!("{}/src", checkout.effective_cwd().as_str())
     );
-    assert_eq!(servers[0].env[1].1, "0042");
+    assert_eq!(servers[0].env[1].1.resolved_value(), "0042");
 }
 
 #[test]

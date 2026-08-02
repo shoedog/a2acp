@@ -2292,7 +2292,7 @@ async fn run_attempt(args: &SmokeArgs) -> SmokeArtifactV2 {
             retain_descriptor_after_exec: pin.retain_descriptor_after_exec(),
         });
     let spawn = make_spawn_fn(policy, config_path, run, None, 1, None, host_process_cwd);
-    let registry = match Registry::new_observed(snapshot, spawn) {
+    let registry = match Registry::new_bound_observed(snapshot, spawn) {
         Ok(registry) => Arc::new(registry),
         Err(error) => {
             state.fail_error(&error, DiagnosticPhase::Resolve, false);

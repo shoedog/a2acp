@@ -39,6 +39,8 @@ pub enum BridgeError {
     ConfigReseedRequired { field: &'static str },
     #[error("bound session configuration is unsupported")]
     BoundSessionUnsupported,
+    #[error("bound registry resolution is unsupported")]
+    BindUnsupported,
     #[error("session expired")]
     SessionExpired,
     #[error("session busy")]
@@ -387,6 +389,7 @@ mod tests {
             ConfigMismatch { field: "x" },
             ConfigReseedRequired { field: "x" },
             BoundSessionUnsupported,
+            BindUnsupported,
             SessionExpired,
             HandleBusy,
             AuthRequired {
