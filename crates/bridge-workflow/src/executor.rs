@@ -13,7 +13,8 @@ use bridge_core::domain::{
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
     freeze_provider_attempt_v1, BoundProviderEffectV1, BoundSessionSpecV1,
-    FrozenProviderLogicalSessionV1, ProviderEffectKeyV1, ProviderFreezeInputV1, Sha256HexV1,
+    FrozenNodeExecutionIdentityV1, FrozenProviderLogicalSessionV1, ProviderEffectKeyV1,
+    ProviderFreezeInputV1, Sha256HexV1,
 };
 use bridge_core::harvest::{
     commit_harvested_completion, CompletionBodyOrigin, HarvestAuditStore, NoopHarvestAuditStore,
@@ -86,6 +87,29 @@ pub struct WorkflowDiagnosticContext {
 struct FrozenWorkflowAuthority {
     run_spec: Arc<WorkflowRunSpecV1>,
     provider_effect_key: Option<Arc<ProviderEffectKeyV1>>,
+}
+
+impl FrozenWorkflowAuthority {
+    fn node_identity(
+        &self,
+        node: &WorkflowNode,
+    ) -> Result<&FrozenNodeExecutionIdentityV1, BridgeError> {
+        let node_digest = Sha256HexV1::digest(node.id.as_str().as_bytes());
+        let identity = self
+            .run_spec
+            .node_execution_identities
+            .iter()
+            .find(|identity| identity.node.id_sha256 == node_digest)
+            .ok_or(BridgeError::ConfigMismatch {
+                field: "node_execution_identity",
+            })?;
+        if identity.selection.agent != node.agent {
+            return Err(BridgeError::ConfigMismatch {
+                field: "provider_selection",
+            });
+        }
+        Ok(identity)
+    }
 }
 
 /// True when at least one node explicitly renders the run-workflow input variable.
@@ -482,10 +506,75 @@ fn is_exact_preflight_pong(text: &str) -> bool {
 type PreflightCacheEntry = Arc<tokio::sync::OnceCell<Result<PreflightDecision, PreflightFailure>>>;
 type PreflightCache = Arc<tokio::sync::Mutex<HashMap<String, PreflightCacheEntry>>>;
 
+#[derive(Clone)]
+enum PreflightSource<'a> {
+    Legacy(Arc<AgentEntry>),
+    Bound {
+        authority: &'a FrozenWorkflowAuthority,
+        identity: &'a FrozenNodeExecutionIdentityV1,
+    },
+}
+
+impl PreflightSource<'_> {
+    fn agent(&self) -> &bridge_core::ids::AgentId {
+        match self {
+            Self::Legacy(entry) => &entry.id,
+            Self::Bound { identity, .. } => &identity.selection.agent,
+        }
+    }
+
+    fn preflight(&self) -> bool {
+        match self {
+            Self::Legacy(entry) => entry.preflight,
+            Self::Bound { identity, .. } => identity.selection.preflight,
+        }
+    }
+
+    fn primary_model(&self) -> Option<String> {
+        match self {
+            Self::Legacy(entry) => entry.model.clone(),
+            Self::Bound { identity, .. } => identity.selection.effective_model.clone(),
+        }
+    }
+
+    fn candidates(&self) -> Vec<Option<String>> {
+        match self {
+            Self::Legacy(entry) => WorkflowExecutor::preflight_candidates(entry),
+            Self::Bound { identity, .. } => identity.selection.candidates(),
+        }
+    }
+
+    fn cache_key(&self) -> String {
+        match self {
+            Self::Legacy(entry) => entry.id.as_str().to_string(),
+            Self::Bound { identity, .. } => {
+                let mut effect_bytes = Vec::new();
+                for attempt in &identity.provider_attempts {
+                    if matches!(
+                        attempt.logical_session,
+                        FrozenProviderLogicalSessionV1::Preflight { .. }
+                    ) {
+                        effect_bytes
+                            .extend_from_slice(attempt.effect.effect_digest.as_str().as_bytes());
+                    }
+                }
+                let effect_set = Sha256HexV1::digest(&effect_bytes);
+                format!(
+                    "v2:{}:{}:{}",
+                    identity.selection.agent.as_str(),
+                    identity.selection.selection_digest.as_str(),
+                    effect_set.as_str()
+                )
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PreflightDecision {
     selected_model: Option<String>,
     substituted_from: Option<String>,
+    candidate_ordinal: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -976,21 +1065,7 @@ impl WorkflowExecutor {
         node: &WorkflowNode,
         logical_session: FrozenProviderLogicalSessionV1,
     ) -> Result<FrozenBoundEntryUse, BridgeError> {
-        let node_digest =
-            bridge_core::execution_policy::Sha256HexV1::digest(node.id.as_str().as_bytes());
-        let identity = authority
-            .run_spec
-            .node_execution_identities
-            .iter()
-            .find(|identity| identity.node.id_sha256 == node_digest)
-            .ok_or(BridgeError::ConfigMismatch {
-                field: "node_execution_identity",
-            })?;
-        if identity.selection.agent != node.agent {
-            return Err(BridgeError::ConfigMismatch {
-                field: "provider_selection",
-            });
-        }
+        let identity = authority.node_identity(node)?;
         let persisted = identity
             .provider_attempts
             .iter()
@@ -1087,14 +1162,83 @@ impl WorkflowExecutor {
         cache: &PreflightCache,
         cleanup_tracker: &WorkflowCleanupTracker,
     ) -> Result<PreflightDecision, PreflightFailure> {
-        if !entry.preflight {
+        self.ensure_preflight(
+            wf_id,
+            node,
+            run_id,
+            ctx,
+            diagnostic_factory,
+            prompt_dispatch,
+            cancel,
+            PreflightSource::Legacy(entry),
+            cache,
+            cleanup_tracker,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_frozen_preflight(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        run_id: &str,
+        ctx: &WorkflowRunContext,
+        diagnostic_factory: &Arc<dyn DiagnosticObserverFactory>,
+        prompt_dispatch: &Option<PromptDispatchBarrier>,
+        cancel: &CancellationToken,
+        authority: &FrozenWorkflowAuthority,
+        cache: &PreflightCache,
+        cleanup_tracker: &WorkflowCleanupTracker,
+    ) -> Result<PreflightDecision, PreflightFailure> {
+        let identity = authority
+            .node_identity(node)
+            .map_err(|error| PreflightFailure::Hard {
+                message: format!("frozen preflight identity mismatch: {error:?}"),
+                failure_class: classify_failure(&error),
+                retain_in_run_cache: false,
+            })?;
+        self.ensure_preflight(
+            wf_id,
+            node,
+            run_id,
+            ctx,
+            diagnostic_factory,
+            prompt_dispatch,
+            cancel,
+            PreflightSource::Bound {
+                authority,
+                identity,
+            },
+            cache,
+            cleanup_tracker,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_preflight(
+        &self,
+        wf_id: &str,
+        node: &WorkflowNode,
+        run_id: &str,
+        ctx: &WorkflowRunContext,
+        diagnostic_factory: &Arc<dyn DiagnosticObserverFactory>,
+        prompt_dispatch: &Option<PromptDispatchBarrier>,
+        cancel: &CancellationToken,
+        source: PreflightSource<'_>,
+        cache: &PreflightCache,
+        cleanup_tracker: &WorkflowCleanupTracker,
+    ) -> Result<PreflightDecision, PreflightFailure> {
+        if !source.preflight() {
             return Ok(PreflightDecision {
-                selected_model: entry.model.clone(),
+                selected_model: source.primary_model(),
                 substituted_from: None,
+                candidate_ordinal: 0,
             });
         }
 
-        let cache_key = entry.id.as_str().to_string();
+        let cache_key = source.cache_key();
         let cell = {
             let mut cache = cache.lock().await;
             cache
@@ -1118,7 +1262,7 @@ impl WorkflowExecutor {
                     diagnostic_factory,
                     prompt_dispatch,
                     cancel,
-                    entry.clone(),
+                    source.clone(),
                     cleanup_tracker,
                 )
                 .await
@@ -1151,10 +1295,12 @@ impl WorkflowExecutor {
         diagnostic_factory: &Arc<dyn DiagnosticObserverFactory>,
         prompt_dispatch: &Option<PromptDispatchBarrier>,
         cancel: &CancellationToken,
-        entry: Arc<AgentEntry>,
+        source: PreflightSource<'_>,
         cleanup_tracker: &WorkflowCleanupTracker,
     ) -> Result<PreflightDecision, PreflightFailure> {
-        let candidates = Self::preflight_candidates(&entry);
+        let candidates = source.candidates();
+        let agent = source.agent().clone();
+        let primary_model = source.primary_model();
         let mut attempts = Vec::new();
         for (idx, model) in candidates.iter().enumerate() {
             if cancel.is_cancelled() {
@@ -1169,14 +1315,58 @@ impl WorkflowExecutor {
             let mut usage: Option<UsageSnapshot> = None;
             let mut reason: Option<String> = None;
 
-            let resolved_result = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(PreflightFailure::Canceled),
-                result = self.registry.resolve_observed(&entry.id, diagnostic.clone()) => result,
-            };
-            let resolved = match resolved_result {
-                Ok(resolved) => resolved,
-                Err(error) => {
+            let acquired: Result<WorkflowAttemptUse, (BridgeError, RetryInvalidation)> =
+                match &source {
+                    PreflightSource::Legacy(_) => {
+                        let resolved_result = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Err(PreflightFailure::Canceled),
+                            result = self.registry.resolve_observed(&agent, diagnostic.clone()) => result,
+                        };
+                        resolved_result
+                            .map(|resolved| {
+                                let mut config = effective_config(&resolved.entry, None);
+                                config.model = model.clone();
+                                WorkflowAttemptUse::Legacy { resolved, config }
+                            })
+                            .map_err(|error| (error, RetryInvalidation::Legacy(agent.clone())))
+                    }
+                    PreflightSource::Bound { authority, .. } => {
+                        let candidate_ordinal =
+                            u16::try_from(idx).map_err(|_| PreflightFailure::Hard {
+                                message: "frozen preflight candidate ordinal overflow".into(),
+                                failure_class: FailureClass::Other,
+                                retain_in_run_cache: false,
+                            })?;
+                        let frozen = self
+                            .bind_frozen_entry(
+                                authority,
+                                node,
+                                FrozenProviderLogicalSessionV1::Preflight { candidate_ordinal },
+                            )
+                            .map_err(|error| PreflightFailure::Hard {
+                                message: format!(
+                                    "frozen preflight binding refused before effects: {error:?}"
+                                ),
+                                failure_class: classify_failure(&error),
+                                retain_in_run_cache: false,
+                            })?;
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Err(PreflightFailure::Canceled),
+                            result = self.resolve_frozen_entry(frozen, diagnostic.clone()) => {
+                                result
+                                    .map(WorkflowAttemptUse::Bound)
+                                    .map_err(|(error, frozen)| {
+                                        (error, frozen.into_retry_invalidation())
+                                    })
+                            }
+                        }
+                    }
+                };
+            let attempt_use = match acquired {
+                Ok(attempt_use) => attempt_use,
+                Err((error, invalidation)) => {
                     attempts.push(AttemptSummary {
                         attempt: attempt_no,
                         model: model.clone(),
@@ -1185,9 +1375,9 @@ impl WorkflowExecutor {
                         reason: format!("resolve error: {error:?}"),
                     });
                     if idx + 1 < candidates.len() {
-                        self.registry.invalidate(&entry.id).await;
+                        invalidation.apply(self.registry.as_ref()).await;
                         tracing::warn!(
-                            agent = entry.id.as_str(),
+                            agent = agent.as_str(),
                             model = %model_label(model.as_deref()),
                             error = ?error,
                             "workflow preflight fallback after resolve error"
@@ -1201,11 +1391,9 @@ impl WorkflowExecutor {
                 return Err(PreflightFailure::Canceled);
             }
 
-            let mut eff = effective_config(&resolved.entry, None);
-            eff.model = model.clone();
             let session = match SessionId::parse(format!(
                 "workflow-preflight-{wf_id}-{}-{run_id}-{attempt_no}",
-                entry.id.as_str()
+                agent.as_str()
             )) {
                 Ok(session) => session,
                 Err(error) => {
@@ -1217,15 +1405,11 @@ impl WorkflowExecutor {
                 }
             };
 
-            let preflight_spec = SessionSpec {
-                config: eff,
-                cwd: ctx.session_cwd.clone(),
-            };
             let configure_result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     let _ = cleanup_cold_session(
-                        &resolved.backend,
+                        attempt_use.backend(),
                         &session,
                         &diagnostic,
                         ColdCleanupAction::Forget,
@@ -1233,11 +1417,11 @@ impl WorkflowExecutor {
                     ).await;
                     return Err(PreflightFailure::Canceled);
                 }
-                result = resolved.backend.configure_session(&session, &preflight_spec) => result,
+                result = attempt_use.configure_session(&session, ctx.session_cwd.clone()) => result,
             };
             if let Err(error) = configure_result {
                 let _ = cleanup_cold_session(
-                    &resolved.backend,
+                    attempt_use.backend(),
                     &session,
                     &diagnostic,
                     ColdCleanupAction::Forget,
@@ -1252,9 +1436,12 @@ impl WorkflowExecutor {
                     reason: format!("configure error: {error:?}"),
                 });
                 if idx + 1 < candidates.len() {
-                    self.registry.invalidate(&entry.id).await;
+                    attempt_use
+                        .into_retry_invalidation(&agent)
+                        .apply(self.registry.as_ref())
+                        .await;
                     tracing::warn!(
-                        agent = entry.id.as_str(),
+                        agent = agent.as_str(),
                         model = %model_label(model.as_deref()),
                         error = ?error,
                         "workflow preflight fallback after configure error"
@@ -1265,7 +1452,7 @@ impl WorkflowExecutor {
             }
             if cancel.is_cancelled() {
                 let _ = cleanup_cold_session(
-                    &resolved.backend,
+                    attempt_use.backend(),
                     &session,
                     &diagnostic,
                     ColdCleanupAction::Forget,
@@ -1302,8 +1489,8 @@ impl WorkflowExecutor {
                 failure_class: classify_failure(&error),
                 retain_in_run_cache: false,
             })?;
-            resolved
-                .backend
+            attempt_use
+                .backend()
                 .configure_turn(
                     &session,
                     TurnMeta {
@@ -1329,7 +1516,7 @@ impl WorkflowExecutor {
                 biased;
                 _ = cancel.cancelled() => {
                     cancel_and_forget_preflight_session(
-                        &resolved.backend,
+                        attempt_use.backend(),
                         &session,
                         &diagnostic,
                         cleanup_tracker,
@@ -1347,7 +1534,7 @@ impl WorkflowExecutor {
                     let terminal_evidence = match rich_sink.as_ref() {
                         Some(sink) => sink
                             .terminal_evidence_for_turn(
-                                resolved.backend.terminal_evidence_capability(),
+                                attempt_use.backend().terminal_evidence_capability(),
                                 u64::from(attempt_no),
                                 session.as_str(),
                                 preflight_turn_id.as_str(),
@@ -1361,7 +1548,7 @@ impl WorkflowExecutor {
                             bridge_core::terminal_evidence::SharedTurnEvidence::unsupported(),
                         ),
                     };
-                    resolved.backend.prompt_with_observers(
+                    attempt_use.backend().prompt_with_observers(
                         &session,
                         vec![Part {
                             text: WORKFLOW_PREFLIGHT_PROMPT.to_string(),
@@ -1373,7 +1560,7 @@ impl WorkflowExecutor {
             };
             if cancel.is_cancelled() {
                 cancel_and_forget_preflight_session(
-                    &resolved.backend,
+                    attempt_use.backend(),
                     &session,
                     &diagnostic,
                     cleanup_tracker,
@@ -1392,7 +1579,7 @@ impl WorkflowExecutor {
                     };
                     if may_have_been_accepted {
                         cancel_and_forget_preflight_session(
-                            &resolved.backend,
+                            attempt_use.backend(),
                             &session,
                             &diagnostic,
                             cleanup_tracker,
@@ -1400,7 +1587,7 @@ impl WorkflowExecutor {
                         .await;
                     } else {
                         let _ = cleanup_cold_session(
-                            &resolved.backend,
+                            attempt_use.backend(),
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
@@ -1419,7 +1606,7 @@ impl WorkflowExecutor {
                         return Err(PreflightFailure::Hard {
                             message: format!(
                                 "preflight stopped for agent {} because prompt acceptance could not be excluded: {}",
-                                entry.id.as_str(),
+                                agent.as_str(),
                                 format_attempt_summaries(&attempts)
                             ),
                             failure_class: classify_failure(&error),
@@ -1427,9 +1614,12 @@ impl WorkflowExecutor {
                         });
                     }
                     if idx + 1 < candidates.len() {
-                        self.registry.invalidate(&entry.id).await;
+                        attempt_use
+                            .into_retry_invalidation(&agent)
+                            .apply(self.registry.as_ref())
+                            .await;
                         tracing::warn!(
-                            agent = entry.id.as_str(),
+                            agent = agent.as_str(),
                             model = %model_label(model.as_deref()),
                             error = ?error,
                             "workflow preflight fallback after prompt error"
@@ -1477,7 +1667,7 @@ impl WorkflowExecutor {
                     },
                     _ = cancel.cancelled() => {
                         cancel_and_forget_preflight_session(
-                            &resolved.backend,
+                            attempt_use.backend(),
                             &session,
                             &diagnostic,
                             cleanup_tracker,
@@ -1489,7 +1679,7 @@ impl WorkflowExecutor {
 
             let cleanup_error = if replay_barrier {
                 cancel_and_forget_preflight_session(
-                    &resolved.backend,
+                    attempt_use.backend(),
                     &session,
                     &diagnostic,
                     cleanup_tracker,
@@ -1498,7 +1688,7 @@ impl WorkflowExecutor {
                 None
             } else {
                 cleanup_cold_session(
-                    &resolved.backend,
+                    attempt_use.backend(),
                     &session,
                     &diagnostic,
                     ColdCleanupAction::Forget,
@@ -1513,15 +1703,15 @@ impl WorkflowExecutor {
                 && is_exact_preflight_pong(&text)
                 && cleanup_error.is_none()
             {
-                let substituted_from = if model != &entry.model {
-                    Some(model_label(entry.model.as_deref()))
+                let substituted_from = if model != &primary_model {
+                    Some(model_label(primary_model.as_deref()))
                 } else {
                     None
                 };
                 if let Some(from) = &substituted_from {
                     let to = model_label(model.as_deref());
                     tracing::warn!(
-                        agent = entry.id.as_str(),
+                        agent = agent.as_str(),
                         from = %from,
                         to = %to,
                         "workflow preflight selected fallback model"
@@ -1531,7 +1721,7 @@ impl WorkflowExecutor {
                         sink.record(bridge_core::orch::OrchEventKind::Progress {
                             progress: bridge_core::orch::ProgressPayload::legacy(format!(
                                 "workflow preflight selected fallback model for agent {}: {from} -> {to}",
-                                entry.id.as_str()
+                                agent.as_str()
                             )),
                         });
                         let _ = sink.flush().await;
@@ -1540,6 +1730,11 @@ impl WorkflowExecutor {
                 let decision = PreflightDecision {
                     selected_model: model.clone(),
                     substituted_from,
+                    candidate_ordinal: u16::try_from(idx).map_err(|_| PreflightFailure::Hard {
+                        message: "preflight candidate ordinal overflow".into(),
+                        failure_class: FailureClass::Other,
+                        retain_in_run_cache: false,
+                    })?,
                 };
                 return Ok(decision);
             }
@@ -1566,7 +1761,7 @@ impl WorkflowExecutor {
             return Err(PreflightFailure::Hard {
                 message: format!(
                     "preflight stopped for agent {} because the prompt was accepted and must not be replayed: {}",
-                    entry.id.as_str(),
+                    agent.as_str(),
                     format_attempt_summaries(&attempts)
                 ),
                 failure_class: FailureClass::Other,
@@ -1577,7 +1772,7 @@ impl WorkflowExecutor {
         Err(PreflightFailure::Hard {
             message: format!(
                 "preflight exhausted for agent {} after {} model(s): {}",
-                entry.id.as_str(),
+                agent.as_str(),
                 attempts.len(),
                 format_attempt_summaries(&attempts)
             ),
@@ -2357,30 +2552,55 @@ impl WorkflowExecutor {
                     let (attempt_use, preflight_decision) = if let Some(authority) =
                         frozen_authority
                     {
-                        let node_digest = Sha256HexV1::digest(node.id.as_str().as_bytes());
-                        let identity = authority
-                            .run_spec
-                            .node_execution_identities
-                            .iter()
-                            .find(|identity| identity.node.id_sha256 == node_digest)
-                            .ok_or(BridgeError::ConfigMismatch {
-                                field: "node_execution_identity",
-                            })?;
-                        if identity.selection.preflight {
-                            break 'attempt Attempt::Fatal {
-                                text: format!(
-                                    "[node {} failed: bound preflight execution is unavailable]",
-                                    node.id.as_str()
-                                ),
-                                usage: None,
-                                failure_class: classify_failure(&BridgeError::BindUnsupported),
-                            };
-                        }
+                        let decision = match self
+                            .ensure_frozen_preflight(
+                                wf_id,
+                                node,
+                                run_id,
+                                ctx,
+                                diagnostic_factory,
+                                prompt_dispatch,
+                                cancel,
+                                authority,
+                                preflight_cache,
+                                cleanup_tracker,
+                            )
+                            .await
+                        {
+                            Ok(decision) => decision,
+                            Err(PreflightFailure::Canceled) => {
+                                attempt_harvest = node_harvest_meta(
+                                    wf_id,
+                                    node,
+                                    run_id,
+                                    ctx,
+                                    attempt,
+                                    PrefixAttestationCapability::default(),
+                                    PrefixAttestationStatus::default(),
+                                    CompletionBodyOrigin::BridgeSyntheticCancellation,
+                                )?;
+                                break 'attempt Attempt::Canceled {
+                                    marker: format!("[node {} canceled]", node.id.as_str()),
+                                    usage: None,
+                                };
+                            }
+                            Err(PreflightFailure::Hard {
+                                message,
+                                failure_class,
+                                ..
+                            }) => {
+                                break 'attempt Attempt::Fatal {
+                                    text: format!("[node {} failed: {message}]", node.id.as_str()),
+                                    usage: None,
+                                    failure_class,
+                                };
+                            }
+                        };
                         let frozen = match self.bind_frozen_entry(
                             authority,
                             node,
                             FrozenProviderLogicalSessionV1::Execute {
-                                candidate_ordinal: 0,
+                                candidate_ordinal: decision.candidate_ordinal,
                             },
                         ) {
                             Ok(frozen) => frozen,
@@ -2432,10 +2652,6 @@ impl WorkflowExecutor {
                                     };
                                 }
                             },
-                        };
-                        let decision = PreflightDecision {
-                            selected_model: resolved.frozen.config.model.clone(),
-                            substituted_from: None,
                         };
                         (WorkflowAttemptUse::Bound(resolved), decision)
                     } else {

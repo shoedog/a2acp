@@ -34,6 +34,7 @@ struct Calls {
     unbound_resolves: AtomicUsize,
     binds: AtomicUsize,
     bound_resolves: AtomicUsize,
+    bound_invalidations: AtomicUsize,
     legacy_configures: AtomicUsize,
     bound_specs: Mutex<Vec<BoundSessionSpecV1>>,
 }
@@ -47,10 +48,18 @@ impl AgentBackend for RecordingBackend {
     async fn prompt(
         &self,
         _session: &SessionId,
-        _parts: Vec<Part>,
+        parts: Vec<Part>,
     ) -> Result<BackendStream, BridgeError> {
+        let reply = if parts
+            .first()
+            .is_some_and(|part| part.text == "Reply with exactly PONG and nothing else.")
+        {
+            "PONG"
+        } else {
+            "BOUND_OK"
+        };
         Ok(Box::pin(tokio_stream::iter(vec![
-            Ok(Update::Text("BOUND_OK".into())),
+            Ok(Update::Text(reply.into())),
             Ok(Update::done("end_turn")),
         ])))
     }
@@ -85,6 +94,7 @@ struct BoundOnlyRegistry {
     backend: Arc<dyn AgentBackend>,
     slot: Arc<()>,
     calls: Arc<Calls>,
+    fail_preflight_ordinal: Option<u16>,
 }
 
 #[async_trait]
@@ -115,7 +125,28 @@ impl AgentRegistry for BoundOnlyRegistry {
         assert!(bound.use_token.downcast_slot::<()>().is_some());
         assert!(bound.use_token.matches_entry(&self.entry));
         self.calls.bound_resolves.fetch_add(1, Ordering::SeqCst);
+        if matches!(
+            _effect.frozen().logical_session,
+            FrozenProviderLogicalSessionV1::Preflight { candidate_ordinal }
+                if Some(candidate_ordinal) == self.fail_preflight_ordinal
+        ) {
+            return Err(BridgeError::AgentCrashed {
+                reason: "injected pre-acceptance preflight resolve failure".into(),
+            });
+        }
         Ok(self.backend.clone())
+    }
+
+    async fn invalidate_bound(
+        &self,
+        bound: &BoundEntryUseV1,
+        effect_digest: &bridge_core::execution_policy::Sha256HexV1,
+    ) {
+        assert!(bound.use_token.matches_entry(&self.entry));
+        assert!(!effect_digest.as_str().is_empty());
+        self.calls
+            .bound_invalidations
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     fn default_id(&self) -> AgentId {
@@ -171,29 +202,44 @@ fn frozen_worktree_run(entry: &AgentEntry) -> WorkflowRunSpecV1 {
     let attempt_id = AttemptId::parse("attempt-22222222222222222222222222222222").unwrap();
     let source_cwd = SessionCwd::parse("/repo/source").unwrap();
     let node_ref = PolicyNodeRefV1::from_node_id(0, "review-node");
-    let logical_session = FrozenProviderLogicalSessionV1::Execute {
-        candidate_ordinal: 0,
-    };
-    let checkout = freeze_worktree_checkout_v1(&WorktreeCheckoutInputV1 {
-        attempt_id: attempt_id.clone(),
-        node: node_ref.clone(),
-        logical_session,
-        source_cwd: source_cwd.clone(),
-        canonical_source_cwd: source_cwd.clone(),
-        canonical_worktree_root: SessionCwd::parse("/private/tmp/a2a-bound-worktrees").unwrap(),
-        worktree_owner: "bound-test".into(),
-    })
-    .unwrap();
-    let provider = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
-        entry,
-        overrides: None,
-        node: node_ref.clone(),
-        logical_session,
-        checkout,
-        provider_effect_key: None,
-    })
-    .unwrap();
-    let identity = freeze_node_execution_identity_v1(node_ref, vec![provider]).unwrap();
+    let mut logical_sessions = Vec::new();
+    if entry.preflight {
+        for ordinal in 0..=entry.fallback_models.len() {
+            let candidate_ordinal = u16::try_from(ordinal).unwrap();
+            logical_sessions.push(FrozenProviderLogicalSessionV1::Preflight { candidate_ordinal });
+            logical_sessions.push(FrozenProviderLogicalSessionV1::Execute { candidate_ordinal });
+        }
+    } else {
+        logical_sessions.push(FrozenProviderLogicalSessionV1::Execute {
+            candidate_ordinal: 0,
+        });
+    }
+    let providers = logical_sessions
+        .into_iter()
+        .map(|logical_session| {
+            let checkout = freeze_worktree_checkout_v1(&WorktreeCheckoutInputV1 {
+                attempt_id: attempt_id.clone(),
+                node: node_ref.clone(),
+                logical_session,
+                source_cwd: source_cwd.clone(),
+                canonical_source_cwd: source_cwd.clone(),
+                canonical_worktree_root: SessionCwd::parse("/private/tmp/a2a-bound-worktrees")
+                    .unwrap(),
+                worktree_owner: "bound-test".into(),
+            })
+            .unwrap();
+            freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+                entry,
+                overrides: None,
+                node: node_ref.clone(),
+                logical_session,
+                checkout,
+                provider_effect_key: None,
+            })
+            .unwrap()
+        })
+        .collect();
+    let identity = freeze_node_execution_identity_v1(node_ref, providers).unwrap();
     let graph = WorkflowGraph {
         id: WorkflowId::parse("review").unwrap(),
         nodes: vec![WorkflowNode {
@@ -227,6 +273,56 @@ fn frozen_worktree_run(entry: &AgentEntry) -> WorkflowRunSpecV1 {
     .unwrap()
 }
 
+async fn execute_bound(
+    entry: AgentEntry,
+    fail_preflight_ordinal: Option<u16>,
+) -> (
+    Arc<WorkflowRunSpecV1>,
+    Arc<Calls>,
+    Option<bool>,
+    Option<(WorkflowOutcome, String)>,
+) {
+    let entry = Arc::new(entry);
+    let run_spec = Arc::new(frozen_worktree_run(&entry));
+    run_spec.validate().unwrap();
+    let calls = Arc::new(Calls::default());
+    let backend: Arc<dyn AgentBackend> = Arc::new(RecordingBackend {
+        calls: calls.clone(),
+    });
+    let registry = Arc::new(BoundOnlyRegistry {
+        entry,
+        backend,
+        slot: Arc::new(()),
+        calls: calls.clone(),
+        fail_preflight_ordinal,
+    });
+    let request = WorkflowRunContext {
+        session_cwd: run_spec.requested_session_cwd.clone(),
+        ..WorkflowRunContext::default()
+    };
+    let context = WorkflowDiagnosticContext::in_memory(request)
+        .with_frozen_run_spec(run_spec.clone(), None)
+        .unwrap();
+    let executor = WorkflowExecutor::new(registry);
+    let mut stream = executor.run_with_diagnostic_context(
+        Arc::new(run_spec.graph.clone()),
+        "review this".into(),
+        "bound-preflight-run".into(),
+        CancellationToken::new(),
+        context,
+    );
+    let mut node_ok = None;
+    let mut terminal = None;
+    while let Some(event) = stream.next().await {
+        match event.unwrap() {
+            WorkflowEvent::NodeFinished { ok, .. } => node_ok = Some(ok),
+            WorkflowEvent::Terminal { outcome, output } => terminal = Some((outcome, output)),
+            WorkflowEvent::NodeStarted { .. } | WorkflowEvent::CleanupObserved { .. } => {}
+        }
+    }
+    (run_spec, calls, node_ok, terminal)
+}
+
 #[tokio::test]
 async fn v2_worktree_attempt_uses_only_bound_registry_cwd_and_delivery() {
     let entry = Arc::new(entry());
@@ -241,6 +337,7 @@ async fn v2_worktree_attempt_uses_only_bound_registry_cwd_and_delivery() {
         backend,
         slot: Arc::new(()),
         calls: calls.clone(),
+        fail_preflight_ordinal: None,
     });
     let request = WorkflowRunContext {
         session_cwd: run_spec.requested_session_cwd.clone(),
@@ -299,4 +396,69 @@ async fn v2_worktree_attempt_uses_only_bound_registry_cwd_and_delivery() {
         persisted.checkout.effective_cwd(),
         run_spec.requested_session_cwd.as_ref().unwrap()
     );
+}
+
+#[tokio::test]
+async fn v2_preflight_binds_candidate_and_execute_as_distinct_attempts() {
+    let mut configured = entry();
+    configured.preflight = true;
+    let (_run_spec, calls, node_ok, terminal) = execute_bound(configured, None).await;
+
+    assert_eq!(node_ok, Some(true));
+    assert_eq!(
+        terminal,
+        Some((WorkflowOutcome::Completed, "BOUND_OK".into()))
+    );
+    assert_eq!(calls.unbound_resolves.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.binds.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.bound_resolves.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.bound_invalidations.load(Ordering::SeqCst), 0);
+    let specs = calls.bound_specs.lock().unwrap();
+    assert_eq!(specs.len(), 2);
+    assert!(matches!(
+        specs[0].provider_effect.frozen().logical_session,
+        FrozenProviderLogicalSessionV1::Preflight {
+            candidate_ordinal: 0
+        }
+    ));
+    assert!(matches!(
+        specs[1].provider_effect.frozen().logical_session,
+        FrozenProviderLogicalSessionV1::Execute {
+            candidate_ordinal: 0
+        }
+    ));
+}
+
+#[tokio::test]
+async fn v2_preflight_fallback_exact_invalidates_then_executes_persisted_ordinal() {
+    let mut configured = entry();
+    configured.preflight = true;
+    configured.fallback_models = vec!["gpt-5.6-luna".into()];
+    let (_run_spec, calls, node_ok, terminal) = execute_bound(configured, Some(0)).await;
+
+    assert_eq!(node_ok, Some(true));
+    assert_eq!(
+        terminal,
+        Some((WorkflowOutcome::Completed, "BOUND_OK".into()))
+    );
+    assert_eq!(calls.unbound_resolves.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.binds.load(Ordering::SeqCst), 3);
+    assert_eq!(calls.bound_resolves.load(Ordering::SeqCst), 3);
+    assert_eq!(calls.bound_invalidations.load(Ordering::SeqCst), 1);
+    let specs = calls.bound_specs.lock().unwrap();
+    assert_eq!(specs.len(), 2);
+    for (spec, logical_session) in specs.iter().zip([
+        FrozenProviderLogicalSessionV1::Preflight {
+            candidate_ordinal: 1,
+        },
+        FrozenProviderLogicalSessionV1::Execute {
+            candidate_ordinal: 1,
+        },
+    ]) {
+        assert_eq!(
+            spec.provider_effect.frozen().logical_session,
+            logical_session
+        );
+        assert_eq!(spec.session.config.model.as_deref(), Some("gpt-5.6-luna"));
+    }
 }
