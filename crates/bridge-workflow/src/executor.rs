@@ -1813,6 +1813,9 @@ impl WorkflowExecutor {
             );
         }
         if let Some(d) = dispatcher {
+            if frozen_authority.is_some() {
+                return Err(BridgeError::BindUnsupported);
+            }
             let rendered = render(&node.prompt_template, vars);
             let node_obs_ctx = node_turn_context(wf_id, node, run_id, ctx, None, None, None, 0)?;
             ctx.observer

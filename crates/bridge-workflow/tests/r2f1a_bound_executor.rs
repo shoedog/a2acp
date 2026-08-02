@@ -16,7 +16,8 @@ use bridge_core::ports::{
 };
 use bridge_core::SessionCwd;
 use bridge_workflow::executor::{
-    WorkflowDiagnosticContext, WorkflowEvent, WorkflowExecutor, WorkflowOutcome, WorkflowRunContext,
+    NodeTurn, WorkflowDiagnosticContext, WorkflowEvent, WorkflowExecutor, WorkflowNodeDispatcher,
+    WorkflowOutcome, WorkflowRunContext,
 };
 use bridge_workflow::graph::{RetryPolicy, WorkflowGraph, WorkflowNode};
 use bridge_workflow::run_spec::WorkflowRunSpecV1;
@@ -102,6 +103,27 @@ struct BoundOnlyRegistry {
     slot: Arc<()>,
     calls: Arc<Calls>,
     fail_preflight_ordinal: Option<u16>,
+}
+
+#[derive(Default)]
+struct LegacyDispatcher {
+    checkouts: AtomicUsize,
+}
+
+#[async_trait]
+impl WorkflowNodeDispatcher for LegacyDispatcher {
+    async fn checkout(
+        &self,
+        _wf_id: &str,
+        _node: &WorkflowNode,
+        _run_id: &str,
+        _ctx: &WorkflowRunContext,
+    ) -> Result<NodeTurn, BridgeError> {
+        self.checkouts.fetch_add(1, Ordering::SeqCst);
+        Err(BridgeError::ConfigInvalid {
+            reason: "legacy dispatcher reached".into(),
+        })
+    }
 }
 
 #[async_trait]
@@ -522,4 +544,52 @@ async fn v2_retry_rebinds_execute_row_and_never_invalidates_by_agent_id() {
             }
         ));
     }
+}
+
+#[tokio::test]
+async fn v2_refuses_legacy_dispatcher_before_any_unbound_read_or_checkout() {
+    let entry = Arc::new(entry());
+    let run_spec = Arc::new(frozen_worktree_run(&entry));
+    let calls = Arc::new(Calls::default());
+    let backend: Arc<dyn AgentBackend> = Arc::new(RecordingBackend {
+        calls: calls.clone(),
+    });
+    let registry = Arc::new(BoundOnlyRegistry {
+        entry,
+        backend,
+        slot: Arc::new(()),
+        calls: calls.clone(),
+        fail_preflight_ordinal: None,
+    });
+    let dispatcher = Arc::new(LegacyDispatcher::default());
+    let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+        session_cwd: run_spec.requested_session_cwd.clone(),
+        ..WorkflowRunContext::default()
+    })
+    .with_frozen_run_spec(run_spec.clone(), None)
+    .unwrap();
+    let mut stream = WorkflowExecutor::new(registry).run_with_diagnostic_context_and_dispatcher(
+        Arc::new(run_spec.graph.clone()),
+        "review this".into(),
+        "bound-dispatcher-run".into(),
+        CancellationToken::new(),
+        context,
+        dispatcher.clone(),
+    );
+    let mut saw_refusal = false;
+    while let Some(event) = stream.next().await {
+        if matches!(event, Err(BridgeError::BindUnsupported)) {
+            saw_refusal = true;
+        }
+    }
+
+    assert!(
+        saw_refusal,
+        "V2 must expose the typed bound-dispatch refusal"
+    );
+    assert_eq!(dispatcher.checkouts.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.unbound_resolves.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.binds.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.bound_resolves.load(Ordering::SeqCst), 0);
+    assert!(calls.bound_specs.lock().unwrap().is_empty());
 }
