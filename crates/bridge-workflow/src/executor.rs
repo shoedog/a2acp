@@ -1,13 +1,20 @@
 //! WorkflowExecutor — runs a validated DAG over the registry. Each node: configure_session
 //! → prompt → concatenate Update::Text into the node output. Cancel via token.
 use crate::graph::{WorkflowGraph, WorkflowNode};
+use crate::run_spec::WorkflowRunSpecV1;
 use crate::template::render;
 use bridge_core::attestation::{
     append_prompt_contract, prefix_attestation_request_for_capability, HarvestSanitizationMode,
     PrefixAttestationCapability, PrefixAttestationStatus,
 };
-use bridge_core::domain::{effective_config, AgentEntry, AgentOverride, Part, SessionSpec};
+use bridge_core::domain::{
+    effective_config, AgentEntry, AgentOverride, EffectiveConfig, Part, SessionSpec,
+};
 use bridge_core::error::BridgeError;
+use bridge_core::execution_policy::{
+    freeze_provider_attempt_v1, BoundProviderEffectV1, BoundSessionSpecV1,
+    FrozenProviderLogicalSessionV1, ProviderEffectKeyV1, ProviderFreezeInputV1, Sha256HexV1,
+};
 use bridge_core::harvest::{
     commit_harvested_completion, CompletionBodyOrigin, HarvestAuditStore, NoopHarvestAuditStore,
 };
@@ -15,9 +22,10 @@ use bridge_core::ids::{ContextId, NodeId, OperationId, SessionId};
 use bridge_core::orch::UsageSnapshot;
 use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
-    classify_failure, AgentBackend, AgentRegistry, BackendObservers, DiagnosticObserver,
-    DiagnosticObserverFactory, FailureClass, ObsEvent, Observer, RichEventSinkFactory, TurnContext,
-    TurnOutcome, Update, UsageFinalization, STOP_REASON_CANCELLED,
+    classify_failure, AgentBackend, AgentRegistry, BackendObservers, BoundEntryUseV1,
+    DiagnosticObserver, DiagnosticObserverFactory, FailureClass, ObsEvent, Observer, Resolved,
+    RichEventSinkFactory, TurnContext, TurnOutcome, Update, UsageFinalization,
+    STOP_REASON_CANCELLED,
 };
 use bridge_core::SessionCwd;
 use futures::stream::FuturesUnordered;
@@ -71,6 +79,13 @@ pub struct WorkflowDiagnosticContext {
     request: WorkflowRunContext,
     factory: Arc<dyn DiagnosticObserverFactory>,
     prompt_dispatch: Option<PromptDispatchBarrier>,
+    frozen_authority: Option<FrozenWorkflowAuthority>,
+}
+
+#[derive(Clone)]
+struct FrozenWorkflowAuthority {
+    run_spec: Arc<WorkflowRunSpecV1>,
+    provider_effect_key: Option<Arc<ProviderEffectKeyV1>>,
 }
 
 /// True when at least one node explicitly renders the run-workflow input variable.
@@ -100,12 +115,53 @@ impl WorkflowDiagnosticContext {
             request,
             factory,
             prompt_dispatch: None,
+            frozen_authority: None,
         }
     }
 
     pub fn with_prompt_dispatch_barrier(mut self, barrier: PromptDispatchBarrier) -> Self {
         self.prompt_dispatch = Some(barrier);
         self
+    }
+
+    /// Bind this invocation to one validated V2 run specification and its separately held
+    /// provider-effect commitment key. The key is never persisted by the workflow layer.
+    pub fn with_frozen_run_spec(
+        mut self,
+        run_spec: Arc<WorkflowRunSpecV1>,
+        provider_effect_key: Option<Arc<ProviderEffectKeyV1>>,
+    ) -> Result<Self, BridgeError> {
+        run_spec
+            .validate()
+            .map_err(|error| BridgeError::ConfigInvalid {
+                reason: format!("invalid frozen workflow run specification: {error}"),
+            })?;
+        if self.request.session_cwd != run_spec.requested_session_cwd {
+            return Err(BridgeError::ConfigMismatch {
+                field: "requested_session_cwd",
+            });
+        }
+        for identity in &run_spec.node_execution_identities {
+            for attempt in &identity.provider_attempts {
+                if let Some(expected) = &attempt.effect.secret_commitment_key_id {
+                    let Some(actual) = provider_effect_key.as_ref().map(|key| key.key_id()) else {
+                        return Err(BridgeError::ConfigInvalid {
+                            reason: "frozen provider effect requires its commitment key".into(),
+                        });
+                    };
+                    if &actual != expected {
+                        return Err(BridgeError::ConfigMismatch {
+                            field: "provider_effect_key_id",
+                        });
+                    }
+                }
+            }
+        }
+        self.frozen_authority = Some(FrozenWorkflowAuthority {
+            run_spec,
+            provider_effect_key,
+        });
+        Ok(self)
     }
 
     pub fn in_memory(request: WorkflowRunContext) -> Self {
@@ -124,8 +180,14 @@ impl WorkflowDiagnosticContext {
         WorkflowRunContext,
         Arc<dyn DiagnosticObserverFactory>,
         Option<PromptDispatchBarrier>,
+        Option<FrozenWorkflowAuthority>,
     ) {
-        (self.request, self.factory, self.prompt_dispatch)
+        (
+            self.request,
+            self.factory,
+            self.prompt_dispatch,
+            self.frozen_authority,
+        )
     }
 }
 
@@ -739,6 +801,110 @@ pub struct WorkflowExecutor {
     registry: Arc<dyn AgentRegistry>,
 }
 
+struct FrozenBoundEntryUse {
+    bound: BoundEntryUseV1,
+    provider_effect: Arc<BoundProviderEffectV1>,
+    config: EffectiveConfig,
+}
+
+struct FrozenAttemptUse {
+    frozen: FrozenBoundEntryUse,
+    backend: Arc<dyn AgentBackend>,
+}
+
+enum WorkflowAttemptUse {
+    Legacy {
+        resolved: Resolved,
+        config: EffectiveConfig,
+    },
+    Bound(FrozenAttemptUse),
+}
+
+impl WorkflowAttemptUse {
+    fn backend(&self) -> &Arc<dyn AgentBackend> {
+        match self {
+            Self::Legacy { resolved, .. } => &resolved.backend,
+            Self::Bound(bound) => &bound.backend,
+        }
+    }
+
+    fn config(&self) -> &EffectiveConfig {
+        match self {
+            Self::Legacy { config, .. } => config,
+            Self::Bound(bound) => &bound.frozen.config,
+        }
+    }
+
+    async fn configure_session(
+        &self,
+        session: &SessionId,
+        legacy_cwd: Option<SessionCwd>,
+    ) -> Result<(), BridgeError> {
+        match self {
+            Self::Legacy { resolved, config } => {
+                resolved
+                    .backend
+                    .configure_session(
+                        session,
+                        &SessionSpec {
+                            config: config.clone(),
+                            cwd: legacy_cwd,
+                        },
+                    )
+                    .await
+            }
+            Self::Bound(bound) => {
+                bound
+                    .backend
+                    .configure_bound_session(
+                        session,
+                        &BoundSessionSpecV1::new(
+                            bound.frozen.config.clone(),
+                            bound.frozen.provider_effect.clone(),
+                        ),
+                    )
+                    .await
+            }
+        }
+    }
+
+    fn into_retry_invalidation(self, agent: &bridge_core::ids::AgentId) -> RetryInvalidation {
+        match self {
+            Self::Legacy { .. } => RetryInvalidation::Legacy(agent.clone()),
+            Self::Bound(bound) => bound.frozen.into_retry_invalidation(),
+        }
+    }
+}
+
+enum RetryInvalidation {
+    Legacy(bridge_core::ids::AgentId),
+    Bound {
+        bound: BoundEntryUseV1,
+        effect_digest: Sha256HexV1,
+    },
+}
+
+impl FrozenBoundEntryUse {
+    fn into_retry_invalidation(self) -> RetryInvalidation {
+        RetryInvalidation::Bound {
+            effect_digest: self.provider_effect.frozen().effect.effect_digest.clone(),
+            bound: self.bound,
+        }
+    }
+}
+
+impl RetryInvalidation {
+    async fn apply(self, registry: &dyn AgentRegistry) {
+        match self {
+            Self::Legacy(agent) => registry.invalidate(&agent).await,
+            Self::Bound {
+                bound,
+                effect_digest,
+            } => registry.invalidate_bound(&bound, &effect_digest).await,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowOutcome {
     Completed,
@@ -802,6 +968,97 @@ fn node_turn_context(
 impl WorkflowExecutor {
     pub fn new(registry: Arc<dyn AgentRegistry>) -> Self {
         Self { registry }
+    }
+
+    fn bind_frozen_entry(
+        &self,
+        authority: &FrozenWorkflowAuthority,
+        node: &WorkflowNode,
+        logical_session: FrozenProviderLogicalSessionV1,
+    ) -> Result<FrozenBoundEntryUse, BridgeError> {
+        let node_digest =
+            bridge_core::execution_policy::Sha256HexV1::digest(node.id.as_str().as_bytes());
+        let identity = authority
+            .run_spec
+            .node_execution_identities
+            .iter()
+            .find(|identity| identity.node.id_sha256 == node_digest)
+            .ok_or(BridgeError::ConfigMismatch {
+                field: "node_execution_identity",
+            })?;
+        if identity.selection.agent != node.agent {
+            return Err(BridgeError::ConfigMismatch {
+                field: "provider_selection",
+            });
+        }
+        let persisted = identity
+            .provider_attempts
+            .iter()
+            .find(|attempt| attempt.logical_session == logical_session)
+            .ok_or_else(|| BridgeError::ConfigInvalid {
+                reason: "frozen provider logical session is outside the admitted matrix".into(),
+            })?;
+        let bound = self
+            .registry
+            .bind_entry_use(&node.agent)
+            .ok_or(BridgeError::BindUnsupported)?;
+        let reconstructed = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+            entry: &bound.entry,
+            overrides: None,
+            node: identity.node.clone(),
+            logical_session,
+            checkout: persisted.checkout.clone(),
+            provider_effect_key: authority.provider_effect_key.as_deref(),
+        })
+        .map_err(|error| BridgeError::ConfigInvalid {
+            reason: format!("frozen provider attempt cannot be reconstructed: {error}"),
+        })?;
+        if reconstructed.selection != identity.selection {
+            return Err(BridgeError::ConfigMismatch {
+                field: "provider_selection",
+            });
+        }
+        if reconstructed.frozen != *persisted {
+            return Err(BridgeError::ConfigMismatch {
+                field: "provider_effect",
+            });
+        }
+        let candidate_ordinal = match logical_session {
+            FrozenProviderLogicalSessionV1::Preflight { candidate_ordinal }
+            | FrozenProviderLogicalSessionV1::Execute { candidate_ordinal } => candidate_ordinal,
+        };
+        let selected_model = identity
+            .selection
+            .candidates()
+            .get(usize::from(candidate_ordinal))
+            .cloned()
+            .ok_or_else(|| BridgeError::ConfigInvalid {
+                reason: "frozen provider candidate is outside the admitted selection".into(),
+            })?;
+        Ok(FrozenBoundEntryUse {
+            bound,
+            provider_effect: Arc::new(reconstructed.bound),
+            config: EffectiveConfig {
+                model: selected_model,
+                effort: identity.selection.effective_effort,
+                mode: identity.selection.effective_mode.clone(),
+            },
+        })
+    }
+
+    async fn resolve_frozen_entry(
+        &self,
+        frozen: FrozenBoundEntryUse,
+        diagnostic: Arc<dyn DiagnosticObserver>,
+    ) -> Result<FrozenAttemptUse, (BridgeError, FrozenBoundEntryUse)> {
+        match self
+            .registry
+            .resolve_bound(&frozen.bound, &frozen.provider_effect, diagnostic)
+            .await
+        {
+            Ok(backend) => Ok(FrozenAttemptUse { frozen, backend }),
+            Err(error) => Err((error, frozen)),
+        }
     }
 
     /// Compute the configured workload partition without resolving or spawning
@@ -1345,6 +1602,7 @@ impl WorkflowExecutor {
         cleanup_tracker: &WorkflowCleanupTracker,
         dispatcher: Option<&Arc<dyn WorkflowNodeDispatcher>>,
         preflight_cache: &PreflightCache,
+        frozen_authority: Option<&FrozenWorkflowAuthority>,
     ) -> Result<NodeRunOutput, BridgeError> {
         if cancel.is_cancelled() {
             return node_run_output(
@@ -2042,6 +2300,7 @@ impl WorkflowExecutor {
                 err: BridgeError,
                 usage: Option<UsageSnapshot>,
                 cleanup_allows_retry: bool,
+                invalidation: RetryInvalidation,
             },
             EmptyFinal {
                 usage: Option<UsageSnapshot>,
@@ -2095,109 +2354,198 @@ impl WorkflowExecutor {
                     CompletionBodyOrigin::BridgeSyntheticStreamError,
                 )?;
                 let outcome = 'attempt: {
-                    // resolve, with cancel
-                    let mut resolved = tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => {
-                            attempt_harvest = node_harvest_meta(
-                                wf_id,
-                                node,
-                                run_id,
-                                ctx,
-                                attempt,
-                                PrefixAttestationCapability::default(),
-                                PrefixAttestationStatus::default(),
-                                CompletionBodyOrigin::BridgeSyntheticCancellation,
-                            )?;
-                            break 'attempt Attempt::Canceled {
-                                marker: format!("[node {} canceled]", node.id.as_str()),
-                                usage: None,
-                            };
-                        }
-                        r = self.registry.resolve_observed(&node.agent, diagnostic.clone()) => match r {
-                            Ok(r) => r,
-                            Err(e) => {
-                                if retry_enabled && e.is_transient() {
-                                    break 'attempt Attempt::Transient {
-                                        err: e,
-                                        usage: None,
-                                        cleanup_allows_retry: true,
-                                    };
-                                }
-                                break 'attempt Attempt::Fatal {
-                                    text: format!("[node {} failed: {:?}]", node.id.as_str(), e),
-                                    usage: None,
-                                    failure_class: classify_failure(&e),
-                                };
-                            }
-                        },
-                    };
-                    let preflight_decision = match self
-                        .ensure_agent_preflight(
-                            wf_id,
-                            node,
-                            run_id,
-                            ctx,
-                            diagnostic_factory,
-                            prompt_dispatch,
-                            cancel,
-                            resolved.entry.clone(),
-                            preflight_cache,
-                            cleanup_tracker,
-                        )
-                        .await
+                    let (attempt_use, preflight_decision) = if let Some(authority) =
+                        frozen_authority
                     {
-                        Ok(decision) => decision,
-                        Err(PreflightFailure::Canceled) => {
-                            attempt_harvest = node_harvest_meta(
-                                wf_id,
-                                node,
-                                run_id,
-                                ctx,
-                                attempt,
-                                PrefixAttestationCapability::default(),
-                                PrefixAttestationStatus::default(),
-                                CompletionBodyOrigin::BridgeSyntheticCancellation,
-                            )?;
-                            break 'attempt Attempt::Canceled {
-                                marker: format!("[node {} canceled]", node.id.as_str()),
-                                usage: None,
-                            };
-                        }
-                        Err(PreflightFailure::Hard {
-                            message,
-                            failure_class,
-                            ..
-                        }) => {
+                        let node_digest = Sha256HexV1::digest(node.id.as_str().as_bytes());
+                        let identity = authority
+                            .run_spec
+                            .node_execution_identities
+                            .iter()
+                            .find(|identity| identity.node.id_sha256 == node_digest)
+                            .ok_or(BridgeError::ConfigMismatch {
+                                field: "node_execution_identity",
+                            })?;
+                        if identity.selection.preflight {
                             break 'attempt Attempt::Fatal {
-                                text: format!("[node {} failed: {message}]", node.id.as_str()),
+                                text: format!(
+                                    "[node {} failed: bound preflight execution is unavailable]",
+                                    node.id.as_str()
+                                ),
                                 usage: None,
-                                failure_class,
+                                failure_class: classify_failure(&BridgeError::BindUnsupported),
                             };
                         }
-                    };
-                    if preflight_decision.substituted_from.is_some() {
-                        resolved = match self
-                            .registry
-                            .resolve_observed(&node.agent, diagnostic.clone())
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(e) => {
+                        let frozen = match self.bind_frozen_entry(
+                            authority,
+                            node,
+                            FrozenProviderLogicalSessionV1::Execute {
+                                candidate_ordinal: 0,
+                            },
+                        ) {
+                            Ok(frozen) => frozen,
+                            Err(error) => {
                                 break 'attempt Attempt::Fatal {
                                     text: format!(
-                                        "[node {} failed after preflight: {:?}]",
+                                        "[node {} failed: {:?}]",
                                         node.id.as_str(),
-                                        e
+                                        error
                                     ),
                                     usage: None,
-                                    failure_class: classify_failure(&e),
+                                    failure_class: classify_failure(&error),
                                 };
                             }
                         };
-                    }
-                    let mut eff = effective_config(&resolved.entry, None);
-                    eff.model = preflight_decision.selected_model.clone();
+                        let resolved = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                attempt_harvest = node_harvest_meta(
+                                    wf_id,
+                                    node,
+                                    run_id,
+                                    ctx,
+                                    attempt,
+                                    PrefixAttestationCapability::default(),
+                                    PrefixAttestationStatus::default(),
+                                    CompletionBodyOrigin::BridgeSyntheticCancellation,
+                                )?;
+                                break 'attempt Attempt::Canceled {
+                                    marker: format!("[node {} canceled]", node.id.as_str()),
+                                    usage: None,
+                                };
+                            }
+                            result = self.resolve_frozen_entry(frozen, diagnostic.clone()) => match result {
+                                Ok(resolved) => resolved,
+                                Err((error, frozen)) => {
+                                    if retry_enabled && error.is_transient() {
+                                        break 'attempt Attempt::Transient {
+                                            err: error,
+                                            usage: None,
+                                            cleanup_allows_retry: true,
+                                            invalidation: frozen.into_retry_invalidation(),
+                                        };
+                                    }
+                                    break 'attempt Attempt::Fatal {
+                                        text: format!("[node {} failed: {:?}]", node.id.as_str(), error),
+                                        usage: None,
+                                        failure_class: classify_failure(&error),
+                                    };
+                                }
+                            },
+                        };
+                        let decision = PreflightDecision {
+                            selected_model: resolved.frozen.config.model.clone(),
+                            substituted_from: None,
+                        };
+                        (WorkflowAttemptUse::Bound(resolved), decision)
+                    } else {
+                        // Legacy V1 resolution remains unchanged and never enters the bound path.
+                        let mut resolved = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                attempt_harvest = node_harvest_meta(
+                                    wf_id,
+                                    node,
+                                    run_id,
+                                    ctx,
+                                    attempt,
+                                    PrefixAttestationCapability::default(),
+                                    PrefixAttestationStatus::default(),
+                                    CompletionBodyOrigin::BridgeSyntheticCancellation,
+                                )?;
+                                break 'attempt Attempt::Canceled {
+                                    marker: format!("[node {} canceled]", node.id.as_str()),
+                                    usage: None,
+                                };
+                            }
+                            result = self.registry.resolve_observed(&node.agent, diagnostic.clone()) => match result {
+                                Ok(resolved) => resolved,
+                                Err(error) => {
+                                    if retry_enabled && error.is_transient() {
+                                        break 'attempt Attempt::Transient {
+                                            err: error,
+                                            usage: None,
+                                            cleanup_allows_retry: true,
+                                            invalidation: RetryInvalidation::Legacy(node.agent.clone()),
+                                        };
+                                    }
+                                    break 'attempt Attempt::Fatal {
+                                        text: format!("[node {} failed: {:?}]", node.id.as_str(), error),
+                                        usage: None,
+                                        failure_class: classify_failure(&error),
+                                    };
+                                }
+                            },
+                        };
+                        let decision = match self
+                            .ensure_agent_preflight(
+                                wf_id,
+                                node,
+                                run_id,
+                                ctx,
+                                diagnostic_factory,
+                                prompt_dispatch,
+                                cancel,
+                                resolved.entry.clone(),
+                                preflight_cache,
+                                cleanup_tracker,
+                            )
+                            .await
+                        {
+                            Ok(decision) => decision,
+                            Err(PreflightFailure::Canceled) => {
+                                attempt_harvest = node_harvest_meta(
+                                    wf_id,
+                                    node,
+                                    run_id,
+                                    ctx,
+                                    attempt,
+                                    PrefixAttestationCapability::default(),
+                                    PrefixAttestationStatus::default(),
+                                    CompletionBodyOrigin::BridgeSyntheticCancellation,
+                                )?;
+                                break 'attempt Attempt::Canceled {
+                                    marker: format!("[node {} canceled]", node.id.as_str()),
+                                    usage: None,
+                                };
+                            }
+                            Err(PreflightFailure::Hard {
+                                message,
+                                failure_class,
+                                ..
+                            }) => {
+                                break 'attempt Attempt::Fatal {
+                                    text: format!("[node {} failed: {message}]", node.id.as_str()),
+                                    usage: None,
+                                    failure_class,
+                                };
+                            }
+                        };
+                        if decision.substituted_from.is_some() {
+                            resolved = match self
+                                .registry
+                                .resolve_observed(&node.agent, diagnostic.clone())
+                                .await
+                            {
+                                Ok(resolved) => resolved,
+                                Err(error) => {
+                                    break 'attempt Attempt::Fatal {
+                                        text: format!(
+                                            "[node {} failed after preflight: {:?}]",
+                                            node.id.as_str(),
+                                            error
+                                        ),
+                                        usage: None,
+                                        failure_class: classify_failure(&error),
+                                    };
+                                }
+                            };
+                        }
+                        let mut config = effective_config(&resolved.entry, None);
+                        config.model = decision.selected_model.clone();
+                        (WorkflowAttemptUse::Legacy { resolved, config }, decision)
+                    };
+                    let eff = attempt_use.config().clone();
                     let obs_model = eff.model.clone();
                     let obs_effort = eff
                         .effort
@@ -2220,15 +2568,8 @@ impl WorkflowExecutor {
                             "workflow node using preflight-selected fallback model"
                         );
                     }
-                    if let Err(e) = resolved
-                        .backend
-                        .configure_session(
-                            &session,
-                            &SessionSpec {
-                                config: eff,
-                                cwd: ctx.session_cwd.clone(),
-                            },
-                        )
+                    if let Err(e) = attempt_use
+                        .configure_session(&session, ctx.session_cwd.clone())
                         .await
                     {
                         if retry_enabled && e.is_transient() {
@@ -2238,7 +2579,7 @@ impl WorkflowExecutor {
                                 ColdCleanupAction::Forget
                             };
                             let cleanup_allows_retry = cleanup_cold_session(
-                                &resolved.backend,
+                                attempt_use.backend(),
                                 &session,
                                 &diagnostic,
                                 action,
@@ -2250,10 +2591,11 @@ impl WorkflowExecutor {
                                 err: e,
                                 usage: None,
                                 cleanup_allows_retry,
+                                invalidation: attempt_use.into_retry_invalidation(&node.agent),
                             };
                         }
                         let _ = cleanup_cold_session(
-                            &resolved.backend,
+                            attempt_use.backend(),
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
@@ -2268,7 +2610,7 @@ impl WorkflowExecutor {
                     }
                     if cancel.is_cancelled() {
                         match cleanup_cold_session(
-                            &resolved.backend,
+                            attempt_use.backend(),
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
@@ -2306,7 +2648,7 @@ impl WorkflowExecutor {
                         }
                     }
                     // prompt, with cancel
-                    let prefix_capability = resolved.backend.prefix_attestation_capability();
+                    let prefix_capability = attempt_use.backend().prefix_attestation_capability();
                     let node_harvest_mode = node.harvest_sanitization.unwrap_or_default();
                     let prefix_attestation_request = match prefix_attestation_request_for_capability(
                         node_harvest_mode,
@@ -2315,7 +2657,7 @@ impl WorkflowExecutor {
                         Ok(request) => request,
                         Err(e) => {
                             let _ = cleanup_cold_session(
-                                &resolved.backend,
+                                attempt_use.backend(),
                                 &session,
                                 &diagnostic,
                                 ColdCleanupAction::Forget,
@@ -2334,8 +2676,8 @@ impl WorkflowExecutor {
                     let obs_ctx_ref = obs_ctx_opt
                         .as_ref()
                         .expect("turn context is stashed before the prompt is dispatched");
-                    resolved
-                        .backend
+                    attempt_use
+                        .backend()
                         .configure_turn(
                             &session,
                             TurnMeta {
@@ -2378,7 +2720,7 @@ impl WorkflowExecutor {
                             let terminal_evidence = match rich_sink.as_ref() {
                                 Some(sink) => sink
                                     .terminal_evidence_for_turn(
-                                        resolved.backend.terminal_evidence_capability(),
+                                        attempt_use.backend().terminal_evidence_capability(),
                                         u64::from(attempt),
                                         session.as_str(),
                                         obs_ctx_ref.turn_id.as_str(),
@@ -2392,7 +2734,7 @@ impl WorkflowExecutor {
                                     bridge_core::terminal_evidence::SharedTurnEvidence::unsupported(),
                                 ),
                             };
-                            let stream = resolved.backend.prompt_with_observers(
+                            let stream = attempt_use.backend().prompt_with_observers(
                                 &session,
                                 prompt_parts,
                                 BackendObservers::new(diagnostic.clone(), rich_sink.clone())
@@ -2418,7 +2760,7 @@ impl WorkflowExecutor {
                                         ColdCleanupAction::Forget
                                     };
                                     let cleanup_allows_retry = cleanup_cold_session(
-                                        &resolved.backend,
+                                        attempt_use.backend(),
                                         &session,
                                         &diagnostic,
                                         action,
@@ -2430,10 +2772,12 @@ impl WorkflowExecutor {
                                         err: e,
                                         usage: None,
                                         cleanup_allows_retry,
+                                        invalidation: attempt_use
+                                            .into_retry_invalidation(&node.agent),
                                     };
                                 }
                                 let _ = cleanup_cold_session(
-                                    &resolved.backend,
+                                    attempt_use.backend(),
                                     &session,
                                     &diagnostic,
                                     ColdCleanupAction::Forget,
@@ -2463,13 +2807,13 @@ impl WorkflowExecutor {
                             // cancellation even while prompt-open is pending,
                             // then settle the session teardown before projecting
                             // a terminal outcome.
-                            let cancel_error = resolved
-                                .backend
+                            let cancel_error = attempt_use
+                                .backend()
                                 .cancel_observed(&session, diagnostic.clone())
                                 .await
                                 .err();
                             let cleanup_error = cleanup_cold_session(
-                                &resolved.backend,
+                                attempt_use.backend(),
                                 &session,
                                 &diagnostic,
                                 ColdCleanupAction::Forget,
@@ -2608,8 +2952,8 @@ impl WorkflowExecutor {
                         }
                     }
                     let cancel_error = if canceled_during_drain {
-                        resolved
-                            .backend
+                        attempt_use
+                            .backend()
                             .cancel_observed(&session, diagnostic.clone())
                             .await
                             .err()
@@ -2635,7 +2979,7 @@ impl WorkflowExecutor {
                                 usage = None;
                             } else {
                                 let _ = cleanup_cold_session(
-                                    &resolved.backend,
+                                    attempt_use.backend(),
                                     &session,
                                     &diagnostic,
                                     ColdCleanupAction::Forget,
@@ -2663,7 +3007,7 @@ impl WorkflowExecutor {
                     }
                     if canceled_during_drain {
                         let cleanup_error = cleanup_cold_session(
-                            &resolved.backend,
+                            attempt_use.backend(),
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
@@ -2733,7 +3077,7 @@ impl WorkflowExecutor {
                         )
                         .await;
                         let _ = cleanup_cold_session(
-                            &resolved.backend,
+                            attempt_use.backend(),
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
@@ -2757,7 +3101,7 @@ impl WorkflowExecutor {
                                 ColdCleanupAction::Forget
                             };
                             let cleanup_allows_retry = cleanup_cold_session(
-                                &resolved.backend,
+                                attempt_use.backend(),
                                 &session,
                                 &diagnostic,
                                 action,
@@ -2769,11 +3113,12 @@ impl WorkflowExecutor {
                                 err: e,
                                 usage,
                                 cleanup_allows_retry,
+                                invalidation: attempt_use.into_retry_invalidation(&node.agent),
                             };
                         }
                         let fc = classify_failure(&e);
                         let _ = cleanup_cold_session(
-                            &resolved.backend,
+                            attempt_use.backend(),
                             &session,
                             &diagnostic,
                             ColdCleanupAction::Forget,
@@ -2799,7 +3144,7 @@ impl WorkflowExecutor {
                         };
                     }
                     let cleanup = cleanup_cold_session(
-                        &resolved.backend,
+                        attempt_use.backend(),
                         &session,
                         &diagnostic,
                         ColdCleanupAction::Forget,
@@ -2956,6 +3301,7 @@ impl WorkflowExecutor {
                         err,
                         usage,
                         cleanup_allows_retry,
+                        invalidation,
                     } => {
                         let err_for_log = err.clone();
                         let fail_class = classify_failure(&err);
@@ -2974,7 +3320,7 @@ impl WorkflowExecutor {
                             });
                         }
                         if should_retry_after_attempt && cleanup_allows_retry {
-                            self.registry.invalidate(&node.agent).await;
+                            invalidation.apply(self.registry.as_ref()).await;
                             tracing::warn!(
                                 node = node.id.as_str(),
                                 attempt,
@@ -3189,7 +3535,7 @@ impl WorkflowExecutor {
         seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
         ctx: WorkflowDiagnosticContext,
     ) -> WorkflowStream {
-        let (ctx, diagnostic_factory, prompt_dispatch) = ctx.into_parts();
+        let (ctx, diagnostic_factory, prompt_dispatch, frozen_authority) = ctx.into_parts();
         self.run_from_with_context_inner(
             graph,
             input,
@@ -3199,6 +3545,7 @@ impl WorkflowExecutor {
             ctx,
             diagnostic_factory,
             prompt_dispatch,
+            frozen_authority,
             None,
         )
     }
@@ -3236,7 +3583,7 @@ impl WorkflowExecutor {
         ctx: WorkflowDiagnosticContext,
         dispatcher: Arc<dyn WorkflowNodeDispatcher>,
     ) -> WorkflowStream {
-        let (ctx, diagnostic_factory, prompt_dispatch) = ctx.into_parts();
+        let (ctx, diagnostic_factory, prompt_dispatch, frozen_authority) = ctx.into_parts();
         self.run_from_with_context_inner(
             graph,
             input,
@@ -3246,6 +3593,7 @@ impl WorkflowExecutor {
             ctx,
             diagnostic_factory,
             prompt_dispatch,
+            frozen_authority,
             Some(dispatcher),
         )
     }
@@ -3261,12 +3609,19 @@ impl WorkflowExecutor {
         ctx: WorkflowRunContext,
         diagnostic_factory: Arc<dyn DiagnosticObserverFactory>,
         prompt_dispatch: Option<PromptDispatchBarrier>,
+        frozen_authority: Option<FrozenWorkflowAuthority>,
         dispatcher: Option<Arc<dyn WorkflowNodeDispatcher>>,
     ) -> WorkflowStream {
         let this = WorkflowExecutor {
             registry: self.registry.clone(),
         };
         Box::pin(async_stream::stream! {
+            if let Some(authority) = frozen_authority.as_ref() {
+                if graph.as_ref() != &authority.run_spec.graph {
+                    yield Err(BridgeError::ConfigMismatch { field: "workflow_graph" });
+                    return;
+                }
+            }
             let cleanup_tracker = Arc::new(WorkflowCleanupTracker::default());
             // Off-mode audit exemption (§18-7, operator-adjudicated): audit
             // rows are durable whenever the feature is enabled for at least
@@ -3420,6 +3775,7 @@ impl WorkflowExecutor {
                                 let cleanup_tracker = cleanup_tracker.clone();
                                 let dispatcher = dispatcher.clone();
                                 let preflight_cache = preflight_cache.clone();
+                                let frozen_authority = frozen_authority.clone();
                                 let this = &this;
                                 inflight.push(Box::pin(async move {
                                     let vars: HashMap<&str, &str> =
@@ -3436,6 +3792,7 @@ impl WorkflowExecutor {
                                         cleanup_tracker.as_ref(),
                                         dispatcher.as_ref(),
                                         &preflight_cache,
+                                        frozen_authority.as_ref(),
                                     ).await;
                                     (node.id.clone(), output)
                                 }) as NodeFut);
@@ -6237,6 +6594,7 @@ mod tests {
                 &cleanup_tracker,
                 None,
                 &preflight_cache,
+                None,
             )
             .await
             .unwrap();
@@ -6262,6 +6620,7 @@ mod tests {
                 &cleanup_tracker,
                 Some(&dispatcher_dyn),
                 &preflight_cache,
+                None,
             )
             .await
             .unwrap();
@@ -6342,6 +6701,7 @@ mod tests {
                     first_cleanup_tracker.as_ref(),
                     None,
                     &first_cache,
+                    None,
                 )
                 .await
         });
@@ -6365,6 +6725,7 @@ mod tests {
             cleanup_tracker.as_ref(),
             None,
             &preflight_cache,
+            None,
         );
         tokio::pin!(second);
         if !matches!(futures::poll!(&mut second), std::task::Poll::Pending) {
