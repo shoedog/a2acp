@@ -1,8 +1,7 @@
 # R2f1a focused implementation boundary — profiles, fan-out policy, and per-node control
 
-- **Status:** REPAIRED — SOL/XHIGH CLOSURE REVIEW 5 PENDING / IMPLEMENTATION UNAUTHORIZED — one separately
-  authorized bounded repair closes the two closure-review-4 blockers; this round permits one cumulative review and
-  no second repair/review loop
+- **Status:** PARKED — SOL/XHIGH CLOSURE REVIEW 5 REJECT / ONE CLOSED-ENUMERABLE BLOCKER / CAP EXHAUSTED /
+  IMPLEMENTATION UNAUTHORIZED
 - **Frozen base:** `3f35ee6e07e9af314bb548b9d3ab694f3bba5fb1`
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Normative authority:** [`../specs/2026-07-20-r2f-owner-design.md`](../specs/2026-07-20-r2f-owner-design.md)
@@ -179,6 +178,25 @@ that value once, and makes those same bound bytes the only session/MCP delivery 
 history `auto_vacuum=FULL` before any durable or provider effect and permits `INCREMENTAL` only while the bridge-
 owned connection cannot execute incremental vacuum. This authorization does not extend to implementation, a second
 repair/review loop, Rust behavioral evidence, a compatibility case, release, deployment, or operator mutation.
+
+The docs-only repair was frozen at clean commit `f5096575814d40e0b5e506e03bb7c03c21a780e6`, tree
+`3652ad65239bce1150d86b213c2deab421f8e4b3`, with focused-artifact SHA-256
+`8388b24c5781aa68e9e742ad065283f25b749ba29dfba6da0e7334737e2fa96d` and roadmap SHA-256
+`5e5463adbea772f6845c00a1caa147530d8ae45e783765c249a9513dd1c5b040`. The one authorized review ran through host
+`codex-acp 1.1.7` / nested Codex `0.145.0` on exact advertised `gpt-5.6-sol[xhigh]` / `xhigh` / `read-only` as
+execution `exec-1882a11ffa68f9dad47ae79115e16939`, attempt
+`attempt-454556a4b041f292d63612df44d7c6cb`. The first model-catalog probe was an inadmissible managed-sandbox state-
+initialization failure with `prompt_may_have_been_accepted: false`; the identical host probe passed, and the review
+was dispatched once with no replay or fallback.
+
+The 15,717-byte raw artifact has SHA-256
+`f6bf2f57c72d378410b9819f5ffc9f1452b61394205222cfdc69932414dcc607`; the checked-in
+[`closure review 5 record`](../reviews/2026-08-01-r2f1a-sol-closure-review-5.md) adds only the repository-standard
+final newline and has SHA-256 `47718d2cbb5f56b06d2a9e6c6f3bc54afbdb1e229a2741eca3c06d9251e82fff`. It returned `REJECT` with one blocker
+`WRONG` and no `SMELL`: when worktrees are enabled, `WorktreeBackend` derives an attempt/session-specific inner cwd
+after the proposed provider-effect bind, so the frozen cwd/MCP bytes, the actual worktree delivery, isolation, and
+resume identity cannot all be true. W1/W1-B remain `PARTIAL`; W1-A and W2-W6 are `FIXED`. The defect is
+closed-enumerable around that shipped decorator, but the declared cap is exhausted.
 
 ## 1. Frozen authority and slice boundary
 
@@ -2491,9 +2509,11 @@ record. The owner then opened one further closed-population round. This revision
 This repair remains design-only and has not run a Rust behavior test. Its pre-freeze deterministic gates passed:
 `git diff --check`, direct existence checks for every changed-document target, and
 `cargo run -p a2a-bridge -- validate --repo-hygiene` (**39 tracked artifacts / 7 validated example configs**).
-That command reused the scratch clone's dev build; it is not provider or Rust behavior evidence. Exactly one
-cumulative Sol/xhigh closure review remains required. The round cap permits no second repair, review
-replay/fallback, implementation, compatibility/live case, release, deployment, or operator mutation. A rejecting
-review parks this exact artifact and its retained evidence.
+That command reused the scratch clone's dev build; it is not provider or Rust behavior evidence. Closure review 5
+accepted the two intended local mechanisms but found the post-bind worktree transformation above. Its complete
+likelihood, exposure, impact, bounded corrections, cost, and fail-first matrix are retained in the linked review.
+The round cap is exhausted and permits no repair, review replay/fallback, implementation, compatibility/live case,
+release, deployment, or operator mutation. This exact artifact and evidence are parked pending separate owner
+direction.
 
-R2F1A FOCUSED BOUNDARY: REPAIRED / SOL CLOSURE REVIEW 5 PENDING / IMPLEMENTATION UNAUTHORIZED
+R2F1A FOCUSED BOUNDARY: PARKED / SOL CLOSURE REVIEW 5 REJECT / CAP EXHAUSTED / IMPLEMENTATION UNAUTHORIZED
