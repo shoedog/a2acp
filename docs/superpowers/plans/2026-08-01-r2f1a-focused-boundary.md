@@ -1,8 +1,7 @@
 # R2f1a focused implementation boundary — profiles, fan-out policy, and per-node control
 
-- **Status:** REPAIRED / AWAITING SOL CLOSURE REVIEW 4 — the owner authorized one bounded local repair of the four
-  closed-enumerable closure-review-3 blockers, deterministic documentation gates, and exactly one cumulative
-  Sol/xhigh review; implementation remains unauthorized
+- **Status:** PARKED — SOL CLOSURE REVIEW 4 REJECT / CAP EXHAUSTED / IMPLEMENTATION UNAUTHORIZED — the one
+  authorized cumulative review found two closed-enumerable blockers; no further repair or review is authorized
 - **Frozen base:** `3f35ee6e07e9af314bb548b9d3ab694f3bba5fb1`
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Normative authority:** [`../specs/2026-07-20-r2f-owner-design.md`](../specs/2026-07-20-r2f-owner-design.md)
@@ -12,9 +11,9 @@
 - **Synthesis:** `644c2df21579bcb3dc9e07f347911f1516ebf61d6c0b9493433d117d83070a84`
 
 This document records the repaired proposed source boundary. It narrows, but does not replace, the approved owner
-design and parent plan. Its contents are not implementation authority: closure review 3 rejected the preceding
-checkpoint, and this repair cannot advance until one fresh cumulative Sol/xhigh review approves the exact clean
-commit under the owner-authorized convergence cap.
+design and parent plan. Its contents are not implementation authority: closure review 4 rejected the exact clean
+repair commit, and the owner-authorized convergence cap is exhausted. The two residual blockers below must remain
+parked until a separately authorized bounded repair/review round.
 
 ## Dogfood and synthesis evidence
 
@@ -151,6 +150,24 @@ and reported **39 tracked artifacts / 7 validated example configs**. `git diff -
 for the changed documents' roadmap, owner-design, parent-plan, prior-review, and ADR targets also passed. The hygiene
 command compiled the dev binary in the scratch clone; no Rust test suite, compatibility case, smoke, or provider
 behavior was exercised by these deterministic checks.
+
+The exact docs-only repair was frozen at commit `3440829aa920de8bf6782a7181d3c664cc56f87b`, tree
+`55577cfb7e933c044e2388f436b758a778a9a890`, with focused-artifact SHA-256
+`6af2531fbbe042e73f892571fb08713dd09640517fd05be46b1b712822afcb85` and roadmap SHA-256
+`f8ef242c1b00d02f09aa9273c63b5cc13675d3f54ab2899f31d4d32b7b0367d6`. The one authorized Sol/xhigh
+closure review ran through host `codex-acp 1.1.7` / nested Codex `0.145.0` on exact advertised
+`gpt-5.6-sol[xhigh]` / `xhigh` / `read-only` as execution `exec-5a7db8aac53fcc0092dc7c937b3f931a`, attempt
+`attempt-8f62c3a1dd9b15c88301c9e8d9182e3e`. The first model-catalog probe was inadmissible because the managed
+sandbox could not initialize the existing Codex state; it recorded `prompt_may_have_been_accepted: false`. The exact
+same host probe then passed, and the review was dispatched once with no replay or fallback.
+
+The 17,689-byte raw review artifact has SHA-256
+`868010ca02b8fc8403dd673910469553e727b84c3c57ac88fb9b3e7a34c1a5f4`; the checked-in
+[`closure review 4 record`](../reviews/2026-08-01-r2f1a-sol-closure-review-4.md) differs only by the
+repository-standard final newline. It returned `REJECT` with two blocker `WRONG` findings and no `SMELL`: effective
+request cwd and `{cwd}`-resolved MCP delivery bytes are not committed into provider identity, and SQLite FULL
+auto-vacuum can relocate an unrelated tail page and rewrite more pointer-map pages than `D(R)=3R+2` reserves. The
+review classified both as closed-enumerable with bounded fixes, but the declared cap permits neither fix here.
 
 ## 1. Frozen authority and slice boundary
 
@@ -2206,4 +2223,16 @@ closure review of the clean repair commit. It permits no second repair/review lo
 implementation, Rust test result, release, deployment, or live operator effect is authorized or claimed; a rejection
 parks this document again.
 
-R2F1A FOCUSED BOUNDARY: REPAIRED / AWAITING SOL CLOSURE REVIEW 4 / IMPLEMENTATION UNAUTHORIZED
+Closure review 4 marked W1-A, W2, W4, W5, and W6 `FIXED`, retained W1/W1-B and W3 as `PARTIAL`, and rejected the
+following exact residual population:
+
+| Residual blocker | Real-world condition, impact, and bounded proposed fix |
+|---|---|
+| WRONG W1/W1-B — effective request cwd and delivered MCP bytes are not committed | A normal served or batch workflow runs the same entry against cwd A versus B with `ROOT={cwd}/tools`; the frozen configured literal and provider digest are identical, but ACP receives different session/MCP bytes. Likelihood is common for cross-repository use and the impact is wrong tool/repository provenance under falsely equal identity. Freeze the resolved effective cwd in the run spec and execution identity, use it for both session mint and substitution, and commit the exact public delivery bytes (or the template plus that exact frozen resolution input) into cache/replay/resume identity. Add served plus fresh/resumed batch A/B fail-first controls and a no-template negative control. |
+| WRONG W3 — FULL auto-vacuum escapes `D(R)=3R+2` | Rare but constructible boundary state: retention frees a history page while FULL auto-vacuum relocates an unrelated fragmented tail interior page; SQLite rewrites pointer-map entries for its distributed children/overflow pointers, which is not bounded by history-root union `R`. Near 128 MiB this can underreserve WAL/journal custody. Fail closed on `auto_vacuum=FULL` for configured-history admission/migration; permit `NONE`, and `INCREMENTAL` only while vacuum operations are prohibited or separately ticketed. Retaining FULL support requires a new relocation proof or exact dirty-page instrumentation. |
+
+The complete likelihood, exposure, impact, repair cost, and fail-first evidence is retained in the linked closure-4
+record. The population is closed-enumerable, but the design-review cap is exhausted: no repair, second review,
+implementation, release, deployment, or operator mutation is authorized by this checkpoint.
+
+R2F1A FOCUSED BOUNDARY: PARKED / SOL CLOSURE REVIEW 4 REJECT / CAP EXHAUSTED / IMPLEMENTATION UNAUTHORIZED
