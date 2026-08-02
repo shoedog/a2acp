@@ -1,7 +1,8 @@
 # R2f1a focused implementation boundary — profiles, fan-out policy, and per-node control
 
-- **Status:** PARKED / SOL CLOSURE REVIEW 3 REJECT — four closed-enumerable blockers remain; the declared design
-  convergence cap is exhausted; owner direction is required before any repair, review, or implementation
+- **Status:** REPAIRED / AWAITING SOL CLOSURE REVIEW 4 — the owner authorized one bounded local repair of the four
+  closed-enumerable closure-review-3 blockers, deterministic documentation gates, and exactly one cumulative
+  Sol/xhigh review; implementation remains unauthorized
 - **Frozen base:** `3f35ee6e07e9af314bb548b9d3ab694f3bba5fb1`
 - **Program cursor:** [`../../reliability-execution-roadmap.md`](../../reliability-execution-roadmap.md)
 - **Normative authority:** [`../specs/2026-07-20-r2f-owner-design.md`](../specs/2026-07-20-r2f-owner-design.md)
@@ -10,10 +11,10 @@
 - **Fable input:** `d612788847a9142172cb38080bc77568e23c89116f44153ec0376b17327ce8c0`
 - **Synthesis:** `644c2df21579bcb3dc9e07f347911f1516ebf61d6c0b9493433d117d83070a84`
 
-This document records the rejected proposed source boundary. It narrows, but does not replace, the approved owner
-design and parent plan. Its contents are not implementation authority: closure review 3 rejected the checkpoint,
-and the status cannot advance until the four residual blockers are repaired and cumulatively approved under a new
-owner-authorized convergence round.
+This document records the repaired proposed source boundary. It narrows, but does not replace, the approved owner
+design and parent plan. Its contents are not implementation authority: closure review 3 rejected the preceding
+checkpoint, and this repair cannot advance until one fresh cumulative Sol/xhigh review approves the exact clean
+commit under the owner-authorized convergence cap.
 
 ## Dogfood and synthesis evidence
 
@@ -135,6 +136,15 @@ had SHA-256 `154417a11a82c989eaa7682f718e23fc16d9b124e899e8267b53a6a663a6016b`; 
 repository-standard final newline. The review returned `REJECT` with four closed-enumerable blocker `WRONG`
 findings and no `SMELL`. The declared round allowed one Sonnet/xhigh mining turn, one Opus/xhigh repair, and one
 Sol/xhigh closure review. That cap is exhausted, so the checkpoint is parked rather than silently repaired again.
+
+The owner then authorized one further bounded repair of that exact closed population, deterministic documentation
+gates, and exactly one Sol/xhigh cumulative closure review. The repair decisions are explicit: API session model
+state becomes tri-valued; MCP environment values gain typed secret references and secret-silent keyed commitments
+without pretending to infer credential entropy; configured-store accounting uses measured allocation-owned pages
+plus pre-debited journal/WAL mutation tickets; and the injected overflow comparison permits only the exact
+dependency/cause changes the fallback requires. This cap authorizes no second repair, replay, fallback review,
+implementation, Rust test claim, live compatibility case, release, deployment, or operator mutation. A rejecting
+closure review parks the artifact again.
 
 The pre-freeze docs gate ran `cargo run -p a2a-bridge -- validate --repo-hygiene` successfully in the scratch clone
 and reported **39 tracked artifacts / 7 validated example configs**. `git diff --check` and direct existence checks
@@ -473,7 +483,8 @@ margin for the additive declared-control evidence block. Each constant carries t
    original `failure_class`, the original static `code`, the prompt-acceptance bit, degraded ancestry, and the
    trigger id — drops only `dependency_set`, whose exact members remain recomputable from the frozen graph and
    terminal map, sets `evidence_overflow = true`, and retains the **deepest UTF-8 suffix** of `deepest_cause` that
-   fits the remaining encoded budget, setting `cause_truncated = true` whenever that shortened the cause;
+   fits the remaining encoded budget, setting `cause_truncated` to its prior truth value OR whether that shortened
+   the cause;
 5. return the exact byte string. A value still over bound after step 4 is an invariant violation: the node
    terminalizes through the typed over-bound path and no over-bound row is ever written or admitted.
 
@@ -483,7 +494,9 @@ been violated, and contradicted the owner design's requirement that failed roots
 the deepest bounded cause. Overflow is therefore indicated **separately** from the failure it describes:
 
 - `failure_class` and `code` always keep their original values; no code is overwritten, and `evidence_overflow` is
-  the only signal that the encoder hit its bound. Two distinct failures that overflow remain distinguishable.
+  the only **dedicated overflow-classification field**. It is not the only serialized field permitted to change:
+  fitting the bounded representation may drop `dependency_set` and shorten the cause as specified below. Two
+  distinct failures that overflow remain distinguishable.
 - the retained suffix is computed by measurement, not from a constant: serialize the mandatory shape with an empty
   cause, measure its exact encoded length, and give the cause the whole remaining budget, stepping down on UTF-8
   character boundaries from the deepest end until the re-measured encoding fits. Keeping the suffix retains the
@@ -533,6 +546,8 @@ pub struct FrozenProviderSelectionV1 {
 pub struct FrozenProviderEffectV1 {
     pub agent: AgentId,
     pub effect_digest: Sha256HexV1,
+    /// Present exactly when the entry carries one or more MCP environment values.
+    pub secret_commitment_key_id: Option<Sha256HexV1>,
 }
 
 pub struct FrozenNodeExecutionIdentityV1 {
@@ -579,7 +594,7 @@ mint, watchdog behavior, or MCP prompt transport and is not already carried by t
 | backend construction and transport | `kind`, `cmd`, `args`, `base_url` |
 | credentials and authentication | `api_key_env` (the variable **name** only, never its value), `auth_method`, `pre_authenticated` |
 | checkout, isolation, and session location | `cwd`, `session_cwd`, `sandbox`, `watchdog` |
-| tool surface offered to the agent | `mcp` with exact server/argument/environment order and configured values, plus `mcp_delivery` |
+| tool surface offered to the agent | `mcp` with exact server/argument/environment order, public source descriptors, and keyed value commitments, plus `mcp_delivery` |
 
 `id` is carried beside `effect_digest` in `FrozenProviderEffectV1` and is also part of `selection_digest`.
 `model`, `effort`, `mode`, `preflight`, and `fallback_models` are carried by that separate selection digest rather
@@ -591,9 +606,80 @@ authorization edit cannot manufacture R2f1a drift. The classification is exhaust
 builder destructures `AgentEntry` with no `..` rest pattern and explicitly routes each field to provider effect,
 selection, carried identifier, or excluded-by-source-boundary metadata. Adding a field fails compilation until it is
 classified. The ambient bearer selected by `api_key_env` is never read or hashed; only its configured variable name
-participates. Configured MCP environment values do alter the delivered tool surface and therefore participate in the
-domain-separated effect digest, but no raw MCP command, argument, or environment value is persisted, projected, or
-logged by this identity mechanism.
+participates. MCP environment values alter the delivered tool surface, but they enter durable identity only through
+the secret-silent keyed commitment below. No raw MCP command, argument, environment value, key path, or key byte is
+persisted, projected, or logged by this identity mechanism.
+
+**Typed MCP environment values and secret-silent commitment.** The current `EnvToml { name, value }` and
+`McpServerSpec.env: Vec<(String, String)>` make a literal value both delivery data and potential credential material.
+R2f1a replaces that ambiguous internal shape with one closed source enum while retaining declaration order:
+
+```rust
+pub enum McpEnvValueSourceV1 {
+    PublicLiteral(String),
+    SecretFromEnv { variable: String, resolved: SecretString },
+}
+
+pub struct McpEnvBindingV1 {
+    pub name: String,
+    pub source: McpEnvValueSourceV1,
+}
+```
+
+Each `[[agents.mcp.env]]` sets exactly one of `value` or `value_from_env`. `value` is explicitly a public literal and
+retains today's `{cwd}` substitution. `value_from_env` is a nonempty environment-variable **name**, permits no
+template syntax, and is resolved exactly once while constructing the immutable `AgentEntry`; missing, non-Unicode,
+or empty input refuses the snapshot. `SecretString` has secret-silent `Debug`/display/serialization behavior. The
+same immutable source bytes held by the bound entry are used for commitment and delivery: referenced secrets are
+delivered directly, while public literals undergo only the already-frozen `{cwd}` substitution. No later `std::env`
+read may change a referenced value between validation and provider use. Reload re-resolves into a new
+entry, so a changed referenced value is ordinary provider-effect drift. Existing literal syntax remains valid, but
+the type and operator docs no longer call it a credential channel.
+
+`SecretFromEnv` is admitted only when the resolved delivery is `McpDelivery::Acp`. Current `CodexNative` renders MCP
+values in process arguments and `KiroNative` writes them into native settings; those channels remain public-literal
+only and reject a secret reference until they have a separately reviewed secret-safe transport. For ACP, every
+referenced source variable is removed from the adapter child's ambient environment, the value is delivered only in
+the typed ACP MCP-server field, and its redaction material is installed before any diagnostic-capable send. This is
+delivery custody, not a claim that a deliberately hostile adapter cannot inspect the MCP configuration it receives.
+
+Every MCP environment value is keyed before it enters durable identity, including a declared-public literal. This
+defense-in-depth rule closes the offline oracle even when an old or mistaken config put a low-entropy credential in
+`value`; the bridge does not try to infer entropy or secrecy from names or bytes. For each binding, compute
+`HMAC-SHA256(K, domain || schema || agent || server_ordinal || env_ordinal || env_name || source_kind ||
+source_name_if_any || source_value_bytes)` with injective length prefixes. The canonical provider-effect encoding
+contains the public server/env order and source descriptor plus that 32-byte MAC, never the configured or resolved
+value. `effect_digest` remains SHA-256 over the resulting secret-silent canonical effect encoding.
+
+`K` is an operator-provisioned, exactly 32-byte random provider-effect key named by
+`[security].provider_effect_key_file`. The bridge opens that existing regular file descriptor-relatively/no-follow
+under the same owner-private custody rules used for history state, requires one link and owner-only access on Unix,
+requires an absolute canonical path in a separately held platform secret-state directory, and rejects containment
+under a repository, session/allowed-cwd root, evidence/output root, configured SQLite artifact, or any projected
+container mount. Raw and canonical containment checks prevent a symlink/`..` alias from bypassing that separation.
+The process loads the key once and never passes it to an adapter child, container, snapshot, history row, export, or
+diagnostic. Syntax-only validation performs no key-file I/O; doctor and effect freezing report a bounded typed
+failure. An entry with no MCP environment values needs no key and persists `secret_commitment_key_id = None`.
+Otherwise the key is mandatory before snapshot-V2 persistence or any registry/session/provider effect, and the
+persisted key id is
+`HMAC-SHA256(K, "a2a-bridge/provider-effect-key-id/v1")`. The 32-byte key requirement is a custody requirement for this
+bridge-generated verifier key; it does not claim that an arbitrary MCP credential has measurable entropy.
+
+The supported provisioning path is `a2a-bridge provider-effect-key create --out <absolute-new-path>`. It obtains all
+32 bytes from the operating-system CSPRNG, creates the destination with no-follow/exclusive-create and owner-only
+mode, refuses an existing path or link, writes and syncs the file, syncs its containing directory, and emits no key
+bytes. `init` may invoke the same primitive but never overwrites or rotates a key. A deterministic fault-injection
+test covers every write/sync boundary and leaves either no entry or one complete owner-private key. Runtime cannot
+statistically prove entropy from an imported 32-byte string; accepting an externally provisioned file is therefore
+an explicit operator assertion that it was CSPRNG-generated, while the bridge-created path supplies the enforceable
+default. Neither path attempts to infer the entropy of an MCP value.
+
+Resume resolves the current key and every typed value once, requires the current key id to equal the persisted id,
+recomputes every MAC, and compares the resulting effect digest before any effect. Missing/replaced key material,
+missing referenced environment input, or a changed value refuses as typed provider-identity drift; it never creates a
+replacement key, silently accepts a new epoch, or falls back to an unkeyed digest. Key rotation for working attempts
+is a separate administrative migration and is not added here. Terminal historical rows remain readable without the
+key because they are evidence, not authority to resume.
 
 **Selection digest.** `selection_digest` is unchanged: SHA-256 over a canonical, injective encoding of the whole
 selection tuple, each component emitted as a length-prefixed byte string in fixed order — agent id, preflight flag,
@@ -869,6 +955,13 @@ rules are:
   registry call the attempt may make; no code path may call `resolve`, `entry_snapshot`, `configured_effective`, or
   any other entry-reading accessor again. Because the attempt never re-reads `slot.entry`, a config-only reload
   landing after the bind cannot reach it: the validated value is the used value.
+- The API backend represents its per-session model as
+  `Unconfigured | ExplicitNone | ExplicitSome(String)`, not `Option<String>`. A newly minted legacy session is
+  `Unconfigured` and may use the backend's spawn-time default; every successful `configure_session` changes it to
+  `ExplicitNone` or `ExplicitSome` from the bound `SessionSpec`. `resolve_model` falls back to the spawn default only
+  for `Unconfigured`. An explicit bound `None` therefore suppresses a stale default captured when the warm API slot
+  was first spawned, while `Some(B)` selects B. This rule is API-local and does not force a new registry slot or
+  weaken the config-only warm-reuse contract.
 - Each candidate's backend resolution goes through `resolve_bound`, which resolves the backend of the exact bound
   slot rather than re-looking-up by agent id, and initializes that backend from the same bound entry if needed.
   `bind_entry_use` increments the lease before checking retirement and retries the current mapping if the chosen slot
@@ -1205,7 +1298,6 @@ CREATE TABLE workflow_attempt_node_terminals(
     node_id          TEXT NOT NULL,
     terminal_json    TEXT NOT NULL,
     terminal_reserve INTEGER NOT NULL,
-    charged_bytes    INTEGER NOT NULL,
     PRIMARY KEY(attempt_id, node_id)
 ) WITHOUT ROWID;
 ```
@@ -1231,56 +1323,164 @@ conforming implementation could pass its own schema gate. The invariant is:
   `SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND tbl_name='workflow_attempt_node_terminals'` is **zero**,
   proving the primary key has no separately rooted B-tree and is the table itself;
 - adding any index later adds a second `index_list` entry and a separate `sqlite_schema` root, so the regression
-  fails until every charge below is re-derived in the same change.
+  fails until the measurement roster and mutation-ticket proof are adjudicated in the same change.
 
 #### Placeholder materialization
 
 At admission, create one placeholder node row per canonical graph node with its **full** key and a
 `MAX_NODE_TERMINAL_JSON_BYTES` terminal reserve. The placeholder is materialized at exactly its reserve size: its
-`terminal_json` is canonical filler of exactly `MAX_NODE_TERMINAL_JSON_BYTES` bytes, and its `terminal_reserve` and
-`charged_bytes` integer columns are written at admission at their **final** values and never rewritten. Replacing the
+`terminal_json` is canonical filler of exactly `MAX_NODE_TERMINAL_JSON_BYTES` bytes, and its `terminal_reserve`
+integer column is written at admission at its **final** value and never rewritten. Replacing the
 filler with a real terminal therefore writes an equal-or-smaller payload — a shorter TEXT also has an equal-or-smaller
 serial-type varint — into an already-allocated cell, so replacement cannot grow the row, split a page, or add an
 overflow page. The reserve is consumed at admission or not at all.
 
-#### Logical accounting
+#### Configured-store measured accounting
 
-Accounting schema V2 uses `MAX_NODE_TERMINAL_JSON_BYTES = 2_048`, `MAX_POLICY_TRIGGER_JSON_BYTES = 1_024`, and
-`MAX_CONTROLS_JSON_BYTES = 4_096` from §3, plus:
+Configured shared stores cannot use the fixed `exact key bytes + 256` charge. A 256-byte constant does not bound
+SQLite record headers, B-tree structure, overflow pointers, or WAL frames for an uncapped `NodeId`. Accounting V2
+therefore deletes `NODE_ROW_OVERHEAD_BYTES`, every per-attempt page prediction, and the invariant equating aggregate
+charge to a sum of logical row lengths.
+
+The bundled SQLite is compiled with `SQLITE_ENABLE_DBSTAT_VTAB`. In the serialized pre-effect transaction, after
+materializing the exact rows, query `dbstat('main')` and checked-sum `pgsize` for one explicit
+`HISTORY_ALLOCATION_TABLES_V2` roster and every SQLite index whose `sqlite_schema.tbl_name` belongs to that roster:
+
+- `workflow_attempt_summaries`;
+- `workflow_history_attachment`;
+- `workflow_history_rewrite_reserve`;
+- `workflow_attempt_node_terminals`;
+- `workflow_history_mutation_reserve`; and
+- `workflow_history_allocation`.
+
+Admission retains the existing atomic authority/history transaction. That transaction explicitly inserts or updates
+`attempt_identities` on success; a served refusal may instead update `attempt_identities` and
+`task_attempt_locators` without admitting a history row. Those permanent authority/primary roots and their journal
+frames remain outside the configured workflow-history allocation, exactly like unrelated task/turn data. The ticket
+is root-attributed rather than whole-transaction-attributed: it conservatively reserves every frame whose database
+page belongs to a roster root, while explicit authority/locator frames are primary-store custody. This preserves the
+accepted R2f0a property that a large permanent identity or unrelated primary table cannot brick history admission.
+A served refusal that writes no roster root creates no history ticket or history debt.
+
+The schema gate rejects an unclassified table/index in the allocation namespace, any trigger on an allocation or
+explicitly co-mutated authority/locator root, and any foreign-key action that a history-root mutation could drive
+outside the history roster. The attachment delete cascade terminates inside the roster. Adding a history index
+changes the measured charge automatically; adding a trigger or an escaping cascade refuses until its dirty roots and
+mutation direction are adjudicated. `tasks`, `sessions`, `turn_log`, task journals/checkpoints, attempt identities,
+task-attempt locators, harvest tables, and every other primary-store object are deliberately outside the roster:
+unrelated primary data does not consume the 128-MiB history allocation, and it cannot hide a history page because
+every history-owned root is enumerated from `sqlite_schema`. `dbstat` counts leaf, interior, and overflow pages in
+the current transaction, so the full arbitrary ID and placeholder are charged by their real table-local page
+allocation rather than a payload formula.
+
+`workflow_history_mutation_reserve` is `WITHOUT ROWID` and keys a ticket by bounded `attempt_id`, closed numeric
+`mutation_kind`, and checked `u32` ordinal; node tickets use the graph-bound sorted ordinal and never duplicate an
+arbitrary `NodeId`. Its reserve is an exact eight-byte big-endian BLOB and its state is a closed integer, so rebasing a
+ticket cannot enlarge its record. The admission transaction materializes every ticket row before the final `H`
+measurement, then writes only equal-width bounds/states. Schema-shape tests reject a secondary index, variable-width
+reserve, full node-id key, or unclassified state/kind.
+
+Accounting V2 likewise rebuilds every dynamic numeric cell in `workflow_history_allocation`—the five byte
+components, aggregate charge, slot count, and terminal count—as an exact eight-byte big-endian BLOB decoded through
+checked `u64`; allocation kind/state are closed one-byte integer codes. Static limits are schema constants, not
+rewritten counters. The singleton has no secondary index. Replacing a component value or flipping a closed state
+therefore cannot change record width after measurement; a variable-width INTEGER/TEXT component is a schema refusal.
+
+Every possible post-admission history write consumes one persisted closed mutation ticket: one ticket per node
+terminal replacement, at most one trigger barrier, one attempt terminalization, and each separately bounded
+enrichment/reconciliation mutation named by the schema. There is no wildcard ticket, and an unreserved mutation
+refuses before SQL. Let `H` be the freshly measured count of allocation-owned pages after materialization and let
+`frame_bytes = page_size + 24`. Inside a future history-only mutation the implementation remeasures and requires
+`H_post <= 2 * H + 2`, so the pre/post roster-root union has size at most `R = H + H_post <= 3 * H + 2`.
+
+`dbstat` deliberately omits shared structural pages, so `R + 2` is not a proof: at 512-byte pages an auto-vacuum
+database with one 1-MiB value has 2,138 pages while `dbstat` reports only 2,116, 2,115 of them for the owning table.
+The closed mutation SQL therefore uses no temporary table, DDL, `VACUUM`, or insert-then-delete allocation churn;
+every roster page it allocates or frees appears in the pre/post union. For any such root union, reserve
+`D(R) = 3 * R + 2` dirty pages: `R` for every pre/post roster page, at most `R` distinct auto-vacuum pointer-map
+pages, at most `R + 1` distinct freelist trunk/leaf pages, and one database-header page. The future history-only WAL
+ticket is consequently `W(D(3 * H + 2)) = 32 + (9 * H + 8) * frame_bytes`, with checked arithmetic. A larger root
+transition or any SQL plan outside the closed no-churn shape rolls back as `capacity_protected`; it is never learned
+after commit.
+
+Admission uses its own exact closed history ticket because arbitrary IDs can make its page growth much larger than a
+post-admission lifecycle mutation. Measure roster pages as `H0` before the transaction's first write and `H1` after
+materializing the complete history result and pre-materializing every fixed-width ticket/allocation cell, but before
+installing their computed equal-width values and committing. Its history root-union bound is
+`R_admission = H0 + H1`; its dirty-page bound is
+`D_admission = D(R_admission) = 3 * (H0 + H1) + 2`, and its WAL ticket is
+`W(D_admission) = 32 + D_admission * frame_bytes`. The explicit authority/locator writes in the same transaction do
+not enter `H0`/`H1`; the structural multiplier covers shared pointer-map, freelist, and header pages attributable to
+roster growth. Every ticket, component, count, and state cell is pre-materialized before the final measurement, so
+installing the checked values and consumed state cannot grow a root after `H1`; an out-of-range value refuses.
+
+History transactions run with connection-local `cache_spill=OFF` while holding the store mutex, so one transaction
+cannot emit repeated spill frames for the same dirty page. An RAII guard captures the exact prior spill setting,
+disables it before `BEGIN IMMEDIATE`, and restores it on commit, rollback, error, cancellation, and unwind;
+restoration failure quarantines configured-history writes instead of silently changing primary-store policy.
+Whenever measured `H` changes, admission/mutation recomputes **all** unconsumed tickets under the same serialized
+transaction before accepting the new state, so a later attempt cannot make an older ticket stale.
+
+The closed kinds are `admission`, `prompt_acceptance`, `node_terminal`, `trigger_barrier`, `attempt_terminal`,
+`cleanup_settlement`, `final_activity`, and `boot_reconciliation`. Admission persists their exact legal population:
+its own commit ticket, one prompt transition, one node transition per canonical node, at most one trigger, one of attempt-terminal or boot-
+reconciliation, at most one cleanup settlement, and one final activity snapshot; byte-identical replay consumes no
+new ticket. The admission transaction runs with spill disabled, measures before commit, and moves its ticket directly
+to WAL debt when it commits. `pin_change`, one bounded `retention_batch`, and a migration step are operator/store
+mutations rather than provider-lifecycle promises. One maintenance ticket sized from current `H` is permanently
+included in the allocation so retention can still make progress when ordinary admission has consumed every other
+byte; retention consumes and re-establishes that ticket atomically. Pin changes and migration obtain their own exact
+one-operation ticket under the serialized capacity check immediately before SQL and may refuse when no headroom
+exists. Repeated pin toggles therefore cannot evade the cap, while they also do not require an unbounded reservation
+at workflow admission. A total enum/match and persisted ticket identity make a new mutation kind a compile/schema
+failure until its reserve ownership is specified.
+
+On a WAL commit, the exact ticket moves atomically from `future_wal_reserve_bytes` to sticky `wal_debt_bytes`; total
+charge does not fall merely because the mutation finished. The persisted debt is an upper bound tagged with the
+observed WAL epoch. It may be treated as cleared only after `busy=0` plus a complete checkpoint/reset proves that
+epoch has no surviving frame. No standalone “set debt to zero” write is allowed, because that write would itself
+append a frame. Instead, the next serialized history mutation uses the reset proof in its preflight calculation and
+atomically replaces the stale upper bound with that mutation's new ticket/epoch at commit; until then read-only
+reporting may show the conservative old bound. A pinned reader or unrelated primary WAL traffic may delay reset proof
+but cannot erase or reduce history debt; unrelated frames themselves remain outside the history allocation.
+
+For `DELETE`, `TRUNCATE`, or `PERSIST`, let `S = 65,536`, bundled SQLite's hard maximum sector size, and conservatively
+reserve `J(D) = (D + 1) * S + D * (page_size + 8)` for a transaction with dirty-page bound `D`: at most one padded
+journal header before each page record plus one initial header, and one page-number/checksum record around each page.
+The connection must have only `main` as a writable durable database, so no master journal or attached-database write
+can escape that formula. Serialized writers keep the maximum applicable future `J(D)` as
+`transient_journal_reserve_bytes`; the live admission transaction temporarily substitutes `J(D_admission)` if that
+is larger and proves the component sum before commit. Only roster-page records are attributed to that reserve;
+explicit authority/locator records remain primary-store custody. The reserve does not become debt. In rollback mode
+`future_wal_reserve_bytes = wal_debt_bytes = 0`; in WAL mode `transient_journal_reserve_bytes = 0`.
+`MEMORY`, `OFF`, an unknown mode, a writable attached database, missing `dbstat`, or inability to restore the prior
+connection-local spill setting refuses configured-history admission before provider effects.
+
+The V2 configured invariant is component-exact:
 
 ```text
-NODE_ROW_OVERHEAD_BYTES = 256   // bounded attempt-id key bytes, the two integer columns,
-                                // the SQLite record header/serial-type array, and B-tree cell overhead
-```
-
-Each node row's logical charge is
-`MAX_NODE_TERMINAL_JSON_BYTES + NODE_ROW_OVERHEAD_BYTES + node_id.as_bytes().len()`, checked per row and in the sum.
-The exact node-key bytes appear once because the schema stores them once.
-
-The V2 configured-store invariant is exact:
-
-```text
-attempt_summary_charge = 16_384 + MAX_CONTROLS_JSON_BYTES + MAX_POLICY_TRIGGER_JSON_BYTES
-                       = 16_384 + 4_096 + 1_024
-attempt_charge = attempt_summary_charge
-               + HISTORY_ATTACHMENT_CHARGE            // existing 1,024-byte attachment charge
-               + sum over every node row of
-                     (MAX_NODE_TERMINAL_JSON_BYTES + NODE_ROW_OVERHEAD_BYTES + exact node-id bytes)
-allocation.charged_bytes = sum(attempt_charge for every retained attempt)
+allocation.history_page_bytes = measured pgsize sum over every allocation-owned table/index root
+allocation.future_wal_reserve_bytes = sum(all unconsumed WAL mutation tickets)
+allocation.wal_debt_bytes = sum(consumed tickets since the last proven complete WAL reset)
+allocation.maintenance_reserve_bytes = one current-H retention ticket
+allocation.transient_journal_reserve_bytes = max(unconsumed rollback-journal ticket, default 0)
+allocation.charged_bytes = checked sum of those five components
+allocation.charged_bytes <= MAX_CHARGED_BYTES
 allocation.slots_used = count(retained attempt summaries)
+allocation.terminal_rows = count(terminal attempt summaries)
 ```
 
-Legacy rows keep their V1 `16_384 + 1_024` charge and zero node charge. `accounting_version = 2` admits variable
-charges with one checked compare-and-debit; each summary stores its whole derived attempt charge, and retention
-subtracts that stored value while cascading attachment/node rows by exact key. Migration sets `migrating`, creates and
-verifies the new `WITHOUT ROWID` table and columns, rederives every stored and aggregate charge from authoritative
-rows using the equation above, and flips to `ready` in one transaction; restart repeats safely, and any mismatch is
-corruption rather than a rebaseline. The migration transaction is itself subject to the physical gate below and
-rolls back while leaving `migrating` intact rather than exceeding the cap.
+The component rows are mode-exact: a WAL allocation persists zero transient-journal reserve, while a supported
+rollback-journal allocation persists zero future-WAL reserve and zero WAL debt. Any nonzero forbidden component is
+corruption, not a conservative overcharge.
 
-This equation is a **logical accounting charge** over bounded column contents. It is deliberately not a page count
-and never stands in for one: physical admission for the platform ledger is decided by materialization and
-measurement below.
+`workflow_history_mutation_reserve` stores the closed ticket identity, bound, and state. A ticket transition and the
+history mutation it covers are one transaction. Retention cascades exact rows, then remeasures pages and recomputes
+remaining tickets; it never “credits” a predicted per-attempt byte count. Migration sets `migrating`, creates and
+verifies the V2 schema, materializes any required bounded reserves, derives all five components from authoritative
+rows plus current journal state, and flips to `ready` in one transaction. Restart repeats safely, and any component,
+ticket, roster, or count mismatch is corruption rather than a rebaseline. Legacy V1 attempt rows have no node
+terminal or future-mutation ticket; they remain readable and are included in the measured table pages.
 
 #### Physical accounting for the platform ledger
 
@@ -1320,9 +1520,9 @@ session, checkout, or task effect:
    `-wal`/`-journal`/`-shm` objects; re-read `page_size`, `page_count`, `freelist_count`, `max_page_count`, journal
    mode, and cache-spill policy; and refuse unless the hard page ceiling, supported rollback-journal mode, and
    existing aggregate-plus-transaction-headroom gate all still hold;
-2. derive the logical `attempt_charge` from the §"Logical accounting" equation and perform the checked
-   compare-and-debit against the allocation. This is an accounting charge, not a page prediction;
-3. gate with the existing `history_growth_fits(conn, attempt_charge)` before writing any row;
+2. derive a checked `payload_precheck_bytes` from the exact stored string/blob lengths and bounded reserves. This is
+   only an early growth screen, never a page prediction or configured-store debit;
+3. gate with the existing `history_growth_fits(conn, payload_precheck_bytes)` before writing any row;
 4. materialize the attempt summary row, the attachment row, and **one full-size placeholder node row per canonical
    graph node**, in canonical `NodeId` order, each carrying its exact full key bytes and an exactly
    `MAX_NODE_TERMINAL_JSON_BYTES` filler payload. `SQLITE_FULL` from the hard ceiling is translated to the bounded
@@ -1342,7 +1542,7 @@ transaction, after materialization:
 P1  page_count * page_size <= MAX_CHARGED_BYTES - HISTORY_SIDECAR_HEADROOM_BYTES     // 56 MiB main ceiling
 P2  freelist_count >= pages required to replace one full-size node terminal in place
 P3  every materialized placeholder is present with its exact full key and exact reserve length
-P4  the debited logical charge equals the sum of the stored per-attempt charges
+P4  the exact summary/attachment/node-row counts and stored reserve lengths match the admitted graph
 P5  max_page_count, rollback-journal mode, cache-spill policy, live sidecars, and the conservative
     aggregate transaction-headroom gate still satisfy the existing 128-MiB physical regime
 ```
@@ -1373,14 +1573,15 @@ The surrounding properties are unchanged and remain true under measurement:
 3. **Migration.** The V2 migration runs inside this same gate and rolls back leaving `migrating` intact rather than
    exceeding the ceiling. It also rebuilds the accounting table, because the current
    `accounting_version INTEGER NOT NULL CHECK(accounting_version=1)` constraint cannot admit version 2 in place.
-4. **Retention.** Collection removes the oldest unpinned terminal summaries first, cascading their attachment and
-   node rows by exact key and crediting the exact stored attempt charge, so a long-ID attempt returns the bytes it
-   consumed.
-5. **Mixed V1/V2.** Legacy V1 attempts contribute zero node rows and keep their V1 charge; a mixed allocation sums
-   both forms under one checked compare-and-debit.
+4. **Retention.** Collection removes the oldest unpinned terminal summaries first and cascades their attachment and
+   node rows by exact key. Platform custody remains governed by the measured whole-file gate; configured custody
+   remeasures the allocation-owned roots and tickets under the component invariant above.
+5. **Mixed V1/V2.** Legacy V1 attempts contribute no node rows or future-mutation tickets but remain part of measured
+   history-owned table pages; V2 adds its exact placeholders and closed ticket population.
 
-Configured stores are not platform ledgers and have no page gate; they enforce the same 128-MiB ceiling through the
-logical equation above, which charges the same exact key bytes.
+Configured stores use the measured table-local component regime above, not the platform whole-file page gate and not
+a logical byte equation. Platform and configured decisions therefore share materialize-before-effect ordering while
+retaining their deliberately different owner-approved custody boundaries.
 
 Crash/failpoint tests cover the V1-to-V2 allocation transition, the rollback path, and every debit/credit boundary.
 
@@ -1414,7 +1615,8 @@ Bump the persisted workflow snapshot to V2:
         "node": { "sorted_ordinal": 0, "id_sha256": "..." },
         "effect": {
           "agent": "...",
-          "effect_digest": "..."
+          "effect_digest": "...",
+          "secret_commitment_key_id": null
         },
         "selection": {
           "agent": "...",
@@ -1486,15 +1688,16 @@ Resume rules:
 5. Existing task/checkpoint rows remain readable through Boolean fallback.
 6. New binaries read V1 and V2 snapshots; old binaries cannot resume V2 working tasks and may mark them interrupted.
 7. New task columns and journal fields are additive; old task readers still see the known `completed` status.
-8. Workflow-history accounting V2 uses the exact logical equations above; migration is transactional, idempotent,
-   schema-admitted, and rederives exact charges from authoritative rows. It creates the node-terminal table as
+8. Workflow-history accounting V2 is transactional, idempotent, schema-admitted, and rederives exact state from
+   authoritative rows. It creates the node-terminal table as
    `WITHOUT ROWID` with exactly one `unique=1`, `origin='pk'`, `partial=0` metadata entry, exact
    `(attempt_id, node_id)` key order, and no separately rooted index; verifies that shape before flipping to `ready`;
-   rebuilds the accounting table whose current `CHECK(accounting_version=1)` constraint cannot admit version 2 in
-   place; and rolls back inside the hard page/journal/sidecar gate rather than exceeding the ceiling. No static page
-   formula participates: physical admission is decided by materializing the placeholders under `max_page_count` and
-   the rollback-journal regime, then measuring P1–P5. Legacy rows receive zero node-evidence charge, and a mixed
-   V1/V2 allocation sums both forms under one checked compare-and-debit.
+   creates the closed mutation-ticket table; and rebuilds the accounting table whose current
+   `CHECK(accounting_version=1)` constraint cannot admit version 2 in place. Configured migration remeasures the
+   exact allocation-owned `dbstat` roots and derives future WAL reserve, sticky debt, and transient journal reserve;
+   platform migration remains inside the hard page/journal/sidecar gate and measures P1–P5. Either rolls back before
+   effects while leaving `migrating` intact on a capacity failure. No static page formula participates. Legacy rows
+   receive no invented node evidence or future ticket, but their real history-owned pages remain charged.
 9. Rollback after the allocation migration or V2 working-task creation requires stopping the new binary and restoring the pre-migration database snapshot. There is no in-place down-migration.
 10. No migration infers timeout, policy trigger, cleanup completion, or degraded ancestry from legacy text.
 11. The node-terminal, policy-trigger, and controls JSON bounds are encoded-byte bounds produced by one canonical
@@ -1506,6 +1709,10 @@ Resume rules:
     an explicit opt-out whose nodes refuse the bound path; none silently falls back to an unbound resolve.
 13. `NodeCauseV1.evidence_overflow` is additive and defaults to `false`. It indicates encoder overflow separately and
     never replaces a failure class or static code, so existing code/class vocabularies are unchanged.
+14. Existing `value` MCP environment syntax remains source-compatible and is explicitly public. New
+    `value_from_env` is mutually exclusive and secret-bearing. Every literal or referenced MCP environment value is
+    nevertheless HMAC-committed before durable identity. A V2 working snapshot records the commitment key id;
+    resume under a missing or different key refuses before effects rather than migrating the digest silently.
 
 ## 11. Compile-correct build and ownership order
 
@@ -1520,7 +1727,8 @@ One owner changes:
 - new `crates/bridge-workflow/src/fanout.rs`
 - run-spec serialization helpers
 
-Land the pure types, resolver, exact constants, the canonical terminal/trigger/controls serializer with its derived
+Land the pure types, resolver, typed MCP environment sources and secret-silent debug boundary, exact constants, the
+canonical terminal/trigger/controls serializer with its derived
 worst-case assertions and bounded-evidence fallback, the frozen provider-effect and provider-selection digests with
 their exhaustive `AgentEntry` classification, the exhaustive `LedgerUnavailableReason` classifier, fingerprinting, and
 controller transition tests first. Stage 1 also lands the additive `AgentRegistry` bind methods and their defaults in
@@ -1529,7 +1737,8 @@ compile before parallel work begins.
 
 ### Stage 2 — parallel siblings from the same frozen Stage-1 base
 
-- **Configuration owner:** `bin/a2a-bridge/src/config.rs` and config-only tests.
+- **Configuration owner:** `bin/a2a-bridge/src/config.rs`, `[security].provider_effect_key_file`, typed MCP
+  source resolution, key-custody validation, and config-only tests.
 - **Controller owner:** `crates/bridge-workflow/src/fanout.rs` and fake/manual state-machine tests, without touching executor integration.
 - **Persistence owner:** `crates/bridge-core/src/task_store.rs`, `workflow_history.rs`, `orch.rs`, and `crates/bridge-store/src/sqlite.rs`.
 
@@ -1546,6 +1755,7 @@ After integrating all Stage-2 siblings, one owner changes the shared seams:
 - `crates/bridge-coordinator/src/coordinator.rs`
 - `crates/bridge-coordinator/src/params.rs`
 - `crates/bridge-coordinator/src/session_manager.rs`
+- `crates/bridge-api/src/backend.rs`
 - `bin/a2a-bridge/src/main.rs`
 - `crates/bridge-a2a-inbound/src/server.rs`
 - `crates/bridge-mcp/src/server.rs`
@@ -1556,7 +1766,9 @@ resume, projections, CLI/A2A/MCP overrides, and compile fixes. It also owns remo
 inside an attempt, so no path can re-derive a model, effort, mode, preflight flag, fallback candidate, or any other
 effect-bearing field after the bind, and converting retry invalidation to the exact-bound form. The concrete
 `bind_entry_use`/`resolve_bound`/`invalidate_bound` implementations in `crates/bridge-registry/src/registry.rs` are
-part of this stage because they must land with their only production callers. These files must not be split among
+part of this stage because they must land with their only production callers. This stage also owns the API-local
+`Unconfigured | ExplicitNone | ExplicitSome` session-model transition, so bound `None` cannot fall through to a
+stale spawn default. These files must not be split among
 concurrent implementors.
 
 ### Stage 4 — checked-in configs, docs, and aggregate gate
@@ -1605,12 +1817,31 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
   asserts those exclusions remain outside ordinary workflow execution. The effect digest never contains a
   bearer value selected through `api_key_env`, only the env-var name. A separate non-disclosure fixture uses a
   redaction-sensitive MCP environment value, proves changing it changes the digest, and proves its raw bytes appear
-  in no snapshot, history row, projection, diagnostic, or log artifact.
+  in no snapshot, history row, projection, diagnostic, debug string, or log artifact.
+- MCP env parsing requires exactly one of `value`/`value_from_env`; empty names, both/neither sources, missing or
+  non-Unicode referenced values, template syntax in a reference name, and any MCP-env-bearing entry without the exact
+  32-byte owner-private key refuse before registry/provider effects. A public literal retains `{cwd}` substitution;
+  a referenced secret is resolved once and the same bound bytes reach HMAC and ACP delivery. Secret references on
+  CodexNative/KiroNative refuse; ACP child-spawn tests prove the source variable is removed from ambient env and the
+  value is present only in the redacted typed MCP field.
+- **W1-B oracle, red first:** persist the old deterministic digest for a literal selected from `0000..9999` while
+  every other canonical field is known, and recover the value by enumeration. Under V2, repeat against both
+  `value = "0042"` and `value_from_env = "TEST_MCP_SECRET"`: enumeration without the separately held key cannot
+  validate a candidate, while changing either resolved value changes the keyed commitment and effect digest. The
+  artifact exposes only key id, MAC-derived effect digest, and public source descriptor. Missing/replaced key or
+  changed referenced value on resume refuses before checkout/configure/prompt; an unchanged key/value resumes.
+  Tests prove the key reaches no child, the source variable is absent from the adapter's ambient environment, and
+  the raw value reaches no projection or serialization/diagnostic surface.
 - **W1's exact constructible state, red first:** freeze an API agent against endpoint A with env `X`, then hot-reload
   only `base_url` to endpoint B (and separately only `api_key_env` to `Y`) before the queued node binds. Every
   selection field stays byte-identical. The repaired path refuses with `configuration_drift{effect}` before resolve,
   checkout, configuration, and prompt, and records zero provider effects. A selection-only digest passes this reload,
   so the old identity fails the fixture red.
+- **W1-A warm API model, red first:** warm one API backend whose spawn config is `model=M`, hot-reload the reused
+  slot to `model=None`, bind/configure a new attempt, and assert the outgoing request contains no `M`. The old
+  `Option<String>` state fails by falling back to M. Negative controls prove `M -> Some(B)` sends B and a legacy
+  session that was never configured may still use the spawn default. The assertions inspect the request body and
+  frozen identity together, so a fresh-slot workaround or provenance-only change cannot green the wrong call.
 - **The inherited fallback state, red first:** a queued preflight-enabled node freezes primary `M` with fallback
   `F1`; a hot reload rewrites only `fallback_models` to `F2`. If the reload wins before M's bind, the repaired path
   refuses on selection drift before resolve. If M binds first and then fails before prompt acceptance, its exact use
@@ -1684,14 +1915,20 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
   and asserts the canonical skeleton length is at most its declared ceiling.
 - The fail-closed control: an injected over-bound value produces the bounded-evidence fallback, which itself encodes
   at or below `MAX_NODE_TERMINAL_JSON_BYTES`, and no over-bound row is ever written or admitted.
-- **W5 evidence preservation, red first:** inject the overflow required by the fault-injection fixture and require the
-  result to encode within 2,048 bytes while preserving the **original** `failure_class` and static `code`, a
-  **nonempty** deepest-cause suffix, `evidence_overflow = true`, `cause_truncated` set when the cause was shortened,
-  sticky prompt acceptance, degraded ancestry, and trigger identity. The previous fallback dropped `deepest_cause`
-  and overwrote the code with `terminal_encoding_overflow`, so it fails this fixture red on both counts.
+- **W5 evidence preservation, red first:** the production proof makes natural overflow unreachable for every valid
+  current-schema value, so a test-only/internal encoder limit is parameterized below 2,048 but above the measured
+  mandatory shape plus one retained UTF-8 scalar. The same production algorithm must then take the fallback and fit
+  the injected bound. The pre-fallback and fallback terminals are destructured without `..` and may differ only as
+  follows: `evidence_overflow` changes `false -> true`; `dependency_set` changes `Some -> None` (and `None` remains
+  `None`); `deepest_cause` is byte-identical or a **nonempty valid-UTF-8 deepest suffix**; and
+  `cause_truncated` equals `input.cause_truncated || cause_was_shortened`. `primary`, both cleanup fields,
+  `failure_class`, static `code`, prompt acceptance, degraded ancestry, trigger identity, schema version, and every
+  other field are byte-identical. Any forbidden mutation, wildcard comparison, empty/non-suffix cause, or output
+  above the injected bound fails the fixture; a fallback still over bound refuses before persistence.
 - Overflow is indicated separately, not by class or code substitution: two distinct failure classes sharing one
-  static code both overflow and remain distinguishable, and `evidence_overflow` is the only differing signal against
-  their non-overflowing counterparts.
+  static code both overflow and remain distinguishable. Each output is compared with its own pre-fallback terminal
+  under the exact allowed-difference set above; `evidence_overflow` is the only dedicated classifier, not the only
+  serialized difference.
 - The retained suffix is budget-driven, not constant-driven: as the mandatory fields grow toward their ceilings the
   retained suffix shrinks monotonically and the encoding stays within bound; with an empty cause the mandatory shape
   encodes at or below 880 bytes.
@@ -1760,11 +1997,17 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
 
 ### Persistence, migration, and projection
 
-- Memory and SQLite round-trip frozen controls, frozen provider effects and selections with both digests, trigger,
-  every node terminal, ancestry, and cleanup duration.
+- Memory and SQLite round-trip frozen controls, frozen provider effects and selections with both digests, the
+  provider-effect key ID and per-binding value MACs, trigger, every node terminal, ancestry, and cleanup duration.
+- Provider-effect key creation obtains 32 bytes from the OS CSPRNG, creates one owner-private file atomically, emits
+  no bytes, refuses an existing file/link, and at every injected write/sync failure leaves either no destination or
+  one complete valid key. Doctor refuses wrong length, wrong ownership/mode, multiple links, no-follow failure, a
+  relative path, and raw/canonical containment under a repo, session/output/evidence root, SQLite artifact, or
+  projected mount. Alias fixtures prove the separately held key never enters a bundle or child projection.
 - Exact replay succeeds; conflicting replay refuses.
-- Accounting-V2 migration is idempotent and the exact mixed V1/V2 row equation rederives under boundary capacity,
-  retention, rollback-required, concurrent admission, and crash/failpoint fixtures.
+- Accounting-V2 migration is idempotent and rederives the exact configured page/reserve/debt components or platform
+  physical state under boundary capacity, retention, rollback-required, concurrent admission, and crash/failpoint
+  fixtures.
 
 #### Arbitrary-node-ID physical accounting
 
@@ -1784,6 +2027,43 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
   decision. The specific falsifying case is covered directly — a 512-byte page database with a 1 MiB node ID, where
   the deleted formula charged 2,055 pages while the node ID and terminal alone need at least 2,068 overflow pages —
   and the repaired path decides it by measurement rather than arithmetic, in both the admit and refuse directions.
+- **Configured long-ID/WAL regression, red first:** in an otherwise empty 512-byte-page configured store, materialize
+  a 1-MiB-ID placeholder and assert `dbstat` charges every allocation-owned leaf/interior/overflow page plus the
+  exact closed mutation-ticket population. With `auto_vacuum=FULL`, separately assert the fixture has more than two
+  non-`dbstat` pages and that `D(R) = 3 * R + 2` covers its roster, pointer-map, freelist, and header page population;
+  this fails the former `R + 2` proof red. Seed the old logical allocation to
+  `MAX_CHARGED_BYTES - old_proposed_charge`; the old `exact ID + 256` equation admits while measured history pages
+  plus WAL reserve exceed the cap, and V2 rolls the whole admission back. Repeat with many short IDs and a reader
+  pinning WAL: admission itself creates charged debt, each later committed history mutation transfers its full ticket
+  to sticky debt, a busy checkpoint releases
+  zero debt, and admission refuses before the component sum crosses 128 MiB. After a proven complete reset, only the
+  next committed history mutation may replace the stale-epoch debt with its own ticket; a bookkeeping-only clear is
+  forbidden. A near-cap store consumes its permanently reserved retention ticket and successfully removes one
+  eligible attempt without exceeding the cap. Unrelated primary tables/frames neither add to measured history pages
+  nor erase the debt. The same fixtures cover each supported rollback-journal mode, `cache_spill=OFF` restoration, and refusal
+  for MEMORY/OFF/unknown mode or unavailable `dbstat`.
+- **Root attribution and mixed-admission regression:** grow `attempt_identities`, `task_attempt_locators`, and their
+  accepted index roots without changing history; the history charge and future tickets remain byte-identical and a
+  small admissible history reservation still fits. Then admit one served attempt (authority update) and one direct
+  attempt (authority insert): the history ticket is exactly `W(D(H0 + H1))` in WAL mode or temporarily reserves
+  `J(D(H0 + H1))` in rollback mode, while rollback/failpoint leaves neither authority nor history half committed.
+  A served optional-ledger refusal that changes only authority/locator roots creates no history ticket or debt.
+  Adding a history-root index incorporates it automatically; adding a trigger on a history/explicitly co-mutated
+  root, an escaping cascade, or a writable attached database refuses before effects. These fixtures distinguish
+  deliberate primary-root exclusion from the old undercharge of actual history leaf/interior/overflow pages.
+- **Journal-mode exclusivity:** WAL fixtures persist zero transient-journal reserve; each supported rollback mode
+  persists zero future-WAL reserve and zero WAL debt. Seed each forbidden nonzero component and assert corruption,
+  not automatic repair. Use page sizes at both extremes and the bundled 65,536-byte sector bound to exercise checked
+  `W(D)` and `J(D)` arithmetic overflow/refusal.
+- **Fixed-width accounting schema:** every V2 dynamic component/count and mutation bound is an exact eight-byte BLOB,
+  kind/state are closed one-byte codes, and neither singleton table has a secondary index. Boundary values that
+  cross SQLite INTEGER serial-width thresholds leave `H1` unchanged after installation; a variable-width legacy or
+  malformed V2 cell refuses migration/open rather than silently growing after measurement.
+- A configured mutation with an injected post-measurement page expansion above `2 * H + 2`, an unreserved mutation
+  kind, a temporary/DDL/allocation-churn SQL plan, a ticket/component mismatch, or checked-arithmetic overflow rolls
+  back before commit. Adding a history-owned index enters the root roster and increases the measurement; adding an
+  unclassified allocation-namespace object fails schema admission. These controls make the ticket bound executable
+  rather than a comment.
 - Postconditions are authoritative and checked at boundaries: short IDs, exact-page-boundary IDs, single-overflow
   IDs, and multi-page IDs each satisfy P1–P5, with reserved page bytes, autovacuum on and off, a legacy
   WAL-to-supported-rollback transition, each supported rollback journal mode, `cache_spill=OFF`, exact hard
@@ -1793,17 +2073,15 @@ Every behavior begins with a test demonstrated red against exact base `3f35ee6�
   allocation, and the allocation accounting is byte-identical to its pre-admission state. A failpoint injected
   between materialization and postcondition evaluation produces the same result.
 - Replacing a full-size placeholder with a real terminal adds zero pages, never exceeds the reserve, and draws only
-  on the provisioned reusable pool; the integer columns are unchanged by the replacement.
-- Retention of a long-ID attempt credits exactly the stored attempt charge and cascades its attachment and node rows
-  by exact key, returning the allocation to its pre-admission accounting.
+  on the provisioned reusable pool; `terminal_reserve` is unchanged by the replacement.
+- Retention of a long-ID attempt cascades its attachment, node, and mutation-ticket rows by exact key, remeasures the
+  remaining allocation-owned pages, and recomputes every outstanding ticket. It never credits a stored prediction.
 - A refusal is a capacity refusal, never a `NodeId` length cap: the same graph admits on a ledger with headroom, and
   no path truncates, hashes, or rejects an ID for being long by itself.
-- Mixed V1/V2 allocations sum legacy zero-node charges with V2 node charges under one checked compare-and-debit, and
-  the migration rolls back inside the physical gate while leaving `migrating` intact rather than exceeding the
-  ceiling. The migration rebuilds the accounting table rather than attempting to store version 2 under the current
-  `CHECK(accounting_version=1)` constraint.
-- Configured-store logical accounting charges the same exact key bytes and the same per-row overhead as the platform
-  physical derivation.
+- Mixed V1/V2 allocations measure legacy summary/attachment pages without inventing node rows or tickets; V2 adds
+  exact placeholders and its closed mutation population. Migration rolls back while leaving `migrating` intact
+  rather than exceeding either custody regime, and rebuilds the accounting table rather than attempting to store
+  version 2 under the current `CHECK(accounting_version=1)` constraint.
 - Legacy checkpoint fallback never invents timeout or cleanup completion.
 - V1 working snapshot resumes with frozen legacy defaults.
 - V2 resumes frozen controls despite changed config.
@@ -1913,9 +2191,19 @@ source-validated the following residual population in this candidate:
 | WRONG W5 — mutually unsatisfiable fault-injection criterion | The specified fallback drops `dependency_set` and may change cause fields, while its mandatory forced-overflow test permits only `evidence_overflow` to differ, so no implementation can satisfy both requirements. The production overflow remains theoretical under the current size proof; the certain impact is a failed implementation acceptance gate. State that the flag is the only dedicated classifier and permit exactly the named dependency/cause fields to differ. |
 
 The full mechanism, source locations, likelihood, exposure, impact, fix cost, and fail-first evidence are retained in
-the linked [closure review 3 record](../reviews/2026-08-01-r2f1a-sol-closure-review-3.md). The population is
-closed-enumerable, but this round's cap is exhausted. A new owner-authorized bounded repair and cumulative closure
-review are required before implementation. No implementation, Rust test result, review approval, release,
-deployment, or live operator effect is claimed.
+the linked [closure review 3 record](../reviews/2026-08-01-r2f1a-sol-closure-review-3.md). The owner-authorized repair
+of that closed population is:
 
-R2F1A FOCUSED BOUNDARY: PARKED / SOL CLOSURE REVIEW 3 REJECT / OWNER DIRECTION REQUIRED
+| Residual blocker | Repaired mechanism and exact acceptance evidence |
+|---|---|
+| WRONG W1-A — stale warm-API model | §5 gives API sessions the tri-state `Unconfigured | ExplicitNone | ExplicitSome`. Only `Unconfigured` may use the spawn default; a bound/configured `None` suppresses it. §11 assigns `bridge-api` to the integration owner. §12 requires the former-red warm `M -> None` request-body regression plus `M -> B` and never-configured legacy controls. |
+| WRONG W1-B — credential-verifier digest | §3 makes MCP env sources typed (`value` public literal or mutually exclusive `value_from_env`), resolves a referenced value once into the bound entry, and HMAC-commits **every** MCP env value under a separately held 32-byte provider-effect key before durable identity. The artifact carries only the key id, public descriptor, and MAC-derived effect digest. Missing/rotated key or changed value refuses resume before effects. The supported key creator uses the OS CSPRNG and atomic owner-private custody; imported key entropy remains an explicit operator assertion because runtime cannot infer it statistically. §12 proves the old four-digit digest is enumerable, the repaired artifact supplies no verifier without the key, delivery uses the committed bytes, and key/value bytes are absent from projections and diagnostics. No MCP-credential entropy inference is claimed. |
+| WRONG W3 — configured-store undercount | §9 deletes the fixed 256-byte row overhead and measures every allocation-owned table/index page through bundled `dbstat` after exact materialization. A persisted closed ticket population reserves every remaining lifecycle mutation; WAL commits move the full reserve to sticky debt until a complete reset, and rollback journals retain one transient maximum. Root attribution keeps unrelated primary/authority pages outside the configured history allocation while accounting for every history leaf/interior/overflow page and its journal frame, including inside a mixed atomic admission. Because `dbstat` omits pointer-map/freelist/header pages, the ticket applies the proved `D(R) = 3R + 2` structural bound to the pre/post history-root union and forbids transient allocation churn. Each transaction remeasures, rebases outstanding tickets, and rolls back before commit if the component sum exceeds 128 MiB or page growth exceeds the ticket proof. §12 covers 512-byte/1-MiB ID, auto-vacuum structure, many-short-ID, pinned-reader, root isolation, index/trigger classification, unsupported journal modes, arithmetic, migration, retention, and failpoints without capping or hashing `NodeId`. |
+| WRONG W5 — impossible injected comparison | §3 and §12 now say `evidence_overflow` is the only dedicated classifier, not the only changed field. A test-only smaller internal limit forces the otherwise unreachable fallback and permits exactly flag `false -> true`, dependency `Some -> None`, a deepest nonempty UTF-8 suffix, and monotonic `cause_truncated`; every other field is byte-identical and explicitly destructured. Forbidden changes or a still-over-bound output fail before persistence. |
+
+The newly declared cap permits deterministic documentation gates followed by exactly one fresh cumulative Sol/xhigh
+closure review of the clean repair commit. It permits no second repair/review loop. Until that review approves, no
+implementation, Rust test result, release, deployment, or live operator effect is authorized or claimed; a rejection
+parks this document again.
+
+R2F1A FOCUSED BOUNDARY: REPAIRED / AWAITING SOL CLOSURE REVIEW 4 / IMPLEMENTATION UNAUTHORIZED
