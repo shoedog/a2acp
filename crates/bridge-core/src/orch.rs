@@ -160,6 +160,10 @@ pub enum OrchEventKind {
         output: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<UsageSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_json: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_trigger_json: Option<String>,
     },
     Terminal {
         status: TerminalStatus,
@@ -344,6 +348,8 @@ mod tests {
                 ok: true,
                 output: "o".into(),
                 usage: None,
+                terminal_json: None,
+                policy_trigger_json: None,
             },
         };
         let j = serde_json::to_value(&finished).unwrap();
@@ -395,6 +401,8 @@ mod tests {
                 terminal: None,
                 at_ms: 5,
             }),
+            terminal_json: None,
+            policy_trigger_json: None,
         };
         let j = serde_json::to_value(&with_usage).unwrap();
         assert_eq!(j["kind"], "node_finished");
@@ -405,6 +413,8 @@ mod tests {
             ok: true,
             output: "o".into(),
             usage: None,
+            terminal_json: None,
+            policy_trigger_json: None,
         };
         let j2 = serde_json::to_value(&without).unwrap();
         assert!(j2.get("usage").is_none(), "absent usage omitted from wire");

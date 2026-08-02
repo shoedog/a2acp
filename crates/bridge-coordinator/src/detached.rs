@@ -82,6 +82,10 @@ pub enum FrameKind {
         output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         usage: Option<bridge_core::orch::UsageSnapshot>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        terminal_json: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        policy_trigger_json: Option<String>,
     },
     SnapshotComplete,
     Terminal {
@@ -117,11 +121,15 @@ pub fn project_orch_frame(
             ok,
             output,
             usage,
+            terminal_json,
+            policy_trigger_json,
         } => FrameKind::NodeFinished {
             node: node.clone(),
             ok: *ok,
             output: output.clone(),
             usage: usage.clone(),
+            terminal_json: terminal_json.clone(),
+            policy_trigger_json: policy_trigger_json.clone(),
         },
         OrchEventKind::Terminal { status, output } => FrameKind::Terminal {
             outcome: match status {
@@ -524,6 +532,8 @@ impl WorkflowSink for DetachedProgressSink {
                 ok,
                 output: output.to_string(),
                 usage: usage.cloned(),
+                terminal_json: None,
+                policy_trigger_json: None,
             },
         });
         Ok(())
@@ -6183,6 +6193,8 @@ mod frame_tests {
                 ok: true,
                 output: "o".into(),
                 usage: None,
+                terminal_json: None,
+                policy_trigger_json: None,
             },
         });
         let f = rx.recv().await.unwrap();
@@ -6202,6 +6214,8 @@ mod frame_tests {
                 ok: true,
                 output: "done".into(),
                 usage: None,
+                terminal_json: None,
+                policy_trigger_json: None,
             },
         };
         let val: serde_json::Value = serde_json::to_value(&frame).unwrap();

@@ -270,6 +270,18 @@ pub enum NodeCheckpointOutput {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeTerminalEvidenceV1 {
+    pub node: NodeId,
+    pub terminal_json: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkflowTaskEvidenceV1 {
+    pub workflow_outcome: Option<crate::execution_policy::WorkflowDurableOutcomeV1>,
+    pub policy_trigger_json: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaskUsageAgg {
     pub rows: u64,
@@ -613,6 +625,40 @@ pub trait TaskStore: HarvestAuditStore + Send + Sync {
         usage: Option<&crate::orch::UsageSnapshot>,
     ) -> Result<i64, BridgeError>;
 
+    /// V2 write-once checkpoint. Exact byte-for-byte replay is idempotent and
+    /// returns the original sequence; any changed output, usage, terminal, or
+    /// trigger is a conflict. When present, the trigger and its selected node
+    /// terminal are committed atomically with the journal event.
+    #[allow(clippy::too_many_arguments)]
+    async fn put_node_checkpoint_sequenced_v2(
+        &self,
+        _task: &TaskId,
+        _node: &NodeId,
+        _operation_id: &OperationId,
+        _output: &str,
+        _ok: bool,
+        _ts: i64,
+        _usage: Option<&crate::orch::UsageSnapshot>,
+        _terminal_json: &str,
+        _policy_trigger_json: Option<&str>,
+    ) -> Result<i64, BridgeError> {
+        Err(BridgeError::StoreFailure)
+    }
+
+    async fn node_terminal_evidence(
+        &self,
+        _task: &TaskId,
+    ) -> Result<Vec<NodeTerminalEvidenceV1>, BridgeError> {
+        Ok(Vec::new())
+    }
+
+    async fn workflow_task_evidence(
+        &self,
+        _task: &TaskId,
+    ) -> Result<WorkflowTaskEvidenceV1, BridgeError> {
+        Ok(WorkflowTaskEvidenceV1::default())
+    }
+
     /// Set the terminal status + result/error, recording a seq for the event.
     /// Returns the seq.
     async fn set_terminal_sequenced(
@@ -825,6 +871,7 @@ pub fn fold_journal_to_snapshot(
                 ok,
                 output,
                 usage: _,
+                ..
             } => {
                 let node = NodeId::parse(node)?;
                 starts.retain(|(started, _seq)| started != &node);
@@ -915,6 +962,12 @@ pub struct MemoryTaskStore {
     birth: Mutex<HashSet<String>>,
     /// Key: (task_id, node_id) → (output, ok, ts, seq, usage)
     checkpoints: Mutex<HashMap<(String, String), CheckpointValue>>,
+    /// Canonical R2f1a terminal bytes, keyed exactly like checkpoints.
+    node_terminals: Mutex<HashMap<(String, String), String>>,
+    /// Canonical R2f1a trigger bytes attached to the selected checkpoint.
+    node_policy_triggers: Mutex<HashMap<(String, String), String>>,
+    /// Additive task-level R2f1a outcome/trigger evidence.
+    workflow_evidence: Mutex<HashMap<String, WorkflowTaskEvidenceV1>>,
     /// Per-task monotonic seq counter. Key: task_id.
     seq_counters: Mutex<HashMap<String, i64>>,
     /// Per-task terminal seq. Key: task_id.
@@ -951,6 +1004,9 @@ impl MemoryTaskStore {
             batches: Mutex::new(HashMap::new()),
             birth: Mutex::new(HashSet::new()),
             checkpoints: Mutex::new(HashMap::new()),
+            node_terminals: Mutex::new(HashMap::new()),
+            node_policy_triggers: Mutex::new(HashMap::new()),
+            workflow_evidence: Mutex::new(HashMap::new()),
             seq_counters: Mutex::new(HashMap::new()),
             terminal_seqs: Mutex::new(HashMap::new()),
             starts: Mutex::new(HashMap::new()),
@@ -2044,6 +2100,8 @@ impl TaskStore for MemoryTaskStore {
                 ok,
                 output: output.to_string(),
                 usage: usage.cloned(),
+                terminal_json: None,
+                policy_trigger_json: None,
             },
         };
         self.journals
@@ -2053,6 +2111,157 @@ impl TaskStore for MemoryTaskStore {
             .or_default()
             .push((seq, event));
         Ok(seq)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn put_node_checkpoint_sequenced_v2(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        operation_id: &OperationId,
+        output: &str,
+        ok: bool,
+        ts: i64,
+        usage: Option<&crate::orch::UsageSnapshot>,
+        terminal_json: &str,
+        policy_trigger_json: Option<&str>,
+    ) -> Result<i64, BridgeError> {
+        crate::execution_policy::NodeTerminalV1::decode_canonical(terminal_json.as_bytes())
+            .map_err(|_| BridgeError::StoreFailure)?;
+        if let Some(trigger) = policy_trigger_json {
+            crate::execution_policy::PolicyTriggerV1::decode_canonical(trigger.as_bytes())
+                .map_err(|_| BridgeError::StoreFailure)?;
+        }
+
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let key = (task.as_str().to_string(), node.as_str().to_string());
+        if let Some((stored_output, stored_ok, _stored_ts, stored_seq, stored_usage)) =
+            self.checkpoints.lock().unwrap().get(&key).cloned()
+        {
+            let stored_terminal = self.node_terminals.lock().unwrap().get(&key).cloned();
+            let stored_trigger = self.node_policy_triggers.lock().unwrap().get(&key).cloned();
+            if stored_output == output
+                && stored_ok == ok
+                && stored_usage.as_ref() == usage
+                && stored_terminal.as_deref() == Some(terminal_json)
+                && stored_trigger.as_deref() == policy_trigger_json
+            {
+                return Ok(stored_seq);
+            }
+            return Err(BridgeError::StoreFailure);
+        }
+
+        {
+            let inner = self.inner.lock().unwrap();
+            if !inner.contains_key(task.as_str()) {
+                return Err(BridgeError::StoreFailure);
+            }
+        }
+        {
+            let stored_trigger = self
+                .workflow_evidence
+                .lock()
+                .unwrap()
+                .get(task.as_str())
+                .and_then(|evidence| evidence.policy_trigger_json.clone());
+            if let Some(trigger) = policy_trigger_json {
+                if stored_trigger
+                    .as_deref()
+                    .is_some_and(|stored| stored != trigger)
+                {
+                    return Err(BridgeError::StoreFailure);
+                }
+            }
+        }
+        let artifact_ms = self.retention_now_ms();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let row = inner
+                .get_mut(task.as_str())
+                .ok_or(BridgeError::StoreFailure)?;
+            Self::bump_last_artifact(row, artifact_ms);
+        }
+        let seq = self.next_seq(task.as_str());
+        self.starts.lock().unwrap().remove(&key);
+        self.checkpoints.lock().unwrap().insert(
+            key.clone(),
+            (output.to_string(), ok, ts, seq, usage.cloned()),
+        );
+        self.node_terminals
+            .lock()
+            .unwrap()
+            .insert(key.clone(), terminal_json.to_owned());
+        if let Some(trigger) = policy_trigger_json {
+            self.node_policy_triggers
+                .lock()
+                .unwrap()
+                .insert(key, trigger.to_owned());
+            self.workflow_evidence
+                .lock()
+                .unwrap()
+                .entry(task.as_str().to_owned())
+                .or_default()
+                .policy_trigger_json = Some(trigger.to_owned());
+        }
+        let event = crate::orch::OrchEvent {
+            v: crate::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: operation_id.clone(),
+            session: None,
+            source: None,
+            kind: crate::orch::OrchEventKind::NodeFinished {
+                node: node.as_str().to_string(),
+                ok,
+                output: output.to_string(),
+                usage: usage.cloned(),
+                terminal_json: Some(terminal_json.to_owned()),
+                policy_trigger_json: policy_trigger_json.map(str::to_owned),
+            },
+        };
+        self.journals
+            .lock()
+            .unwrap()
+            .entry(task.as_str().to_string())
+            .or_default()
+            .push((seq, event));
+        Ok(seq)
+    }
+
+    async fn node_terminal_evidence(
+        &self,
+        task: &TaskId,
+    ) -> Result<Vec<NodeTerminalEvidenceV1>, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        let mut evidence = self
+            .node_terminals
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((task_id, _), _)| task_id == task.as_str())
+            .map(|((_, node), terminal_json)| {
+                Ok(NodeTerminalEvidenceV1 {
+                    node: NodeId::parse(node).map_err(|_| BridgeError::StoreFailure)?,
+                    terminal_json: terminal_json.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, BridgeError>>()?;
+        evidence.sort_by(|left, right| left.node.cmp(&right.node));
+        Ok(evidence)
+    }
+
+    async fn workflow_task_evidence(
+        &self,
+        task: &TaskId,
+    ) -> Result<WorkflowTaskEvidenceV1, BridgeError> {
+        let _guard = self.journal_fold_guard.lock().unwrap();
+        Ok(self
+            .workflow_evidence
+            .lock()
+            .unwrap()
+            .get(task.as_str())
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn set_terminal_sequenced(
@@ -2475,7 +2684,11 @@ impl TaskStore for MemoryTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{BatchId, ContextId, NodeId, OperationId, TurnId};
+    use crate::execution_policy::{
+        ControlEventIdV1, FanOutPolicyNameV1, NodeCleanupDispositionV1, NodeCleanupV1,
+        NodePrimaryDispositionV1, NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1,
+    };
+    use crate::ids::{AttemptId, BatchId, ContextId, NodeId, OperationId, TurnId};
     use crate::orch::{OrchEvent, OrchEventKind, TerminalUsage, UsageCost, UsageSnapshot, ORCH_V};
     use crate::ports::{TraceParent, TurnContext, TurnOutcome};
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -3408,6 +3621,8 @@ mod tests {
                     ok: true,
                     output: "oA".into(),
                     usage: None,
+                    terminal_json: None,
+                    policy_trigger_json: None,
                 },
             ),
             ev(3, OrchEventKind::NodeStarted { node: "b".into() }),
@@ -3776,6 +3991,228 @@ mod tests {
             &evs[0].kind,
             OrchEventKind::NodeFinished { usage: Some(got), .. } if got == &usage
         ));
+    }
+
+    #[tokio::test]
+    async fn memory_v2_checkpoint_replay_is_exact_and_trigger_commit_is_atomic() {
+        let clock = Arc::new(AtomicI64::new(100));
+        let s = MemoryTaskStore::with_clock({
+            let clock = Arc::clone(&clock);
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        });
+        let task = TaskId::parse("task-v2-checkpoint").unwrap();
+        let operation = OperationId::parse("op-task-v2-checkpoint").unwrap();
+        let selected = NodeId::parse("selected").unwrap();
+        s.create(&rec(task.as_str(), 1)).await.unwrap();
+
+        let attempt = AttemptId::parse("attempt-11111111111111111111111111111111").unwrap();
+        let trigger = PolicyTriggerV1 {
+            schema_version: 1,
+            id: ControlEventIdV1::for_attempt(&attempt, 0),
+            node: PolicyNodeRefV1::from_node_id(0, selected.as_str()),
+            policy: FanOutPolicyNameV1::FailFast,
+            grace_ms: None,
+        };
+        let trigger_json = String::from_utf8(trigger.encode_canonical().unwrap()).unwrap();
+        let terminal = NodeTerminalV1 {
+            schema_version: 1,
+            primary: NodePrimaryDispositionV1::Failed,
+            cleanup: NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::Complete,
+                duration_ms: 3,
+            },
+            cause: None,
+            prompt_may_have_been_accepted: false,
+            degraded_ancestry: false,
+            policy_trigger_id: Some(trigger.id.clone()),
+        };
+        let terminal_json = String::from_utf8(terminal.encode_canonical().unwrap()).unwrap();
+        let usage = UsageSnapshot {
+            used: Some(7),
+            size: Some(11),
+            cost: None,
+            terminal: None,
+            at_ms: 5,
+        };
+
+        let start_seq = s
+            .record_node_started(&task, &selected, &operation, 4)
+            .await
+            .unwrap();
+        let checkpoint_seq = s
+            .put_node_checkpoint_sequenced_v2(
+                &task,
+                &selected,
+                &operation,
+                "FAILED",
+                false,
+                5,
+                Some(&usage),
+                &terminal_json,
+                Some(&trigger_json),
+            )
+            .await
+            .unwrap();
+        assert!(checkpoint_seq > start_seq);
+        assert_eq!(
+            s.put_node_checkpoint_sequenced_v2(
+                &task,
+                &selected,
+                &operation,
+                "FAILED",
+                false,
+                999,
+                Some(&usage),
+                &terminal_json,
+                Some(&trigger_json),
+            )
+            .await
+            .unwrap(),
+            checkpoint_seq,
+            "an exact replay returns the original sequence and ignores a new observation time"
+        );
+        assert!(
+            s.put_node_checkpoint_sequenced_v2(
+                &task,
+                &selected,
+                &operation,
+                "FAILED",
+                false,
+                999,
+                Some(&usage),
+                &terminal_json,
+                None,
+            )
+            .await
+            .is_err(),
+            "dropping a selected checkpoint's trigger is a conflicting replay"
+        );
+
+        let mut changed_terminal = terminal.clone();
+        changed_terminal.cleanup.duration_ms += 1;
+        let changed_terminal_json =
+            String::from_utf8(changed_terminal.encode_canonical().unwrap()).unwrap();
+        assert!(
+            s.put_node_checkpoint_sequenced_v2(
+                &task,
+                &selected,
+                &operation,
+                "FAILED",
+                false,
+                999,
+                Some(&usage),
+                &changed_terminal_json,
+                Some(&trigger_json),
+            )
+            .await
+            .is_err(),
+            "changed terminal evidence is a conflicting replay"
+        );
+
+        let independent = NodeId::parse("independent").unwrap();
+        let independent_terminal = NodeTerminalV1 {
+            policy_trigger_id: None,
+            primary: NodePrimaryDispositionV1::Completed,
+            ..terminal.clone()
+        };
+        let independent_terminal_json =
+            String::from_utf8(independent_terminal.encode_canonical().unwrap()).unwrap();
+        clock.store(150, Ordering::SeqCst);
+        let independent_seq = s
+            .put_node_checkpoint_sequenced_v2(
+                &task,
+                &independent,
+                &operation,
+                "OK",
+                true,
+                6,
+                None,
+                &independent_terminal_json,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            s.put_node_checkpoint_sequenced_v2(
+                &task,
+                &independent,
+                &operation,
+                "OK",
+                true,
+                777,
+                None,
+                &independent_terminal_json,
+                None,
+            )
+            .await
+            .unwrap(),
+            independent_seq,
+            "a trigger-less checkpoint remains replayable after another node selected the policy"
+        );
+
+        let conflicting_trigger = PolicyTriggerV1 {
+            schema_version: 1,
+            id: ControlEventIdV1::for_attempt(&attempt, 1),
+            node: PolicyNodeRefV1::from_node_id(2, "conflict"),
+            policy: FanOutPolicyNameV1::FailFast,
+            grace_ms: None,
+        };
+        let conflicting_trigger_json =
+            String::from_utf8(conflicting_trigger.encode_canonical().unwrap()).unwrap();
+        let conflicting_terminal = NodeTerminalV1 {
+            policy_trigger_id: Some(conflicting_trigger.id.clone()),
+            ..terminal.clone()
+        };
+        let conflicting_terminal_json =
+            String::from_utf8(conflicting_terminal.encode_canonical().unwrap()).unwrap();
+        clock.store(200, Ordering::SeqCst);
+        assert!(s
+            .put_node_checkpoint_sequenced_v2(
+                &task,
+                &NodeId::parse("conflict").unwrap(),
+                &operation,
+                "FAILED",
+                false,
+                7,
+                None,
+                &conflicting_terminal_json,
+                Some(&conflicting_trigger_json),
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            s.get(&task).await.unwrap().unwrap().last_artifact_ms,
+            Some(150),
+            "a rejected trigger must not mutate task recency"
+        );
+
+        let terminals = s.node_terminal_evidence(&task).await.unwrap();
+        assert_eq!(terminals.len(), 2);
+        assert_eq!(terminals[0].node.as_str(), "independent");
+        assert_eq!(terminals[1].node.as_str(), "selected");
+        assert_eq!(
+            s.workflow_task_evidence(&task)
+                .await
+                .unwrap()
+                .policy_trigger_json
+                .as_deref(),
+            Some(trigger_json.as_str())
+        );
+        let events = s.journal_from(&task, -1).await.unwrap();
+        assert_eq!(
+            events.len(),
+            3,
+            "one start and two unique finishes are durable"
+        );
+        assert!(matches!(
+            &events[1].kind,
+            OrchEventKind::NodeFinished {
+                terminal_json: Some(stored_terminal),
+                policy_trigger_json: Some(stored_trigger),
+                ..
+            } if stored_terminal == &terminal_json && stored_trigger == &trigger_json
+        ));
+        assert!(s.progress_snapshot(&task).await.unwrap().starts.is_empty());
     }
 
     #[tokio::test]

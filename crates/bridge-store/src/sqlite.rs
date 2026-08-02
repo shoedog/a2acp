@@ -3039,6 +3039,11 @@ fn migrate_tasks_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         ("last_artifact_ms", "INTEGER"),
         ("artifacts_purged_at", "INTEGER"),
         (
+            "workflow_outcome",
+            "TEXT CHECK(workflow_outcome IN ('completed','completed_degraded','failed','canceled','interrupted'))",
+        ),
+        ("policy_trigger_json", "TEXT"),
+        (
             "terminal_projection_ready",
             "INTEGER NOT NULL DEFAULT 1 CHECK(terminal_projection_ready IN (0, 1))",
         ),
@@ -3067,6 +3072,14 @@ fn migrate_tasks_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     }
     if !cp_existing.contains("usage_json") {
         conn.execute_batch("ALTER TABLE task_node_checkpoints ADD COLUMN usage_json TEXT;")?;
+    }
+    if !cp_existing.contains("terminal_json") {
+        conn.execute_batch("ALTER TABLE task_node_checkpoints ADD COLUMN terminal_json TEXT;")?;
+    }
+    if !cp_existing.contains("policy_trigger_json") {
+        conn.execute_batch(
+            "ALTER TABLE task_node_checkpoints ADD COLUMN policy_trigger_json TEXT;",
+        )?;
     }
 
     let mut stmt3 = conn.prepare("PRAGMA table_info(turn_log)")?;
@@ -4991,11 +5004,221 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                 ok,
                 output: output.to_string(),
                 usage: usage.cloned(),
+                terminal_json: None,
+                policy_trigger_json: None,
             },
         };
         insert_journal_event(&tx, task, &event)?;
         tx.commit().map_err(|_| BridgeError::StoreFailure)?;
         Ok(seq)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn put_node_checkpoint_sequenced_v2(
+        &self,
+        task: &TaskId,
+        node: &NodeId,
+        operation_id: &OperationId,
+        output: &str,
+        ok: bool,
+        ts: i64,
+        usage: Option<&bridge_core::orch::UsageSnapshot>,
+        terminal_json: &str,
+        policy_trigger_json: Option<&str>,
+    ) -> Result<i64, BridgeError> {
+        bridge_core::execution_policy::NodeTerminalV1::decode_canonical(terminal_json.as_bytes())
+            .map_err(|_| BridgeError::StoreFailure)?;
+        if let Some(trigger) = policy_trigger_json {
+            bridge_core::execution_policy::PolicyTriggerV1::decode_canonical(trigger.as_bytes())
+                .map_err(|_| BridgeError::StoreFailure)?;
+        }
+        let usage_json = usage
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let conn = self.conn.lock().unwrap();
+        let tx = immediate_transaction(&conn)?;
+        let existing: Option<(
+            String,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = tx
+            .query_row(
+                "SELECT output, ok, seq, usage_json, terminal_json, policy_trigger_json
+                 FROM task_node_checkpoints WHERE task_id=?1 AND node_id=?2",
+                rusqlite::params![task.as_str(), node.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let stored_trigger: Option<String> = tx
+            .query_row(
+                "SELECT policy_trigger_json FROM tasks WHERE id=?1",
+                rusqlite::params![task.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| BridgeError::StoreFailure)?
+            .ok_or(BridgeError::StoreFailure)?;
+        if let Some((
+            stored_output,
+            stored_ok,
+            stored_seq,
+            stored_usage,
+            stored_terminal,
+            stored_checkpoint_trigger,
+        )) = existing
+        {
+            if stored_output == output
+                && stored_ok == i64::from(ok)
+                && stored_usage == usage_json
+                && stored_terminal.as_deref() == Some(terminal_json)
+                && stored_checkpoint_trigger.as_deref() == policy_trigger_json
+            {
+                tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+                return Ok(stored_seq);
+            }
+            return Err(BridgeError::StoreFailure);
+        }
+        if let Some(trigger) = policy_trigger_json {
+            if stored_trigger
+                .as_deref()
+                .is_some_and(|stored| stored != trigger)
+            {
+                return Err(BridgeError::StoreFailure);
+            }
+            tx.execute(
+                "UPDATE tasks SET policy_trigger_json=?2 WHERE id=?1",
+                rusqlite::params![task.as_str(), trigger],
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        }
+        let changed = tx
+            .execute(
+                "UPDATE tasks SET
+                    last_event_seq = last_event_seq + 1,
+                    last_artifact_ms = CASE
+                        WHEN last_artifact_ms IS NULL OR last_artifact_ms < ?2 THEN ?2
+                        ELSE last_artifact_ms
+                    END
+                 WHERE id=?1",
+                rusqlite::params![task.as_str(), durable_retention_ms((self.now_ms)())],
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        if changed != 1 {
+            return Err(BridgeError::StoreFailure);
+        }
+        let seq: i64 = tx
+            .query_row(
+                "SELECT last_event_seq FROM tasks WHERE id=?1",
+                rusqlite::params![task.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        tx.execute(
+            "INSERT INTO task_node_checkpoints(
+                 task_id, node_id, output, ok, ts, seq, usage_json, terminal_json,
+                 policy_trigger_json)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                task.as_str(),
+                node.as_str(),
+                output,
+                i64::from(ok),
+                ts,
+                seq,
+                usage_json,
+                terminal_json,
+                policy_trigger_json
+            ],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        tx.execute(
+            "DELETE FROM task_node_starts WHERE task_id=?1 AND node_id=?2",
+            rusqlite::params![task.as_str(), node.as_str()],
+        )
+        .map_err(|_| BridgeError::StoreFailure)?;
+        let event = bridge_core::orch::OrchEvent {
+            v: bridge_core::orch::ORCH_V,
+            seq,
+            ts_ms: ts,
+            operation_id: operation_id.clone(),
+            session: None,
+            source: None,
+            kind: bridge_core::orch::OrchEventKind::NodeFinished {
+                node: node.as_str().to_string(),
+                ok,
+                output: output.to_string(),
+                usage: usage.cloned(),
+                terminal_json: Some(terminal_json.to_owned()),
+                policy_trigger_json: policy_trigger_json.map(str::to_owned),
+            },
+        };
+        insert_journal_event(&tx, task, &event)?;
+        tx.commit().map_err(|_| BridgeError::StoreFailure)?;
+        Ok(seq)
+    }
+
+    async fn node_terminal_evidence(
+        &self,
+        task: &TaskId,
+    ) -> Result<Vec<bridge_core::task_store::NodeTerminalEvidenceV1>, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT node_id, terminal_json FROM task_node_checkpoints
+                 WHERE task_id=?1 AND terminal_json IS NOT NULL ORDER BY node_id",
+            )
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let rows = statement
+            .query_map(rusqlite::params![task.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| BridgeError::StoreFailure)?;
+        rows.map(|row| {
+            let (node, terminal_json) = row.map_err(|_| BridgeError::StoreFailure)?;
+            Ok(bridge_core::task_store::NodeTerminalEvidenceV1 {
+                node: NodeId::parse(node).map_err(|_| BridgeError::StoreFailure)?,
+                terminal_json,
+            })
+        })
+        .collect()
+    }
+
+    async fn workflow_task_evidence(
+        &self,
+        task: &TaskId,
+    ) -> Result<bridge_core::task_store::WorkflowTaskEvidenceV1, BridgeError> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT workflow_outcome, policy_trigger_json FROM tasks WHERE id=?1",
+                rusqlite::params![task.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| BridgeError::StoreFailure)?;
+        let (outcome, policy_trigger_json) = row.ok_or(BridgeError::StoreFailure)?;
+        let workflow_outcome = outcome
+            .as_deref()
+            .map(parse_workflow_durable_outcome)
+            .transpose()?;
+        Ok(bridge_core::task_store::WorkflowTaskEvidenceV1 {
+            workflow_outcome,
+            policy_trigger_json,
+        })
     }
 
     async fn set_terminal_sequenced(
@@ -5712,6 +5935,20 @@ fn terminal_projection_boundary(
     match ready {
         1 => Ok(None),
         0 => Ok(Some(terminal_seq.ok_or(BridgeError::StoreFailure)?)),
+        _ => Err(BridgeError::StoreFailure),
+    }
+}
+
+fn parse_workflow_durable_outcome(
+    value: &str,
+) -> Result<bridge_core::execution_policy::WorkflowDurableOutcomeV1, BridgeError> {
+    use bridge_core::execution_policy::WorkflowDurableOutcomeV1;
+    match value {
+        "completed" => Ok(WorkflowDurableOutcomeV1::Completed),
+        "completed_degraded" => Ok(WorkflowDurableOutcomeV1::CompletedDegraded),
+        "failed" => Ok(WorkflowDurableOutcomeV1::Failed),
+        "canceled" => Ok(WorkflowDurableOutcomeV1::Canceled),
+        "interrupted" => Ok(WorkflowDurableOutcomeV1::Interrupted),
         _ => Err(BridgeError::StoreFailure),
     }
 }
@@ -11213,7 +11450,11 @@ impl SqliteStore {
 mod tests {
     use super::*;
     use bridge_core::domain::{PeerTaskId, PendingKind, PendingRequest};
-    use bridge_core::ids::{BatchId, ContextId, SessionId, TaskId, TurnId};
+    use bridge_core::execution_policy::{
+        ControlEventIdV1, FanOutPolicyNameV1, NodeCleanupDispositionV1, NodeCleanupV1,
+        NodePrimaryDispositionV1, NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1,
+    };
+    use bridge_core::ids::{AttemptId, BatchId, ContextId, SessionId, TaskId, TurnId};
     use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
     use bridge_core::ports::{FailureClass, SessionStore, TraceParent, TurnContext, TurnOutcome};
     use bridge_core::task_store::{
@@ -12877,6 +13118,14 @@ mod tests {
                     cp_cols.contains("usage_json"),
                     "task_node_checkpoints.usage_json must exist after migration"
                 );
+                assert!(
+                    cp_cols.contains("terminal_json"),
+                    "task_node_checkpoints.terminal_json must exist after migration"
+                );
+                assert!(
+                    cp_cols.contains("policy_trigger_json"),
+                    "task_node_checkpoints.policy_trigger_json must exist after migration"
+                );
                 // task_node_starts must exist.
                 let count: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='task_node_starts'",
@@ -12996,6 +13245,221 @@ mod tests {
             s.progress_snapshot(&t).await.unwrap().terminal_seq,
             Some(term)
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_v2_checkpoint_replay_is_exact_and_trigger_commit_is_atomic() {
+        let clock = Arc::new(AtomicI64::new(100));
+        let store = SqliteStore::open_in_memory_with_clock({
+            let clock = Arc::clone(&clock);
+            Arc::new(move || clock.load(Ordering::SeqCst))
+        })
+        .unwrap();
+        let task = TaskId::parse("sqlite-v2-checkpoint").unwrap();
+        let operation = OperationId::parse("op-sqlite-v2-checkpoint").unwrap();
+        let selected = NodeId::parse("selected").unwrap();
+        store.create(&trec(task.as_str(), 1)).await.unwrap();
+
+        let attempt = AttemptId::parse("attempt-22222222222222222222222222222222").unwrap();
+        let trigger = PolicyTriggerV1 {
+            schema_version: 1,
+            id: ControlEventIdV1::for_attempt(&attempt, 0),
+            node: PolicyNodeRefV1::from_node_id(0, selected.as_str()),
+            policy: FanOutPolicyNameV1::FailFast,
+            grace_ms: None,
+        };
+        let trigger_json = String::from_utf8(trigger.encode_canonical().unwrap()).unwrap();
+        let terminal = NodeTerminalV1 {
+            schema_version: 1,
+            primary: NodePrimaryDispositionV1::Failed,
+            cleanup: NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::Complete,
+                duration_ms: 3,
+            },
+            cause: None,
+            prompt_may_have_been_accepted: false,
+            degraded_ancestry: false,
+            policy_trigger_id: Some(trigger.id.clone()),
+        };
+        let terminal_json = String::from_utf8(terminal.encode_canonical().unwrap()).unwrap();
+        let usage = UsageSnapshot {
+            used: Some(7),
+            size: Some(11),
+            cost: None,
+            terminal: None,
+            at_ms: 5,
+        };
+
+        let start_seq = store
+            .record_node_started(&task, &selected, &operation, 4)
+            .await
+            .unwrap();
+        let checkpoint_seq = store
+            .put_node_checkpoint_sequenced_v2(
+                &task,
+                &selected,
+                &operation,
+                "FAILED",
+                false,
+                5,
+                Some(&usage),
+                &terminal_json,
+                Some(&trigger_json),
+            )
+            .await
+            .unwrap();
+        assert!(checkpoint_seq > start_seq);
+        assert_eq!(
+            store
+                .put_node_checkpoint_sequenced_v2(
+                    &task,
+                    &selected,
+                    &operation,
+                    "FAILED",
+                    false,
+                    999,
+                    Some(&usage),
+                    &terminal_json,
+                    Some(&trigger_json),
+                )
+                .await
+                .unwrap(),
+            checkpoint_seq
+        );
+        assert!(
+            store
+                .put_node_checkpoint_sequenced_v2(
+                    &task,
+                    &selected,
+                    &operation,
+                    "FAILED",
+                    false,
+                    999,
+                    Some(&usage),
+                    &terminal_json,
+                    None,
+                )
+                .await
+                .is_err(),
+            "dropping a selected checkpoint's trigger is a conflicting replay"
+        );
+
+        let independent = NodeId::parse("independent").unwrap();
+        let independent_terminal = NodeTerminalV1 {
+            policy_trigger_id: None,
+            primary: NodePrimaryDispositionV1::Completed,
+            ..terminal.clone()
+        };
+        let independent_terminal_json =
+            String::from_utf8(independent_terminal.encode_canonical().unwrap()).unwrap();
+        clock.store(150, Ordering::SeqCst);
+        let independent_seq = store
+            .put_node_checkpoint_sequenced_v2(
+                &task,
+                &independent,
+                &operation,
+                "OK",
+                true,
+                6,
+                None,
+                &independent_terminal_json,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .put_node_checkpoint_sequenced_v2(
+                    &task,
+                    &independent,
+                    &operation,
+                    "OK",
+                    true,
+                    777,
+                    None,
+                    &independent_terminal_json,
+                    None,
+                )
+                .await
+                .unwrap(),
+            independent_seq,
+            "task-level policy evidence must not contaminate a trigger-less checkpoint replay"
+        );
+
+        let conflicting_trigger = PolicyTriggerV1 {
+            schema_version: 1,
+            id: ControlEventIdV1::for_attempt(&attempt, 1),
+            node: PolicyNodeRefV1::from_node_id(2, "conflict"),
+            policy: FanOutPolicyNameV1::FailFast,
+            grace_ms: None,
+        };
+        let conflicting_trigger_json =
+            String::from_utf8(conflicting_trigger.encode_canonical().unwrap()).unwrap();
+        let conflicting_terminal = NodeTerminalV1 {
+            policy_trigger_id: Some(conflicting_trigger.id.clone()),
+            ..terminal.clone()
+        };
+        let conflicting_terminal_json =
+            String::from_utf8(conflicting_terminal.encode_canonical().unwrap()).unwrap();
+        clock.store(200, Ordering::SeqCst);
+        assert!(store
+            .put_node_checkpoint_sequenced_v2(
+                &task,
+                &NodeId::parse("conflict").unwrap(),
+                &operation,
+                "FAILED",
+                false,
+                7,
+                None,
+                &conflicting_terminal_json,
+                Some(&conflicting_trigger_json),
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            store.get(&task).await.unwrap().unwrap().last_artifact_ms,
+            Some(150),
+            "the rejected SQLite transaction must roll back recency"
+        );
+
+        let checkpoint_state: (i64, i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*),
+                        SUM(CASE WHEN policy_trigger_json IS NOT NULL THEN 1 ELSE 0 END),
+                        (SELECT COUNT(*) FROM task_node_starts WHERE task_id=?1)
+                 FROM task_node_checkpoints WHERE task_id=?1",
+                rusqlite::params![task.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_state, (2, 1, 0));
+        assert_eq!(store.node_terminal_evidence(&task).await.unwrap().len(), 2);
+        assert_eq!(
+            store
+                .workflow_task_evidence(&task)
+                .await
+                .unwrap()
+                .policy_trigger_json
+                .as_deref(),
+            Some(trigger_json.as_str())
+        );
+        let events = store.journal_from(&task, -1).await.unwrap();
+        assert_eq!(
+            events.len(),
+            3,
+            "one start and two unique finishes are durable"
+        );
+        assert!(matches!(
+            &events[1].kind,
+            bridge_core::orch::OrchEventKind::NodeFinished {
+                terminal_json: Some(stored_terminal),
+                policy_trigger_json: Some(stored_trigger),
+                ..
+            } if stored_terminal == &terminal_json && stored_trigger == &trigger_json
+        ));
     }
 
     async fn journal_write_matches_typed<S: bridge_core::task_store::TaskStore>(store: S) {
