@@ -52,6 +52,7 @@ pub struct Event {
     source: Option<String>,
     outcome: Option<TaskOutcome>,
     usage: Option<UsageSnapshot>,
+    metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl Event {
@@ -71,6 +72,17 @@ impl Event {
         self.source = Some(s.into());
         self
     }
+    pub fn metadata(&self) -> &std::collections::HashMap<String, serde_json::Value> {
+        &self.metadata
+    }
+    pub fn with_metadata(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
+    }
     pub fn outcome(&self) -> Option<TaskOutcome> {
         self.outcome
     }
@@ -84,6 +96,7 @@ impl Event {
             source: None,
             outcome: None,
             usage: None,
+            metadata: std::collections::HashMap::new(),
         }
     }
     pub fn artifact(t: impl Into<String>) -> Self {
@@ -94,6 +107,7 @@ impl Event {
             source: None,
             outcome: None,
             usage: None,
+            metadata: std::collections::HashMap::new(),
         }
     }
     pub fn terminal(o: TaskOutcome) -> Self {
@@ -103,6 +117,7 @@ impl Event {
             source: None,
             outcome: Some(o),
             usage: None,
+            metadata: std::collections::HashMap::new(),
         }
     }
     pub fn usage(snap: UsageSnapshot) -> Self {
@@ -112,6 +127,7 @@ impl Event {
             source: None,
             outcome: None,
             usage: Some(snap),
+            metadata: std::collections::HashMap::new(),
         }
     }
 }

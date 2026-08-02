@@ -4327,6 +4327,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     // Run the workflow.
     use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
     use futures::StreamExt;
+    let expected_node_count = graph.nodes.len();
     let mut stream = executor.run_with_diagnostic_context(
         graph,
         input,
@@ -4342,6 +4343,9 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let mut cleanup_disposition = "unknown";
     let mut cleanup_ms = 0_u64;
     let mut terminal_seen = false;
+    let mut structured_terminals = std::collections::BTreeMap::new();
+    let mut structured_evidence_invalid = false;
+    let mut policy_trigger_json: Option<String> = None;
     while let Some(item) = stream.next().await {
         match item {
             Ok(WorkflowEvent::NodeStarted { node }) => {
@@ -4359,7 +4363,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                 node,
                 ok: node_ok,
                 usage: _,
-                ..
+                terminal_json,
+                policy_trigger_json: node_policy_trigger_json,
+                policy_trigger_barrier_result: _,
+                output: _,
             }) => {
                 if node_ok {
                     completed_nodes = completed_nodes.saturating_add(1);
@@ -4378,6 +4385,39 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                     node.as_str(),
                     if node_ok { "ok" } else { "failed" }
                 );
+                if let Some(terminal_json) = terminal_json {
+                    let node_json = serde_json::to_string(node.as_str())
+                        .unwrap_or_else(|_| "\"invalid-node\"".into());
+                    eprintln!("node_terminal{{node={node_json},terminal_json={terminal_json}}}");
+                    match bridge_core::execution_policy::NodeTerminalV1::decode_canonical(
+                        terminal_json.as_bytes(),
+                    ) {
+                        Ok(terminal) => {
+                            if structured_terminals
+                                .insert(node.as_str().to_owned(), terminal)
+                                .is_some()
+                            {
+                                structured_evidence_invalid = true;
+                            }
+                        }
+                        Err(_) => structured_evidence_invalid = true,
+                    }
+                }
+                if let Some(trigger_json) = node_policy_trigger_json {
+                    eprintln!("policy_trigger{{json={trigger_json}}}");
+                    if bridge_core::execution_policy::PolicyTriggerV1::decode_canonical(
+                        trigger_json.as_bytes(),
+                    )
+                    .is_err()
+                        || policy_trigger_json
+                            .as_ref()
+                            .is_some_and(|prior| prior != &trigger_json)
+                    {
+                        structured_evidence_invalid = true;
+                    } else {
+                        policy_trigger_json = Some(trigger_json);
+                    }
+                }
             }
             Ok(WorkflowEvent::CleanupObserved {
                 disposition,
@@ -4394,9 +4434,13 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             Ok(WorkflowEvent::Terminal { outcome, output: o }) => {
                 terminal_seen = true;
                 output = o;
-                ok = matches!(outcome, WorkflowOutcome::Completed);
+                ok = matches!(
+                    outcome,
+                    WorkflowOutcome::Completed | WorkflowOutcome::CompletedDegraded
+                );
                 terminal_outcome = match outcome {
                     WorkflowOutcome::Completed => "completed",
+                    WorkflowOutcome::CompletedDegraded => "completed_degraded",
                     WorkflowOutcome::Failed => "failed",
                     WorkflowOutcome::Canceled => "canceled",
                 };
@@ -4411,6 +4455,19 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let cleanup_ms = cleanup_ms.min(prefinal_ms);
     let work_ms = prefinal_ms.saturating_sub(cleanup_ms);
     let finalization_started = std::time::Instant::now();
+    let structured_node_counts = if !structured_evidence_invalid
+        && structured_terminals.len() == expected_node_count
+    {
+        bridge_coordinator::detached::structured_node_counts_v1(structured_terminals.values()).ok()
+    } else {
+        None
+    };
+    let structured_evidence_complete = structured_node_counts.is_some();
+    if terminal_seen && !structured_evidence_complete {
+        eprintln!("[workflow] error: incomplete structured node evidence");
+        ok = false;
+        terminal_outcome = "failed";
+    }
 
     // Resolve negotiated terminal evidence before publishing either the output
     // or the process result. Unsupported legacy turns retain their stream
@@ -4445,7 +4502,10 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                         completeness,
                         producer,
                         final_presence,
-                        prompt_rpc: if terminal_outcome == "completed" {
+                        prompt_rpc: if matches!(
+                            terminal_outcome,
+                            "completed" | "completed_degraded"
+                        ) {
                             bridge_core::terminal_evidence::PromptRpcObservation::Resolved
                         } else {
                             bridge_core::terminal_evidence::PromptRpcObservation::RejectedAcceptedOrUncertain
@@ -4455,7 +4515,9 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                         child_liveness,
                     },
                 );
-                terminal_outcome = resolved.outcome.as_str();
+                if terminal_outcome != "completed_degraded" {
+                    terminal_outcome = resolved.outcome.as_str();
+                }
                 resolved_reason = Some(resolved.reason.as_str());
             }
             (
@@ -4511,7 +4573,11 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             None,
         ),
     };
-    if terminal_outcome != "completed" {
+    if !matches!(terminal_outcome, "completed" | "completed_degraded") {
+        ok = false;
+    }
+    if terminal_seen && !structured_evidence_complete {
+        terminal_outcome = "failed";
         ok = false;
     }
 
@@ -4542,6 +4608,7 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             1,
         );
         let telemetry_complete = terminal_seen
+            && structured_evidence_complete
             && offline_telemetry.reason().is_none()
             && !evidence_counts.overflowed
             && activity_recorder
@@ -4549,6 +4616,8 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
                 .is_some_and(|tally| !tally.overflowed);
         let terminal_reason = if output_error.is_some() {
             "output_write_failed"
+        } else if !structured_evidence_complete {
+            "structured_node_evidence_invalid"
         } else {
             resolved_reason.unwrap_or(terminal_outcome)
         };
@@ -4573,11 +4642,13 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
             degraded: terminal_outcome != "completed" || !telemetry_complete,
             prompt_acceptance: "unknown".into(),
             cleanup_disposition: cleanup_disposition.into(),
-            node_counts: bridge_core::workflow_history::NodeCounts {
-                completed: completed_nodes,
-                failed: failed_nodes,
-                ..bridge_core::workflow_history::NodeCounts::default()
-            },
+            node_counts: structured_node_counts.unwrap_or(
+                bridge_core::workflow_history::NodeCounts {
+                    completed: completed_nodes,
+                    failed: failed_nodes,
+                    ..bridge_core::workflow_history::NodeCounts::default()
+                },
+            ),
             phase_durations: vec![
                 bridge_core::workflow_history::PhaseDuration {
                     phase: "work".into(),

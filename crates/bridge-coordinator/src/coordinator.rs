@@ -136,6 +136,12 @@ pub struct TaskStatusDto {
     pub parent_attempt_id: Option<bridge_core::ids::AttemptId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telemetry_unavailable: Option<bridge_core::workflow_history::LedgerUnavailableReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_outcome: Option<bridge_core::execution_policy::WorkflowDurableOutcomeV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_trigger: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<bridge_core::task_store::NodeTerminalEvidenceV1>,
 }
 
 pub struct DirectAttemptHandle {
@@ -589,6 +595,9 @@ impl From<&TaskRecord> for TaskStatusDto {
             attempt_ordinal: None,
             parent_attempt_id: None,
             telemetry_unavailable: None,
+            workflow_outcome: None,
+            policy_trigger: None,
+            nodes: Vec::new(),
         }
     }
 }
@@ -1893,6 +1902,10 @@ impl Coordinator {
 
     async fn task_status_dto(&self, rec: &TaskRecord) -> Result<TaskStatusDto, BridgeError> {
         let mut dto = TaskStatusDto::from(rec);
+        let evidence = self.task_store.workflow_task_evidence(&rec.id).await?;
+        dto.workflow_outcome = evidence.workflow_outcome;
+        dto.policy_trigger = evidence.policy_trigger_json;
+        dto.nodes = self.task_store.node_terminal_evidence(&rec.id).await?;
         if let Some(locator) = self.task_store.get_attempt_locator(&rec.id).await? {
             dto.execution_id = Some(locator.identity.execution_id);
             dto.attempt_id = Some(locator.identity.attempt_id);

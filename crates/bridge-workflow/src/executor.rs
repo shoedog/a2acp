@@ -16,11 +16,11 @@ use bridge_core::domain::{
 };
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
-    freeze_provider_attempt_v1, BoundProviderEffectV1, BoundSessionSpecV1,
+    freeze_provider_attempt_v1, BoundProviderEffectV1, BoundSessionSpecV1, DependencySetRefV1,
     FrozenNodeExecutionIdentityV1, FrozenProviderLogicalSessionV1, LedgerAdmissionV1, NodeCauseV1,
     NodeCleanupDispositionV1, NodeCleanupV1, NodePrimaryDispositionV1, NodeTerminalV1,
-    PolicyNodeRefV1, ProviderEffectKeyV1, ProviderFreezeInputV1, Sha256HexV1,
-    EXECUTION_POLICY_SCHEMA_V1,
+    PolicyNodeRefV1, PolicyTriggerV1, ProviderEffectKeyV1, ProviderFreezeInputV1, Sha256HexV1,
+    SynthesisModeV1, EXECUTION_POLICY_SCHEMA_V1,
 };
 use bridge_core::harvest::{
     commit_harvested_completion, CompletionBodyOrigin, HarvestAuditStore, NoopHarvestAuditStore,
@@ -152,6 +152,45 @@ fn canonical_terminal_json_v1(terminal: &NodeTerminalV1) -> Result<String, Bridg
             .map_err(|_| BridgeError::InvalidStateTransition)?,
     )
     .map_err(|_| BridgeError::InvalidStateTransition)
+}
+
+fn terminal_completed_v1(terminal: &NodeTerminalV1) -> bool {
+    terminal.primary == NodePrimaryDispositionV1::Completed
+}
+
+fn degraded_input_text_v1(
+    legacy_output: &str,
+    terminal: Option<&NodeTerminalV1>,
+) -> Result<(String, bool), BridgeError> {
+    let Some(terminal) = terminal else {
+        return Ok((legacy_output.to_owned(), false));
+    };
+    if terminal_completed_v1(terminal) {
+        return Ok((legacy_output.to_owned(), terminal.degraded_ancestry));
+    }
+    let terminal_json = canonical_terminal_json_v1(terminal)?;
+    Ok((
+        format!("{{\"type\":\"a2a_bridge.node_failure.v1\",\"terminal\":{terminal_json}}}"),
+        true,
+    ))
+}
+
+fn disposition_from_terminal_v1(terminal: &NodeTerminalV1) -> NodeDisposition {
+    match terminal.primary {
+        NodePrimaryDispositionV1::Completed if terminal.degraded_ancestry => {
+            NodeDisposition::CompletedDegraded
+        }
+        NodePrimaryDispositionV1::Completed => NodeDisposition::Completed,
+        NodePrimaryDispositionV1::CanceledWorkflow
+        | NodePrimaryDispositionV1::CanceledPolicy
+        | NodePrimaryDispositionV1::CanceledNode => NodeDisposition::Canceled,
+        NodePrimaryDispositionV1::SkippedDependency => NodeDisposition::SkippedDependency,
+        NodePrimaryDispositionV1::NotStartedPolicy => NodeDisposition::NotStartedPolicy,
+        NodePrimaryDispositionV1::Failed
+        | NodePrimaryDispositionV1::TimedOut
+        | NodePrimaryDispositionV1::InterruptedLegacy
+        | NodePrimaryDispositionV1::Deadline => NodeDisposition::Failed,
+    }
 }
 
 fn canonical_trigger_json_v1(
@@ -493,8 +532,11 @@ fn node_run_output(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NodeDisposition {
     Completed,
+    CompletedDegraded,
     Failed,
     Canceled,
+    SkippedDependency,
+    NotStartedPolicy,
 }
 
 impl NodeDisposition {
@@ -509,7 +551,10 @@ impl NodeDisposition {
     fn workflow_outcome(self) -> WorkflowOutcome {
         match self {
             Self::Completed => WorkflowOutcome::Completed,
-            Self::Failed => WorkflowOutcome::Failed,
+            Self::CompletedDegraded => WorkflowOutcome::CompletedDegraded,
+            Self::Failed | Self::SkippedDependency | Self::NotStartedPolicy => {
+                WorkflowOutcome::Failed
+            }
             Self::Canceled => WorkflowOutcome::Canceled,
         }
     }
@@ -1159,8 +1204,36 @@ impl RetryInvalidation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowOutcome {
     Completed,
+    CompletedDegraded,
     Failed,
     Canceled,
+}
+
+#[derive(Clone, Debug)]
+pub struct StructuredNodeSeedV1 {
+    pub output: String,
+    pub ok: bool,
+    pub usage: Option<UsageSnapshot>,
+    pub terminal: NodeTerminalV1,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StructuredWorkflowSeedV1 {
+    pub nodes: BTreeMap<NodeId, StructuredNodeSeedV1>,
+    pub policy_trigger: Option<PolicyTriggerV1>,
+}
+
+impl WorkflowOutcome {
+    #[must_use]
+    pub const fn durable(&self) -> bridge_core::execution_policy::WorkflowDurableOutcomeV1 {
+        use bridge_core::execution_policy::WorkflowDurableOutcomeV1 as Durable;
+        match self {
+            Self::Completed => Durable::Completed,
+            Self::CompletedDegraded => Durable::CompletedDegraded,
+            Self::Failed => Durable::Failed,
+            Self::Canceled => Durable::Canceled,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4005,6 +4078,48 @@ impl WorkflowExecutor {
             run_id,
             cancel,
             seed,
+            None,
+            ctx,
+            diagnostic_factory,
+            prompt_dispatch,
+            policy_trigger,
+            frozen_authority,
+            None,
+        )
+    }
+
+    pub fn run_from_v2_with_diagnostic_context(
+        &self,
+        graph: Arc<WorkflowGraph>,
+        input: String,
+        run_id: String,
+        cancel: CancellationToken,
+        seed: StructuredWorkflowSeedV1,
+        ctx: WorkflowDiagnosticContext,
+    ) -> WorkflowStream {
+        let legacy_seed = seed
+            .nodes
+            .iter()
+            .map(|(node, checkpoint)| {
+                (
+                    node.as_str().to_owned(),
+                    (
+                        checkpoint.output.clone(),
+                        checkpoint.ok,
+                        checkpoint.usage.clone(),
+                    ),
+                )
+            })
+            .collect();
+        let (ctx, diagnostic_factory, prompt_dispatch, policy_trigger, frozen_authority) =
+            ctx.into_parts();
+        self.run_from_with_context_inner(
+            graph,
+            input,
+            run_id,
+            cancel,
+            legacy_seed,
+            Some(seed),
             ctx,
             diagnostic_factory,
             prompt_dispatch,
@@ -4055,6 +4170,7 @@ impl WorkflowExecutor {
             run_id,
             cancel,
             seed,
+            None,
             ctx,
             diagnostic_factory,
             prompt_dispatch,
@@ -4072,6 +4188,7 @@ impl WorkflowExecutor {
         run_id: String,
         cancel: CancellationToken,
         seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
+        structured_seed: Option<StructuredWorkflowSeedV1>,
         ctx: WorkflowRunContext,
         diagnostic_factory: Arc<dyn DiagnosticObserverFactory>,
         prompt_dispatch: Option<PromptDispatchBarrier>,
@@ -4087,6 +4204,44 @@ impl WorkflowExecutor {
                 if graph.as_ref() != &authority.run_spec.graph {
                     yield Err(BridgeError::ConfigMismatch { field: "workflow_graph" });
                     return;
+                }
+            }
+            match (&frozen_authority, &structured_seed) {
+                (Some(_), None) if !seed.is_empty() => {
+                    yield Err(BridgeError::ConfigInvalid {
+                        reason: "V2 resume requires structured node terminal evidence".into(),
+                    });
+                    return;
+                }
+                (None, Some(_)) => {
+                    yield Err(BridgeError::ConfigInvalid {
+                        reason: "structured node terminal evidence requires a frozen V2 run".into(),
+                    });
+                    return;
+                }
+                _ => {}
+            }
+            if let Some(structured) = structured_seed.as_ref() {
+                if structured.nodes.len() != seed.len()
+                    || structured
+                        .nodes
+                        .keys()
+                        .any(|node| !seed.contains_key(node.as_str()))
+                {
+                    yield Err(BridgeError::ConfigInvalid {
+                        reason: "V2 resume checkpoint and terminal sets differ".into(),
+                    });
+                    return;
+                }
+                for checkpoint in structured.nodes.values() {
+                    if checkpoint.terminal.encode_canonical().is_err()
+                        || checkpoint.ok != terminal_completed_v1(&checkpoint.terminal)
+                    {
+                        yield Err(BridgeError::ConfigInvalid {
+                            reason: "V2 resume checkpoint terminal is invalid".into(),
+                        });
+                        return;
+                    }
                 }
             }
             let cleanup_tracker = Arc::new(WorkflowCleanupTracker::default());
@@ -4160,19 +4315,31 @@ impl WorkflowExecutor {
                 }
             }
 
-            let mut dispositions: HashMap<String, NodeDisposition> = seed
-                .iter()
-                .map(|(node, (_, ok, _))| {
-                    (
-                        node.clone(),
-                        if *ok {
-                            NodeDisposition::Completed
-                        } else {
-                            NodeDisposition::Failed
-                        },
-                    )
-                })
-                .collect();
+            let mut dispositions: HashMap<String, NodeDisposition> = match structured_seed.as_ref() {
+                Some(structured) => structured
+                    .nodes
+                    .iter()
+                    .map(|(node, checkpoint)| {
+                        (
+                            node.as_str().to_owned(),
+                            disposition_from_terminal_v1(&checkpoint.terminal),
+                        )
+                    })
+                    .collect(),
+                None => seed
+                    .iter()
+                    .map(|(node, (_, ok, _))| {
+                        (
+                            node.clone(),
+                            if *ok {
+                                NodeDisposition::Completed
+                            } else {
+                                NodeDisposition::Failed
+                            },
+                        )
+                    })
+                    .collect(),
+            };
             let mut outputs: HashMap<String, (String, bool, Option<UsageSnapshot>)> = seed;
             let mut done: HashSet<String> = outputs.keys().cloned().collect();
             let terminal_id = graph.terminal().map(|n| n.id.as_str().to_string()).unwrap_or_default();
@@ -4187,8 +4354,20 @@ impl WorkflowExecutor {
             let mut stop_scheduling = false; // set on cancel: drain in-flight, schedule nothing new
             let mut node_cancels = BTreeMap::<NodeId, CancellationToken>::new();
             let mut policy_canceled = HashSet::<String>::new();
-            let mut node_terminals = BTreeMap::<NodeId, NodeTerminalV1>::new();
+            let mut node_terminals = structured_seed
+                .as_ref()
+                .map(|structured| {
+                    structured
+                        .nodes
+                        .iter()
+                        .map(|(node, checkpoint)| (node.clone(), checkpoint.terminal.clone()))
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default();
             let mut node_refs = BTreeMap::<NodeId, PolicyNodeRefV1>::new();
+            let mut scheduled_degraded_ancestry = BTreeMap::<NodeId, bool>::new();
+            let mut scheduled_dependency_sets =
+                BTreeMap::<NodeId, DependencySetRefV1>::new();
             let mut fanout_controller = frozen_authority
                 .as_ref()
                 .map(|authority| FanOutControllerV1::new(authority.run_spec.controls.fan_out.clone()));
@@ -4203,6 +4382,51 @@ impl WorkflowExecutor {
                     };
                     node_refs.insert(node.id.clone(), identity.node.clone());
                 }
+            }
+            if let (Some(authority), Some(structured), Some(controller)) = (
+                frozen_authority.as_ref(),
+                structured_seed.as_ref(),
+                fanout_controller.as_mut(),
+            ) {
+                match structured.policy_trigger.clone() {
+                    Some(trigger) => {
+                        if controller
+                            .restore_committed_trigger(
+                                &authority.run_spec.attempt_id,
+                                trigger,
+                                &node_terminals,
+                                &node_refs,
+                            )
+                            .is_err()
+                        {
+                            yield Err(BridgeError::InvalidStateTransition);
+                            return;
+                        }
+                    }
+                    None => {
+                        let has_trigger_reference = node_terminals
+                            .values()
+                            .any(|terminal| terminal.policy_trigger_id.is_some());
+                        let qualifying_failure = node_terminals.values().any(|terminal| {
+                            matches!(
+                                terminal.primary,
+                                NodePrimaryDispositionV1::Failed
+                                    | NodePrimaryDispositionV1::TimedOut
+                            )
+                        });
+                        if has_trigger_reference
+                            || (qualifying_failure
+                                && !matches!(
+                                    authority.run_spec.controls.fan_out,
+                                    bridge_core::execution_policy::FanOutPolicyV1::BoundedIndependent
+                                ))
+                        {
+                            yield Err(BridgeError::InvalidStateTransition);
+                            return;
+                        }
+                    }
+                }
+                stop_scheduling = controller.admission_stopped();
             }
 
             // Push every not-done/not-scheduled node whose inputs are all done.
@@ -4221,11 +4445,106 @@ impl WorkflowExecutor {
                             }
                             if n.inputs.iter().all(|i| done.contains(i.as_str())) {
                                 scheduled.insert(id.to_string());
-                                started.push(n.id.clone());
                                 let mut owned: Vec<(String, String)> = base_render_vars.clone();
+                                let synthesis_mode = frozen_authority
+                                    .as_ref()
+                                    .map(|authority| authority.run_spec.controls.synthesis);
+                                let prepared_inputs = (|| {
+                                    let mut rendered = BTreeMap::<NodeId, String>::new();
+                                    let mut degraded_ancestry = false;
+                                    let mut noncompleted_refs = Vec::<PolicyNodeRefV1>::new();
+                                    for inp in &n.inputs {
+                                        let (legacy_text, _, _) = outputs
+                                            .get(inp.as_str())
+                                            .ok_or(BridgeError::InvalidStateTransition)?;
+                                        let rendered_text = match synthesis_mode {
+                                            None => legacy_text.clone(),
+                                            Some(SynthesisModeV1::Strict) => {
+                                                let terminal = node_terminals
+                                                    .get(inp)
+                                                    .ok_or(BridgeError::InvalidStateTransition)?;
+                                                if !terminal_completed_v1(terminal) {
+                                                    noncompleted_refs.push(
+                                                        node_refs
+                                                            .get(inp)
+                                                            .cloned()
+                                                            .ok_or(BridgeError::InvalidStateTransition)?,
+                                                    );
+                                                }
+                                                legacy_text.clone()
+                                            }
+                                            Some(SynthesisModeV1::Degraded) => {
+                                                let terminal = node_terminals
+                                                    .get(inp)
+                                                    .ok_or(BridgeError::InvalidStateTransition)?;
+                                                let (text, input_degraded) =
+                                                    degraded_input_text_v1(legacy_text, Some(terminal))?;
+                                                degraded_ancestry |= input_degraded;
+                                                text
+                                            }
+                                        };
+                                        rendered.insert(inp.clone(), rendered_text);
+                                    }
+                                    Ok::<_, BridgeError>((
+                                        rendered,
+                                        degraded_ancestry,
+                                        noncompleted_refs,
+                                    ))
+                                })();
+                                let (rendered_inputs, degraded_ancestry, noncompleted_refs) =
+                                    match prepared_inputs {
+                                        Ok(prepared) => prepared,
+                                        Err(error) => {
+                                            let node_id = n.id.clone();
+                                            inflight.push(Box::pin(futures::future::ready((
+                                                node_id,
+                                                Err(error),
+                                            ))) as NodeFut);
+                                            continue;
+                                        }
+                                    };
+
+                                if !noncompleted_refs.is_empty() {
+                                    let dependency_set = match DependencySetRefV1::from_node_refs(
+                                        noncompleted_refs,
+                                    ) {
+                                        Ok(dependency_set) => dependency_set,
+                                        Err(_) => {
+                                            let node_id = n.id.clone();
+                                            inflight.push(Box::pin(futures::future::ready((
+                                                node_id,
+                                                Err(BridgeError::InvalidStateTransition),
+                                            ))) as NodeFut);
+                                            continue;
+                                        }
+                                    };
+                                    scheduled_dependency_sets.insert(n.id.clone(), dependency_set);
+                                    let output = node_run_output(
+                                        graph.id.as_str(),
+                                        n,
+                                        &run_id,
+                                        &ctx,
+                                        format!(
+                                            "[node {} skipped: dependency failure]",
+                                            n.id.as_str()
+                                        ),
+                                        false,
+                                        None,
+                                        NodeDisposition::SkippedDependency,
+                                        CompletionBodyOrigin::BridgeSyntheticStreamError,
+                                    );
+                                    inflight.push(Box::pin(futures::future::ready((
+                                        n.id.clone(),
+                                        output,
+                                    ))) as NodeFut);
+                                    continue;
+                                }
+
+                                scheduled_degraded_ancestry
+                                    .insert(n.id.clone(), degraded_ancestry);
                                 for inp in &n.inputs {
-                                    if let Some((t, _, _)) = outputs.get(inp.as_str()) {
-                                        owned.push((inp.as_str().into(), t.clone()));
+                                    if let Some(text) = rendered_inputs.get(inp) {
+                                        owned.push((inp.as_str().into(), text.clone()));
                                     }
                                 }
                                 // Single-upstream alias: a node with exactly one input can render its
@@ -4233,8 +4552,8 @@ impl WorkflowExecutor {
                                 // node id — so one refine prompt serves model-diverse legs whose draft nodes
                                 // have distinct ids (e.g. reviewer_codex_draft / reviewer_claude_draft).
                                 if let [only] = n.inputs.as_slice() {
-                                    if let Some((t, _, _)) = outputs.get(only.as_str()) {
-                                        owned.push(("draft".into(), t.clone()));
+                                    if let Some(text) = rendered_inputs.get(only) {
+                                        owned.push(("draft".into(), text.clone()));
                                     }
                                 }
                                 if !n.inputs.is_empty() {
@@ -4251,6 +4570,7 @@ impl WorkflowExecutor {
                                     owned.push(("workflow.costs".into(), render_costs_table(&cost_rows)));
                                     owned.push(("workflow.weights".into(), render_weights(&graph.panel)));
                                 }
+                                started.push(n.id.clone());
                                 let node = n.clone();
                                 let run_id = run_id.clone();
                                 let node_cancel = cancel.child_token();
@@ -4328,6 +4648,17 @@ impl WorkflowExecutor {
                         primary_error,
                         harvest,
                     } = raw_output;
+                    let degraded_ancestry = scheduled_degraded_ancestry
+                        .remove(&node_id)
+                        .unwrap_or(false);
+                    let dependency_set = scheduled_dependency_sets.remove(&node_id);
+                    let disposition = if disposition == NodeDisposition::Completed
+                        && degraded_ancestry
+                    {
+                        NodeDisposition::CompletedDegraded
+                    } else {
+                        disposition
+                    };
                     // §18-7 Off-mode audit exemption: with zero runnable enabled
                     // nodes there is no audit commit at all — Off mode is the §7.1
                     // identity, so the raw body IS the effective body, and no
@@ -4382,7 +4713,9 @@ impl WorkflowExecutor {
                     let (cleanup, cleanup_error) = cleanup_tracker.node_observation(&node_id);
                     let terminal_error = primary_error.as_ref().or(cleanup_error.as_ref());
                     let primary = match disposition {
-                        NodeDisposition::Completed => NodePrimaryDispositionV1::Completed,
+                        NodeDisposition::Completed | NodeDisposition::CompletedDegraded => {
+                            NodePrimaryDispositionV1::Completed
+                        }
                         NodeDisposition::Failed
                             if terminal_error.is_some_and(|error| match error {
                                 BridgeError::AgentTimedOut | BridgeError::CancelTimeout => true,
@@ -4400,6 +4733,12 @@ impl WorkflowExecutor {
                             NodePrimaryDispositionV1::CanceledPolicy
                         }
                         NodeDisposition::Canceled => NodePrimaryDispositionV1::CanceledWorkflow,
+                        NodeDisposition::SkippedDependency => {
+                            NodePrimaryDispositionV1::SkippedDependency
+                        }
+                        NodeDisposition::NotStartedPolicy => {
+                            NodePrimaryDispositionV1::NotStartedPolicy
+                        }
                     };
                     ready_terminals.push(ReadyNodeTerminalV1 {
                         node: node_id.clone(),
@@ -4407,7 +4746,9 @@ impl WorkflowExecutor {
                             schema_version: EXECUTION_POLICY_SCHEMA_V1,
                             primary,
                             cleanup,
-                            cause: terminal_error.map(NodeCauseV1::from_bridge_error),
+                            cause: dependency_set
+                                .map(NodeCauseV1::skipped_dependency)
+                                .or_else(|| terminal_error.map(NodeCauseV1::from_bridge_error)),
                             prompt_may_have_been_accepted: primary_error.as_ref().is_some_and(
                                 |error| match error {
                                     BridgeError::AgentFailure { diagnostic } => {
@@ -4416,7 +4757,7 @@ impl WorkflowExecutor {
                                     _ => false,
                                 },
                             ),
-                            degraded_ancestry: false,
+                            degraded_ancestry,
                             policy_trigger_id: None,
                         },
                     });
@@ -4559,6 +4900,74 @@ impl WorkflowExecutor {
                     yield Ok(WorkflowEvent::NodeStarted { node });
                 }
             }
+            if frozen_authority.is_some() {
+                let mut missing = graph
+                    .nodes
+                    .iter()
+                    .filter(|node| !node_terminals.contains_key(&node.id))
+                    .map(|node| node.id.clone())
+                    .collect::<Vec<_>>();
+                missing.sort();
+                for node in missing {
+                    let (primary, disposition, text) = if cancel.is_cancelled() {
+                        (
+                            NodePrimaryDispositionV1::CanceledWorkflow,
+                            NodeDisposition::Canceled,
+                            format!("[node {} canceled: workflow]", node.as_str()),
+                        )
+                    } else if fanout_controller
+                        .as_ref()
+                        .is_some_and(|controller| {
+                            controller.admission_stopped() && controller.trigger().is_some()
+                        })
+                    {
+                        (
+                            NodePrimaryDispositionV1::NotStartedPolicy,
+                            NodeDisposition::NotStartedPolicy,
+                            format!("[node {} not started: policy]", node.as_str()),
+                        )
+                    } else {
+                        yield Err(BridgeError::InvalidStateTransition);
+                        return;
+                    };
+                    let terminal = NodeTerminalV1 {
+                        schema_version: EXECUTION_POLICY_SCHEMA_V1,
+                        primary,
+                        cleanup: NodeCleanupV1 {
+                            disposition: NodeCleanupDispositionV1::NotNeeded,
+                            duration_ms: 0,
+                        },
+                        cause: None,
+                        prompt_may_have_been_accepted: false,
+                        degraded_ancestry: false,
+                        policy_trigger_id: None,
+                    };
+                    let terminal_json = match canonical_terminal_json_v1(&terminal) {
+                        Ok(terminal_json) => terminal_json,
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    };
+                    node_terminals.insert(node.clone(), terminal);
+                    done.insert(node.as_str().to_owned());
+                    dispositions.insert(node.as_str().to_owned(), disposition);
+                    outputs.insert(node.as_str().to_owned(), (text.clone(), false, None));
+                    yield Ok(WorkflowEvent::NodeFinished {
+                        node,
+                        ok: false,
+                        output: text,
+                        usage: None,
+                        terminal_json: Some(terminal_json),
+                        policy_trigger_json: None,
+                        policy_trigger_barrier_result: None,
+                    });
+                }
+                if node_terminals.len() != graph.nodes.len() {
+                    yield Err(BridgeError::InvalidStateTransition);
+                    return;
+                }
+            }
             let (term_text, _, _usage) = outputs.get(&terminal_id).cloned().unwrap_or_default();
             let outcome = dispositions
                 .get(&terminal_id)
@@ -4569,7 +4978,14 @@ impl WorkflowExecutor {
                     // node reports a concrete failure (including failed cancel
                     // or teardown), that evidence outranks the generic canceled
                     // fallback for the never-started terminal node.
-                    if dispositions.values().any(|d| *d == NodeDisposition::Failed) {
+                    if dispositions.values().any(|d| {
+                        matches!(
+                            d,
+                            NodeDisposition::Failed
+                                | NodeDisposition::SkippedDependency
+                                | NodeDisposition::NotStartedPolicy
+                        )
+                    }) {
                         WorkflowOutcome::Failed
                     } else if cancel.is_cancelled() {
                         WorkflowOutcome::Canceled

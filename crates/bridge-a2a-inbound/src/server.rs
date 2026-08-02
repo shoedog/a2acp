@@ -1764,19 +1764,50 @@ fn workflow_progress_events(kind: &crate::reattach::FrameKind) -> Vec<Event> {
         crate::reattach::FrameKind::NodeStarted { node } => {
             vec![Event::status(format!("node {node} started"))]
         }
-        crate::reattach::FrameKind::NodeFinished { node, ok, .. } => {
-            vec![Event::status(format!(
+        crate::reattach::FrameKind::NodeFinished {
+            node,
+            ok,
+            terminal_json,
+            policy_trigger_json,
+            ..
+        } => {
+            let mut event = Event::status(format!(
                 "node {node} {}",
                 if *ok { "ok" } else { "failed" }
-            ))]
+            ))
+            .with_metadata("a2a-bridge.node", node.clone());
+            if let Some(terminal_json) = terminal_json {
+                event = event.with_metadata(
+                    "a2a-bridge.node-terminal",
+                    terminal_json.clone(),
+                );
+            }
+            if let Some(policy_trigger_json) = policy_trigger_json {
+                event = event.with_metadata(
+                    "a2a-bridge.policy-trigger",
+                    policy_trigger_json.clone(),
+                );
+            }
+            vec![event]
         }
         crate::reattach::FrameKind::Terminal { outcome, output } => {
-            let outcome = match outcome {
-                crate::reattach::TerminalOutcome::Completed => TaskOutcome::Completed,
-                crate::reattach::TerminalOutcome::Failed => TaskOutcome::Failed,
-                crate::reattach::TerminalOutcome::Canceled => TaskOutcome::Canceled,
+            let (task_outcome, workflow_outcome) = match outcome {
+                crate::reattach::TerminalOutcome::Completed => {
+                    (TaskOutcome::Completed, "completed")
+                }
+                crate::reattach::TerminalOutcome::CompletedDegraded => {
+                    (TaskOutcome::Completed, "completed_degraded")
+                }
+                crate::reattach::TerminalOutcome::Failed => (TaskOutcome::Failed, "failed"),
+                crate::reattach::TerminalOutcome::Canceled => {
+                    (TaskOutcome::Canceled, "canceled")
+                }
             };
-            vec![Event::artifact(output.clone()), Event::terminal(outcome)]
+            vec![
+                Event::artifact(output.clone()),
+                Event::terminal(task_outcome)
+                    .with_metadata("a2a-bridge.workflow-outcome", workflow_outcome),
+            ]
         }
         crate::reattach::FrameKind::Plan { .. }
         | crate::reattach::FrameKind::ToolCall { .. }
@@ -1850,15 +1881,7 @@ async fn durable_workflow_a2a_sse_response(
     let terminal_snapshot = snapshot.snap.status.is_terminal()
         && (live.is_none() || terminal_published_before_snapshot);
     if terminal_snapshot {
-        let outcome = match snapshot.snap.status {
-            bridge_core::task_store::TaskRecordStatus::Completed => {
-                crate::reattach::TerminalOutcome::Completed
-            }
-            bridge_core::task_store::TaskRecordStatus::Canceled => {
-                crate::reattach::TerminalOutcome::Canceled
-            }
-            _ => crate::reattach::TerminalOutcome::Failed,
-        };
+        let outcome = replay_terminal_outcome(&snapshot);
         replay.push(crate::reattach::WorkflowProgressFrame {
             v: 1,
             seq: snapshot.snap.terminal_seq.unwrap_or(snapshot.snap.cut_seq),
@@ -2078,13 +2101,7 @@ fn terminal_sse_response(snapshot: &FoldedProgressSnapshot, cursor: Option<i64>)
         kind: crate::reattach::FrameKind::SnapshotComplete,
     });
     if emit_terminal {
-        use bridge_core::task_store::TaskRecordStatus;
-        let outcome = match snap.status {
-            TaskRecordStatus::Completed => crate::reattach::TerminalOutcome::Completed,
-            TaskRecordStatus::Canceled => crate::reattach::TerminalOutcome::Canceled,
-            // Failed, Interrupted, Working all map to Failed on the wire.
-            _ => crate::reattach::TerminalOutcome::Failed,
-        };
+        let outcome = replay_terminal_outcome(snapshot);
         let output = snap
             .result
             .clone()
@@ -2111,6 +2128,7 @@ struct FoldedProgressSnapshot {
     snap: bridge_core::task_store::TaskProgressSnapshot,
     events: Vec<bridge_core::orch::OrchEvent>,
     locator: Option<bridge_core::task_store::TaskAttemptLocator>,
+    workflow_outcome: Option<bridge_core::execution_policy::WorkflowDurableOutcomeV1>,
 }
 
 async fn fold_or_typed_snapshot(
@@ -2130,10 +2148,12 @@ async fn fold_or_typed_snapshot(
     if eligible {
         // ONE consistent read (journal_fold_inputs): `events` and `snap.cut_seq` agree by construction.
         let snap = bridge_core::task_store::fold_journal_to_snapshot(&fi.events, &fi.scalars)?;
+        let workflow_outcome = store.workflow_task_evidence(task).await?.workflow_outcome;
         Ok(FoldedProgressSnapshot {
             snap,
             events: fi.events,
             locator,
+            workflow_outcome,
         })
     } else {
         // Ineligible (legacy / cancel_if_working- or sweep-terminated): the typed snapshot is a SECOND
@@ -2150,11 +2170,36 @@ async fn fold_or_typed_snapshot(
             .into_iter()
             .filter(|e| e.seq <= cut)
             .collect();
+        let workflow_outcome = store.workflow_task_evidence(task).await?.workflow_outcome;
         Ok(FoldedProgressSnapshot {
             snap,
             events,
             locator,
+            workflow_outcome,
         })
+    }
+}
+
+fn replay_terminal_outcome(snapshot: &FoldedProgressSnapshot) -> crate::reattach::TerminalOutcome {
+    use bridge_core::execution_policy::WorkflowDurableOutcomeV1;
+    use bridge_core::task_store::TaskRecordStatus;
+
+    match snapshot.workflow_outcome {
+        Some(WorkflowDurableOutcomeV1::Completed) => crate::reattach::TerminalOutcome::Completed,
+        Some(WorkflowDurableOutcomeV1::CompletedDegraded) => {
+            crate::reattach::TerminalOutcome::CompletedDegraded
+        }
+        Some(WorkflowDurableOutcomeV1::Canceled) => crate::reattach::TerminalOutcome::Canceled,
+        Some(WorkflowDurableOutcomeV1::Failed | WorkflowDurableOutcomeV1::Interrupted) => {
+            crate::reattach::TerminalOutcome::Failed
+        }
+        None => match snapshot.snap.status {
+            TaskRecordStatus::Completed => crate::reattach::TerminalOutcome::Completed,
+            TaskRecordStatus::Canceled => crate::reattach::TerminalOutcome::Canceled,
+            TaskRecordStatus::Failed
+            | TaskRecordStatus::Interrupted
+            | TaskRecordStatus::Working => crate::reattach::TerminalOutcome::Failed,
+        },
     }
 }
 
@@ -2426,11 +2471,33 @@ fn rich_snapshot_frames(
     cursor: Option<i64>,
 ) -> Vec<crate::reattach::WorkflowProgressFrame> {
     let mut frames = snapshot_frames(snap, None);
+    let node_frame_positions = frames
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frame)| match &frame.kind {
+            crate::reattach::FrameKind::NodeFinished { node, .. } => {
+                Some((frame.seq, node.clone(), index))
+            }
+            _ => None,
+        })
+        .map(|(seq, node, index)| ((seq, node), index))
+        .collect::<std::collections::HashMap<_, _>>();
     let mut latest_plan = None;
     let mut tool_calls = std::collections::HashMap::<String, ToolCallFold>::new();
 
     for event in events {
         match &event.kind {
+            bridge_core::orch::OrchEventKind::NodeFinished { node, .. } => {
+                if let Some(index) = node_frame_positions.get(&(event.seq, node.clone())) {
+                    if let Some(projected) = crate::reattach::project_orch_frame(
+                        &event.kind,
+                        crate::reattach::Phase::Snapshot,
+                        event.seq,
+                    ) {
+                        frames[*index] = projected;
+                    }
+                }
+            }
             bridge_core::orch::OrchEventKind::Plan { .. } => {
                 latest_plan = crate::reattach::project_orch_frame(
                     &event.kind,
@@ -3599,6 +3666,34 @@ fn attempt_identity_metadata(
             serde_json::to_value(telemetry_unavailable).unwrap_or_default(),
         ),
     ])
+}
+
+async fn durable_task_metadata(
+    store: &Arc<dyn bridge_core::task_store::TaskStore>,
+    task: &TaskId,
+    locator: Option<&bridge_core::task_store::TaskAttemptLocator>,
+) -> Result<Option<std::collections::HashMap<String, Value>>, BridgeError> {
+    let mut metadata = locator
+        .map(|locator| attempt_identity_metadata(&locator.identity, locator.telemetry_unavailable))
+        .unwrap_or_default();
+    let evidence = store.workflow_task_evidence(task).await?;
+    if let Some(outcome) = evidence.workflow_outcome {
+        metadata.insert(
+            "a2a-bridge.workflow-outcome".into(),
+            Value::String(outcome.as_str().into()),
+        );
+    }
+    if let Some(trigger) = evidence.policy_trigger_json {
+        metadata.insert("a2a-bridge.policy-trigger".into(), Value::String(trigger));
+    }
+    let nodes = store.node_terminal_evidence(task).await?;
+    if !nodes.is_empty() {
+        metadata.insert(
+            "a2a-bridge.nodes".into(),
+            serde_json::to_value(nodes).map_err(|_| BridgeError::StoreFailure)?,
+        );
+    }
+    Ok((!metadata.is_empty()).then_some(metadata))
 }
 
 /// Unary path: run the same pipeline but collect events into one JSON response.
@@ -4858,9 +4953,11 @@ async fn get_task(
                 Ok(locator) => locator,
                 Err(error) => return bridge_err_to_jsonrpc(id, &error),
             };
-            let metadata = locator.as_ref().map(|locator| {
-                attempt_identity_metadata(&locator.identity, locator.telemetry_unavailable)
-            });
+            let metadata =
+                match durable_task_metadata(srv.task_store(), &rec.id, locator.as_ref()).await {
+                    Ok(metadata) => metadata,
+                    Err(error) => return bridge_err_to_jsonrpc(id, &error),
+                };
             let t = a2a::Task {
                 id: rec.id.as_str().to_owned(),
                 context_id: rec.id.as_str().to_owned(),
@@ -15921,6 +16018,72 @@ mod tests {
         bridge_core::ids::OperationId::parse(format!("op-{}", task.as_str())).unwrap()
     }
 
+    fn v2_terminal_and_trigger(
+        attempt: &bridge_core::ids::AttemptId,
+        node: &bridge_core::ids::NodeId,
+    ) -> (String, String) {
+        use bridge_core::execution_policy::{
+            FanOutPolicyNameV1, NodeCleanupDispositionV1, NodeCleanupV1, NodePrimaryDispositionV1,
+            NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1,
+        };
+
+        let trigger = PolicyTriggerV1 {
+            schema_version: 1,
+            id: bridge_core::execution_policy::ControlEventIdV1::for_attempt(attempt, 0),
+            node: PolicyNodeRefV1::from_node_id(0, node.as_str()),
+            policy: FanOutPolicyNameV1::FailFast,
+            grace_ms: None,
+        };
+        let terminal = NodeTerminalV1 {
+            schema_version: 1,
+            primary: NodePrimaryDispositionV1::Failed,
+            cleanup: NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::Complete,
+                duration_ms: 3,
+            },
+            cause: None,
+            prompt_may_have_been_accepted: false,
+            degraded_ancestry: false,
+            policy_trigger_id: Some(trigger.id.clone()),
+        };
+        (
+            String::from_utf8(terminal.encode_canonical().unwrap()).unwrap(),
+            String::from_utf8(trigger.encode_canonical().unwrap()).unwrap(),
+        )
+    }
+
+    fn completed_degraded_attempt_terminal() -> bridge_core::workflow_history::AttemptTerminal {
+        bridge_core::workflow_history::AttemptTerminal {
+            completed_ms: 2,
+            work_ms: 1,
+            end_to_end_ms: 1,
+            queue_ms: 0,
+            cancellation_ms: 0,
+            cleanup_ms: 0,
+            finalization_ms: 0,
+            outcome: "completed_degraded".into(),
+            terminal_reason: "owner_finalized".into(),
+            producer_terminal: "unknown".into(),
+            final_message: "unknown".into(),
+            process_liveness: "unknown".into(),
+            terminal_evidence_capability: "not_applicable".into(),
+            terminal_evidence_version: "none".into(),
+            terminal_evidence_source: "none".into(),
+            terminal_evidence_complete: true,
+            terminal_evidence_counts: Default::default(),
+            degraded: true,
+            prompt_acceptance: "not_dispatched".into(),
+            cleanup_disposition: "complete".into(),
+            node_counts: bridge_core::workflow_history::NodeCounts {
+                failed: 1,
+                ..Default::default()
+            },
+            phase_durations: Vec::new(),
+            telemetry_complete: true,
+            monotonic_clock: true,
+        }
+    }
+
     fn serialize_frames(frames: &[crate::reattach::WorkflowProgressFrame]) -> Vec<String> {
         frames
             .iter()
@@ -16802,6 +16965,196 @@ mod tests {
         assert_eq!(
             snapshot_tags(&frames),
             vec![(2, "plan".into()), (3, "node_finished".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn rich_snapshot_preserves_exact_v2_terminal_and_trigger_bytes() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = bridge_core::ids::TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let node = bridge_core::ids::NodeId::parse("selected").unwrap();
+        let operation = operation_id_for_task(&task);
+        let (terminal_json, trigger_json) = v2_terminal_and_trigger(&identity.attempt_id, &node);
+        store
+            .create_with_attempt_locator(
+                &working_record(task.as_str()),
+                &bridge_core::task_store::TaskAttemptLocator {
+                    identity,
+                    telemetry_unavailable: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_node_checkpoint_sequenced_v2(
+                &task,
+                &node,
+                &operation,
+                "failed",
+                false,
+                crate::workflow_sink::now_ms(),
+                None,
+                &terminal_json,
+                Some(&trigger_json),
+            )
+            .await
+            .unwrap();
+
+        let inputs = store.journal_fold_inputs(&task).await.unwrap();
+        let snapshot =
+            bridge_core::task_store::fold_journal_to_snapshot(&inputs.events, &inputs.scalars)
+                .unwrap();
+        let frames = rich_snapshot_frames(&snapshot, &inputs.events, None);
+        let frame = frames
+            .iter()
+            .find(|frame| matches!(frame.kind, crate::reattach::FrameKind::NodeFinished { .. }))
+            .expect("the selected checkpoint is replayed");
+        match &frame.kind {
+            crate::reattach::FrameKind::NodeFinished {
+                terminal_json: replayed_terminal,
+                policy_trigger_json: replayed_trigger,
+                ..
+            } => {
+                assert_eq!(replayed_terminal.as_deref(), Some(terminal_json.as_str()));
+                assert_eq!(replayed_trigger.as_deref(), Some(trigger_json.as_str()));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn workflow_a2a_events_preserve_structured_metadata() {
+        let terminal_json = "{\"schema_version\":1,\"primary\":\"failed\"}";
+        let trigger_json = "{\"schema_version\":1,\"policy\":\"fail_fast\"}";
+        let node_events = workflow_progress_events(&crate::reattach::FrameKind::NodeFinished {
+            node: "selected".into(),
+            ok: false,
+            output: "failed".into(),
+            usage: None,
+            terminal_json: Some(terminal_json.into()),
+            policy_trigger_json: Some(trigger_json.into()),
+        });
+        let node_response = crate::sse::event_to_streamresponse(&node_events[0], "task", "ctx");
+        let a2a::StreamResponse::StatusUpdate(node_update) = node_response else {
+            panic!("node progress must be an A2A status update");
+        };
+        let metadata = node_update.metadata.expect("node evidence metadata");
+        assert_eq!(metadata["a2a-bridge.node"], "selected");
+        assert_eq!(metadata["a2a-bridge.node-terminal"], terminal_json);
+        assert_eq!(metadata["a2a-bridge.policy-trigger"], trigger_json);
+
+        let terminal_events = workflow_progress_events(&crate::reattach::FrameKind::Terminal {
+            outcome: crate::reattach::TerminalOutcome::CompletedDegraded,
+            output: String::new(),
+        });
+        let terminal_response =
+            crate::sse::event_to_streamresponse(terminal_events.last().unwrap(), "task", "ctx");
+        let a2a::StreamResponse::StatusUpdate(terminal_update) = terminal_response else {
+            panic!("terminal progress must be an A2A status update");
+        };
+        assert_eq!(terminal_update.status.state, a2a::TaskState::Completed);
+        assert_eq!(
+            terminal_update.metadata.unwrap()["a2a-bridge.workflow-outcome"],
+            "completed_degraded"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_completed_degraded_replays_and_get_task_preserves_exact_evidence() {
+        let store = std::sync::Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = bridge_core::ids::TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let node = bridge_core::ids::NodeId::parse("selected").unwrap();
+        let operation = operation_id_for_task(&task);
+        let (terminal_json, trigger_json) = v2_terminal_and_trigger(&identity.attempt_id, &node);
+        let locator = bridge_core::task_store::TaskAttemptLocator {
+            identity: identity.clone(),
+            telemetry_unavailable: None,
+        };
+        store
+            .create_with_attempt_locator(&working_record(task.as_str()), &locator)
+            .await
+            .unwrap();
+        store
+            .put_node_checkpoint_sequenced_v2(
+                &task,
+                &node,
+                &operation,
+                "failed",
+                false,
+                crate::workflow_sink::now_ms(),
+                None,
+                &terminal_json,
+                Some(&trigger_json),
+            )
+            .await
+            .unwrap();
+        store
+            .set_terminal_sequenced_pending(
+                &task,
+                &operation,
+                bridge_core::task_store::TaskRecordStatus::Completed,
+                Some(""),
+                None,
+                crate::workflow_sink::now_ms(),
+                &identity.attempt_id,
+                &completed_degraded_attempt_terminal(),
+            )
+            .await
+            .unwrap();
+        store
+            .mark_terminal_projection_ready(&task, &identity.attempt_id)
+            .await
+            .unwrap();
+
+        let store_dyn: std::sync::Arc<dyn bridge_core::task_store::TaskStore> = store.clone();
+        let snapshot = fold_or_typed_snapshot(&store_dyn, &task).await.unwrap();
+        let replay = body_string(terminal_sse_response(&snapshot, None)).await;
+        let replay_values = replay
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("data: ")
+                    .or_else(|| line.strip_prefix("data:"))
+            })
+            .map(|data| serde_json::from_str::<Value>(data).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            replay_values
+                .iter()
+                .any(|value| value["outcome"] == "completed_degraded"),
+            "reattach must derive the additive durable outcome: {replay}"
+        );
+        let node_frame = replay_values
+            .iter()
+            .find(|value| value["kind"] == "node_finished")
+            .expect("reattach includes the selected node");
+        assert_eq!(node_frame["terminal_json"], terminal_json);
+        assert_eq!(node_frame["policy_trigger_json"], trigger_json);
+
+        let response = router(build_with_task_store(store))
+            .oneshot(post_request(
+                methods::GET_TASK,
+                json!({ "taskId": task.as_str() }),
+                "1.0",
+            ))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(
+            body["result"]["task"]["status"]["state"],
+            "TASK_STATE_COMPLETED"
+        );
+        let metadata = &body["result"]["task"]["metadata"];
+        assert_eq!(
+            metadata["a2a-bridge.workflow-outcome"],
+            "completed_degraded"
+        );
+        assert_eq!(metadata["a2a-bridge.policy-trigger"], trigger_json);
+        assert_eq!(metadata["a2a-bridge.nodes"][0]["node"], "selected");
+        assert_eq!(
+            metadata["a2a-bridge.nodes"][0]["terminal_json"],
+            terminal_json
         );
     }
 

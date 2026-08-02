@@ -331,6 +331,22 @@ pub struct NodeCauseV1 {
 }
 
 impl NodeCauseV1 {
+    #[must_use]
+    pub fn skipped_dependency(dependency_set: DependencySetRefV1) -> Self {
+        Self {
+            failure_class: crate::diagnostics::DiagnosticFailureClass::Unknown,
+            code: crate::diagnostics::DiagnosticCode::build(
+                "workflow.skipped_dependency",
+                &crate::diagnostics::DiagnosticRedactor::default(),
+            )
+            .expect("bridge-owned node terminal codes are static and bounded"),
+            deepest_cause: None,
+            cause_truncated: false,
+            evidence_overflow: false,
+            dependency_set: Some(dependency_set),
+        }
+    }
+
     /// Convert one bridge-owned failure into the bounded evidence carried by a
     /// V2 node terminal. Structured agent diagnostics retain their exact closed
     /// class/code and deepest sanitized cause. Every legacy bridge error maps
@@ -588,6 +604,28 @@ pub enum WorkflowRuntimeOutcomeV1 {
     Canceled,
 }
 
+impl WorkflowRuntimeOutcomeV1 {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::CompletedDegraded => "completed_degraded",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+        }
+    }
+
+    #[must_use]
+    pub const fn durable(self) -> WorkflowDurableOutcomeV1 {
+        match self {
+            Self::Completed => WorkflowDurableOutcomeV1::Completed,
+            Self::CompletedDegraded => WorkflowDurableOutcomeV1::CompletedDegraded,
+            Self::Failed => WorkflowDurableOutcomeV1::Failed,
+            Self::Canceled => WorkflowDurableOutcomeV1::Canceled,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowDurableOutcomeV1 {
@@ -596,6 +634,31 @@ pub enum WorkflowDurableOutcomeV1 {
     Failed,
     Canceled,
     Interrupted,
+}
+
+impl WorkflowDurableOutcomeV1 {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::CompletedDegraded => "completed_degraded",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    #[must_use]
+    pub fn parse_closed(value: &str) -> Option<Self> {
+        match value {
+            "completed" => Some(Self::Completed),
+            "completed_degraded" => Some(Self::CompletedDegraded),
+            "failed" => Some(Self::Failed),
+            "canceled" => Some(Self::Canceled),
+            "interrupted" => Some(Self::Interrupted),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -828,6 +891,34 @@ impl PolicyNodeRefV1 {
             sorted_ordinal,
             id_sha256: Sha256HexV1::digest(node_id.as_bytes()),
         }
+    }
+}
+
+impl DependencySetRefV1 {
+    pub fn from_node_refs(mut refs: Vec<PolicyNodeRefV1>) -> Result<Self, ExecutionPolicyError> {
+        refs.sort_by(|left, right| {
+            left.sorted_ordinal
+                .cmp(&right.sorted_ordinal)
+                .then_with(|| left.id_sha256.as_str().cmp(right.id_sha256.as_str()))
+        });
+        if refs
+            .windows(2)
+            .any(|pair| pair[0].sorted_ordinal == pair[1].sorted_ordinal)
+        {
+            return Err(ExecutionPolicyError::InvalidStructuredEvidence);
+        }
+        let count =
+            u32::try_from(refs.len()).map_err(|_| ExecutionPolicyError::ArithmeticOverflow)?;
+        let mut canonical = Vec::with_capacity(refs.len().saturating_mul(68).saturating_add(4));
+        canonical.extend_from_slice(&count.to_be_bytes());
+        for node_ref in refs {
+            canonical.extend_from_slice(&node_ref.sorted_ordinal.to_be_bytes());
+            canonical.extend_from_slice(node_ref.id_sha256.as_str().as_bytes());
+        }
+        Ok(Self {
+            count,
+            sorted_node_refs_sha256: Sha256HexV1::digest(&canonical),
+        })
     }
 }
 

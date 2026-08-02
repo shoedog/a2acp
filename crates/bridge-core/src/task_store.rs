@@ -270,7 +270,7 @@ pub enum NodeCheckpointOutput {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct NodeTerminalEvidenceV1 {
     pub node: NodeId,
     pub terminal_json: String,
@@ -2264,13 +2264,22 @@ impl TaskStore for MemoryTaskStore {
         task: &TaskId,
     ) -> Result<WorkflowTaskEvidenceV1, BridgeError> {
         let _guard = self.journal_fold_guard.lock().unwrap();
-        Ok(self
+        let pending = self
+            .pending_terminal
+            .lock()
+            .unwrap()
+            .contains_key(task.as_str());
+        let mut evidence = self
             .workflow_evidence
             .lock()
             .unwrap()
             .get(task.as_str())
             .cloned()
-            .unwrap_or_default())
+            .unwrap_or_default();
+        if pending {
+            evidence.workflow_outcome = None;
+        }
+        Ok(evidence)
     }
 
     async fn set_terminal_sequenced(
@@ -2283,6 +2292,19 @@ impl TaskStore for MemoryTaskStore {
         ts: i64,
     ) -> Result<i64, BridgeError> {
         let _guard = self.journal_fold_guard.lock().unwrap();
+        let workflow_outcome = match status {
+            TaskRecordStatus::Completed => {
+                crate::execution_policy::WorkflowDurableOutcomeV1::Completed
+            }
+            TaskRecordStatus::Failed => crate::execution_policy::WorkflowDurableOutcomeV1::Failed,
+            TaskRecordStatus::Canceled => {
+                crate::execution_policy::WorkflowDurableOutcomeV1::Canceled
+            }
+            TaskRecordStatus::Interrupted => {
+                crate::execution_policy::WorkflowDurableOutcomeV1::Interrupted
+            }
+            TaskRecordStatus::Working => return Err(BridgeError::StoreFailure),
+        };
         if self
             .pending_terminal
             .lock()
@@ -2336,6 +2358,12 @@ impl TaskStore for MemoryTaskStore {
             .entry(task.as_str().to_string())
             .or_default()
             .push((seq, event));
+        self.workflow_evidence
+            .lock()
+            .unwrap()
+            .entry(task.as_str().to_owned())
+            .or_default()
+            .workflow_outcome = Some(workflow_outcome);
         Ok(seq)
     }
 
@@ -2352,6 +2380,25 @@ impl TaskStore for MemoryTaskStore {
         terminal: &crate::workflow_history::AttemptTerminal,
     ) -> Result<i64, BridgeError> {
         if !status.is_terminal() || terminal.validate().is_err() {
+            return Err(BridgeError::StoreFailure);
+        }
+        let workflow_outcome =
+            crate::execution_policy::WorkflowDurableOutcomeV1::parse_closed(&terminal.outcome)
+                .ok_or(BridgeError::StoreFailure)?;
+        let expected_status = match workflow_outcome {
+            crate::execution_policy::WorkflowDurableOutcomeV1::Completed
+            | crate::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded => {
+                TaskRecordStatus::Completed
+            }
+            crate::execution_policy::WorkflowDurableOutcomeV1::Failed => TaskRecordStatus::Failed,
+            crate::execution_policy::WorkflowDurableOutcomeV1::Canceled => {
+                TaskRecordStatus::Canceled
+            }
+            crate::execution_policy::WorkflowDurableOutcomeV1::Interrupted => {
+                TaskRecordStatus::Interrupted
+            }
+        };
+        if status != expected_status {
             return Err(BridgeError::StoreFailure);
         }
         let _guard = self.journal_fold_guard.lock().unwrap();
@@ -2445,6 +2492,12 @@ impl TaskStore for MemoryTaskStore {
                 terminal: terminal.clone(),
             },
         );
+        self.workflow_evidence
+            .lock()
+            .unwrap()
+            .entry(task.as_str().to_owned())
+            .or_default()
+            .workflow_outcome = Some(workflow_outcome);
         Ok(seq)
     }
 
@@ -4222,6 +4275,87 @@ mod tests {
             } if stored_terminal == &terminal_json && stored_trigger == &trigger_json
         ));
         assert!(s.progress_snapshot(&task).await.unwrap().starts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_terminal_outcome_stays_hidden_until_public_projection_is_ready() {
+        let store = MemoryTaskStore::new();
+        let identity = crate::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let locator = TaskAttemptLocator {
+            identity: identity.clone(),
+            telemetry_unavailable: None,
+        };
+        store
+            .create_with_attempt_locator(&rec(task.as_str(), 1), &locator)
+            .await
+            .unwrap();
+        let terminal = crate::workflow_history::AttemptTerminal {
+            completed_ms: 2,
+            work_ms: 1,
+            end_to_end_ms: 1,
+            queue_ms: 0,
+            cancellation_ms: 0,
+            cleanup_ms: 0,
+            finalization_ms: 0,
+            outcome: "completed_degraded".into(),
+            terminal_reason: "owner_finalized".into(),
+            producer_terminal: "unknown".into(),
+            final_message: "unknown".into(),
+            process_liveness: "unknown".into(),
+            terminal_evidence_capability: "not_applicable".into(),
+            terminal_evidence_version: "none".into(),
+            terminal_evidence_source: "none".into(),
+            terminal_evidence_complete: true,
+            terminal_evidence_counts: Default::default(),
+            degraded: true,
+            prompt_acceptance: "not_dispatched".into(),
+            cleanup_disposition: "complete".into(),
+            node_counts: Default::default(),
+            phase_durations: Vec::new(),
+            telemetry_complete: true,
+            monotonic_clock: true,
+        };
+        store
+            .set_terminal_sequenced_pending(
+                &task,
+                &OperationId::parse(format!("op-{}", task.as_str())).unwrap(),
+                TaskRecordStatus::Completed,
+                Some(""),
+                None,
+                2,
+                &identity.attempt_id,
+                &terminal,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get(&task).await.unwrap().unwrap().status,
+            TaskRecordStatus::Working
+        );
+        assert_eq!(
+            store
+                .workflow_task_evidence(&task)
+                .await
+                .unwrap()
+                .workflow_outcome,
+            None,
+            "the future terminal outcome must not outrun the public projection barrier"
+        );
+
+        store
+            .mark_terminal_projection_ready(&task, &identity.attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .workflow_task_evidence(&task)
+                .await
+                .unwrap()
+                .workflow_outcome,
+            Some(crate::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded)
+        );
     }
 
     #[tokio::test]

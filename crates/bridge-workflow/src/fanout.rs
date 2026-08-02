@@ -28,6 +28,7 @@ pub struct ReadyBatchSelectionV1 {
 pub enum FanOutControllerError {
     MissingNodeReference,
     DuplicateReadyNode,
+    InvalidRestoredTrigger,
 }
 
 impl std::fmt::Display for FanOutControllerError {
@@ -35,6 +36,9 @@ impl std::fmt::Display for FanOutControllerError {
         formatter.write_str(match self {
             Self::MissingNodeReference => "ready node is absent from the frozen graph identity",
             Self::DuplicateReadyNode => "ready terminal batch contains a duplicate node",
+            Self::InvalidRestoredTrigger => {
+                "restored policy trigger disagrees with frozen workflow evidence"
+            }
         })
     }
 }
@@ -114,6 +118,56 @@ impl FanOutControllerV1 {
     #[must_use]
     pub fn admission_stopped(&self) -> bool {
         self.admission_stopped
+    }
+
+    pub fn restore_committed_trigger(
+        &mut self,
+        attempt_id: &AttemptId,
+        trigger: PolicyTriggerV1,
+        terminals: &BTreeMap<NodeId, NodeTerminalV1>,
+        node_refs: &BTreeMap<NodeId, PolicyNodeRefV1>,
+    ) -> Result<(), FanOutControllerError> {
+        let expected_grace = match self.policy {
+            FanOutPolicyV1::FixedGrace { grace_ms } => Some(grace_ms),
+            FanOutPolicyV1::BoundedIndependent | FanOutPolicyV1::FailFast => None,
+        };
+        let selected_node = node_refs
+            .iter()
+            .find_map(|(node, node_ref)| (node_ref == &trigger.node).then_some(node));
+        let valid_selected_terminal = selected_node
+            .and_then(|node| terminals.get(node))
+            .is_some_and(|terminal| {
+                matches!(
+                    terminal.primary,
+                    NodePrimaryDispositionV1::Failed | NodePrimaryDispositionV1::TimedOut
+                ) && terminal.policy_trigger_id.as_ref() == Some(&trigger.id)
+            });
+        let trigger_mentions = terminals
+            .values()
+            .filter(|terminal| terminal.policy_trigger_id.as_ref() == Some(&trigger.id))
+            .count();
+        if self.trigger.is_some()
+            || self.barrier_pending
+            || matches!(self.policy, FanOutPolicyV1::BoundedIndependent)
+            || trigger.schema_version != EXECUTION_POLICY_SCHEMA_V1
+            || trigger.id != ControlEventIdV1::for_attempt(attempt_id, 0)
+            || trigger.policy != FanOutPolicyNameV1::from(&self.policy)
+            || trigger.grace_ms != expected_grace
+            || !valid_selected_terminal
+            || trigger_mentions != 1
+            || terminals.values().any(|terminal| {
+                terminal
+                    .policy_trigger_id
+                    .as_ref()
+                    .is_some_and(|id| id != &trigger.id)
+            })
+        {
+            return Err(FanOutControllerError::InvalidRestoredTrigger);
+        }
+        self.trigger = Some(trigger);
+        self.admission_stopped = true;
+        self.manual_grace_armed = matches!(self.policy, FanOutPolicyV1::FixedGrace { .. });
+        Ok(())
     }
 
     pub fn finalize_ready_batch(

@@ -18,6 +18,7 @@ pub enum Phase {
 #[serde(rename_all = "snake_case")]
 pub enum TerminalOutcome {
     Completed,
+    CompletedDegraded,
     Failed,
     Canceled,
 }
@@ -28,6 +29,7 @@ impl TerminalOutcome {
         // Real variants (executor.rs:35-39): unit Completed, Failed, Canceled — no payloads.
         match o {
             W::Completed => Self::Completed,
+            W::CompletedDegraded => Self::CompletedDegraded,
             W::Failed => Self::Failed,
             W::Canceled => Self::Canceled,
         }
@@ -374,8 +376,8 @@ use bridge_core::ids::{NodeId, OperationId, TaskId};
 use bridge_core::ports::{RichEventSink, RichEventSinkFactory};
 use bridge_core::task_store::{ResumeClaim, TaskRecord, TaskRecordStatus, TaskStore};
 use bridge_workflow::executor::{
-    PolicyTriggerBarrier, PromptDispatchBarrier, WorkflowDiagnosticContext, WorkflowExecutor,
-    WorkflowRunContext,
+    PolicyTriggerBarrier, PromptDispatchBarrier, StructuredNodeSeedV1, StructuredWorkflowSeedV1,
+    WorkflowDiagnosticContext, WorkflowExecutor, WorkflowRunContext,
 };
 use bridge_workflow::graph::WorkflowGraph;
 use std::collections::{HashMap, VecDeque};
@@ -459,8 +461,52 @@ struct TerminalBarrierSettlement {
 struct TerminalProjectionCommit {
     seq: i64,
     telemetry_unavailable: Option<bridge_core::workflow_history::LedgerUnavailableReason>,
-    status: TaskRecordStatus,
+    workflow_outcome: bridge_core::execution_policy::WorkflowDurableOutcomeV1,
     output: String,
+}
+
+pub fn structured_node_counts_v1<'a>(
+    terminals: impl IntoIterator<Item = &'a bridge_core::execution_policy::NodeTerminalV1>,
+) -> Result<bridge_core::workflow_history::NodeCounts, BridgeError> {
+    use bridge_core::execution_policy::{
+        NodeCleanupDispositionV1 as Cleanup, NodePrimaryDispositionV1 as Primary,
+    };
+    let mut counts = bridge_core::workflow_history::NodeCounts::default();
+    for terminal in terminals {
+        match terminal.primary {
+            Primary::Completed => {
+                counts.completed = counts
+                    .completed
+                    .checked_add(1)
+                    .ok_or(BridgeError::InvalidStateTransition)?;
+            }
+            Primary::Failed | Primary::TimedOut => {
+                counts.failed = counts
+                    .failed
+                    .checked_add(1)
+                    .ok_or(BridgeError::InvalidStateTransition)?;
+            }
+            Primary::CanceledWorkflow | Primary::CanceledPolicy | Primary::CanceledNode => {
+                counts.canceled = counts
+                    .canceled
+                    .checked_add(1)
+                    .ok_or(BridgeError::InvalidStateTransition)?;
+            }
+            Primary::SkippedDependency | Primary::NotStartedPolicy | Primary::InterruptedLegacy => {
+            }
+            Primary::Deadline => return Err(BridgeError::InvalidStateTransition),
+        }
+        if matches!(
+            terminal.cleanup.disposition,
+            Cleanup::Failed | Cleanup::UnknownLegacy
+        ) {
+            counts.cleanup_partial = counts
+                .cleanup_partial
+                .checked_add(1)
+                .ok_or(BridgeError::InvalidStateTransition)?;
+        }
+    }
+    Ok(counts)
 }
 
 /// Detached progress sink: persists each event via the sequenced store methods
@@ -603,8 +649,9 @@ impl WorkflowSink for DetachedProgressSink {
         outcome: WorkflowOutcome,
         output: String,
     ) -> Result<(), BridgeError> {
+        let workflow_outcome = outcome.durable();
         let (status, result, error) = match &outcome {
-            WorkflowOutcome::Completed => (
+            WorkflowOutcome::Completed | WorkflowOutcome::CompletedDegraded => (
                 bridge_core::task_store::TaskRecordStatus::Completed,
                 Some(output.as_str()),
                 None,
@@ -633,6 +680,7 @@ impl WorkflowSink for DetachedProgressSink {
             result,
             error,
             now_ms(),
+            workflow_outcome,
             self.terminal_barrier.as_ref(),
             cleanup_disposition,
             cleanup_ms,
@@ -652,12 +700,20 @@ impl WorkflowSink for DetachedProgressSink {
             seq,
             phase: Phase::Live,
             kind: FrameKind::Terminal {
-                outcome: match commit.status {
-                    TaskRecordStatus::Completed => TerminalOutcome::Completed,
-                    TaskRecordStatus::Canceled => TerminalOutcome::Canceled,
-                    TaskRecordStatus::Failed
-                    | TaskRecordStatus::Interrupted
-                    | TaskRecordStatus::Working => TerminalOutcome::Failed,
+                outcome: match commit.workflow_outcome {
+                    bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed => {
+                        TerminalOutcome::Completed
+                    }
+                    bridge_core::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded => {
+                        TerminalOutcome::CompletedDegraded
+                    }
+                    bridge_core::execution_policy::WorkflowDurableOutcomeV1::Canceled => {
+                        TerminalOutcome::Canceled
+                    }
+                    bridge_core::execution_policy::WorkflowDurableOutcomeV1::Failed
+                    | bridge_core::execution_policy::WorkflowDurableOutcomeV1::Interrupted => {
+                        TerminalOutcome::Failed
+                    }
                 },
                 output: commit.output,
             },
@@ -986,7 +1042,7 @@ mod sink_tests {
         );
         apply_workflow_terminal_evidence(
             &mut terminal,
-            TaskRecordStatus::Completed,
+            bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed,
             barrier.inner.attempt_telemetry.evidence().as_ref(),
         );
         assert_eq!(terminal.outcome, "completed");
@@ -2783,11 +2839,10 @@ impl TerminalSummaryBarrier {
 
     async fn prepare_terminal(
         &self,
-        status: bridge_core::task_store::TaskRecordStatus,
+        workflow_outcome: bridge_core::execution_policy::WorkflowDurableOutcomeV1,
         cleanup_disposition: &str,
         cleanup_ms: u64,
     ) -> bridge_core::workflow_history::AttemptTerminal {
-        use bridge_core::task_store::TaskRecordStatus;
         use bridge_core::workflow_history::{LedgerUnavailableReason as R, NodeCounts};
 
         let prefinal_ms =
@@ -2797,13 +2852,42 @@ impl TerminalSummaryBarrier {
         let work_ms = prefinal_ms
             .saturating_sub(queue_ms)
             .saturating_sub(cleanup_ms);
-        let (node_counts, node_counts_complete) = match self
-            .inner
-            .task_store
-            .node_checkpoints(&self.inner.task)
-            .await
-        {
-            Ok(checkpoints) => (
+        let (node_counts, node_counts_complete) = match (
+            self.inner
+                .task_store
+                .node_checkpoints(&self.inner.task)
+                .await,
+            self.inner
+                .task_store
+                .node_terminal_evidence(&self.inner.task)
+                .await,
+        ) {
+            (Ok(checkpoints), Ok(evidence)) if checkpoints.len() == evidence.len() => {
+                let decoded = evidence
+                    .iter()
+                    .map(|evidence| {
+                        bridge_core::execution_policy::NodeTerminalV1::decode_canonical(
+                            evidence.terminal_json.as_bytes(),
+                        )
+                        .map_err(|_| BridgeError::StoreFailure)
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                match decoded.and_then(|terminals| {
+                    structured_node_counts_v1(terminals.iter()).map(|counts| (counts, true))
+                }) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        tracing::warn!(
+                            task = self.inner.task.as_str(),
+                            error = ?error,
+                            "workflow structured node-count finalization failed"
+                        );
+                        self.inner.telemetry.record(R::Io);
+                        (NodeCounts::default(), false)
+                    }
+                }
+            }
+            (Ok(checkpoints), Ok(evidence)) if evidence.is_empty() => (
                 NodeCounts {
                     completed: u32::try_from(
                         checkpoints.iter().filter(|(_, _, ok, _)| *ok).count(),
@@ -2815,7 +2899,8 @@ impl TerminalSummaryBarrier {
                 },
                 true,
             ),
-            Err(error) => {
+            (Ok(_), Ok(_)) => (NodeCounts::default(), false),
+            (Err(error), _) | (_, Err(error)) => {
                 tracing::warn!(
                     task = self.inner.task.as_str(),
                     error = ?error,
@@ -2825,13 +2910,7 @@ impl TerminalSummaryBarrier {
                 (NodeCounts::default(), false)
             }
         };
-        let outcome = match status {
-            TaskRecordStatus::Completed => "completed",
-            TaskRecordStatus::Failed => "failed",
-            TaskRecordStatus::Canceled => "canceled",
-            TaskRecordStatus::Interrupted => "interrupted",
-            TaskRecordStatus::Working => "failed",
-        };
+        let outcome = workflow_outcome.as_str();
         let _ = self.inner.attempt_telemetry.recorder().record(
             bridge_core::attempt_activity::AttemptPhase::TerminalStore,
             bridge_core::attempt_activity::ActivityReason::ProducerTerminal,
@@ -2858,7 +2937,7 @@ impl TerminalSummaryBarrier {
         );
         apply_workflow_terminal_evidence(
             &mut terminal,
-            status,
+            workflow_outcome,
             self.inner.attempt_telemetry.evidence().as_ref(),
         );
         terminal.degraded = terminal.outcome != "completed" || !terminal.telemetry_complete;
@@ -3003,18 +3082,24 @@ async fn commit_terminal_projection(
     result: Option<&str>,
     error: Option<&str>,
     ts: i64,
+    workflow_outcome: bridge_core::execution_policy::WorkflowDurableOutcomeV1,
     terminal_barrier: Option<&TerminalSummaryBarrier>,
     cleanup_disposition: &str,
     cleanup_ms: u64,
 ) -> Result<TerminalProjectionCommit, BridgeError> {
     let Some(barrier) = terminal_barrier else {
+        if workflow_outcome
+            == bridge_core::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded
+        {
+            return Err(BridgeError::StoreFailure);
+        }
         let seq = store
             .set_terminal_sequenced(task, operation_id, status, result, error, ts)
             .await?;
         return Ok(TerminalProjectionCommit {
             seq,
             telemetry_unavailable: None,
-            status,
+            workflow_outcome,
             output: result.or(error).unwrap_or("").to_string(),
         });
     };
@@ -3028,15 +3113,25 @@ async fn commit_terminal_projection(
         }
         None => {
             barrier
-                .prepare_terminal(status, cleanup_disposition, cleanup_ms)
+                .prepare_terminal(workflow_outcome, cleanup_disposition, cleanup_ms)
                 .await
         }
     };
-    let projection_status = match terminal.outcome.as_str() {
-        "completed" => TaskRecordStatus::Completed,
-        "canceled" => TaskRecordStatus::Canceled,
-        "interrupted" => TaskRecordStatus::Interrupted,
-        _ => TaskRecordStatus::Failed,
+    let terminal_outcome =
+        bridge_core::execution_policy::WorkflowDurableOutcomeV1::parse_closed(&terminal.outcome)
+            .ok_or(BridgeError::StoreFailure)?;
+    let projection_status = match terminal_outcome {
+        bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed
+        | bridge_core::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded => {
+            TaskRecordStatus::Completed
+        }
+        bridge_core::execution_policy::WorkflowDurableOutcomeV1::Canceled => {
+            TaskRecordStatus::Canceled
+        }
+        bridge_core::execution_policy::WorkflowDurableOutcomeV1::Interrupted => {
+            TaskRecordStatus::Interrupted
+        }
+        bridge_core::execution_policy::WorkflowDurableOutcomeV1::Failed => TaskRecordStatus::Failed,
     };
     let projection_result = if projection_status == TaskRecordStatus::Completed {
         result
@@ -3077,14 +3172,14 @@ async fn commit_terminal_projection(
     Ok(TerminalProjectionCommit {
         seq,
         telemetry_unavailable: settlement.telemetry_unavailable,
-        status: projection_status,
+        workflow_outcome: terminal_outcome,
         output: projection_output,
     })
 }
 
 fn apply_workflow_terminal_evidence(
     terminal: &mut bridge_core::workflow_history::AttemptTerminal,
-    status: bridge_core::task_store::TaskRecordStatus,
+    workflow_outcome: bridge_core::execution_policy::WorkflowDurableOutcomeV1,
     evidence: &bridge_core::terminal_evidence::WorkflowTurnEvidenceCollector,
 ) {
     use bridge_core::terminal_evidence::{
@@ -3170,7 +3265,11 @@ fn apply_workflow_terminal_evidence(
             completeness,
             producer,
             final_presence,
-            prompt_rpc: if status == bridge_core::task_store::TaskRecordStatus::Completed {
+            prompt_rpc: if matches!(
+                workflow_outcome,
+                bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed
+                    | bridge_core::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded
+            ) {
                 PromptRpcObservation::Resolved
             } else {
                 PromptRpcObservation::RejectedAcceptedOrUncertain
@@ -3179,7 +3278,14 @@ fn apply_workflow_terminal_evidence(
             deliverable_final_present,
             child_liveness,
         });
-        terminal.outcome = resolved.outcome.as_str().into();
+        terminal.outcome = if workflow_outcome
+            == bridge_core::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded
+            && resolved.outcome.as_str() == "completed"
+        {
+            "completed_degraded".into()
+        } else {
+            resolved.outcome.as_str().into()
+        };
         terminal.terminal_reason = resolved.reason.as_str().into();
     }
 }
@@ -3303,6 +3409,20 @@ pub async fn finalize_detached_with_barrier(
         result,
         error,
         now_ms(),
+        match status {
+            TaskRecordStatus::Completed => {
+                bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed
+            }
+            TaskRecordStatus::Failed | TaskRecordStatus::Working => {
+                bridge_core::execution_policy::WorkflowDurableOutcomeV1::Failed
+            }
+            TaskRecordStatus::Canceled => {
+                bridge_core::execution_policy::WorkflowDurableOutcomeV1::Canceled
+            }
+            TaskRecordStatus::Interrupted => {
+                bridge_core::execution_policy::WorkflowDurableOutcomeV1::Interrupted
+            }
+        },
         terminal_barrier,
         cleanup_disposition,
         0,
@@ -3322,12 +3442,20 @@ pub async fn finalize_detached_with_barrier(
         }
         // Publish the Terminal frame ONLY on a committed seq (durable-first).
         // Interrupted has no WorkflowOutcome analogue; the closest wire terminal is Failed.
-        let outcome = match commit.status {
-            TaskRecordStatus::Completed => TerminalOutcome::Completed,
-            TaskRecordStatus::Canceled => TerminalOutcome::Canceled,
-            TaskRecordStatus::Failed
-            | TaskRecordStatus::Interrupted
-            | TaskRecordStatus::Working => TerminalOutcome::Failed,
+        let outcome = match commit.workflow_outcome {
+            bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed => {
+                TerminalOutcome::Completed
+            }
+            bridge_core::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded => {
+                TerminalOutcome::CompletedDegraded
+            }
+            bridge_core::execution_policy::WorkflowDurableOutcomeV1::Canceled => {
+                TerminalOutcome::Canceled
+            }
+            bridge_core::execution_policy::WorkflowDurableOutcomeV1::Failed
+            | bridge_core::execution_policy::WorkflowDurableOutcomeV1::Interrupted => {
+                TerminalOutcome::Failed
+            }
         };
         let output = commit.output.clone();
         hub.publish(WorkflowProgressFrame {
@@ -3427,6 +3555,7 @@ pub fn spawn_detached_workflow_with_attempt_barriers(
         prompt_dispatch,
         terminal_barrier,
         None,
+        None,
     )
 }
 
@@ -3458,6 +3587,53 @@ pub fn spawn_bound_detached_workflow_with_attempt_barriers(
         prompt_dispatch,
         terminal_barrier,
         Some(authority),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_bound_detached_workflow_v2_resume_with_attempt_barriers(
+    deps: &DetachedDeps,
+    task: TaskId,
+    input: String,
+    graph: Arc<WorkflowGraph>,
+    run_id: String,
+    token: CancellationToken,
+    seed: StructuredWorkflowSeedV1,
+    ctx: WorkflowRunContext,
+    hub: Arc<TaskProgressHub>,
+    prompt_dispatch: Option<PromptDispatchBarrier>,
+    terminal_barrier: Option<TerminalSummaryBarrier>,
+    authority: bridge_workflow::admission::AdmittedWorkflowRunV1,
+) -> tokio::task::JoinHandle<bool> {
+    let legacy_seed = seed
+        .nodes
+        .iter()
+        .map(|(node, checkpoint)| {
+            (
+                node.as_str().to_owned(),
+                (
+                    checkpoint.output.clone(),
+                    checkpoint.ok,
+                    checkpoint.usage.clone(),
+                ),
+            )
+        })
+        .collect();
+    spawn_detached_workflow_inner(
+        deps,
+        task,
+        input,
+        graph,
+        run_id,
+        token,
+        legacy_seed,
+        ctx,
+        hub,
+        prompt_dispatch,
+        terminal_barrier,
+        Some(authority),
+        Some(seed),
     )
 }
 
@@ -3475,6 +3651,7 @@ fn spawn_detached_workflow_inner(
     prompt_dispatch: Option<PromptDispatchBarrier>,
     terminal_barrier: Option<TerminalSummaryBarrier>,
     authority: Option<bridge_workflow::admission::AdmittedWorkflowRunV1>,
+    structured_seed: Option<StructuredWorkflowSeedV1>,
 ) -> tokio::task::JoinHandle<bool> {
     if ctx.make_rich_sink.is_none() {
         if let Some(barrier) = terminal_barrier.as_ref() {
@@ -3662,14 +3839,24 @@ fn spawn_detached_workflow_inner(
             },
             None => diagnostic_context,
         };
-        let stream = executor.run_from_with_diagnostic_context(
-            graph,
-            input,
-            run_id,
-            token,
-            seed,
-            diagnostic_context,
-        );
+        let stream = match structured_seed {
+            Some(seed) => executor.run_from_v2_with_diagnostic_context(
+                graph,
+                input,
+                run_id,
+                token,
+                seed,
+                diagnostic_context,
+            ),
+            None => executor.run_from_with_diagnostic_context(
+                graph,
+                input,
+                run_id,
+                token,
+                seed,
+                diagnostic_context,
+            ),
+        };
         // The DetachedProgressSink OWNS the sequenced terminal write: on a clean drain it
         // has already written `set_terminal_sequenced` AND published the Terminal frame.
         let mut sink =
@@ -4052,8 +4239,9 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
         let Some(spec_json) = record.workflow_spec_json.as_deref() else {
             continue;
         };
-        let graph = match decode_workflow_spec(spec_json) {
-            Ok(decoded) => decoded.graph().clone(),
+        let (graph, run_spec) = match decode_workflow_spec(spec_json) {
+            Ok(DecodedWorkflowSpec::LegacyV1(graph)) => (graph, None),
+            Ok(DecodedWorkflowSpec::BoundV2(run_spec)) => (run_spec.graph.clone(), Some(run_spec)),
             Err(_) => continue,
         };
         let Some(terminal_node) = graph.terminal() else {
@@ -4077,10 +4265,225 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
         else {
             continue;
         };
-        let status = if *ok {
-            TaskRecordStatus::Completed
-        } else {
-            TaskRecordStatus::Failed
+        let (workflow_outcome, node_counts, prompt_acceptance, cleanup_disposition) =
+            if let Some(run_spec) = run_spec.as_ref() {
+                let terminal_evidence =
+                    match deps.task_store.node_terminal_evidence(&record.id).await {
+                        Ok(evidence)
+                            if evidence.len() == checkpoints.len()
+                                && evidence.len() == graph.nodes.len() =>
+                        {
+                            evidence
+                        }
+                        Ok(_) => {
+                            tracing::warn!(
+                                task = record.id.as_str(),
+                                "checkpoint reconciliation: incomplete V2 terminal map"
+                            );
+                            safe_to_interrupt = false;
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                task = record.id.as_str(),
+                                error = ?error,
+                                "checkpoint reconciliation: V2 terminal evidence read failed"
+                            );
+                            safe_to_interrupt = false;
+                            continue;
+                        }
+                    };
+                let mut terminals = std::collections::BTreeMap::new();
+                let mut valid = true;
+                for evidence in terminal_evidence {
+                    let terminal =
+                        match bridge_core::execution_policy::NodeTerminalV1::decode_canonical(
+                            evidence.terminal_json.as_bytes(),
+                        ) {
+                            Ok(terminal) => terminal,
+                            Err(_) => {
+                                valid = false;
+                                break;
+                            }
+                        };
+                    let checkpoint_ok = checkpoints
+                        .iter()
+                        .find(|(node, ..)| node == &evidence.node)
+                        .map(|(_, _, checkpoint_ok, _)| *checkpoint_ok);
+                    if checkpoint_ok
+                        != Some(matches!(
+                            terminal.primary,
+                            bridge_core::execution_policy::NodePrimaryDispositionV1::Completed
+                        ))
+                        || terminals.insert(evidence.node, terminal).is_some()
+                    {
+                        valid = false;
+                        break;
+                    }
+                }
+                if !valid || terminals.len() != graph.nodes.len() {
+                    tracing::warn!(
+                        task = record.id.as_str(),
+                        "checkpoint reconciliation: corrupt V2 terminal map"
+                    );
+                    safe_to_interrupt = false;
+                    continue;
+                }
+                let task_evidence = match deps.task_store.workflow_task_evidence(&record.id).await {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        tracing::warn!(
+                            task = record.id.as_str(),
+                            error = ?error,
+                            "checkpoint reconciliation: V2 task evidence read failed"
+                        );
+                        safe_to_interrupt = false;
+                        continue;
+                    }
+                };
+                if task_evidence.workflow_outcome.is_some() {
+                    tracing::warn!(
+                        task = record.id.as_str(),
+                        "checkpoint reconciliation: V2 terminal projection already pending"
+                    );
+                    safe_to_interrupt = false;
+                    continue;
+                }
+                let mut ordered_nodes: Vec<_> = graph.nodes.iter().collect();
+                ordered_nodes.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+                let node_refs: std::collections::BTreeMap<_, _> = ordered_nodes
+                    .into_iter()
+                    .zip(&run_spec.node_execution_identities)
+                    .map(|(node, identity)| (node.id.clone(), identity.node.clone()))
+                    .collect();
+                let valid_trigger = match task_evidence.policy_trigger_json {
+                    Some(encoded) => {
+                        bridge_core::execution_policy::PolicyTriggerV1::decode_canonical(
+                            encoded.as_bytes(),
+                        )
+                        .ok()
+                        .is_some_and(|trigger| {
+                            let mut controller = bridge_workflow::fanout::FanOutControllerV1::new(
+                                run_spec.controls.fan_out.clone(),
+                            );
+                            controller
+                                .restore_committed_trigger(
+                                    &run_spec.attempt_id,
+                                    trigger,
+                                    &terminals,
+                                    &node_refs,
+                                )
+                                .is_ok()
+                        })
+                    }
+                    None => terminals
+                        .values()
+                        .all(|terminal| terminal.policy_trigger_id.is_none()),
+                };
+                if !valid_trigger {
+                    tracing::warn!(
+                        task = record.id.as_str(),
+                        "checkpoint reconciliation: corrupt V2 policy trigger evidence"
+                    );
+                    safe_to_interrupt = false;
+                    continue;
+                }
+                let Some(terminal_node_evidence) = terminals.get(&terminal_node.id) else {
+                    safe_to_interrupt = false;
+                    continue;
+                };
+                let outcome = match terminal_node_evidence.primary {
+                    bridge_core::execution_policy::NodePrimaryDispositionV1::Completed
+                        if terminal_node_evidence.degraded_ancestry =>
+                    {
+                        bridge_core::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded
+                    }
+                    bridge_core::execution_policy::NodePrimaryDispositionV1::Completed => {
+                        bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed
+                    }
+                    bridge_core::execution_policy::NodePrimaryDispositionV1::CanceledWorkflow
+                    | bridge_core::execution_policy::NodePrimaryDispositionV1::CanceledPolicy
+                    | bridge_core::execution_policy::NodePrimaryDispositionV1::CanceledNode => {
+                        bridge_core::execution_policy::WorkflowDurableOutcomeV1::Canceled
+                    }
+                    _ => bridge_core::execution_policy::WorkflowDurableOutcomeV1::Failed,
+                };
+                let counts = match structured_node_counts_v1(terminals.values()) {
+                    Ok(counts) => counts,
+                    Err(error) => {
+                        tracing::warn!(
+                            task = record.id.as_str(),
+                            error = ?error,
+                            "checkpoint reconciliation: V2 node counts invalid"
+                        );
+                        safe_to_interrupt = false;
+                        continue;
+                    }
+                };
+                let prompt_acceptance = if terminals
+                    .values()
+                    .any(|terminal| terminal.prompt_may_have_been_accepted)
+                {
+                    "dispatch_uncertain"
+                } else {
+                    "unknown"
+                };
+                let cleanup_disposition = if terminals.values().any(|terminal| {
+                    terminal.cleanup.disposition
+                        == bridge_core::execution_policy::NodeCleanupDispositionV1::Failed
+                }) {
+                    "failed"
+                } else if terminals.values().any(|terminal| {
+                    terminal.cleanup.disposition
+                        == bridge_core::execution_policy::NodeCleanupDispositionV1::UnknownLegacy
+                }) {
+                    "unknown"
+                } else {
+                    "complete"
+                };
+                (outcome, counts, prompt_acceptance, cleanup_disposition)
+            } else {
+                (
+                    if *ok {
+                        bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed
+                    } else {
+                        bridge_core::execution_policy::WorkflowDurableOutcomeV1::Failed
+                    },
+                    NodeCounts {
+                        completed: u32::try_from(
+                            checkpoints
+                                .iter()
+                                .filter(|(_, _, success, _)| *success)
+                                .count(),
+                        )
+                        .unwrap_or(u32::MAX),
+                        failed: u32::try_from(
+                            checkpoints
+                                .iter()
+                                .filter(|(_, _, success, _)| !*success)
+                                .count(),
+                        )
+                        .unwrap_or(u32::MAX),
+                        ..NodeCounts::default()
+                    },
+                    "unknown",
+                    "unknown",
+                )
+            };
+        let status = match workflow_outcome {
+            bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed
+            | bridge_core::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded => {
+                TaskRecordStatus::Completed
+            }
+            bridge_core::execution_policy::WorkflowDurableOutcomeV1::Failed => {
+                TaskRecordStatus::Failed
+            }
+            bridge_core::execution_policy::WorkflowDurableOutcomeV1::Canceled => {
+                TaskRecordStatus::Canceled
+            }
+            bridge_core::execution_policy::WorkflowDurableOutcomeV1::Interrupted => {
+                TaskRecordStatus::Interrupted
+            }
         };
         let locator = match deps.task_store.get_attempt_locator(&record.id).await {
             Ok(Some(locator)) => locator,
@@ -4103,7 +4506,6 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
             }
         };
         let completed_ms = record.last_artifact_ms.unwrap_or(record.updated_ms).max(1);
-        let outcome = if *ok { "completed" } else { "failed" };
         let terminal = AttemptTerminal {
             completed_ms,
             work_ms: 0,
@@ -4112,7 +4514,7 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
             cancellation_ms: 0,
             cleanup_ms: 0,
             finalization_ms: 0,
-            outcome: outcome.into(),
+            outcome: workflow_outcome.as_str().into(),
             terminal_reason: "terminal_checkpoint_recovered".into(),
             producer_terminal: "unknown".into(),
             final_message: "unknown".into(),
@@ -4123,25 +4525,9 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
             terminal_evidence_complete: false,
             terminal_evidence_counts: Default::default(),
             degraded: true,
-            prompt_acceptance: "unknown".into(),
-            cleanup_disposition: "unknown".into(),
-            node_counts: NodeCounts {
-                completed: u32::try_from(
-                    checkpoints
-                        .iter()
-                        .filter(|(_, _, success, _)| *success)
-                        .count(),
-                )
-                .unwrap_or(u32::MAX),
-                failed: u32::try_from(
-                    checkpoints
-                        .iter()
-                        .filter(|(_, _, success, _)| !*success)
-                        .count(),
-                )
-                .unwrap_or(u32::MAX),
-                ..NodeCounts::default()
-            },
+            prompt_acceptance: prompt_acceptance.into(),
+            cleanup_disposition: cleanup_disposition.into(),
+            node_counts,
             phase_durations: Vec::new(),
             telemetry_complete: false,
             monotonic_clock: false,
@@ -4158,8 +4544,10 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
                 continue;
             }
         };
-        let (result, error) = if *ok {
+        let (result, error) = if status == TaskRecordStatus::Completed {
             (Some(output.as_str()), None)
+        } else if status == TaskRecordStatus::Canceled {
+            (None, None)
         } else {
             (None, Some(output.as_str()))
         };
@@ -4297,6 +4685,7 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
         }
     };
     let (graph, frozen_run_spec) = decoded.into_parts();
+    let is_v2 = frozen_run_spec.is_some();
 
     // (3) Load checkpoints → seed map keyed by node id: node_id → (output, ok, usage).
     let cps = match deps.task_store.node_checkpoints(&task).await {
@@ -4318,6 +4707,188 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
             )
         })
         .collect();
+    let structured_seed = if is_v2 {
+        let terminal_evidence = match deps.task_store.node_terminal_evidence(&task).await {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                tracing::warn!(task = task.as_str(), error = ?error, "resume scan: V2 node terminal evidence read failed");
+                let _ = finalize_detached(
+                    &deps.task_store,
+                    &deps.progress_hubs,
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("not resumable: V2 node terminal evidence unavailable"),
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
+        if terminal_evidence.len() != cps.len() {
+            let _ = finalize_detached(
+                &deps.task_store,
+                &deps.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("not resumable: V2 checkpoint terminal set mismatch"),
+                None,
+            )
+            .await;
+            return;
+        }
+        let mut nodes = std::collections::BTreeMap::new();
+        for (node, output, ok, usage) in &cps {
+            let Some(evidence) = terminal_evidence
+                .iter()
+                .find(|evidence| evidence.node == *node)
+            else {
+                let _ = finalize_detached(
+                    &deps.task_store,
+                    &deps.progress_hubs,
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("not resumable: V2 checkpoint terminal missing"),
+                    None,
+                )
+                .await;
+                return;
+            };
+            let terminal = match bridge_core::execution_policy::NodeTerminalV1::decode_canonical(
+                evidence.terminal_json.as_bytes(),
+            ) {
+                Ok(terminal) => terminal,
+                Err(_) => {
+                    let _ = finalize_detached(
+                        &deps.task_store,
+                        &deps.progress_hubs,
+                        &task,
+                        TaskRecordStatus::Interrupted,
+                        None,
+                        Some("not resumable: corrupt V2 node terminal"),
+                        None,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if nodes
+                .insert(
+                    node.clone(),
+                    StructuredNodeSeedV1 {
+                        output: output.clone(),
+                        ok: *ok,
+                        usage: usage.clone(),
+                        terminal,
+                    },
+                )
+                .is_some()
+            {
+                let _ = finalize_detached(
+                    &deps.task_store,
+                    &deps.progress_hubs,
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("not resumable: duplicate V2 checkpoint terminal"),
+                    None,
+                )
+                .await;
+                return;
+            }
+        }
+        let task_evidence = match deps.task_store.workflow_task_evidence(&task).await {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                tracing::warn!(task = task.as_str(), error = ?error, "resume scan: V2 task evidence read failed");
+                let _ = finalize_detached(
+                    &deps.task_store,
+                    &deps.progress_hubs,
+                    &task,
+                    TaskRecordStatus::Interrupted,
+                    None,
+                    Some("not resumable: V2 task evidence unavailable"),
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
+        if task_evidence.workflow_outcome.is_some() {
+            let _ = finalize_detached(
+                &deps.task_store,
+                &deps.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("not resumable: V2 terminal projection is already pending"),
+                None,
+            )
+            .await;
+            return;
+        }
+        let policy_trigger = match task_evidence.policy_trigger_json {
+            Some(encoded) => {
+                match bridge_core::execution_policy::PolicyTriggerV1::decode_canonical(
+                    encoded.as_bytes(),
+                ) {
+                    Ok(trigger) => Some(trigger),
+                    Err(_) => {
+                        let _ = finalize_detached(
+                            &deps.task_store,
+                            &deps.progress_hubs,
+                            &task,
+                            TaskRecordStatus::Interrupted,
+                            None,
+                            Some("not resumable: corrupt V2 policy trigger"),
+                            None,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
+        Some(StructuredWorkflowSeedV1 {
+            nodes,
+            policy_trigger,
+        })
+    } else {
+        None
+    };
+
+    // A durable policy trigger proves the prior process crossed the
+    // commit-before-cancel barrier. Resuming that attempt would either replay
+    // cancellation under a new lineage or publish a newly derived outcome for
+    // work whose exact post-trigger effects are unknowable after the crash.
+    // Preserve the trigger/node bytes and interrupt the existing task before a
+    // resume slot, successor identity, session, or provider effect is created.
+    if structured_seed
+        .as_ref()
+        .is_some_and(|seed| seed.policy_trigger.is_some())
+    {
+        if let Err(error) = finalize_detached(
+            &deps.task_store,
+            &deps.progress_hubs,
+            &task,
+            TaskRecordStatus::Interrupted,
+            None,
+            Some("not resumable: committed V2 policy trigger"),
+            None,
+        )
+        .await
+        {
+            tracing::warn!(
+                task = task.as_str(),
+                error = ?error,
+                "resume scan: committed V2 policy trigger interruption failed"
+            );
+        }
+        return;
+    }
 
     // (4) A terminal checkpoint is owned exclusively by the attempt-first
     //     reconciliation pass. Reaching it here means that pass could not prove
@@ -4612,8 +5183,24 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
                 .insert(task.clone(), token.clone());
             let run_id = identity.run_id().to_string();
             let graph = Arc::new(graph);
-            let _handle = match authority {
-                Some(authority) => spawn_bound_detached_workflow_with_attempt_barriers(
+            let _handle = match (authority, structured_seed) {
+                (Some(authority), Some(structured_seed)) => {
+                    spawn_bound_detached_workflow_v2_resume_with_attempt_barriers(
+                        deps,
+                        task.clone(),
+                        wt.input.clone(),
+                        graph,
+                        run_id.clone(),
+                        token,
+                        structured_seed,
+                        ctx,
+                        hub,
+                        prompt_dispatch,
+                        Some(terminal_barrier),
+                        authority,
+                    )
+                }
+                (None, None) => spawn_detached_workflow_with_attempt_barriers(
                     deps,
                     task.clone(),
                     wt.input.clone(),
@@ -4625,21 +5212,22 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
                     hub,
                     prompt_dispatch,
                     Some(terminal_barrier),
-                    authority,
                 ),
-                None => spawn_detached_workflow_with_attempt_barriers(
-                    deps,
-                    task.clone(),
-                    wt.input.clone(),
-                    graph,
-                    run_id.clone(),
-                    token,
-                    seed,
-                    ctx,
-                    hub,
-                    prompt_dispatch,
-                    Some(terminal_barrier),
-                ),
+                _ => {
+                    let _ = finalize_detached_with_barrier(
+                        &deps.task_store,
+                        &deps.progress_hubs,
+                        &task,
+                        TaskRecordStatus::Interrupted,
+                        None,
+                        Some("not resumable: V2 resume evidence mismatch"),
+                        Some(&hub),
+                        Some(&terminal_barrier),
+                        "not_needed",
+                    )
+                    .await;
+                    return;
+                }
             };
             tracing::info!(task = task.as_str(), attempt, run_id = %run_id, "resume scan: resumed from checkpoints");
         }
@@ -4828,6 +5416,39 @@ mod resume_tests {
         synth: Arc<PromptRec>,
     }
 
+    impl RecordingRegistry {
+        fn entry(id: &AgentId) -> AgentEntry {
+            AgentEntry {
+                id: id.clone(),
+                cmd: Some("x".into()),
+                base_url: None,
+                api_key_env: None,
+                args: vec![],
+                kind: AgentKind::Acp,
+                model_provider: None,
+                model: None,
+                effort: None,
+                mode: None,
+                preflight: false,
+                fallback_models: vec![],
+                cwd: None,
+                session_cwd: None,
+                sandbox: None,
+                watchdog: None,
+                auth_method: None,
+                pre_authenticated: false,
+                host_fallback_eligible: false,
+                name: None,
+                description: None,
+                tags: vec![],
+                version: None,
+                mcp: vec![],
+                mcp_delivery: Default::default(),
+                extensions: Default::default(),
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl AgentRegistry for RecordingRegistry {
         async fn resolve(&self, id: &AgentId) -> Result<Resolved, BridgeError> {
@@ -4837,34 +5458,7 @@ mod resume_tests {
                 });
             }
             Ok(Resolved {
-                entry: Arc::new(AgentEntry {
-                    id: id.clone(),
-                    cmd: Some("x".into()),
-                    base_url: None,
-                    api_key_env: None,
-                    args: vec![],
-                    kind: AgentKind::Acp,
-                    model_provider: None,
-                    model: None,
-                    effort: None,
-                    mode: None,
-                    preflight: false,
-                    fallback_models: vec![],
-                    cwd: None,
-                    session_cwd: None,
-                    sandbox: None,
-                    watchdog: None,
-                    auth_method: None,
-                    pre_authenticated: false,
-                    host_fallback_eligible: false,
-                    name: None,
-                    description: None,
-                    tags: vec![],
-                    version: None,
-                    mcp: vec![],
-                    mcp_delivery: Default::default(),
-                    extensions: Default::default(),
-                }),
+                entry: Arc::new(Self::entry(id)),
                 backend: Arc::new(RecordingBackend {
                     rec: self.synth.clone(),
                 }),
@@ -4899,6 +5493,10 @@ mod resume_tests {
 
         async fn apply(&self, _snapshot: RegistrySnapshot) -> Result<(), BridgeError> {
             Ok(())
+        }
+
+        fn entry_snapshot(&self, id: &AgentId) -> Option<Arc<AgentEntry>> {
+            (id.as_str() == "synth").then(|| Arc::new(Self::entry(id)))
         }
 
         fn list(&self) -> Vec<AgentId> {
@@ -6226,6 +6824,290 @@ mod resume_tests {
             prompt.contains("| claude | 42 | 100 |"),
             "resumed synth costs table includes claude usage: {prompt}"
         );
+    }
+
+    #[tokio::test]
+    async fn v2_committed_trigger_interrupts_without_claiming_a_successor() {
+        use bridge_core::execution_policy::{
+            ControlEventIdV1, ExecutionPolicyInvocationV1, FanOutPolicyNameV1, FanOutPolicyV1,
+            LedgerAdmissionV1, NodeCleanupDispositionV1, NodeCleanupV1, NodePrimaryDispositionV1,
+            NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1, WorkflowControlDefaultsV1,
+        };
+        use bridge_workflow::admission::{
+            DirectWorkflowCheckoutPlannerV1, WorkflowAdmissionRequestV1, WorkflowAdmissionV1,
+        };
+
+        let prompts = Arc::new(PromptRec::default());
+        let registry: Arc<dyn AgentRegistry> = Arc::new(RecordingRegistry {
+            synth: prompts.clone(),
+        });
+        let graph = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("trigger-resume").unwrap(),
+            nodes: vec![
+                WorkflowNode {
+                    id: NodeId::parse("root").unwrap(),
+                    agent: AgentId::parse("synth").unwrap(),
+                    prompt_template: "root {{input}}".into(),
+                    inputs: Vec::new(),
+                    retry: None,
+                    harvest_sanitization: None,
+                },
+                WorkflowNode {
+                    id: NodeId::parse("synth").unwrap(),
+                    agent: AgentId::parse("synth").unwrap(),
+                    prompt_template: "synth {{root}}".into(),
+                    inputs: vec![NodeId::parse("root").unwrap()],
+                    retry: None,
+                    harvest_sanitization: None,
+                },
+            ],
+            panel: None,
+            controls: Some(WorkflowControlDefaultsV1 {
+                fan_out: Some(FanOutPolicyV1::FailFast),
+                ..WorkflowControlDefaultsV1::default()
+            }),
+        });
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let admission = Arc::new(WorkflowAdmissionV1::new(
+            registry.clone(),
+            Arc::new(DirectWorkflowCheckoutPlannerV1),
+            bridge_core::SessionCwd::parse("/tmp").unwrap(),
+            None,
+        ));
+        let authority = admission
+            .freeze(WorkflowAdmissionRequestV1 {
+                attempt_id: identity.attempt_id.clone(),
+                graph: graph.clone(),
+                requested_session_cwd: Some(bridge_core::SessionCwd::parse("/tmp").unwrap()),
+                policy_invocation: ExecutionPolicyInvocationV1::default(),
+                ledger_admission: LedgerAdmissionV1::DurablePrimaryTaskStore,
+            })
+            .await
+            .unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let store = Arc::new(MemoryTaskStore::new());
+        store
+            .create_with_attempt_locator(
+                &TaskRecord {
+                    id: task.clone(),
+                    workflow: graph.id.as_str().into(),
+                    workflow_spec_json: Some(
+                        String::from_utf8(authority.run_spec.encode_snapshot_v2().unwrap())
+                            .unwrap(),
+                    ),
+                    ..make_task_record(task.as_str())
+                },
+                &bridge_core::task_store::TaskAttemptLocator {
+                    identity: identity.clone(),
+                    telemetry_unavailable: None,
+                },
+            )
+            .await
+            .unwrap();
+        let root = NodeId::parse("root").unwrap();
+        let trigger = PolicyTriggerV1 {
+            schema_version: 1,
+            id: ControlEventIdV1::for_attempt(&identity.attempt_id, 0),
+            node: PolicyNodeRefV1::from_node_id(0, root.as_str()),
+            policy: FanOutPolicyNameV1::FailFast,
+            grace_ms: None,
+        };
+        let terminal = NodeTerminalV1 {
+            schema_version: 1,
+            primary: NodePrimaryDispositionV1::Failed,
+            cleanup: NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::Complete,
+                duration_ms: 1,
+            },
+            cause: None,
+            prompt_may_have_been_accepted: true,
+            degraded_ancestry: false,
+            policy_trigger_id: Some(trigger.id.clone()),
+        };
+        let terminal_json = String::from_utf8(terminal.encode_canonical().unwrap()).unwrap();
+        let trigger_json = String::from_utf8(trigger.encode_canonical().unwrap()).unwrap();
+        store
+            .put_node_checkpoint_sequenced_v2(
+                &task,
+                &root,
+                &OperationId::parse(format!("op-{}", task.as_str())).unwrap(),
+                "root failed",
+                false,
+                2,
+                None,
+                &terminal_json,
+                Some(&trigger_json),
+            )
+            .await
+            .unwrap();
+        let store_dyn: Arc<dyn TaskStore> = store.clone();
+        let deps = DetachedDeps {
+            task_store: store_dyn,
+            executor: Some(Arc::new(WorkflowExecutor::new(registry))),
+            workflows: Arc::new(HashMap::new()),
+            workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
+            progress_hubs: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(ManualClock::new(100)),
+            observer: Arc::new(NoopObserver),
+            workflow_history: None,
+            workflow_admission: Some(admission),
+        };
+
+        let record = store.get(&task).await.unwrap().unwrap();
+        resume_one_working_task(&deps, &record, 1).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let settled = loop {
+            let record = store.get(&task).await.unwrap().unwrap();
+            if record.status.is_terminal() {
+                break record;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resume did not settle"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+
+        assert_eq!(settled.status, TaskRecordStatus::Interrupted);
+        assert_eq!(settled.resume_attempts, 0);
+        assert!(prompts.prompts.lock().unwrap().is_empty());
+        assert_eq!(
+            store
+                .get_attempt_locator(&task)
+                .await
+                .unwrap()
+                .unwrap()
+                .identity,
+            identity
+        );
+        assert_eq!(
+            store
+                .workflow_task_evidence(&task)
+                .await
+                .unwrap()
+                .policy_trigger_json
+                .as_deref(),
+            Some(trigger_json.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_terminal_reconciliation_rejects_uncommitted_trigger_reference() {
+        use bridge_core::execution_policy::{
+            ControlEventIdV1, ExecutionPolicyInvocationV1, FanOutPolicyV1, LedgerAdmissionV1,
+            NodeCleanupDispositionV1, NodeCleanupV1, NodePrimaryDispositionV1, NodeTerminalV1,
+            WorkflowControlDefaultsV1,
+        };
+        use bridge_workflow::admission::{
+            DirectWorkflowCheckoutPlannerV1, WorkflowAdmissionRequestV1, WorkflowAdmissionV1,
+        };
+
+        let prompts = Arc::new(PromptRec::default());
+        let registry: Arc<dyn AgentRegistry> = Arc::new(RecordingRegistry {
+            synth: prompts.clone(),
+        });
+        let graph = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("trigger-reconcile").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: NodeId::parse("only").unwrap(),
+                agent: AgentId::parse("synth").unwrap(),
+                prompt_template: "only {{input}}".into(),
+                inputs: Vec::new(),
+                retry: None,
+                harvest_sanitization: None,
+            }],
+            panel: None,
+            controls: Some(WorkflowControlDefaultsV1 {
+                fan_out: Some(FanOutPolicyV1::FailFast),
+                ..WorkflowControlDefaultsV1::default()
+            }),
+        });
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let admission = Arc::new(WorkflowAdmissionV1::new(
+            registry,
+            Arc::new(DirectWorkflowCheckoutPlannerV1),
+            bridge_core::SessionCwd::parse("/tmp").unwrap(),
+            None,
+        ));
+        let authority = admission
+            .freeze(WorkflowAdmissionRequestV1 {
+                attempt_id: identity.attempt_id.clone(),
+                graph: graph.clone(),
+                requested_session_cwd: Some(bridge_core::SessionCwd::parse("/tmp").unwrap()),
+                policy_invocation: ExecutionPolicyInvocationV1::default(),
+                ledger_admission: LedgerAdmissionV1::DurablePrimaryTaskStore,
+            })
+            .await
+            .unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        let store = Arc::new(MemoryTaskStore::new());
+        store
+            .create_with_attempt_locator(
+                &TaskRecord {
+                    id: task.clone(),
+                    workflow: graph.id.as_str().into(),
+                    workflow_spec_json: Some(
+                        String::from_utf8(authority.run_spec.encode_snapshot_v2().unwrap())
+                            .unwrap(),
+                    ),
+                    ..make_task_record(task.as_str())
+                },
+                &bridge_core::task_store::TaskAttemptLocator {
+                    identity: identity.clone(),
+                    telemetry_unavailable: None,
+                },
+            )
+            .await
+            .unwrap();
+        let node = NodeId::parse("only").unwrap();
+        let terminal = NodeTerminalV1 {
+            schema_version: 1,
+            primary: NodePrimaryDispositionV1::Failed,
+            cleanup: NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::Complete,
+                duration_ms: 1,
+            },
+            cause: None,
+            prompt_may_have_been_accepted: true,
+            degraded_ancestry: false,
+            policy_trigger_id: Some(ControlEventIdV1::for_attempt(&identity.attempt_id, 0)),
+        };
+        let terminal_json = String::from_utf8(terminal.encode_canonical().unwrap()).unwrap();
+        store
+            .put_node_checkpoint_sequenced_v2(
+                &task,
+                &node,
+                &OperationId::parse(format!("op-{}", task.as_str())).unwrap(),
+                "only failed",
+                false,
+                2,
+                None,
+                &terminal_json,
+                None,
+            )
+            .await
+            .unwrap();
+        let deps = DetachedDeps {
+            task_store: store.clone(),
+            executor: None,
+            workflows: Arc::new(HashMap::new()),
+            workflow_cancels: Arc::new(Mutex::new(HashMap::new())),
+            progress_hubs: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(ManualClock::new(100)),
+            observer: Arc::new(NoopObserver),
+            workflow_history: None,
+            workflow_admission: Some(admission),
+        };
+
+        assert!(
+            !reconcile_terminal_checkpoints(&deps).await,
+            "a terminal trigger reference without the atomically committed task trigger must fail closed"
+        );
+        assert_eq!(
+            store.get(&task).await.unwrap().unwrap().status,
+            TaskRecordStatus::Working
+        );
+        assert!(prompts.prompts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

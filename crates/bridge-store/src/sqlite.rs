@@ -5206,19 +5206,25 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         task: &TaskId,
     ) -> Result<bridge_core::task_store::WorkflowTaskEvidenceV1, BridgeError> {
         let conn = self.conn.lock().unwrap();
-        let row: Option<(Option<String>, Option<String>)> = conn
+        let row: Option<(Option<String>, Option<String>, i64)> = conn
             .query_row(
-                "SELECT workflow_outcome, policy_trigger_json FROM tasks WHERE id=?1",
+                "SELECT workflow_outcome, policy_trigger_json, terminal_projection_ready
+                 FROM tasks WHERE id=?1",
                 rusqlite::params![task.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|_| BridgeError::StoreFailure)?;
-        let (outcome, policy_trigger_json) = row.ok_or(BridgeError::StoreFailure)?;
-        let workflow_outcome = outcome
-            .as_deref()
-            .map(parse_workflow_durable_outcome)
-            .transpose()?;
+        let (outcome, policy_trigger_json, terminal_projection_ready) =
+            row.ok_or(BridgeError::StoreFailure)?;
+        let workflow_outcome = match terminal_projection_ready {
+            0 => None,
+            1 => outcome
+                .as_deref()
+                .map(parse_workflow_durable_outcome)
+                .transpose()?,
+            _ => return Err(BridgeError::StoreFailure),
+        };
         Ok(bridge_core::task_store::WorkflowTaskEvidenceV1 {
             workflow_outcome,
             policy_trigger_json,
@@ -5234,6 +5240,15 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         error: Option<&str>,
         ts: i64,
     ) -> Result<i64, BridgeError> {
+        let workflow_outcome = match status {
+            bridge_core::task_store::TaskRecordStatus::Completed => "completed",
+            bridge_core::task_store::TaskRecordStatus::Failed => "failed",
+            bridge_core::task_store::TaskRecordStatus::Canceled => "canceled",
+            bridge_core::task_store::TaskRecordStatus::Interrupted => "interrupted",
+            bridge_core::task_store::TaskRecordStatus::Working => {
+                return Err(BridgeError::StoreFailure)
+            }
+        };
         let conn = self.conn.lock().unwrap();
         let tx = immediate_transaction(&conn)?;
         // Allocate seq.
@@ -5262,6 +5277,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         // Write the terminal status, result, error, and record terminal_seq.
         tx.execute(
             "UPDATE tasks SET status=?2, result=?3, error=?4, updated_ms=?5, terminal_seq=?6,
+                workflow_outcome=?7,
                 terminal_projection_ready=1, terminal_projection_attempt_id=NULL,
                 terminal_projection_json=NULL WHERE id=?1",
             rusqlite::params![
@@ -5270,7 +5286,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                 result,
                 error,
                 durable_retention_ms(ts),
-                seq
+                seq,
+                workflow_outcome,
             ],
         )
         .map_err(|_| BridgeError::StoreFailure)?;
@@ -5312,6 +5329,29 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
         if !status.is_terminal() || terminal.validate().is_err() {
             return Err(BridgeError::StoreFailure);
         }
+        let workflow_outcome =
+            bridge_core::execution_policy::WorkflowDurableOutcomeV1::parse_closed(
+                &terminal.outcome,
+            )
+            .ok_or(BridgeError::StoreFailure)?;
+        let expected_status = match workflow_outcome {
+            bridge_core::execution_policy::WorkflowDurableOutcomeV1::Completed
+            | bridge_core::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded => {
+                bridge_core::task_store::TaskRecordStatus::Completed
+            }
+            bridge_core::execution_policy::WorkflowDurableOutcomeV1::Failed => {
+                bridge_core::task_store::TaskRecordStatus::Failed
+            }
+            bridge_core::execution_policy::WorkflowDurableOutcomeV1::Canceled => {
+                bridge_core::task_store::TaskRecordStatus::Canceled
+            }
+            bridge_core::execution_policy::WorkflowDurableOutcomeV1::Interrupted => {
+                bridge_core::task_store::TaskRecordStatus::Interrupted
+            }
+        };
+        if status != expected_status {
+            return Err(BridgeError::StoreFailure);
+        }
         let terminal_json =
             serde_json::to_string(terminal).map_err(|_| BridgeError::StoreFailure)?;
         let conn = self.conn.lock().map_err(|_| BridgeError::StoreFailure)?;
@@ -5324,12 +5364,13 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             i64,
             Option<String>,
             Option<String>,
+            Option<String>,
             String,
         )> = tx
             .query_row(
                 "SELECT t.status, t.result, t.error, t.terminal_seq,
                         t.terminal_projection_ready, t.terminal_projection_attempt_id,
-                        t.terminal_projection_json, l.locator_json
+                        t.terminal_projection_json, t.workflow_outcome, l.locator_json
                  FROM tasks t
                  JOIN task_attempt_locators l ON l.task_id=t.id
                  WHERE t.id=?1",
@@ -5344,6 +5385,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -5357,6 +5399,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             ready,
             pending_attempt,
             pending_json,
+            current_workflow_outcome,
             locator_json,
         ) = current.ok_or(BridgeError::StoreFailure)?;
         if !matches!(ready, 0 | 1) {
@@ -5375,6 +5418,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                 && current_result.as_deref() == result
                 && current_error.as_deref() == error
                 && pending_attempt.as_deref() == Some(attempt_id.as_str())
+                && current_workflow_outcome.as_deref() == Some(workflow_outcome.as_str())
                 && prior == *terminal;
             tx.commit().map_err(|_| BridgeError::StoreFailure)?;
             return compatible
@@ -5385,6 +5429,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
             || current_terminal_seq.is_some()
             || pending_attempt.is_some()
             || pending_json.is_some()
+            || current_workflow_outcome.is_some()
         {
             return Err(BridgeError::StoreFailure);
         }
@@ -5401,7 +5446,8 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                     terminal_seq=last_event_seq+2,
                     terminal_projection_ready=0,
                     terminal_projection_attempt_id=?7,
-                    terminal_projection_json=?8
+                    terminal_projection_json=?8,
+                    workflow_outcome=?9
                  WHERE id=?1 AND status='working' AND terminal_projection_ready=1",
                 rusqlite::params![
                     task.as_str(),
@@ -5412,6 +5458,7 @@ impl bridge_core::task_store::TaskStore for SqliteStore {
                     durable_retention_ms(ts),
                     attempt_id.as_str(),
                     terminal_json,
+                    workflow_outcome.as_str(),
                 ],
             )
             .map_err(|_| BridgeError::StoreFailure)?;
@@ -13464,6 +13511,88 @@ mod tests {
                 ..
             } if stored_terminal == &terminal_json && stored_trigger == &trigger_json
         ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_pending_terminal_outcome_stays_hidden_until_projection_is_ready() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let identity = bridge_core::ids::AttemptIdentity::initial().unwrap();
+        let task = TaskId::parse(identity.execution_id.as_str()).unwrap();
+        store
+            .create_with_attempt_locator(
+                &trec(task.as_str(), 1),
+                &bridge_core::task_store::TaskAttemptLocator {
+                    identity: identity.clone(),
+                    telemetry_unavailable: None,
+                },
+            )
+            .await
+            .unwrap();
+        let terminal = bridge_core::workflow_history::AttemptTerminal {
+            completed_ms: 2,
+            work_ms: 1,
+            end_to_end_ms: 1,
+            queue_ms: 0,
+            cancellation_ms: 0,
+            cleanup_ms: 0,
+            finalization_ms: 0,
+            outcome: "completed_degraded".into(),
+            terminal_reason: "owner_finalized".into(),
+            producer_terminal: "unknown".into(),
+            final_message: "unknown".into(),
+            process_liveness: "unknown".into(),
+            terminal_evidence_capability: "not_applicable".into(),
+            terminal_evidence_version: "none".into(),
+            terminal_evidence_source: "none".into(),
+            terminal_evidence_complete: true,
+            terminal_evidence_counts: Default::default(),
+            degraded: true,
+            prompt_acceptance: "not_dispatched".into(),
+            cleanup_disposition: "complete".into(),
+            node_counts: Default::default(),
+            phase_durations: Vec::new(),
+            telemetry_complete: true,
+            monotonic_clock: true,
+        };
+        store
+            .set_terminal_sequenced_pending(
+                &task,
+                &OperationId::parse(format!("op-{}", task.as_str())).unwrap(),
+                TaskRecordStatus::Completed,
+                Some(""),
+                None,
+                2,
+                &identity.attempt_id,
+                &terminal,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get(&task).await.unwrap().unwrap().status,
+            TaskRecordStatus::Working
+        );
+        assert_eq!(
+            store
+                .workflow_task_evidence(&task)
+                .await
+                .unwrap()
+                .workflow_outcome,
+            None
+        );
+
+        store
+            .mark_terminal_projection_ready(&task, &identity.attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .workflow_task_evidence(&task)
+                .await
+                .unwrap()
+                .workflow_outcome,
+            Some(bridge_core::execution_policy::WorkflowDurableOutcomeV1::CompletedDegraded)
+        );
     }
 
     async fn journal_write_matches_typed<S: bridge_core::task_store::TaskStore>(store: S) {

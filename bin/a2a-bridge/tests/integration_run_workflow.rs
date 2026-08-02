@@ -387,4 +387,19 @@ fn offline_unsupported_legacy_success_remains_completed() {
     assert_eq!(terminal.outcome, "completed");
     assert_eq!(terminal.terminal_evidence_capability, "unsupported");
     assert_eq!(output_text, "FINAL");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let structured = stderr
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("node_terminal{node=\"only\",terminal_json=")
+                .and_then(|value| value.strip_suffix('}'))
+        })
+        .expect("offline stderr must retain the exact bounded node terminal");
+    let decoded =
+        bridge_core::execution_policy::NodeTerminalV1::decode_canonical(structured.as_bytes())
+            .unwrap();
+    assert_eq!(
+        decoded.primary,
+        bridge_core::execution_policy::NodePrimaryDispositionV1::Completed
+    );
 }

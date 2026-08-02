@@ -415,10 +415,12 @@ fn frozen_fail_fast_run_with_ledger(
             ..WorkflowControlDefaultsV1::default()
         }),
     };
+    let mut sorted_ids = nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
+    sorted_ids.sort();
     let identities = nodes
         .iter()
-        .enumerate()
-        .map(|(ordinal, node)| {
+        .map(|node| {
+            let ordinal = sorted_ids.iter().position(|id| id == &node.id).unwrap();
             let node_ref =
                 PolicyNodeRefV1::from_node_id(u32::try_from(ordinal).unwrap(), node.id.as_str());
             let logical_session = FrozenProviderLogicalSessionV1::Execute {
@@ -1092,4 +1094,256 @@ async fn v2_node_terminal_keeps_primary_diagnostic_when_cleanup_also_fails() {
     assert_eq!(cause.failure_class, DiagnosticFailureClass::Transport);
     assert_eq!(cause.code.as_str(), "test.node.prompt_open");
     assert_eq!(cause.deepest_cause.as_deref(), Some("deepest cause"));
+}
+
+#[derive(Default)]
+struct SynthesisState {
+    prompts: Mutex<Vec<String>>,
+}
+
+struct SynthesisBackend {
+    state: Arc<SynthesisState>,
+}
+
+#[async_trait]
+impl AgentBackend for SynthesisBackend {
+    async fn prompt(
+        &self,
+        _session: &SessionId,
+        parts: Vec<Part>,
+    ) -> Result<BackendStream, BridgeError> {
+        let prompt = parts
+            .iter()
+            .map(|part| part.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.state.prompts.lock().unwrap().push(prompt.clone());
+        if prompt.contains("ROOT_FAIL") {
+            return Err(BridgeError::AgentOverloaded);
+        }
+        let reply = if prompt.contains("FINAL_NODE") {
+            "FINAL_OK"
+        } else {
+            "MID_OK"
+        };
+        Ok(Box::pin(tokio_stream::iter(vec![
+            Ok(Update::Text(reply.into())),
+            Ok(Update::done("end_turn")),
+        ])))
+    }
+
+    async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+        Ok(())
+    }
+
+    async fn configure_bound_session(
+        &self,
+        _session: &SessionId,
+        _spec: &BoundSessionSpecV1,
+    ) -> Result<(), BridgeError> {
+        Ok(())
+    }
+}
+
+fn frozen_synthesis_run(entry: &AgentEntry, synthesis: SynthesisModeV1) -> WorkflowRunSpecV1 {
+    let attempt_id = AttemptId::parse("attempt-44444444444444444444444444444444").unwrap();
+    let source_cwd = SessionCwd::parse("/repo/source").unwrap();
+    let nodes = vec![
+        WorkflowNode {
+            id: NodeId::parse("root").unwrap(),
+            agent: entry.id.clone(),
+            prompt_template: "ROOT_FAIL".into(),
+            inputs: vec![],
+            retry: None,
+            harvest_sanitization: None,
+        },
+        WorkflowNode {
+            id: NodeId::parse("middle").unwrap(),
+            agent: entry.id.clone(),
+            prompt_template: "MID_NODE {{root}}".into(),
+            inputs: vec![NodeId::parse("root").unwrap()],
+            retry: None,
+            harvest_sanitization: None,
+        },
+        WorkflowNode {
+            id: NodeId::parse("terminal").unwrap(),
+            agent: entry.id.clone(),
+            prompt_template: "FINAL_NODE {{middle}}".into(),
+            inputs: vec![NodeId::parse("middle").unwrap()],
+            retry: None,
+            harvest_sanitization: None,
+        },
+    ];
+    let graph = WorkflowGraph {
+        id: WorkflowId::parse("synthesis-policy").unwrap(),
+        nodes: nodes.clone(),
+        panel: None,
+        controls: Some(WorkflowControlDefaultsV1 {
+            fan_out: Some(FanOutPolicyV1::BoundedIndependent),
+            synthesis: Some(synthesis),
+            ..WorkflowControlDefaultsV1::default()
+        }),
+    };
+    let mut sorted_ids = nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
+    sorted_ids.sort();
+    let identities = nodes
+        .iter()
+        .map(|node| {
+            let ordinal = sorted_ids.iter().position(|id| id == &node.id).unwrap();
+            let node_ref =
+                PolicyNodeRefV1::from_node_id(u32::try_from(ordinal).unwrap(), node.id.as_str());
+            let logical_session = FrozenProviderLogicalSessionV1::Execute {
+                candidate_ordinal: 0,
+            };
+            let provider = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+                entry,
+                overrides: None,
+                node: node_ref.clone(),
+                logical_session,
+                checkout: freeze_direct_checkout_v1(source_cwd.clone()),
+                provider_effect_key: None,
+            })
+            .unwrap();
+            freeze_node_execution_identity_v1(node_ref, vec![provider]).unwrap()
+        })
+        .collect();
+    let controls = resolve_execution_policy_v1(
+        graph.controls.as_ref().unwrap(),
+        &ExecutionPolicyInvocationV1::default(),
+        false,
+        PolicyActivationV1::Production,
+    )
+    .unwrap();
+    WorkflowRunSpecV1::build(
+        attempt_id,
+        graph,
+        controls,
+        Some(source_cwd),
+        identities,
+        LedgerAdmissionV1::HistoryLedgerUnavailable {
+            reason: bridge_core::workflow_history::LedgerUnavailableReason::Open.into(),
+        },
+    )
+    .unwrap()
+}
+
+async fn execute_synthesis_case(
+    synthesis: SynthesisModeV1,
+) -> (Arc<SynthesisState>, Vec<WorkflowEvent>) {
+    let entry = Arc::new(entry());
+    let run_spec = Arc::new(frozen_synthesis_run(&entry, synthesis));
+    run_spec.validate().unwrap();
+    let calls = Arc::new(Calls::default());
+    let state = Arc::new(SynthesisState::default());
+    let registry = Arc::new(BoundOnlyRegistry {
+        entry,
+        backend: Arc::new(SynthesisBackend {
+            state: state.clone(),
+        }),
+        slot: Arc::new(()),
+        calls,
+        fail_preflight_ordinal: None,
+    });
+    let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+        session_cwd: run_spec.requested_session_cwd.clone(),
+        ..WorkflowRunContext::default()
+    })
+    .with_frozen_run_spec(run_spec.clone(), None)
+    .unwrap();
+    let events = WorkflowExecutor::new(registry)
+        .run_with_diagnostic_context(
+            Arc::new(run_spec.graph.clone()),
+            "review this".into(),
+            "bound-synthesis-run".into(),
+            CancellationToken::new(),
+            context,
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    (state, events)
+}
+
+fn node_terminal(events: &[WorkflowEvent], wanted: &str) -> (String, NodeTerminalV1) {
+    let json = events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::NodeFinished {
+                node,
+                terminal_json: Some(json),
+                ..
+            } if node.as_str() == wanted => Some(json.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing terminal for {wanted}"));
+    let terminal = NodeTerminalV1::decode_canonical(json.as_bytes()).unwrap();
+    (json, terminal)
+}
+
+#[tokio::test]
+async fn v2_strict_synthesis_structurally_skips_failed_dependency_chain() {
+    let (state, events) = execute_synthesis_case(SynthesisModeV1::Strict).await;
+    assert_eq!(
+        state.prompts.lock().unwrap().len(),
+        1,
+        "only the failed root prompts"
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        WorkflowEvent::NodeStarted { node }
+            if matches!(node.as_str(), "middle" | "terminal")
+    )));
+    for node in ["middle", "terminal"] {
+        let (_, terminal) = node_terminal(&events, node);
+        assert_eq!(
+            terminal.primary,
+            NodePrimaryDispositionV1::SkippedDependency
+        );
+        assert_eq!(
+            terminal.cleanup.disposition,
+            NodeCleanupDispositionV1::NotNeeded
+        );
+        let dependency = terminal
+            .cause
+            .and_then(|cause| cause.dependency_set)
+            .expect("strict skip binds its exact direct failed dependency set");
+        assert_eq!(dependency.count, 1);
+    }
+    assert!(matches!(
+        events.last(),
+        Some(WorkflowEvent::Terminal {
+            outcome: WorkflowOutcome::Failed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn v2_degraded_synthesis_uses_typed_marker_and_propagates_ancestry() {
+    let (state, events) = execute_synthesis_case(SynthesisModeV1::Degraded).await;
+    let prompts = state.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 3);
+    let (root_json, root) = node_terminal(&events, "root");
+    assert_eq!(root.primary, NodePrimaryDispositionV1::Failed);
+    let marker = format!("{{\"type\":\"a2a_bridge.node_failure.v1\",\"terminal\":{root_json}}}");
+    assert!(
+        prompts[1].contains(&marker),
+        "direct child receives typed marker"
+    );
+    drop(prompts);
+    for node in ["middle", "terminal"] {
+        let (_, terminal) = node_terminal(&events, node);
+        assert_eq!(terminal.primary, NodePrimaryDispositionV1::Completed);
+        assert!(
+            terminal.degraded_ancestry,
+            "taint propagates through {node}"
+        );
+    }
+    let outcome = match events.last() {
+        Some(WorkflowEvent::Terminal { outcome, .. }) => outcome,
+        other => panic!("missing workflow terminal: {other:?}"),
+    };
+    assert_eq!(format!("{outcome:?}"), "CompletedDegraded");
 }

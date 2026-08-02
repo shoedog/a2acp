@@ -31,16 +31,16 @@ pub const EVENT_ARTIFACT: &str = "artifact-update";
 /// * If `ev.source()` is `Some(id)`, `metadata["a2a-bridge.source"]` is set on
 ///   the emitted event; for artifacts, `artifact.name` is also set to `id`.
 pub fn event_to_streamresponse(ev: &Event, task_id: &str, context_id: &str) -> a2a::StreamResponse {
-    /// Build a `metadata` map from a source label, if present.
-    fn source_metadata(ev: &Event) -> Option<HashMap<String, serde_json::Value>> {
-        ev.source().map(|id| {
-            let mut m = HashMap::new();
+    /// Preserve bridge-owned event metadata and add the source label, if present.
+    fn event_metadata(ev: &Event) -> Option<HashMap<String, serde_json::Value>> {
+        let mut m = ev.metadata().clone();
+        if let Some(id) = ev.source() {
             m.insert(
                 "a2a-bridge.source".to_owned(),
                 serde_json::Value::String(id.to_owned()),
             );
-            m
-        })
+        }
+        (!m.is_empty()).then_some(m)
     }
 
     match ev.kind() {
@@ -63,7 +63,7 @@ pub fn event_to_streamresponse(ev: &Event, task_id: &str, context_id: &str) -> a
                     message: Some(message),
                     timestamp: None,
                 },
-                metadata: source_metadata(ev),
+                metadata: event_metadata(ev),
             })
         }
         EventKind::Artifact => {
@@ -85,7 +85,7 @@ pub fn event_to_streamresponse(ev: &Event, task_id: &str, context_id: &str) -> a
                 },
                 append: None,
                 last_chunk: Some(true),
-                metadata: source_metadata(ev),
+                metadata: event_metadata(ev),
             })
         }
         EventKind::Terminal => {
@@ -102,7 +102,7 @@ pub fn event_to_streamresponse(ev: &Event, task_id: &str, context_id: &str) -> a
                     message: None,
                     timestamp: None,
                 },
-                metadata: source_metadata(ev),
+                metadata: event_metadata(ev),
             })
         }
         EventKind::Usage => {

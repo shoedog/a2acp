@@ -286,6 +286,10 @@ impl AttemptTerminal {
         };
         if self.completed_ms <= 0
             || dims.iter().any(|v| !bounded(v, MAX_DIMENSION_LEN))
+            || !matches!(
+                self.outcome.as_str(),
+                "completed" | "completed_degraded" | "failed" | "canceled" | "interrupted"
+            )
             || self.phase_durations.len() > MAX_PHASES
             || self
                 .phase_durations
