@@ -922,18 +922,27 @@ diff --git \"a/docs/a b.md\" \"b/docs/a b.md\"
                 ok: false,
                 output: String::new(),
                 usage: None,
+                terminal_json: None,
+                policy_trigger_json: None,
+                policy_trigger_barrier_result: None,
             },
             WorkflowEvent::NodeFinished {
                 node: NodeId::parse("reviewer_claude").unwrap(),
                 ok: true,
                 output: "ok".into(),
                 usage: None,
+                terminal_json: None,
+                policy_trigger_json: None,
+                policy_trigger_barrier_result: None,
             },
             WorkflowEvent::NodeFinished {
                 node: NodeId::parse("synth").unwrap(),
                 ok: true,
                 output: "VERDICT: APPROVE".into(),
                 usage: None,
+                terminal_json: None,
+                policy_trigger_json: None,
+                policy_trigger_barrier_result: None,
             },
             WorkflowEvent::Terminal {
                 outcome: WorkflowOutcome::Completed,
@@ -955,6 +964,9 @@ diff --git \"a/docs/a b.md\" \"b/docs/a b.md\"
             ok: false,
             output: String::new(),
             usage: None,
+            terminal_json: None,
+            policy_trigger_json: None,
+            policy_trigger_barrier_result: None,
         };
         let term = WorkflowEvent::Terminal {
             outcome: WorkflowOutcome::Completed,

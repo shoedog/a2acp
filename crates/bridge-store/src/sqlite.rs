@@ -3768,6 +3768,10 @@ impl HarvestAuditStore for SqliteStore {
 
 #[async_trait::async_trait]
 impl bridge_core::task_store::TaskStore for SqliteStore {
+    fn workflow_ledger_admission(&self) -> bridge_core::execution_policy::LedgerAdmissionV1 {
+        bridge_core::execution_policy::LedgerAdmissionV1::DurablePrimaryTaskStore
+    }
+
     async fn create(&self, rec: &bridge_core::task_store::TaskRecord) -> Result<(), BridgeError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

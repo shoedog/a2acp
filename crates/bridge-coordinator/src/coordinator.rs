@@ -1566,8 +1566,7 @@ impl Coordinator {
                         requested_session_cwd: session_cwd.clone(),
                         policy_invocation:
                             bridge_core::execution_policy::ExecutionPolicyInvocationV1::default(),
-                        ledger_admission:
-                            bridge_core::execution_policy::LedgerAdmissionV1::DurablePrimaryTaskStore,
+                        ledger_admission: self.task_store.workflow_ledger_admission(),
                     })
                     .await?,
             ),
@@ -2139,11 +2138,14 @@ mod tests {
         PermissionRequest, RegistrySnapshot, SessionContext,
     };
     use bridge_core::error::BridgeError;
+    use bridge_core::execution_policy::{
+        FanOutPolicyV1, SynthesisModeV1, WorkflowControlDefaultsV1,
+    };
     use bridge_core::ids::{AgentId, ContextId, NodeId, SessionId};
     use bridge_core::orch::{TerminalUsage, UsageCost, UsageSnapshot};
     use bridge_core::ports::{
-        AgentBackend, BackendObservers, BackendStream, DiagnosticObserver, Lease, Resolved,
-        TurnContext, TurnOutcome, Update,
+        AgentBackend, BackendObservers, BackendStream, BoundEntryUseV1, DiagnosticObserver,
+        EntryUseTokenV1, Lease, Resolved, TurnContext, TurnOutcome, Update,
     };
     use bridge_core::task_store::{
         MemoryTaskStore, TaskAttemptLocator, TaskRecord, TaskRecordStatus, TaskStore,
@@ -2278,6 +2280,32 @@ mod tests {
                 backend: self.backend.clone(),
                 lease: Box::new(NoopLease),
             })
+        }
+
+        fn bind_entry_use(&self, id: &AgentId) -> Option<BoundEntryUseV1> {
+            if id != &self.entry.id {
+                return None;
+            }
+            let entry = Arc::new(self.entry.clone());
+            Some(BoundEntryUseV1 {
+                use_token: EntryUseTokenV1::new(Arc::new(()), &entry, 1),
+                entry,
+                lease: Box::new(NoopLease),
+            })
+        }
+
+        async fn resolve_bound(
+            &self,
+            bound: &BoundEntryUseV1,
+            _effect: &bridge_core::execution_policy::BoundProviderEffectV1,
+            _observer: Arc<dyn DiagnosticObserver>,
+        ) -> Result<Arc<dyn AgentBackend>, BridgeError> {
+            if bound.entry.id != self.entry.id || !bound.use_token.matches_entry(&bound.entry) {
+                return Err(BridgeError::ConfigMismatch {
+                    field: "bound_entry",
+                });
+            }
+            Ok(self.backend.clone())
         }
 
         fn default_id(&self) -> AgentId {
@@ -2544,6 +2572,14 @@ mod tests {
         }
 
         async fn cancel(&self, _session: &SessionId) -> Result<(), BridgeError> {
+            Ok(())
+        }
+
+        async fn configure_bound_session(
+            &self,
+            _session: &SessionId,
+            _spec: &bridge_core::execution_policy::BoundSessionSpecV1,
+        ) -> Result<(), BridgeError> {
             Ok(())
         }
 
@@ -5295,7 +5331,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admitted_workflow_persists_v2_and_not_legacy_task_cwd() {
+    async fn admitted_memory_workflow_persists_v2_and_freezes_offline_unavailable() {
         let gate = Arc::new(Notify::new());
         let mut workflows = HashMap::new();
         workflows.insert(
@@ -5329,7 +5365,9 @@ mod tests {
         );
         assert_eq!(
             run_spec.ledger_admission,
-            bridge_core::execution_policy::LedgerAdmissionV1::DurablePrimaryTaskStore
+            bridge_core::execution_policy::LedgerAdmissionV1::HistoryLedgerUnavailable {
+                reason: bridge_core::execution_policy::BoundedLedgerReasonV1::Open,
+            }
         );
         let locator = fixture
             .task_store
@@ -5338,6 +5376,132 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(run_spec.attempt_id, locator.identity.attempt_id);
+    }
+
+    #[tokio::test]
+    async fn admitted_sqlite_fail_fast_commits_trigger_before_exact_sink_replay() {
+        let graph = Arc::new(WorkflowGraph {
+            id: WorkflowId::parse("code-review").unwrap(),
+            nodes: vec![WorkflowNode {
+                id: NodeId::parse("only").unwrap(),
+                agent: AgentId::parse("codex").unwrap(),
+                prompt_template: "{{input}}".into(),
+                inputs: Vec::new(),
+                retry: None,
+                harvest_sanitization: None,
+            }],
+            panel: None,
+            controls: Some(WorkflowControlDefaultsV1 {
+                fan_out: Some(FanOutPolicyV1::FailFast),
+                synthesis: Some(SynthesisModeV1::Strict),
+                ..WorkflowControlDefaultsV1::default()
+            }),
+        });
+        let backend: Arc<dyn AgentBackend> = Arc::new(ErrorBackend {
+            error: BridgeError::AgentOverloaded,
+            releases: Arc::new(AtomicUsize::new(0)),
+        });
+        let registry: Arc<dyn AgentRegistry> = Arc::new(FakeRegistry {
+            entry: entry(),
+            backend,
+            resolved: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(1_700_000_000_000));
+        let session_manager = Arc::new(SessionManager::new_with_clock(
+            registry.clone(),
+            Duration::from_secs(60),
+            clock.clone(),
+        ));
+        let concrete_store = Arc::new(bridge_store::sqlite::SqliteStore::open_in_memory().unwrap());
+        let task_store: Arc<dyn TaskStore> = concrete_store.clone();
+        let session_store: Arc<dyn SessionStore> = Arc::new(FakeSessionStore::default());
+        let policy: Arc<dyn PolicyEngine> = Arc::new(AllowPolicy);
+        let admission = Arc::new(bridge_workflow::admission::WorkflowAdmissionV1::new(
+            registry.clone(),
+            Arc::new(bridge_workflow::admission::DirectWorkflowCheckoutPlannerV1),
+            SessionCwd::parse("/tmp").unwrap(),
+            None,
+        ));
+        let coordinator = Coordinator::new(
+            session_manager,
+            Some(Arc::new(WorkflowExecutor::new(registry.clone()))),
+            Arc::new(HashMap::from([(
+                WorkflowId::parse("code-review").unwrap(),
+                graph,
+            )])),
+            task_store,
+            session_store,
+            policy,
+            registry,
+            clock,
+            Some(SessionCwd::parse("/tmp").unwrap()),
+            None,
+            Arc::new(NoopObserver),
+            3,
+        )
+        .with_workflow_admission(admission);
+
+        let task = coordinator.run_workflow(workflow_params()).await.unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let row = concrete_store.get(&task).await.unwrap().unwrap();
+                if row.status != TaskRecordStatus::Working {
+                    break row;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("served V2 workflow must terminalize");
+        assert_eq!(terminal.status, TaskRecordStatus::Failed);
+
+        let snapshot =
+            crate::detached::decode_workflow_spec(terminal.workflow_spec_json.as_deref().unwrap())
+                .unwrap();
+        let crate::detached::DecodedWorkflowSpec::BoundV2(run_spec) = snapshot else {
+            panic!("SQLite admission must persist V2")
+        };
+        assert_eq!(
+            run_spec.ledger_admission,
+            bridge_core::execution_policy::LedgerAdmissionV1::DurablePrimaryTaskStore
+        );
+
+        let terminals = concrete_store.node_terminal_evidence(&task).await.unwrap();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0].node.as_str(), "only");
+        let task_evidence = concrete_store.workflow_task_evidence(&task).await.unwrap();
+        let trigger_json = task_evidence
+            .policy_trigger_json
+            .expect("selected trigger is durable");
+        let trigger = bridge_core::execution_policy::PolicyTriggerV1::decode_canonical(
+            trigger_json.as_bytes(),
+        )
+        .unwrap();
+        let node_terminal = bridge_core::execution_policy::NodeTerminalV1::decode_canonical(
+            terminals[0].terminal_json.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(node_terminal.policy_trigger_id.as_ref(), Some(&trigger.id));
+
+        let journal = concrete_store.journal_from(&task, -1).await.unwrap();
+        let finishes = journal
+            .iter()
+            .filter_map(|event| match &event.kind {
+                bridge_core::orch::OrchEventKind::NodeFinished {
+                    terminal_json: Some(terminal),
+                    policy_trigger_json: Some(trigger),
+                    ..
+                } => Some((terminal, trigger)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finishes.len(),
+            1,
+            "sink replay must not append a second finish"
+        );
+        assert_eq!(finishes[0].0, &terminals[0].terminal_json);
+        assert_eq!(finishes[0].1, &trigger_json);
     }
     #[tokio::test]
     async fn healthy_workflow_persists_calibration_eligible_measurements() {

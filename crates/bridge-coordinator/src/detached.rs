@@ -253,6 +253,11 @@ pub trait WorkflowSink: Send {
         _ok: bool,
         _output: &str,
         _usage: Option<&bridge_core::orch::UsageSnapshot>,
+        _terminal_json: Option<&str>,
+        _policy_trigger_json: Option<&str>,
+        _policy_trigger_barrier_result: Option<
+            &bridge_workflow::fanout::PolicyTriggerBarrierResultV1,
+        >,
     ) -> Result<(), BridgeError> {
         Ok(())
     }
@@ -314,9 +319,20 @@ async fn drain_workflow_inner<S: WorkflowSink>(
                 ok,
                 output,
                 usage,
+                terminal_json,
+                policy_trigger_json,
+                policy_trigger_barrier_result,
             }) => {
-                sink.node_finished(node.as_str(), ok, &output, usage.as_ref())
-                    .await
+                sink.node_finished(
+                    node.as_str(),
+                    ok,
+                    &output,
+                    usage.as_ref(),
+                    terminal_json.as_deref(),
+                    policy_trigger_json.as_deref(),
+                    policy_trigger_barrier_result.as_ref(),
+                )
+                .await
             }
             Ok(WorkflowEvent::CleanupObserved {
                 disposition,
@@ -358,7 +374,8 @@ use bridge_core::ids::{NodeId, OperationId, TaskId};
 use bridge_core::ports::{RichEventSink, RichEventSinkFactory};
 use bridge_core::task_store::{ResumeClaim, TaskRecord, TaskRecordStatus, TaskStore};
 use bridge_workflow::executor::{
-    PromptDispatchBarrier, WorkflowDiagnosticContext, WorkflowExecutor, WorkflowRunContext,
+    PolicyTriggerBarrier, PromptDispatchBarrier, WorkflowDiagnosticContext, WorkflowExecutor,
+    WorkflowRunContext,
 };
 use bridge_workflow::graph::WorkflowGraph;
 use std::collections::{HashMap, VecDeque};
@@ -508,21 +525,51 @@ impl WorkflowSink for DetachedProgressSink {
         ok: bool,
         output: &str,
         usage: Option<&bridge_core::orch::UsageSnapshot>,
+        terminal_json: Option<&str>,
+        policy_trigger_json: Option<&str>,
+        policy_trigger_barrier_result: Option<
+            &bridge_workflow::fanout::PolicyTriggerBarrierResultV1,
+        >,
     ) -> Result<(), BridgeError> {
+        if matches!(
+            policy_trigger_barrier_result,
+            Some(bridge_workflow::fanout::PolicyTriggerBarrierResultV1::PrimaryFailed)
+        ) {
+            return Err(BridgeError::StoreFailure);
+        }
         let node_id = bridge_core::ids::NodeId::parse(node)?;
         let operation_id = self.operation_id()?;
-        let seq = self
-            .store
-            .put_node_checkpoint_sequenced(
-                &self.task,
-                &node_id,
-                &operation_id,
-                output,
-                ok,
-                now_ms(),
-                usage,
-            )
-            .await?;
+        let seq = match terminal_json {
+            Some(terminal_json) => {
+                self.store
+                    .put_node_checkpoint_sequenced_v2(
+                        &self.task,
+                        &node_id,
+                        &operation_id,
+                        output,
+                        ok,
+                        now_ms(),
+                        usage,
+                        terminal_json,
+                        policy_trigger_json,
+                    )
+                    .await?
+            }
+            None if policy_trigger_json.is_none() => {
+                self.store
+                    .put_node_checkpoint_sequenced(
+                        &self.task,
+                        &node_id,
+                        &operation_id,
+                        output,
+                        ok,
+                        now_ms(),
+                        usage,
+                    )
+                    .await?
+            }
+            None => return Err(BridgeError::StoreFailure),
+        };
         self.hub.publish(WorkflowProgressFrame {
             v: 1,
             seq,
@@ -532,8 +579,8 @@ impl WorkflowSink for DetachedProgressSink {
                 ok,
                 output: output.to_string(),
                 usage: usage.cloned(),
-                terminal_json: None,
-                policy_trigger_json: None,
+                terminal_json: terminal_json.map(str::to_owned),
+                policy_trigger_json: policy_trigger_json.map(str::to_owned),
             },
         });
         Ok(())
@@ -1073,6 +1120,11 @@ mod sink_tests {
             _ok: bool,
             _output: &str,
             _usage: Option<&bridge_core::orch::UsageSnapshot>,
+            _terminal_json: Option<&str>,
+            _policy_trigger_json: Option<&str>,
+            _policy_trigger_barrier_result: Option<
+                &bridge_workflow::fanout::PolicyTriggerBarrierResultV1,
+            >,
         ) -> Result<(), BridgeError> {
             self.calls += 1;
             Err(BridgeError::StoreFailure)
@@ -1102,6 +1154,9 @@ mod sink_tests {
                 ok: true,
                 output: "checkpoint".into(),
                 usage: None,
+                terminal_json: None,
+                policy_trigger_json: None,
+                policy_trigger_barrier_result: None,
             })
         });
         let sibling = futures::stream::once(async move {
@@ -1129,6 +1184,87 @@ mod sink_tests {
         assert_eq!(rich_flushes.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn primary_failed_policy_barrier_is_never_retried_by_detached_sink() {
+        use bridge_core::execution_policy::{
+            ControlEventIdV1, FanOutPolicyNameV1, NodeCleanupDispositionV1, NodeCleanupV1,
+            NodePrimaryDispositionV1, NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1,
+        };
+        use bridge_core::ids::AttemptId;
+
+        let concrete = Arc::new(bridge_core::task_store::MemoryTaskStore::new());
+        let store: Arc<dyn TaskStore> = concrete.clone();
+        let task = TaskId::parse("primary-failed-no-retry").unwrap();
+        store
+            .create(&make_task_record(task.as_str()))
+            .await
+            .unwrap();
+        let hub = Arc::new(TaskProgressHub::new());
+        let mut sink = DetachedProgressSink::new(store, task.clone(), hub);
+        sink.node_started("selected").await.unwrap();
+
+        let attempt = AttemptId::parse("attempt-44444444444444444444444444444444").unwrap();
+        let trigger = PolicyTriggerV1 {
+            schema_version: 1,
+            id: ControlEventIdV1::for_attempt(&attempt, 0),
+            node: PolicyNodeRefV1::from_node_id(0, "selected"),
+            policy: FanOutPolicyNameV1::FailFast,
+            grace_ms: None,
+        };
+        let trigger_json = String::from_utf8(trigger.encode_canonical().unwrap()).unwrap();
+        let terminal = NodeTerminalV1 {
+            schema_version: 1,
+            primary: NodePrimaryDispositionV1::Failed,
+            cleanup: NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::Complete,
+                duration_ms: 1,
+            },
+            cause: None,
+            prompt_may_have_been_accepted: false,
+            degraded_ancestry: false,
+            policy_trigger_id: Some(trigger.id),
+        };
+        let terminal_json = String::from_utf8(terminal.encode_canonical().unwrap()).unwrap();
+
+        let error = sink
+            .node_finished(
+                "selected",
+                false,
+                "FAILED",
+                None,
+                Some(&terminal_json),
+                Some(&trigger_json),
+                Some(&bridge_workflow::fanout::PolicyTriggerBarrierResultV1::PrimaryFailed),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, BridgeError::StoreFailure));
+        let snapshot = concrete.progress_snapshot(&task).await.unwrap();
+        assert!(snapshot.checkpoints.is_empty());
+        assert_eq!(
+            snapshot.starts.len(),
+            1,
+            "the uncommitted start remains recoverable"
+        );
+        assert!(concrete
+            .node_terminal_evidence(&task)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(concrete
+            .workflow_task_evidence(&task)
+            .await
+            .unwrap()
+            .policy_trigger_json
+            .is_none());
+        let journal = concrete.journal_from(&task, -1).await.unwrap();
+        assert_eq!(journal.len(), 1);
+        assert!(matches!(
+            journal[0].kind,
+            bridge_core::orch::OrchEventKind::NodeStarted { .. }
+        ));
+    }
+
     /// Recording sink that logs the order of calls. Used to assert that
     /// `drain_workflow` fully awaits `node_finished` before delivering the next
     /// event (the sequential `while let … stream.next().await` loop guarantees
@@ -1149,6 +1285,11 @@ mod sink_tests {
             _ok: bool,
             _output: &str,
             _usage: Option<&bridge_core::orch::UsageSnapshot>,
+            _terminal_json: Option<&str>,
+            _policy_trigger_json: Option<&str>,
+            _policy_trigger_barrier_result: Option<
+                &bridge_workflow::fanout::PolicyTriggerBarrierResultV1,
+            >,
         ) -> Result<(), BridgeError> {
             self.log.push("node_finished");
             Ok(())
@@ -1178,6 +1319,9 @@ mod sink_tests {
                 ok: true,
                 output: "out-a".into(),
                 usage: None,
+                terminal_json: None,
+                policy_trigger_json: None,
+                policy_trigger_barrier_result: None,
             }),
             Ok(WorkflowEvent::NodeStarted { node: b.clone() }),
             Ok(WorkflowEvent::NodeFinished {
@@ -1185,6 +1329,9 @@ mod sink_tests {
                 ok: true,
                 output: "out-b".into(),
                 usage: None,
+                terminal_json: None,
+                policy_trigger_json: None,
+                policy_trigger_barrier_result: None,
             }),
             Ok(WorkflowEvent::Terminal {
                 outcome: WorkflowOutcome::Completed,
@@ -1630,6 +1777,9 @@ mod sink_tests {
                 ok: true,
                 output: "out-a".into(),
                 usage: None,
+                terminal_json: None,
+                policy_trigger_json: None,
+                policy_trigger_barrier_result: None,
             }),
             Ok(WorkflowEvent::Terminal {
                 outcome: WorkflowOutcome::Completed,
@@ -1993,7 +2143,7 @@ mod sink_tests {
             terminal: None,
             at_ms: 1,
         };
-        sink.node_finished("member", true, "OUT", Some(&usage))
+        sink.node_finished("member", true, "OUT", Some(&usage), None, None, None)
             .await
             .unwrap();
 
@@ -2225,6 +2375,9 @@ mod sink_tests {
                 ok: true,
                 output: "out-a".into(),
                 usage: None,
+                terminal_json: None,
+                policy_trigger_json: None,
+                policy_trigger_barrier_result: None,
             }),
             Ok(WorkflowEvent::Terminal {
                 outcome: WorkflowOutcome::Completed,
@@ -3414,6 +3567,49 @@ fn spawn_detached_workflow_inner(
             };
         let diagnostic_factory: Arc<dyn bridge_core::ports::DiagnosticObserverFactory> =
             Arc::new(diagnostic_factory);
+        let policy_trigger_barrier: Option<PolicyTriggerBarrier> = authority
+            .as_ref()
+            .filter(|authority| {
+                matches!(
+                    authority.run_spec.ledger_admission,
+                    bridge_core::execution_policy::LedgerAdmissionV1::DurablePrimaryTaskStore
+                )
+            })
+            .map(|_| {
+                let store = deps.task_store.clone();
+                let task = task.clone();
+                let operation = op.clone();
+                Arc::new(move |checkpoint: bridge_workflow::executor::PolicyTriggerCheckpointV1| {
+                    let store = store.clone();
+                    let task = task.clone();
+                    let operation = operation.clone();
+                    Box::pin(async move {
+                        match store
+                            .put_node_checkpoint_sequenced_v2(
+                                &task,
+                                &checkpoint.node,
+                                &operation,
+                                &checkpoint.output,
+                                checkpoint.ok,
+                                now_ms(),
+                                checkpoint.usage.as_ref(),
+                                &checkpoint.terminal_json,
+                                Some(&checkpoint.policy_trigger_json),
+                            )
+                            .await
+                        {
+                            Ok(_) => bridge_workflow::fanout::PolicyTriggerBarrierResultV1::ServedPrimaryCommitted,
+                            Err(_) => bridge_workflow::fanout::PolicyTriggerBarrierResultV1::PrimaryFailed,
+                        }
+                    }) as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = bridge_workflow::fanout::PolicyTriggerBarrierResultV1,
+                                > + Send,
+                        >,
+                    >
+                }) as PolicyTriggerBarrier
+            });
         let durable: Arc<dyn RichEventSinkFactory> = Arc::new(DetachedRichSinkFactory {
             store: deps.task_store.clone(),
             task: task.clone(),
@@ -3434,6 +3630,10 @@ fn spawn_detached_workflow_inner(
         let diagnostic_context = WorkflowDiagnosticContext::new(ctx, diagnostic_factory);
         let diagnostic_context = match prompt_dispatch {
             Some(barrier) => diagnostic_context.with_prompt_dispatch_barrier(barrier),
+            None => diagnostic_context,
+        };
+        let diagnostic_context = match policy_trigger_barrier {
+            Some(barrier) => diagnostic_context.with_policy_trigger_barrier(barrier),
             None => diagnostic_context,
         };
         let diagnostic_context = match authority {

@@ -77,6 +77,94 @@ impl Default for WorkflowRunContext {
 pub type PromptDispatchBarrier =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Exact canonical checkpoint payload selected by the fan-out controller.
+/// The callback must resolve one closed barrier result before policy action.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolicyTriggerCheckpointV1 {
+    pub node: NodeId,
+    pub output: String,
+    pub ok: bool,
+    pub usage: Option<UsageSnapshot>,
+    pub terminal_json: String,
+    pub policy_trigger_json: String,
+}
+
+pub type PolicyTriggerBarrier = Arc<
+    dyn Fn(
+            PolicyTriggerCheckpointV1,
+        ) -> Pin<Box<dyn Future<Output = PolicyTriggerBarrierResultV1> + Send>>
+        + Send
+        + Sync,
+>;
+
+async fn reach_policy_trigger_barrier_v1(
+    admission: &LedgerAdmissionV1,
+    barrier: Option<&PolicyTriggerBarrier>,
+    checkpoint: PolicyTriggerCheckpointV1,
+) -> PolicyTriggerBarrierResultV1 {
+    match admission {
+        LedgerAdmissionV1::HistoryLedgerUnavailable { reason } => {
+            classify_offline_barrier_error_v1((*reason).into())
+        }
+        LedgerAdmissionV1::DurablePrimaryTaskStore => {
+            let Some(barrier) = barrier else {
+                return PolicyTriggerBarrierResultV1::PrimaryFailed;
+            };
+            match barrier(checkpoint).await {
+                PolicyTriggerBarrierResultV1::ServedPrimaryCommitted => {
+                    PolicyTriggerBarrierResultV1::ServedPrimaryCommitted
+                }
+                PolicyTriggerBarrierResultV1::PrimaryFailed
+                | PolicyTriggerBarrierResultV1::OfflineHistoryCommitted
+                | PolicyTriggerBarrierResultV1::OfflineTelemetryUnavailable { .. } => {
+                    PolicyTriggerBarrierResultV1::PrimaryFailed
+                }
+            }
+        }
+        LedgerAdmissionV1::HistoryLedgerAdmitted { .. } => {
+            let Some(barrier) = barrier else {
+                return PolicyTriggerBarrierResultV1::PrimaryFailed;
+            };
+            match barrier(checkpoint).await {
+                PolicyTriggerBarrierResultV1::OfflineHistoryCommitted => {
+                    PolicyTriggerBarrierResultV1::OfflineHistoryCommitted
+                }
+                PolicyTriggerBarrierResultV1::OfflineTelemetryUnavailable { reason }
+                    if reason
+                        != bridge_core::workflow_history::LedgerUnavailableReason::Collision =>
+                {
+                    PolicyTriggerBarrierResultV1::OfflineTelemetryUnavailable { reason }
+                }
+                PolicyTriggerBarrierResultV1::PrimaryFailed
+                | PolicyTriggerBarrierResultV1::ServedPrimaryCommitted
+                | PolicyTriggerBarrierResultV1::OfflineTelemetryUnavailable { .. } => {
+                    PolicyTriggerBarrierResultV1::PrimaryFailed
+                }
+            }
+        }
+    }
+}
+
+fn canonical_terminal_json_v1(terminal: &NodeTerminalV1) -> Result<String, BridgeError> {
+    String::from_utf8(
+        terminal
+            .encode_canonical()
+            .map_err(|_| BridgeError::InvalidStateTransition)?,
+    )
+    .map_err(|_| BridgeError::InvalidStateTransition)
+}
+
+fn canonical_trigger_json_v1(
+    trigger: &bridge_core::execution_policy::PolicyTriggerV1,
+) -> Result<String, BridgeError> {
+    String::from_utf8(
+        trigger
+            .encode_canonical()
+            .map_err(|_| BridgeError::InvalidStateTransition)?,
+    )
+    .map_err(|_| BridgeError::InvalidStateTransition)
+}
+
 /// Additive diagnostic-authority wrapper for workflow execution. Keeping the
 /// factory out of [`WorkflowRunContext`] preserves source compatibility for
 /// downstream exhaustive struct literals while making durable authority an
@@ -86,6 +174,7 @@ pub struct WorkflowDiagnosticContext {
     request: WorkflowRunContext,
     factory: Arc<dyn DiagnosticObserverFactory>,
     prompt_dispatch: Option<PromptDispatchBarrier>,
+    policy_trigger: Option<PolicyTriggerBarrier>,
     frozen_authority: Option<FrozenWorkflowAuthority>,
 }
 
@@ -145,12 +234,18 @@ impl WorkflowDiagnosticContext {
             request,
             factory,
             prompt_dispatch: None,
+            policy_trigger: None,
             frozen_authority: None,
         }
     }
 
     pub fn with_prompt_dispatch_barrier(mut self, barrier: PromptDispatchBarrier) -> Self {
         self.prompt_dispatch = Some(barrier);
+        self
+    }
+
+    pub fn with_policy_trigger_barrier(mut self, barrier: PolicyTriggerBarrier) -> Self {
+        self.policy_trigger = Some(barrier);
         self
     }
 
@@ -210,12 +305,14 @@ impl WorkflowDiagnosticContext {
         WorkflowRunContext,
         Arc<dyn DiagnosticObserverFactory>,
         Option<PromptDispatchBarrier>,
+        Option<PolicyTriggerBarrier>,
         Option<FrozenWorkflowAuthority>,
     ) {
         (
             self.request,
             self.factory,
             self.prompt_dispatch,
+            self.policy_trigger,
             self.frozen_authority,
         )
     }
@@ -1017,6 +1114,9 @@ pub enum WorkflowEvent {
         ok: bool,
         output: String,
         usage: Option<bridge_core::orch::UsageSnapshot>,
+        terminal_json: Option<String>,
+        policy_trigger_json: Option<String>,
+        policy_trigger_barrier_result: Option<PolicyTriggerBarrierResultV1>,
     },
     CleanupObserved {
         disposition: WorkflowCleanupDisposition,
@@ -3760,7 +3860,8 @@ impl WorkflowExecutor {
         seed: HashMap<String, (String, bool, Option<UsageSnapshot>)>,
         ctx: WorkflowDiagnosticContext,
     ) -> WorkflowStream {
-        let (ctx, diagnostic_factory, prompt_dispatch, frozen_authority) = ctx.into_parts();
+        let (ctx, diagnostic_factory, prompt_dispatch, policy_trigger, frozen_authority) =
+            ctx.into_parts();
         self.run_from_with_context_inner(
             graph,
             input,
@@ -3770,6 +3871,7 @@ impl WorkflowExecutor {
             ctx,
             diagnostic_factory,
             prompt_dispatch,
+            policy_trigger,
             frozen_authority,
             None,
         )
@@ -3808,7 +3910,8 @@ impl WorkflowExecutor {
         ctx: WorkflowDiagnosticContext,
         dispatcher: Arc<dyn WorkflowNodeDispatcher>,
     ) -> WorkflowStream {
-        let (ctx, diagnostic_factory, prompt_dispatch, frozen_authority) = ctx.into_parts();
+        let (ctx, diagnostic_factory, prompt_dispatch, policy_trigger, frozen_authority) =
+            ctx.into_parts();
         self.run_from_with_context_inner(
             graph,
             input,
@@ -3818,6 +3921,7 @@ impl WorkflowExecutor {
             ctx,
             diagnostic_factory,
             prompt_dispatch,
+            policy_trigger,
             frozen_authority,
             Some(dispatcher),
         )
@@ -3834,6 +3938,7 @@ impl WorkflowExecutor {
         ctx: WorkflowRunContext,
         diagnostic_factory: Arc<dyn DiagnosticObserverFactory>,
         prompt_dispatch: Option<PromptDispatchBarrier>,
+        policy_trigger_barrier: Option<PolicyTriggerBarrier>,
         frozen_authority: Option<FrozenWorkflowAuthority>,
         dispatcher: Option<Arc<dyn WorkflowNodeDispatcher>>,
     ) -> WorkflowStream {
@@ -4065,6 +4170,10 @@ impl WorkflowExecutor {
 
                 let mut completed = Vec::with_capacity(ready.len());
                 let mut ready_terminals = Vec::with_capacity(ready.len());
+                let mut ready_event_evidence = BTreeMap::<
+                    NodeId,
+                    (String, Option<String>, Option<PolicyTriggerBarrierResultV1>),
+                >::new();
                 for (node_id, raw_output) in ready {
                     node_cancels.remove(&node_id);
                     let raw_output = match raw_output {
@@ -4176,20 +4285,75 @@ impl WorkflowExecutor {
                             return;
                         }
                     };
-                    for ready in selection.terminals {
-                        node_terminals.insert(ready.node, ready.terminal);
-                    }
-                    if selection.trigger.is_some() {
-                        let barrier = match authority.run_spec.ledger_admission {
-                            LedgerAdmissionV1::HistoryLedgerUnavailable { reason } => {
-                                classify_offline_barrier_error_v1(reason.into())
+                    let trigger_json = match selection.trigger.as_ref() {
+                        Some(trigger) => match canonical_trigger_json_v1(trigger) {
+                            Ok(encoded) => Some(encoded),
+                            Err(error) => {
+                                yield Err(error);
+                                return;
                             }
-                            LedgerAdmissionV1::DurablePrimaryTaskStore
-                            | LedgerAdmissionV1::HistoryLedgerAdmitted { .. } => {
-                                PolicyTriggerBarrierResultV1::PrimaryFailed
+                        },
+                        None => None,
+                    };
+                    let mut selected_node = None;
+                    for ready in &selection.terminals {
+                        let terminal_json = match canonical_terminal_json_v1(&ready.terminal) {
+                            Ok(encoded) => encoded,
+                            Err(error) => {
+                                yield Err(error);
+                                return;
                             }
                         };
+                        let selected = selection.trigger.as_ref().is_some_and(|trigger| {
+                            ready.terminal.policy_trigger_id.as_ref() == Some(&trigger.id)
+                        });
+                        if selected {
+                            selected_node = Some(ready.node.clone());
+                        }
+                        ready_event_evidence.insert(
+                            ready.node.clone(),
+                            (
+                                terminal_json,
+                                selected.then(|| trigger_json.clone()).flatten(),
+                                None,
+                            ),
+                        );
+                    }
+                    if let (Some(trigger_json), Some(selected_node)) =
+                        (trigger_json, selected_node)
+                    {
+                        let Some((_, output, ok, usage, _)) = completed
+                            .iter()
+                            .find(|(node, ..)| node == &selected_node)
+                        else {
+                            yield Err(BridgeError::InvalidStateTransition);
+                            return;
+                        };
+                        let Some((terminal_json, _, barrier_slot)) =
+                            ready_event_evidence.get_mut(&selected_node)
+                        else {
+                            yield Err(BridgeError::InvalidStateTransition);
+                            return;
+                        };
+                        let checkpoint = PolicyTriggerCheckpointV1 {
+                            node: selected_node,
+                            output: output.clone(),
+                            ok: *ok,
+                            usage: usage.clone(),
+                            terminal_json: terminal_json.clone(),
+                            policy_trigger_json: trigger_json,
+                        };
+                        let barrier = reach_policy_trigger_barrier_v1(
+                            &authority.run_spec.ledger_admission,
+                            policy_trigger_barrier.as_ref(),
+                            checkpoint,
+                        )
+                        .await;
+                        *barrier_slot = Some(barrier.clone());
                         action = controller.acknowledge_barrier(barrier, cancel.is_cancelled());
+                    }
+                    for ready in selection.terminals {
+                        node_terminals.insert(ready.node, ready.terminal);
                     }
                     stop_scheduling |= controller.admission_stopped();
                 } else {
@@ -4210,11 +4374,21 @@ impl WorkflowExecutor {
                 }
 
                 for (node_id, text, ok, usage, disposition) in completed {
+                    let (terminal_json, policy_trigger_json, policy_trigger_barrier_result) =
+                        ready_event_evidence
+                            .remove(&node_id)
+                            .map(|(terminal, trigger, barrier)| {
+                                (Some(terminal), trigger, barrier)
+                            })
+                            .unwrap_or((None, None, None));
                     yield Ok(WorkflowEvent::NodeFinished {
                         node: node_id.clone(),
                         ok,
                         output: text.clone(),
                         usage: usage.clone(),
+                        terminal_json,
+                        policy_trigger_json,
+                        policy_trigger_barrier_result,
                     });
                     done.insert(node_id.as_str().to_string());
                     dispositions.insert(node_id.as_str().to_string(), disposition);

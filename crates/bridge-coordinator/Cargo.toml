@@ -22,4 +22,5 @@ a2a.workspace = true
 
 [dev-dependencies]
 bridge-observ = { path = "../bridge-observ" }
+bridge-store = { path = "../bridge-store" }
 tokio-stream.workspace = true

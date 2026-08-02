@@ -555,6 +555,7 @@ dependencies = [
  "async-trait",
  "bridge-core",
  "bridge-observ",
+ "bridge-store",
  "bridge-workflow",
  "futures",
  "serde",

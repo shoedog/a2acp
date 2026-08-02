@@ -351,6 +351,15 @@ pub enum ResumeClaim {
 
 #[async_trait::async_trait]
 pub trait TaskStore: HarvestAuditStore + Send + Sync {
+    /// Freeze the policy-trigger durability lane this primary store can actually own.
+    /// Ephemeral and compatibility stores default to the explicit offline-unavailable
+    /// path; a durable implementation must opt in together with its atomic V2 writer.
+    fn workflow_ledger_admission(&self) -> crate::execution_policy::LedgerAdmissionV1 {
+        crate::execution_policy::LedgerAdmissionV1::HistoryLedgerUnavailable {
+            reason: crate::execution_policy::BoundedLedgerReasonV1::Open,
+        }
+    }
+
     /// Non-clobbering INSERT. A duplicate id MUST return an error (NOT upsert),
     /// so a resubmit/colliding id can never overwrite a terminal result.
     async fn create(&self, rec: &TaskRecord) -> Result<(), BridgeError>;

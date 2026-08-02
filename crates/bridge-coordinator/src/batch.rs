@@ -1012,8 +1012,7 @@ pub async fn run_admission(
                         requested_session_cwd: session_cwd.clone(),
                         policy_invocation:
                             bridge_core::execution_policy::ExecutionPolicyInvocationV1::default(),
-                        ledger_admission:
-                            bridge_core::execution_policy::LedgerAdmissionV1::DurablePrimaryTaskStore,
+                        ledger_admission: deps.detached.task_store.workflow_ledger_admission(),
                     })
                     .await
                 {

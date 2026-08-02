@@ -17,9 +17,10 @@ use bridge_core::ports::{
 };
 use bridge_core::SessionCwd;
 use bridge_workflow::executor::{
-    NodeTurn, WorkflowDiagnosticContext, WorkflowEvent, WorkflowExecutor, WorkflowNodeDispatcher,
-    WorkflowOutcome, WorkflowRunContext,
+    NodeTurn, PolicyTriggerBarrier, PolicyTriggerCheckpointV1, WorkflowDiagnosticContext,
+    WorkflowEvent, WorkflowExecutor, WorkflowNodeDispatcher, WorkflowOutcome, WorkflowRunContext,
 };
+use bridge_workflow::fanout::PolicyTriggerBarrierResultV1;
 use bridge_workflow::graph::{RetryPolicy, WorkflowGraph, WorkflowNode};
 use bridge_workflow::run_spec::WorkflowRunSpecV1;
 use futures::StreamExt;
@@ -364,7 +365,10 @@ fn frozen_worktree_run(entry: &AgentEntry) -> WorkflowRunSpecV1 {
     frozen_worktree_run_with_retry(entry, None)
 }
 
-fn frozen_fail_fast_run(entry: &AgentEntry) -> WorkflowRunSpecV1 {
+fn frozen_fail_fast_run_with_ledger(
+    entry: &AgentEntry,
+    ledger_admission: LedgerAdmissionV1,
+) -> WorkflowRunSpecV1 {
     let attempt_id = AttemptId::parse("attempt-33333333333333333333333333333333").unwrap();
     let source_cwd = SessionCwd::parse("/repo/source").unwrap();
     let nodes = vec![
@@ -440,11 +444,18 @@ fn frozen_fail_fast_run(entry: &AgentEntry) -> WorkflowRunSpecV1 {
         controls,
         Some(source_cwd),
         identities,
+        ledger_admission,
+    )
+    .unwrap()
+}
+
+fn frozen_fail_fast_run(entry: &AgentEntry) -> WorkflowRunSpecV1 {
+    frozen_fail_fast_run_with_ledger(
+        entry,
         LedgerAdmissionV1::HistoryLedgerUnavailable {
             reason: bridge_core::workflow_history::LedgerUnavailableReason::Open.into(),
         },
     )
-    .unwrap()
 }
 
 async fn execute_bound(
@@ -779,4 +790,122 @@ async fn v2_fail_fast_cancels_running_sibling_and_never_admits_synthesis() {
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn v2_durable_fail_fast_barrier_precedes_policy_cancel_and_publishes_exact_evidence() {
+    let entry = Arc::new(entry());
+    let run_spec = Arc::new(frozen_fail_fast_run_with_ledger(
+        &entry,
+        LedgerAdmissionV1::DurablePrimaryTaskStore,
+    ));
+    run_spec.validate().unwrap();
+    let calls = Arc::new(Calls::default());
+    let backend: Arc<dyn AgentBackend> = Arc::new(FanoutBackend {
+        calls: calls.clone(),
+    });
+    let registry = Arc::new(BoundOnlyRegistry {
+        entry,
+        backend,
+        slot: Arc::new(()),
+        calls: calls.clone(),
+        fail_preflight_ordinal: None,
+    });
+    let checkpoints = Arc::new(Mutex::new(Vec::<PolicyTriggerCheckpointV1>::new()));
+    let barrier_calls = checkpoints.clone();
+    let cancellation_order = calls.clone();
+    let barrier: PolicyTriggerBarrier = Arc::new(move |checkpoint| {
+        let barrier_calls = barrier_calls.clone();
+        let cancellation_order = cancellation_order.clone();
+        Box::pin(async move {
+            assert_eq!(
+                cancellation_order.policy_cancels.load(Ordering::SeqCst),
+                0,
+                "the durable acknowledgement must precede sibling cancellation"
+            );
+            barrier_calls.lock().unwrap().push(checkpoint);
+            PolicyTriggerBarrierResultV1::ServedPrimaryCommitted
+        })
+    });
+    let context = WorkflowDiagnosticContext::in_memory(WorkflowRunContext {
+        session_cwd: run_spec.requested_session_cwd.clone(),
+        ..WorkflowRunContext::default()
+    })
+    .with_policy_trigger_barrier(barrier)
+    .with_frozen_run_spec(run_spec.clone(), None)
+    .unwrap();
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        WorkflowExecutor::new(registry)
+            .run_with_diagnostic_context(
+                Arc::new(run_spec.graph.clone()),
+                "review this".into(),
+                "bound-durable-fail-fast-run".into(),
+                CancellationToken::new(),
+                context,
+            )
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .expect("durable fail-fast execution must drain")
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+
+    let checkpoints = checkpoints.lock().unwrap();
+    assert_eq!(
+        checkpoints.len(),
+        1,
+        "exactly one trigger reaches the barrier"
+    );
+    let checkpoint = &checkpoints[0];
+    assert_eq!(checkpoint.node.as_str(), "fail-root");
+    assert!(!checkpoint.ok);
+    let trigger = bridge_core::execution_policy::PolicyTriggerV1::decode_canonical(
+        checkpoint.policy_trigger_json.as_bytes(),
+    )
+    .unwrap();
+    let terminal = bridge_core::execution_policy::NodeTerminalV1::decode_canonical(
+        checkpoint.terminal_json.as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(terminal.policy_trigger_id.as_ref(), Some(&trigger.id));
+
+    let selected = events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::NodeFinished {
+                node,
+                terminal_json,
+                policy_trigger_json,
+                ..
+            } if node.as_str() == "fail-root" => {
+                Some((terminal_json.as_deref(), policy_trigger_json.as_deref()))
+            }
+            _ => None,
+        })
+        .expect("selected node terminal is emitted");
+    assert_eq!(selected.0, Some(checkpoint.terminal_json.as_str()));
+    assert_eq!(selected.1, Some(checkpoint.policy_trigger_json.as_str()));
+    let sibling_terminal = events
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::NodeFinished {
+                node,
+                terminal_json: Some(terminal_json),
+                ..
+            } if node.as_str() == "slow-root" => Some(
+                bridge_core::execution_policy::NodeTerminalV1::decode_canonical(
+                    terminal_json.as_bytes(),
+                )
+                .unwrap(),
+            ),
+            _ => None,
+        })
+        .expect("the canceled sibling retains a structured terminal");
+    assert_eq!(
+        sibling_terminal.primary,
+        bridge_core::execution_policy::NodePrimaryDispositionV1::CanceledPolicy
+    );
+    assert_eq!(calls.policy_cancels.load(Ordering::SeqCst), 1);
 }

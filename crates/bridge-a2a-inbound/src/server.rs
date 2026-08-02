@@ -2362,6 +2362,8 @@ fn snapshot_frames(
                     ok: *ok,
                     output: output.clone(),
                     usage: None,
+                    terminal_json: None,
+                    policy_trigger_json: None,
                 },
             });
         }
@@ -17196,6 +17198,8 @@ mod tests {
                 ok: true,
                 output: "live".to_string(),
                 usage: None,
+                terminal_json: None,
+                policy_trigger_json: None,
             },
         }
     }
