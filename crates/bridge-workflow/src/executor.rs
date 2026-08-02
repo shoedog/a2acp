@@ -4054,6 +4054,7 @@ mod tests {
                 harvest_sanitization: None,
             }],
             panel: None,
+            controls: None,
         })
     }
 
@@ -4085,6 +4086,7 @@ mod tests {
                 harvest_sanitization: None,
             }],
             panel: None,
+            controls: None,
         })
     }
 
@@ -8025,6 +8027,7 @@ mod tests {
                 },
             ],
             panel: None,
+            controls: None,
         });
         let shared = Arc::new(Shared {
             entered: AtomicUsize::new(0),
@@ -8457,6 +8460,7 @@ mod tests {
                 ),
             ],
             panel: None,
+            controls: None,
         })
     }
 
@@ -8485,6 +8489,7 @@ mod tests {
                 },
             ],
             panel: None,
+            controls: None,
         });
         let mk = |reply: &str| (reply.to_string(), Arc::new(Rec::default()));
         let reg = Arc::new(FakeRegistry {
@@ -8561,6 +8566,7 @@ mod tests {
                 harvest_sanitization: Some(HarvestSanitizationMode::AttestedPrefixV1),
             }],
             panel: None,
+            controls: None,
         });
         let ex = WorkflowExecutor::new(reg);
         let evs: Vec<_> = ex
@@ -8667,6 +8673,7 @@ mod tests {
                 },
             ],
             panel: None,
+            controls: None,
         });
         let ctx = WorkflowRunContext {
             task_id: Some(bridge_core::ids::TaskId::parse("task-harvest-fail").unwrap()),
@@ -8795,6 +8802,7 @@ mod tests {
                 },
             ],
             panel: None,
+            controls: None,
         })
     }
 
@@ -9139,6 +9147,7 @@ mod tests {
                 },
             ],
             panel: None,
+            controls: None,
         });
         let audit_store = Arc::new(bridge_core::task_store::MemoryTaskStore::with_clock(
             Arc::new(|| 100),
@@ -9307,6 +9316,7 @@ mod tests {
                 },
             ],
             panel: None,
+            controls: None,
         });
         let reg = Arc::new(BReg {
             barrier: Arc::new(Barrier::new(2)),
@@ -9368,6 +9378,7 @@ mod tests {
                 },
             ],
             panel: None,
+            controls: None,
         });
         let ex = WorkflowExecutor::new(reg);
         let _ = ex
@@ -9471,6 +9482,7 @@ mod tests {
                 },
             ],
             panel: None,
+            controls: None,
         });
         let evs: Vec<_> = WorkflowExecutor::new(reg)
             .run(g, "DIFF".into(), "r".into(), CancellationToken::new())
@@ -9663,6 +9675,7 @@ mod tests {
                 },
             ],
             panel: None,
+            controls: None,
         });
         let shared = Arc::new(Shared {
             cleanups: AtomicUsize::new(0),
@@ -9826,6 +9839,7 @@ mod tests {
                 },
             ],
             panel: None,
+            controls: None,
         });
         let reg = Arc::new(TReg {
             slow_gate: slow_gate.clone(),
@@ -10345,6 +10359,7 @@ mod tests {
                 },
             ],
             panel: None,
+            controls: None,
         });
 
         // Seed only `b` without its upstream `a` → closure violation.
@@ -10508,6 +10523,7 @@ mod observability_tests {
                 harvest_sanitization: None,
             }],
             panel: None,
+            controls: None,
         });
         let exec = WorkflowExecutor::new(Arc::new(UsageRegistry));
         let mut stream = exec.run_with_context(
@@ -10615,6 +10631,7 @@ mod observability_tests {
                 harvest_sanitization: None,
             }],
             panel: None,
+            controls: None,
         })
     }
 
@@ -10630,6 +10647,7 @@ mod observability_tests {
                 harvest_sanitization: None,
             }],
             panel: None,
+            controls: None,
         })
     }
 

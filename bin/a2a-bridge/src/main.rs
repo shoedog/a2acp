@@ -9298,6 +9298,7 @@ inputs = []
                 harvest_sanitization: None,
             }],
             panel: None,
+            controls: None,
         });
         let workflows = std::collections::HashMap::from([(workflow_id.clone(), graph)]);
         let review_cfg = Some(Ok(config::ReviewConfig {
@@ -9530,6 +9531,7 @@ inputs = []
             id: WorkflowId::parse(id).unwrap(),
             nodes,
             panel: None,
+            controls: None,
         }
     }
 

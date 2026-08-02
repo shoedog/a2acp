@@ -3351,6 +3351,7 @@ mod tests {
                 harvest_sanitization: None,
             }],
             panel: None,
+            controls: None,
         })
     }
 

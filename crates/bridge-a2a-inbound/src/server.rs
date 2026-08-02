@@ -6957,6 +6957,7 @@ mod tests {
                     },
                 ],
                 panel: None,
+                controls: None,
             };
             bridge_coordinator::detached::encode_workflow_spec(&graph)
         }
@@ -12586,6 +12587,7 @@ mod tests {
                     harvest_sanitization: None,
                 }],
                 panel: None,
+                controls: None,
             });
             let (_allow_flush, flush_gate) = oneshot::channel();
             let sink = Arc::new(BlockingFlushSink {
@@ -13029,6 +13031,7 @@ mod tests {
                 harvest_sanitization: None,
             }],
             panel: None,
+            controls: None,
         });
         let dispatcher = Arc::new(WarmWorkflowNodeDispatcher {
             sm,
@@ -16341,6 +16344,7 @@ mod tests {
                 harvest_sanitization: None,
             }],
             panel: None,
+            controls: None,
         };
         let mut record = working_record(task.as_str());
         record.workflow_spec_json =

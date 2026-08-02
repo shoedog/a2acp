@@ -364,6 +364,7 @@ fn workflow(id: &str) -> Arc<WorkflowGraph> {
             harvest_sanitization: None,
         }],
         panel: None,
+        controls: None,
     })
 }
 

@@ -11,12 +11,15 @@ pub struct PanelConfig {
     pub weights: BTreeMap<String, f64>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowGraph {
     pub id: WorkflowId,
     pub nodes: Vec<WorkflowNode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel: Option<PanelConfig>,
+    /// Additive R2f1a declared controls. True omission retains the compatibility profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controls: Option<bridge_core::execution_policy::WorkflowControlDefaultsV1>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -49,7 +52,7 @@ impl RetryPolicy {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowNode {
     pub id: NodeId,
     pub agent: AgentId,
@@ -270,6 +273,7 @@ mod tests {
                 node("synth", "claude", &["codex", "claude"]),
             ],
             panel: None,
+            controls: None,
         };
         g.validate().unwrap();
         assert_eq!(g.terminal().unwrap().id.as_str(), "synth");
@@ -280,6 +284,7 @@ mod tests {
             id: WorkflowId::parse("c").unwrap(),
             nodes: vec![node("a", "x", &["b"]), node("b", "x", &["a"])],
             panel: None,
+            controls: None,
         };
         assert!(matches!(g.validate(), Err(WorkflowError::Cyclic)));
     }
@@ -289,6 +294,7 @@ mod tests {
             id: WorkflowId::parse("c").unwrap(),
             nodes: vec![node("a", "x", &[]), node("b", "x", &[])],
             panel: None,
+            controls: None,
         };
         assert!(matches!(
             g.validate(),
@@ -301,6 +307,7 @@ mod tests {
             id: WorkflowId::parse("c").unwrap(),
             nodes: vec![node("a", "x", &["ghost"])],
             panel: None,
+            controls: None,
         };
         assert!(matches!(
             g.validate(),
@@ -313,6 +320,7 @@ mod tests {
             id: WorkflowId::parse("c").unwrap(),
             nodes: vec![node("a", "x", &[]), node("a", "x", &[])],
             panel: None,
+            controls: None,
         };
         assert!(matches!(g.validate(), Err(WorkflowError::DuplicateNode(_))));
     }
@@ -330,6 +338,7 @@ mod tests {
                 harvest_sanitization: None,
             }],
             panel: None,
+            controls: None,
         };
         let s = serde_json::to_string(&g).unwrap();
         let g2: WorkflowGraph = serde_json::from_str(&s).unwrap();
@@ -353,6 +362,7 @@ mod tests {
                 harvest_sanitization: None,
             }],
             panel: Some(PanelConfig { weights }),
+            controls: None,
         };
         let s = serde_json::to_string(&g).unwrap();
         assert!(s.contains("\"benefit\":0.4"));
@@ -445,6 +455,7 @@ mod tests {
                 node("synth", "claude", &["draft"]),
             ],
             panel: None,
+            controls: None,
         };
         let mut second = first.clone();
         second.nodes.reverse();
@@ -471,6 +482,7 @@ mod tests {
                 node("synth", "claude", &["draft"]),
             ],
             panel: None,
+            controls: None,
         };
         let baseline = workload_fingerprint_with(&base, |agent| {
             Some(configured(match agent.as_str() {

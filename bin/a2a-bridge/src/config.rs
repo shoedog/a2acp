@@ -375,9 +375,121 @@ fn canonicalize_lenient_session_cwd(path: &Path) -> Result<bridge_core::SessionC
 pub struct WorkflowToml {
     pub id: String,
     #[serde(default)]
+    pub task_class: Option<String>,
+    #[serde(default)]
+    pub liveness_profile: Option<String>,
+    #[serde(default)]
+    pub fan_out_policy: Option<String>,
+    #[serde(default)]
+    pub fixed_grace_ms: Option<u64>,
+    #[serde(default)]
+    pub synthesis_mode: Option<String>,
+    #[serde(default)]
+    pub max_work_cutoff_ms: Option<u64>,
+    #[serde(default)]
+    pub max_reason: Option<String>,
+    #[serde(default)]
     pub panel: Option<PanelTomlSection>,
     #[serde(default)]
     pub nodes: Vec<WorkflowNodeToml>,
+}
+
+impl WorkflowToml {
+    fn execution_controls(
+        &self,
+    ) -> Result<Option<bridge_core::execution_policy::WorkflowControlDefaultsV1>, ConfigError> {
+        use bridge_core::execution_policy::{
+            FanOutPolicyV1, LivenessProfileIdV1, SynthesisModeV1, TaskClassV1,
+            WorkflowControlDefaultsV1,
+        };
+
+        let omitted = self.task_class.is_none()
+            && self.liveness_profile.is_none()
+            && self.fan_out_policy.is_none()
+            && self.fixed_grace_ms.is_none()
+            && self.synthesis_mode.is_none()
+            && self.max_work_cutoff_ms.is_none()
+            && self.max_reason.is_none();
+        if omitted {
+            return Ok(None);
+        }
+
+        let invalid = |field: &str, value: &str| {
+            ConfigError::Registry(format!(
+                "workflow {} has invalid {field} value {value:?}",
+                self.id
+            ))
+        };
+        let task_class = self
+            .task_class
+            .as_deref()
+            .map(|value| match value {
+                "other" => Ok(TaskClassV1::Other),
+                "review_high_xhigh" => Ok(TaskClassV1::ReviewHighXhigh),
+                _ => Err(invalid("task_class", value)),
+            })
+            .transpose()?;
+        let liveness_profile = self
+            .liveness_profile
+            .as_deref()
+            .map(|value| match value {
+                "legacy_bounded_v1" => Ok(LivenessProfileIdV1::LegacyBoundedV1),
+                "review_high_xhigh_v1" => Ok(LivenessProfileIdV1::ReviewHighXhighV1),
+                _ => Err(invalid("liveness_profile", value)),
+            })
+            .transpose()?;
+        let fan_out = match (self.fan_out_policy.as_deref(), self.fixed_grace_ms) {
+            (None, None) => None,
+            (None, Some(_)) => {
+                return Err(ConfigError::Registry(format!(
+                    "workflow {} fixed_grace_ms requires fan_out_policy=\"fixed_grace\"",
+                    self.id
+                )))
+            }
+            (Some("bounded_independent"), None) => Some(FanOutPolicyV1::BoundedIndependent),
+            (Some("fail_fast"), None) => Some(FanOutPolicyV1::FailFast),
+            (Some("fixed_grace"), Some(grace_ms)) if grace_ms > 0 => {
+                Some(FanOutPolicyV1::FixedGrace { grace_ms })
+            }
+            (Some("fixed_grace"), _) => {
+                return Err(ConfigError::Registry(format!(
+                    "workflow {} fixed_grace requires a positive fixed_grace_ms",
+                    self.id
+                )))
+            }
+            (Some(value @ ("bounded_independent" | "fail_fast")), Some(_)) => {
+                return Err(ConfigError::Registry(format!(
+                    "workflow {} fan_out_policy={value:?} forbids fixed_grace_ms",
+                    self.id
+                )))
+            }
+            (Some(value), _) => return Err(invalid("fan_out_policy", value)),
+        };
+        let synthesis = self
+            .synthesis_mode
+            .as_deref()
+            .map(|value| match value {
+                "strict" => Ok(SynthesisModeV1::Strict),
+                "degraded" => Ok(SynthesisModeV1::Degraded),
+                _ => Err(invalid("synthesis_mode", value)),
+            })
+            .transpose()?;
+        if self.max_work_cutoff_ms.is_some() != self.max_reason.is_some() {
+            return Err(ConfigError::Registry(format!(
+                "workflow {} max_work_cutoff_ms and max_reason must be supplied together",
+                self.id
+            )));
+        }
+
+        Ok(Some(WorkflowControlDefaultsV1 {
+            task_class,
+            liveness_profile,
+            fan_out,
+            synthesis,
+            max_work_cutoff_ms: self.max_work_cutoff_ms,
+            max_reason: self.max_reason.clone(),
+        }))
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1412,6 +1524,7 @@ impl RegistryConfig {
                     .map(|p| bridge_workflow::graph::PanelConfig {
                         weights: p.weights.clone(),
                     }),
+                controls: w.execution_controls()?,
             };
             g.validate()
                 .map_err(|e| ConfigError::Registry(format!("workflow {} invalid: {e:?}", w.id)))?;
@@ -4072,6 +4185,70 @@ harvest_sanitization=\"attested_prefix_v1\"
                 backoff_ms: 250,
                 backoff_cap_ms: None,
             })
+        );
+    }
+
+    #[test]
+    fn workflow_r2f1a_controls_parse_with_true_omission_and_exact_values() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.md"), "review {{input}}").unwrap();
+        let declared = format!(
+            "{AGENTS_HEADER}\n[[workflows]]\nid = \"wf1\"\n\
+            task_class = \"review_high_xhigh\"\nliveness_profile = \"review_high_xhigh_v1\"\n\
+            fan_out_policy = \"fail_fast\"\nsynthesis_mode = \"strict\"\n\
+            [[workflows.nodes]]\nid = \"only\"\nagent = \"codex\"\nprompt_file = \"p.md\"\ninputs = []\n{SERVER_FOOTER}"
+        );
+        let graph = RegistryConfig::parse(&declared)
+            .unwrap()
+            .load_workflows(dir.path())
+            .unwrap()
+            .remove(&bridge_core::ids::WorkflowId::parse("wf1").unwrap())
+            .unwrap();
+        let controls = graph.controls.as_ref().unwrap();
+        assert_eq!(
+            controls.task_class,
+            Some(bridge_core::execution_policy::TaskClassV1::ReviewHighXhigh)
+        );
+        assert_eq!(
+            controls.liveness_profile,
+            Some(bridge_core::execution_policy::LivenessProfileIdV1::ReviewHighXhighV1)
+        );
+        assert_eq!(
+            controls.fan_out,
+            Some(bridge_core::execution_policy::FanOutPolicyV1::FailFast)
+        );
+        assert_eq!(
+            controls.synthesis,
+            Some(bridge_core::execution_policy::SynthesisModeV1::Strict)
+        );
+
+        let omitted = format!(
+            "{AGENTS_HEADER}\n[[workflows]]\nid = \"wf2\"\n\
+            [[workflows.nodes]]\nid = \"only\"\nagent = \"codex\"\nprompt_file = \"p.md\"\ninputs = []\n{SERVER_FOOTER}"
+        );
+        let graph = RegistryConfig::parse(&omitted)
+            .unwrap()
+            .load_workflows(dir.path())
+            .unwrap()
+            .remove(&bridge_core::ids::WorkflowId::parse("wf2").unwrap())
+            .unwrap();
+        assert!(graph.controls.is_none());
+    }
+
+    #[test]
+    fn workflow_fixed_grace_requires_exactly_one_positive_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.md"), "review {{input}}").unwrap();
+        let missing = format!(
+            "{AGENTS_HEADER}\n[[workflows]]\nid = \"wf1\"\nfan_out_policy = \"fixed_grace\"\n\
+            [[workflows.nodes]]\nid = \"only\"\nagent = \"codex\"\nprompt_file = \"p.md\"\ninputs = []\n{SERVER_FOOTER}"
+        );
+        assert!(
+            RegistryConfig::parse(&missing).is_err()
+                || RegistryConfig::parse(&missing)
+                    .unwrap()
+                    .load_workflows(dir.path())
+                    .is_err()
         );
     }
 

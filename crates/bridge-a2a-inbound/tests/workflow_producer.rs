@@ -244,6 +244,7 @@ fn review_graph() -> Arc<WorkflowGraph> {
             ),
         ],
         panel: None,
+        controls: None,
     })
 }
 
@@ -615,6 +616,7 @@ async fn write_ahead_barrier() {
             },
         ],
         panel: None,
+        controls: None,
     });
 
     let mut stream = executor.run(graph, "DIFF".into(), "r".into(), CancellationToken::new());

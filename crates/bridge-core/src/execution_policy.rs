@@ -269,6 +269,8 @@ pub enum ExecutionPolicyError {
     MissingProviderEffectKey,
     #[error("provider candidate is outside the frozen ordered set")]
     ProviderSelectionOutOfSet,
+    #[error("provider-attempt identity matrix is incomplete or non-canonical")]
+    ProviderAttemptMatrixInvalid,
 }
 
 fn max_qualification(
@@ -703,6 +705,72 @@ pub struct FrozenProviderAttemptIdentityV1 {
     pub checkout: FrozenCheckoutEffectV1,
     pub effect: FrozenProviderEffectV1,
     pub attempt_fingerprint: Sha256HexV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenNodeExecutionIdentityV1 {
+    pub node: PolicyNodeRefV1,
+    pub selection: FrozenProviderSelectionV1,
+    /// Canonically ordered by candidate ordinal, with `Preflight` before `Execute`.
+    /// Current retries reuse the one `Execute` row for their selected candidate.
+    pub provider_attempts: Vec<FrozenProviderAttemptIdentityV1>,
+    pub identity_fingerprint: Sha256HexV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryAllocationKindV1 {
+    Configured,
+    Platform,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundedLedgerReasonV1 {
+    Open,
+    Permission,
+    ReadOnlyDatabase,
+    ReadOnlyLock,
+    ReadOnlyParent,
+    AdvisoryLockUnsupported,
+    AdvisoryLockIo,
+    Locked,
+    Migration,
+    Schema,
+    Corruption,
+    Io,
+    CapacityProtected,
+    Collision,
+}
+
+impl From<crate::workflow_history::LedgerUnavailableReason> for BoundedLedgerReasonV1 {
+    fn from(value: crate::workflow_history::LedgerUnavailableReason) -> Self {
+        use crate::workflow_history::LedgerUnavailableReason as Source;
+        match value {
+            Source::Open => Self::Open,
+            Source::Permission => Self::Permission,
+            Source::ReadOnlyDatabase => Self::ReadOnlyDatabase,
+            Source::ReadOnlyLock => Self::ReadOnlyLock,
+            Source::ReadOnlyParent => Self::ReadOnlyParent,
+            Source::AdvisoryLockUnsupported => Self::AdvisoryLockUnsupported,
+            Source::AdvisoryLockIo => Self::AdvisoryLockIo,
+            Source::Locked => Self::Locked,
+            Source::Migration => Self::Migration,
+            Source::Schema => Self::Schema,
+            Source::Corruption => Self::Corruption,
+            Source::Io => Self::Io,
+            Source::CapacityProtected => Self::CapacityProtected,
+            Source::Collision => Self::Collision,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "admission", rename_all = "snake_case")]
+pub enum LedgerAdmissionV1 {
+    DurablePrimaryTaskStore,
+    HistoryLedgerAdmitted { kind: HistoryAllocationKindV1 },
+    HistoryLedgerUnavailable { reason: BoundedLedgerReasonV1 },
 }
 
 #[derive(Clone)]
@@ -1192,4 +1260,112 @@ pub fn freeze_provider_attempt_v1(
         frozen,
         bound,
     })
+}
+
+fn expected_logical_sessions(
+    selection: &FrozenProviderSelectionV1,
+) -> Result<Vec<FrozenProviderLogicalSessionV1>, ExecutionPolicyError> {
+    if !selection.preflight {
+        return Ok(vec![FrozenProviderLogicalSessionV1::Execute {
+            candidate_ordinal: 0,
+        }]);
+    }
+    let candidates = selection.candidates();
+    let mut sessions = Vec::with_capacity(
+        candidates
+            .len()
+            .checked_mul(2)
+            .ok_or(ExecutionPolicyError::ArithmeticOverflow)?,
+    );
+    for ordinal in 0..candidates.len() {
+        let candidate_ordinal = u16::try_from(ordinal)
+            .map_err(|_| ExecutionPolicyError::ProviderAttemptMatrixInvalid)?;
+        sessions.push(FrozenProviderLogicalSessionV1::Preflight { candidate_ordinal });
+        sessions.push(FrozenProviderLogicalSessionV1::Execute { candidate_ordinal });
+    }
+    Ok(sessions)
+}
+
+fn node_identity_fingerprint(
+    node: &PolicyNodeRefV1,
+    selection: &FrozenProviderSelectionV1,
+    attempts: &[FrozenProviderAttemptIdentityV1],
+) -> Sha256HexV1 {
+    let mut canonical = Vec::new();
+    push_bytes(&mut canonical, b"a2a-bridge/node-execution-identity/v1");
+    canonical.extend_from_slice(&node.sorted_ordinal.to_be_bytes());
+    push_bytes(&mut canonical, node.id_sha256.as_str().as_bytes());
+    push_bytes(
+        &mut canonical,
+        selection.selection_digest.as_str().as_bytes(),
+    );
+    canonical.extend_from_slice(&(attempts.len() as u64).to_be_bytes());
+    for attempt in attempts {
+        push_bytes(
+            &mut canonical,
+            attempt.attempt_fingerprint.as_str().as_bytes(),
+        );
+    }
+    Sha256HexV1::digest(&canonical)
+}
+
+fn validate_provider_attempt_matrix(
+    selection: &FrozenProviderSelectionV1,
+    attempts: &[FrozenProviderAttemptIdentityV1],
+) -> Result<(), ExecutionPolicyError> {
+    let expected = expected_logical_sessions(selection)?;
+    if attempts.len() != expected.len() {
+        return Err(ExecutionPolicyError::ProviderAttemptMatrixInvalid);
+    }
+    for (attempt, logical_session) in attempts.iter().zip(expected) {
+        if attempt.logical_session != logical_session
+            || attempt.effect.agent != selection.agent
+            || attempt.effect.effective_session_cwd != *attempt.checkout.effective_cwd()
+        {
+            return Err(ExecutionPolicyError::ProviderAttemptMatrixInvalid);
+        }
+    }
+    Ok(())
+}
+
+pub fn freeze_node_execution_identity_v1(
+    node: PolicyNodeRefV1,
+    bundles: Vec<FrozenProviderAttemptBundleV1>,
+) -> Result<FrozenNodeExecutionIdentityV1, ExecutionPolicyError> {
+    let selection = bundles
+        .first()
+        .map(|bundle| bundle.selection.clone())
+        .ok_or(ExecutionPolicyError::ProviderAttemptMatrixInvalid)?;
+    if bundles.iter().any(|bundle| {
+        bundle.selection != selection
+            || bundle.frozen != *bundle.bound.frozen()
+            || bundle.frozen.effect.mcp_delivery_digest != *bundle.bound.delivery().digest()
+    }) {
+        return Err(ExecutionPolicyError::ProviderAttemptMatrixInvalid);
+    }
+    let attempts: Vec<_> = bundles.into_iter().map(|bundle| bundle.frozen).collect();
+    validate_provider_attempt_matrix(&selection, &attempts)?;
+    let identity_fingerprint = node_identity_fingerprint(&node, &selection, &attempts);
+    Ok(FrozenNodeExecutionIdentityV1 {
+        node,
+        selection,
+        provider_attempts: attempts,
+        identity_fingerprint,
+    })
+}
+
+pub fn validate_node_execution_identity_v1(
+    identity: &FrozenNodeExecutionIdentityV1,
+) -> Result<(), ExecutionPolicyError> {
+    validate_provider_attempt_matrix(&identity.selection, &identity.provider_attempts)?;
+    if identity.identity_fingerprint
+        != node_identity_fingerprint(
+            &identity.node,
+            &identity.selection,
+            &identity.provider_attempts,
+        )
+    {
+        return Err(ExecutionPolicyError::ProviderAttemptMatrixInvalid);
+    }
+    Ok(())
 }

@@ -2437,6 +2437,7 @@ mod sink_tests {
                 harvest_sanitization: None,
             }],
             panel: None,
+            controls: None,
         });
         let executor = WorkflowExecutor::new(Arc::new(RichRegistry));
         let ctx = WorkflowRunContext {
@@ -4945,6 +4946,7 @@ mod resume_tests {
             panel: Some(PanelConfig {
                 weights: BTreeMap::from([("usage".into(), 0.2), ("benefit".into(), 0.8)]),
             }),
+            controls: None,
         })
     }
 
@@ -4964,6 +4966,7 @@ mod resume_tests {
                 harvest_sanitization: None,
             }],
             panel: None,
+            controls: None,
         })
     }
 
@@ -4989,6 +4992,7 @@ mod resume_tests {
                 },
             ],
             panel: None,
+            controls: None,
         })
     }
     fn detached_deps_with_observer(
@@ -5198,6 +5202,7 @@ mod resume_tests {
                 node("synth", "synth", &["checkpoint", "pending"]),
             ],
             panel: None,
+            controls: None,
         })
     }
 
@@ -5887,6 +5892,7 @@ mod frame_tests {
                 harvest_sanitization: None,
             }],
             panel: None,
+            controls: None,
         };
         let json = encode_workflow_spec(&graph);
         let env: WorkflowSpecEnvelope = serde_json::from_str(&json).unwrap();
@@ -5919,6 +5925,7 @@ mod frame_tests {
                 },
             ],
             panel: None,
+            controls: None,
         };
         let json = encode_workflow_spec(&graph);
 

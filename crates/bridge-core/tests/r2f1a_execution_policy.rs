@@ -1,13 +1,13 @@
 use bridge_core::domain::{AgentEntry, AgentKind, EffectiveConfig, Effort, Part};
 use bridge_core::error::BridgeError;
 use bridge_core::execution_policy::{
-    freeze_provider_attempt_v1, freeze_worktree_checkout_v1, resolve_execution_policy_v1,
-    BoundMcpDeliveryPayloadV1, BoundSessionSpecV1, ExecutionPolicyError,
-    ExecutionPolicyInvocationV1, FanOutPolicyV1, FrozenCheckoutEffectV1,
-    FrozenProviderLogicalSessionV1, LivenessProfileIdV1, PolicyActivationV1, PolicyNodeRefV1,
-    ProfileSelectionSourceV1, ProviderEffectKeyV1, ProviderFreezeInputV1, SynthesisModeV1,
-    TaskClassV1, WorkflowControlDefaultsV1, WorktreeCheckoutInputV1, PROFILE_LEGACY_BOUNDED_V1,
-    PROFILE_REVIEW_HIGH_XHIGH_V1,
+    freeze_direct_checkout_v1, freeze_node_execution_identity_v1, freeze_provider_attempt_v1,
+    freeze_worktree_checkout_v1, resolve_execution_policy_v1, BoundMcpDeliveryPayloadV1,
+    BoundSessionSpecV1, ExecutionPolicyError, ExecutionPolicyInvocationV1, FanOutPolicyV1,
+    FrozenCheckoutEffectV1, FrozenProviderLogicalSessionV1, LivenessProfileIdV1,
+    PolicyActivationV1, PolicyNodeRefV1, ProfileSelectionSourceV1, ProviderEffectKeyV1,
+    ProviderFreezeInputV1, SynthesisModeV1, TaskClassV1, WorkflowControlDefaultsV1,
+    WorktreeCheckoutInputV1, PROFILE_LEGACY_BOUNDED_V1, PROFILE_REVIEW_HIGH_XHIGH_V1,
 };
 use bridge_core::ids::{AgentId, AttemptId, SessionId};
 use bridge_core::mcp::{McpDelivery, McpServerSpec};
@@ -260,6 +260,75 @@ fn provider_entry() -> AgentEntry {
         version: None,
         extensions: BTreeMap::new(),
     }
+}
+
+#[test]
+fn node_identity_requires_the_complete_canonical_logical_session_matrix() {
+    let mut entry = provider_entry();
+    entry.fallback_models = vec!["fallback-a".into()];
+    let node = PolicyNodeRefV1::from_node_id(0, "review-node");
+    let checkout = freeze_direct_checkout_v1(SessionCwd::parse("/repo").unwrap());
+    let key = ProviderEffectKeyV1::from_bytes([17; 32]);
+    let mut attempts = Vec::new();
+    for ordinal in 0..=1 {
+        for logical_session in [
+            FrozenProviderLogicalSessionV1::Preflight {
+                candidate_ordinal: ordinal,
+            },
+            FrozenProviderLogicalSessionV1::Execute {
+                candidate_ordinal: ordinal,
+            },
+        ] {
+            attempts.push(
+                freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+                    entry: &entry,
+                    overrides: None,
+                    node: node.clone(),
+                    logical_session,
+                    checkout: checkout.clone(),
+                    provider_effect_key: Some(&key),
+                })
+                .unwrap(),
+            );
+        }
+    }
+
+    let identity = freeze_node_execution_identity_v1(node.clone(), attempts.clone()).unwrap();
+    assert_eq!(identity.provider_attempts.len(), 4);
+    assert_eq!(identity.node, node);
+
+    attempts.remove(2);
+    assert_eq!(
+        freeze_node_execution_identity_v1(identity.node.clone(), attempts),
+        Err(ExecutionPolicyError::ProviderAttemptMatrixInvalid)
+    );
+}
+
+#[test]
+fn preflight_disabled_identity_has_one_execute_row_and_no_retry_rows() {
+    let mut entry = provider_entry();
+    entry.preflight = false;
+    entry.fallback_models.clear();
+    let node = PolicyNodeRefV1::from_node_id(0, "review-node");
+    let bundle = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+        entry: &entry,
+        overrides: None,
+        node: node.clone(),
+        logical_session: FrozenProviderLogicalSessionV1::Execute {
+            candidate_ordinal: 0,
+        },
+        checkout: freeze_direct_checkout_v1(SessionCwd::parse("/repo").unwrap()),
+        provider_effect_key: Some(&ProviderEffectKeyV1::from_bytes([18; 32])),
+    })
+    .unwrap();
+    let identity = freeze_node_execution_identity_v1(node, vec![bundle]).unwrap();
+    assert_eq!(identity.provider_attempts.len(), 1);
+    assert!(matches!(
+        identity.provider_attempts[0].logical_session,
+        FrozenProviderLogicalSessionV1::Execute {
+            candidate_ordinal: 0
+        }
+    ));
 }
 
 fn provider_freeze_input<'a>(
