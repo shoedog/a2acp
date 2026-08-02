@@ -5,8 +5,19 @@ use std::path::{Component, Path, PathBuf};
 
 /// A validated absolute, lexically-normalized session working directory (ACP §11A).
 /// Construct ONLY via [`SessionCwd::parse`]; holding one guarantees validity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[serde(transparent)]
 pub struct SessionCwd(String);
+
+impl<'de> serde::Deserialize<'de> for SessionCwd {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl SessionCwd {
     pub fn parse(s: &str) -> Result<SessionCwd, BridgeError> {
