@@ -1,4 +1,5 @@
 use bridge_core::error::BridgeError;
+use bridge_core::execution_policy::FrozenCheckoutEffectV1;
 use bridge_core::SessionCwd;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -57,6 +58,67 @@ pub fn resolve_worktree(
     Ok(ResolvedWorktree {
         canonical_source: canonical_source.as_str().to_string(),
         worktree_path: canonical_worktree.as_str().to_string(),
+    })
+}
+
+/// Validate a V2 checkout that was fully derived and persisted before provider effects.
+/// This function never derives a destination and deliberately ignores `cfg.run`: runtime
+/// liveness identity is sidecar custody, not durable checkout identity.
+pub fn validate_bound_worktree(
+    cfg: &WorktreeConfig,
+    allowed_root: &Option<SessionCwd>,
+    checkout: &FrozenCheckoutEffectV1,
+) -> Result<ResolvedWorktree, BridgeError> {
+    let FrozenCheckoutEffectV1::Worktree {
+        source_cwd,
+        canonical_source_cwd,
+        canonical_worktree_root,
+        worktree_owner,
+        target_cwd,
+        ..
+    } = checkout
+    else {
+        return Err(BridgeError::ConfigMismatch {
+            field: "bound checkout kind",
+        });
+    };
+
+    let actual_source = canonicalize_existing(source_cwd.as_str())?;
+    if actual_source != *canonical_source_cwd {
+        return Err(BridgeError::ConfigMismatch {
+            field: "bound worktree source",
+        });
+    }
+    let allowed_root = allowed_root.as_ref().ok_or(BridgeError::InvalidRequest {
+        field: "worktrees requires allowed_cwd_root",
+    })?;
+    let canonical_allowed_root = canonicalize_lenient(allowed_root.as_str())?;
+    if !actual_source.is_under(&canonical_allowed_root) {
+        return Err(BridgeError::InvalidRequest {
+            field: "worktree source outside allowed_cwd_root",
+        });
+    }
+
+    let actual_root = canonicalize_lenient(&cfg.root)?;
+    if actual_root != *canonical_worktree_root || cfg.owner != *worktree_owner {
+        return Err(BridgeError::ConfigMismatch {
+            field: "bound worktree configuration",
+        });
+    }
+    let actual_target = canonicalize_lenient(target_cwd.as_str())?;
+    if actual_target != *target_cwd
+        || !target_cwd.is_under(canonical_worktree_root)
+        || Path::new(target_cwd.as_str()).parent()
+            != Some(Path::new(canonical_worktree_root.as_str()))
+    {
+        return Err(BridgeError::ConfigMismatch {
+            field: "bound worktree target",
+        });
+    }
+
+    Ok(ResolvedWorktree {
+        canonical_source: canonical_source_cwd.as_str().to_owned(),
+        worktree_path: target_cwd.as_str().to_owned(),
     })
 }
 

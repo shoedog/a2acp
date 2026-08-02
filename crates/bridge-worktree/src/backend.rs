@@ -1,9 +1,11 @@
 use crate::provider::WorktreeProvider;
 use crate::provider_path::{
-    resolve_worktree, sidecar_path, write_sidecar, WorktreeConfig, WorktreeSidecar,
+    resolve_worktree, sidecar_path, validate_bound_worktree, write_sidecar, ResolvedWorktree,
+    WorktreeConfig, WorktreeSidecar,
 };
 use bridge_core::domain::{Part, SessionSpec};
 use bridge_core::error::BridgeError;
+use bridge_core::execution_policy::{BoundSessionSpecV1, FrozenCheckoutEffectV1};
 use bridge_core::ids::SessionId;
 use bridge_core::orch::{AgentSessionCaps, ReconcileOutcome};
 use bridge_core::permission::TurnMeta;
@@ -922,6 +924,186 @@ impl WorktreeBackend {
     }
 }
 
+impl WorktreeBackend {
+    async fn configure_bound_inner_at(
+        &self,
+        session: &SessionId,
+        spec: &BoundSessionSpecV1,
+        worktree_path: &str,
+    ) -> Result<(), BridgeError> {
+        if spec.session.cwd.as_ref().map(SessionCwd::as_str) != Some(worktree_path) {
+            return Err(BridgeError::ConfigMismatch {
+                field: "bound session cwd",
+            });
+        }
+        self.inner.configure_bound_session(session, spec).await
+    }
+
+    async fn configure_bound_resolved_with_admission(
+        &self,
+        session: &SessionId,
+        spec: &BoundSessionSpecV1,
+        resolved: ResolvedWorktree,
+        mut admission: ConfigureAdmission<'_>,
+    ) -> Result<(), BridgeError> {
+        let key = session.as_str().to_string();
+        let reservation_entry = WtEntry {
+            canonical_source: resolved.canonical_source.clone(),
+            worktree_path: resolved.worktree_path.clone(),
+        };
+        let admission_cell = admission.cell.clone();
+        let claim;
+
+        loop {
+            let map_changed = self.notify.notified();
+            let configure_changed = admission_cell.configure_settled.notified();
+            let mut map = self.map.lock().await;
+            match map.get(session.as_str()) {
+                Some(WtState::Ready(entry)) => {
+                    if entry.canonical_source != resolved.canonical_source
+                        || entry.worktree_path != resolved.worktree_path
+                    {
+                        return Err(BridgeError::ConfigMismatch {
+                            field: "bound worktree identity",
+                        });
+                    }
+                    let worktree_path = entry.worktree_path.clone();
+                    drop(map);
+                    let result = self
+                        .configure_bound_inner_at(session, spec, &worktree_path)
+                        .await;
+                    if result.is_ok() {
+                        admission.retain_for_session();
+                    }
+                    return result;
+                }
+                Some(WtState::Reserving { configure, .. }) => {
+                    let owner_active = admission_cell
+                        .lifecycle
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .active_configures
+                        .contains(configure);
+                    drop(map);
+                    if !owner_active {
+                        admission.retain_failed_configure_cleanup();
+                        drop(admission);
+                        self.cleanup_session_with_sealed_admission(
+                            session,
+                            CleanupStrength::Release,
+                            true,
+                        )
+                        .await?;
+                        return Err(BridgeError::SessionExpired);
+                    }
+                    tokio::select! {
+                        _ = map_changed => {}
+                        _ = configure_changed => {}
+                    }
+                }
+                None => {
+                    if self.sealed.load(Ordering::SeqCst) {
+                        return Err(BridgeError::SessionExpired);
+                    }
+                    admission.arm_cleanup_on_drop();
+                    claim = self.next_claim.fetch_add(1, Ordering::Relaxed);
+                    map.insert(
+                        key.clone(),
+                        WtState::Reserving {
+                            claim,
+                            configure: admission.id(),
+                            entry: reservation_entry.clone(),
+                        },
+                    );
+                    break;
+                }
+            }
+        }
+
+        let common_dir = match self
+            .provider
+            .add(&resolved.canonical_source, &resolved.worktree_path)
+            .await
+        {
+            Ok(common_dir) => common_dir,
+            Err(error) => {
+                admission.retain_failed_configure_cleanup();
+                drop(admission);
+                let _ = self
+                    .cleanup_session_with_sealed_admission(session, CleanupStrength::Release, true)
+                    .await;
+                return Err(error);
+            }
+        };
+
+        let sidecar = WorktreeSidecar {
+            canonical_source: resolved.canonical_source.clone(),
+            common_dir,
+            worktree_path: resolved.worktree_path.clone(),
+            owner: self.cfg.owner.clone(),
+            run_id: self.identity.run_id.clone(),
+            host: self.identity.host.clone(),
+            lease: self.identity.lease.clone(),
+        };
+        if let Err(error) = write_sidecar(&sidecar) {
+            admission.retain_failed_configure_cleanup();
+            drop(admission);
+            let _ = self
+                .cleanup_session_with_sealed_admission(session, CleanupStrength::Release, true)
+                .await;
+            return Err(error);
+        }
+
+        if let Err(error) = self
+            .configure_bound_inner_at(session, spec, &resolved.worktree_path)
+            .await
+        {
+            admission.retain_failed_configure_cleanup();
+            drop(admission);
+            let _ = self
+                .cleanup_session_with_sealed_admission(session, CleanupStrength::Release, true)
+                .await;
+            return Err(error);
+        }
+
+        let mut map = self.map.lock().await;
+        let owns_claim = matches!(
+            map.get(session.as_str()),
+            Some(WtState::Reserving { claim: current, .. }) if *current == claim
+        );
+        if owns_claim {
+            let sealed = self.sealed.load(Ordering::SeqCst);
+            map.insert(
+                key,
+                WtState::Ready(WtEntry {
+                    canonical_source: resolved.canonical_source,
+                    worktree_path: resolved.worktree_path,
+                }),
+            );
+            self.notify.notify_waiters();
+            drop(map);
+            if sealed {
+                admission.retain_failed_configure_cleanup();
+                drop(admission);
+                let _ = self
+                    .cleanup_session_with_sealed_admission(session, CleanupStrength::Release, true)
+                    .await;
+                return Err(BridgeError::SessionExpired);
+            }
+            admission.retain_for_session();
+            return Ok(());
+        }
+        drop(map);
+        admission.retain_failed_configure_cleanup();
+        drop(admission);
+        let _ = self
+            .cleanup_session_with_sealed_admission(session, CleanupStrength::Release, true)
+            .await;
+        self.notify.notify_waiters();
+        Err(BridgeError::SessionExpired)
+    }
+}
+
 async fn wait_for_cleanup_report(mut report: CleanupReportReceiver) -> Result<(), BridgeError> {
     loop {
         if let Some(result) = report.borrow().clone() {
@@ -1010,6 +1192,46 @@ impl AgentBackend for WorktreeBackend {
 
     async fn configure_turn(&self, session: &SessionId, meta: TurnMeta) {
         self.inner.configure_turn(session, meta).await;
+    }
+
+    async fn configure_bound_session(
+        &self,
+        session: &SessionId,
+        spec: &BoundSessionSpecV1,
+    ) -> Result<(), BridgeError> {
+        let admission = self.admit_configure(session)?;
+        let frozen = spec.provider_effect.frozen();
+        let session_cwd = spec
+            .session
+            .cwd
+            .as_ref()
+            .ok_or(BridgeError::ConfigMismatch {
+                field: "bound session cwd",
+            })?;
+        if session_cwd != &frozen.effect.effective_session_cwd
+            || session_cwd != frozen.checkout.effective_cwd()
+        {
+            return Err(BridgeError::ConfigMismatch {
+                field: "bound session cwd",
+            });
+        }
+
+        match &frozen.checkout {
+            FrozenCheckoutEffectV1::Direct { .. } => {
+                let mut admission = admission;
+                let result = self.inner.configure_bound_session(session, spec).await;
+                if result.is_ok() {
+                    admission.retain_for_session();
+                }
+                result
+            }
+            FrozenCheckoutEffectV1::Worktree { .. } => {
+                let resolved =
+                    validate_bound_worktree(&self.cfg, &self.allowed_root, &frozen.checkout)?;
+                self.configure_bound_resolved_with_admission(session, spec, resolved, admission)
+                    .await
+            }
+        }
     }
 
     async fn configure_session(
@@ -1369,14 +1591,21 @@ impl AgentBackend for WorktreeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bridge_core::domain::{EffectiveConfig, Part, SessionSpec};
+    use bridge_core::domain::{AgentEntry, AgentKind, EffectiveConfig, Part, SessionSpec};
     use bridge_core::error::BridgeError;
-    use bridge_core::ids::SessionId;
+    use bridge_core::execution_policy::{
+        freeze_direct_checkout_v1, freeze_provider_attempt_v1, freeze_worktree_checkout_v1,
+        BoundSessionSpecV1, FrozenProviderLogicalSessionV1, PolicyNodeRefV1, ProviderFreezeInputV1,
+        WorktreeCheckoutInputV1,
+    };
+    use bridge_core::ids::{AgentId, AttemptId, SessionId};
+    use bridge_core::mcp::{McpDelivery, McpServerSpec};
     use bridge_core::ports::{
         AgentBackend, BackendStream, DiagnosticObserver, RichEventSink, Update,
     };
     use bridge_core::SessionCwd;
-    use std::path::PathBuf;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1386,6 +1615,8 @@ mod tests {
     #[derive(Default)]
     struct Rec {
         configured_cwd: Mutex<Vec<Option<String>>>,
+        bound_configure_count: AtomicUsize,
+        added_worktrees: Mutex<Vec<(String, String)>>,
         order: Mutex<Vec<String>>,
         configure_count: AtomicUsize,
         fail_configure: AtomicBool,
@@ -1539,6 +1770,22 @@ mod tests {
             }
         }
 
+        async fn configure_bound_session(
+            &self,
+            _session: &SessionId,
+            spec: &BoundSessionSpecV1,
+        ) -> Result<(), BridgeError> {
+            self.rec
+                .bound_configure_count
+                .fetch_add(1, Ordering::SeqCst);
+            self.rec
+                .configured_cwd
+                .lock()
+                .unwrap()
+                .push(spec.session.cwd.as_ref().map(|c| c.as_str().to_string()));
+            Ok(())
+        }
+
         async fn forget_session(&self, _session: &SessionId) {
             self.rec.order.lock().unwrap().push("inner_forget".into());
         }
@@ -1587,8 +1834,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::provider::WorktreeProvider for FakeProv {
-        async fn add(&self, _repo: &str, _worktree_path: &str) -> Result<String, BridgeError> {
+        async fn add(&self, repo: &str, worktree_path: &str) -> Result<String, BridgeError> {
             self.rec.add_count.fetch_add(1, Ordering::SeqCst);
+            self.rec
+                .added_worktrees
+                .lock()
+                .unwrap()
+                .push((repo.to_owned(), worktree_path.to_owned()));
             tokio::task::yield_now().await;
             Ok(String::new())
         }
@@ -1698,6 +1950,78 @@ mod tests {
         }
     }
 
+    fn bound_spec_from_checkout(
+        logical_session: FrozenProviderLogicalSessionV1,
+        checkout: bridge_core::execution_policy::FrozenCheckoutEffectV1,
+    ) -> BoundSessionSpecV1 {
+        let entry = AgentEntry {
+            id: AgentId::parse("bound-worktree").unwrap(),
+            cmd: Some("fake-cmd".into()),
+            base_url: None,
+            api_key_env: None,
+            args: vec![],
+            kind: AgentKind::Acp,
+            model_provider: None,
+            model: None,
+            effort: None,
+            mode: None,
+            preflight: false,
+            fallback_models: vec![],
+            cwd: None,
+            session_cwd: None,
+            sandbox: None,
+            watchdog: None,
+            mcp: vec![McpServerSpec {
+                name: "repo".into(),
+                command: "/bin/repo".into(),
+                args: vec!["--root".into(), "{cwd}".into()],
+                env: vec![],
+            }],
+            mcp_delivery: McpDelivery::Acp,
+            auth_method: None,
+            pre_authenticated: true,
+            host_fallback_eligible: false,
+            name: None,
+            description: None,
+            tags: vec![],
+            version: None,
+            extensions: BTreeMap::new(),
+        };
+        let bundle = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+            entry: &entry,
+            overrides: None,
+            node: PolicyNodeRefV1::from_node_id(0, "node"),
+            logical_session,
+            checkout,
+            provider_effect_key: None,
+        })
+        .unwrap();
+        BoundSessionSpecV1::new(EffectiveConfig::default(), Arc::new(bundle.bound))
+    }
+
+    fn bound_spec(
+        source: &Path,
+        cfg: &crate::provider_path::WorktreeConfig,
+    ) -> (BoundSessionSpecV1, String) {
+        let source = std::fs::canonicalize(source).unwrap();
+        let source_cwd = SessionCwd::parse(&source.to_string_lossy()).unwrap();
+        let logical_session = FrozenProviderLogicalSessionV1::Execute {
+            candidate_ordinal: 0,
+        };
+        let checkout = freeze_worktree_checkout_v1(&WorktreeCheckoutInputV1 {
+            attempt_id: AttemptId::parse("attempt-22222222222222222222222222222222").unwrap(),
+            node: PolicyNodeRefV1::from_node_id(0, "node"),
+            logical_session,
+            source_cwd: source_cwd.clone(),
+            canonical_source_cwd: source_cwd,
+            canonical_worktree_root: SessionCwd::parse(&cfg.root).unwrap(),
+            worktree_owner: cfg.owner.clone(),
+        })
+        .unwrap();
+        let target = checkout.effective_cwd().as_str().to_owned();
+        (bound_spec_from_checkout(logical_session, checkout), target)
+    }
+
     fn backend_fixture(
         name: &str,
     ) -> (
@@ -1730,6 +2054,120 @@ mod tests {
             identity(),
         ));
         (be, rec, tmp, source, cfg)
+    }
+
+    #[tokio::test]
+    async fn bound_worktree_configure_consumes_frozen_target_without_legacy_derivation() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("bound-frozen-target");
+        let (bound, target) = bound_spec(&source, &cfg);
+        let session = SessionId::parse("v2-bound-worktree").unwrap();
+
+        be.configure_bound_session(&session, &bound).await.unwrap();
+
+        assert_eq!(rec.configure_count.load(Ordering::SeqCst), 0);
+        assert_eq!(rec.bound_configure_count.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 1);
+        let added = rec.added_worktrees.lock().unwrap().clone();
+        assert_eq!(added.len(), 1);
+        assert_eq!(
+            added[0].0,
+            std::fs::canonicalize(&source).unwrap().to_string_lossy()
+        );
+        assert_eq!(added[0].1, target);
+        assert_eq!(
+            rec.configured_cwd.lock().unwrap().as_slice(),
+            [Some(target.clone())]
+        );
+        assert!(!target.contains(&cfg.run));
+
+        be.forget_session_checked(&session).await.unwrap();
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_direct_checkout_bypasses_worktree_provider_and_uses_bound_inner_path() {
+        let (be, rec, tmp, source, _cfg) = backend_fixture("bound-direct");
+        let source = std::fs::canonicalize(source).unwrap();
+        let source_cwd = SessionCwd::parse(&source.to_string_lossy()).unwrap();
+        let logical_session = FrozenProviderLogicalSessionV1::Execute {
+            candidate_ordinal: 0,
+        };
+        let bound = bound_spec_from_checkout(
+            logical_session,
+            freeze_direct_checkout_v1(source_cwd.clone()),
+        );
+        let session = SessionId::parse("v2-bound-direct").unwrap();
+
+        be.configure_bound_session(&session, &bound).await.unwrap();
+
+        assert_eq!(rec.configure_count.load(Ordering::SeqCst), 0);
+        assert_eq!(rec.bound_configure_count.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            rec.configured_cwd.lock().unwrap().as_slice(),
+            [Some(source_cwd.as_str().to_owned())]
+        );
+        be.forget_session_checked(&session).await.unwrap();
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_worktree_configuration_drift_refuses_before_checkout_or_inner_configure() {
+        let (be, rec, tmp, source, cfg) = backend_fixture("bound-config-drift");
+        let mut drifted_cfg = cfg;
+        drifted_cfg.owner = "other-owner".into();
+        let (bound, _target) = bound_spec(&source, &drifted_cfg);
+        let session = SessionId::parse("v2-bound-config-drift").unwrap();
+
+        assert_eq!(
+            be.configure_bound_session(&session, &bound).await,
+            Err(BridgeError::ConfigMismatch {
+                field: "bound worktree configuration"
+            })
+        );
+        assert_eq!(rec.add_count.load(Ordering::SeqCst), 0);
+        assert_eq!(rec.configure_count.load(Ordering::SeqCst), 0);
+        assert_eq!(rec.bound_configure_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_worktree_restart_changes_runtime_custody_but_reuses_persisted_target() {
+        let (first, rec, tmp, source, cfg) = backend_fixture("bound-restart");
+        let (bound, target) = bound_spec(&source, &cfg);
+        let session = SessionId::parse("v2-bound-restart").unwrap();
+        first
+            .configure_bound_session(&session, &bound)
+            .await
+            .unwrap();
+        first.forget_session_checked(&session).await.unwrap();
+
+        let allowed_root = std::fs::canonicalize(tmp.join("allowed")).unwrap();
+        let mut restarted_cfg = cfg;
+        restarted_cfg.run = "different-process-run".into();
+        let restarted = WorktreeBackend::new(
+            Arc::new(FakeInner { rec: rec.clone() }),
+            Arc::new(FakeProv { rec: rec.clone() }),
+            restarted_cfg,
+            Some(SessionCwd::parse(&allowed_root.to_string_lossy()).unwrap()),
+            WorktreeIdentity {
+                run_id: "different-runtime-custodian".into(),
+                host: "host-b".into(),
+                lease: "/tmp/a2a-bridge-test-restarted.lock".into(),
+            },
+        );
+        restarted
+            .configure_bound_session(&session, &bound)
+            .await
+            .unwrap();
+
+        let added = rec.added_worktrees.lock().unwrap().clone();
+        assert_eq!(added.len(), 2);
+        assert_eq!(added[0].1, target);
+        assert_eq!(added[1].1, target);
+        assert!(!target.contains("different-process-run"));
+        restarted.forget_session_checked(&session).await.unwrap();
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[derive(Default)]

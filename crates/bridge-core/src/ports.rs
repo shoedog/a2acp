@@ -212,6 +212,16 @@ pub trait AgentBackend: Send + Sync {
     ) -> Result<(), BridgeError> {
         Ok(())
     }
+    /// Configure a V2 session from one already-frozen provider effect. The default refuses
+    /// rather than falling back to `configure_session`, which could re-render MCP or derive a
+    /// different checkout after durable identity was committed.
+    async fn configure_bound_session(
+        &self,
+        _session: &SessionId,
+        _spec: &crate::execution_policy::BoundSessionSpecV1,
+    ) -> Result<(), BridgeError> {
+        Err(BridgeError::BoundSessionUnsupported)
+    }
     /// Return the bounded model/effort/mode surface retained from this exact live session.
     /// Backends that do not expose a session catalog remain source-compatible and report none.
     fn session_catalog(&self, _session: &SessionId) -> Option<crate::catalog::AgentCaps> {

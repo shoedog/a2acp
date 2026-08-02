@@ -37,6 +37,8 @@ pub enum BridgeError {
     ConfigMismatch { field: &'static str },
     #[error("config reseed required: {field}")]
     ConfigReseedRequired { field: &'static str },
+    #[error("bound session configuration is unsupported")]
+    BoundSessionUnsupported,
     #[error("session expired")]
     SessionExpired,
     #[error("session busy")]
@@ -384,6 +386,7 @@ mod tests {
             SessionNotFound,
             ConfigMismatch { field: "x" },
             ConfigReseedRequired { field: "x" },
+            BoundSessionUnsupported,
             SessionExpired,
             HandleBusy,
             AuthRequired {

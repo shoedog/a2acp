@@ -5,11 +5,17 @@
 //! provider effect. Graph validation and run-spec assembly live in `bridge-workflow` so
 //! `bridge-core` remains below the workflow crate in the dependency graph.
 
-use crate::ids::AttemptId;
+use crate::domain::{
+    effective_config, AgentEntry, AgentKind, AgentOverride, EgressPolicy, MountAccess,
+    SandboxConfig,
+};
+use crate::ids::{AgentId, AttemptId};
+use crate::mcp::{render_codex_mcp_args, render_kiro_agent_config, McpDelivery, McpServerSpec};
 use crate::SessionCwd;
-use ring::digest;
+use ring::{digest, hmac};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::Arc;
 
 pub const EXECUTION_POLICY_SCHEMA_V1: u16 = 1;
 pub const CHECKOUT_EFFECT_SCHEMA_V1: u16 = 1;
@@ -259,6 +265,10 @@ pub enum ExecutionPolicyError {
     WorktreeTargetOutsideRoot,
     #[error("invalid SHA-256 hex value")]
     InvalidSha256,
+    #[error("provider-effect key is required for MCP environment values")]
+    MissingProviderEffectKey,
+    #[error("provider candidate is outside the frozen ordered set")]
+    ProviderSelectionOutOfSet,
 }
 
 fn max_qualification(
@@ -559,4 +569,627 @@ pub fn freeze_direct_checkout_v1(source_cwd: SessionCwd) -> FrozenCheckoutEffect
         effective_cwd: source_cwd.clone(),
         source_cwd,
     }
+}
+
+/// Separately held provider-effect commitment key. It is intentionally neither serializable nor
+/// printable; persisted identity carries only [`ProviderEffectKeyV1::key_id`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderEffectKeyV1([u8; 32]);
+
+impl std::fmt::Debug for ProviderEffectKeyV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProviderEffectKeyV1([REDACTED])")
+    }
+}
+
+impl ProviderEffectKeyV1 {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub fn key_id(&self) -> Sha256HexV1 {
+        self.mac(b"a2a-bridge/provider-effect-key-id/v1", &[])
+    }
+
+    fn mac(&self, domain: &[u8], value: &[u8]) -> Sha256HexV1 {
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.0);
+        let mut bytes = Vec::with_capacity(domain.len() + 16 + value.len());
+        push_bytes(&mut bytes, domain);
+        push_bytes(&mut bytes, value);
+        let tag = hmac::sign(&key, &bytes);
+        let mut encoded = String::with_capacity(64);
+        for byte in tag.as_ref() {
+            use std::fmt::Write as _;
+            let _ = write!(&mut encoded, "{byte:02x}");
+        }
+        Sha256HexV1(encoded)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum BoundMcpDeliveryPayloadV1 {
+    Acp(Vec<McpServerSpec>),
+    CodexNative(Vec<String>),
+    KiroNative { agent_name: String, json: String },
+}
+
+impl std::fmt::Debug for BoundMcpDeliveryPayloadV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Acp(servers) => formatter
+                .debug_struct("Acp")
+                .field("server_count", &servers.len())
+                .finish(),
+            Self::CodexNative(args) => formatter
+                .debug_struct("CodexNative")
+                .field("arg_count", &args.len())
+                .finish(),
+            Self::KiroNative { json, .. } => formatter
+                .debug_struct("KiroNative")
+                .field("json_bytes", &json.len())
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct BoundMcpDeliveryV1 {
+    payload: BoundMcpDeliveryPayloadV1,
+    digest: Sha256HexV1,
+}
+
+impl std::fmt::Debug for BoundMcpDeliveryV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundMcpDeliveryV1")
+            .field("payload", &self.payload)
+            .field("digest", &self.digest)
+            .finish()
+    }
+}
+
+impl BoundMcpDeliveryV1 {
+    #[must_use]
+    pub fn payload(&self) -> &BoundMcpDeliveryPayloadV1 {
+        &self.payload
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> &Sha256HexV1 {
+        &self.digest
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenProviderSelectionV1 {
+    pub agent: AgentId,
+    pub preflight: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<String>,
+    pub ordered_fallback_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_effort: Option<crate::domain::Effort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_mode: Option<String>,
+    pub selection_digest: Sha256HexV1,
+}
+
+impl FrozenProviderSelectionV1 {
+    #[must_use]
+    pub fn candidates(&self) -> Vec<Option<String>> {
+        let mut candidates = vec![self.effective_model.clone()];
+        if self.preflight {
+            candidates.extend(self.ordered_fallback_models.iter().cloned().map(Some));
+        }
+        candidates
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenProviderEffectV1 {
+    pub agent: AgentId,
+    pub effective_session_cwd: SessionCwd,
+    pub mcp_delivery_digest: Sha256HexV1,
+    pub effect_digest: Sha256HexV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_commitment_key_id: Option<Sha256HexV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenProviderAttemptIdentityV1 {
+    pub logical_session: FrozenProviderLogicalSessionV1,
+    pub checkout: FrozenCheckoutEffectV1,
+    pub effect: FrozenProviderEffectV1,
+    pub attempt_fingerprint: Sha256HexV1,
+}
+
+#[derive(Clone)]
+pub struct BoundProviderEffectV1 {
+    frozen: FrozenProviderAttemptIdentityV1,
+    delivery: Arc<BoundMcpDeliveryV1>,
+}
+
+impl std::fmt::Debug for BoundProviderEffectV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundProviderEffectV1")
+            .field("frozen", &self.frozen)
+            .field("delivery", &self.delivery)
+            .finish()
+    }
+}
+
+impl BoundProviderEffectV1 {
+    #[must_use]
+    pub fn frozen(&self) -> &FrozenProviderAttemptIdentityV1 {
+        &self.frozen
+    }
+
+    #[must_use]
+    pub fn delivery(&self) -> &BoundMcpDeliveryV1 {
+        &self.delivery
+    }
+}
+
+#[derive(Clone)]
+pub struct BoundSessionSpecV1 {
+    pub session: crate::domain::SessionSpec,
+    pub provider_effect: Arc<BoundProviderEffectV1>,
+}
+
+impl std::fmt::Debug for BoundSessionSpecV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundSessionSpecV1")
+            .field("session", &self.session)
+            .field("provider_effect", &self.provider_effect)
+            .finish()
+    }
+}
+
+impl BoundSessionSpecV1 {
+    #[must_use]
+    pub fn new(
+        config: crate::domain::EffectiveConfig,
+        provider_effect: Arc<BoundProviderEffectV1>,
+    ) -> Self {
+        let cwd = provider_effect
+            .frozen()
+            .effect
+            .effective_session_cwd
+            .clone();
+        Self {
+            session: crate::domain::SessionSpec {
+                config,
+                cwd: Some(cwd),
+            },
+            provider_effect,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FrozenProviderAttemptBundleV1 {
+    pub selection: FrozenProviderSelectionV1,
+    pub frozen: FrozenProviderAttemptIdentityV1,
+    pub bound: BoundProviderEffectV1,
+}
+
+pub struct ProviderFreezeInputV1<'a> {
+    pub entry: &'a AgentEntry,
+    pub overrides: Option<&'a AgentOverride>,
+    pub node: PolicyNodeRefV1,
+    pub logical_session: FrozenProviderLogicalSessionV1,
+    pub checkout: FrozenCheckoutEffectV1,
+    pub provider_effect_key: Option<&'a ProviderEffectKeyV1>,
+}
+
+fn push_option(target: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            target.push(1);
+            push_bytes(target, value.as_bytes());
+        }
+        None => target.push(0),
+    }
+}
+
+fn push_bool(target: &mut Vec<u8>, value: bool) {
+    target.push(u8::from(value));
+}
+
+fn effort_token(effort: crate::domain::Effort) -> &'static str {
+    match effort {
+        crate::domain::Effort::Minimal => "minimal",
+        crate::domain::Effort::Low => "low",
+        crate::domain::Effort::Medium => "medium",
+        crate::domain::Effort::High => "high",
+        crate::domain::Effort::Xhigh => "xhigh",
+        crate::domain::Effort::Max => "max",
+    }
+}
+
+fn freeze_selection(
+    entry: &AgentEntry,
+    overrides: Option<&AgentOverride>,
+) -> FrozenProviderSelectionV1 {
+    let effective = effective_config(entry, overrides);
+    let mut canonical = Vec::new();
+    push_bytes(&mut canonical, b"a2a-bridge/provider-selection/v1");
+    push_bytes(&mut canonical, entry.id.as_str().as_bytes());
+    push_bool(&mut canonical, entry.preflight);
+    push_option(&mut canonical, effective.model.as_deref());
+    canonical.extend_from_slice(&(entry.fallback_models.len() as u64).to_be_bytes());
+    for fallback in &entry.fallback_models {
+        push_bytes(&mut canonical, fallback.as_bytes());
+    }
+    push_option(&mut canonical, effective.effort.map(effort_token));
+    push_option(&mut canonical, effective.mode.as_deref());
+    FrozenProviderSelectionV1 {
+        agent: entry.id.clone(),
+        preflight: entry.preflight,
+        effective_model: effective.model,
+        ordered_fallback_models: entry.fallback_models.clone(),
+        effective_effort: effective.effort,
+        effective_mode: effective.mode,
+        selection_digest: Sha256HexV1::digest(&canonical),
+    }
+}
+
+fn encode_servers(servers: &[McpServerSpec]) -> Vec<u8> {
+    let mut canonical = Vec::new();
+    canonical.extend_from_slice(&(servers.len() as u64).to_be_bytes());
+    for server in servers {
+        push_bytes(&mut canonical, server.name.as_bytes());
+        push_bytes(&mut canonical, server.command.as_bytes());
+        canonical.extend_from_slice(&(server.args.len() as u64).to_be_bytes());
+        for arg in &server.args {
+            push_bytes(&mut canonical, arg.as_bytes());
+        }
+        canonical.extend_from_slice(&(server.env.len() as u64).to_be_bytes());
+        for (name, value) in &server.env {
+            push_bytes(&mut canonical, name.as_bytes());
+            push_bytes(&mut canonical, value.as_bytes());
+        }
+    }
+    canonical
+}
+
+fn secret_silent_digest(
+    key: Option<&ProviderEffectKeyV1>,
+    secret_bearing: bool,
+    domain: &'static [u8],
+    value: &[u8],
+) -> Result<Sha256HexV1, ExecutionPolicyError> {
+    if secret_bearing {
+        return key
+            .map(|key| key.mac(domain, value))
+            .ok_or(ExecutionPolicyError::MissingProviderEffectKey);
+    }
+    let mut canonical = Vec::new();
+    push_bytes(&mut canonical, domain);
+    push_bytes(&mut canonical, value);
+    Ok(Sha256HexV1::digest(&canonical))
+}
+
+fn freeze_delivery(
+    entry: &AgentEntry,
+    cwd: &SessionCwd,
+    key: Option<&ProviderEffectKeyV1>,
+) -> Result<(BoundMcpDeliveryV1, bool, Option<Sha256HexV1>, Sha256HexV1), ExecutionPolicyError> {
+    let secret_bearing = entry.mcp.iter().any(|server| !server.env.is_empty());
+    if secret_bearing && key.is_none() {
+        return Err(ExecutionPolicyError::MissingProviderEffectKey);
+    }
+    let source_digest = secret_silent_digest(
+        key,
+        secret_bearing,
+        b"a2a-bridge/mcp-source/v1",
+        &encode_servers(&entry.mcp),
+    )?;
+    let payload = match entry.mcp_delivery {
+        McpDelivery::Acp => BoundMcpDeliveryPayloadV1::Acp(
+            entry
+                .mcp
+                .iter()
+                .map(|server| server.substituted_for_managed_agent(cwd.as_str()))
+                .collect(),
+        ),
+        McpDelivery::CodexNative => {
+            BoundMcpDeliveryPayloadV1::CodexNative(render_codex_mcp_args(&entry.mcp, cwd.as_str()))
+        }
+        McpDelivery::KiroNative => {
+            let delivered: Vec<McpServerSpec> = entry
+                .mcp
+                .iter()
+                .map(|server| server.substituted_for_managed_agent(cwd.as_str()))
+                .collect();
+            let content_key = secret_silent_digest(
+                key,
+                secret_bearing,
+                b"a2a-bridge/kiro-mcp-content/v1",
+                &encode_servers(&delivered),
+            )?;
+            let agent_name = format!(
+                "a2a-mcp-{}-{}",
+                entry.id.as_str(),
+                &content_key.as_str()[..16]
+            );
+            let json = render_kiro_agent_config(&entry.mcp, cwd.as_str(), &agent_name);
+            BoundMcpDeliveryPayloadV1::KiroNative { agent_name, json }
+        }
+    };
+
+    let mut delivered_bytes = Vec::new();
+    match &payload {
+        BoundMcpDeliveryPayloadV1::Acp(servers) => {
+            push_bytes(&mut delivered_bytes, b"acp");
+            push_bytes(&mut delivered_bytes, &encode_servers(servers));
+        }
+        BoundMcpDeliveryPayloadV1::CodexNative(args) => {
+            push_bytes(&mut delivered_bytes, b"codex_native");
+            delivered_bytes.extend_from_slice(&(args.len() as u64).to_be_bytes());
+            for arg in args {
+                push_bytes(&mut delivered_bytes, arg.as_bytes());
+            }
+        }
+        BoundMcpDeliveryPayloadV1::KiroNative { agent_name, json } => {
+            push_bytes(&mut delivered_bytes, b"kiro_native");
+            push_bytes(&mut delivered_bytes, agent_name.as_bytes());
+            push_bytes(&mut delivered_bytes, json.as_bytes());
+        }
+    }
+    let delivery_digest = secret_silent_digest(
+        key,
+        secret_bearing,
+        b"a2a-bridge/mcp-delivery/v1",
+        &delivered_bytes,
+    )?;
+    Ok((
+        BoundMcpDeliveryV1 {
+            payload,
+            digest: delivery_digest.clone(),
+        },
+        secret_bearing,
+        secret_bearing.then(|| key.expect("checked above").key_id()),
+        source_digest,
+    ))
+}
+
+fn agent_kind_token(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Acp => "acp",
+        AgentKind::Api => "api",
+        AgentKind::ContainerRw => "container_rw",
+    }
+}
+
+fn encode_sandbox(target: &mut Vec<u8>, sandbox: Option<&SandboxConfig>) {
+    let Some(sandbox) = sandbox else {
+        target.push(0);
+        return;
+    };
+    target.push(1);
+    push_option(target, sandbox.runtime.as_deref());
+    push_bytes(target, sandbox.image.as_bytes());
+    push_bytes(target, sandbox.mount.as_bytes());
+    push_bytes(
+        target,
+        match sandbox.access {
+            MountAccess::Ro => b"ro",
+            MountAccess::Rw => b"rw",
+        },
+    );
+    match &sandbox.egress {
+        EgressPolicy::Locked {
+            network,
+            proxy,
+            no_proxy,
+        } => {
+            push_bytes(target, b"locked");
+            push_bytes(target, network.as_bytes());
+            push_bytes(target, proxy.as_bytes());
+            push_option(target, no_proxy.as_deref());
+        }
+        EgressPolicy::Open => push_bytes(target, b"open"),
+    }
+    target.extend_from_slice(&(sandbox.volumes.len() as u64).to_be_bytes());
+    for volume in &sandbox.volumes {
+        push_bytes(target, volume.as_bytes());
+    }
+}
+
+fn encode_checkout(target: &mut Vec<u8>, checkout: &FrozenCheckoutEffectV1) {
+    match checkout {
+        FrozenCheckoutEffectV1::Direct {
+            source_cwd,
+            effective_cwd,
+        } => {
+            push_bytes(target, b"direct");
+            push_bytes(target, source_cwd.as_str().as_bytes());
+            push_bytes(target, effective_cwd.as_str().as_bytes());
+        }
+        FrozenCheckoutEffectV1::Worktree {
+            source_cwd,
+            canonical_source_cwd,
+            canonical_worktree_root,
+            worktree_owner,
+            target_cwd,
+            checkout_digest,
+        } => {
+            push_bytes(target, b"worktree");
+            push_bytes(target, source_cwd.as_str().as_bytes());
+            push_bytes(target, canonical_source_cwd.as_str().as_bytes());
+            push_bytes(target, canonical_worktree_root.as_str().as_bytes());
+            push_bytes(target, worktree_owner.as_bytes());
+            push_bytes(target, target_cwd.as_str().as_bytes());
+            push_bytes(target, checkout_digest.as_str().as_bytes());
+        }
+    }
+}
+
+fn freeze_effect(
+    entry: &AgentEntry,
+    checkout: &FrozenCheckoutEffectV1,
+    delivery_digest: Sha256HexV1,
+    source_digest: &Sha256HexV1,
+    secret_bearing: bool,
+    key: Option<&ProviderEffectKeyV1>,
+) -> Result<FrozenProviderEffectV1, ExecutionPolicyError> {
+    let AgentEntry {
+        id,
+        cmd,
+        base_url,
+        api_key_env,
+        args,
+        kind,
+        model_provider: _,
+        model: _,
+        effort: _,
+        mode: _,
+        preflight: _,
+        fallback_models: _,
+        cwd,
+        session_cwd,
+        sandbox,
+        watchdog,
+        mcp: _,
+        mcp_delivery,
+        auth_method,
+        pre_authenticated,
+        host_fallback_eligible: _,
+        name: _,
+        description: _,
+        tags: _,
+        version: _,
+        extensions: _,
+    } = entry;
+    let mut canonical = Vec::new();
+    push_bytes(&mut canonical, b"a2a-bridge/provider-effect/v1");
+    push_bytes(&mut canonical, id.as_str().as_bytes());
+    push_bytes(&mut canonical, agent_kind_token(*kind).as_bytes());
+    push_option(&mut canonical, cmd.as_deref());
+    push_option(&mut canonical, base_url.as_deref());
+    push_option(&mut canonical, api_key_env.as_deref());
+    canonical.extend_from_slice(&(args.len() as u64).to_be_bytes());
+    for arg in args {
+        push_bytes(&mut canonical, arg.as_bytes());
+    }
+    push_option(&mut canonical, cwd.as_deref());
+    push_option(&mut canonical, session_cwd.as_deref());
+    encode_sandbox(&mut canonical, sandbox.as_ref());
+    match watchdog {
+        Some(watchdog) => {
+            canonical.push(1);
+            canonical.extend_from_slice(&watchdog.idle_timeout.as_millis().to_be_bytes());
+            canonical.extend_from_slice(&watchdog.hard_wall_clock.as_millis().to_be_bytes());
+        }
+        None => canonical.push(0),
+    }
+    push_option(&mut canonical, auth_method.as_deref());
+    push_bool(&mut canonical, *pre_authenticated);
+    encode_checkout(&mut canonical, checkout);
+    push_bytes(&mut canonical, checkout.effective_cwd().as_str().as_bytes());
+    push_bytes(
+        &mut canonical,
+        match mcp_delivery {
+            McpDelivery::Acp => b"acp",
+            McpDelivery::CodexNative => b"codex_native",
+            McpDelivery::KiroNative => b"kiro_native",
+        },
+    );
+    push_bytes(&mut canonical, source_digest.as_str().as_bytes());
+    push_bytes(&mut canonical, delivery_digest.as_str().as_bytes());
+    let effect_digest = secret_silent_digest(
+        key,
+        secret_bearing,
+        b"a2a-bridge/provider-effect-final/v1",
+        &canonical,
+    )?;
+    Ok(FrozenProviderEffectV1 {
+        agent: id.clone(),
+        effective_session_cwd: checkout.effective_cwd().clone(),
+        mcp_delivery_digest: delivery_digest,
+        effect_digest,
+        secret_commitment_key_id: secret_bearing.then(|| key.expect("checked above").key_id()),
+    })
+}
+
+fn attempt_fingerprint(
+    node: &PolicyNodeRefV1,
+    logical_session: FrozenProviderLogicalSessionV1,
+    checkout: &FrozenCheckoutEffectV1,
+    effect: &FrozenProviderEffectV1,
+    selection: &FrozenProviderSelectionV1,
+) -> Sha256HexV1 {
+    let mut canonical = Vec::new();
+    push_bytes(&mut canonical, b"a2a-bridge/provider-attempt/v1");
+    canonical.extend_from_slice(&node.sorted_ordinal.to_be_bytes());
+    push_bytes(&mut canonical, node.id_sha256.as_str().as_bytes());
+    let (kind, ordinal) = logical_session.tag();
+    push_bytes(&mut canonical, kind.as_bytes());
+    canonical.extend_from_slice(&ordinal.to_be_bytes());
+    encode_checkout(&mut canonical, checkout);
+    push_bytes(&mut canonical, effect.effect_digest.as_str().as_bytes());
+    push_bytes(
+        &mut canonical,
+        selection.selection_digest.as_str().as_bytes(),
+    );
+    Sha256HexV1::digest(&canonical)
+}
+
+pub fn freeze_provider_attempt_v1(
+    input: &ProviderFreezeInputV1<'_>,
+) -> Result<FrozenProviderAttemptBundleV1, ExecutionPolicyError> {
+    let selection = freeze_selection(input.entry, input.overrides);
+    let candidate_ordinal = match input.logical_session {
+        FrozenProviderLogicalSessionV1::Preflight { candidate_ordinal } => {
+            if !selection.preflight {
+                return Err(ExecutionPolicyError::ProviderSelectionOutOfSet);
+            }
+            candidate_ordinal
+        }
+        FrozenProviderLogicalSessionV1::Execute { candidate_ordinal } => candidate_ordinal,
+    };
+    if usize::from(candidate_ordinal) >= selection.candidates().len() {
+        return Err(ExecutionPolicyError::ProviderSelectionOutOfSet);
+    }
+
+    let (delivery, secret_bearing, key_id, source_digest) = freeze_delivery(
+        input.entry,
+        input.checkout.effective_cwd(),
+        input.provider_effect_key,
+    )?;
+    let effect = freeze_effect(
+        input.entry,
+        &input.checkout,
+        delivery.digest().clone(),
+        &source_digest,
+        secret_bearing,
+        input.provider_effect_key,
+    )?;
+    debug_assert_eq!(effect.secret_commitment_key_id, key_id);
+    let frozen = FrozenProviderAttemptIdentityV1 {
+        logical_session: input.logical_session,
+        checkout: input.checkout.clone(),
+        attempt_fingerprint: attempt_fingerprint(
+            &input.node,
+            input.logical_session,
+            &input.checkout,
+            &effect,
+            &selection,
+        ),
+        effect,
+    };
+    let bound = BoundProviderEffectV1 {
+        frozen: frozen.clone(),
+        delivery: Arc::new(delivery),
+    };
+    Ok(FrozenProviderAttemptBundleV1 {
+        selection,
+        frozen,
+        bound,
+    })
 }
