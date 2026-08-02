@@ -18,7 +18,7 @@ use bridge_core::SessionCwd;
 use bridge_workflow::executor::{
     WorkflowDiagnosticContext, WorkflowEvent, WorkflowExecutor, WorkflowOutcome, WorkflowRunContext,
 };
-use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
+use bridge_workflow::graph::{RetryPolicy, WorkflowGraph, WorkflowNode};
 use bridge_workflow::run_spec::WorkflowRunSpecV1;
 use futures::StreamExt;
 use std::collections::BTreeMap;
@@ -35,7 +35,10 @@ struct Calls {
     binds: AtomicUsize,
     bound_resolves: AtomicUsize,
     bound_invalidations: AtomicUsize,
+    unbound_invalidations: AtomicUsize,
     legacy_configures: AtomicUsize,
+    main_prompts: AtomicUsize,
+    fail_main_prompts: AtomicUsize,
     bound_specs: Mutex<Vec<BoundSessionSpecV1>>,
 }
 
@@ -50,12 +53,16 @@ impl AgentBackend for RecordingBackend {
         _session: &SessionId,
         parts: Vec<Part>,
     ) -> Result<BackendStream, BridgeError> {
-        let reply = if parts
+        let is_preflight = parts
             .first()
-            .is_some_and(|part| part.text == "Reply with exactly PONG and nothing else.")
-        {
+            .is_some_and(|part| part.text == "Reply with exactly PONG and nothing else.");
+        let reply = if is_preflight {
             "PONG"
         } else {
+            let prompt = self.calls.main_prompts.fetch_add(1, Ordering::SeqCst);
+            if prompt < self.calls.fail_main_prompts.load(Ordering::SeqCst) {
+                return Err(BridgeError::AgentOverloaded);
+            }
             "BOUND_OK"
         };
         Ok(Box::pin(tokio_stream::iter(vec![
@@ -149,6 +156,12 @@ impl AgentRegistry for BoundOnlyRegistry {
             .fetch_add(1, Ordering::SeqCst);
     }
 
+    async fn invalidate(&self, _agent: &AgentId) {
+        self.calls
+            .unbound_invalidations
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
     fn default_id(&self) -> AgentId {
         self.entry.id.clone()
     }
@@ -198,7 +211,10 @@ fn entry() -> AgentEntry {
     }
 }
 
-fn frozen_worktree_run(entry: &AgentEntry) -> WorkflowRunSpecV1 {
+fn frozen_worktree_run_with_retry(
+    entry: &AgentEntry,
+    retry: Option<RetryPolicy>,
+) -> WorkflowRunSpecV1 {
     let attempt_id = AttemptId::parse("attempt-22222222222222222222222222222222").unwrap();
     let source_cwd = SessionCwd::parse("/repo/source").unwrap();
     let node_ref = PolicyNodeRefV1::from_node_id(0, "review-node");
@@ -247,7 +263,7 @@ fn frozen_worktree_run(entry: &AgentEntry) -> WorkflowRunSpecV1 {
             agent: entry.id.clone(),
             prompt_template: "{{input}}".into(),
             inputs: vec![],
-            retry: None,
+            retry,
             harvest_sanitization: None,
         }],
         panel: None,
@@ -273,9 +289,15 @@ fn frozen_worktree_run(entry: &AgentEntry) -> WorkflowRunSpecV1 {
     .unwrap()
 }
 
+fn frozen_worktree_run(entry: &AgentEntry) -> WorkflowRunSpecV1 {
+    frozen_worktree_run_with_retry(entry, None)
+}
+
 async fn execute_bound(
     entry: AgentEntry,
     fail_preflight_ordinal: Option<u16>,
+    retry: Option<RetryPolicy>,
+    fail_main_prompts: usize,
 ) -> (
     Arc<WorkflowRunSpecV1>,
     Arc<Calls>,
@@ -283,9 +305,12 @@ async fn execute_bound(
     Option<(WorkflowOutcome, String)>,
 ) {
     let entry = Arc::new(entry);
-    let run_spec = Arc::new(frozen_worktree_run(&entry));
+    let run_spec = Arc::new(frozen_worktree_run_with_retry(&entry, retry));
     run_spec.validate().unwrap();
     let calls = Arc::new(Calls::default());
+    calls
+        .fail_main_prompts
+        .store(fail_main_prompts, Ordering::SeqCst);
     let backend: Arc<dyn AgentBackend> = Arc::new(RecordingBackend {
         calls: calls.clone(),
     });
@@ -402,7 +427,7 @@ async fn v2_worktree_attempt_uses_only_bound_registry_cwd_and_delivery() {
 async fn v2_preflight_binds_candidate_and_execute_as_distinct_attempts() {
     let mut configured = entry();
     configured.preflight = true;
-    let (_run_spec, calls, node_ok, terminal) = execute_bound(configured, None).await;
+    let (_run_spec, calls, node_ok, terminal) = execute_bound(configured, None, None, 0).await;
 
     assert_eq!(node_ok, Some(true));
     assert_eq!(
@@ -434,7 +459,7 @@ async fn v2_preflight_fallback_exact_invalidates_then_executes_persisted_ordinal
     let mut configured = entry();
     configured.preflight = true;
     configured.fallback_models = vec!["gpt-5.6-luna".into()];
-    let (_run_spec, calls, node_ok, terminal) = execute_bound(configured, Some(0)).await;
+    let (_run_spec, calls, node_ok, terminal) = execute_bound(configured, Some(0), None, 0).await;
 
     assert_eq!(node_ok, Some(true));
     assert_eq!(
@@ -460,5 +485,41 @@ async fn v2_preflight_fallback_exact_invalidates_then_executes_persisted_ordinal
             logical_session
         );
         assert_eq!(spec.session.config.model.as_deref(), Some("gpt-5.6-luna"));
+    }
+}
+
+#[tokio::test]
+async fn v2_retry_rebinds_execute_row_and_never_invalidates_by_agent_id() {
+    let configured = entry();
+    let retry = RetryPolicy {
+        max_attempts: 2,
+        backoff_ms: 0,
+        backoff_cap_ms: None,
+    };
+    let (run_spec, calls, node_ok, terminal) =
+        execute_bound(configured, None, Some(retry), 1).await;
+
+    assert_eq!(node_ok, Some(true));
+    assert_eq!(
+        terminal,
+        Some((WorkflowOutcome::Completed, "BOUND_OK".into()))
+    );
+    assert_eq!(calls.main_prompts.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.unbound_resolves.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.binds.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.bound_resolves.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.bound_invalidations.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.unbound_invalidations.load(Ordering::SeqCst), 0);
+    let specs = calls.bound_specs.lock().unwrap();
+    assert_eq!(specs.len(), 2);
+    let persisted = &run_spec.node_execution_identities[0].provider_attempts[0];
+    for spec in specs.iter() {
+        assert_eq!(spec.provider_effect.frozen(), persisted);
+        assert!(matches!(
+            spec.provider_effect.frozen().logical_session,
+            FrozenProviderLogicalSessionV1::Execute {
+                candidate_ordinal: 0
+            }
+        ));
     }
 }
