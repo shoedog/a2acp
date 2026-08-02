@@ -3164,6 +3164,7 @@ fn detached_deps(srv: &Arc<InboundServer>) -> bridge_coordinator::detached::Deta
         clock: Arc::new(bridge_coordinator::clock::SystemClock),
         observer: srv.coordinator().observer(),
         workflow_history: srv.coordinator().workflow_history(),
+        workflow_admission: srv.coordinator().workflow_admission(),
     }
 }
 

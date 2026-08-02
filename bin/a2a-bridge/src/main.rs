@@ -897,13 +897,7 @@ fn container_owner(config_path: &std::path::Path, mount: &str, agent_id: &str) -
 }
 
 fn worktree_owner(config_path: &std::path::Path, agent_id: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    let canonical =
-        std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
-    canonical.to_string_lossy().hash(&mut h);
-    agent_id.hash(&mut h);
-    format!("{:016x}", h.finish())
+    bridge_worktree::workflow_planner::stable_worktree_owner(config_path, agent_id)
 }
 
 /// Epoch-seconds string for the display-only `a2a.start` label (no RFC3339 dep; `containers list` shows
@@ -1120,6 +1114,100 @@ fn resolve_worktree_runtime_cfg(
     }))
 }
 
+fn build_workflow_admission(
+    cfg: &RegistryConfig,
+    registry: Arc<dyn bridge_core::ports::AgentRegistry>,
+    owner_config_path: &Path,
+    worktree_cfg: Option<&WorktreeRuntimeCfg>,
+    extra_forbidden_roots: &[PathBuf],
+    extra_forbidden_files: &[PathBuf],
+) -> Result<Arc<bridge_workflow::admission::WorkflowAdmissionV1>, BoxError> {
+    let launch = std::env::current_dir()
+        .map_err(|error| format!("workflow admission: launch cwd unavailable: {error}"))?;
+    let launch_cwd = bridge_core::SessionCwd::parse(&launch.to_string_lossy())
+        .map_err(|error| format!("workflow admission: invalid launch cwd: {error:?}"))?;
+    let checkout_planner: Arc<dyn bridge_workflow::admission::WorkflowCheckoutPlannerV1> =
+        match worktree_cfg {
+            Some(runtime) if runtime.enabled => Arc::new(
+                bridge_worktree::workflow_planner::WorktreeCheckoutPlannerV1::new(
+                    runtime.root.clone(),
+                    runtime
+                        .allowed_root
+                        .clone()
+                        .ok_or("workflow admission: enabled worktrees require allowed_cwd_root")?,
+                    owner_config_path.to_path_buf(),
+                    Arc::new(bridge_worktree::host_git::HostGitWorktree::new()),
+                ),
+            ),
+            _ => Arc::new(bridge_workflow::admission::DirectWorkflowCheckoutPlannerV1),
+        };
+
+    let provider_effect_key_path = cfg.provider_effect_key_path()?;
+    let provider_effect_key = match provider_effect_key_path.as_ref() {
+        Some(path) => {
+            let config_base = owner_config_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let mut forbidden_roots = extra_forbidden_roots.to_vec();
+            forbidden_roots.push(launch.clone());
+            if let Some(root) = cfg.allowed_cwd_root.as_deref() {
+                let root = PathBuf::from(root);
+                if root.is_absolute() {
+                    forbidden_roots.push(root);
+                }
+            }
+            if let Some(runtime) = worktree_cfg {
+                forbidden_roots.push(PathBuf::from(&runtime.root));
+            }
+            for agent in &cfg.agents {
+                if let Some(sandbox) = &agent.sandbox {
+                    for volume in &sandbox.volumes {
+                        if let Some(host) = volume.split(':').next().filter(|host| !host.is_empty())
+                        {
+                            let host = PathBuf::from(host);
+                            if host.is_absolute() {
+                                forbidden_roots.push(host);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut forbidden_files = cfg
+                .store
+                .iter()
+                .map(|store| {
+                    let path = PathBuf::from(&store.path);
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        config_base.join(path)
+                    }
+                })
+                .collect::<Vec<_>>();
+            forbidden_files.extend_from_slice(extra_forbidden_files);
+            Some(Arc::new(config::load_provider_effect_key_file(
+                path,
+                &forbidden_roots,
+                &forbidden_files,
+            )?))
+        }
+        None => None,
+    };
+
+    let admission = bridge_workflow::admission::WorkflowAdmissionV1::new(
+        registry,
+        checkout_planner,
+        launch_cwd,
+        provider_effect_key,
+    );
+    let admission = match provider_effect_key_path {
+        Some(path) => admission.with_provider_effect_key_path(path),
+        None => admission,
+    };
+    Ok(Arc::new(admission))
+}
+
 fn batch_runtime(
     cfg: &RegistryConfig,
     observer: Arc<dyn bridge_core::ports::Observer>,
@@ -1169,6 +1257,7 @@ fn build_coordinator(
         Arc<dyn bridge_core::workflow_history::WorkflowHistoryStore>,
         bridge_core::workflow_history::LedgerUnavailableReason,
     >,
+    workflow_admission: Arc<bridge_workflow::admission::WorkflowAdmissionV1>,
     perm_registry: Arc<PermissionRegistry>,
 ) -> Arc<bridge_coordinator::Coordinator> {
     Arc::new(
@@ -1188,6 +1277,7 @@ fn build_coordinator(
         )
         .with_trace_refs_config(trace_refs_enabled, max_task_turns)
         .with_workflow_history(workflow_history)
+        .with_workflow_admission(workflow_admission)
         .with_permission_registry(perm_registry),
     )
 }
@@ -1284,6 +1374,34 @@ fn make_spawn_fn(
                     return Err(BridgeError::ConfigInvalid {
                         reason: "pinned host ACP cwd must be absolute".into(),
                     });
+                }
+            }
+            if let Some(effect) = bound_effect.as_deref() {
+                if matches!(
+                    effect.frozen().checkout,
+                    bridge_core::execution_policy::FrozenCheckoutEffectV1::Worktree { .. }
+                ) {
+                    let Some(runtime) = worktree_cfg.as_ref().filter(|runtime| runtime.enabled)
+                    else {
+                        return Err(BridgeError::ConfigMismatch {
+                            field: "bound worktree configuration",
+                        });
+                    };
+                    if entry.kind != AgentKind::Acp || entry.sandbox.is_some() {
+                        return Err(BridgeError::ConfigMismatch {
+                            field: "bound worktree backend kind",
+                        });
+                    }
+                    let cfg = bridge_worktree::provider_path::WorktreeConfig {
+                        root: runtime.root.clone(),
+                        owner: worktree_owner(&owner_config_path, entry.id.as_str()),
+                        run: run.instance_id.clone(),
+                    };
+                    bridge_worktree::provider_path::validate_bound_worktree(
+                        &cfg,
+                        &runtime.allowed_root,
+                        &effect.frozen().checkout,
+                    )?;
                 }
             }
             let cwd = match (host_process_cwd.as_ref(), bound_effect.as_ref()) {
@@ -3879,20 +3997,6 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         return Err(format!("run-workflow: {error}").into());
     }
 
-    let (workload_fingerprint, workload_fingerprint_complete) =
-        bridge_workflow::graph::workload_fingerprint_with(&graph, |agent| {
-            let entry = cfg.agents.iter().find(|entry| entry.id == agent.as_str())?;
-            let effort = match entry.effort.as_deref() {
-                Some(value) => Some(value.parse::<bridge_core::domain::Effort>().ok()?),
-                None => None,
-            };
-            Some(bridge_core::domain::EffectiveConfig {
-                model: entry.model.clone(),
-                effort,
-                mode: entry.mode.clone(),
-            })
-        });
-
     // Freeze exactly one history allocation before registry/session/provider effects.
     let selected_history = match cfg.store.as_ref() {
         Some(store) => {
@@ -3920,77 +4024,12 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         .store
         .as_ref()
         .and_then(|_| selected_history.as_ref().ok().cloned());
-    // Admit the exact offline attempt before registry construction, container
-    // warmup, session creation, executor resolution, or provider work. Ordinary
-    // summary failures remain fail-open; identity collisions are replay refusal.
-    let offline_telemetry = bridge_coordinator::detached::AttemptTelemetryState::default();
-    let history_store = match selected_history {
-        Ok(store) => {
-            let reservation = bridge_core::workflow_history::AttemptReservation {
-                identity: identity.clone(),
-                task_id: None,
-                workflow: workflow_id.clone(),
-                task_class: "workflow".into(),
-                surface: bridge_core::workflow_history::ExecutionSurface::Offline,
-                policy: "r2f0a".into(),
-                workload_fingerprint,
-                started_ms: bridge_core::task_store::system_wall_now_ms(),
-                workload_fingerprint_complete,
-                prompt_acceptance: "not_dispatched".into(),
-                pinned: false,
-            };
-            match bridge_core::workflow_history::WorkflowHistoryStore::reserve(
-                store.as_ref(),
-                &reservation,
-            )
-            .await
-            {
-                Ok(()) => Some(store),
-                Err(error)
-                    if error.reason
-                        == bridge_core::workflow_history::LedgerUnavailableReason::Collision =>
-                {
-                    return Err(format!(
-                        "run-workflow: attempt identity collision ({})",
-                        identity.attempt_id.as_str()
-                    )
-                    .into());
-                }
-                Err(error) => {
-                    offline_telemetry.record(error.reason);
-                    eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
-                    None
-                }
-            }
-        }
-        Err(error) => {
-            offline_telemetry.record(error.reason);
-            eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
-            None
-        }
-    };
-
     let harvest_enabled = graph.nodes.iter().any(|node| {
         matches!(
             node.harvest_sanitization.unwrap_or_default(),
             bridge_core::attestation::HarvestSanitizationMode::AttestedPrefixV1
         )
     });
-    let (harvest_audit_store, harvest_audit_path) = run_workflow_harvest_audit_store(
-        &cfg,
-        configured_harvest_store,
-        &base,
-        &run_artifact_root,
-        &run_id,
-        harvest_enabled,
-    )?;
-    if let Some(path) = harvest_audit_path.as_ref() {
-        eprintln!(
-            "[run-workflow] harvest audit store {} task_id {}",
-            path.display(),
-            run_id
-        );
-    }
     let task_id = if harvest_enabled {
         Some(
             bridge_core::ids::TaskId::parse(run_id.clone()).map_err(|e| {
@@ -4021,24 +4060,16 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         resolve_worktree_runtime_cfg(&cfg).map_err(|e| format!("run-workflow: {e}"))?;
 
     // Build the registry + executor using the same SpawnFn the server uses.
+    let admission_cfg = RegistryConfig::parse(&raw)
+        .map_err(|e| format!("run-workflow: config reparse for admission failed: {e}"))?;
     let mut snapshot = cfg
         .into_snapshot()
         .map_err(|e| format!("run-workflow: registry snapshot error: {e}"))?;
     preflight_runtimes(&snapshot, None); // warn early if a sandbox runtime isn't up (verify is implement-only)
-                                         // MAJOR 4 (ADR-0028): stamp --session-cwd into every entry's `session_cwd` so the ONE resolution
-                                         // chain (`resolve_static_session_cwd`) feeds BOTH the agent's ACP session cwd AND the codex native
-                                         // MCP `-c` args' `{cwd}` from the same value — prism then indexes exactly the repo the agent works
-                                         // in (no silent wrong-repo). Acp-kind agents read this at spawn; container_rw gets the per-turn cwd
-                                         // via the run context instead. run-workflow targets one repo, so stamping all entries is correct.
-    if let Some(ref dir) = session_cwd {
-        for e in &mut snapshot.entries {
-            e.session_cwd = Some(dir.clone());
-        }
-    }
-    // Warm ONLY container_rw agents the SELECTED workflow actually resolves (its graph nodes), not every
-    // container_rw entry in the config: the shipped containerized.toml defines the `impl` container_rw agent
-    // AND host-only workflows (code-review/spec-review/design) — warming config-wide would make those pay a
-    // docker warm-fetch + registries-egress attempt for an agent they never spawn (dual-review MAJOR).
+                                         // Warm ONLY container_rw agents the SELECTED workflow actually resolves (its graph nodes), not every
+                                         // container_rw entry in the config: the shipped containerized.toml defines the `impl` container_rw agent
+                                         // AND host-only workflows (code-review/spec-review/design) — warming config-wide would make those pay a
+                                         // docker warm-fetch + registries-egress attempt for an agent they never spawn (dual-review MAJOR).
     let wf_agent_ids: std::collections::HashSet<&str> =
         graph.nodes.iter().map(|n| n.agent.as_str()).collect();
     let warms_container_rw = snapshot.entries.iter().any(|e| {
@@ -4105,11 +4136,11 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
     let policy_for_spawn = Arc::clone(&policy) as Arc<dyn bridge_core::ports::PolicyEngine>;
     let spawn = make_spawn_fn(
         policy_for_spawn,
-        owner_config_path,
+        owner_config_path.clone(),
         run,
         None,
         120_000,
-        worktree_cfg,
+        worktree_cfg.clone(),
         None,
     );
     let registry = Arc::new(
@@ -4120,18 +4151,127 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         Arc::clone(&registry) as Arc<dyn bridge_core::ports::AgentRegistry>
     );
 
-    // Per-request session cwd: thread it into the context so EVERY node's agent works in the target
-    // dir (a container_rw :rw target, or the repo a reader reads) — not the launch cwd.
-    let mut ctx = match session_cwd {
-        Some(dir) => {
-            let cwd = bridge_core::SessionCwd::parse(&dir)
-                .map_err(|e| format!("run-workflow: invalid --session-cwd {dir:?}: {e:?}"))?;
-            bridge_workflow::executor::WorkflowRunContext {
-                session_cwd: Some(cwd),
-                make_rich_sink: None,
-                ..bridge_workflow::executor::WorkflowRunContext::default()
+    let requested_session_cwd = session_cwd
+        .as_deref()
+        .map(bridge_core::SessionCwd::parse)
+        .transpose()
+        .map_err(|e| format!("run-workflow: invalid --session-cwd: {e:?}"))?;
+    let history_kind = if admission_cfg.store.is_some() {
+        bridge_core::execution_policy::HistoryAllocationKindV1::Configured
+    } else {
+        bridge_core::execution_policy::HistoryAllocationKindV1::Platform
+    };
+    let initial_ledger_admission = match &selected_history {
+        Ok(_) => bridge_core::execution_policy::LedgerAdmissionV1::HistoryLedgerAdmitted {
+            kind: history_kind,
+        },
+        Err(error) => bridge_core::execution_policy::LedgerAdmissionV1::HistoryLedgerUnavailable {
+            reason: error.reason.into(),
+        },
+    };
+    let extra_forbidden_files: Vec<PathBuf> = out_path.iter().cloned().collect();
+    let workflow_admission = build_workflow_admission(
+        &admission_cfg,
+        Arc::clone(&registry) as Arc<dyn AgentRegistry>,
+        &owner_config_path,
+        worktree_cfg.as_ref(),
+        std::slice::from_ref(&run_artifact_root),
+        &extra_forbidden_files,
+    )?;
+    let mut authority = workflow_admission
+        .freeze(bridge_workflow::admission::WorkflowAdmissionRequestV1 {
+            attempt_id: identity.attempt_id.clone(),
+            graph: graph.clone(),
+            requested_session_cwd: requested_session_cwd.clone(),
+            policy_invocation: bridge_core::execution_policy::ExecutionPolicyInvocationV1::default(
+            ),
+            ledger_admission: initial_ledger_admission,
+        })
+        .await
+        .map_err(|error| format!("run-workflow: frozen admission failed: {error:?}"))?;
+
+    // Optional history remains fail-open except for identity collision. The final unpublished
+    // run spec records the actual disposition before any session/provider effect.
+    let offline_telemetry = bridge_coordinator::detached::AttemptTelemetryState::default();
+    let history_store = match selected_history {
+        Ok(store) => {
+            let reservation = bridge_core::workflow_history::AttemptReservation {
+                identity: identity.clone(),
+                task_id: None,
+                workflow: workflow_id.clone(),
+                task_class: "workflow".into(),
+                surface: bridge_core::workflow_history::ExecutionSurface::Offline,
+                policy: "r2f1a".into(),
+                workload_fingerprint: authority.run_spec.workload_fingerprint.clone(),
+                started_ms: bridge_core::task_store::system_wall_now_ms(),
+                workload_fingerprint_complete: true,
+                prompt_acceptance: "not_dispatched".into(),
+                pinned: false,
+            };
+            match bridge_core::workflow_history::WorkflowHistoryStore::reserve(
+                store.as_ref(),
+                &reservation,
+            )
+            .await
+            {
+                Ok(()) => Some(store),
+                Err(error)
+                    if error.reason
+                        == bridge_core::workflow_history::LedgerUnavailableReason::Collision =>
+                {
+                    return Err(format!(
+                        "run-workflow: attempt identity collision ({})",
+                        identity.attempt_id.as_str()
+                    )
+                    .into());
+                }
+                Err(error) => {
+                    offline_telemetry.record(error.reason);
+                    eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
+                    let mut run_spec = (*authority.run_spec).clone();
+                    run_spec.ledger_admission =
+                        bridge_core::execution_policy::LedgerAdmissionV1::HistoryLedgerUnavailable {
+                            reason: error.reason.into(),
+                        };
+                    run_spec.validate().map_err(|invalid| {
+                        format!("run-workflow: degraded frozen admission invalid: {invalid}")
+                    })?;
+                    authority.run_spec = Arc::new(run_spec);
+                    None
+                }
             }
         }
+        Err(error) => {
+            offline_telemetry.record(error.reason);
+            eprintln!("telemetry_unavailable{{reason={}}}", error.reason.as_str());
+            None
+        }
+    };
+
+    let (harvest_audit_store, harvest_audit_path) = run_workflow_harvest_audit_store(
+        &admission_cfg,
+        configured_harvest_store,
+        &base,
+        &run_artifact_root,
+        &run_id,
+        harvest_enabled,
+    )?;
+    if let Some(path) = harvest_audit_path.as_ref() {
+        eprintln!(
+            "[run-workflow] harvest audit store {} task_id {}",
+            path.display(),
+            run_id
+        );
+    }
+
+    // Per-request session cwd: thread it into the context so EVERY node's agent works in the target
+    // dir (a container_rw :rw target, or the repo a reader reads) — not the launch cwd.
+    let mut ctx = match requested_session_cwd {
+        Some(cwd) => bridge_workflow::executor::WorkflowRunContext {
+            session_cwd: Some(cwd),
+            make_rich_sink: None,
+            ..bridge_workflow::executor::WorkflowRunContext::default()
+        },
         None => bridge_workflow::executor::WorkflowRunContext::default(),
     };
     ctx.task_id = task_id;
@@ -4180,6 +4320,9 @@ async fn run_workflow_cmd(args: &[String]) -> Result<(), BoxError> {
         }
         None => diagnostic_ctx,
     };
+    let diagnostic_ctx = diagnostic_ctx
+        .with_frozen_run_spec(authority.run_spec, authority.provider_effect_key)
+        .map_err(|error| format!("run-workflow: frozen authority refused: {error:?}"))?;
 
     // Run the workflow.
     use bridge_workflow::executor::{WorkflowEvent, WorkflowOutcome};
@@ -6530,6 +6673,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         (None, Some(s)) => Some(resolve_rel(std::path::Path::new(&s.path))),
         (None, None) => None,
     };
+    let custody_store_files: Vec<PathBuf> = store_path.iter().cloned().collect();
     let (session_store, task_store, workflow_history): McpStores = match store_path {
         Some(path) => {
             let opened = SqliteStore::open_shared_history(&path).map_err(|error| {
@@ -6571,6 +6715,14 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
     let observer: Arc<dyn bridge_core::ports::Observer> = Arc::new(bridge_observ::NoopObserver);
     let batch =
         batch_runtime(&cfg, Arc::clone(&observer)).map_err(|e| format!("a2a-bridge mcp: {e}"))?;
+    let workflow_admission = build_workflow_admission(
+        &cfg,
+        Arc::clone(&registry) as Arc<dyn AgentRegistry>,
+        &config_path,
+        worktree_cfg.as_ref(),
+        &[],
+        &custody_store_files,
+    )?;
 
     let coordinator = build_coordinator(
         session_manager,
@@ -6588,6 +6740,7 @@ async fn mcp_cmd(args: &[String]) -> Result<(), BoxError> {
         false,
         512,
         workflow_history,
+        workflow_admission,
         Arc::clone(&perm_registry),
     );
 
@@ -8376,6 +8529,14 @@ async fn main() -> Result<(), BoxError> {
     // (`SessionCwd::parse` rejects empty/relative roots) that serve never had. The
     // real parsed root is wired at the slice that consumes it.
     let workflow_history_for_metrics = workflow_history.clone();
+    let workflow_admission = build_workflow_admission(
+        &cfg,
+        Arc::clone(&registry) as Arc<dyn AgentRegistry>,
+        &config_path,
+        worktree_cfg.as_ref(),
+        &[],
+        &[],
+    )?;
     let coordinator = build_coordinator(
         session_manager,
         executor,
@@ -8392,6 +8553,7 @@ async fn main() -> Result<(), BoxError> {
         traces_cfg.enabled,
         traces_cfg.max_task_turns,
         workflow_history,
+        workflow_admission,
         Arc::clone(&perm_registry),
     );
 

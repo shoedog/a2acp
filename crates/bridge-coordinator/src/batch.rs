@@ -11,7 +11,6 @@ use bridge_core::task_store::{
     TaskRecord, TaskRecordStatus,
 };
 use bridge_workflow::executor::WorkflowRunContext;
-use bridge_workflow::graph::WorkflowGraph;
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use serde_json::json;
 use std::time::Instant;
@@ -19,10 +18,10 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::detached::{
-    encode_workflow_spec, finalize_detached, finalize_detached_with_barrier,
+    decode_workflow_spec, encode_workflow_run_spec, encode_workflow_spec, finalize_detached,
+    finalize_detached_with_barrier, spawn_bound_detached_workflow_with_attempt_barriers,
     spawn_detached_workflow_with_attempt_barriers, workflow_prompt_dispatch_barrier_with_state,
     workflow_terminal_summary_barrier, AttemptTelemetryState, TaskProgressHub,
-    SUPPORTED_SNAPSHOT_VERSION,
 };
 use crate::params::validate_cwd_str;
 
@@ -352,12 +351,6 @@ struct BatchPlanEnvelope {
     items: Vec<BatchItem>,
 }
 
-#[derive(serde::Deserialize)]
-struct BatchWorkflowSpecEnvelope {
-    v: u32,
-    graph: WorkflowGraph,
-}
-
 fn decode_batch_plan(raw: &str) -> Option<Vec<BatchItem>> {
     let env: BatchPlanEnvelope = serde_json::from_str(raw).ok()?;
     (env.v == 1).then_some(env.items)
@@ -413,8 +406,8 @@ async fn resumed_child_future(
         return None;
     };
 
-    let graph = match serde_json::from_str::<BatchWorkflowSpecEnvelope>(spec_json) {
-        Ok(env) if env.v == SUPPORTED_SNAPSHOT_VERSION => env.graph,
+    let decoded = match decode_workflow_spec(spec_json) {
+        Ok(decoded) => decoded,
         _ => {
             let _ = finalize_detached(
                 &deps.detached.task_store,
@@ -430,6 +423,7 @@ async fn resumed_child_future(
             return None;
         }
     };
+    let (graph, frozen_run_spec) = decoded.into_parts();
 
     let cps = match deps.detached.task_store.node_checkpoints(&task).await {
         Ok(cps) => cps,
@@ -486,31 +480,75 @@ async fn resumed_child_future(
         return None;
     }
 
-    // Validate the persisted cwd before consuming a resume slot.
-    let ctx = match child.session_cwd.as_deref() {
-        Some(s) => match SessionCwd::parse(s) {
-            Ok(c) => WorkflowRunContext {
-                session_cwd: Some(c),
-                task_id: Some(task.clone()),
-                make_rich_sink: None,
-                observer: deps.detached.observer.clone(),
-                ..WorkflowRunContext::default()
-            },
-            Err(_) => {
+    let authority = match frozen_run_spec {
+        Some(run_spec) => {
+            let Some(admission) = deps.detached.workflow_admission.as_ref() else {
                 let _ = finalize_detached(
                     &deps.detached.task_store,
                     &deps.detached.progress_hubs,
                     &task,
                     TaskRecordStatus::Interrupted,
                     None,
-                    Some("not resumable: unreadable session cwd"),
+                    Some("not resumable: frozen workflow admission unavailable"),
                     None,
                 )
                 .await;
                 drop(permit);
                 return None;
+            };
+            match admission.restore(run_spec) {
+                Ok(authority) => Some(authority),
+                Err(error) => {
+                    tracing::warn!(task = task.as_str(), error = ?error, "batch resume: frozen workflow authority refused");
+                    let _ = finalize_detached(
+                        &deps.detached.task_store,
+                        &deps.detached.progress_hubs,
+                        &task,
+                        TaskRecordStatus::Interrupted,
+                        None,
+                        Some("not resumable: frozen workflow authority refused"),
+                        None,
+                    )
+                    .await;
+                    drop(permit);
+                    return None;
+                }
             }
+        }
+        None => None,
+    };
+    let persisted_request_cwd = authority
+        .as_ref()
+        .and_then(|authority| authority.run_spec.requested_session_cwd.clone());
+    let legacy_cwd = authority
+        .is_none()
+        .then_some(child.session_cwd.as_deref())
+        .flatten();
+    let ctx = match persisted_request_cwd
+        .map(Ok)
+        .or_else(|| legacy_cwd.map(SessionCwd::parse))
+    {
+        Some(Ok(c)) => WorkflowRunContext {
+            session_cwd: Some(c),
+            task_id: Some(task.clone()),
+            make_rich_sink: None,
+            observer: deps.detached.observer.clone(),
+            ..WorkflowRunContext::default()
         },
+        Some(Err(_)) => {
+            let _ = finalize_detached(
+                &deps.detached.task_store,
+                &deps.detached.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("not resumable: unreadable session cwd"),
+                None,
+            )
+            .await;
+            drop(permit);
+            return None;
+        }
         None => WorkflowRunContext {
             task_id: Some(task.clone()),
             observer: deps.detached.observer.clone(),
@@ -689,19 +727,36 @@ async fn resumed_child_future(
         .await
         .insert(task.clone(), token.clone());
     let run_id = identity.run_id().to_string();
-    let handle = spawn_detached_workflow_with_attempt_barriers(
-        &deps.detached,
-        task.clone(),
-        child.input.clone(),
-        Arc::new(graph),
-        run_id,
-        token.clone(),
-        seed,
-        ctx,
-        hub,
-        prompt_dispatch,
-        Some(terminal_barrier),
-    );
+    let graph = Arc::new(graph);
+    let handle = match authority {
+        Some(authority) => spawn_bound_detached_workflow_with_attempt_barriers(
+            &deps.detached,
+            task.clone(),
+            child.input.clone(),
+            graph,
+            run_id,
+            token.clone(),
+            seed,
+            ctx,
+            hub,
+            prompt_dispatch,
+            Some(terminal_barrier),
+            authority,
+        ),
+        None => spawn_detached_workflow_with_attempt_barriers(
+            &deps.detached,
+            task.clone(),
+            child.input.clone(),
+            graph,
+            run_id,
+            token.clone(),
+            seed,
+            ctx,
+            hub,
+            prompt_dispatch,
+            Some(terminal_barrier),
+        ),
+    };
     let task_id = child.id.clone();
     Some((
         Box::pin(async move {
@@ -938,6 +993,54 @@ pub async fn run_admission(
             };
             let task = TaskId::parse(identity.execution_id.as_str().to_string())
                 .expect("execution id is a valid task id");
+            let now = deps.detached.clock.now_ms();
+            let session_cwd = match item.session_cwd.as_deref().map(SessionCwd::parse) {
+                Some(Ok(cwd)) => Some(cwd),
+                Some(Err(_)) => {
+                    drop(permit);
+                    fail_batch_unavailable(&deps, &bid).await;
+                    claim_failed = true;
+                    break;
+                }
+                None => None,
+            };
+            let admitted = match deps.detached.workflow_admission.as_ref() {
+                Some(admission) => match admission
+                    .freeze(bridge_workflow::admission::WorkflowAdmissionRequestV1 {
+                        attempt_id: identity.attempt_id.clone(),
+                        graph: graph.clone(),
+                        requested_session_cwd: session_cwd.clone(),
+                        policy_invocation:
+                            bridge_core::execution_policy::ExecutionPolicyInvocationV1::default(),
+                        ledger_admission:
+                            bridge_core::execution_policy::LedgerAdmissionV1::DurablePrimaryTaskStore,
+                    })
+                    .await
+                {
+                    Ok(authority) => Some(authority),
+                    Err(error) => {
+                        tracing::warn!(batch = bid.as_str(), error = ?error, "batch child frozen admission refused");
+                        drop(permit);
+                        fail_batch_unavailable(&deps, &bid).await;
+                        claim_failed = true;
+                        break;
+                    }
+                },
+                None => None,
+            };
+            let workflow_spec_json = match admitted.as_ref() {
+                Some(authority) => match encode_workflow_run_spec(&authority.run_spec) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        tracing::warn!(batch = bid.as_str(), error = ?error, "batch child frozen snapshot encoding failed");
+                        drop(permit);
+                        fail_batch_unavailable(&deps, &bid).await;
+                        claim_failed = true;
+                        break;
+                    }
+                },
+                None => Some(encode_workflow_spec(&graph)),
+            };
             let hub = Arc::new(TaskProgressHub::new());
             let ctok = CancellationToken::new();
             deps.detached
@@ -950,12 +1053,6 @@ pub async fn run_admission(
                 .lock()
                 .await
                 .insert(task.clone(), ctok.clone());
-
-            let now = deps.detached.clock.now_ms();
-            let session_cwd = item
-                .session_cwd
-                .as_deref()
-                .and_then(|raw| SessionCwd::parse(raw).ok());
             let rec = TaskRecord {
                 id: task.clone(),
                 workflow: workflow.as_str().to_string(),
@@ -966,9 +1063,12 @@ pub async fn run_admission(
                 updated_ms: now,
                 last_artifact_ms: None,
                 input: item.input.clone(),
-                workflow_spec_json: Some(encode_workflow_spec(&graph)),
+                workflow_spec_json,
                 resume_attempts: 0,
-                session_cwd: session_cwd.as_ref().map(|c| c.as_str().to_string()),
+                session_cwd: admitted
+                    .is_none()
+                    .then(|| session_cwd.as_ref().map(|c| c.as_str().to_string()))
+                    .flatten(),
                 batch_id: Some(bid.clone()),
                 item_id: Some(item.item_id.clone()),
                 artifacts_purged_at: None,
@@ -985,21 +1085,26 @@ pub async fn run_admission(
                 .await
             {
                 Ok(ChildClaim::Created) => {
-                    let (workload_fingerprint, workload_fingerprint_complete) = deps
-                        .detached
-                        .executor
+                    let (workload_fingerprint, workload_fingerprint_complete) = match admitted
                         .as_ref()
-                        .map(|executor| executor.workload_fingerprint(&graph))
-                        .unwrap_or_else(|| {
-                            bridge_workflow::graph::workload_fingerprint_with(&graph, |_| None)
-                        });
+                    {
+                        Some(authority) => (authority.run_spec.workload_fingerprint.clone(), true),
+                        None => deps
+                            .detached
+                            .executor
+                            .as_ref()
+                            .map(|executor| executor.workload_fingerprint(&graph))
+                            .unwrap_or_else(|| {
+                                bridge_workflow::graph::workload_fingerprint_with(&graph, |_| None)
+                            }),
+                    };
                     let reservation = bridge_core::workflow_history::AttemptReservation {
                         identity: identity.clone(),
                         task_id: Some(task.clone()),
                         workflow: workflow.as_str().to_string(),
                         task_class: "workflow".into(),
                         surface: bridge_core::workflow_history::ExecutionSurface::ServedTask,
-                        policy: "r2f0a".into(),
+                        policy: if admitted.is_some() { "r2f1a" } else { "r2f0a" }.into(),
                         workload_fingerprint,
                         started_ms: now,
                         workload_fingerprint_complete,
@@ -1120,25 +1225,42 @@ pub async fn run_admission(
                         continue;
                     }
 
-                    let handle = spawn_detached_workflow_with_attempt_barriers(
-                        &deps.detached,
-                        task.clone(),
-                        item.input.clone(),
-                        graph,
-                        identity.run_id().to_string(),
-                        ctok.clone(),
-                        HashMap::new(),
-                        WorkflowRunContext {
-                            session_cwd,
-                            task_id: Some(task.clone()),
-                            make_rich_sink: None,
-                            observer: deps.detached.observer.clone(),
-                            ..WorkflowRunContext::default()
-                        },
-                        hub,
-                        prompt_dispatch,
-                        Some(terminal_barrier),
-                    );
+                    let run_context = WorkflowRunContext {
+                        session_cwd,
+                        task_id: Some(task.clone()),
+                        make_rich_sink: None,
+                        observer: deps.detached.observer.clone(),
+                        ..WorkflowRunContext::default()
+                    };
+                    let handle = match admitted {
+                        Some(authority) => spawn_bound_detached_workflow_with_attempt_barriers(
+                            &deps.detached,
+                            task.clone(),
+                            item.input.clone(),
+                            graph,
+                            identity.run_id().to_string(),
+                            ctok.clone(),
+                            HashMap::new(),
+                            run_context,
+                            hub,
+                            prompt_dispatch,
+                            Some(terminal_barrier),
+                            authority,
+                        ),
+                        None => spawn_detached_workflow_with_attempt_barriers(
+                            &deps.detached,
+                            task.clone(),
+                            item.input.clone(),
+                            graph,
+                            identity.run_id().to_string(),
+                            ctok.clone(),
+                            HashMap::new(),
+                            run_context,
+                            hub,
+                            prompt_dispatch,
+                            Some(terminal_barrier),
+                        ),
+                    };
                     live.insert(task.clone(), ctok);
                     let queue_guard = queue_guard;
                     inflight.push(Box::pin(async move {
@@ -1558,6 +1680,7 @@ mod tests {
                 clock: Arc::new(ManualClock::new(100)),
                 observer: Arc::new(NoopObserver),
                 workflow_history: None,
+                workflow_admission: None,
             },
             runtime: BatchRuntime::new(max, max, Arc::new(NoopObserver)),
             allowed_cwd_root: None,
@@ -1588,6 +1711,7 @@ mod tests {
                 clock: Arc::new(ManualClock::new(100)),
                 observer: Arc::new(NoopObserver),
                 workflow_history: Some(Ok(history.clone())),
+                workflow_admission: None,
             },
             runtime: BatchRuntime::new(max, max, Arc::new(NoopObserver)),
             allowed_cwd_root: None,
@@ -1619,6 +1743,7 @@ mod tests {
                 clock: Arc::new(ManualClock::new(100)),
                 observer: turnlog.clone(),
                 workflow_history: None,
+                workflow_admission: None,
             },
             runtime: BatchRuntime::new(max, max, Arc::new(NoopObserver)),
             allowed_cwd_root: None,

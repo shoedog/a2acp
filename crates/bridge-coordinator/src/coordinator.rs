@@ -31,6 +31,7 @@ use crate::batch::{BatchDeps, BatchParams, BatchRuntime};
 use crate::clock::Clock;
 use crate::detached::{
     reconcile_pending_terminal_projections, reconcile_terminal_checkpoints, resume_working_tasks,
+    spawn_bound_detached_workflow_with_attempt_barriers,
     spawn_detached_workflow_with_attempt_barriers, workflow_prompt_dispatch_barrier_with_state,
     workflow_terminal_summary_barrier, AttemptTelemetryState, DetachedDeps, TaskProgressHub,
 };
@@ -620,6 +621,7 @@ pub struct Coordinator {
             bridge_core::workflow_history::LedgerUnavailableReason,
         >,
     >,
+    workflow_admission: Option<Arc<bridge_workflow::admission::WorkflowAdmissionV1>>,
 }
 
 pub fn apply_permit(reg: &PermissionRegistry, p: &PermitParams) -> bool {
@@ -674,7 +676,17 @@ impl Coordinator {
             workflow_history: Some(Err(
                 bridge_core::workflow_history::LedgerUnavailableReason::Open,
             )),
+            workflow_admission: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_workflow_admission(
+        mut self,
+        admission: Arc<bridge_workflow::admission::WorkflowAdmissionV1>,
+    ) -> Self {
+        self.workflow_admission = Some(admission);
+        self
     }
 
     #[must_use]
@@ -758,6 +770,11 @@ impl Coordinator {
     > {
         self.workflow_history.clone()
     }
+    pub fn workflow_admission(
+        &self,
+    ) -> Option<Arc<bridge_workflow::admission::WorkflowAdmissionV1>> {
+        self.workflow_admission.clone()
+    }
     pub fn allowed_cwd_root(&self) -> Option<SessionCwd> {
         self.allowed_cwd_root.clone()
     }
@@ -822,6 +839,7 @@ impl Coordinator {
             clock: self.clock.clone(),
             observer: self.observer.clone(),
             workflow_history: self.workflow_history.clone(),
+            workflow_admission: self.workflow_admission.clone(),
         }
     }
 
@@ -1539,6 +1557,28 @@ impl Coordinator {
             }
             None => bridge_core::ids::AttemptIdentity::initial()?,
         };
+        let admitted = match self.workflow_admission.as_ref() {
+            Some(admission) => Some(
+                admission
+                    .freeze(bridge_workflow::admission::WorkflowAdmissionRequestV1 {
+                        attempt_id: identity.attempt_id.clone(),
+                        graph: graph.clone(),
+                        requested_session_cwd: session_cwd.clone(),
+                        policy_invocation:
+                            bridge_core::execution_policy::ExecutionPolicyInvocationV1::default(),
+                        ledger_admission:
+                            bridge_core::execution_policy::LedgerAdmissionV1::DurablePrimaryTaskStore,
+                    })
+                    .await?,
+            ),
+            None => None,
+        };
+        let workflow_spec_json = match admitted.as_ref() {
+            Some(authority) => Some(crate::detached::encode_workflow_run_spec(
+                &authority.run_spec,
+            )?),
+            None => Some(crate::detached::encode_workflow_spec(&graph)),
+        };
         let task = TaskId::parse(identity.execution_id.as_str().to_string())?;
         let now = self.clock.now_ms();
         let attempt_started = Instant::now();
@@ -1566,9 +1606,12 @@ impl Coordinator {
             updated_ms: now,
             last_artifact_ms: None,
             input: input.clone(),
-            workflow_spec_json: Some(crate::detached::encode_workflow_spec(&graph)),
+            workflow_spec_json,
             resume_attempts: 0,
-            session_cwd: session_cwd.as_ref().map(|c| c.as_str().to_string()),
+            session_cwd: admitted
+                .is_none()
+                .then(|| session_cwd.as_ref().map(|c| c.as_str().to_string()))
+                .flatten(),
             batch_id: None,
             item_id: None,
             artifacts_purged_at: None,
@@ -1591,15 +1634,17 @@ impl Coordinator {
             return Err(error);
         }
 
-        let (workload_fingerprint, workload_fingerprint_complete) =
-            bridge_workflow::graph::workload_fingerprint(&graph, self.registry.as_ref());
+        let (workload_fingerprint, workload_fingerprint_complete) = match admitted.as_ref() {
+            Some(authority) => (authority.run_spec.workload_fingerprint.clone(), true),
+            None => bridge_workflow::graph::workload_fingerprint(&graph, self.registry.as_ref()),
+        };
         let reservation = bridge_core::workflow_history::AttemptReservation {
             identity: identity.clone(),
             task_id: Some(task.clone()),
             workflow: wf_id.as_str().to_string(),
             task_class: "workflow".into(),
             surface: bridge_core::workflow_history::ExecutionSurface::ServedTask,
-            policy: "r2f0a".into(),
+            policy: if admitted.is_some() { "r2f1a" } else { "r2f0a" }.into(),
             workload_fingerprint,
             started_ms: now,
             workload_fingerprint_complete,
@@ -1713,25 +1758,43 @@ impl Coordinator {
             attempt_started,
             0,
         );
-        let runner = spawn_detached_workflow_with_attempt_barriers(
-            &self.detached_deps(),
-            task.clone(),
-            input,
-            graph,
-            identity.run_id().to_string(),
-            token.clone(),
-            HashMap::new(),
-            WorkflowRunContext {
-                session_cwd,
-                task_id: Some(task.clone()),
-                make_rich_sink: None,
-                observer: self.observer.clone(),
-                ..WorkflowRunContext::default()
-            },
-            hub,
-            prompt_dispatch,
-            Some(terminal_barrier),
-        );
+        let deps = self.detached_deps();
+        let run_context = WorkflowRunContext {
+            session_cwd,
+            task_id: Some(task.clone()),
+            make_rich_sink: None,
+            observer: self.observer.clone(),
+            ..WorkflowRunContext::default()
+        };
+        let runner = match admitted {
+            Some(authority) => spawn_bound_detached_workflow_with_attempt_barriers(
+                &deps,
+                task.clone(),
+                input,
+                graph,
+                identity.run_id().to_string(),
+                token.clone(),
+                HashMap::new(),
+                run_context,
+                hub,
+                prompt_dispatch,
+                Some(terminal_barrier),
+                authority,
+            ),
+            None => spawn_detached_workflow_with_attempt_barriers(
+                &deps,
+                task.clone(),
+                input,
+                graph,
+                identity.run_id().to_string(),
+                token.clone(),
+                HashMap::new(),
+                run_context,
+                hub,
+                prompt_dispatch,
+                Some(terminal_barrier),
+            ),
+        };
         if let Some(context) = context {
             let workflow_runs = self.workflow_runs.clone();
             tokio::spawn(async move {
@@ -2229,6 +2292,10 @@ mod tests {
 
         async fn apply(&self, _snapshot: RegistrySnapshot) -> Result<(), BridgeError> {
             Ok(())
+        }
+
+        fn entry_snapshot(&self, id: &AgentId) -> Option<Arc<AgentEntry>> {
+            (*id == self.entry.id).then(|| Arc::new(self.entry.clone()))
         }
 
         fn list(&self) -> Vec<AgentId> {
@@ -5226,6 +5293,52 @@ mod tests {
             "task creates must be non-clobbering"
         );
     }
+
+    #[tokio::test]
+    async fn admitted_workflow_persists_v2_and_not_legacy_task_cwd() {
+        let gate = Arc::new(Notify::new());
+        let mut workflows = HashMap::new();
+        workflows.insert(
+            WorkflowId::parse("code-review").unwrap(),
+            workflow("code-review"),
+        );
+        let fixture = coordinator_fixture_with_backend(
+            Arc::new(workflows),
+            Arc::new(FakeBackend::new(Some(gate))),
+        );
+        let admission = Arc::new(bridge_workflow::admission::WorkflowAdmissionV1::new(
+            fixture.coordinator.registry(),
+            Arc::new(bridge_workflow::admission::DirectWorkflowCheckoutPlannerV1),
+            SessionCwd::parse("/launch").unwrap(),
+            None,
+        ));
+        let coordinator = fixture.coordinator.with_workflow_admission(admission);
+
+        let id = coordinator.run_workflow(workflow_params()).await.unwrap();
+        let record = fixture.task_store.get(&id).await.unwrap().unwrap();
+        assert_eq!(record.session_cwd, None);
+        let decoded =
+            crate::detached::decode_workflow_spec(record.workflow_spec_json.as_deref().unwrap())
+                .unwrap();
+        let crate::detached::DecodedWorkflowSpec::BoundV2(run_spec) = decoded else {
+            panic!("admitted production shape must persist snapshot V2");
+        };
+        assert_eq!(
+            run_spec.requested_session_cwd,
+            Some(SessionCwd::parse("/tmp/repo").unwrap())
+        );
+        assert_eq!(
+            run_spec.ledger_admission,
+            bridge_core::execution_policy::LedgerAdmissionV1::DurablePrimaryTaskStore
+        );
+        let locator = fixture
+            .task_store
+            .get_attempt_locator(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run_spec.attempt_id, locator.identity.attempt_id);
+    }
     #[tokio::test]
     async fn healthy_workflow_persists_calibration_eligible_measurements() {
         let mut workflows = HashMap::new();
@@ -5536,6 +5649,7 @@ mod tests {
             clock: Arc::new(ManualClock::new(10)),
             observer: Arc::new(NoopObserver),
             workflow_history: Some(Ok(history_dyn)),
+            workflow_admission: None,
         };
         (deps, history, identity, task, locator)
     }

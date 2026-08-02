@@ -373,6 +373,7 @@ pub struct DetachedDeps {
             bridge_core::workflow_history::LedgerUnavailableReason,
         >,
     >,
+    pub workflow_admission: Option<Arc<bridge_workflow::admission::WorkflowAdmissionV1>>,
 }
 
 /// Sticky, process-local telemetry degradation paired with the best-effort durable
@@ -1852,6 +1853,7 @@ mod sink_tests {
             clock: Arc::new(crate::clock::SystemClock),
             observer: Arc::new(bridge_observ::NoopObserver),
             workflow_history: Some(Ok(selected)),
+            workflow_admission: None,
         };
         assert!(reconcile_pending_terminal_projections(&deps).await);
         assert_eq!(
@@ -3244,10 +3246,72 @@ pub fn spawn_detached_workflow_with_attempt_barriers(
     run_id: String,
     token: CancellationToken,
     seed: HashMap<String, (String, bool, Option<bridge_core::orch::UsageSnapshot>)>,
+    ctx: WorkflowRunContext,
+    hub: Arc<TaskProgressHub>,
+    prompt_dispatch: Option<PromptDispatchBarrier>,
+    terminal_barrier: Option<TerminalSummaryBarrier>,
+) -> tokio::task::JoinHandle<bool> {
+    spawn_detached_workflow_inner(
+        deps,
+        task,
+        input,
+        graph,
+        run_id,
+        token,
+        seed,
+        ctx,
+        hub,
+        prompt_dispatch,
+        terminal_barrier,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_bound_detached_workflow_with_attempt_barriers(
+    deps: &DetachedDeps,
+    task: TaskId,
+    input: String,
+    graph: Arc<WorkflowGraph>,
+    run_id: String,
+    token: CancellationToken,
+    seed: HashMap<String, (String, bool, Option<bridge_core::orch::UsageSnapshot>)>,
+    ctx: WorkflowRunContext,
+    hub: Arc<TaskProgressHub>,
+    prompt_dispatch: Option<PromptDispatchBarrier>,
+    terminal_barrier: Option<TerminalSummaryBarrier>,
+    authority: bridge_workflow::admission::AdmittedWorkflowRunV1,
+) -> tokio::task::JoinHandle<bool> {
+    spawn_detached_workflow_inner(
+        deps,
+        task,
+        input,
+        graph,
+        run_id,
+        token,
+        seed,
+        ctx,
+        hub,
+        prompt_dispatch,
+        terminal_barrier,
+        Some(authority),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_detached_workflow_inner(
+    deps: &DetachedDeps,
+    task: TaskId,
+    input: String,
+    graph: Arc<WorkflowGraph>,
+    run_id: String,
+    token: CancellationToken,
+    seed: HashMap<String, (String, bool, Option<bridge_core::orch::UsageSnapshot>)>,
     mut ctx: WorkflowRunContext,
     hub: Arc<TaskProgressHub>,
     prompt_dispatch: Option<PromptDispatchBarrier>,
     terminal_barrier: Option<TerminalSummaryBarrier>,
+    authority: Option<bridge_workflow::admission::AdmittedWorkflowRunV1>,
 ) -> tokio::task::JoinHandle<bool> {
     if ctx.make_rich_sink.is_none() {
         if let Some(barrier) = terminal_barrier.as_ref() {
@@ -3360,6 +3424,32 @@ pub fn spawn_detached_workflow_with_attempt_barriers(
         let diagnostic_context = WorkflowDiagnosticContext::new(ctx, diagnostic_factory);
         let diagnostic_context = match prompt_dispatch {
             Some(barrier) => diagnostic_context.with_prompt_dispatch_barrier(barrier),
+            None => diagnostic_context,
+        };
+        let diagnostic_context = match authority {
+            Some(authority) => match diagnostic_context
+                .with_frozen_run_spec(authority.run_spec, authority.provider_effect_key)
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::warn!(task = task.as_str(), error = ?error, "frozen workflow authority refused before execution");
+                    let _ = finalize_detached_with_barrier(
+                        &deps.task_store,
+                        &deps.progress_hubs,
+                        &task,
+                        bridge_core::task_store::TaskRecordStatus::Failed,
+                        None,
+                        Some("frozen workflow authority refused"),
+                        Some(&hub),
+                        terminal_barrier.as_ref(),
+                        "not_needed",
+                    )
+                    .await;
+                    fin.done = true;
+                    deps.workflow_cancels.lock().await.remove(&task);
+                    return false;
+                }
+            },
             None => diagnostic_context,
         };
         let stream = executor.run_from_with_diagnostic_context(
@@ -3512,10 +3602,8 @@ pub async fn spawn_detached_workflow_with_token_for_test(
     )
 }
 
-/// The only snapshot schema version this server can resume. The forward-compat door:
-/// a snapshot whose `v` field does not match this const is treated as unreadable and
-/// the task is marked `Interrupted` rather than mis-deserialized.
-pub const SUPPORTED_SNAPSHOT_VERSION: u32 = 1;
+pub const LEGACY_SNAPSHOT_VERSION: u16 = 1;
+pub const SUPPORTED_SNAPSHOT_VERSION: u16 = bridge_workflow::run_spec::WORKFLOW_SNAPSHOT_V2;
 
 /// The persisted workflow-spec snapshot envelope (mirrors the `{"v":1,"graph":...}`
 /// written at detached-submit time — see the `RouteTarget::Workflow` arm of
@@ -3526,11 +3614,43 @@ pub const SUPPORTED_SNAPSHOT_VERSION: u32 = 1;
 /// which may have changed since).
 #[derive(serde::Deserialize)]
 pub struct WorkflowSpecEnvelope {
-    v: u32,
+    v: u16,
     graph: bridge_workflow::graph::WorkflowGraph,
 }
 
-/// Serialize the persisted workflow-spec snapshot envelope (`{"v":SUPPORTED_SNAPSHOT_VERSION,"graph":…}`).
+#[derive(serde::Deserialize)]
+struct WorkflowSpecVersion {
+    v: u16,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DecodedWorkflowSpec {
+    LegacyV1(bridge_workflow::graph::WorkflowGraph),
+    BoundV2(bridge_workflow::run_spec::WorkflowRunSpecV1),
+}
+
+impl DecodedWorkflowSpec {
+    pub fn graph(&self) -> &bridge_workflow::graph::WorkflowGraph {
+        match self {
+            Self::LegacyV1(graph) => graph,
+            Self::BoundV2(run_spec) => &run_spec.graph,
+        }
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        bridge_workflow::graph::WorkflowGraph,
+        Option<bridge_workflow::run_spec::WorkflowRunSpecV1>,
+    ) {
+        match self {
+            Self::LegacyV1(graph) => (graph, None),
+            Self::BoundV2(run_spec) => (run_spec.graph.clone(), Some(run_spec)),
+        }
+    }
+}
+
+/// Serialize the legacy persisted workflow-spec snapshot envelope (`{"v":1,"graph":…}`).
 ///
 /// This is the SINGLE construction site for that snapshot: BOTH detached-submit surfaces
 /// — [`crate::Coordinator::run_workflow`] and the A2A `unary_message` `RouteTarget::Workflow` arm —
@@ -3539,19 +3659,48 @@ pub struct WorkflowSpecEnvelope {
 /// which would have silently diverged from the Coordinator on a version bump; routing both through
 /// this helper closes that gap.
 pub fn encode_workflow_spec(graph: &bridge_workflow::graph::WorkflowGraph) -> String {
-    serde_json::json!({ "v": SUPPORTED_SNAPSHOT_VERSION, "graph": graph }).to_string()
+    serde_json::json!({ "v": LEGACY_SNAPSHOT_VERSION, "graph": graph }).to_string()
+}
+
+pub fn encode_workflow_run_spec(
+    run_spec: &bridge_workflow::run_spec::WorkflowRunSpecV1,
+) -> Result<String, bridge_core::error::BridgeError> {
+    String::from_utf8(
+        run_spec
+            .encode_snapshot_v2()
+            .map_err(|_| bridge_core::error::BridgeError::StoreFailure)?,
+    )
+    .map_err(|_| bridge_core::error::BridgeError::StoreFailure)
+}
+
+pub fn decode_workflow_spec(
+    spec_json: &str,
+) -> Result<DecodedWorkflowSpec, bridge_core::error::BridgeError> {
+    let version: WorkflowSpecVersion = serde_json::from_str(spec_json)
+        .map_err(|_| bridge_core::error::BridgeError::StoreFailure)?;
+    match version.v {
+        LEGACY_SNAPSHOT_VERSION => {
+            let envelope: WorkflowSpecEnvelope = serde_json::from_str(spec_json)
+                .map_err(|_| bridge_core::error::BridgeError::StoreFailure)?;
+            if envelope.v != LEGACY_SNAPSHOT_VERSION {
+                return Err(bridge_core::error::BridgeError::StoreFailure);
+            }
+            Ok(DecodedWorkflowSpec::LegacyV1(envelope.graph))
+        }
+        SUPPORTED_SNAPSHOT_VERSION => Ok(DecodedWorkflowSpec::BoundV2(
+            bridge_workflow::run_spec::WorkflowRunSpecV1::decode_snapshot_v2(spec_json.as_bytes())
+                .map_err(|_| bridge_core::error::BridgeError::StoreFailure)?,
+        )),
+        _ => Err(bridge_core::error::BridgeError::StoreFailure),
+    }
 }
 
 pub fn workflow_spec_node_ids(
     spec_json: &str,
 ) -> Result<std::collections::BTreeSet<bridge_core::ids::NodeId>, bridge_core::error::BridgeError> {
-    let env: WorkflowSpecEnvelope = serde_json::from_str(spec_json)
-        .map_err(|_| bridge_core::error::BridgeError::StoreFailure)?;
-    if env.v != SUPPORTED_SNAPSHOT_VERSION {
-        return Err(bridge_core::error::BridgeError::StoreFailure);
-    }
+    let decoded = decode_workflow_spec(spec_json)?;
     let mut ids = std::collections::BTreeSet::new();
-    for node in env.graph.nodes {
+    for node in &decoded.graph().nodes {
         // A node id that fails the strict grammar means the STORED snapshot is corrupt
         // (not a client error) — classify as StoreFailure, consistent with the JSON/version
         // failures above (and so a route surfaces it as 500, not 400).
@@ -3693,9 +3842,9 @@ pub async fn reconcile_terminal_checkpoints(deps: &DetachedDeps) -> bool {
         let Some(spec_json) = record.workflow_spec_json.as_deref() else {
             continue;
         };
-        let graph = match serde_json::from_str::<WorkflowSpecEnvelope>(spec_json) {
-            Ok(envelope) if envelope.v == SUPPORTED_SNAPSHOT_VERSION => envelope.graph,
-            _ => continue,
+        let graph = match decode_workflow_spec(spec_json) {
+            Ok(decoded) => decoded.graph().clone(),
+            Err(_) => continue,
         };
         let Some(terminal_node) = graph.terminal() else {
             continue;
@@ -3913,8 +4062,8 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
     //     won't deserialize into a `WorkflowGraph` all mean "not resumable". The
     //     version check is the forward-compat door (unknown version → Interrupted,
     //     never a panic).
-    let graph = match serde_json::from_str::<WorkflowSpecEnvelope>(spec_json) {
-        Ok(env) if env.v == SUPPORTED_SNAPSHOT_VERSION => env.graph,
+    let decoded = match decode_workflow_spec(spec_json) {
+        Ok(decoded) => decoded,
         _ => {
             if let Err(e) = finalize_detached(
                 &deps.task_store,
@@ -3937,6 +4086,7 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
             return;
         }
     };
+    let (graph, frozen_run_spec) = decoded.into_parts();
 
     // (3) Load checkpoints → seed map keyed by node id: node_id → (output, ok, usage).
     let cps = match deps.task_store.node_checkpoints(&task).await {
@@ -4001,29 +4151,73 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
     // The primary attempt locator is mandatory for every R2f0a served task: a
     // missing/corrupt lineage is interrupted rather than assigned an identity
     // that can be reused after another crash.
-    let ctx = match wt.session_cwd.as_deref() {
-        Some(s) => match bridge_core::SessionCwd::parse(s) {
-            Ok(c) => bridge_workflow::executor::WorkflowRunContext {
-                session_cwd: Some(c),
-                task_id: Some(task.clone()),
-                make_rich_sink: None,
-                observer: deps.observer.clone(),
-                ..bridge_workflow::executor::WorkflowRunContext::default()
-            },
-            Err(_) => {
+    let authority = match frozen_run_spec {
+        Some(run_spec) => {
+            let Some(admission) = deps.workflow_admission.as_ref() else {
                 let _ = finalize_detached(
                     &deps.task_store,
                     &deps.progress_hubs,
                     &task,
                     TaskRecordStatus::Interrupted,
                     None,
-                    Some("not resumable: unreadable session cwd"),
+                    Some("not resumable: frozen workflow admission unavailable"),
                     None,
                 )
                 .await;
                 return;
+            };
+            match admission.restore(run_spec) {
+                Ok(authority) => Some(authority),
+                Err(error) => {
+                    tracing::warn!(task = task.as_str(), error = ?error, "resume scan: frozen workflow authority refused");
+                    let _ = finalize_detached(
+                        &deps.task_store,
+                        &deps.progress_hubs,
+                        &task,
+                        TaskRecordStatus::Interrupted,
+                        None,
+                        Some("not resumable: frozen workflow authority refused"),
+                        None,
+                    )
+                    .await;
+                    return;
+                }
             }
+        }
+        None => None,
+    };
+    let persisted_request_cwd = authority
+        .as_ref()
+        .map(|authority| authority.run_spec.requested_session_cwd.clone());
+    let legacy_cwd = authority
+        .is_none()
+        .then_some(wt.session_cwd.as_deref())
+        .flatten();
+    let ctx = match persisted_request_cwd
+        .flatten()
+        .map(Ok)
+        .or_else(|| legacy_cwd.map(bridge_core::SessionCwd::parse))
+    {
+        Some(Ok(c)) => bridge_workflow::executor::WorkflowRunContext {
+            session_cwd: Some(c),
+            task_id: Some(task.clone()),
+            make_rich_sink: None,
+            observer: deps.observer.clone(),
+            ..bridge_workflow::executor::WorkflowRunContext::default()
         },
+        Some(Err(_)) => {
+            let _ = finalize_detached(
+                &deps.task_store,
+                &deps.progress_hubs,
+                &task,
+                TaskRecordStatus::Interrupted,
+                None,
+                Some("not resumable: unreadable session cwd"),
+                None,
+            )
+            .await;
+            return;
+        }
         None => bridge_workflow::executor::WorkflowRunContext {
             task_id: Some(task.clone()),
             observer: deps.observer.clone(),
@@ -4207,19 +4401,36 @@ pub async fn resume_one_working_task(deps: &DetachedDeps, wt: &TaskRecord, cap: 
                 .await
                 .insert(task.clone(), token.clone());
             let run_id = identity.run_id().to_string();
-            let _handle = spawn_detached_workflow_with_attempt_barriers(
-                deps,
-                task.clone(),
-                wt.input.clone(),
-                Arc::new(graph),
-                run_id.clone(),
-                token,
-                seed,
-                ctx,
-                hub,
-                prompt_dispatch,
-                Some(terminal_barrier),
-            );
+            let graph = Arc::new(graph);
+            let _handle = match authority {
+                Some(authority) => spawn_bound_detached_workflow_with_attempt_barriers(
+                    deps,
+                    task.clone(),
+                    wt.input.clone(),
+                    graph,
+                    run_id.clone(),
+                    token,
+                    seed,
+                    ctx,
+                    hub,
+                    prompt_dispatch,
+                    Some(terminal_barrier),
+                    authority,
+                ),
+                None => spawn_detached_workflow_with_attempt_barriers(
+                    deps,
+                    task.clone(),
+                    wt.input.clone(),
+                    graph,
+                    run_id.clone(),
+                    token,
+                    seed,
+                    ctx,
+                    hub,
+                    prompt_dispatch,
+                    Some(terminal_barrier),
+                ),
+            };
             tracing::info!(task = task.as_str(), attempt, run_id = %run_id, "resume scan: resumed from checkpoints");
         }
         Err(e) => {
@@ -5012,6 +5223,7 @@ mod resume_tests {
             clock: Arc::new(ManualClock::new(100)),
             observer,
             workflow_history: None,
+            workflow_admission: None,
         }
     }
 
@@ -5238,6 +5450,7 @@ mod resume_tests {
             clock: Arc::new(ManualClock::new(100)),
             observer: Arc::new(NoopObserver),
             workflow_history: None,
+            workflow_admission: None,
         };
         let hub = Arc::new(TaskProgressHub::new());
         deps.progress_hubs
@@ -5327,6 +5540,7 @@ mod resume_tests {
             clock: Arc::new(ManualClock::new(100)),
             observer: Arc::new(NoopObserver),
             workflow_history: Some(Ok(history.clone())),
+            workflow_admission: None,
         };
         let hub = Arc::new(TaskProgressHub::new());
         deps.progress_hubs
@@ -5441,6 +5655,7 @@ mod resume_tests {
             clock: Arc::new(ManualClock::new(100)),
             observer: Arc::new(NoopObserver),
             workflow_history: Some(Ok(history.clone())),
+            workflow_admission: None,
         };
         let hub = Arc::new(TaskProgressHub::new());
         deps.progress_hubs
@@ -5614,6 +5829,7 @@ mod resume_tests {
             clock: Arc::new(ManualClock::new(100)),
             observer: Arc::new(NoopObserver),
             workflow_history: None,
+            workflow_admission: None,
         };
 
         let handle = spawn_detached_workflow_for_test(
@@ -5667,6 +5883,7 @@ mod resume_tests {
             clock: Arc::new(ManualClock::new(100)),
             observer: Arc::new(NoopObserver),
             workflow_history: None,
+            workflow_admission: None,
         };
 
         let handle = spawn_detached_workflow_for_test(
@@ -5773,6 +5990,7 @@ mod resume_tests {
             clock: Arc::new(ManualClock::new(100)),
             observer: Arc::new(NoopObserver),
             workflow_history: None,
+            workflow_admission: None,
         };
 
         resume_working_tasks(&deps, 1).await;
@@ -5827,6 +6045,7 @@ mod resume_tests {
             clock: Arc::new(ManualClock::new(100)),
             observer: Arc::new(NoopObserver),
             workflow_history: None,
+            workflow_admission: None,
         };
 
         resume_working_tasks(&deps, 1).await;
@@ -5878,7 +6097,7 @@ mod frame_tests {
     // arm, and it round-trips through the resume-path `WorkflowSpecEnvelope` at the supported
     // version. If these ever drift, a detached task submitted on one surface can't be resumed.
     #[test]
-    fn workflow_spec_envelope_round_trips_at_supported_version() {
+    fn legacy_workflow_spec_envelope_round_trips_at_v1() {
         use bridge_core::ids::{AgentId, NodeId, WorkflowId};
         use bridge_workflow::graph::{WorkflowGraph, WorkflowNode};
         let graph = WorkflowGraph {
@@ -5896,7 +6115,7 @@ mod frame_tests {
         };
         let json = encode_workflow_spec(&graph);
         let env: WorkflowSpecEnvelope = serde_json::from_str(&json).unwrap();
-        assert_eq!(env.v, SUPPORTED_SNAPSHOT_VERSION);
+        assert_eq!(env.v, LEGACY_SNAPSHOT_VERSION);
         assert_eq!(env.graph.id.as_str(), "code-review");
         assert_eq!(env.graph.nodes.len(), 1);
     }
