@@ -1,5 +1,5 @@
 //! Bounded R2f0a workflow-attempt history domain and storage port.
-use crate::ids::{AttemptId, AttemptIdentity, TaskId};
+use crate::ids::{AttemptId, AttemptIdentity, NodeId, TaskId};
 
 pub const RETENTION_DAYS: i64 = 180;
 pub const MAX_TERMINAL_ROWS: u64 = 100_000;
@@ -16,6 +16,7 @@ pub const MAX_FINGERPRINT_LEN: usize = 128;
 pub const MAX_PHASES: usize = 32;
 pub const MAX_RESERVATION_JSON_BYTES: usize = 4 * 1024;
 pub const MAX_TERMINAL_JSON_BYTES: usize = 8 * 1024;
+pub const WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1: u16 = 1;
 
 /// Hash a canonical, prompt-free configured workload shape into a bounded
 /// partition dimension. The caller owns canonicalization; only the digest is
@@ -198,6 +199,98 @@ impl AttemptReservation {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryNodeReservationV1 {
+    pub node: NodeId,
+    pub sorted_ordinal: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptReservationV2 {
+    pub schema_version: u16,
+    pub reservation: AttemptReservation,
+    pub controls_json: String,
+    pub controls_fingerprint: String,
+    pub expected_node_count: u32,
+    pub nodes: Vec<HistoryNodeReservationV1>,
+}
+
+impl AttemptReservationV2 {
+    pub fn validate(&self) -> Result<(), LedgerError> {
+        self.reservation.validate()?;
+        if self.schema_version != WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1
+            || !bounded(&self.controls_fingerprint, MAX_FINGERPRINT_LEN)
+            || self.controls_json.len() > crate::execution_policy::MAX_CONTROLS_JSON_BYTES
+            || usize::try_from(self.expected_node_count).ok() != Some(self.nodes.len())
+            || self.nodes.is_empty()
+        {
+            return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+        }
+        let controls: crate::execution_policy::FrozenWorkflowControlsV1 =
+            serde_json::from_str(&self.controls_json)
+                .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        if controls
+            .encode_canonical()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?
+            != self.controls_json.as_bytes()
+        {
+            return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+        }
+        for (ordinal, node) in self.nodes.iter().enumerate() {
+            let ordinal = u32::try_from(ordinal)
+                .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+            if node.sorted_ordinal != ordinal
+                || self
+                    .nodes
+                    .get(ordinal as usize + 1)
+                    .is_some_and(|next| node.node.as_str() >= next.node.as_str())
+            {
+                return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn node(&self, id: &NodeId) -> Option<&HistoryNodeReservationV1> {
+        self.nodes
+            .binary_search_by(|candidate| candidate.node.cmp(id))
+            .ok()
+            .and_then(|index| self.nodes.get(index))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryNodeTerminalV1 {
+    pub node: NodeId,
+    pub sorted_ordinal: u32,
+    pub terminal_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptStructuredEvidenceV1 {
+    pub reservation: AttemptReservationV2,
+    pub node_terminals: Vec<HistoryNodeTerminalV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_trigger_json: Option<String>,
+}
+
+#[must_use]
+pub fn node_terminal_placeholder_v1() -> String {
+    let payload =
+        "x".repeat(crate::execution_policy::MAX_NODE_TERMINAL_JSON_BYTES.saturating_sub(2));
+    let encoded = serde_json::to_string(&payload).expect("JSON string encoding is infallible");
+    debug_assert_eq!(
+        encoded.len(),
+        crate::execution_policy::MAX_NODE_TERMINAL_JSON_BYTES
+    );
+    encoded
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NodeCounts {
@@ -407,6 +500,32 @@ pub enum TerminalWrite {
 #[async_trait::async_trait]
 pub trait WorkflowHistoryStore: Send + Sync {
     async fn reserve(&self, row: &AttemptReservation) -> Result<(), LedgerError>;
+    /// Admit one structured workflow attempt and its complete node-placeholder
+    /// roster atomically before any provider effect. Implementations that do
+    /// not own the R2f1a history schema must fail closed.
+    async fn reserve_v2(&self, _row: &AttemptReservationV2) -> Result<(), LedgerError> {
+        Err(LedgerError::new(LedgerUnavailableReason::Schema))
+    }
+    /// Replace one admitted placeholder with its canonical terminal. When a
+    /// policy trigger is supplied, the selected terminal and attempt-level
+    /// trigger must share this one durable transition.
+    async fn commit_node_terminal_v2(
+        &self,
+        _id: &AttemptId,
+        _node: &NodeId,
+        _terminal_json: &str,
+        _policy_trigger_json: Option<&str>,
+    ) -> Result<TerminalWrite, LedgerError> {
+        Err(LedgerError::new(LedgerUnavailableReason::Schema))
+    }
+    /// Read the exact structured reservation, committed node terminals, and
+    /// trigger without reconstructing missing evidence from legacy fields.
+    async fn structured_evidence_v2(
+        &self,
+        _id: &AttemptId,
+    ) -> Result<Option<AttemptStructuredEvidenceV1>, LedgerError> {
+        Ok(None)
+    }
     /// Persist the conservative prompt-dispatch state before polling a provider prompt.
     /// Values are a closed vocabulary owned by the caller (`not_dispatched` or
     /// `dispatch_uncertain`) and may only advance from the former to the latter.
@@ -996,20 +1115,31 @@ pub struct MemoryWorkflowHistoryStore {
     rows: std::sync::Mutex<
         std::collections::BTreeMap<String, (AttemptReservation, Option<AttemptTerminal>)>,
     >,
+    structured: std::sync::Mutex<std::collections::BTreeMap<String, MemoryStructuredAttemptV1>>,
     activity: std::sync::Mutex<
         std::collections::BTreeMap<String, crate::attempt_activity::ActivityTally>,
     >,
+}
+
+#[derive(Clone)]
+struct MemoryStructuredAttemptV1 {
+    reservation: AttemptReservationV2,
+    node_terminals: std::collections::BTreeMap<NodeId, Option<String>>,
+    policy_trigger_json: Option<String>,
 }
 
 impl MemoryWorkflowHistoryStore {
     pub fn new() -> Self {
         Self::default()
     }
-}
 
-#[async_trait::async_trait]
-impl WorkflowHistoryStore for MemoryWorkflowHistoryStore {
-    async fn reserve(&self, row: &AttemptReservation) -> Result<(), LedgerError> {
+    fn reserve_row_locked(
+        rows: &mut std::collections::BTreeMap<
+            String,
+            (AttemptReservation, Option<AttemptTerminal>),
+        >,
+        row: &AttemptReservation,
+    ) -> Result<(), LedgerError> {
         row.validate()?;
         if matches!(
             row.surface,
@@ -1021,10 +1151,6 @@ impl WorkflowHistoryStore for MemoryWorkflowHistoryStore {
         {
             return Err(LedgerError::new(LedgerUnavailableReason::Schema));
         }
-        let mut rows = self
-            .rows
-            .lock()
-            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
         if rows.contains_key(row.identity.attempt_id.as_str())
             || rows.values().any(|(existing, _)| {
                 existing.identity.execution_id == row.identity.execution_id
@@ -1082,6 +1208,244 @@ impl WorkflowHistoryStore for MemoryWorkflowHistoryStore {
         Ok(())
     }
 
+    fn validate_complete_structured_attempt(
+        id: &AttemptId,
+        structured: &MemoryStructuredAttemptV1,
+    ) -> Result<(), LedgerError> {
+        use crate::execution_policy::{
+            ControlEventIdV1, FanOutPolicyNameV1, FanOutPolicyV1, FrozenWorkflowControlsV1,
+            NodePrimaryDispositionV1, NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1,
+        };
+
+        if structured.node_terminals.values().any(Option::is_none) {
+            return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+        }
+        let controls: FrozenWorkflowControlsV1 =
+            serde_json::from_str(&structured.reservation.controls_json)
+                .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        let mut trigger_mentions = 0_usize;
+        let mut qualifying_failure = false;
+        let mut selected_terminal_valid = false;
+        let trigger = structured
+            .policy_trigger_json
+            .as_deref()
+            .map(|encoded| {
+                PolicyTriggerV1::decode_canonical(encoded.as_bytes())
+                    .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))
+            })
+            .transpose()?;
+        for admitted in &structured.reservation.nodes {
+            let encoded = structured
+                .node_terminals
+                .get(&admitted.node)
+                .and_then(Option::as_deref)
+                .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
+            let terminal = NodeTerminalV1::decode_canonical(encoded.as_bytes())
+                .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+            qualifying_failure |= matches!(
+                terminal.primary,
+                NodePrimaryDispositionV1::Failed | NodePrimaryDispositionV1::TimedOut
+            );
+            if let Some(trigger_id) = terminal.policy_trigger_id.as_ref() {
+                trigger_mentions = trigger_mentions.saturating_add(1);
+                if let Some(trigger) = trigger.as_ref() {
+                    selected_terminal_valid |= trigger_id == &trigger.id
+                        && trigger.node
+                            == PolicyNodeRefV1::from_node_id(
+                                admitted.sorted_ordinal,
+                                admitted.node.as_str(),
+                            )
+                        && matches!(
+                            terminal.primary,
+                            NodePrimaryDispositionV1::Failed | NodePrimaryDispositionV1::TimedOut
+                        );
+                }
+            }
+        }
+        match trigger {
+            Some(trigger) => {
+                let expected_grace = match controls.fan_out {
+                    FanOutPolicyV1::FixedGrace { grace_ms } => Some(grace_ms),
+                    FanOutPolicyV1::BoundedIndependent | FanOutPolicyV1::FailFast => None,
+                };
+                if matches!(controls.fan_out, FanOutPolicyV1::BoundedIndependent)
+                    || trigger.id != ControlEventIdV1::for_attempt(id, 0)
+                    || trigger.policy != FanOutPolicyNameV1::from(&controls.fan_out)
+                    || trigger.grace_ms != expected_grace
+                    || trigger_mentions != 1
+                    || !selected_terminal_valid
+                {
+                    return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+                }
+            }
+            None => {
+                if trigger_mentions != 0
+                    || (qualifying_failure
+                        && !matches!(controls.fan_out, FanOutPolicyV1::BoundedIndependent))
+                {
+                    return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkflowHistoryStore for MemoryWorkflowHistoryStore {
+    async fn reserve(&self, row: &AttemptReservation) -> Result<(), LedgerError> {
+        let mut rows = self
+            .rows
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
+        Self::reserve_row_locked(&mut rows, row)
+    }
+
+    async fn reserve_v2(&self, row: &AttemptReservationV2) -> Result<(), LedgerError> {
+        row.validate()?;
+        let mut rows = self
+            .rows
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
+        let mut structured = self
+            .structured
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
+        if structured.contains_key(row.reservation.identity.attempt_id.as_str()) {
+            return Err(LedgerError::new(LedgerUnavailableReason::Collision));
+        }
+        Self::reserve_row_locked(&mut rows, &row.reservation)?;
+        let node_terminals = row
+            .nodes
+            .iter()
+            .map(|node| (node.node.clone(), None))
+            .collect();
+        structured.insert(
+            row.reservation.identity.attempt_id.as_str().to_owned(),
+            MemoryStructuredAttemptV1 {
+                reservation: row.clone(),
+                node_terminals,
+                policy_trigger_json: None,
+            },
+        );
+        Ok(())
+    }
+
+    async fn commit_node_terminal_v2(
+        &self,
+        id: &AttemptId,
+        node: &NodeId,
+        terminal_json: &str,
+        policy_trigger_json: Option<&str>,
+    ) -> Result<TerminalWrite, LedgerError> {
+        use crate::execution_policy::{
+            ControlEventIdV1, FanOutPolicyNameV1, FanOutPolicyV1, FrozenWorkflowControlsV1,
+            NodePrimaryDispositionV1, NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1,
+        };
+
+        let terminal = NodeTerminalV1::decode_canonical(terminal_json.as_bytes())
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        let trigger = policy_trigger_json
+            .map(|encoded| {
+                PolicyTriggerV1::decode_canonical(encoded.as_bytes())
+                    .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))
+            })
+            .transpose()?;
+        if terminal.policy_trigger_id.as_ref() != trigger.as_ref().map(|value| &value.id) {
+            return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+        }
+
+        let mut structured = self
+            .structured
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
+        let attempt = structured
+            .get_mut(id.as_str())
+            .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        let admitted = attempt
+            .reservation
+            .node(node)
+            .cloned()
+            .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        let controls: FrozenWorkflowControlsV1 =
+            serde_json::from_str(&attempt.reservation.controls_json)
+                .map_err(|_| LedgerError::new(LedgerUnavailableReason::Schema))?;
+
+        if let Some(trigger) = trigger.as_ref() {
+            let expected_grace = match controls.fan_out {
+                FanOutPolicyV1::FixedGrace { grace_ms } => Some(grace_ms),
+                FanOutPolicyV1::BoundedIndependent | FanOutPolicyV1::FailFast => None,
+            };
+            if matches!(controls.fan_out, FanOutPolicyV1::BoundedIndependent)
+                || !matches!(
+                    terminal.primary,
+                    NodePrimaryDispositionV1::Failed | NodePrimaryDispositionV1::TimedOut
+                )
+                || trigger.id != ControlEventIdV1::for_attempt(id, 0)
+                || trigger.node
+                    != PolicyNodeRefV1::from_node_id(admitted.sorted_ordinal, node.as_str())
+                || trigger.policy != FanOutPolicyNameV1::from(&controls.fan_out)
+                || trigger.grace_ms != expected_grace
+            {
+                return Err(LedgerError::new(LedgerUnavailableReason::Schema));
+            }
+        }
+
+        if let Some(existing_trigger) = attempt.policy_trigger_json.as_deref() {
+            if policy_trigger_json.is_some_and(|candidate| candidate != existing_trigger) {
+                return Ok(TerminalWrite::Conflict);
+            }
+        }
+        let slot = attempt
+            .node_terminals
+            .get_mut(node)
+            .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
+        match slot {
+            Some(existing) if existing == terminal_json => Ok(TerminalWrite::Replayed),
+            Some(_) => Ok(TerminalWrite::Conflict),
+            slot @ None => {
+                *slot = Some(terminal_json.to_owned());
+                if let Some(trigger_json) = policy_trigger_json {
+                    attempt.policy_trigger_json = Some(trigger_json.to_owned());
+                }
+                Ok(TerminalWrite::Applied)
+            }
+        }
+    }
+
+    async fn structured_evidence_v2(
+        &self,
+        id: &AttemptId,
+    ) -> Result<Option<AttemptStructuredEvidenceV1>, LedgerError> {
+        let structured = self
+            .structured
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
+        Ok(structured.get(id.as_str()).map(|attempt| {
+            let node_terminals = attempt
+                .reservation
+                .nodes
+                .iter()
+                .filter_map(|admitted| {
+                    attempt
+                        .node_terminals
+                        .get(&admitted.node)
+                        .and_then(Option::as_ref)
+                        .map(|terminal_json| HistoryNodeTerminalV1 {
+                            node: admitted.node.clone(),
+                            sorted_ordinal: admitted.sorted_ordinal,
+                            terminal_json: terminal_json.clone(),
+                        })
+                })
+                .collect();
+            AttemptStructuredEvidenceV1 {
+                reservation: attempt.reservation.clone(),
+                node_terminals,
+                policy_trigger_json: attempt.policy_trigger_json.clone(),
+            }
+        }))
+    }
+
     async fn mark_prompt_acceptance(
         &self,
         id: &AttemptId,
@@ -1118,6 +1482,13 @@ impl WorkflowHistoryStore for MemoryWorkflowHistoryStore {
             .rows
             .lock()
             .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
+        let structured = self
+            .structured
+            .lock()
+            .map_err(|_| LedgerError::new(LedgerUnavailableReason::Io))?;
+        if let Some(attempt) = structured.get(id.as_str()) {
+            Self::validate_complete_structured_attempt(id, attempt)?;
+        }
         let (reservation, persisted) = rows
             .get_mut(id.as_str())
             .ok_or_else(|| LedgerError::new(LedgerUnavailableReason::Schema))?;
@@ -1551,6 +1922,198 @@ mod tests {
                 .reservation
                 .prompt_acceptance,
             "unknown"
+        );
+    }
+
+    fn structured_reservation(identity: AttemptIdentity) -> AttemptReservationV2 {
+        use crate::execution_policy::{
+            resolve_execution_policy_v1, ExecutionPolicyInvocationV1, FanOutPolicyV1,
+            PolicyActivationV1, WorkflowControlDefaultsV1,
+        };
+
+        let controls = resolve_execution_policy_v1(
+            &WorkflowControlDefaultsV1 {
+                fan_out: Some(FanOutPolicyV1::FailFast),
+                ..WorkflowControlDefaultsV1::default()
+            },
+            &ExecutionPolicyInvocationV1::default(),
+            false,
+            PolicyActivationV1::Production,
+        )
+        .unwrap();
+        AttemptReservationV2 {
+            schema_version: WORKFLOW_HISTORY_EVIDENCE_SCHEMA_V1,
+            reservation: served_reservation(identity, ExecutionSurface::Offline),
+            controls_json: String::from_utf8(controls.encode_canonical().unwrap()).unwrap(),
+            controls_fingerprint: "controls-a".into(),
+            expected_node_count: 2,
+            nodes: vec![
+                HistoryNodeReservationV1 {
+                    node: NodeId::parse("root").unwrap(),
+                    sorted_ordinal: 0,
+                },
+                HistoryNodeReservationV1 {
+                    node: NodeId::parse("synth").unwrap(),
+                    sorted_ordinal: 1,
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_v2_history_reserves_exact_roster_and_commits_trigger_atomically() {
+        use crate::execution_policy::{
+            ControlEventIdV1, FanOutPolicyNameV1, NodeCleanupDispositionV1, NodeCleanupV1,
+            NodePrimaryDispositionV1, NodeTerminalV1, PolicyNodeRefV1, PolicyTriggerV1,
+            EXECUTION_POLICY_SCHEMA_V1,
+        };
+
+        let store = MemoryWorkflowHistoryStore::new();
+        let identity = AttemptIdentity::initial().unwrap();
+        let reservation = structured_reservation(identity.clone());
+        store.reserve_v2(&reservation).await.unwrap();
+
+        let empty = store
+            .structured_evidence_v2(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty.reservation, reservation);
+        assert!(empty.node_terminals.is_empty());
+        assert!(empty.policy_trigger_json.is_none());
+        assert_eq!(
+            node_terminal_placeholder_v1().len(),
+            crate::execution_policy::MAX_NODE_TERMINAL_JSON_BYTES
+        );
+
+        let root = NodeId::parse("root").unwrap();
+        let trigger = PolicyTriggerV1 {
+            schema_version: EXECUTION_POLICY_SCHEMA_V1,
+            id: ControlEventIdV1::for_attempt(&identity.attempt_id, 0),
+            node: PolicyNodeRefV1::from_node_id(0, root.as_str()),
+            policy: FanOutPolicyNameV1::FailFast,
+            grace_ms: None,
+        };
+        let root_terminal = NodeTerminalV1 {
+            schema_version: EXECUTION_POLICY_SCHEMA_V1,
+            primary: NodePrimaryDispositionV1::Failed,
+            cleanup: NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::Complete,
+                duration_ms: 1,
+            },
+            cause: None,
+            prompt_may_have_been_accepted: true,
+            degraded_ancestry: false,
+            policy_trigger_id: Some(trigger.id.clone()),
+        };
+        let terminal_json = String::from_utf8(root_terminal.encode_canonical().unwrap()).unwrap();
+        let trigger_json = String::from_utf8(trigger.encode_canonical().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .commit_node_terminal_v2(
+                    &identity.attempt_id,
+                    &root,
+                    &terminal_json,
+                    Some(&trigger_json),
+                )
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+        assert_eq!(
+            store
+                .commit_node_terminal_v2(
+                    &identity.attempt_id,
+                    &root,
+                    &terminal_json,
+                    Some(&trigger_json),
+                )
+                .await
+                .unwrap(),
+            TerminalWrite::Replayed
+        );
+        let mut conflicting_root_terminal = root_terminal.clone();
+        conflicting_root_terminal.cleanup.duration_ms = 2;
+        let conflicting_terminal_json =
+            String::from_utf8(conflicting_root_terminal.encode_canonical().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .commit_node_terminal_v2(
+                    &identity.attempt_id,
+                    &root,
+                    &conflicting_terminal_json,
+                    Some(&trigger_json),
+                )
+                .await
+                .unwrap(),
+            TerminalWrite::Conflict
+        );
+
+        let evidence = store
+            .structured_evidence_v2(&identity.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            evidence.policy_trigger_json.as_deref(),
+            Some(trigger_json.as_str())
+        );
+        assert_eq!(
+            evidence.node_terminals,
+            vec![HistoryNodeTerminalV1 {
+                node: root,
+                sorted_ordinal: 0,
+                terminal_json,
+            }]
+        );
+
+        let mut summary = completed("shape-a", true).terminal;
+        summary.outcome = "failed".into();
+        summary.terminal_reason = "failed".into();
+        summary.prompt_acceptance = "dispatch_uncertain".into();
+        summary.node_counts = NodeCounts {
+            failed: 1,
+            ..NodeCounts::default()
+        };
+        assert_eq!(
+            store
+                .terminalize(&identity.attempt_id, &summary)
+                .await
+                .unwrap_err()
+                .reason,
+            LedgerUnavailableReason::Schema,
+            "terminalization must not outrun the missing synth terminal"
+        );
+
+        let synth = NodeId::parse("synth").unwrap();
+        let synth_terminal = NodeTerminalV1 {
+            schema_version: EXECUTION_POLICY_SCHEMA_V1,
+            primary: NodePrimaryDispositionV1::Completed,
+            cleanup: NodeCleanupV1 {
+                disposition: NodeCleanupDispositionV1::Complete,
+                duration_ms: 1,
+            },
+            cause: None,
+            prompt_may_have_been_accepted: true,
+            degraded_ancestry: true,
+            policy_trigger_id: None,
+        };
+        let synth_terminal_json =
+            String::from_utf8(synth_terminal.encode_canonical().unwrap()).unwrap();
+        assert_eq!(
+            store
+                .commit_node_terminal_v2(&identity.attempt_id, &synth, &synth_terminal_json, None,)
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
+        );
+        summary.node_counts.completed = 1;
+        assert_eq!(
+            store
+                .terminalize(&identity.attempt_id, &summary)
+                .await
+                .unwrap(),
+            TerminalWrite::Applied
         );
     }
 
