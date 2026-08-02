@@ -300,6 +300,29 @@ impl Supervised {
         pinned_cwd_fd: Option<std::os::fd::RawFd>,
         retain_pinned_cwd_fd_after_exec: bool,
     ) -> std::io::Result<Self> {
+        Self::spawn_with_stderr_redactor_pinned_cwd_and_env_removals(
+            prog,
+            args,
+            cwd,
+            stderr_redactor,
+            pinned_cwd_fd,
+            retain_pinned_cwd_fd_after_exec,
+            &[],
+        )
+    }
+
+    /// Spawn with the same cwd and stderr guarantees as
+    /// [`Self::spawn_with_stderr_redactor_and_pinned_cwd`], while removing the
+    /// named variables from the child's inherited environment before exec.
+    pub fn spawn_with_stderr_redactor_pinned_cwd_and_env_removals(
+        prog: &str,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+        stderr_redactor: DiagnosticRedactor,
+        pinned_cwd_fd: Option<std::os::fd::RawFd>,
+        retain_pinned_cwd_fd_after_exec: bool,
+        removed_environment: &[String],
+    ) -> std::io::Result<Self> {
         let mut cmd = Command::new(prog);
         cmd.args(args)
             .stdin(Stdio::piped())
@@ -307,6 +330,9 @@ impl Supervised {
             .stderr(Stdio::piped())
             .process_group(0) // child becomes its own group leader (pgid == child pid)
             .kill_on_drop(true);
+        for variable in removed_environment {
+            cmd.env_remove(variable);
+        }
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
@@ -592,6 +618,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stdout.trim(), "unpinned");
+    }
+
+    #[tokio::test]
+    async fn bounded_spawn_removes_named_variables_from_child_environment() {
+        use tokio::io::AsyncReadExt as _;
+
+        const VARIABLE: &str = "A2A_BRIDGE_TEST_SECRET_SOURCE_ENV_R2F1A";
+        const SECRET: &str = "must-not-reach-adapter-child";
+        std::env::set_var(VARIABLE, SECRET);
+        let command = format!("printf %s \"${{{VARIABLE}-}}\"");
+        let mut child = Supervised::spawn_with_stderr_redactor_pinned_cwd_and_env_removals(
+            "/bin/sh",
+            &["-c", &command],
+            None,
+            DiagnosticRedactor::new([SECRET]),
+            None,
+            false,
+            &[VARIABLE.to_string()],
+        )
+        .unwrap();
+        let mut stdout = String::new();
+        child
+            .child_mut()
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .await
+            .unwrap();
+        std::env::remove_var(VARIABLE);
+
+        assert!(stdout.is_empty(), "source secret reached adapter child");
     }
 
     #[tokio::test]

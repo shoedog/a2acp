@@ -770,6 +770,14 @@ fn acp_spawn_inputs_with_cwd_binding(
     mcp_redaction_values.extend(bridge_core::mcp::env_redaction_values(&entry.mcp, &mcp_cwd));
     let diagnostic_redactor =
         bridge_core::diagnostics::DiagnosticRedactor::new(mcp_redaction_values);
+    let mut child_env_remove: Vec<String> = entry
+        .mcp
+        .iter()
+        .flat_map(|server| server.env.iter())
+        .filter_map(|(_, source)| source.source_name().map(str::to_owned))
+        .collect();
+    child_env_remove.sort();
+    child_env_remove.dedup();
     let acp = bridge_acp::acp_backend::AcpConfig {
         agent_id: entry.id.as_str().to_string(),
         cwd,
@@ -780,6 +788,7 @@ fn acp_spawn_inputs_with_cwd_binding(
         container,
         watchdog: entry.watchdog.clone(),
         diagnostic_redactor,
+        child_env_remove,
         prefix_attestation_transport: acp_prefix_attestation_transport(entry),
         // ACP-param MCP delivery (claude): the entry's MCP servers ride `session/new`. Codex/kiro
         // native delivery leaves this empty (they get MCP via their native channel, not the param).
@@ -9831,6 +9840,54 @@ inputs = []
             );
             assert!(sanitized.contains("REDACTED KNOWN SECRET"));
         }
+    }
+
+    #[test]
+    fn acp_spawn_inputs_removes_only_unique_secret_source_variables() {
+        use bridge_core::mcp::{McpEnvValueSourceV1, McpServerSpec, SecretString};
+
+        let secret = McpEnvValueSourceV1::SecretFromEnv {
+            variable: "A2A_BRIDGE_TEST_SOURCE_SECRET".into(),
+            resolved: SecretString::new("resolved-secret").unwrap(),
+        };
+        let mut entry = acp_entry("reader-secret-custody");
+        entry.mcp = vec![
+            McpServerSpec {
+                name: "one".into(),
+                command: "/bin/true".into(),
+                args: vec![],
+                env: vec![
+                    ("PUBLIC_DESTINATION".into(), "public".into()),
+                    ("SECRET_DESTINATION".into(), secret.clone()),
+                ],
+            },
+            McpServerSpec {
+                name: "two".into(),
+                command: "/bin/true".into(),
+                args: vec![],
+                env: vec![("OTHER_DESTINATION".into(), secret)],
+            },
+        ];
+        let run = bridge_core::run_identity::RunHandle {
+            instance_id: "run-secret-custody".into(),
+            host: "h".into(),
+            lease: "/l/run-secret-custody.lock".into(),
+            start: "0".into(),
+        };
+
+        let (_, _, acp) = acp_spawn_inputs(
+            &entry,
+            std::path::PathBuf::from("/tmp"),
+            std::path::Path::new("/cfg/a2a.toml"),
+            &run,
+        )
+        .unwrap();
+
+        assert_eq!(acp.child_env_remove, vec!["A2A_BRIDGE_TEST_SOURCE_SECRET"]);
+        assert!(!acp
+            .child_env_remove
+            .iter()
+            .any(|name| { matches!(name.as_str(), "PUBLIC_DESTINATION" | "SECRET_DESTINATION") }));
     }
 
     #[cfg(unix)]

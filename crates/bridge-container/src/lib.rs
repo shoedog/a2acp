@@ -14,6 +14,9 @@ use async_trait::async_trait;
 use bridge_acp::acp_backend::AcpConfig;
 use bridge_core::domain::{Part, SandboxConfig, SessionSpec};
 use bridge_core::error::BridgeError;
+use bridge_core::execution_policy::{
+    BoundMcpDeliveryPayloadV1, BoundProviderEffectV1, BoundSessionSpecV1,
+};
 use bridge_core::ids::SessionId;
 use bridge_core::permission::TurnMeta;
 use bridge_core::ports::{
@@ -21,7 +24,9 @@ use bridge_core::ports::{
 };
 use bridge_core::reaper::{spawn_detached, ReapController, ReapFailure, ReapFn};
 use bridge_core::run_identity::RunHandle;
-use bridge_core::sandbox::{a2a_name, check_rw_target, compose_container_rw};
+use bridge_core::sandbox::{
+    a2a_name, check_rw_target, compose_container_rw, compose_container_rw_with_source,
+};
 use bridge_core::session_cwd::SessionCwd;
 use futures::StreamExt;
 use tokio::sync::Mutex;
@@ -312,6 +317,12 @@ struct PreparedInner {
     rw_canon: SessionCwd,
 }
 
+#[derive(Clone)]
+struct ContainerSessionSpec {
+    session: SessionSpec,
+    bound_effect: Option<Arc<BoundProviderEffectV1>>,
+}
+
 type Inflight = Arc<Mutex<HashMap<SessionId, InflightState>>>;
 type ReapFactory = Arc<dyn Fn(String, String) -> ReapController + Send + Sync>;
 
@@ -328,7 +339,7 @@ pub struct ContainerRwBackend {
     reap_factory: ReapFactory,
     /// STABLE per-instance owner token (hash of config-path + mount + agent id), set by the caller.
     owner: String,
-    session_cfg: Mutex<HashMap<SessionId, SessionSpec>>,
+    session_cfg: Mutex<HashMap<SessionId, ContainerSessionSpec>>,
     pending_turn_meta: Mutex<HashMap<SessionId, TurnMeta>>,
     inflight: Inflight,
     turn_seq: AtomicU64,
@@ -448,12 +459,17 @@ impl ContainerRwBackend {
     /// Prepare the complete named-container generation before the first spawn
     /// await. Callers publish `prepared.owner` as a reservation before passing
     /// this value to [`Self::open_inner`].
-    fn prepare_inner(&self, spec: &SessionSpec) -> Result<PreparedInner, BridgeError> {
+    fn prepare_inner(&self, spec: &ContainerSessionSpec) -> Result<PreparedInner, BridgeError> {
         let runtime = self.cfg.sandbox.runtime().to_string();
-        let cwd = spec.cwd.clone().ok_or(BridgeError::ConfigInvalid {
+        let cwd = spec.session.cwd.clone().ok_or(BridgeError::ConfigInvalid {
             reason: "missing session cwd".into(),
         })?;
         let rw_canon = self.resolve_rw_target(&cwd)?;
+        let delivery_cwd = if spec.bound_effect.is_some() {
+            cwd.clone()
+        } else {
+            rw_canon.clone()
+        };
         let preflight_sandbox = SandboxConfig {
             mount: rw_canon.as_str().to_owned(),
             access: bridge_core::domain::MountAccess::Rw,
@@ -477,7 +493,7 @@ impl ContainerRwBackend {
             dispatch_gate: Arc::new(Mutex::new(())),
         };
         let kind = if self.is_warm() { "warm" } else { "perturn" };
-        let repo = rw_canon.as_str();
+        let repo = delivery_cwd.as_str();
         let labels = self
             .cfg
             .run
@@ -493,31 +509,65 @@ impl ContainerRwBackend {
         // Native codex MCP (ADR-0028): append `-c mcp_servers.*` args to the inner codex-acp argv,
         // `{cwd}`-substituted with THIS turn's `:rw` clone (identical-path mount → the same path
         // resolves inside the container). claude/non-codex leave `mcp` empty.
-        let inner_args: Vec<String> = if matches!(
-            self.cfg.mcp_delivery,
-            bridge_core::mcp::McpDelivery::CodexNative
-        ) && !self.cfg.mcp.is_empty()
-        {
-            let mut a = self.cfg.args.clone();
-            a.extend(bridge_core::mcp::render_codex_mcp_args(
-                &self.cfg.mcp,
-                rw_canon.as_str(),
-            ));
-            a
-        } else {
-            self.cfg.args.clone()
+        let inner_args: Vec<String> = match spec.bound_effect.as_deref() {
+            Some(effect) => match effect.delivery().payload() {
+                BoundMcpDeliveryPayloadV1::CodexNative(suffix) => {
+                    let mut args = self.cfg.args.clone();
+                    args.extend(suffix.iter().cloned());
+                    args
+                }
+                BoundMcpDeliveryPayloadV1::Acp(_) => self.cfg.args.clone(),
+                BoundMcpDeliveryPayloadV1::KiroNative { .. } => {
+                    return Err(BridgeError::ConfigMismatch {
+                        field: "bound_container_mcp_delivery",
+                    });
+                }
+            },
+            None if matches!(
+                self.cfg.mcp_delivery,
+                bridge_core::mcp::McpDelivery::CodexNative
+            ) && !self.cfg.mcp.is_empty() =>
+            {
+                let mut args = self.cfg.args.clone();
+                args.extend(bridge_core::mcp::render_codex_mcp_args(
+                    &self.cfg.mcp,
+                    rw_canon.as_str(),
+                ));
+                args
+            }
+            None => self.cfg.args.clone(),
         };
-        let (program, argv) = compose_container_rw(
-            &self.cfg.sandbox,
-            &rw_canon,
-            &name,
-            &self.cfg.cmd,
-            &inner_args,
-            &labels,
-        );
+        let (program, argv) = if spec.bound_effect.is_some() {
+            compose_container_rw_with_source(
+                &self.cfg.sandbox,
+                &rw_canon,
+                &delivery_cwd,
+                &name,
+                &self.cfg.cmd,
+                &inner_args,
+                &labels,
+            )
+        } else {
+            compose_container_rw(
+                &self.cfg.sandbox,
+                &rw_canon,
+                &name,
+                &self.cfg.cmd,
+                &inner_args,
+                &labels,
+            )
+        };
+        let delivery_mcp = match spec.bound_effect.as_deref() {
+            Some(effect) => match effect.delivery().payload() {
+                BoundMcpDeliveryPayloadV1::Acp(servers) => servers.clone(),
+                BoundMcpDeliveryPayloadV1::CodexNative(_)
+                | BoundMcpDeliveryPayloadV1::KiroNative { .. } => Vec::new(),
+            },
+            None => self.cfg.mcp.clone(),
+        };
         let acp = AcpConfig {
             agent_id: self.cfg.agent.clone(),
-            cwd: PathBuf::from(rw_canon.as_str()),
+            cwd: PathBuf::from(delivery_cwd.as_str()),
             model: self.cfg.model.clone(),
             mode: self.cfg.mode.clone(),
             auth_method: self.cfg.auth_method.clone(),
@@ -528,8 +578,18 @@ impl ContainerRwBackend {
             handshake_timeout: self.cfg.handshake_timeout,
             cancel_grace: self.cfg.cancel_grace,
             diagnostic_redactor: bridge_core::diagnostics::DiagnosticRedactor::new(
-                bridge_core::mcp::env_redaction_values(&self.cfg.mcp, rw_canon.as_str()),
+                bridge_core::mcp::env_redaction_values(&delivery_mcp, delivery_cwd.as_str()),
             ),
+            child_env_remove: {
+                let mut variables: Vec<String> = delivery_mcp
+                    .iter()
+                    .flat_map(|server| server.env.iter())
+                    .filter_map(|(_, source)| source.source_name().map(str::to_owned))
+                    .collect();
+                variables.sort();
+                variables.dedup();
+                variables
+            },
             // :rw has its own reaper (this crate); the inner AcpBackend's :ro reaper stays off.
             container: None,
             // MCP delivery to the inner CONTAINER agent (#1b):
@@ -538,7 +598,9 @@ impl ContainerRwBackend {
             //  - Acp (claude): the inner AcpBackend mints `NewSessionRequest.mcpServers` from this list,
             //    `{cwd}`-substituted at mint with this turn's clone -> in-container lsp/prism nav for claude.
             //  - KiroNative: kiro honors neither channel for stdio MCP (settings file) -> not wired here.
-            mcp: if matches!(self.cfg.mcp_delivery, bridge_core::mcp::McpDelivery::Acp) {
+            mcp: if spec.bound_effect.is_some() {
+                Vec::new()
+            } else if matches!(self.cfg.mcp_delivery, bridge_core::mcp::McpDelivery::Acp) {
                 self.cfg.mcp.clone()
             } else {
                 Vec::new()
@@ -608,7 +670,7 @@ impl ContainerRwBackend {
     async fn open_inner(
         &self,
         session: &SessionId,
-        spec: &SessionSpec,
+        spec: &ContainerSessionSpec,
         prepared: PreparedInner,
         diagnostic_observer: Option<Arc<dyn DiagnosticObserver>>,
     ) -> Result<WarmInner, BridgeError> {
@@ -640,10 +702,23 @@ impl ContainerRwBackend {
                 return Err(e);
             }
         };
-        // The inner prefers the stashed SessionSpec.cwd over AcpConfig.cwd → configure with CANONICAL cwd.
-        let mut spec_canon = spec.clone();
-        spec_canon.cwd = Some(rw_canon.clone());
-        if let Err(e) = inner.configure_session(session, &spec_canon).await {
+        let configure = if let Some(effect) = &spec.bound_effect {
+            inner
+                .configure_bound_session(
+                    session,
+                    &BoundSessionSpecV1 {
+                        session: spec.session.clone(),
+                        provider_effect: Arc::clone(effect),
+                    },
+                )
+                .await
+        } else {
+            // Legacy V1 canonicalizes its writable target before minting.
+            let mut canonical = spec.session.clone();
+            canonical.cwd = Some(rw_canon.clone());
+            inner.configure_session(session, &canonical).await
+        };
+        if let Err(e) = configure {
             owner.reap_detached();
             return Err(e);
         }
@@ -787,9 +862,22 @@ impl ContainerRwBackend {
                     "warm session retired during prompt"
                 )),
             };
-            let mut spec_canon = spec.clone();
-            spec_canon.cwd = Some(rw_canon);
-            if let Err(e) = inner.configure_session(session, &spec_canon).await {
+            let configure = if let Some(effect) = &spec.bound_effect {
+                inner
+                    .configure_bound_session(
+                        session,
+                        &BoundSessionSpecV1 {
+                            session: spec.session.clone(),
+                            provider_effect: Arc::clone(effect),
+                        },
+                    )
+                    .await
+            } else {
+                let mut canonical = spec.session.clone();
+                canonical.cwd = Some(rw_canon);
+                inner.configure_session(session, &canonical).await
+            };
+            if let Err(e) = configure {
                 fail!(e) // reuse: no reap
             }
         }
@@ -1101,7 +1189,7 @@ impl ContainerRwBackend {
                 reason: "missing session cwd".into(),
             },
         )?;
-        if spec.cwd.is_none() {
+        if spec.session.cwd.is_none() {
             return Err(BridgeError::ConfigInvalid {
                 reason: "missing session cwd".into(),
             });
@@ -1273,10 +1361,61 @@ impl AgentBackend for ContainerRwBackend {
         session: &SessionId,
         spec: &SessionSpec,
     ) -> Result<(), BridgeError> {
-        self.session_cfg
-            .lock()
-            .await
-            .insert(session.clone(), spec.clone());
+        self.session_cfg.lock().await.insert(
+            session.clone(),
+            ContainerSessionSpec {
+                session: spec.clone(),
+                bound_effect: None,
+            },
+        );
+        Ok(())
+    }
+
+    async fn configure_bound_session(
+        &self,
+        session: &SessionId,
+        spec: &BoundSessionSpecV1,
+    ) -> Result<(), BridgeError> {
+        let frozen = spec.provider_effect.frozen();
+        let cwd = spec
+            .session
+            .cwd
+            .as_ref()
+            .ok_or(BridgeError::ConfigMismatch {
+                field: "bound_session_cwd",
+            })?;
+        use bridge_core::mcp::McpDelivery;
+        let channel_matches = matches!(
+            (
+                self.cfg.mcp_delivery,
+                spec.provider_effect.delivery().payload()
+            ),
+            (McpDelivery::Acp, BoundMcpDeliveryPayloadV1::Acp(_))
+                | (
+                    McpDelivery::CodexNative,
+                    BoundMcpDeliveryPayloadV1::CodexNative(_)
+                )
+        );
+        if frozen.effect.agent.as_str() != self.cfg.agent
+            || cwd != &frozen.effect.effective_session_cwd
+            || cwd != frozen.checkout.effective_cwd()
+            || frozen.effect.mcp_delivery_digest != *spec.provider_effect.delivery().digest()
+            || !channel_matches
+        {
+            return Err(BridgeError::ConfigMismatch {
+                field: "bound_provider_effect",
+            });
+        }
+        // Perform containment/infrastructure validation before publishing the session stash, but do
+        // not derive or rewrite the persisted lexical delivery cwd.
+        let _ = self.resolve_rw_target(cwd)?;
+        self.session_cfg.lock().await.insert(
+            session.clone(),
+            ContainerSessionSpec {
+                session: spec.session.clone(),
+                bound_effect: Some(Arc::clone(&spec.provider_effect)),
+            },
+        );
         Ok(())
     }
 
@@ -1627,6 +1766,15 @@ mod tests {
                 .await
                 .push((session.clone(), meta));
             self.call_order.lock().await.push("configure_turn");
+        }
+
+        async fn configure_bound_session(
+            &self,
+            _session: &SessionId,
+            _spec: &BoundSessionSpecV1,
+        ) -> Result<(), BridgeError> {
+            self.call_order.lock().await.push("configure_bound_session");
+            Ok(())
         }
 
         async fn prompt_with_observers(
@@ -2051,6 +2199,99 @@ mod tests {
         be.forget_session(&s).await;
         assert!(!be.session_cfg.lock().await.contains_key(&s));
         assert!(!be.pending_turn_meta.lock().await.contains_key(&s));
+    }
+
+    #[tokio::test]
+    async fn bound_container_codex_consumes_only_the_frozen_argv_suffix() {
+        use bridge_core::domain::{AgentEntry, AgentKind};
+        use bridge_core::execution_policy::{
+            freeze_direct_checkout_v1, freeze_provider_attempt_v1, BoundSessionSpecV1,
+            FrozenProviderLogicalSessionV1, PolicyNodeRefV1, ProviderFreezeInputV1,
+        };
+        use bridge_core::ids::AgentId;
+        use bridge_core::mcp::{McpDelivery, McpServerSpec};
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real-worktree");
+        let logical = temp.path().join("logical-worktree");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &logical).unwrap();
+        let root = logical.to_str().unwrap();
+        let canonical_root = std::fs::canonicalize(&real).unwrap();
+        let canonical_root = canonical_root.to_str().unwrap();
+        let mut config = cfg_with_mount(root);
+        config.cmd = "codex-acp".into();
+        config.mcp_delivery = McpDelivery::CodexNative;
+        config.mcp = vec![McpServerSpec {
+            name: "prism".into(),
+            command: "/opt/prism".into(),
+            args: vec!["--repo".into(), "{cwd}".into()],
+            env: vec![],
+        }];
+        let entry = AgentEntry {
+            id: AgentId::parse("impl").unwrap(),
+            cmd: Some(config.cmd.clone()),
+            base_url: None,
+            api_key_env: None,
+            args: config.args.clone(),
+            kind: AgentKind::ContainerRw,
+            model_provider: None,
+            model: config.model.clone(),
+            effort: None,
+            mode: config.mode.clone(),
+            preflight: false,
+            fallback_models: vec![],
+            cwd: None,
+            session_cwd: None,
+            sandbox: Some(config.sandbox.clone()),
+            watchdog: config.watchdog.clone(),
+            mcp: config.mcp.clone(),
+            mcp_delivery: config.mcp_delivery,
+            auth_method: config.auth_method.clone(),
+            pre_authenticated: config.pre_authenticated,
+            host_fallback_eligible: false,
+            name: None,
+            description: None,
+            tags: vec![],
+            version: None,
+            extensions: Default::default(),
+        };
+        let bundle = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+            entry: &entry,
+            overrides: None,
+            node: PolicyNodeRefV1::from_node_id(0, "node"),
+            logical_session: FrozenProviderLogicalSessionV1::Execute {
+                candidate_ordinal: 0,
+            },
+            checkout: freeze_direct_checkout_v1(SessionCwd::parse(root).unwrap()),
+            provider_effect_key: None,
+        })
+        .unwrap();
+        let spawn = CountingSpawn::new(false);
+        let (reap, _) = counting_reap();
+        let mut backend =
+            ContainerRwBackend::new_with_hooks(config, spawn.clone(), "inst".into(), reap)
+                .await
+                .unwrap();
+        backend.cfg.mcp[0].args[1] = "/mutated-after-freeze".into();
+        let session = SessionId::parse("bound-container").unwrap();
+        let spec = BoundSessionSpecV1::new(EffectiveConfig::default(), Arc::new(bundle.bound));
+
+        backend
+            .configure_bound_session(&session, &spec)
+            .await
+            .unwrap();
+        let mut stream = backend.prompt(&session, vec![]).await.unwrap();
+        let argv = spawn.last_argv.lock().await.clone();
+        assert!(argv.iter().any(|arg| arg.contains(root)));
+        assert!(argv
+            .iter()
+            .any(|arg| { arg == &format!("{canonical_root}:{root}") }));
+        assert!(!argv
+            .iter()
+            .any(|arg| { arg == &format!("{canonical_root}:{canonical_root}") }));
+        assert!(!argv.iter().any(|arg| arg.contains("/mutated-after-freeze")));
+        while stream.next().await.is_some() {}
     }
 
     #[tokio::test]

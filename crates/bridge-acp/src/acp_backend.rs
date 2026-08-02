@@ -64,7 +64,9 @@ use bridge_core::domain::{
     SessionSpec,
 };
 use bridge_core::error::BridgeError;
+use bridge_core::execution_policy::{BoundMcpDeliveryPayloadV1, BoundSessionSpecV1};
 use bridge_core::ids::SessionId;
+use bridge_core::mcp::McpServerSpec;
 use bridge_core::orch::{
     AgentSessionCaps, ContentSummary, OrchEventKind, PlanEntry as BridgePlanEntry, ReconcileOutcome,
 };
@@ -974,6 +976,10 @@ pub struct AcpConfig {
     /// `McpDelivery::Acp` agents (claude); `{cwd}` in args/env is substituted per session at mint.
     /// Codex/kiro native delivery leaves this empty (they ignore the param).
     pub mcp: Vec<bridge_core::mcp::McpServerSpec>,
+    /// Non-secret names of ambient source variables whose resolved values are
+    /// carried only in typed MCP delivery. The adapter/runtime child must not
+    /// inherit these variables as a second, unbound delivery channel.
+    pub child_env_remove: Vec<String>,
     /// Optional per-turn watchdog. `None` disables watchdog behavior.
     pub watchdog: Option<bridge_core::domain::WatchdogConfig>,
     /// Exact credential values the bridge already possesses and must remove
@@ -1057,6 +1063,7 @@ impl Default for AcpConfig {
             cancel_grace: DEFAULT_CANCEL_GRACE,
             container: None,
             mcp: Vec::new(),
+            child_env_remove: Vec::new(),
             watchdog: None,
             diagnostic_redactor: DiagnosticRedactor::default(),
             prefix_attestation_transport: PrefixAttestationTransport::Unsupported,
@@ -1938,6 +1945,15 @@ enum CancelDispatch {
 struct SessionConfigSnapshot {
     desired_cwd: String,
     config: EffectiveConfig,
+    /// `None` is the V1 static-config fallback. `Some`, including an empty vector, is an exact
+    /// already-rendered V2 delivery and must never consult `AcpConfig.mcp`.
+    bound_mcp: Option<Vec<McpServerSpec>>,
+}
+
+#[derive(Clone)]
+struct SessionConfigStash {
+    spec: SessionSpec,
+    bound_mcp: Option<Vec<McpServerSpec>>,
 }
 
 // ── Public struct ────────────────────────────────────────────────────────────
@@ -2002,7 +2018,7 @@ pub struct AcpBackend {
     /// FALLBACK: a session with NO stash entry (direct callers / the gated e2es that
     /// don't go through `configure_session`) falls back to [`AcpConfig`]'s static
     /// `model`/`mode`, preserving the pre-3b behavior.
-    session_cfg: Arc<StdMutex<HashMap<SessionId, SessionSpec>>>,
+    session_cfg: Arc<StdMutex<HashMap<SessionId, SessionConfigStash>>>,
     /// Per-turn metadata stashed by the A2A producer immediately before the next
     /// prompt. `prompt_inner` takes it at entry, before lazy session minting, so
     /// early setup errors cannot leave stale metadata for a later turn.
@@ -2287,20 +2303,21 @@ impl AcpBackend {
             .and_then(|configs| configs.get(key).cloned());
         let desired_cwd = stashed
             .as_ref()
-            .and_then(|spec| spec.cwd.as_ref())
+            .and_then(|stash| stash.spec.cwd.as_ref())
             .map(|cwd| cwd.as_str().to_owned())
             .unwrap_or_else(|| config.cwd.to_string_lossy().into_owned());
-        let effective_config = stashed.map_or_else(
+        let effective_config = stashed.as_ref().map_or_else(
             || EffectiveConfig {
                 model: config.model.clone(),
                 effort: None,
                 mode: config.mode.clone(),
             },
-            |spec| spec.config,
+            |stash| stash.spec.config.clone(),
         );
         Ok(SessionConfigSnapshot {
             desired_cwd,
             config: effective_config,
+            bound_mcp: stashed.and_then(|stash| stash.bound_mcp),
         })
     }
 
@@ -2475,19 +2492,33 @@ impl AcpBackend {
     ) -> NewSessionRequest {
         let cwd = cwd.into();
         let cwd_str = cwd.to_string_lossy().into_owned();
+        let rendered: Vec<McpServerSpec> = mcp
+            .iter()
+            .map(|spec| spec.substituted_for_managed_agent(&cwd_str))
+            .collect();
+        Self::new_session_request_from_rendered(cwd, &rendered)
+    }
+
+    fn new_session_request_from_rendered(
+        cwd: impl Into<PathBuf>,
+        mcp: &[McpServerSpec],
+    ) -> NewSessionRequest {
         let servers: Vec<McpServer> = mcp
             .iter()
-            .map(|spec| {
-                let s = spec.substituted_for_managed_agent(&cwd_str);
+            .cloned()
+            .map(|server| {
                 McpServer::Stdio(
-                    McpServerStdio::new(s.name, s.command).args(s.args).env(
-                        s.env
-                            .into_iter()
-                            .map(|(name, value)| {
-                                EnvVariable::new(name, value.resolved_value().to_owned())
-                            })
-                            .collect(),
-                    ),
+                    McpServerStdio::new(server.name, server.command)
+                        .args(server.args)
+                        .env(
+                            server
+                                .env
+                                .into_iter()
+                                .map(|(name, value)| {
+                                    EnvVariable::new(name, value.resolved_value().to_owned())
+                                })
+                                .collect(),
+                        ),
                 )
             })
             .collect();
@@ -2499,6 +2530,13 @@ impl AcpBackend {
         mcp: &[bridge_core::mcp::McpServerSpec],
     ) -> ModelAwareNewSessionRequest {
         ModelAwareNewSessionRequest::new(Self::new_session_request(cwd, mcp))
+    }
+
+    fn model_aware_new_session_request_from_rendered(
+        cwd: impl Into<PathBuf>,
+        mcp: &[McpServerSpec],
+    ) -> ModelAwareNewSessionRequest {
+        ModelAwareNewSessionRequest::new(Self::new_session_request_from_rendered(cwd, mcp))
     }
 
     /// Build the `session/prompt` request the backend sends for a turn: the
@@ -3078,13 +3116,14 @@ impl AcpBackend {
                 .as_ref()
                 .map(ContainerReap::legacy_controller)
         });
-        let supervised = match Supervised::spawn_with_stderr_redactor_and_pinned_cwd(
+        let supervised = match Supervised::spawn_with_stderr_redactor_pinned_cwd_and_env_removals(
             cmd,
             args,
             None,
             redactor.clone(),
             pinned_cwd_fd,
             retain_pinned_cwd_fd_after_exec,
+            &config.child_env_remove,
         ) {
             Ok(supervised) => supervised,
             Err(error) => {
@@ -4307,12 +4346,16 @@ impl AcpBackend {
         // One owned snapshot supplies both mint inputs and the lifecycle redactor.
         // A concurrent `configure_session` replacement affects the next snapshot,
         // never half of this attempt.
-        let desired_cwd = snapshot.desired_cwd;
+        let SessionConfigSnapshot {
+            desired_cwd,
+            config,
+            bound_mcp,
+        } = snapshot;
         let EffectiveConfig {
             mode,
             model,
             effort,
-        } = snapshot.config;
+        } = config;
         let agent_id_for_mint = self
             .config
             .as_ref()
@@ -4328,11 +4371,11 @@ impl AcpBackend {
         // MCP servers to offer at session/new (ADR-0028). Static per agent (the entry's `mcp`);
         // `{cwd}` is substituted with `cwd_for_mint` inside `new_session_request`. Empty for
         // non-Acp delivery (codex/kiro get MCP via their native channel, not this param).
-        let mcp_for_mint: Vec<bridge_core::mcp::McpServerSpec> = self
-            .config
-            .as_ref()
-            .map(|c| c.mcp.clone())
+        let mcp_for_mint: Vec<bridge_core::mcp::McpServerSpec> = bound_mcp
+            .clone()
+            .or_else(|| self.config.as_ref().map(|config| config.mcp.clone()))
             .unwrap_or_default();
+        let mcp_is_bound = bound_mcp.is_some();
         let (id, newly_minted) = if let Some(id) = entry.agent_id.get() {
             (id.clone(), false)
         } else {
@@ -4385,10 +4428,17 @@ impl AcpBackend {
                                 None,
                             )
                             .await?;
-                        let req = Self::model_aware_new_session_request(
-                            PathBuf::from(&cwd_for_mint),
-                            &mcp_for_mint,
-                        );
+                        let req = if mcp_is_bound {
+                            Self::model_aware_new_session_request_from_rendered(
+                                PathBuf::from(&cwd_for_mint),
+                                &mcp_for_mint,
+                            )
+                        } else {
+                            Self::model_aware_new_session_request(
+                                PathBuf::from(&cwd_for_mint),
+                                &mcp_for_mint,
+                            )
+                        };
                         // From request installation until durable minted-cwd
                         // publication, the process may have consumed a
                         // cwd-expanded credential that a later bounded policy
@@ -6611,8 +6661,53 @@ impl AgentBackend for AcpBackend {
         spec: &SessionSpec,
     ) -> Result<(), BridgeError> {
         if let Ok(mut m) = self.session_cfg.lock() {
-            m.insert(session.clone(), spec.clone());
+            m.insert(
+                session.clone(),
+                SessionConfigStash {
+                    spec: spec.clone(),
+                    bound_mcp: None,
+                },
+            );
         }
+        Ok(())
+    }
+
+    async fn configure_bound_session(
+        &self,
+        session: &SessionId,
+        spec: &BoundSessionSpecV1,
+    ) -> Result<(), BridgeError> {
+        let frozen = spec.provider_effect.frozen();
+        let cwd = spec
+            .session
+            .cwd
+            .as_ref()
+            .ok_or(BridgeError::ConfigMismatch {
+                field: "bound_session_cwd",
+            })?;
+        if cwd != &frozen.effect.effective_session_cwd
+            || cwd != frozen.checkout.effective_cwd()
+            || frozen.effect.mcp_delivery_digest != *spec.provider_effect.delivery().digest()
+        {
+            return Err(BridgeError::ConfigMismatch {
+                field: "bound_provider_effect",
+            });
+        }
+        let bound_mcp = match spec.provider_effect.delivery().payload() {
+            BoundMcpDeliveryPayloadV1::Acp(servers) => servers.clone(),
+            BoundMcpDeliveryPayloadV1::CodexNative(_)
+            | BoundMcpDeliveryPayloadV1::KiroNative { .. } => Vec::new(),
+        };
+        self.session_cfg
+            .lock()
+            .map_err(|_| BridgeError::InvalidStateTransition)?
+            .insert(
+                session.clone(),
+                SessionConfigStash {
+                    spec: spec.session.clone(),
+                    bound_mcp: Some(bound_mcp),
+                },
+            );
         Ok(())
     }
 
@@ -10388,6 +10483,8 @@ mod tests {
         /// Tests assert against this to verify `ensure_session` passed the correct
         /// cwd down to the wire (stashed SessionSpec.cwd vs static AcpConfig.cwd).
         new_session_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
+        /// Exact serialized `session/new` request for bound-delivery assertions.
+        new_session_request: Arc<Mutex<Option<serde_json::Value>>>,
     }
 
     impl Recorder {
@@ -10459,6 +10556,7 @@ mod tests {
                 reject_set_config_call: Arc::new(Mutex::new(None)),
                 set_config_error_body: Arc::new(Mutex::new("Invalid value for effort".to_string())),
                 new_session_cwd: Arc::new(Mutex::new(None)),
+                new_session_request: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -11011,6 +11109,8 @@ mod tests {
                         async move {
                             let mint_sequence =
                                 r.new_session_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                            *r.new_session_request.lock().await =
+                                Some(serde_json::to_value(&req.0).expect("serialize session/new"));
                             // Record the cwd the client sent so Task-4 tests can
                             // assert the correct cwd reached the wire.
                             *r.new_session_cwd.lock().await = Some(req.0.cwd);
@@ -16975,6 +17075,92 @@ mod tests {
             "ensure_session must pass the stashed SessionSpec.cwd (/req) to session/new, \
              not the static AcpConfig.cwd (/tmp); got {recorded:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn bound_mint_uses_only_the_frozen_cwd_and_mcp_delivery() {
+        use bridge_core::domain::{AgentEntry, AgentKind};
+        use bridge_core::execution_policy::{
+            freeze_direct_checkout_v1, freeze_provider_attempt_v1, BoundSessionSpecV1,
+            FrozenProviderLogicalSessionV1, PolicyNodeRefV1, ProviderFreezeInputV1,
+        };
+        use bridge_core::ids::AgentId;
+        use bridge_core::mcp::{McpDelivery, McpServerSpec};
+
+        let rec = Recorder::new("agent-sess-BOUND-MCP");
+        let mut config = test_config();
+        config.mcp = vec![McpServerSpec {
+            name: "stale".into(),
+            command: "/static/stale".into(),
+            args: vec!["/static/stale".into()],
+            env: vec![],
+        }];
+        let backend = connect_recording_with(rec.clone(), config).await;
+        let mut entry = AgentEntry {
+            id: AgentId::parse("claude").unwrap(),
+            cmd: Some("claude-agent-acp".into()),
+            base_url: None,
+            api_key_env: None,
+            args: vec![],
+            kind: AgentKind::Acp,
+            model_provider: None,
+            model: None,
+            effort: None,
+            mode: None,
+            preflight: false,
+            fallback_models: vec![],
+            cwd: None,
+            session_cwd: None,
+            sandbox: None,
+            watchdog: None,
+            mcp: vec![McpServerSpec {
+                name: "bound".into(),
+                command: "/bound/server".into(),
+                args: vec!["--repo".into(), "{cwd}".into()],
+                env: vec![],
+            }],
+            mcp_delivery: McpDelivery::Acp,
+            auth_method: None,
+            pre_authenticated: false,
+            host_fallback_eligible: false,
+            name: None,
+            description: None,
+            tags: vec![],
+            version: None,
+            extensions: Default::default(),
+        };
+        let bundle = freeze_provider_attempt_v1(&ProviderFreezeInputV1 {
+            entry: &entry,
+            overrides: None,
+            node: PolicyNodeRefV1::from_node_id(0, "node"),
+            logical_session: FrozenProviderLogicalSessionV1::Execute {
+                candidate_ordinal: 0,
+            },
+            checkout: freeze_direct_checkout_v1(SessionCwd::parse("/bound-worktree").unwrap()),
+            provider_effect_key: None,
+        })
+        .unwrap();
+        entry.mcp[0].args[1] = "/mutated-after-freeze".into();
+        let spec = BoundSessionSpecV1::new(EffectiveConfig::default(), Arc::new(bundle.bound));
+        let session = bkey("bridge-BOUND-MCP");
+
+        backend
+            .configure_bound_session(&session, &spec)
+            .await
+            .unwrap();
+        backend.ensure_session(&session).await.unwrap();
+
+        let request = rec
+            .new_session_request
+            .lock()
+            .await
+            .clone()
+            .expect("session/new captured");
+        let rendered = serde_json::to_string(&request).unwrap();
+        assert!(rendered.contains("/bound-worktree"));
+        assert!(rendered.contains("/bound/server"));
+        assert!(!rendered.contains("/static/stale"));
+        assert!(!rendered.contains("/mutated-after-freeze"));
     }
 
     #[tokio::test]

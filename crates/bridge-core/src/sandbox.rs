@@ -553,6 +553,17 @@ pub fn compose_sandbox(
     agent_args: &[String],
     labels: &[(String, String)],
 ) -> (String, Vec<String>) {
+    compose_sandbox_with_primary_mount(sb, &sb.mount, &sb.mount, agent_cmd, agent_args, labels)
+}
+
+fn compose_sandbox_with_primary_mount(
+    sb: &SandboxConfig,
+    mount_source: &str,
+    mount_target: &str,
+    agent_cmd: &str,
+    agent_args: &[String],
+    labels: &[(String, String)],
+) -> (String, Vec<String>) {
     let mut argv: Vec<String> = vec!["run".into(), "-i".into(), "--rm".into()];
     // Increment A: `--label`s right after the `run -i --rm` prefix (the `--name` splice in the named
     // variants lands at `3..3`, BEFORE these → `run -i --rm --name N --label …`).
@@ -583,7 +594,7 @@ pub fn compose_sandbox(
         ""
     };
     argv.push("-v".into());
-    argv.push(format!("{m}:{m}{ro_suffix}", m = sb.mount));
+    argv.push(format!("{mount_source}:{mount_target}{ro_suffix}"));
 
     // Extra volumes (creds / named vols) verbatim. S6 (validate) guarantees none nests under `mount`.
     for v in &sb.volumes {
@@ -610,12 +621,33 @@ pub fn compose_container_rw(
     args: &[String],
     labels: &[(String, String)],
 ) -> (String, Vec<String>) {
+    compose_container_rw_with_source(sb, rw_target, rw_target, name, cmd, args, labels)
+}
+
+/// V2 variant of [`compose_container_rw`] whose canonical host source may have
+/// a different spelling from the frozen lexical in-container target.
+pub fn compose_container_rw_with_source(
+    sb: &SandboxConfig,
+    rw_source: &crate::session_cwd::SessionCwd,
+    rw_target: &crate::session_cwd::SessionCwd,
+    name: &str,
+    cmd: &str,
+    args: &[String],
+    labels: &[(String, String)],
+) -> (String, Vec<String>) {
     let derived = SandboxConfig {
         mount: rw_target.as_str().to_string(),
         access: MountAccess::Rw,
         ..sb.clone()
     };
-    let (program, mut argv) = compose_sandbox(&derived, cmd, args, labels);
+    let (program, mut argv) = compose_sandbox_with_primary_mount(
+        &derived,
+        rw_source.as_str(),
+        rw_target.as_str(),
+        cmd,
+        args,
+        labels,
+    );
     // INVARIANT: compose_sandbox always emits ["run","-i","--rm", ...] (this module, ~line 17).
     debug_assert_eq!(
         &argv[0..3],
@@ -839,6 +871,29 @@ mod tests {
             &argv[5..9],
             &["--label", "a2a.managed=1", "--label", "a2a.run=r1"]
         );
+    }
+
+    #[test]
+    fn container_rw_v2_separates_canonical_host_source_from_lexical_target() {
+        let mut sb = ro_locked();
+        sb.access = MountAccess::Rw;
+        let source = crate::session_cwd::SessionCwd::parse("/private/real/worktree").unwrap();
+        let target = crate::session_cwd::SessionCwd::parse("/logical/worktree").unwrap();
+        let (_program, argv) = compose_container_rw_with_source(
+            &sb,
+            &source,
+            &target,
+            "a2a-rw-owner-run-0",
+            "claude-agent-acp",
+            &[],
+            &[],
+        );
+        assert!(argv.windows(2).any(|window| {
+            window[0] == "-v" && window[1] == "/private/real/worktree:/logical/worktree"
+        }));
+        assert!(!argv
+            .iter()
+            .any(|arg| arg == "/logical/worktree:/logical/worktree"));
     }
 
     #[test]

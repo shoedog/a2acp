@@ -15,6 +15,7 @@ use bridge_core::domain::{
     Part, PermissionDecision, PermissionRequest, SessionContext, SessionSpec,
 };
 use bridge_core::error::BridgeError;
+use bridge_core::execution_policy::{BoundMcpDeliveryPayloadV1, BoundSessionSpecV1};
 use bridge_core::ids::SessionId;
 use bridge_core::orch::OrchEventKind;
 use bridge_core::ports::{
@@ -202,13 +203,21 @@ async fn install_first_send<F>(
 /// `select!` on cancellation even while parked awaiting the next SSE chunk — an
 /// `AtomicBool` polled only between chunks cannot cancel during a stall.
 struct SessionState {
-    model: Option<String>,
+    model: SessionModelState,
     cancel: watch::Sender<bool>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionModelState {
+    Unconfigured,
+    ExplicitNone,
+    ExplicitSome(String),
+}
+
 impl Default for SessionState {
     fn default() -> Self {
         Self {
-            model: None,
+            model: SessionModelState::Unconfigured,
             cancel: watch::channel(false).0,
         }
     }
@@ -257,11 +266,10 @@ impl ApiBackend {
 
     /// Test/inspection helper: the stashed effective model for a session.
     pub fn session_model(&self, s: &SessionId) -> Option<String> {
-        self.sessions
-            .lock()
-            .ok()?
-            .get(s)
-            .and_then(|st| st.model.clone())
+        match self.sessions.lock().ok()?.get(s)?.model.clone() {
+            SessionModelState::ExplicitSome(model) => Some(model),
+            SessionModelState::Unconfigured | SessionModelState::ExplicitNone => None,
+        }
     }
 
     /// The session's cancel sender (creating the slot if absent).
@@ -277,7 +285,16 @@ impl ApiBackend {
             .and_then(|var| std::env::var(var).ok())
     }
     fn resolve_model(&self, s: &SessionId) -> Option<String> {
-        self.session_model(s).or_else(|| self.cfg.model.clone())
+        match self
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(s).map(|state| state.model.clone()))
+        {
+            Some(SessionModelState::ExplicitNone) => None,
+            Some(SessionModelState::ExplicitSome(model)) => Some(model),
+            Some(SessionModelState::Unconfigured) | None => self.cfg.model.clone(),
+        }
     }
 
     fn reject_blocked_model(model: Option<&str>) -> Result<(), BridgeError> {
@@ -691,7 +708,40 @@ impl AgentBackend for ApiBackend {
     ) -> Result<(), BridgeError> {
         Self::reject_blocked_model(spec.config.model.as_deref())?;
         let mut map = self.sessions.lock().expect("sessions lock");
-        map.entry(session.clone()).or_default().model = spec.config.model.clone();
+        map.entry(session.clone()).or_default().model = match &spec.config.model {
+            Some(model) => SessionModelState::ExplicitSome(model.clone()),
+            None => SessionModelState::ExplicitNone,
+        };
+        Ok(())
+    }
+
+    async fn configure_bound_session(
+        &self,
+        session: &SessionId,
+        spec: &BoundSessionSpecV1,
+    ) -> Result<(), BridgeError> {
+        let frozen = spec.provider_effect.frozen();
+        let cwd = spec
+            .session
+            .cwd
+            .as_ref()
+            .ok_or(BridgeError::ConfigMismatch {
+                field: "bound_session_cwd",
+            })?;
+        let empty_acp_delivery = matches!(
+            spec.provider_effect.delivery().payload(),
+            BoundMcpDeliveryPayloadV1::Acp(servers) if servers.is_empty()
+        );
+        if cwd != &frozen.effect.effective_session_cwd
+            || cwd != frozen.checkout.effective_cwd()
+            || frozen.effect.mcp_delivery_digest != *spec.provider_effect.delivery().digest()
+            || !empty_acp_delivery
+        {
+            return Err(BridgeError::ConfigMismatch {
+                field: "bound_provider_effect",
+            });
+        }
+        self.configure_session(session, &spec.session).await?;
         Ok(())
     }
 
@@ -850,6 +900,27 @@ mod tests {
         let _obj: Arc<dyn AgentBackend> = Arc::new(ApiBackend::new(crate::config::ApiConfig::new(
             "http://127.0.0.1:1",
         )));
+    }
+
+    #[tokio::test]
+    async fn explicit_none_session_model_suppresses_the_spawn_default() {
+        let mut config = crate::config::ApiConfig::new("http://127.0.0.1:1");
+        config.model = Some("model-m".into());
+        let backend = ApiBackend::new(config);
+        let session = SessionId::parse("explicit-none").unwrap();
+
+        backend
+            .configure_session(
+                &session,
+                &SessionSpec::from_config(EffectiveConfig {
+                    model: None,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(backend.resolve_model(&session), None);
     }
 
     #[tokio::test]
